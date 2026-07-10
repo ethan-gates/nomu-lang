@@ -1,0 +1,11 @@
+# Top-level build file — targets live in their own packages.
+
+alias(
+    name = "nomuc",
+    actual = "//nomu-cli:nomuc",
+)
+
+alias(
+    name = "install",
+    actual = "//tools/install:install",
+)
