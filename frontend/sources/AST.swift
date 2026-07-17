@@ -1,8 +1,28 @@
 // MARK: - Type references
 
-public struct TypeRef {
+// A named type (`Int`, `Point`) or a function type (`(Int) -> Int`).
+// `name` is a canonical rendering usable as a dictionary key; `fn` is set for function types.
+// A reference type so function types can recurse (a struct here would be infinite-size).
+public final class TypeRef {
     public let name: String
+    public let fn: FnType?
     public let line: Int
+
+    public init(name: String, fn: FnType? = nil, line: Int) {
+        self.name = name
+        self.fn = fn
+        self.line = line
+    }
+}
+
+public struct FnType {
+    public let params: [TypeRef]
+    public let ret: TypeRef?   // nil = void
+
+    public init(params: [TypeRef], ret: TypeRef?) {
+        self.params = params
+        self.ret = ret
+    }
 }
 
 // MARK: - Program
@@ -48,7 +68,6 @@ public struct EnumCaseDecl {
 public struct ClassDecl {
     public let name: String
     public let fields: [VarField]
-    public let deinitBody: Block?
     public let line: Int
 }
 
@@ -97,9 +116,19 @@ public enum Stmt {
     case assign(lhs: Expr, rhs: Expr, line: Int)
     case compoundAssign(lhs: Expr, rhs: Expr, line: Int)  // +=
     case ret(Expr?, line: Int)
+    case ifStmt(IfStmt)
     case switchStmt(SwitchStmt)
     case send(Expr, line: Int)
+    case join(Expr, line: Int)
     case expr(Expr)
+}
+
+// `else if` is represented as an elseBody holding a single .ifStmt.
+public struct IfStmt {
+    public let cond: Expr
+    public let thenBody: Block
+    public let elseBody: Block?
+    public let line: Int
 }
 
 public struct BindingStmt {
@@ -137,6 +166,7 @@ public indirect enum Expr {
     case call(Expr, [Arg], line: Int)
     case binary(BinOp, Expr, Expr, line: Int)
     case spawn(String, [Arg], line: Int)
+    case closure(params: [Param], ret: TypeRef?, body: Block, line: Int)
 }
 
 public struct Arg {

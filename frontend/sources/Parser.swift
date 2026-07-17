@@ -83,12 +83,8 @@ public struct Parser {
         while check(.kwVar) {
             fields.append(parseVarField())
         }
-        var deinitBody: Block? = nil
-        if eat(.kwDeinit) {
-            deinitBody = parseBlock()
-        }
         expect(.rBrace)
-        return ClassDecl(name: name, fields: fields, deinitBody: deinitBody, line: line)
+        return ClassDecl(name: name, fields: fields, line: line)
     }
 
     private mutating func parseActorDecl() -> ActorDecl {
@@ -181,8 +177,25 @@ public struct Parser {
 
     private mutating func parseTypeRef() -> TypeRef {
         let line = currentLine
+        if check(.lParen) {
+            // Function type: (T1, T2) -> R
+            expect(.lParen)
+            var params: [TypeRef] = []
+            while !check(.rParen) && !check(.eof) {
+                if !params.isEmpty { expect(.comma) }
+                params.append(parseTypeRef())
+            }
+            expect(.rParen)
+            expect(.arrow)
+            let ret = parseTypeRef()
+            return TypeRef(name: renderFnType(params, ret), fn: FnType(params: params, ret: ret), line: line)
+        }
         let name = expectIdent()
         return TypeRef(name: name, line: line)
+    }
+
+    private func renderFnType(_ params: [TypeRef], _ ret: TypeRef?) -> String {
+        "(" + params.map(\.name).joined(separator: ", ") + ") -> " + (ret?.name ?? "Void")
     }
 
     // MARK: - Statements
@@ -210,8 +223,10 @@ public struct Parser {
         case .kwLet:    return parseBinding(isMutable: false)
         case .kwVar:    return parseBinding(isMutable: true)
         case .kwReturn: return parseReturn()
+        case .kwIf:     return parseIfStmt()
         case .kwSwitch: return parseSwitchStmt()
         case .kwSend:   return parseSend()
+        case .kwJoin:   return parseJoin()
         default:        return parseExprOrAssign()
         }
     }
@@ -235,6 +250,19 @@ public struct Parser {
         // Return has an expression unless followed by a statement terminator
         let expr: Expr? = (check(.rBrace) || check(.kwCase) || check(.eof)) ? nil : parseExpr()
         return .ret(expr, line: line)
+    }
+
+    private mutating func parseIfStmt() -> Stmt {
+        let line = currentLine
+        expect(.kwIf)
+        let cond = parseExpr()
+        let thenBody = parseBlock()
+        var elseBody: Block? = nil
+        if eat(.kwElse) {
+            // `else if …` chains as a single nested if; `else { … }` is a plain block.
+            elseBody = check(.kwIf) ? [parseIfStmt()] : parseBlock()
+        }
+        return .ifStmt(IfStmt(cond: cond, thenBody: thenBody, elseBody: elseBody, line: line))
     }
 
     private mutating func parseSwitchStmt() -> Stmt {
@@ -275,6 +303,13 @@ public struct Parser {
         expect(.kwSend)
         let expr = parseExpr()
         return .send(expr, line: line)
+    }
+
+    private mutating func parseJoin() -> Stmt {
+        let line = currentLine
+        expect(.kwJoin)
+        let expr = parseExpr()
+        return .join(expr, line: line)
     }
 
     private mutating func parseExprOrAssign() -> Stmt {
@@ -365,11 +400,29 @@ public struct Parser {
             advance()
             let name = expectIdent()
             return .spawn(name, parseArgList(), line: line)
+        case .lBrace:
+            return parseClosure()
         case .ident(let name):
             advance(); return .ident(name, line: line)
         default:
             error("expected expression, got \(currentKind)")
         }
+    }
+
+    // { (x: Int) -> Int in <stmts> }   — return type optional (void if omitted)
+    private mutating func parseClosure() -> Expr {
+        let line = currentLine
+        expect(.lBrace)
+        let params = parseParamList()
+        var ret: TypeRef? = nil
+        if eat(.arrow) { ret = parseTypeRef() }
+        expect(.kwIn)
+        var body: [Stmt] = []
+        while !check(.rBrace) && !check(.eof) {
+            body.append(parseStmt())
+        }
+        expect(.rBrace)
+        return .closure(params: params, ret: ret, body: body, line: line)
     }
 
     private mutating func parseArgList() -> [Arg] {

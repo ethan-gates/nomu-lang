@@ -1,0 +1,28 @@
+// M1 walking-skeleton surface: fun, let, Int, arithmetic/comparison, if/else, print.
+
+fun bigger(a: Int, b: Int) -> Int {
+    if a > b {
+        return a
+    } else {
+        return b
+    }
+}
+
+fun classify(n: Int) -> Int {
+    if n < 0 {
+        return 0
+    } else if n == 0 {
+        return 1
+    } else {
+        return 2
+    }
+}
+
+fun main() {
+    let x = 7
+    let y = 4
+    print(bigger(x, y))       // 7
+    print(classify(0 - 3))    // 0
+    print(classify(0))        // 1
+    print(classify(9))        // 2
+}

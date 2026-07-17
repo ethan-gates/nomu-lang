@@ -8,14 +8,14 @@ enum Shape {
     case rect(w: Int, h: Int)
 }
 
-func area(s: Shape) -> Int {
+fun area(s: Shape) -> Int {
     switch s {
     case .circle(let r):      return 3 * r * r
     case .rect(let w, let h): return w * h
     }
 }
 
-func main() {
+fun main() {
     let p = Point(x: 3, y: 4)
     print(p.x)
 }

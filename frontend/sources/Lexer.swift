@@ -11,9 +11,10 @@ public enum TokenKind: Equatable {
     // Keywords
     case kwStruct, kwEnum, kwClass, kwActor
     case kwFunc, kwLet, kwVar
-    case kwOn, kwSpawn, kwSend
+    case kwOn, kwSpawn, kwSend, kwJoin
     case kwSwitch, kwCase, kwReturn
-    case kwDeinit
+    case kwIf, kwElse
+    case kwIn
 
     // Punctuation
     case lBrace, rBrace       // { }
@@ -140,16 +141,19 @@ public struct Lexer {
         case "enum":    .kwEnum
         case "class":   .kwClass
         case "actor":   .kwActor
-        case "func":    .kwFunc
+        case "fun":     .kwFunc
         case "let":     .kwLet
         case "var":     .kwVar
         case "on":      .kwOn
         case "spawn":   .kwSpawn
         case "send":    .kwSend
+        case "join":    .kwJoin
         case "switch":  .kwSwitch
         case "case":    .kwCase
         case "return":  .kwReturn
-        case "deinit":  .kwDeinit
+        case "if":      .kwIf
+        case "else":    .kwElse
+        case "in":      .kwIn
         case "true":    .boolLit(true)
         case "false":   .boolLit(false)
         default:        .ident(text)

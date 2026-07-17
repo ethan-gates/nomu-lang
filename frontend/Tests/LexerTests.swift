@@ -1,4 +1,5 @@
 import XCTest
+import frontend
 
 final class LexerTests: XCTestCase {
 
@@ -8,13 +9,13 @@ final class LexerTests: XCTestCase {
     }
 
     func testKeywords() {
-        let kinds = lex("struct enum class actor func let var on spawn send switch case return deinit")
+        let kinds = lex("struct enum class actor fun let var on spawn send switch case return if else")
         XCTAssertEqual(kinds, [
             .kwStruct, .kwEnum, .kwClass, .kwActor,
             .kwFunc, .kwLet, .kwVar,
             .kwOn, .kwSpawn, .kwSend,
             .kwSwitch, .kwCase, .kwReturn,
-            .kwDeinit, .eof,
+            .kwIf, .kwElse, .eof,
         ])
     }
 

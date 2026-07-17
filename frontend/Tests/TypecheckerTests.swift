@@ -1,4 +1,5 @@
 import XCTest
+import frontend
 
 final class TypecheckerTests: XCTestCase {
 
@@ -39,20 +40,20 @@ final class TypecheckerTests: XCTestCase {
 
     func testVarAssignmentAccepted() {
         check("""
-        func main() { var x: Int = 1 x = 2 }
+        fun main() { var x: Int = 1 x = 2 }
         """)
     }
 
     func testLetBindingReadAccepted() {
         check("""
-        func main() { let x: Int = 1 let y: Int = x }
+        fun main() { let x: Int = 1 let y: Int = x }
         """)
     }
 
     func testPatternBindingInSwitchReadAccepted() {
         check("""
         enum Shape { case circle(radius: Int) }
-        func area(s: Shape) -> Int {
+        fun area(s: Shape) -> Int {
             switch s {
             case .circle(let r): return r
             }

@@ -82,8 +82,6 @@ public struct Typechecker {
             switch decl {
             case .funcDecl(let f):
                 checkBlock(f.body, lets: [])
-            case .classDecl(let c):
-                if let body = c.deinitBody { checkBlock(body, lets: []) }
             case .actorDecl(let a):
                 for h in a.handlers { checkBlock(h.body, lets: []) }
             default:
@@ -105,6 +103,9 @@ public struct Typechecker {
             rejectLetTarget(lhs, lets: lets, line: line)
         case .compoundAssign(let lhs, _, let line):
             rejectLetTarget(lhs, lets: lets, line: line)
+        case .ifStmt(let s):
+            checkBlock(s.thenBody, lets: lets)
+            if let elseBody = s.elseBody { checkBlock(elseBody, lets: lets) }
         case .switchStmt(let sw):
             for arm in sw.cases {
                 var innerLets = lets
@@ -113,7 +114,7 @@ public struct Typechecker {
                 }
                 checkBlock(arm.body, lets: innerLets)
             }
-        case .ret, .send, .expr:
+        case .ret, .send, .join, .expr:
             break
         }
     }

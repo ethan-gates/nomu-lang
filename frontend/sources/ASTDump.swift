@@ -24,10 +24,6 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
     case .classDecl(let c):
         lines.append("\(ind)ClassDecl '\(c.name)'")
         for f in c.fields { lines.append("\(ind)  Field \(f.name): \(f.type.name)") }
-        if let body = c.deinitBody {
-            lines.append("\(ind)  Deinit")
-            appendBlock(body, ind: ind + "    ", into: &lines)
-        }
     case .actorDecl(let a):
         lines.append("\(ind)ActorDecl '\(a.name)'")
         for f in a.fields {
@@ -65,6 +61,13 @@ private func appendStmt(_ stmt: Stmt, ind: String, into lines: inout [String]) {
         lines.append("\(ind)\(describeExpr(lhs)) += \(describeExpr(rhs))")
     case .ret(let e, _):
         lines.append("\(ind)return\(e.map { " \(describeExpr($0))" } ?? "")")
+    case .ifStmt(let s):
+        lines.append("\(ind)if \(describeExpr(s.cond))")
+        appendBlock(s.thenBody, ind: ind + "  ", into: &lines)
+        if let elseBody = s.elseBody {
+            lines.append("\(ind)else")
+            appendBlock(elseBody, ind: ind + "  ", into: &lines)
+        }
     case .switchStmt(let sw):
         lines.append("\(ind)switch \(describeExpr(sw.subject))")
         for arm in sw.cases {
@@ -73,6 +76,8 @@ private func appendStmt(_ stmt: Stmt, ind: String, into lines: inout [String]) {
         }
     case .send(let e, _):
         lines.append("\(ind)send \(describeExpr(e))")
+    case .join(let e, _):
+        lines.append("\(ind)join \(describeExpr(e))")
     case .expr(let e):
         lines.append("\(ind)\(describeExpr(e))")
     }
@@ -92,6 +97,10 @@ private func describeExpr(_ e: Expr) -> String {
         return "\(describeExpr(callee))(\(describeArgs(args)))"
     case .spawn(let name, let args, _):
         return "spawn \(name)(\(describeArgs(args)))"
+    case .closure(let params, let ret, _, _):
+        let ps = params.map { "\($0.name): \($0.type.name)" }.joined(separator: ", ")
+        let r = ret.map { " -> \($0.name)" } ?? ""
+        return "{ (\(ps))\(r) in … }"
     }
 }
 

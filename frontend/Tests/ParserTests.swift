@@ -1,4 +1,5 @@
 import XCTest
+import frontend
 
 final class ParserTests: XCTestCase {
 
@@ -28,17 +29,10 @@ final class ParserTests: XCTestCase {
     }
 
     func testClassDecl() {
-        let p = parse("class Buffer { var data: Point deinit {} }")
+        let p = parse("class Buffer { var data: Point }")
         guard case .classDecl(let c) = p.decls[0] else { XCTFail(); return }
         XCTAssertEqual(c.name, "Buffer")
         XCTAssertEqual(c.fields.count, 1)
-        XCTAssertNotNil(c.deinitBody)
-    }
-
-    func testClassNoDeinit() {
-        let p = parse("class Node { var val: Int }")
-        guard case .classDecl(let c) = p.decls[0] else { XCTFail(); return }
-        XCTAssertNil(c.deinitBody)
     }
 
     func testActorDecl() {
@@ -54,7 +48,7 @@ final class ParserTests: XCTestCase {
     }
 
     func testFuncDecl() {
-        let p = parse("func area(s: Shape) -> Int { return 0 }")
+        let p = parse("fun area(s: Shape) -> Int { return 0 }")
         guard case .funcDecl(let f) = p.decls[0] else { XCTFail(); return }
         XCTAssertEqual(f.name, "area")
         XCTAssertEqual(f.params[0].label, "s")
@@ -65,7 +59,7 @@ final class ParserTests: XCTestCase {
 
     func testSwitchStmt() {
         let src = """
-        func area(s: Shape) -> Int {
+        fun area(s: Shape) -> Int {
             switch s {
             case .circle(let r):      return 3 * r * r
             case .rect(let w, let h): return w * h
@@ -84,7 +78,7 @@ final class ParserTests: XCTestCase {
     }
 
     func testBinaryExpr() {
-        let p = parse("func f() -> Int { return 3 * 4 + 1 }")
+        let p = parse("fun f() -> Int { return 3 * 4 + 1 }")
         guard case .funcDecl(let f) = p.decls[0],
               case .ret(let expr?, _) = f.body[0],
               case .binary(let op, _, _, _) = expr else { XCTFail(); return }
@@ -92,7 +86,7 @@ final class ParserTests: XCTestCase {
     }
 
     func testLabeledCall() {
-        let p = parse("func f() -> Int { return Point(x: 1, y: 2).x }")
+        let p = parse("fun f() -> Int { return Point(x: 1, y: 2).x }")
         guard case .funcDecl(let f) = p.decls[0],
               case .ret(let expr?, _) = f.body[0],
               case .member(let inner, let field, _) = expr,
@@ -104,7 +98,7 @@ final class ParserTests: XCTestCase {
     }
 
     func testSpawnAndSend() {
-        let p = parse("func main() { let c = spawn Counter() send c.bump(by: p) }")
+        let p = parse("fun main() { let c = spawn Counter() send c.bump(by: p) }")
         guard case .funcDecl(let f) = p.decls[0] else { XCTFail(); return }
         guard case .binding(let b) = f.body[0],
               case .spawn(let name, _, _) = b.value else { XCTFail(); return }
@@ -116,5 +110,3 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(args[0].label, "by")
     }
 }
-
-extension BinOp: Equatable {}

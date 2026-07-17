@@ -44,7 +44,8 @@ public func compile(path: String, emit: EmitMode = .binary) {
 
     let cc = Process()
     cc.executableURL = URL(fileURLWithPath: "/usr/bin/cc")
-    cc.arguments = ["-o", outPath, tmpC]
+    // Warnings on generated C are noise to the Nomu user (inspect via --emit-c instead).
+    cc.arguments = ["-w", "-o", outPath, tmpC]
     do {
         try cc.run()
         cc.waitUntilExit()
