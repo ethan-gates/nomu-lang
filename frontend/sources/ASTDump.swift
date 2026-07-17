@@ -32,7 +32,8 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
         }
         for h in a.handlers {
             let params = h.params.map { "\($0.label): \($0.type.name)" }.joined(separator: ", ")
-            lines.append("\(ind)  OnHandler '\(h.name)'(\(params))")
+            let ret = h.returnType.map { " -> \($0.name)" } ?? ""
+            lines.append("\(ind)  OnHandler '\(h.name)'(\(params))\(ret)")
             appendBlock(h.body, ind: ind + "    ", into: &lines)
         }
     case .funcDecl(let f):
@@ -55,6 +56,9 @@ private func appendStmt(_ stmt: Stmt, ind: String, into lines: inout [String]) {
         let kw    = b.isMutable ? "var" : "let"
         let annot = b.type.map { ": \($0.name)" } ?? ""
         lines.append("\(ind)\(kw) \(b.name)\(annot) = \(describeExpr(b.value))")
+    case .spawnLet(let name, let type, let value, _):
+        let annot = type.map { ": \($0.name)" } ?? ""
+        lines.append("\(ind)spawn let \(name)\(annot) = \(describeExpr(value))")
     case .assign(let lhs, let rhs, _):
         lines.append("\(ind)\(describeExpr(lhs)) = \(describeExpr(rhs))")
     case .compoundAssign(let lhs, let rhs, _):
@@ -74,10 +78,6 @@ private func appendStmt(_ stmt: Stmt, ind: String, into lines: inout [String]) {
             lines.append("\(ind)  \(describePattern(arm.pattern))")
             appendBlock(arm.body, ind: ind + "    ", into: &lines)
         }
-    case .send(let e, _):
-        lines.append("\(ind)send \(describeExpr(e))")
-    case .join(let e, _):
-        lines.append("\(ind)join \(describeExpr(e))")
     case .expr(let e):
         lines.append("\(ind)\(describeExpr(e))")
     }
@@ -95,8 +95,6 @@ private func describeExpr(_ e: Expr) -> String {
         return "\(describeExpr(l)) \(describeOp(op)) \(describeExpr(r))"
     case .call(let callee, let args, _):
         return "\(describeExpr(callee))(\(describeArgs(args)))"
-    case .spawn(let name, let args, _):
-        return "spawn \(name)(\(describeArgs(args)))"
     case .closure(let params, let ret, _, _):
         let ps = params.map { "\($0.name): \($0.type.name)" }.joined(separator: ", ")
         let r = ret.map { " -> \($0.name)" } ?? ""

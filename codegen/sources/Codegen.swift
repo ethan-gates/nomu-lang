@@ -19,7 +19,22 @@ public struct Codegen {
     // function types (canonical name → signature) for call-site casts.
     private var closureDefs = ""
     private var closureSeq  = 0
+    private var spawnSeq    = 0
     private var fnTypes: [String: FnType] = [:]
+
+    public var diagnostics: [String] = []
+
+    // Closure bindings whose captured environment is entirely shareable.
+    // Populated in emitBinding; consulted in the spawn capture check.
+    private var shareableClosureBindings: Set<String> = []
+
+    // Set while emitting an actor handler function body so that early returns
+    // write back field locals and release the actor's mutex before returning.
+    private struct HandlerCtx {
+        let fields: [ActorField]
+        let actorName: String
+    }
+    private var handlerCtx: HandlerCtx? = nil
 
     public init(_ program: Program) {
         self.program = program
@@ -41,7 +56,12 @@ public struct Codegen {
             if case .funcDecl = decl { continue }
             emitTopDecl(decl)
         }
-        // Marker where hoisted closure definitions get spliced in (after types, before funcs).
+        // Forward-declare functions so hoisted closure/spawn thunks (and mutual calls) resolve.
+        for decl in program.decls {
+            if case .funcDecl(let f) = decl { emitFuncProto(f) }
+        }
+        out += "\n"
+        // Marker where hoisted closure/spawn definitions get spliced in (after protos, before funcs).
         let marker = "/*__NOMU_CLOSURES__*/\n"
         out += marker
         for decl in program.decls {
@@ -95,6 +115,7 @@ public struct Codegen {
     private mutating func emitClass(_ c: ClassDecl) {
         // Reference type under bump-and-leak: heap-allocated, never freed (no GC yet,
         // no deinit). The header word is vestigial until real GC arrives (M6).
+        out += "// ===== class \(c.name) =====\n"
         out += "typedef struct {\n"
         out += "    ObjectHeader header;\n"
         for f in c.fields { out += "    \(cType(f.type.name)) \(f.name);\n" }
@@ -112,107 +133,24 @@ public struct Codegen {
 
     // MARK: - Actors
 
+    // Actors are mutex-protected objects. Each handler becomes a blocking call that
+    // locks the actor's mutex, runs the handler body under it, writes fields back,
+    // unlocks, and returns — serializing all callers automatically (non-reentrant).
     private mutating func emitActor(_ a: ActorDecl) {
-        let name      = a.name
-        let msgType   = "\(name)_msg"
-        let queueType = "MsgQueue_\(name)"
+        let name = a.name
 
-        // Message tag enum + payload union
-        let tags = a.handlers.map { "\(name)_\($0.name)" }.joined(separator: ", ")
-        out += "typedef enum { \(tags) } \(name)_msg_tag;\n"
-        out += "typedef struct {\n"
-        out += "    \(name)_msg_tag tag;\n"
-        out += "    union {\n"
-        for h in a.handlers {
-            if h.params.isEmpty {
-                out += "        char \(h.name)_pad;\n"
-            } else {
-                out += "        struct {\n"
-                for p in h.params { out += "            \(cType(p.type.name)) \(p.name);\n" }
-                out += "        } \(h.name);\n"
-            }
-        }
-        out += "    } payload;\n"
-        out += "} \(msgType);\n\n"
-
-        // Mailbox + actor struct (thread, mutex, condvar, shutdown flag)
-        out += "typedef struct { \(msgType)* buf; size_t len, cap; } \(queueType);\n\n"
-
+        // Actor struct: fields + a single mutex for serialization.
+        out += "// ===== actor \(name) =====\n"
         out += "typedef struct {\n"
         out += "    ObjectHeader header;\n"
         for f in a.fields { out += "    \(cType(f.type.name)) \(f.name);\n" }
-        out += "    \(queueType) queue;\n"
-        out += "    pthread_t      thread;\n"
-        out += "    pthread_mutex_t mutex;\n"
-        out += "    pthread_cond_t  cond;\n"
-        out += "    int shutdown;\n"
-        out += "    int joined;\n"
+        out += "    pthread_mutex_t mu;\n"
         out += "} \(name);\n\n"
 
-        // Enqueue — called from any thread; locks, appends, signals actor thread
-        out += "static void \(name)_enqueue(\(name)* self, \(msgType) msg) {\n"
-        out += "    pthread_mutex_lock(&self->mutex);\n"
-        out += "    if (self->queue.len == self->queue.cap) {\n"
-        out += "        self->queue.cap = self->queue.cap == 0 ? 4 : self->queue.cap * 2;\n"
-        out += "        self->queue.buf = (\(msgType)*)realloc(self->queue.buf, sizeof(\(msgType)) * self->queue.cap);\n"
-        out += "    }\n"
-        out += "    self->queue.buf[self->queue.len++] = msg;\n"
-        out += "    pthread_cond_signal(&self->cond);\n"
-        out += "    pthread_mutex_unlock(&self->mutex);\n"
-        out += "}\n\n"
+        // One blocking call function per handler.
+        for h in a.handlers { emitHandlerFunc(h, actor: a) }
 
-        // Run loop — actor's dedicated thread; steals the queue batch, dispatches without holding the lock
-        out += "static void* \(name)_run(void* arg) {\n"
-        out += "    \(name)* self = (\(name)*)arg;\n"
-        out += "    for (;;) {\n"
-        out += "        pthread_mutex_lock(&self->mutex);\n"
-        out += "        while (self->queue.len == 0 && !self->shutdown)\n"
-        out += "            pthread_cond_wait(&self->cond, &self->mutex);\n"
-        out += "        // Steal the pending batch so enqueue can proceed without contention\n"
-        out += "        size_t n = self->queue.len;\n"
-        out += "        \(msgType)* msgs = self->queue.buf;\n"
-        out += "        self->queue.buf = NULL; self->queue.len = 0; self->queue.cap = 0;\n"
-        out += "        pthread_mutex_unlock(&self->mutex);\n"
-        out += "        if (n == 0) break;  // shutdown && empty\n"
-        out += "        // Dispatch — actor fields only ever touched here\n"
-        out += "        for (size_t i = 0; i < n; i++) {\n"
-        out += "            \(msgType) m = msgs[i];\n"
-        out += "            switch (m.tag) {\n"
-        for h in a.handlers {
-            out += "                case \(name)_\(h.name): {\n"
-            for p in h.params {
-                out += "                    \(cType(p.type.name)) \(p.name) = m.payload.\(h.name).\(p.name);\n"
-            }
-            var handlerScope: Scope = [:]
-            for f in a.fields {
-                out += "                    \(cType(f.type.name)) \(f.name) = self->\(f.name);\n"
-                handlerScope[f.name] = f.type.name
-            }
-            for p in h.params { handlerScope[p.name] = p.type.name }
-            emitBlock(h.body, scope: &handlerScope, ind: "                    ")
-            for f in a.fields { out += "                    self->\(f.name) = \(f.name);\n" }
-            out += "                    break;\n"
-            out += "                }\n"
-        }
-        out += "            }\n"
-        out += "        }\n"
-        out += "        free(msgs);\n"
-        out += "    }\n"
-        out += "    return NULL;\n"
-        out += "}\n\n"
-
-        // Join — signals shutdown, waits for the actor thread to drain and exit (idempotent)
-        out += "static void \(name)_join(\(name)* self) {\n"
-        out += "    if (self->joined) return;\n"
-        out += "    pthread_mutex_lock(&self->mutex);\n"
-        out += "    self->shutdown = 1;\n"
-        out += "    pthread_cond_signal(&self->cond);\n"
-        out += "    pthread_mutex_unlock(&self->mutex);\n"
-        out += "    pthread_join(self->thread, NULL);\n"
-        out += "    self->joined = 1;\n"
-        out += "}\n\n"
-
-        // Constructor — fields with initializers don't appear as parameters
+        // Constructor — fields with initializers don't appear as parameters.
         let ctorFields = a.fields.filter { $0.initializer == nil }
         let ctorParams = ctorFields.isEmpty
             ? "void"
@@ -228,18 +166,12 @@ public struct Codegen {
                 out += "    self->\(f.name) = \(f.name);\n"
             }
         }
-        out += "    pthread_mutex_init(&self->mutex, NULL);\n"
-        out += "    pthread_cond_init(&self->cond, NULL);\n"
-        out += "    pthread_create(&self->thread, NULL, \(name)_run, self);\n"
+        out += "    pthread_mutex_init(&self->mu, NULL);\n"
         out += "    return self;\n"
         out += "}\n\n"
 
-        // Deinit (joins thread, frees queue, destroys sync primitives) + release
         out += "static void \(name)_deinit(\(name)* self) {\n"
-        out += "    \(name)_join(self);\n"
-        out += "    free(self->queue.buf);\n"
-        out += "    pthread_mutex_destroy(&self->mutex);\n"
-        out += "    pthread_cond_destroy(&self->cond);\n"
+        out += "    pthread_mutex_destroy(&self->mu);\n"
         out += "}\n\n"
 
         out += "static void \(name)_release(\(name)* self) {\n"
@@ -250,7 +182,44 @@ public struct Codegen {
         out += "}\n\n"
     }
 
+    // Emits a blocking handler function. The caller locks the actor's mutex and runs
+    // the handler body inline; concurrent callers block on the mutex (non-reentrant).
+    private mutating func emitHandlerFunc(_ h: OnHandler, actor a: ActorDecl) {
+        let retC = h.returnType.map { cType($0.name) } ?? "void"
+        var sig = "\(a.name)* self"
+        for p in h.params { sig += ", \(cType(p.type.name)) \(p.name)" }
+        out += "static \(retC) \(a.name)_\(h.name)(\(sig)) {\n"
+        out += "    pthread_mutex_lock(&self->mu);\n"
+
+        // Copy actor fields to locals so the handler body can read/write them by name.
+        var handlerScope: Scope = [:]
+        for f in a.fields {
+            out += "    \(cType(f.type.name)) \(f.name) = self->\(f.name);\n"
+            handlerScope[f.name] = f.type.name
+        }
+        for p in h.params { handlerScope[p.name] = p.type.name }
+
+        handlerCtx = HandlerCtx(fields: a.fields, actorName: a.name)
+        emitBlock(h.body, scope: &handlerScope, ind: "    ")
+        handlerCtx = nil
+
+        // Fallthrough exit (reached when there is no early return).
+        out += "// fall through exit when there is no early return\n"
+        for f in a.fields { out += "    self->\(f.name) = \(f.name);\n" }
+        out += "    pthread_mutex_unlock(&self->mu);\n"
+        out += "}\n\n"
+    }
+
     // MARK: - Functions
+
+    private mutating func emitFuncProto(_ f: FuncDecl) {
+        let cName = f.name == "main" ? "nomu_main" : f.name
+        let ret   = f.returnType.map { cType($0.name) } ?? "void"
+        let params = f.params.isEmpty
+            ? "void"
+            : f.params.map { "\(cType($0.type.name)) \($0.name)" }.joined(separator: ", ")
+        out += "\(ret) \(cName)(\(params));\n"
+    }
 
     private mutating func emitFunc(_ f: FuncDecl) {
         var scope: Scope = [:]
@@ -276,7 +245,10 @@ public struct Codegen {
         let outerKeys = Set(scope.keys)
         for stmt in stmts { emitStmt(stmt, scope: &scope, ind: ind) }
         for key in Set(scope.keys).subtracting(outerKeys).sorted() {
-            if let typeName = scope[key], actors[typeName] != nil {
+            guard let typeName = scope[key] else { continue }
+            if spawnResultType(typeName) != nil {
+                out += "\(ind)spawn_join(&\(key)__h);\n"   // structured: join before leaving scope
+            } else if actors[typeName] != nil {
                 out += "\(ind)\(typeName)_release(\(key));\n"
             }
         }
@@ -288,6 +260,8 @@ public struct Codegen {
         switch stmt {
         case .binding(let b):
             emitBinding(b, scope: &scope, ind: ind)
+        case .spawnLet(let name, let type, let value, _):
+            emitSpawnLet(name: name, type: type, value: value, scope: &scope, ind: ind)
         case .assign(let lhs, let rhs, _):
             // bind before appending: emitExpr may mutate `out` (closure hoisting), which
             // would overlap the `out +=` write.
@@ -297,6 +271,17 @@ public struct Codegen {
             let l = emitExpr(lhs, scope: scope); let r = emitExpr(rhs, scope: scope)
             out += "\(ind)\(l) += \(r);\n"
         case .ret(let e, _):
+            // Structured guarantee: join all active spawns before leaving the function.
+            for key in scope.keys.sorted() {
+                if spawnResultType(scope[key]) != nil {
+                    out += "\(ind)spawn_join(&\(key)__h);\n"
+                }
+            }
+            // Actor handler: write fields back and release the mutex before returning.
+            if let ctx = handlerCtx {
+                for f in ctx.fields { out += "\(ind)self->\(f.name) = \(f.name);\n" }
+                out += "\(ind)pthread_mutex_unlock(&self->mu);\n"
+            }
             if let e { let v = emitExpr(e, scope: scope); out += "\(ind)return \(v);\n" }
             else { out += "\(ind)return;\n" }
         case .ifStmt(let s):
@@ -306,13 +291,6 @@ public struct Codegen {
         case .expr(let e):
             let v = emitExpr(e, scope: scope)
             out += "\(ind)\(v);\n"
-        case .send(let e, _):
-            emitSend(e, scope: &scope, ind: ind)
-        case .join(let e, _):
-            guard case .ident(let actorVar, _) = e,
-                  let actorType = scope[actorVar]
-            else { out += "\(ind)/* join: unrecognized form */\n"; return }
-            out += "\(ind)\(actorType)_join(\(actorVar));\n"
         }
     }
 
@@ -320,37 +298,23 @@ public struct Codegen {
         let typeName = b.type?.name ?? typeOf(b.value, scope: scope)
         scope[b.name] = typeName
         // A closure-bound name needs its signature registered for later call-site casts.
-        if case .closure(let ps, let r, _, _) = b.value {
+        // Also record whether its captures are all shareable — closures are shareable iff
+        // their captured environment is (design: concurrency.md §6).
+        if case .closure(let ps, let r, let body, _) = b.value {
             fnTypes[typeName] = FnType(params: ps.map { $0.type }, ret: r)
+            var bound = Set(ps.map(\.name))
+            var used: [String] = []
+            collectUsesBlock(body, bound: &bound, used: &used)
+            var seen = Set<String>()
+            let caps = used.filter { scope[$0] != nil && seen.insert($0).inserted }
+            let allShareable = caps.allSatisfy { cap in
+                let t = spawnResultType(scope[cap]) ?? scope[cap]!
+                return isShareableBinding(cap, type: t)
+            }
+            if allShareable { shareableClosureBindings.insert(b.name) }
         }
         let value = emitInit(b.value, as: typeName, scope: scope)
         out += "\(ind)\(cType(typeName)) \(b.name) = \(value);\n"
-    }
-
-    private mutating func emitSend(_ e: Expr, scope: inout Scope, ind: String) {
-        guard case .call(let callee, let args, _) = e,
-              case .member(let actorExpr, let handlerName, _) = callee,
-              case .ident(let actorVar, _) = actorExpr,
-              let actorType = scope[actorVar],
-              let ad = actors[actorType],
-              let handler = ad.handlers.first(where: { $0.name == handlerName })
-        else {
-            out += "\(ind)/* send: unrecognized form */\n"
-            return
-        }
-
-        let msgType = "\(actorType)_msg"
-        let tag     = "\(actorType)_\(handlerName)"
-
-        var fieldInits = ".tag = \(tag)"
-        for p in handler.params {
-            let v: String
-            if let a = args.first(where: { $0.label == p.label }) { v = emitExpr(a.value, scope: scope) }
-            else { v = "0" }
-            fieldInits += ", .payload.\(handlerName).\(p.name) = \(v)"
-        }
-
-        out += "\(ind)\(actorType)_enqueue(\(actorVar), (\(msgType)){ \(fieldInits) });\n"
     }
 
     private mutating func emitIf(_ s: IfStmt, scope: inout Scope, ind: String) {
@@ -386,8 +350,7 @@ public struct Codegen {
                 out += "\(ind)        \(cType(field.type.name)) \(binding) = \(subj).payload.\(caseName).\(field.name);\n"
                 inner[binding] = field.type.name
             }
-            for stmt in arm.body { emitStmt(stmt, scope: &inner, ind: ind + "        ") }
-            // classes bump-and-leak: no release of pattern-bound class locals
+            emitBlock(arm.body, scope: &inner, ind: ind + "        ")
             out += "\(ind)        break;\n"
             out += "\(ind)    }\n"
         }
@@ -401,7 +364,12 @@ public struct Codegen {
         switch e {
         case .intLit(let v, _):   return "\(v)"
         case .boolLit(let v, _):  return v ? "1" : "0"
-        case .ident(let n, _):    return n
+        case .ident(let n, _):
+            // Reading a spawn-bound name joins its thread (idempotent) and yields the result.
+            if let rt = spawnResultType(scope[n]) {
+                return "(*(\(cType(rt))*)spawn_join(&\(n)__h))"
+            }
+            return n
         case .member(let base, let field, _):
             let bt = typeOf(base, scope: scope)
             let op = (classes[bt] != nil || actors[bt] != nil) ? "->" : "."
@@ -410,10 +378,6 @@ public struct Codegen {
             return "(\(emitExpr(lhs, scope: scope)) \(cOp(op)) \(emitExpr(rhs, scope: scope)))"
         case .call(let callee, let args, _):
             return emitCall(callee: callee, args: args, scope: scope)
-        case .spawn(let name, let args, _):
-            guard let ad = actors[name] else { return "/* spawn: unknown actor \(name) */" }
-            let labels = ad.fields.filter { $0.initializer == nil }.map(\.name)
-            return "\(name)_new(\(emitLabeled(labels, args, scope: scope).joined(separator: ", ")))"
         case .closure(let params, let ret, let body, _):
             return emitClosure(params: params, ret: ret, body: body, scope: scope)
         }
@@ -451,6 +415,19 @@ public struct Codegen {
     }
 
     private mutating func emitCall(callee: Expr, args: [Arg], scope: Scope) -> String {
+        // Actor method call: c.handlerName(args) → ActorType_handlerName(c, args...)
+        if case .member(let base, let handlerName, _) = callee,
+           case .ident(let actorVar, _) = base,
+           let actorType = scope[actorVar],
+           let ad = actors[actorType],
+           let handler = ad.handlers.first(where: { $0.name == handlerName }) {
+            for p in handler.params where !isShareable(p.type.name) {
+                diagnostics.append("error: actor handler '\(handlerName)' parameter '\(p.name)' has type '\(p.type.name)' which cannot cross a task boundary — only value types are shareable")
+            }
+            let argVals = emitArgs(args, scope: scope)
+            return "\(actorType)_\(handlerName)(\(([actorVar] + argVals).joined(separator: ", ")))"
+        }
+
         guard case .ident(let name, _) = callee else {
             return "\(emitExpr(callee, scope: scope))(\(emitArgs(args, scope: scope).joined(separator: ", ")))"
         }
@@ -467,9 +444,19 @@ public struct Codegen {
             let arg = args.isEmpty ? "0" : emitExpr(args[0].value, scope: scope)
             return "printf(\"%lld\\n\", (long long)(\(arg)))"
         }
+        // `sleep(ms)` — a prototype builtin (usleep/nanosleep), returns the ms slept.
+        // Lets us observe real concurrent timing; not a committed language/stdlib API.
+        if name == "sleep" {
+            let arg = args.isEmpty ? "0" : emitExpr(args[0].value, scope: scope)
+            return "({ int64_t __ms = (\(arg)); struct timespec __ts = { __ms / 1000, (__ms % 1000) * 1000000 }; nanosleep(&__ts, NULL); __ms; })"
+        }
         if structs[name] != nil { return structLiteral(name: name, args: args, scope: scope) }
         if let cd = classes[name] {
             return "\(name)_new(\(emitLabeled(cd.fields.map(\.name), args, scope: scope).joined(separator: ", ")))"
+        }
+        if let ad = actors[name] {
+            let labels = ad.fields.filter { $0.initializer == nil }.map(\.name)
+            return "\(name)_new(\(emitLabeled(labels, args, scope: scope).joined(separator: ", ")))"
         }
         return "\(name)(\(emitArgs(args, scope: scope).joined(separator: ", ")))"
     }
@@ -548,6 +535,9 @@ public struct Codegen {
         case .binding(let b):
             collectUsesExpr(b.value, bound: bound, used: &used)
             bound.insert(b.name)
+        case .spawnLet(let name, _, let value, _):
+            collectUsesExpr(value, bound: bound, used: &used)
+            bound.insert(name)
         case .assign(let l, let r, _), .compoundAssign(let l, let r, _):
             collectUsesExpr(l, bound: bound, used: &used)
             collectUsesExpr(r, bound: bound, used: &used)
@@ -566,8 +556,6 @@ public struct Codegen {
             }
         case .expr(let e):
             collectUsesExpr(e, bound: bound, used: &used)
-        case .send, .join:
-            break
         }
     }
 
@@ -582,13 +570,93 @@ public struct Codegen {
         case .binary(_, let l, let r, _):
             collectUsesExpr(l, bound: bound, used: &used)
             collectUsesExpr(r, bound: bound, used: &used)
-        case .spawn(_, let args, _):
-            for a in args { collectUsesExpr(a.value, bound: bound, used: &used) }
         case .closure(let ps, _, let cbody, _):
             var nb = bound
             for p in ps { nb.insert(p.name) }
             collectUsesBlock(cbody, bound: &nb, used: &used)
         }
+    }
+
+    // MARK: - Structured spawn
+
+    private mutating func emitSpawnLet(name: String, type: TypeRef?, value: Expr, scope: inout Scope, ind: String) {
+        let rt = type?.name ?? typeOf(value, scope: scope)
+        let (thunk, envName, caps) = emitSpawnThunk(value: value, resultType: rt, scope: scope)
+
+        // Site: allocate the env, copy captures by value, start the thread.
+        out += "\(ind)\(envName)* \(name)__e = (\(envName)*)rt_alloc(sizeof(\(envName)));\n"
+        for c in caps { out += "\(ind)\(name)__e->\(c) = \(c);\n" }
+        out += "\(ind)SpawnHandle \(name)__h; \(name)__h.joined = 0;\n"
+        out += "\(ind)pthread_create(&\(name)__h.thread, NULL, \(thunk), \(name)__e);\n"
+        scope[name] = "spawn \(rt)"   // reads of `name` join and yield `rt`
+    }
+
+    // Closure-convert `value` into a pthread start routine returning a boxed result.
+    private mutating func emitSpawnThunk(value: Expr, resultType: String, scope: Scope) -> (String, String, [String]) {
+        let idx = spawnSeq; spawnSeq += 1
+        let name    = "nomu_spawn\(idx)"
+        let envName = "\(name)_env"
+
+        var used: [String] = []
+        collectUsesExpr(value, bound: [], used: &used)
+        var seen = Set<String>()
+        let caps = used.filter { scope[$0] != nil && seen.insert($0).inserted }
+
+        for cap in caps {
+            let typeName = spawnResultType(scope[cap]) ?? scope[cap]!
+            if !isShareableBinding(cap, type: typeName) {
+                diagnostics.append("error: '\(cap)' has type '\(typeName)' which cannot cross a task boundary — only value types and closures with shareable captures are shareable")
+            }
+        }
+
+        var def = "typedef struct {\n"
+        if caps.isEmpty {
+            def += "    char _empty;\n"
+        } else {
+            for c in caps { def += "    \(cType(scope[c]!)) \(c);\n" }
+        }
+        def += "} \(envName);\n\n"
+
+        let rc = cType(resultType)
+        def += "static void* \(name)(void* __envv) {\n"
+        def += "    \(envName)* __env = (\(envName)*)__envv;\n"
+        var cscope: Scope = [:]
+        for c in caps {
+            def += "    \(cType(scope[c]!)) \(c) = __env->\(c);\n"
+            cscope[c] = scope[c]
+        }
+        let v = emitExpr(value, scope: cscope)
+        def += "    \(rc)* __box = (\(rc)*)rt_alloc(sizeof(\(rc)));\n"
+        def += "    *__box = \(v);\n"
+        def += "    return __box;\n"
+        def += "}\n\n"
+        closureDefs += def
+        return (name, envName, caps)
+    }
+
+    // A type is shareable if it can safely cross a task boundary.
+    // Primitives and value types (structs, enums) are shareable by construction.
+    // Actor handles are shareable — they are self-synchronizing (mutex-protected).
+    // Classes are task-local. Closures are conditionally shareable, checked per-binding.
+    private func isShareable(_ typeName: String) -> Bool {
+        if typeName == "Int" || typeName == "Bool" { return true }
+        if structs[typeName] != nil { return true }
+        if enums[typeName]   != nil { return true }
+        if actors[typeName]  != nil { return true }
+        return false   // classes: task-local
+    }
+
+    // Whether a named binding is shareable, accounting for closures whose
+    // captures are all shareable (see emitBinding).
+    private func isShareableBinding(_ name: String, type typeName: String) -> Bool {
+        if isShareable(typeName) { return true }
+        return shareableClosureBindings.contains(name)
+    }
+
+    // A spawn binding stores its type in the scope as "spawn <resultType>".
+    private func spawnResultType(_ s: String?) -> String? {
+        guard let s, s.hasPrefix("spawn ") else { return nil }
+        return String(s.dropFirst("spawn ".count))
     }
 
     // MARK: - Type resolution
@@ -597,7 +665,9 @@ public struct Codegen {
         switch e {
         case .intLit:               return "Int"
         case .boolLit:              return "Bool"
-        case .ident(let n, _):      return scope[n] ?? ""
+        case .ident(let n, _):
+            let t = scope[n] ?? ""
+            return spawnResultType(t) ?? t   // a spawn binding resolves to its result type
         case .member(let base, let field, _):
             let bt = typeOf(base, scope: scope)
             return structs[bt]?.fields.first(where: { $0.name == field })?.type.name
@@ -605,11 +675,19 @@ public struct Codegen {
                 ?? actors[bt]?.fields.first(where: { $0.name == field })?.type.name
                 ?? ""
         case .call(let callee, _, _):
+            // Actor method call: look up the handler's declared return type.
+            if case .member(let base, let handlerName, _) = callee,
+               case .ident(let actorVar, _) = base,
+               let actorType = scope[actorVar],
+               let ad = actors[actorType],
+               let handler = ad.handlers.first(where: { $0.name == handlerName }) {
+                return handler.returnType?.name ?? ""
+            }
             guard case .ident(let n, _) = callee else { return "" }
-            if structs[n] != nil || enums[n] != nil || classes[n] != nil { return n }
+            if n == "sleep" { return "Int" }
+            if structs[n] != nil || enums[n] != nil || classes[n] != nil || actors[n] != nil { return n }
             return funcs[n]?.returnType?.name ?? ""
         case .binary:   return "Int"
-        case .spawn(let n, _, _): return n
         case .closure(let params, let ret, _, _):
             return "(" + params.map { $0.type.name }.joined(separator: ", ") + ") -> " + (ret?.name ?? "Void")
         }
@@ -650,6 +728,7 @@ public struct Codegen {
         #include <stdint.h>
         #include <string.h>
         #include <pthread.h>
+        #include <time.h>
 
         typedef struct { size_t refcount; } ObjectHeader;
         static inline void* rt_alloc(size_t size) {
@@ -658,13 +737,18 @@ public struct Codegen {
             ((ObjectHeader*)p)->refcount = 1;
             return p;
         }
-        static inline void rt_retain(void* p) {
-            if (p) ((ObjectHeader*)p)->refcount++;
-        }
 
         // A closure value: code pointer + captured environment (heap-allocated, bump-and-leak).
         typedef struct { void* fn; void* env; } Closure;
 
+        // A structured spawn: an OS thread computing a boxed result. Reading joins (idempotent).
+        typedef struct { pthread_t thread; void* result; int joined; } SpawnHandle;
+        static void* spawn_join(SpawnHandle* h) {
+            if (!h->joined) { pthread_join(h->thread, &h->result); h->joined = 1; }
+            return h->result;
+        }
+
+        /// ====== END PREAMBLE ======
 
         """
     }

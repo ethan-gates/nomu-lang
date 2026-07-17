@@ -1,0 +1,11 @@
+// A reference type (class): heap-allocated, accessed by reference.
+// Under M2 it bump-allocates and leaks (no GC yet, no deinit).
+class Node {
+    var val : Int
+
+}
+
+fun main() {
+
+    let n = Node(val : 42) print(n.val)
+}

@@ -9,11 +9,11 @@ final class LexerTests: XCTestCase {
     }
 
     func testKeywords() {
-        let kinds = lex("struct enum class actor fun let var on spawn send switch case return if else")
+        let kinds = lex("struct enum class actor fun let var on spawn switch case return if else")
         XCTAssertEqual(kinds, [
             .kwStruct, .kwEnum, .kwClass, .kwActor,
             .kwFunc, .kwLet, .kwVar,
-            .kwOn, .kwSpawn, .kwSend,
+            .kwOn, .kwSpawn,
             .kwSwitch, .kwCase, .kwReturn,
             .kwIf, .kwElse, .eof,
         ])
@@ -63,10 +63,11 @@ final class LexerTests: XCTestCase {
         ])
     }
 
-    func testActorSend() {
-        let kinds = lex("send c.bump(by: p)")
+    func testActorMethodCall() {
+        // Actor calls are plain method-call syntax — no send/join keywords.
+        let kinds = lex("c.bump(by: p)")
         XCTAssertEqual(kinds, [
-            .kwSend, .ident("c"), .dot, .ident("bump"),
+            .ident("c"), .dot, .ident("bump"),
             .lParen, .ident("by"), .colon, .ident("p"), .rParen, .eof,
         ])
     }

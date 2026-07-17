@@ -1,14 +1,11 @@
 // Closures (M2): first-class values that capture by value, bind, call, and pass as arguments.
 // Explicit typing for now (no inference yet).
 
-fun apply(f: (Int) -> Int, x: Int) -> Int {
-    return f(x)
-}
+fun apply(f : (Int)->Int, x : Int) -> Int{return f(x)}
 
 fun main() {
-    let base = 100
-    let add = { (x: Int) -> Int in return x + base }     // captures base by value
-    print(add(5))                                        // 105
-    print(apply(add, 10))                                // 110
-    print(apply({ (n: Int) -> Int in return n * n }, 7)) // 49  (closure literal as an argument)
+    let base = 100 let add = {(x : Int)->Int in return x + base} // captures base by value
+    print(add(5))                                                // 105
+    print(apply(add, 10))                                       // 110
+    print(apply({(n : Int)->Int in return n * n}, 7))           // 49  (closure literal as an argument)
 }

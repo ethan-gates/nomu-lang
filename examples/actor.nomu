@@ -1,0 +1,36 @@
+// Actor model (M3.4): method-call syntax, mutex-serialized, actor handles are shareable.
+//
+// Key property: multiple concurrent spawns call the same actor safely because the
+// actor's mutex serializes every handler. The caller blocks until the handler returns.
+//
+// Run with `time ./a.out` — should print in ~200ms, not ~600ms, proving the three
+// workers ran concurrently even though they share one Counter.
+
+actor Counter {
+    var count: Int = 0
+    on bump(by: Int) { count += by }
+    on getCount() -> Int { return count }
+}
+
+// Simulates work (sleep 200ms), then records the result in the shared counter.
+// Actor handle is shareable — safe to pass across task boundaries.
+fun doWork(c: Counter, amount: Int) -> Int {
+    let waited = sleep(200)
+    c.bump(by: amount)
+    return amount
+}
+
+fun main() {
+    let c = Counter()
+
+    // Three workers run concurrently. Each sleeps 200ms, then bumps the counter.
+    // The mutex ensures no two bumps interleave — the final count is always exact.
+    spawn let a = doWork(c, 1)
+    spawn let b = doWork(c, 2)
+    spawn let d = doWork(c, 3)
+
+    // Spawn results and actor state both sum to 6 — two independent witnesses
+    // to the same six units of work.
+    print(a + b + d)      // 6
+    print(c.getCount())   // 6
+}

@@ -88,6 +88,7 @@ public struct ActorField {
 public struct OnHandler {
     public let name: String
     public let params: [Param]
+    public let returnType: TypeRef?
     public let body: Block
     public let line: Int
 }
@@ -113,13 +114,12 @@ public typealias Block = [Stmt]
 
 public enum Stmt {
     case binding(BindingStmt)
+    case spawnLet(name: String, type: TypeRef?, value: Expr, line: Int)  // spawn let x = expr
     case assign(lhs: Expr, rhs: Expr, line: Int)
     case compoundAssign(lhs: Expr, rhs: Expr, line: Int)  // +=
     case ret(Expr?, line: Int)
     case ifStmt(IfStmt)
     case switchStmt(SwitchStmt)
-    case send(Expr, line: Int)
-    case join(Expr, line: Int)
     case expr(Expr)
 }
 
@@ -165,7 +165,6 @@ public indirect enum Expr {
     case member(Expr, String, line: Int)
     case call(Expr, [Arg], line: Int)
     case binary(BinOp, Expr, Expr, line: Int)
-    case spawn(String, [Arg], line: Int)
     case closure(params: [Param], ret: TypeRef?, body: Block, line: Int)
 }
 

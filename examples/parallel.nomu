@@ -1,0 +1,11 @@
+// Observe real concurrency: three 500ms tasks run at once on separate OS threads,
+// so this finishes in ~500ms wall-clock, not ~1500ms. Compare the two with:
+//     nomuc examples/parallel.nomu && time examples/parallel
+// (`sleep` is a prototype builtin for testing timing, not a committed language API.)
+
+fun work(ms : Int) -> Int{return sleep(ms)}
+
+fun main() {
+    spawn let a = work(500) spawn let b = work(500) spawn let c = work(500)
+        print(a + b + c) // 1500 (sum of ms slept), but wall-clock ~500ms — they overlap
+}

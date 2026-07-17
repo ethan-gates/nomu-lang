@@ -97,16 +97,26 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(args[1].label, "y")
     }
 
-    func testSpawnAndSend() {
-        let p = parse("fun main() { let c = spawn Counter() send c.bump(by: p) }")
+    func testActorMethodCall() {
+        // Actor construction is a plain call; method calls are plain member-call expressions.
+        let p = parse("fun main() { let c = Counter() c.bump(by: p) }")
         guard case .funcDecl(let f) = p.decls[0] else { XCTFail(); return }
+        // Construction: Counter()
         guard case .binding(let b) = f.body[0],
-              case .spawn(let name, _, _) = b.value else { XCTFail(); return }
-        XCTAssertEqual(name, "Counter")
-        guard case .send(let expr, _) = f.body[1],
-              case .call(let callee, let args, _) = expr,
+              case .call(let ctor, _, _) = b.value,
+              case .ident(let ctorName, _) = ctor else { XCTFail(); return }
+        XCTAssertEqual(ctorName, "Counter")
+        // Method call: c.bump(by: p)
+        guard case .expr(let callExpr) = f.body[1],
+              case .call(let callee, let args, _) = callExpr,
               case .member(_, let handler, _) = callee else { XCTFail(); return }
         XCTAssertEqual(handler, "bump")
         XCTAssertEqual(args[0].label, "by")
+    }
+
+    func testHandlerReturnType() {
+        let p = parse("actor Counter { var count: Int = 0 on getCount() -> Int { return count } }")
+        guard case .actorDecl(let a) = p.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(a.handlers[0].returnType?.name, "Int")
     }
 }

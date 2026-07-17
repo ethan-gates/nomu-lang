@@ -11,7 +11,7 @@ public enum TokenKind: Equatable {
     // Keywords
     case kwStruct, kwEnum, kwClass, kwActor
     case kwFunc, kwLet, kwVar
-    case kwOn, kwSpawn, kwSend, kwJoin
+    case kwOn, kwSpawn
     case kwSwitch, kwCase, kwReturn
     case kwIf, kwElse
     case kwIn
@@ -146,8 +146,6 @@ public struct Lexer {
         case "var":     .kwVar
         case "on":      .kwOn
         case "spawn":   .kwSpawn
-        case "send":    .kwSend
-        case "join":    .kwJoin
         case "switch":  .kwSwitch
         case "case":    .kwCase
         case "return":  .kwReturn

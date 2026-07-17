@@ -149,8 +149,10 @@ public struct Parser {
         expect(.kwOn)
         let name = expectIdent()
         let params = parseParamList()
+        var returnType: TypeRef? = nil
+        if eat(.arrow) { returnType = parseTypeRef() }
         let body = parseBlock()
-        return OnHandler(name: name, params: params, body: body, line: line)
+        return OnHandler(name: name, params: params, returnType: returnType, body: body, line: line)
     }
 
     private mutating func parseParamList() -> [Param] {
@@ -225,10 +227,22 @@ public struct Parser {
         case .kwReturn: return parseReturn()
         case .kwIf:     return parseIfStmt()
         case .kwSwitch: return parseSwitchStmt()
-        case .kwSend:   return parseSend()
-        case .kwJoin:   return parseJoin()
+        case .kwSpawn where peek() == .kwLet: return parseSpawnLet()
         default:        return parseExprOrAssign()
         }
+    }
+
+    // spawn let x [: T] = expr  — runs expr concurrently; reading x joins.
+    private mutating func parseSpawnLet() -> Stmt {
+        let line = currentLine
+        expect(.kwSpawn)
+        expect(.kwLet)
+        let name = expectIdent()
+        var type: TypeRef? = nil
+        if eat(.colon) { type = parseTypeRef() }
+        expect(.eq)
+        let value = parseExpr()
+        return .spawnLet(name: name, type: type, value: value, line: line)
     }
 
     private mutating func parseBinding(isMutable: Bool) -> Stmt {
@@ -296,20 +310,6 @@ public struct Parser {
             expect(.rParen)
         }
         return .enumCase(name: name, bindings: bindings, line: line)
-    }
-
-    private mutating func parseSend() -> Stmt {
-        let line = currentLine
-        expect(.kwSend)
-        let expr = parseExpr()
-        return .send(expr, line: line)
-    }
-
-    private mutating func parseJoin() -> Stmt {
-        let line = currentLine
-        expect(.kwJoin)
-        let expr = parseExpr()
-        return .join(expr, line: line)
     }
 
     private mutating func parseExprOrAssign() -> Stmt {
@@ -396,10 +396,6 @@ public struct Parser {
             advance(); return .intLit(v, line: line)
         case .boolLit(let v):
             advance(); return .boolLit(v, line: line)
-        case .kwSpawn:
-            advance()
-            let name = expectIdent()
-            return .spawn(name, parseArgList(), line: line)
         case .lBrace:
             return parseClosure()
         case .ident(let name):

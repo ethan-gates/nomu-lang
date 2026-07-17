@@ -1,0 +1,47 @@
+// Shareability checker (M3.3): only value types and closures with shareable
+// captures can cross a task boundary. Classes are task-local by default.
+
+struct Point {
+    var x: Int
+    var y: Int
+}
+
+fun sumPoint(p: Point) -> Int {
+    return p.x + p.y
+}
+
+fun twice(n: Int) -> Int {
+    return n * 2
+}
+
+fun apply(f: (Int) -> Int, x: Int) -> Int {
+    return f(x)
+}
+
+fun main() {
+    // Structs are value types — shareable across task boundaries.
+    let p = Point(x: 3, y: 4)
+    spawn let s = sumPoint(p)
+    print(s)   // 7
+
+    // Primitives (Int) are shareable.
+    let base = 10
+    spawn let d = twice(base)
+    print(d)   // 20
+
+    // A closure with only shareable captures is itself shareable.
+    let offset = 5
+    let addOffset = { (x: Int) -> Int in return x + offset }
+    spawn let r = apply(addOffset, 100)
+    print(r)   // 105
+}
+
+// ── Uncomment the block below to see the shareability error ──────────────────
+//
+class Box { var val: Int }
+fun getVal(b: Box) -> Int { return b.val }
+fun badMain() {
+    let b = Box(val: 42)
+    spawn let v = getVal(b)   // error: 'b' has type 'Box' which cannot cross a task boundary
+    print(v)
+}

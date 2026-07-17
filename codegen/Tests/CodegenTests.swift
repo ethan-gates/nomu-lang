@@ -11,6 +11,15 @@ final class CodegenTests: XCTestCase {
         return codegen.emit()
     }
 
+    // Returns the Codegen after emit(), so tests can inspect diagnostics.
+    private func compiled(_ source: String) -> Codegen {
+        var lexer = Lexer(source)
+        var parser = Parser(lexer.tokenize())
+        var codegen = Codegen(parser.parse())
+        _ = codegen.emit()
+        return codegen
+    }
+
     func testStructEmit() {
         let c = gen("struct Point { var x: Int var y: Int }")
         XCTAssertTrue(c.contains("typedef struct {"))
@@ -119,11 +128,125 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(c.contains(".fn = (void*)nomu_clo0"))
     }
 
+    func testSpawnEmit() {
+        let c = gen("""
+        fun sq(n: Int) -> Int { return n * n }
+        fun main() {
+            spawn let a = sq(3)
+            spawn let b = sq(4)
+            print(a + b)
+        }
+        """)
+        XCTAssertTrue(c.contains("typedef struct { pthread_t thread; void* result; int joined; } SpawnHandle;"))
+        XCTAssertTrue(c.contains("static void* nomu_spawn0(void* __envv)"))     // thunk
+        XCTAssertTrue(c.contains("SpawnHandle a__h; a__h.joined = 0;"))
+        XCTAssertTrue(c.contains("pthread_create(&a__h.thread, NULL, nomu_spawn0, a__e);"))
+        XCTAssertTrue(c.contains("(*(int64_t*)spawn_join(&a__h))"))             // reading joins
+        XCTAssertTrue(c.contains("int64_t sq(int64_t n);"))                     // forward prototype
+    }
+
+    func testEarlyReturnJoins() {
+        // Spawns must be joined before any return, not just at block exit.
+        let c = gen("""
+        fun work(n: Int) -> Int { return n * 2 }
+        fun compute(a: Int, b: Int) -> Int {
+            spawn let x = work(a)
+            spawn let y = work(b)
+            return x + y
+        }
+        fun main() { print(compute(3, 4)) }
+        """)
+        // Standalone spawn_join (followed by semicolon+newline) proves the pre-join statement
+        // was emitted. It cannot appear that way inside the return expression itself.
+        XCTAssertTrue(c.contains("spawn_join(&x__h);\n"), "x must be joined before return")
+        XCTAssertTrue(c.contains("spawn_join(&y__h);\n"), "y must be joined before return")
+    }
+
+    func testSwitchArmSpawnJoin() {
+        // A spawn defined inside a switch arm and never read must be joined at arm exit.
+        let c = gen("""
+        enum Box { case val(n: Int) }
+        fun work(n: Int) -> Int { return n * 2 }
+        fun process(b: Box) {
+            switch b {
+            case .val(let n):
+                spawn let x = work(n)
+            }
+        }
+        fun main() { }
+        """)
+        // x is never read in the arm body, so emitBlock must emit the join before break.
+        XCTAssertTrue(c.contains("spawn_join(&x__h);\n"), "unread spawn in switch arm must be joined at arm exit")
+    }
+
+    func testShareableClosureAllowed() {
+        // A closure whose captures are all shareable is itself shareable.
+        let cg = compiled("""
+        fun apply(f: (Int) -> Int, x: Int) -> Int { return f(x) }
+        fun main() {
+            let base = 10
+            let add = { (x: Int) -> Int in return x + base }
+            spawn let r = apply(add, 5)
+            print(r)
+        }
+        """)
+        XCTAssertTrue(cg.diagnostics.isEmpty, "closure with shareable captures must be allowed: \(cg.diagnostics)")
+    }
+
+    func testNonShareableClosureRejected() {
+        // A closure that captures a class is not shareable.
+        let cg = compiled("""
+        class Box { var val: Int }
+        fun apply(f: (Int) -> Int, x: Int) -> Int { return f(x) }
+        fun main() {
+            let b = Box(val: 10)
+            let get = { (x: Int) -> Int in return b.val + x }
+            spawn let r = apply(get, 5)
+            print(r)
+        }
+        """)
+        XCTAssertFalse(cg.diagnostics.isEmpty, "closure capturing a class must be rejected at a task boundary")
+    }
+
+    func testShareableValueTypeCaptureAllowed() {
+        let cg = compiled("""
+        struct Point { var x: Int var y: Int }
+        fun dist(p: Point) -> Int { return p.x + p.y }
+        fun main() {
+            let p = Point(x: 3, y: 4)
+            spawn let d = dist(p)
+            print(d)
+        }
+        """)
+        XCTAssertTrue(cg.diagnostics.isEmpty, "struct capture must be allowed: \(cg.diagnostics)")
+    }
+
+    func testNonShareableClassCaptureRejected() {
+        let cg = compiled("""
+        class Node { var val: Int }
+        fun getVal(n: Node) -> Int { return n.val }
+        fun main() {
+            let n = Node(val: 42)
+            spawn let v = getVal(n)
+            print(v)
+        }
+        """)
+        XCTAssertFalse(cg.diagnostics.isEmpty, "class capture across task boundary must be rejected")
+        XCTAssertTrue(cg.diagnostics[0].contains("'n'"), "diagnostic must name the offending variable")
+        XCTAssertTrue(cg.diagnostics[0].contains("Node"), "diagnostic must name the offending type")
+    }
+
+    func testSleepBuiltin() {
+        let c = gen("fun main() { let a = sleep(100) print(a) }")
+        XCTAssertTrue(c.contains("#include <time.h>"))
+        XCTAssertTrue(c.contains("nanosleep(&__ts, NULL)"))
+    }
+
     func testPreambleIncluded() {
         let c = gen("fun main() { }")
         XCTAssertTrue(c.contains("#include <stdio.h>"))
         XCTAssertTrue(c.contains("ObjectHeader"))
-        XCTAssertTrue(c.contains("rt_retain"))
+        XCTAssertFalse(c.contains("rt_retain"))
     }
 
     func testClassTypedef() {
@@ -153,62 +276,75 @@ final class CodegenTests: XCTestCase {
         actor Counter {
             var count: Int = 0
             on bump(by: Int) { count += by }
+            on getCount() -> Int { return count }
         }
         """)
-        // Message union
-        XCTAssertTrue(c.contains("Counter_bump"))
-        XCTAssertTrue(c.contains("Counter_msg_tag tag;"))
-        XCTAssertTrue(c.contains("int64_t by;"))
-        // Mailbox
-        XCTAssertTrue(c.contains("MsgQueue_Counter"))
-        // Actor struct with queue
+        // Actor struct: fields + mutex only (no thread, no queue, no condvars)
         XCTAssertTrue(c.contains("ObjectHeader header;"))
         XCTAssertTrue(c.contains("int64_t count;"))
-        XCTAssertTrue(c.contains("MsgQueue_Counter queue;"))
-        // Thread + sync primitives in struct
-        XCTAssertTrue(c.contains("pthread_t      thread;"))
-        XCTAssertTrue(c.contains("pthread_mutex_t mutex;"))
-        XCTAssertTrue(c.contains("pthread_cond_t  cond;"))
-        // Enqueue (locked) + run loop + join
-        XCTAssertTrue(c.contains("static void Counter_enqueue(Counter* self"))
-        XCTAssertTrue(c.contains("pthread_mutex_lock(&self->mutex)"))
-        XCTAssertTrue(c.contains("static void* Counter_run(void* arg)"))
-        XCTAssertTrue(c.contains("pthread_cond_wait(&self->cond, &self->mutex)"))
-        XCTAssertTrue(c.contains("static void Counter_join(Counter* self)"))
-        // Constructor starts thread
+        XCTAssertTrue(c.contains("pthread_mutex_t mu;"))
+        XCTAssertFalse(c.contains("Counter_run"), "no dedicated run loop in M3 actor")
+        XCTAssertFalse(c.contains("pthread_cond_t"), "no condvar in M3 actor")
+        // Per-handler blocking functions
+        XCTAssertTrue(c.contains("static void Counter_bump(Counter* self, int64_t by)"))
+        XCTAssertTrue(c.contains("static int64_t Counter_getCount(Counter* self)"))
+        // Each function locks, runs body, writes back, unlocks
+        XCTAssertTrue(c.contains("pthread_mutex_lock(&self->mu)"))
+        XCTAssertTrue(c.contains("count += by"))
+        XCTAssertTrue(c.contains("self->count = count;"))
+        XCTAssertTrue(c.contains("pthread_mutex_unlock(&self->mu)"))
+        // Constructor initializes mutex, no thread spawn
         XCTAssertTrue(c.contains("static Counter* Counter_new(void)"))
         XCTAssertTrue(c.contains("self->count = 0;"))
-        XCTAssertTrue(c.contains("pthread_create(&self->thread, NULL, Counter_run, self)"))
-        // Deinit joins + destroys
-        XCTAssertTrue(c.contains("Counter_join(self);"))
-        XCTAssertTrue(c.contains("pthread_mutex_destroy(&self->mutex)"))
+        XCTAssertTrue(c.contains("pthread_mutex_init(&self->mu, NULL)"))
+        XCTAssertFalse(c.contains("pthread_create"), "no thread in M3 actor constructor")
+        // Deinit destroys mutex + release for refcount
+        XCTAssertTrue(c.contains("pthread_mutex_destroy(&self->mu)"))
         XCTAssertTrue(c.contains("static void Counter_release(Counter* self)"))
     }
 
-    func testSpawnAndSendCodegen() {
+    func testActorMethodCallCodegen() {
         let c = gen("""
         actor Counter {
             var count: Int = 0
             on bump(by: Int) { count += by }
+            on getCount() -> Int { return count }
         }
         fun main() {
-            let c = spawn Counter()
-            send c.bump(by: 10)
-            join c
-            print(c.count)
+            let c = Counter()
+            c.bump(by: 10)
+            print(c.getCount())
         }
         """)
-        // spawn → Counter_new()
+        // Actor construction via plain call
         XCTAssertTrue(c.contains("Counter* c = Counter_new();"))
-        // send → enqueue only (no drain; actor thread handles dispatch)
-        XCTAssertTrue(c.contains("Counter_enqueue(c, (Counter_msg){ .tag = Counter_bump, .payload.bump.by = 10 });"))
-        XCTAssertFalse(c.contains("Counter_drain"))
-        // join → Counter_join
-        XCTAssertTrue(c.contains("Counter_join(c);"))
-        // member access via ->
-        XCTAssertTrue(c.contains("c->count"))
+        // Void handler call
+        XCTAssertTrue(c.contains("Counter_bump(c, 10);"))
+        // Returning handler call (used inside print)
+        XCTAssertTrue(c.contains("Counter_getCount(c)"))
         // ARC release at scope end
         XCTAssertTrue(c.contains("Counter_release(c);"))
+    }
+
+    func testActorHandleIsShareable() {
+        // Actor handles are shareable — passing one across a spawn boundary must not produce a diagnostic.
+        let cg = compiled("""
+        actor Counter {
+            var count: Int = 0
+            on bump(by: Int) { count += by }
+        }
+        fun doWork(c: Counter, amount: Int) -> Int {
+            c.bump(by: amount)
+            return amount
+        }
+        fun main() {
+            let c = Counter()
+            spawn let a = doWork(c, 1)
+            spawn let b = doWork(c, 2)
+            print(a + b)
+        }
+        """)
+        XCTAssertTrue(cg.diagnostics.isEmpty, "actor handle must be shareable across task boundary: \(cg.diagnostics)")
     }
 
     func testClassNoReleaseAtScopeEnd() {

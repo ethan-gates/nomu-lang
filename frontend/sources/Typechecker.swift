@@ -99,6 +99,8 @@ public struct Typechecker {
         switch stmt {
         case .binding(let b):
             if !b.isMutable { lets.insert(b.name) }
+        case .spawnLet(let name, _, _, _):
+            lets.insert(name)   // a spawn binding is immutable
         case .assign(let lhs, _, let line):
             rejectLetTarget(lhs, lets: lets, line: line)
         case .compoundAssign(let lhs, _, let line):
@@ -114,7 +116,7 @@ public struct Typechecker {
                 }
                 checkBlock(arm.body, lets: innerLets)
             }
-        case .ret, .send, .join, .expr:
+        case .ret, .expr:
             break
         }
     }

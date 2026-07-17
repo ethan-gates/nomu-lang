@@ -26,9 +26,19 @@ public func compile(path: String, emit: EmitMode = .binary) {
     var gen = Codegen(program)
     let cCode = gen.emit()
 
-    // --emit-c: print generated C and stop
+    if !gen.diagnostics.isEmpty {
+        for d in gen.diagnostics { fputs("\(d)\n", stderr) }
+        exit(1)
+    }
+
+    // --emit-c: write generated C to <basename>.c beside the source file
     if emit == .c {
-        print(cCode)
+        let cPath = URL(fileURLWithPath: path).deletingPathExtension().appendingPathExtension("c").path
+        guard (try? cCode.write(toFile: cPath, atomically: true, encoding: .utf8)) != nil else {
+            fputs("error: failed to write '\(cPath)'\n", stderr)
+            exit(1)
+        }
+        print(cPath)
         return
     }
 
