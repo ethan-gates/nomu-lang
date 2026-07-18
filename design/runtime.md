@@ -64,7 +64,7 @@ Waking a parked fiber from a different thread than the one that parked it is the
 
 ## 4. Platform & syscall strategy
 
-- **Direct syscalls where possible (Go-style, no CGO), for fully static binaries.** The runtime and stdlib own their threads and talk to the OS directly, which serves the deployment goal (static binary, ~20MB ceiling, copy-and-run — `vision.md` → Deployment). — **Leaning (direction).**
+- **Direct syscalls where possible (Go-style, no CGO), for fully static binaries.** The runtime and stdlib own their threads and talk to the OS directly, which serves the deployment goal (static binary, under 9MB, copy-and-run — `vision.md` → Deployment). — **Leaning (direction).**
 - **Platform nuance:** "no libc" is realistic on **Linux** (stable raw syscall ABI). On **macOS / BSD** the stable ABI is the platform libc (`libSystem`), so those targets go through a thin platform-libc shim rather than raw syscalls. — **Noted.**
 - **libc dependency is itself under review** — whether to drop it à la Go-without-CGO, accepting the per-platform syscall maintenance cost. — **Open.**
 

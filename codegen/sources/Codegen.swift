@@ -586,8 +586,7 @@ public struct Codegen {
         // Site: allocate the env, copy captures by value, start the thread.
         out += "\(ind)\(envName)* \(name)__e = (\(envName)*)rt_alloc(sizeof(\(envName)));\n"
         for c in caps { out += "\(ind)\(name)__e->\(c) = \(c);\n" }
-        out += "\(ind)SpawnHandle \(name)__h; \(name)__h.joined = 0;\n"
-        out += "\(ind)pthread_create(&\(name)__h.thread, NULL, \(thunk), \(name)__e);\n"
+        out += "\(ind)SpawnHandle \(name)__h; \(name)__h.fiber = fiber_spawn(\(thunk), \(name)__e);\n"
         scope[name] = "spawn \(rt)"   // reads of `name` join and yield `rt`
     }
 
@@ -723,12 +722,14 @@ public struct Codegen {
 
     private mutating func emitPreamble() {
         out += """
+        #define _XOPEN_SOURCE 600
         #include <stdio.h>
         #include <stdlib.h>
         #include <stdint.h>
         #include <string.h>
         #include <pthread.h>
         #include <time.h>
+        #include <ucontext.h>
 
         typedef struct { size_t refcount; } ObjectHeader;
         static inline void* rt_alloc(size_t size) {
@@ -741,11 +742,76 @@ public struct Codegen {
         // A closure value: code pointer + captured environment (heap-allocated, bump-and-leak).
         typedef struct { void* fn; void* env; } Closure;
 
-        // A structured spawn: an OS thread computing a boxed result. Reading joins (idempotent).
-        typedef struct { pthread_t thread; void* result; int joined; } SpawnHandle;
+        // ---- Fiber scheduler (M4.2: single-carrier, cooperative) ----
+        #define RT_MAX_FIBERS 256
+        #define RT_STACK_SIZE (128 * 1024)
+
+        typedef enum { FIBER_RUNNABLE, FIBER_PARKED, FIBER_DONE } FiberStatus;
+        typedef struct Fiber {
+            ucontext_t ctx;
+            char* stack;
+            FiberStatus status;
+            void* result;
+            struct Fiber* joiner;
+            void* (*fn)(void*);
+            void* arg;
+        } Fiber;
+
+        static Fiber* rt_run_queue[RT_MAX_FIBERS];
+        static int rt_rq_head = 0, rt_rq_tail = 0;
+        static Fiber* rt_current = NULL;
+        static ucontext_t rt_sched_ctx;
+
+        static void rt_rq_push(Fiber* f) {
+            rt_run_queue[rt_rq_tail % RT_MAX_FIBERS] = f;
+            rt_rq_tail++;
+        }
+        static Fiber* rt_rq_pop(void) {
+            if (rt_rq_head == rt_rq_tail) return NULL;
+            Fiber* f = rt_run_queue[rt_rq_head % RT_MAX_FIBERS];
+            rt_rq_head++;
+            return f;
+        }
+
+        static void rt_fiber_trampoline(void) {
+            Fiber* self = rt_current;
+            self->result = self->fn(self->arg);
+            self->status = FIBER_DONE;
+            if (self->joiner) { rt_rq_push(self->joiner); self->joiner = NULL; }
+            swapcontext(&self->ctx, &rt_sched_ctx);
+        }
+
+        static Fiber* fiber_spawn(void* (*fn)(void*), void* arg) {
+            Fiber* f = (Fiber*)calloc(1, sizeof(Fiber));
+            f->stack = (char*)malloc(RT_STACK_SIZE);
+            f->fn = fn; f->arg = arg; f->status = FIBER_RUNNABLE;
+            getcontext(&f->ctx);
+            f->ctx.uc_stack.ss_sp = f->stack;
+            f->ctx.uc_stack.ss_size = RT_STACK_SIZE;
+            f->ctx.uc_link = NULL;
+            makecontext(&f->ctx, rt_fiber_trampoline, 0);
+            rt_rq_push(f);
+            return f;
+        }
+
+        static void rt_scheduler_run(void) {
+            while (1) {
+                Fiber* f = rt_rq_pop();
+                if (!f) break;
+                rt_current = f;
+                swapcontext(&rt_sched_ctx, &f->ctx);
+            }
+        }
+
+        // A structured spawn handle: a fiber whose result we will join.
+        typedef struct { Fiber* fiber; } SpawnHandle;
         static void* spawn_join(SpawnHandle* h) {
-            if (!h->joined) { pthread_join(h->thread, &h->result); h->joined = 1; }
-            return h->result;
+            if (h->fiber->status != FIBER_DONE) {
+                h->fiber->joiner = rt_current;
+                rt_current->status = FIBER_PARKED;
+                swapcontext(&rt_current->ctx, &rt_sched_ctx);
+            }
+            return h->fiber->result;
         }
 
         /// ====== END PREAMBLE ======
@@ -755,8 +821,10 @@ public struct Codegen {
 
     private mutating func emitCMain() {
         out += """
+        static void* __rt_main_entry(void* _) { nomu_main(); return NULL; }
         int main(void) {
-            nomu_main();
+            fiber_spawn(__rt_main_entry, NULL);
+            rt_scheduler_run();
             return 0;
         }
         """

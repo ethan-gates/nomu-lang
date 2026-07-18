@@ -51,7 +51,7 @@ Feels like Go: cheap to reach for, no ceremony.
 
 ## Deployment
 
-Go-class: a single small static binary (~20MB ceiling), no install requirement (no JVM/Python/Erlang VM), copy-and-run on Linux. MMTk links statically and fits.
+Go-class: a single small static binary (under 9MB), no install requirement (no JVM/Python/Erlang VM), copy-and-run on Linux. MMTk links statically and fits.
 
 ## Library tiers: language > runtime > stdlib
 
