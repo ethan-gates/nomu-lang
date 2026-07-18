@@ -89,6 +89,7 @@ private func describeExpr(_ e: Expr) -> String {
     switch e {
     case .intLit(let v, _):    return "\(v)"
     case .boolLit(let v, _):   return v ? "true" : "false"
+    case .stringLit(let v, _): return "\"\(v)\""
     case .ident(let n, _):     return n
     case .member(let b, let f, _): return "\(describeExpr(b)).\(f)"
     case .binary(let op, let l, let r, _):

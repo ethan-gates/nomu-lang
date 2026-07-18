@@ -161,6 +161,7 @@ public enum Pattern {
 public indirect enum Expr {
     case intLit(Int, line: Int)
     case boolLit(Bool, line: Int)
+    case stringLit(String, line: Int)
     case ident(String, line: Int)
     case member(Expr, String, line: Int)
     case call(Expr, [Arg], line: Int)

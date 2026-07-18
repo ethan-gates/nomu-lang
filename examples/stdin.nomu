@@ -1,0 +1,19 @@
+fun ticker() -> Int {
+    sleep(300)
+    print("tick")
+    sleep(300)
+    print("tick")
+    sleep(300)
+    print("tick")
+    sleep(300)
+    print("tick")
+    sleep(300)
+    print("tick")
+    return 0
+}
+
+fun main() {
+    spawn let t = ticker()
+    let line = readLine()
+    print(concat("got: ", line))
+}

@@ -1,0 +1,7 @@
+fun main() {
+    let hello: String = "hello"
+    let world: String = "world"
+    let greeting = concat(hello, concat(", ", world))
+    print(greeting)
+    print(concat("length test: ", "abc"))
+}

@@ -5,6 +5,7 @@ public struct Typechecker {
     private var typeKinds: [String: DeclKind] = [
         "Int": .builtin,
         "Bool": .builtin,
+        "String": .builtin,
     ]
 
     private enum DeclKind {

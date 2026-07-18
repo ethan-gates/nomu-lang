@@ -103,3 +103,81 @@ These are gating runtime engineering, tracked with the backend work, not restate
 - **Platform syscall strategy** — how far to push no-libc; per-platform coverage (§4).
 - **FFI** — foreign-thread attach + moving-GC pinning; deferred with FFI, protected by the context-free rule (§5).
 - **Cancellation propagation through the scheduler** — how a cancelled scope unwinds parked children (interacts with the cancellation model, `concurrency.md` §7).
+
+---
+
+## 8. Implementation status (M4, C backend)
+
+The scheduler is implemented in the C preamble emitted by the codegen for every compiled program. This section documents what exists, the API contract, and what remains deferred.
+
+### What's built
+
+**M4.1–M4.2 — Fiber context switch + single-carrier scheduler**
+Context switching uses `ucontext`/`swapcontext` (POSIX, deprecated on macOS but functional). Each fiber gets a heap-allocated fixed stack (`RT_STACK_SIZE = 128KB`). The scheduler is a loop that pops from the run queue and switches into the next fiber; when the fiber yields control (by parking or finishing), it switches back to the per-carrier scheduler context (`rt_sched_ctx`).
+
+**M4.3a — Multiple carriers**
+`N` OS pthreads each run `rt_scheduler_run()` against a single shared run queue protected by `rt_queue_mu`. The carrier count is hardcoded at 4 (`RT_MAX_CARRIERS = 16` cap exists but the knob is not yet wired). Each carrier has thread-local `rt_current` and `rt_sched_ctx`.
+
+**M4.3b — Idle carrier sleep**
+Carriers sleep on `rt_queue_cond` (a `pthread_cond_t`) when the queue is empty but `rt_active > 0`. `rt_rq_push` calls `pthread_cond_signal`; `rt_fiber_trampoline` calls `pthread_cond_broadcast` on completion so all carriers re-check the exit condition.
+
+**M4.4 — I/O poller (macOS only)**
+A dedicated poller thread runs a `kqueue` loop. `rt_wait_readable(fd)` registers a one-shot `EVFILT_READ` kevent with `rt_current` as `udata`, then parks the fiber (`FIBER_PARKED` + `swapcontext` back to scheduler). The poller thread pushes the fiber back onto the run queue when the fd fires. Currently used for stdin; wires up to any readable fd.
+
+**M4.5 — Timer heap**
+A min-heap of `(expiry_ns, Fiber*)` pairs, ordered by `CLOCK_MONOTONIC` nanosecond timestamp. Protected by `rt_timer_mu` / `rt_timer_cond`. A dedicated timer thread sleeps with `pthread_cond_timedwait` until the nearest deadline, fires expired entries by pushing their fibers onto the run queue, then loops. `rt_sleep_ms(ms)` inserts into the heap and parks the calling fiber.
+
+### Internal API contract
+
+These functions are runtime-internal (emitted into the C preamble, not Nomu surface):
+
+| Function | Lock requirement | Notes |
+|---|---|---|
+| `rt_rq_push(f)` | Must hold `rt_queue_mu` | Signals `rt_queue_cond` after push |
+| `rt_rq_pop()` | Must hold `rt_queue_mu` | Returns NULL if empty |
+| `fiber_spawn(fn, arg)` | None (acquires `rt_queue_mu` internally) | Increments `rt_active`; pushes fiber |
+| `spawn_join(h)` | None (acquires `rt_queue_mu` internally) | Parks caller if fiber not yet DONE |
+| `rt_sleep_ms(ms)` | None (acquires `rt_timer_mu` internally) | Parks caller; woken by timer thread |
+| `rt_wait_readable(fd)` | None | Parks caller; woken by poller thread (macOS only) |
+| `rt_timer_push(expiry, f)` | Must hold `rt_timer_mu` | Signals `rt_timer_cond` after push |
+
+### Fiber lifecycle
+
+```
+fiber_spawn()
+     │
+     ▼
+FIBER_RUNNABLE ──── carrier picks up ──→ running (rt_current)
+     ▲                                        │
+     │                                   park / join / sleep
+     │                                        │
+     └──── unpark (poller/timer/joiner) ── FIBER_PARKED
+                                              │
+                                         fiber fn returns
+                                              │
+                                          FIBER_DONE ──→ joiner unparked (if any)
+```
+
+Transitions:
+- `RUNNABLE → running`: carrier calls `swapcontext` into fiber
+- `running → PARKED`: fiber calls `spawn_join` (target not done), `rt_sleep_ms`, or `rt_wait_readable`; sets status, switches back to scheduler
+- `PARKED → RUNNABLE`: timer thread, poller thread, or completing fiber calls `rt_rq_push`
+- `running → DONE`: fiber function returns; `rt_fiber_trampoline` sets status, decrements `rt_active`, unparks joiner if any
+
+### `rt_active` invariant
+
+`rt_active` counts all fibers that are not yet `FIBER_DONE`. It is incremented under `rt_queue_mu` in `fiber_spawn` and decremented under `rt_queue_mu` in `rt_fiber_trampoline`. Carriers exit `rt_scheduler_run` when the queue is empty **and** `rt_active == 0`. This is the only program-exit condition.
+
+### Cross-thread wake safety (satisfies §3)
+
+`rt_rq_push` is always called under `rt_queue_mu`, which provides the release fence; carriers pop under the same lock (acquire). This satisfies the happens-before requirement from §3 — the woken fiber's result is visible to whichever carrier resumes it. The poller and timer thread are both Nomu-managed threads (§3 Tier 1); neither assumes `rt_current` is set, satisfying the context-free resume rule.
+
+### Deferred from M4
+
+- **Stack growth** — fixed 128KB stacks; growable/segmented stacks deferred.
+- **Parallelism knob** — carrier count hardcoded at 4; `GOMAXPROCS`-equivalent not yet wired.
+- **Work stealing** — M4.3c; single shared queue used instead.
+- **Blocking-syscall offload** — M4.6; `nanosleep` / file reads block the carrier.
+- **Task-locals** — open; no implementation.
+- **Linux I/O poller** — kqueue is macOS-only; epoll path not yet written.
+- **Actor mutex → fiber-aware mutex** — actors still use `pthread_mutex_t`; should use the park/unpark primitive to avoid blocking a carrier when a handler is held.

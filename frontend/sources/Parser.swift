@@ -396,6 +396,8 @@ public struct Parser {
             advance(); return .intLit(v, line: line)
         case .boolLit(let v):
             advance(); return .boolLit(v, line: line)
+        case .stringLit(let v):
+            advance(); return .stringLit(v, line: line)
         case .lBrace:
             return parseClosure()
         case .ident(let name):

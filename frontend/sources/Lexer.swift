@@ -4,6 +4,7 @@ public enum TokenKind: Equatable {
     // Literals
     case intLit(Int)
     case boolLit(Bool)
+    case stringLit(String)
 
     // Identifiers
     case ident(String)
@@ -71,6 +72,7 @@ public struct Lexer {
 
         if c.isNumber { return lexInt(startLine) }
         if c.isLetter || c == "_" { return lexIdent(startLine) }
+        if c == "\"" { return lexString(startLine) }
 
         pos += 1
         switch c {
@@ -157,6 +159,29 @@ public struct Lexer {
         default:        .ident(text)
         }
         return Token(kind: kind, line: startLine)
+    }
+
+    private mutating func lexString(_ startLine: Int) -> Token {
+        pos += 1  // consume opening "
+        var value = ""
+        while pos < src.count && src[pos] != "\"" {
+            if src[pos] == "\\" && pos + 1 < src.count {
+                pos += 1
+                switch src[pos] {
+                case "n":  value.append("\n")
+                case "t":  value.append("\t")
+                case "\\": value.append("\\")
+                case "\"": value.append("\"")
+                default:   value.append(src[pos])
+                }
+            } else {
+                value.append(src[pos])
+            }
+            pos += 1
+        }
+        guard pos < src.count else { error("unterminated string literal", line: startLine) }
+        pos += 1  // consume closing "
+        return Token(kind: .stringLit(value), line: startLine)
     }
 
     private func peek() -> Character? {
