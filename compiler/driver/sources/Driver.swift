@@ -31,9 +31,10 @@ public func compile(path: String, emit: EmitMode = .binary) {
         exit(1)
     }
 
-    // --emit-c: write generated C to <basename>.c beside the source file
+    let base = URL(fileURLWithPath: path).deletingPathExtension().path
+
     if emit == .c {
-        let cPath = URL(fileURLWithPath: path).deletingPathExtension().appendingPathExtension("c").path
+        let cPath = base + ".c"
         guard (try? cCode.write(toFile: cPath, atomically: true, encoding: .utf8)) != nil else {
             fputs("error: failed to write '\(cPath)'\n", stderr)
             exit(1)
@@ -42,7 +43,6 @@ public func compile(path: String, emit: EmitMode = .binary) {
         return
     }
 
-    // Default: write to temp file, compile with cc
     let tmpC = NSTemporaryDirectory() + "nomu_\(UUID().uuidString).c"
     guard (try? cCode.write(toFile: tmpC, atomically: true, encoding: .utf8)) != nil else {
         fputs("error: failed to write temp C file\n", stderr)
@@ -50,12 +50,10 @@ public func compile(path: String, emit: EmitMode = .binary) {
     }
     defer { try? FileManager.default.removeItem(atPath: tmpC) }
 
-    let outPath = URL(fileURLWithPath: path).deletingPathExtension().path
-
     let cc = Process()
     cc.executableURL = URL(fileURLWithPath: "/usr/bin/cc")
-    // Warnings on generated C are noise to the Nomu user (inspect via --emit-c instead).
-    cc.arguments = ["-w", "-o", outPath, tmpC]
+    // Warnings on generated C are noise to the Nomu user (inspect via -c instead).
+    cc.arguments = ["-w", "-o", base, tmpC]
     do {
         try cc.run()
         cc.waitUntilExit()
@@ -69,5 +67,5 @@ public func compile(path: String, emit: EmitMode = .binary) {
         exit(1)
     }
 
-    print("\(outPath)")
+    print(base)
 }

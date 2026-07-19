@@ -4,12 +4,12 @@ swift_library(
     name = "codegen",
     srcs = glob(["sources/*.swift"]),
     module_name = "codegen",
-    deps = ["//frontend"],
+    deps = ["//compiler/frontend"],
     visibility = ["//visibility:public"],
 )
 
 swift_test(
     name = "codegen_tests",
     srcs = glob(["tests/*.swift"]),
-    deps = ["//codegen"],
+    deps = ["//compiler/codegen"],
 )

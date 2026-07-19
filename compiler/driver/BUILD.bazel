@@ -4,6 +4,6 @@ swift_library(
     name = "driver",
     srcs = glob(["sources/*.swift"]),
     module_name = "driver",
-    deps = ["//frontend", "//codegen"],
+    deps = ["//compiler/frontend", "//compiler/codegen"],
     visibility = ["//visibility:public"],
 )
