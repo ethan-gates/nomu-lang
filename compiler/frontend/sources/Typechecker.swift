@@ -44,13 +44,13 @@ public struct Typechecker {
             case .structDecl(let s):
                 for field in s.fields where containsReference(field.type.name) {
                     fail("value type '\(s.name)' may not store a reference field '\(field.name)'; use a class",
-                         line: field.line)
+                         span: field.span)
                 }
             case .enumDecl(let e):
                 for c in e.cases {
                     for field in c.fields where containsReference(field.type.name) {
                         fail("value type '\(e.name)' may not store a reference field '\(field.name)'; use a class",
-                             line: field.line)
+                             span: field.span)
                     }
                 }
             default:
@@ -102,10 +102,10 @@ public struct Typechecker {
             if !b.isMutable { lets.insert(b.name) }
         case .spawnLet(let name, _, _, _):
             lets.insert(name)   // a spawn binding is immutable
-        case .assign(let lhs, _, let line):
-            rejectLetTarget(lhs, lets: lets, line: line)
-        case .compoundAssign(let lhs, _, let line):
-            rejectLetTarget(lhs, lets: lets, line: line)
+        case .assign(let lhs, _, let span):
+            rejectLetTarget(lhs, lets: lets, span: span)
+        case .compoundAssign(let lhs, _, let span):
+            rejectLetTarget(lhs, lets: lets, span: span)
         case .ifStmt(let s):
             checkBlock(s.thenBody, lets: lets)
             if let elseBody = s.elseBody { checkBlock(elseBody, lets: lets) }
@@ -122,9 +122,9 @@ public struct Typechecker {
         }
     }
 
-    private func rejectLetTarget(_ lhs: Expr, lets: Set<String>, line: Int) {
+    private func rejectLetTarget(_ lhs: Expr, lets: Set<String>, span: Span) {
         if case .ident(let name, _) = lhs, lets.contains(name) {
-            fail("cannot assign to '\(name)' ('let' constant)", line: line)
+            fail("cannot assign to '\(name)' ('let' constant)", span: span)
         }
     }
 
@@ -146,8 +146,8 @@ public struct Typechecker {
 
     // MARK: - Error reporting
 
-    private func fail(_ msg: String, line: Int) -> Never {
-        fputs("error:\(line): \(msg)\n", stderr)
+    private func fail(_ msg: String, span: Span) -> Never {
+        fputs("error:\(span.begin.line):\(span.begin.col): \(msg)\n", stderr)
         exit(1)
     }
 }

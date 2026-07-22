@@ -6,12 +6,12 @@
 public final class TypeRef {
     public let name: String
     public let fn: FnType?
-    public let line: Int
+    public let span: Span
 
-    public init(name: String, fn: FnType? = nil, line: Int) {
+    public init(name: String, fn: FnType? = nil, span: Span) {
         self.name = name
         self.fn = fn
-        self.line = line
+        self.span = span
     }
 }
 
@@ -44,45 +44,45 @@ public enum TopDecl {
 public struct StructDecl {
     public let name: String
     public let fields: [VarField]
-    public let line: Int
+    public let span: Span
 }
 
 public struct VarField {
     public let name: String
     public let type: TypeRef
-    public let line: Int
+    public let span: Span
 }
 
 public struct EnumDecl {
     public let name: String
     public let cases: [EnumCaseDecl]
-    public let line: Int
+    public let span: Span
 }
 
 public struct EnumCaseDecl {
     public let name: String
     public let fields: [VarField]
-    public let line: Int
+    public let span: Span
 }
 
 public struct ClassDecl {
     public let name: String
     public let fields: [VarField]
-    public let line: Int
+    public let span: Span
 }
 
 public struct ActorDecl {
     public let name: String
     public let fields: [ActorField]
     public let handlers: [OnHandler]
-    public let line: Int
+    public let span: Span
 }
 
 public struct ActorField {
     public let name: String
     public let type: TypeRef
     public let initializer: Expr?
-    public let line: Int
+    public let span: Span
 }
 
 public struct OnHandler {
@@ -90,7 +90,7 @@ public struct OnHandler {
     public let params: [Param]
     public let returnType: TypeRef?
     public let body: Block
-    public let line: Int
+    public let span: Span
 }
 
 public struct FuncDecl {
@@ -98,14 +98,14 @@ public struct FuncDecl {
     public let params: [Param]
     public let returnType: TypeRef?
     public let body: Block
-    public let line: Int
+    public let span: Span
 }
 
 public struct Param {
     public let label: String
     public let name: String
     public let type: TypeRef
-    public let line: Int
+    public let span: Span
 }
 
 public typealias Block = [Stmt]
@@ -114,10 +114,10 @@ public typealias Block = [Stmt]
 
 public enum Stmt {
     case binding(BindingStmt)
-    case spawnLet(name: String, type: TypeRef?, value: Expr, line: Int)  // spawn let x = expr
-    case assign(lhs: Expr, rhs: Expr, line: Int)
-    case compoundAssign(lhs: Expr, rhs: Expr, line: Int)  // +=
-    case ret(Expr?, line: Int)
+    case spawnLet(name: String, type: TypeRef?, value: Expr, span: Span)  // spawn let x = expr
+    case assign(lhs: Expr, rhs: Expr, span: Span)
+    case compoundAssign(lhs: Expr, rhs: Expr, span: Span)  // +=
+    case ret(Expr?, span: Span)
     case ifStmt(IfStmt)
     case switchStmt(SwitchStmt)
     case expr(Expr)
@@ -128,7 +128,7 @@ public struct IfStmt {
     public let cond: Expr
     public let thenBody: Block
     public let elseBody: Block?
-    public let line: Int
+    public let span: Span
 }
 
 public struct BindingStmt {
@@ -136,37 +136,37 @@ public struct BindingStmt {
     public let name: String
     public let type: TypeRef?
     public let value: Expr
-    public let line: Int
+    public let span: Span
 }
 
 public struct SwitchStmt {
     public let subject: Expr
     public let cases: [CaseArm]
-    public let line: Int
+    public let span: Span
 }
 
 public struct CaseArm {
     public let pattern: Pattern
     public let body: Block
-    public let line: Int
+    public let span: Span
 }
 
 // .circle(let r, let s) → name="circle", bindings=["r", "s"] (positional)
 public enum Pattern {
-    case enumCase(name: String, bindings: [String], line: Int)
+    case enumCase(name: String, bindings: [String], span: Span)
 }
 
 // MARK: - Expressions
 
 public indirect enum Expr {
-    case intLit(Int, line: Int)
-    case boolLit(Bool, line: Int)
-    case stringLit(String, line: Int)
-    case ident(String, line: Int)
-    case member(Expr, String, line: Int)
-    case call(Expr, [Arg], line: Int)
-    case binary(BinOp, Expr, Expr, line: Int)
-    case closure(params: [Param], ret: TypeRef?, body: Block, line: Int)
+    case intLit(Int, span: Span)
+    case boolLit(Bool, span: Span)
+    case stringLit(String, span: Span)
+    case ident(String, span: Span)
+    case member(Expr, String, span: Span)
+    case call(Expr, [Arg], span: Span)
+    case binary(BinOp, Expr, Expr, span: Span)
+    case closure(params: [Param], ret: TypeRef?, body: Block, span: Span)
 }
 
 public struct Arg {

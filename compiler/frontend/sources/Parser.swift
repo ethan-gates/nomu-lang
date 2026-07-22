@@ -31,7 +31,7 @@ public struct Parser {
     }
 
     private mutating func parseStructDecl() -> StructDecl {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwStruct)
         let name = expectIdent()
         expect(.lBrace)
@@ -40,11 +40,11 @@ public struct Parser {
             fields.append(parseVarField())
         }
         expect(.rBrace)
-        return StructDecl(name: name, fields: fields, line: line)
+        return StructDecl(name: name, fields: fields, span: spanFrom(start))
     }
 
     private mutating func parseEnumDecl() -> EnumDecl {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwEnum)
         let name = expectIdent()
         expect(.lBrace)
@@ -53,29 +53,29 @@ public struct Parser {
             cases.append(parseEnumCaseDecl())
         }
         expect(.rBrace)
-        return EnumDecl(name: name, cases: cases, line: line)
+        return EnumDecl(name: name, cases: cases, span: spanFrom(start))
     }
 
     private mutating func parseEnumCaseDecl() -> EnumCaseDecl {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwCase)
         let name = expectIdent()
         var fields: [VarField] = []
         if eat(.lParen) {
             repeat {
-                let fline = currentLine
+                let fstart = currentSpan
                 let fname = expectIdent()
                 expect(.colon)
                 let ftype = parseTypeRef()
-                fields.append(VarField(name: fname, type: ftype, line: fline))
+                fields.append(VarField(name: fname, type: ftype, span: spanFrom(fstart)))
             } while eat(.comma)
             expect(.rParen)
         }
-        return EnumCaseDecl(name: name, fields: fields, line: line)
+        return EnumCaseDecl(name: name, fields: fields, span: spanFrom(start))
     }
 
     private mutating func parseClassDecl() -> ClassDecl {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwClass)
         let name = expectIdent()
         expect(.lBrace)
@@ -84,11 +84,11 @@ public struct Parser {
             fields.append(parseVarField())
         }
         expect(.rBrace)
-        return ClassDecl(name: name, fields: fields, line: line)
+        return ClassDecl(name: name, fields: fields, span: spanFrom(start))
     }
 
     private mutating func parseActorDecl() -> ActorDecl {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwActor)
         let name = expectIdent()
         expect(.lBrace)
@@ -104,11 +104,11 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return ActorDecl(name: name, fields: fields, handlers: handlers, line: line)
+        return ActorDecl(name: name, fields: fields, handlers: handlers, span: spanFrom(start))
     }
 
     private mutating func parseFuncDecl() -> FuncDecl {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwFunc)
         let name = expectIdent()
         let params = parseParamList()
@@ -117,22 +117,22 @@ public struct Parser {
             returnType = parseTypeRef()
         }
         let body = parseBlock()
-        return FuncDecl(name: name, params: params, returnType: returnType, body: body, line: line)
+        return FuncDecl(name: name, params: params, returnType: returnType, body: body, span: spanFrom(start))
     }
 
     // MARK: - Fields and params
 
     private mutating func parseVarField() -> VarField {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwVar)
         let name = expectIdent()
         expect(.colon)
         let type = parseTypeRef()
-        return VarField(name: name, type: type, line: line)
+        return VarField(name: name, type: type, span: spanFrom(start))
     }
 
     private mutating func parseActorField() -> ActorField {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwVar)
         let name = expectIdent()
         expect(.colon)
@@ -141,18 +141,18 @@ public struct Parser {
         if eat(.eq) {
             initializer = parseExpr()
         }
-        return ActorField(name: name, type: type, initializer: initializer, line: line)
+        return ActorField(name: name, type: type, initializer: initializer, span: spanFrom(start))
     }
 
     private mutating func parseOnHandler() -> OnHandler {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwOn)
         let name = expectIdent()
         let params = parseParamList()
         var returnType: TypeRef? = nil
         if eat(.arrow) { returnType = parseTypeRef() }
         let body = parseBlock()
-        return OnHandler(name: name, params: params, returnType: returnType, body: body, line: line)
+        return OnHandler(name: name, params: params, returnType: returnType, body: body, span: spanFrom(start))
     }
 
     private mutating func parseParamList() -> [Param] {
@@ -160,7 +160,7 @@ public struct Parser {
         var params: [Param] = []
         while !check(.rParen) && !check(.eof) {
             if !params.isEmpty { expect(.comma) }
-            let line = currentLine
+            let start = currentSpan
             let label = expectIdent()
             // Support `label name: Type` or `label: Type` (label == name)
             let name: String
@@ -171,14 +171,14 @@ public struct Parser {
             }
             expect(.colon)
             let type = parseTypeRef()
-            params.append(Param(label: label, name: name, type: type, line: line))
+            params.append(Param(label: label, name: name, type: type, span: spanFrom(start)))
         }
         expect(.rParen)
         return params
     }
 
     private mutating func parseTypeRef() -> TypeRef {
-        let line = currentLine
+        let start = currentSpan
         if check(.lParen) {
             // Function type: (T1, T2) -> R
             expect(.lParen)
@@ -190,10 +190,10 @@ public struct Parser {
             expect(.rParen)
             expect(.arrow)
             let ret = parseTypeRef()
-            return TypeRef(name: renderFnType(params, ret), fn: FnType(params: params, ret: ret), line: line)
+            return TypeRef(name: renderFnType(params, ret), fn: FnType(params: params, ret: ret), span: spanFrom(start))
         }
         let name = expectIdent()
-        return TypeRef(name: name, line: line)
+        return TypeRef(name: name, span: spanFrom(start))
     }
 
     private func renderFnType(_ params: [TypeRef], _ ret: TypeRef?) -> String {
@@ -234,7 +234,7 @@ public struct Parser {
 
     // spawn let x [: T] = expr  — runs expr concurrently; reading x joins.
     private mutating func parseSpawnLet() -> Stmt {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwSpawn)
         expect(.kwLet)
         let name = expectIdent()
@@ -242,11 +242,11 @@ public struct Parser {
         if eat(.colon) { type = parseTypeRef() }
         expect(.eq)
         let value = parseExpr()
-        return .spawnLet(name: name, type: type, value: value, line: line)
+        return .spawnLet(name: name, type: type, value: value, span: spanFrom(start))
     }
 
     private mutating func parseBinding(isMutable: Bool) -> Stmt {
-        let line = currentLine
+        let start = currentSpan
         advance()  // consume let/var
         let name = expectIdent()
         var type: TypeRef? = nil
@@ -255,19 +255,19 @@ public struct Parser {
         }
         expect(.eq)
         let value = parseExpr()
-        return .binding(BindingStmt(isMutable: isMutable, name: name, type: type, value: value, line: line))
+        return .binding(BindingStmt(isMutable: isMutable, name: name, type: type, value: value, span: spanFrom(start)))
     }
 
     private mutating func parseReturn() -> Stmt {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwReturn)
         // Return has an expression unless followed by a statement terminator
         let expr: Expr? = (check(.rBrace) || check(.kwCase) || check(.eof)) ? nil : parseExpr()
-        return .ret(expr, line: line)
+        return .ret(expr, span: spanFrom(start))
     }
 
     private mutating func parseIfStmt() -> Stmt {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwIf)
         let cond = parseExpr()
         let thenBody = parseBlock()
@@ -276,29 +276,29 @@ public struct Parser {
             // `else if …` chains as a single nested if; `else { … }` is a plain block.
             elseBody = check(.kwIf) ? [parseIfStmt()] : parseBlock()
         }
-        return .ifStmt(IfStmt(cond: cond, thenBody: thenBody, elseBody: elseBody, line: line))
+        return .ifStmt(IfStmt(cond: cond, thenBody: thenBody, elseBody: elseBody, span: spanFrom(start)))
     }
 
     private mutating func parseSwitchStmt() -> Stmt {
-        let line = currentLine
+        let start = currentSpan
         expect(.kwSwitch)
         let subject = parseExpr()
         expect(.lBrace)
         var cases: [CaseArm] = []
         while check(.kwCase) {
-            let cline = currentLine
+            let cstart = currentSpan
             expect(.kwCase)
             let pattern = parsePattern()
             expect(.colon)
             let body = parseCaseBody()
-            cases.append(CaseArm(pattern: pattern, body: body, line: cline))
+            cases.append(CaseArm(pattern: pattern, body: body, span: spanFrom(cstart)))
         }
         expect(.rBrace)
-        return .switchStmt(SwitchStmt(subject: subject, cases: cases, line: line))
+        return .switchStmt(SwitchStmt(subject: subject, cases: cases, span: spanFrom(start)))
     }
 
     private mutating func parsePattern() -> Pattern {
-        let line = currentLine
+        let start = currentSpan
         expect(.dot)
         let name = expectIdent()
         var bindings: [String] = []
@@ -309,17 +309,17 @@ public struct Parser {
             } while eat(.comma)
             expect(.rParen)
         }
-        return .enumCase(name: name, bindings: bindings, line: line)
+        return .enumCase(name: name, bindings: bindings, span: spanFrom(start))
     }
 
     private mutating func parseExprOrAssign() -> Stmt {
-        let line = currentLine
+        let start = currentSpan
         let lhs = parseExpr()
         if eat(.eq) {
-            return .assign(lhs: lhs, rhs: parseExpr(), line: line)
+            return .assign(lhs: lhs, rhs: parseExpr(), span: spanFrom(start))
         }
         if eat(.plusEq) {
-            return .compoundAssign(lhs: lhs, rhs: parseExpr(), line: line)
+            return .compoundAssign(lhs: lhs, rhs: parseExpr(), span: spanFrom(start))
         }
         return .expr(lhs)
     }
@@ -331,11 +331,11 @@ public struct Parser {
     }
 
     private mutating func parseComparison() -> Expr {
+        let start = currentSpan
         var lhs = parseAdditive()
         while let op = comparisonOp() {
-            let line = currentLine
             advance()
-            lhs = .binary(op, lhs, parseAdditive(), line: line)
+            lhs = .binary(op, lhs, parseAdditive(), span: spanFrom(start))
         }
         return lhs
     }
@@ -353,35 +353,35 @@ public struct Parser {
     }
 
     private mutating func parseAdditive() -> Expr {
+        let start = currentSpan
         var lhs = parseMultiplicative()
         while currentKind == .plus || currentKind == .minus {
             let op: BinOp = currentKind == .plus ? .add : .sub
-            let line = currentLine
             advance()
-            lhs = .binary(op, lhs, parseMultiplicative(), line: line)
+            lhs = .binary(op, lhs, parseMultiplicative(), span: spanFrom(start))
         }
         return lhs
     }
 
     private mutating func parseMultiplicative() -> Expr {
+        let start = currentSpan
         var lhs = parsePostfix()
         while currentKind == .star || currentKind == .slash {
             let op: BinOp = currentKind == .star ? .mul : .div
-            let line = currentLine
             advance()
-            lhs = .binary(op, lhs, parsePostfix(), line: line)
+            lhs = .binary(op, lhs, parsePostfix(), span: spanFrom(start))
         }
         return lhs
     }
 
     private mutating func parsePostfix() -> Expr {
+        let start = currentSpan
         var expr = parsePrimary()
         while true {
-            let line = currentLine
             if eat(.dot) {
-                expr = .member(expr, expectIdent(), line: line)
+                expr = .member(expr, expectIdent(), span: spanFrom(start))
             } else if check(.lParen) {
-                expr = .call(expr, parseArgList(), line: line)
+                expr = .call(expr, parseArgList(), span: spanFrom(start))
             } else {
                 break
             }
@@ -390,18 +390,18 @@ public struct Parser {
     }
 
     private mutating func parsePrimary() -> Expr {
-        let line = currentLine
+        let start = currentSpan
         switch currentKind {
         case .intLit(let v):
-            advance(); return .intLit(v, line: line)
+            advance(); return .intLit(v, span: spanFrom(start))
         case .boolLit(let v):
-            advance(); return .boolLit(v, line: line)
+            advance(); return .boolLit(v, span: spanFrom(start))
         case .stringLit(let v):
-            advance(); return .stringLit(v, line: line)
+            advance(); return .stringLit(v, span: spanFrom(start))
         case .lBrace:
             return parseClosure()
         case .ident(let name):
-            advance(); return .ident(name, line: line)
+            advance(); return .ident(name, span: spanFrom(start))
         default:
             error("expected expression, got \(currentKind)")
         }
@@ -409,7 +409,7 @@ public struct Parser {
 
     // { (x: Int) -> Int in <stmts> }   — return type optional (void if omitted)
     private mutating func parseClosure() -> Expr {
-        let line = currentLine
+        let start = currentSpan
         expect(.lBrace)
         let params = parseParamList()
         var ret: TypeRef? = nil
@@ -420,7 +420,7 @@ public struct Parser {
             body.append(parseStmt())
         }
         expect(.rBrace)
-        return .closure(params: params, ret: ret, body: body, line: line)
+        return .closure(params: params, ret: ret, body: body, span: spanFrom(start))
     }
 
     private mutating func parseArgList() -> [Arg] {
@@ -444,7 +444,10 @@ public struct Parser {
     // MARK: - Helpers
 
     private var currentKind: TokenKind { tokens[pos].kind }
-    private var currentLine: Int { tokens[pos].line }
+    private var currentSpan: Span { tokens[pos].span }
+    // Span of the most recently consumed token — a node reaches from its start to here.
+    private var prevSpan: Span { tokens[pos > 0 ? pos - 1 : 0].span }
+    private func spanFrom(_ start: Span) -> Span { Span.merge(start, prevSpan) }
 
     private func peek(_ offset: Int = 1) -> TokenKind {
         let i = pos + offset
@@ -482,7 +485,8 @@ public struct Parser {
     private func check(_ kind: TokenKind) -> Bool { currentKind == kind }
 
     private func error(_ msg: String) -> Never {
-        fputs("error:\(currentLine): \(msg)\n", stderr)
+        let s = currentSpan
+        fputs("error:\(s.begin.line):\(s.begin.col): \(msg)\n", stderr)
         exit(1)
     }
 }

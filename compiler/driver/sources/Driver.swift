@@ -8,7 +8,7 @@ public func compile(path: String, emit: EmitMode = .binary) {
         exit(1)
     }
 
-    var lexer = Lexer(source)
+    var lexer = Lexer(source, file: path)
     let tokens = lexer.tokenize()
 
     var parser = Parser(tokens)
