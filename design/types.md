@@ -45,7 +45,7 @@ Enums are value types (tagged unions, laid out inline); a recursive enum (`indir
 
 ## 3. Generics
 
-**Decided:** generics are real and first-class. **Open (highest-priority forward item):** the full design — dispatch strategy, power ceiling, and how the "shareable" bound rides on type parameters.
+**Decided:** generics are real and first-class. **Open (highest-priority forward item):** the full design — dispatch strategy, power ceiling, and how the "shareable" bound rides on type parameters. The M5 working design (decided variance, deferred items, dispatch/checking direction) lives in `generics.md`; this section keeps the model overview.
 
 - **Dispatch strategy — leaning monomorphization, not locked.** Monomorphization gives zero-cost generics, no witness table, and a small runtime, and it is the same specialization that would close the performance gap to Swift (`memory-model.md` §8). Dictionary-passing / existential lowering is not ruled out. **`any Interface` existentials** (dynamic dispatch) are opt-in regardless of this choice. — **Open (leaning monomorphization).**
 - **Power ceiling** — associated types, constraints; target ~Rust-trait level, **no HKT**. Associated types / generic interfaces, conditional conformance, and `some` (opaque type) mechanics are the highest-complexity area, tracked in `interfaces.md` §4.5. — **Open.**

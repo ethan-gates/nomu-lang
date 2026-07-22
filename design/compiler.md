@@ -8,7 +8,7 @@
 
 ## 1. Mid-level IR above the backend
 
-Build a typed **mid-level IR** between the typed AST and the code-generation backend (analog: Swift's SIL). Semantics-aware passes run on *this* IR, then lower to the backend. — **Decided.**
+Build a typed **mid-level IR** between the typed AST and the code-generation backend (analog: Swift's SIL). Semantics-aware passes run on *this* IR, then lower to the backend. — **Decided.** First built in **M4.9** at a **structured altitude** (keeps `if`/`switch`/loops as nested nodes and closures first-class — not CFG/SSA); a lower CFG/SSA level lands in M6 when escape analysis / GC barriers need it (`m4.9-spec.md`).
 
 Passes that run on the mid-level IR:
 - **monomorphization**
@@ -77,9 +77,45 @@ The build realizes a three-layer separation (positioning in `vision.md` → "Lib
 
 Two deployment shapes fall out: **language + runtime** (no batteries; minimal footprint) and **+ stdlib**. The consequence for the compiler: privileged capabilities (`park`/`unpark`, GC intrinsics) are reached only through **language/runtime intrinsics**, never handed to a stdlib function that user code couldn't itself call — that is what keeps the stdlib pure and elidable. — **Decided (2026-07-16).**
 
-## 6. Open questions
+## 6. C backend → LLVM transition checklist
 
+Things to revisit when the C codegen is replaced by the LLVM backend (M8). The C backend is scaffolding — these are the known gaps.
+
+- **Preamble → runtime library** — everything in `emitPreamble` (fiber scheduler, timer heap, poller, `rt_alloc`, `String`, `Closure`) becomes a compiled `.a` the LLVM backend links against; no more per-file inlining.
+- **`ucontext` → hand-written assembly** — `swapcontext`/`makecontext` replaced with ~20-line arm64 + x86-64 assembly (avoids the macOS signal-mask syscall on every fiber switch).
+- **`int64_t` for `Bool`** — `Bool` currently maps to `int64_t`; LLVM should use `i1`/`i8`.
+- **GCC statement expressions** — `({ ... })` is not valid C99 and has no LLVM IR equivalent; audit the emitter for any remaining uses before the switch.
+- **Safepoints** — the moving GC (MMTk/Immix, M6) needs precise safepoints at call sites and loop back-edges; insert via LLVM's statepoint intrinsics or a custom pass.
+- **Precise stack maps** — the GC must scan parked fiber stacks; the LLVM backend must emit stack maps (the C backend has none).
+- **Write barriers** — Immix requires write barriers on pointer stores; the C backend has none; the LLVM backend inserts them in codegen.
+- **`rt_alloc` header trick** — `rt_str_concat` reaches behind `ObjectHeader` via pointer arithmetic; replace with a proper allocation API the GC can understand.
+- **Bump-and-leak allocator** — `rt_alloc` uses `calloc`; goes away entirely when MMTk lands (M6); all allocations must go through the GC API.
+- **`ObjectHeader` refcount field** — vestigial (used only by the old actor release path, not a real GC header); remove when MMTk takes over.
+- **Debug info** — the C backend gets DWARF from `cc` for free; the LLVM backend must emit its own via `DIBuilder`.
+- **Actor mutex** — `pthread_mutex_t` embedded in actor structs; should become a fiber-aware mutex (park/unpark) to avoid blocking a carrier while a handler is held.
+
+---
+
+## 7. Open questions
+
+- **Runtime language + MMTk binding (M6).** — MMTk is Rust and exposes a C ABI; the irreducible Rust is a `VMBinding` binding crate, while callers can stay C. Open: keep the runtime (scheduler/allocator) in C with a thin Rust binding and codegen-inlined alloc fast path + barriers, vs. move the runtime to Rust for cleaner MMTk integration (rewrites the M4 scheduler). Codegen target stays C either way (emitting Rust rejected — `unsafe`-everywhere, throwaway before LLVM). Decided (2026-07-21) to **defer to M6** and proceed with M5 under two invariants (single alloc seam; explicit scannable object model — `m5-spec.md` §5a).
+- **GC precision vs. backend (M6 ↔ M8 coupling).** — A moving collector (Immix) needs **precise stack maps**, which the C backend can't emit (§6). So precise MMTk may couple to LLVM (M8) more than the M6-before-M8 order implies. Alternatives on the C path: a **shadow stack** (codegen-maintained root list, portable, per-call overhead) or **conservative stack scanning** (no maps, but pins objects — fights a moving GC). Parked fiber stacks make precise scanning harder still. May reorder M6/M8; open.
 - **MLIR vs. plain LLVM** for the release backend (§2).
 - **Cranelift** for fast debug builds — when it earns its place (§2).
 - **Incremental compilation + cached monomorphizations** — the shape that keeps LLVM iteration bearable.
 - **Runtime-structure layout** for the Tier-3 debugger plugin — co-designed with the scheduler/actor runtime (`concurrency.md`).
+
+---
+
+## 8. Pipeline boundary hardening (deferred)
+
+The M4.9 pipeline (typecheck → typed AST → IR → passes → codegen) is built as the **minimal amount to get something working**. The boundaries between phases warrant a deliberate later pass — careful consideration, not now. The checklist to revisit:
+
+- **Per-phase input→output testing** — golden tests at each boundary (source→tokens, tokens→AST, AST→typed AST, →IR, →C), so every phase is independently verifiable.
+- **Phase output formats designed for speed** — the serialized form of each phase's output (typed AST, IR) chosen to be fast to read/write, so caching and tooling aren't bottlenecked.
+- **Format stability** — versioned, backward-compatible boundary formats, so cached artifacts survive compiler changes (a prerequisite for incremental).
+- **Parallelism** — where phases, or per-decl/per-function work within a phase, can run concurrently.
+- **Incremental compilation** — recompute only what changed; ties to the query-based architecture (§3) and cached monomorphizations (§7).
+- **Per-phase debuggability** — inspect/dump each phase's output in isolation. `ASTDump` exists for the AST; M4.9 adds a **typed-AST dump** (`--dump-typed-ast`); an **IR dump** and dumps for later phases remain to extend.
+
+Hooks already in place that keep the door open: the IR carries debug info/spans from the start (§1), `ASTDump` gives a dump pattern to extend, and §3 commits to the query/incremental direction. The hardening itself is deferred until the minimal pipeline works end to end. — **Deferred (noted 2026-07-21).**

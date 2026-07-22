@@ -141,7 +141,7 @@ How the compiler decides which values must be "shareable" (the shareability rule
   2. **Stored / forwarded function values** — reduce to "shareable is part of the function *type*"; inferred + materialized as in #1.
   3. **Dynamic dispatch (interface requirements, `any`)** — no body, open conformer set → the requirement is a **contract decision**, expressed as the parameter's *type*. Irreducible.
 - **The dynamic-dispatch marker is narrow.** It appears only on **closure (and generic) parameters** an implementation might forward to a task — because a closure's shareability depends on its captures, unknown to the interface. **Concrete reference parameters need no marker** (shareability comes from their own type). Default is un-marked; a conformer that tries to forward a non-shareable closure gets a type error prompting the author to widen the requirement's type. This is Rust's `Send`-on-a-trait-method situation, and not the part of Rust that hurts. — **Decided.**
-- **Keyword/spelling is open.** Examples write `shareable`, but the exact keyword (`shareable` / `sendable` / other) is undecided — treat the spelling as a placeholder.
+- **Keyword/spelling — decided (2026-07-20): prefix modifier `shared`**, joining `any`/`some` (e.g. `shared T`, `shared any Shape`, `shared (Int) -> Bool`). Older text in this doc writing `shareable` predates this; the spelling is now `shared`. Rationale and full form in `generics.md` §3a; it is a capability prefix, not an `&`-composed marker interface (`interfaces.md` §4.4).
 
 ---
 
@@ -167,7 +167,7 @@ First-class and central (Swift-style). The GC pivot removes Swift's two closure 
 
 **Parked:**
 - **Autoclosures** — kept as an idea; no implementation for now.
-- **Shareable-closure type spelling** — working placeholder `shareable`; exact keyword open (§5).
+- **Shareable-closure type spelling** — decided (2026-07-20): prefix `shared` on the function type, e.g. `shared (Int) -> Bool` (§5, `generics.md` §3a).
 
 **Continuations (Decided 2026-07-16, §3):** the stackful model *decouples* continuations from closures — a continuation is a **fiber resume-token, not a CPS closure** — so it's a narrow runtime concept, not the foundation of control flow. The exposed form (closure-scoped one-shot checked continuation, a runtime intrinsic whose token is a linear type) is decided in §3; the callback closure that captures the token must be **shareable** (it fires on a foreign OS thread), which is resolved by the cross-thread resume contract in `runtime.md` §3.
 
@@ -230,7 +230,7 @@ Actors own isolated stateful concurrency (§1); this section pins how you declar
 - **Structured concurrency surface** — **structure Decided (§8):** a binding form for static fan-out + a scope/group for dynamic + background; no handle type; both error modes (fail-fast / collect). Residual: spellings, exact join points, result typing/ordering.
 - **Cancellation model** — **spine Decided (§7):** cancellation ≠ error, a cooperative runtime unwind; structured-tree propagation; unified shielded cleanup; safepoint-automatic cancellation points; actors outside the tree. Residual: shield semantics, actor shutdown, scheduler-side propagation (`runtime.md` §7), and spellings.
 - **Shared-mutable primitive** — **Deferred (design) 2026-07-16.** The "fourth shareable category" (a self-synchronizing type — atomics, a green `Mutex<T>`) is **reserved but unbuilt**. Adding it later is additive and low-risk: a green mutex rides the existing suspension core, atomics ride intrinsics the runtime already needs internally, and it can't precede generics anyway. The one thing kept open for it is a **trusted (`unsafe`) shareability escape hatch** — a way for a type to declare itself shareable despite mutable interior (Rust's `unsafe impl Sync`), likely exposed to library authors. Actors remain the default for shared mutable state until then. Design deferred; expected eventually.
-- **"shareable" details** — spelling ("shareable" vs "sendable"); shareable-closure type spelling (§6, placeholder `shareable`).
-- **Closures** — surface syntax locked Swift-shaped (§6, frontend-adjustable); autoclosures parked; shareable-closure spelling open.
+- **"shareable" details** — spelling decided (2026-07-20): prefix modifier `shared` (§5, `generics.md` §3a).
+- **Closures** — surface syntax locked Swift-shaped (§6, frontend-adjustable); autoclosures parked; shareable-closure spelling decided as prefix `shared` (§6).
 - **Continuations** — decided: shape (§3, §6), cross-thread resume at the in-runtime tier (`runtime.md` §3), and the cancellation contract (§3). Residual: the deferred **foreign-thread/FFI** variant (`runtime.md` §5) and **surface spelling**. The cancellation contract assumes the structured (scope-tree) cancellation model (§7).
 - **Scheduler internals** — work-stealing M:N, parallelism knob, stack growth, poller, task-locals, remote-wake primitive, platform/syscall strategy, FFI-readiness. All now homed in `runtime.md`.

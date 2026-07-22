@@ -1,0 +1,113 @@
+# M5 — Implementation Spec (Generics + Interfaces)
+
+**Status:** working draft — the ordered work plan for M5, derived from the design decisions in `generics.md`, `interfaces.md`, `types.md` §3–4, and `concurrency.md` §5. This is the document code planning reads from. Status of the *design* is settled (see those docs); this pins the *build sequence*.
+
+**Framing correction:** the roadmap calls M5 "generics + monomorphization," but the compiler has **no interfaces today** (concrete `struct`/`enum`/`class`/`actor`/`fun` only) and **no computed properties**. So M5 stacks three features — interfaces, computed properties, generics — plus error handling. Monomorphization is an *optional accelerator*, not the correctness baseline (see §5).
+
+---
+
+## 1. Scope
+
+**Ships in M5:**
+- Interfaces: declaration, requirements (method + property), overridable defaults, refinement (`B: A`), `&` composition.
+- Conformance via `extension T: I { … }` (and `struct T: I { … }` at-type sugar); witness tables.
+- Existentials `any I`; opaque types `some I`.
+- Computed properties + get/set accessors (language feature).
+- Generic parameters + interface bounds `<T: I>`; modular checking; type-argument inference; witness-passing lowering.
+- Exhaustiveness under generics.
+- The `shared` bound + conditional conformance; complete the M3 shareability checker (deeply-immutable classes).
+- `Result<T, E>` + explicit `match` error handling.
+
+**Deferred (recorded in `generics.md` §2):** operators-as-requirements, associated types (staged — witness layout reserves a type-witness slot), `?`-sugar / typed throws, the newtype/typealias mechanism, monomorphization if it slips (§5).
+
+---
+
+## 2. Compiler surface touched
+
+Current pipeline (Swift): `Lexer → Parser → AST → Typechecker → Codegen (emit C) → cc`. M5 touches every stage.
+
+- **Lexer** — keywords `interface`, `extension`, `some`, `any`, `shared`, `get`, `set`; disambiguate `<`/`>` as generic brackets vs. comparison; `&` type composition.
+- **AST** — `InterfaceDecl`, `ExtensionDecl`, generic parameter lists on decls, `TypeRef` carrying generic arguments + modifiers (`any`/`some`/`shared`), property declarations with accessor bodies, conformance clauses.
+- **Typechecker** — the bulk: conformance checking, witness resolution, modular generic checking against bounds, constraint solving, type-arg inference, exhaustiveness under generics, conditional conformance, `shared` propagation.
+- **Codegen** — witness-table emission in C, witness-passing generic lowering, `any` boxing, `some`/concrete devirtualization to direct calls, accessor lowering (stored → field load), `Result` layout.
+
+---
+
+## 3. Phased plan
+
+Phases are ordered by dependency. Each has an exit criterion expressed as programs that compile and run.
+
+### Phase A — Interfaces + computed properties
+The prerequisite feature; everything else builds on witness tables.
+- Parse/typecheck `interface I { … }`: method requirements, property requirements (`var x: T { get }` / `{ get set }`), overridable defaults.
+- Computed properties + get/set accessors as a language feature (structs gain accessors; stored fields auto-synthesize trivial ones). Mutating setters on value types.
+- Conformance: `extension T: I { … }` and `struct T: I { … }` sugar. Witness-table generation (accessor-shaped property slots — never offsets — plus method slots; reserve an unused type-witness slot for future associated types).
+- `any I` existentials (boxed, witness-dispatched); refinement `B: A`; `&` composition.
+- Dispatch: call-site property — direct/devirtualized on concrete + `some`; witness lookup through `any`.
+- **Exit:** an `interface Drawable` with a default method and a `{ get }` property; two concrete conformers; a `[any Drawable]` iterated with dynamic dispatch; a stored-backed `get` verified to lower to a field load on a concrete call.
+
+### Phase B — Generic parameters + constraints
+- Parse/typecheck `<T: I>`, `<T: I & J>` on `fun` and on types (`struct Box<T>`).
+- **Modular checking** against declared bounds (the locked invariant — bodies checked once against what the bound promises).
+- Type-argument inference (bidirectional: from arguments and return position; explicit `f<Int>(…)` fallback).
+- Lowering: **witness-passing** (dictionary) — the correctness baseline; a generic body receives witness tables for its bounds. Reuses the exact `any` conformance representation.
+- Exhaustiveness under generics — checked on the generic enum definition; instantiation adds no cases.
+- **Exit:** `Option<T>`, `Box<T>`, a generic `fun map<T, U>(…)` over closures, and `fun describe<T: Drawable>(x: T)` all compile and run; a bound violation is a clean local error.
+
+### Phase C — `shared` bound + conditional conformance
+- The `shared` prefix modifier: declared bound `<shared T>`, shareable closure/function types `shared (A) -> B`, `shared any I`.
+- Conditional conformance: `Box<T>` is shareable iff `T` is — the same mechanism the `shared` bound needs; auto-derived structurally for the marker (`concurrency.md` §5).
+- Complete the M3 shareability checker: recognize deeply-immutable classes (all `let`, recursively) as shareable — the case M3 conservatively rejects.
+- **Exit:** sending a `Box<Int>` across a task boundary type-checks; sending a `Box<SomeClass>` (non-shareable) is rejected with a local error; a deeply-immutable class is accepted where M3 rejected it.
+
+### Phase D — Monomorphization (accelerator, descopable)
+- A specialization pass over Phase B's witness path: stamp concrete copies, devirtualize requirement calls, inline trivial accessors to loads.
+- Polymorphic-recursion termination: detect infinite specialization (`f<Box<T>>()`) and error.
+- Architectural note: this is where a **typed mid-level IR** (`compiler.md` §1) earns its place. If the IR isn't built, monomorphization can run as an AST→AST pass, but the IR is the intended home. Either way, **nothing depends on this phase for correctness** (goal 3) — it's the performance lever, and it may slip past M5's core without blocking the milestone.
+- **Exit:** a specialized `Box<Int>` shows no witness indirection in the emitted C on the hot path; benchmark parity target noted, not required.
+
+### Phase E — Error handling
+- `Result<T, E>` as a generic enum in the stdlib (depends on Phase B generic enums).
+- Explicit `match` handling; no `?` operator, no typed throws (deferred).
+- **Exit:** a failable function returns `Result`, and a caller handles both cases via `match`.
+
+---
+
+## 4. Dependencies
+
+```
+A (interfaces + computed properties)
+└─ B (generics: params, constraints, witness-passing)
+   ├─ C (shared bound + conditional conformance)
+   ├─ D (monomorphization)          [accelerator, descopable]
+   └─ E (Result / error handling)
+```
+
+A gates everything (witness tables). B gates C/D/E. C, D, E are independent of each other.
+
+---
+
+## 5. Cross-cutting decisions (from the design docs)
+
+- **Checking model — modular, locked.** Generic bodies checked once against declared bounds. Keeps monomorphization, dictionary-passing, and GC value-witness stenciling all reachable (`generics.md` §1).
+- **Lowering — witness-first.** Dictionary-passing is the correctness baseline (Phase B); monomorphization (Phase D) is a pure accelerator layered on top. Static dispatch that the language *guarantees* comes from concrete types and `some`, not from specialization (`generics.md` §1, goal 3).
+- **Witness representation — one shared form** for `any` and generics; accessor-shaped property slots (never offsets); a reserved type-witness slot for future associated types (`interfaces.md` §1–§2).
+- **Coherence — global (Rust orphan).** Enforcement waits on modules; under M5's single compilation unit uniqueness is trivial (`generics.md` §1).
+- **C-backend implications** — witness tables become emitted C structs of function pointers; `any` is a boxed `{ witness*, payload }`; the transition checklist for the LLVM move is unchanged (`compiler.md` §6).
+
+---
+
+## 5a. Runtime / GC posture (Decided 2026-07-21)
+
+M5 is a front-end + codegen milestone; the M4 scheduler (`runtime.md` §8 — fibers, carriers, poller, timer, actors) is **not touched**. The runtime-language question (keep the runtime in C vs. move it to Rust for MMTk) and the MMTk-binding approach are **deferred to M6**. Rationale: codegen target and runtime language are independent axes; MMTk exposes a C ABI so C callers are fine; the alloc fast path and write barriers are codegen-inlined regardless of runtime language; and the scheduler barely touches the GC (only safepoints + stack scanning). The larger lever is **codegen precision** — a moving collector needs precise stack maps, which the C backend can't emit, so real MMTk may couple to LLVM (M8) more than the M6-before-M8 order implies (shadow stack / conservative roots on C are the alternatives). This sequencing is an open roadmap item, not an M5 blocker.
+
+**Two invariants M5 must hold** so every M6 option stays open (both are good hygiene regardless):
+1. **Single allocation seam.** Every heap allocation goes through one codegen-controlled call (`rt_alloc` today) so the allocator can be swapped for MMTk's later with a localized change.
+2. **Explicit, scannable object model.** New M5 object shapes — `any` boxes, witness tables, generic instances — have a clear header and discoverable pointer layout, so a C or Rust binding (and later LLVM-emitted barriers/maps) can scan them precisely. Drop the `rt_alloc` header pointer-arithmetic hack (`compiler.md` §6); do not bake in representation tricks that assume conservative-only scanning.
+
+## 6. Risks / watch items
+
+- **Monomorphization vs. the mid-level IR.** Phase D wants the typed IR that doesn't exist yet; keep the pass descopable so the IR's absence can't block M5's core.
+- **Angle-bracket ambiguity.** `<`/`>` as generic brackets vs. comparison needs careful parser handling (the classic C++/Rust turbofish territory) — decide the disambiguation rule in Phase B.
+- **Mutating setters on value types.** New semantics in Phase A; keep read-only `{ get }` requirements the common path.
+- **Type-argument inference scope.** Bidirectional inference can sprawl; keep M5's inference to arguments + return position, explicit args otherwise.
