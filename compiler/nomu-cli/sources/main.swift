@@ -11,13 +11,15 @@ for arg in CommandLine.arguments.dropFirst() {
             usage: nomuc [options] <file.nomu>
 
             options:
-              -c, --emit-c    emit C source to <file>.c beside the source (no binary)
-              --emit-ast      dump the parsed AST to stdout (pre-typecheck)
-              -h, --help      show this help
+              -c, --emit-c       emit C source to <file>.c beside the source (no binary)
+              --emit-ast         dump the parsed AST to stdout (pre-typecheck)
+              --dump-typed-ast   dump the typed IR to stdout (after the semantic pass)
+              -h, --help         show this help
             """)
         exit(0)
-    case "--emit-ast":      emit = .ast
-    case "--emit-c", "-c": emit = .c
+    case "--emit-ast":         emit = .ast
+    case "--dump-typed-ast":   emit = .typedAST
+    case "--emit-c", "-c":    emit = .c
     default:
         guard !arg.hasPrefix("-") else {
             fputs("error: unknown flag '\(arg)'\n", stderr)

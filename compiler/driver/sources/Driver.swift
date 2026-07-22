@@ -20,6 +20,15 @@ public func compile(path: String, emit: EmitMode = .binary) {
         return
     }
 
+    // --dump-typed-ast: run the semantic pass and dump the typed IR (T1 debug view)
+    if emit == .typedAST {
+        var sema = Sema(program)
+        let result = sema.check()
+        if !result.diagnostics.isEmpty { fputs(result.diagnostics.render() + "\n", stderr) }
+        print(dumpTypedIR(result.module))
+        return
+    }
+
     var checker = Typechecker(program)
     checker.check()
 

@@ -4,6 +4,9 @@ swift_binary(
     name = "install",
     srcs = ["main.swift"],
     data = ["//compiler/nomu-cli:nomuc"],
+    # bazel injects the built binary's runfiles path — no hardcoded bazel-bin path,
+    # so this survives the target moving (which is what broke the old install).
+    args = ["$(rootpath //compiler/nomu-cli:nomuc)"],
     visibility = ["//visibility:public"],
 )
 
