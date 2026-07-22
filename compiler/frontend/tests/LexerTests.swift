@@ -71,4 +71,16 @@ final class LexerTests: XCTestCase {
             .lParen, .ident("by"), .colon, .ident("p"), .rParen, .eof,
         ])
     }
+
+    func testTokenSpans() {
+        // "ab" on line 1 (cols 1..3), "cd" on line 2 after two spaces (cols 3..5).
+        // Spans are half-open [begin, end): end col is one past the last char.
+        var lexer = Lexer("ab\n  cd", file: "t.nomu")
+        let toks = lexer.tokenize()
+        XCTAssertEqual(toks[0].span,
+                       Span(file: "t.nomu", begin: Pos(line: 1, col: 1), end: Pos(line: 1, col: 3)))
+        XCTAssertEqual(toks[1].span,
+                       Span(file: "t.nomu", begin: Pos(line: 2, col: 3), end: Pos(line: 2, col: 5)))
+        XCTAssertEqual(toks[2].kind, .eof)
+    }
 }

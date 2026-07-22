@@ -37,20 +37,32 @@ public enum TokenKind: Equatable {
 
 public struct Token {
     public let kind: TokenKind
-    public let line: Int
+    public let span: Span
+    // Convenience for call sites that only need the start line.
+    public var line: Int { span.begin.line }
+
+    public init(kind: TokenKind, span: Span) {
+        self.kind = kind
+        self.span = span
+    }
 }
 
 extension Token: CustomStringConvertible {
-    public var description: String { "\(line): \(kind)" }
+    public var description: String { "\(span.begin.line): \(kind)" }
 }
 
 public struct Lexer {
     private let src: [Character]
+    private let file: String
+    private let lineStarts: [Int]   // char offset of the start of each line
     private var pos: Int = 0
-    private var line: Int = 1
 
-    public init(_ source: String) {
+    public init(_ source: String, file: String = "<input>") {
         src = Array(source)
+        self.file = file
+        var starts = [0]
+        for (i, c) in src.enumerated() where c == "\n" { starts.append(i + 1) }
+        lineStarts = starts
     }
 
     public mutating func tokenize() -> [Token] {
@@ -65,55 +77,58 @@ public struct Lexer {
 
     private mutating func next() -> Token {
         skipWhitespaceAndComments()
-        guard pos < src.count else { return Token(kind: .eof, line: line) }
+        let start = pos
+        let kind = scanKind()
+        return Token(kind: kind, span: Span(file: file, begin: posAt(start), end: posAt(pos)))
+    }
 
-        let startLine = line
+    // Scans one token's kind, advancing `pos` past it.
+    private mutating func scanKind() -> TokenKind {
+        guard pos < src.count else { return .eof }
+
         let c = src[pos]
-
-        if c.isNumber { return lexInt(startLine) }
-        if c.isLetter || c == "_" { return lexIdent(startLine) }
-        if c == "\"" { return lexString(startLine) }
+        if c.isNumber { return lexInt() }
+        if c.isLetter || c == "_" { return lexIdent() }
+        if c == "\"" { return lexString() }
 
         pos += 1
         switch c {
-        case "{": return Token(kind: .lBrace, line: startLine)
-        case "}": return Token(kind: .rBrace, line: startLine)
-        case "(": return Token(kind: .lParen, line: startLine)
-        case ")": return Token(kind: .rParen, line: startLine)
-        case ":": return Token(kind: .colon, line: startLine)
-        case ".": return Token(kind: .dot, line: startLine)
-        case ",": return Token(kind: .comma, line: startLine)
+        case "{": return .lBrace
+        case "}": return .rBrace
+        case "(": return .lParen
+        case ")": return .rParen
+        case ":": return .colon
+        case ".": return .dot
+        case ",": return .comma
         case "+":
-            if peek() == "=" { pos += 1; return Token(kind: .plusEq, line: startLine) }
-            return Token(kind: .plus, line: startLine)
+            if peek() == "=" { pos += 1; return .plusEq }
+            return .plus
         case "-":
-            if peek() == ">" { pos += 1; return Token(kind: .arrow, line: startLine) }
-            return Token(kind: .minus, line: startLine)
-        case "*": return Token(kind: .star, line: startLine)
-        case "/": return Token(kind: .slash, line: startLine)
+            if peek() == ">" { pos += 1; return .arrow }
+            return .minus
+        case "*": return .star
+        case "/": return .slash
         case "=":
-            if peek() == "=" { pos += 1; return Token(kind: .eqEq, line: startLine) }
-            return Token(kind: .eq, line: startLine)
+            if peek() == "=" { pos += 1; return .eqEq }
+            return .eq
         case "!":
-            guard peek() == "=" else { error("unexpected character '!'", line: startLine) }
-            pos += 1; return Token(kind: .bangEq, line: startLine)
+            guard peek() == "=" else { error("unexpected character '!'", at: pos - 1) }
+            pos += 1; return .bangEq
         case "<":
-            if peek() == "=" { pos += 1; return Token(kind: .ltEq, line: startLine) }
-            return Token(kind: .lt, line: startLine)
+            if peek() == "=" { pos += 1; return .ltEq }
+            return .lt
         case ">":
-            if peek() == "=" { pos += 1; return Token(kind: .gtEq, line: startLine) }
-            return Token(kind: .gt, line: startLine)
+            if peek() == "=" { pos += 1; return .gtEq }
+            return .gt
         default:
-            error("unexpected character '\(c)'", line: startLine)
+            error("unexpected character '\(c)'", at: pos - 1)
         }
     }
 
     private mutating func skipWhitespaceAndComments() {
         while pos < src.count {
             let c = src[pos]
-            if c == "\n" {
-                line += 1; pos += 1
-            } else if c.isWhitespace {
+            if c.isWhitespace {
                 pos += 1
             } else if c == "/" && pos + 1 < src.count && src[pos + 1] == "/" {
                 while pos < src.count && src[pos] != "\n" { pos += 1 }
@@ -123,45 +138,45 @@ public struct Lexer {
         }
     }
 
-    private mutating func lexInt(_ startLine: Int) -> Token {
+    private mutating func lexInt() -> TokenKind {
         var value = 0
         while pos < src.count && src[pos].isNumber {
             value = value * 10 + src[pos].wholeNumberValue!
             pos += 1
         }
-        return Token(kind: .intLit(value), line: startLine)
+        return .intLit(value)
     }
 
-    private mutating func lexIdent(_ startLine: Int) -> Token {
+    private mutating func lexIdent() -> TokenKind {
         var text = ""
         while pos < src.count && (src[pos].isLetter || src[pos].isNumber || src[pos] == "_") {
             text.append(src[pos])
             pos += 1
         }
-        let kind: TokenKind = switch text {
-        case "struct":  .kwStruct
-        case "enum":    .kwEnum
-        case "class":   .kwClass
-        case "actor":   .kwActor
-        case "fun":     .kwFunc
-        case "let":     .kwLet
-        case "var":     .kwVar
-        case "on":      .kwOn
-        case "spawn":   .kwSpawn
-        case "switch":  .kwSwitch
-        case "case":    .kwCase
-        case "return":  .kwReturn
-        case "if":      .kwIf
-        case "else":    .kwElse
-        case "in":      .kwIn
-        case "true":    .boolLit(true)
-        case "false":   .boolLit(false)
-        default:        .ident(text)
+        switch text {
+        case "struct":  return .kwStruct
+        case "enum":    return .kwEnum
+        case "class":   return .kwClass
+        case "actor":   return .kwActor
+        case "fun":     return .kwFunc
+        case "let":     return .kwLet
+        case "var":     return .kwVar
+        case "on":      return .kwOn
+        case "spawn":   return .kwSpawn
+        case "switch":  return .kwSwitch
+        case "case":    return .kwCase
+        case "return":  return .kwReturn
+        case "if":      return .kwIf
+        case "else":    return .kwElse
+        case "in":      return .kwIn
+        case "true":    return .boolLit(true)
+        case "false":   return .boolLit(false)
+        default:        return .ident(text)
         }
-        return Token(kind: kind, line: startLine)
     }
 
-    private mutating func lexString(_ startLine: Int) -> Token {
+    private mutating func lexString() -> TokenKind {
+        let startOffset = pos
         pos += 1  // consume opening "
         var value = ""
         while pos < src.count && src[pos] != "\"" {
@@ -179,9 +194,9 @@ public struct Lexer {
             }
             pos += 1
         }
-        guard pos < src.count else { error("unterminated string literal", line: startLine) }
+        guard pos < src.count else { error("unterminated string literal", at: startOffset) }
         pos += 1  // consume closing "
-        return Token(kind: .stringLit(value), line: startLine)
+        return .stringLit(value)
     }
 
     private func peek() -> Character? {
@@ -189,8 +204,20 @@ public struct Lexer {
         return src[pos]
     }
 
-    private func error(_ msg: String, line: Int) -> Never {
-        fputs("error:\(line): \(msg)\n", stderr)
+    // Converts a character offset into a 1-based line/column via binary search
+    // over the line-start table.
+    private func posAt(_ offset: Int) -> Pos {
+        var lo = 0, hi = lineStarts.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if lineStarts[mid] <= offset { lo = mid } else { hi = mid - 1 }
+        }
+        return Pos(line: lo + 1, col: offset - lineStarts[lo] + 1)
+    }
+
+    private func error(_ msg: String, at offset: Int) -> Never {
+        let p = posAt(offset)
+        fputs("error:\(p.line):\(p.col): \(msg)\n", stderr)
         exit(1)
     }
 }
