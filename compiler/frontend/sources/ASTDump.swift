@@ -15,15 +15,18 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
     case .structDecl(let s):
         lines.append("\(ind)StructDecl '\(s.name)'")
         for f in s.fields { lines.append("\(ind)  Field \(f.name): \(f.type.name)") }
+        for m in s.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .enumDecl(let e):
         lines.append("\(ind)EnumDecl '\(e.name)'")
         for c in e.cases {
             let fields = c.fields.map { "\($0.name): \($0.type.name)" }.joined(separator: ", ")
             lines.append("\(ind)  Case '\(c.name)'(\(fields))")
         }
+        for m in e.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .classDecl(let c):
         lines.append("\(ind)ClassDecl '\(c.name)'")
         for f in c.fields { lines.append("\(ind)  Field \(f.name): \(f.type.name)") }
+        for m in c.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .actorDecl(let a):
         lines.append("\(ind)ActorDecl '\(a.name)'")
         for f in a.fields {
@@ -42,6 +45,14 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
         lines.append("\(ind)FuncDecl '\(f.name)'(\(params))\(ret)")
         appendBlock(f.body, ind: ind + "  ", into: &lines)
     }
+}
+
+// A `fun` member (instance method) — same shape as a top-level FuncDecl (T3).
+private func appendMethod(_ m: FuncDecl, ind: String, into lines: inout [String]) {
+    let params = m.params.map { "\($0.label): \($0.type.name)" }.joined(separator: ", ")
+    let ret = m.returnType.map { " -> \($0.name)" } ?? ""
+    lines.append("\(ind)Method '\(m.name)'(\(params))\(ret)")
+    appendBlock(m.body, ind: ind + "  ", into: &lines)
 }
 
 // MARK: - Statements

@@ -1,5 +1,5 @@
 // The semantic pass: resolves names, types every expression, and lowers the AST
-// to the typed IR, collecting diagnostics (m4.9-spec.md §5, T1). Concrete types
+// to the typed IR, collecting diagnostics (design: compiler.md §1). Concrete types
 // only — interfaces/generics are M5; type methods are T3.
 
 public struct SemaResult {
@@ -79,17 +79,32 @@ public struct Sema {
         return nil
     }
 
+    // The declared instance method `name` on a struct/enum/class, if any (T3).
+    private func methodDecl(_ typeName: String, _ kind: NamedKind, _ name: String) -> FuncDecl? {
+        switch kind {
+        case .struct_: return structs[typeName]?.methods.first { $0.name == name }
+        case .enum_:   return enums[typeName]?.methods.first { $0.name == name }
+        case .class_:  return classes[typeName]?.methods.first { $0.name == name }
+        case .actor_:  return nil
+        }
+    }
+
     // MARK: - Declarations
 
     private mutating func lowerDecl(_ decl: TopDecl) -> IRDecl {
         switch decl {
         case .structDecl(let s):
-            return .structDecl(IRStruct(name: s.name, fields: s.fields.map(lowerField), span: s.span))
+            let fields = s.fields.map(lowerField)
+            let methods = lowerMethods(s.methods, selfType: .named(s.name, .struct_), fields: fields)
+            return .structDecl(IRStruct(name: s.name, fields: fields, methods: methods, span: s.span))
         case .enumDecl(let e):
             let cases = e.cases.map { IREnumCase(name: $0.name, fields: $0.fields.map(lowerField), span: $0.span) }
-            return .enumDecl(IREnum(name: e.name, cases: cases, span: e.span))
+            let methods = lowerMethods(e.methods, selfType: .named(e.name, .enum_), fields: [])
+            return .enumDecl(IREnum(name: e.name, cases: cases, methods: methods, span: e.span))
         case .classDecl(let c):
-            return .classDecl(IRClass(name: c.name, fields: c.fields.map(lowerField), span: c.span))
+            let fields = c.fields.map(lowerField)
+            let methods = lowerMethods(c.methods, selfType: .named(c.name, .class_), fields: fields)
+            return .classDecl(IRClass(name: c.name, fields: fields, methods: methods, span: c.span))
         case .actorDecl(let a):
             return .actorDecl(lowerActor(a))
         case .funcDecl(let f):
@@ -99,6 +114,23 @@ public struct Sema {
 
     private func lowerField(_ f: VarField) -> IRField {
         IRField(name: f.name, type: resolve(f.type), span: f.span)
+    }
+
+    // Lower each `fun` member with `self` (immutable) and the receiver's fields
+    // declared by bare name, mirroring how actor handlers see their fields (T3).
+    private mutating func lowerMethods(_ methods: [FuncDecl], selfType: Type, fields: [IRField]) -> [IRFunc] {
+        var out: [IRFunc] = []
+        for m in methods {
+            let params = m.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+            pushScope()
+            declare("self", selfType)
+            for f in fields { declare(f.name, f.type) }
+            for p in params { declare(p.name, p.type) }
+            let body = lowerBlock(m.body)
+            popScope()
+            out.append(IRFunc(name: m.name, params: params, returnType: resolve(m.returnType), body: body, span: m.span))
+        }
+        return out
     }
 
     private mutating func lowerFunc(_ f: FuncDecl) -> IRFunc {
@@ -238,17 +270,28 @@ public struct Sema {
     }
 
     private mutating func checkCall(callee: Expr, args: [Arg], span: Span) -> IRExpr {
-        // Actor handler call: base.handler(args)
+        // Member call: base.member(args) — an actor send or an instance method.
         if case .member(let base, let name, _) = callee {
             let recv = checkExpr(base)
-            if case .named(let typeName, .actor_) = recv.type,
-               let handler = actors[typeName]?.handlers.first(where: { $0.name == name }) {
-                let irArgs = args.map { checkExpr($0.value) }
-                checkArgTypes(irArgs, against: handler.params.map { resolve($0.type) }, at: span)
-                return IRExpr(type: resolve(handler.returnType), span: span,
-                              kind: .methodCall(receiver: recv, method: name, args: irArgs))
+            if case .named(let typeName, let kind) = recv.type {
+                // Actor send: base.handler(args).
+                if kind == .actor_, let handler = actors[typeName]?.handlers.first(where: { $0.name == name }) {
+                    let irArgs = args.map { checkExpr($0.value) }
+                    checkArgTypes(irArgs, against: handler.params.map { resolve($0.type) }, at: span)
+                    return IRExpr(type: resolve(handler.returnType), span: span,
+                                  kind: .methodCall(receiver: recv, method: name, args: irArgs))
+                }
+                // Instance method on a struct/enum/class value.
+                if let method = methodDecl(typeName, kind, name) {
+                    let irArgs = args.map { checkExpr($0.value) }
+                    checkArgTypes(irArgs, against: method.params.map { resolve($0.type) }, at: span)
+                    return IRExpr(type: resolve(method.returnType), span: span,
+                                  kind: .methodCall(receiver: recv, method: name, args: irArgs))
+                }
             }
-            diags.error("value of type '\(recv.type)' has no method '\(name)'", at: span)
+            if recv.type != .error {
+                diags.error("value of type '\(recv.type)' has no method '\(name)'", at: span)
+            }
             return IRExpr(type: .error, span: span, kind: .methodCall(receiver: recv, method: name,
                                                                        args: args.map { checkExpr($0.value) }))
         }

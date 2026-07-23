@@ -19,7 +19,10 @@ final class TypecheckerTests: XCTestCase {
 
     func testPODStructAccepted() {
         check("""
-        struct Point { var x: Int var y: Int }
+        struct Point {
+            var x: Int
+            var y: Int
+        }
         """)
     }
 
@@ -31,8 +34,12 @@ final class TypecheckerTests: XCTestCase {
 
     func testClassAccepted() {
         check("""
-        struct Point { var x: Int }
-        class Buffer { var data: Point }
+        struct Point {
+            var x: Int
+        }
+        class Buffer {
+            var data: Point
+        }
         """)
     }
 

@@ -3,7 +3,7 @@
 // A `Span` covers a half-open character range [begin, end) in a single source
 // file, with 1-based line and column. Threaded from the lexer through tokens
 // and the AST into the typed IR, so diagnostics and (later) debug info can point
-// at precise ranges (design: `m4.9-spec.md` §6).
+// at precise ranges (design: `compiler.md` §1).
 
 public struct Pos: Equatable {
     public let line: Int

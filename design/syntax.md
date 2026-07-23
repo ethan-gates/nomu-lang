@@ -15,7 +15,35 @@ The author likes Swift's simple, elegant surface and dislikes Nim's accreted odd
 
 ---
 
-## 2. What is settled elsewhere
+## 2. Layout rules
+
+Nomu's grammar is mostly brace/keyword-delimited, not newline-significant — statements need no separators. There are two exceptions, both **inside a type body** (`struct`/`enum`/`class`/`actor`), where a declaration keyword must be the **first token on its line**:
+
+- **`fun` members** — a method declaration begins its own line. (T3, 2026-07-23)
+- **`var` fields** — a field declaration begins its own line: two fields may not share a line, and a field may not share the opening-brace line. (2026-07-23)
+
+So this is invalid:
+
+```
+struct Point { var x: Int var y: Int }   // ✗ 'var' must begin a new line
+```
+
+and this is the canonical form:
+
+```
+struct Point {
+    var x: Int
+    var y: Int
+}
+```
+
+Enforced in the parser via token line numbers (the lexer discards newlines). Enum `case` declarations and local `let`/`var` bindings inside function bodies are **not** subject to this rule.
+
+**Status: Open / under discussion.** These two rules were introduced alongside T3. The broader question — whether Nomu adopts a general "one declaration (or statement) per line" layout discipline, and how far it reaches (cases, local bindings, statements) — is unsettled and wants a dedicated decision. Until then, keep line-start rules minimal and agreed, and don't extend them without agreement.
+
+---
+
+## 3. What is settled elsewhere
 
 Surface decisions that belong to a subsystem live with that subsystem, so the syntax here stays a set of principles rather than a scattered grammar:
 
@@ -27,7 +55,7 @@ Surface decisions that belong to a subsystem live with that subsystem, so the sy
 
 ---
 
-## 3. Open questions
+## 4. Open questions
 
 - **Keyword spellings** — `shareable` (`concurrency.md`), `extension` (`interfaces.md`), the `interface` vs `protocol` choice (largely settled on `interface`), and the actor message-handler keyword. Tracked in their home docs; kept adjustable while the models settle.
-- **A full grammar** — deferred until the surface has proven out on real programs (roadmap M1, `roadmap.md`).
+- **TODO — hold a dedicated syntax discussion and write the grammar.** One deliberate pass over the surface: settle how far the line-start discipline extends (§2 — enum `case`, local bindings, statements), resolve the open keyword spellings above, and produce a full formal grammar. Several surface choices have accreted ad hoc (the `fun`/`var` line-start rules); this is the checkpoint to make them coherent rather than incremental. Deferred until the surface has proven out on real programs (roadmap M1, `roadmap.md`).

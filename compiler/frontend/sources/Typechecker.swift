@@ -85,9 +85,23 @@ public struct Typechecker {
                 checkBlock(f.body, lets: [])
             case .actorDecl(let a):
                 for h in a.handlers { checkBlock(h.body, lets: []) }
-            default:
-                break
+            case .structDecl(let s):
+                checkMethods(s.methods, fieldNames: s.fields.map(\.name))
+            case .classDecl(let c):
+                checkMethods(c.methods, fieldNames: c.fields.map(\.name))
+            case .enumDecl(let e):
+                checkMethods(e.methods, fieldNames: [])
             }
+        }
+    }
+
+    // Method bodies are read-only in M4.9: `self` and its fields are immutable, so
+    // seed them as `let`s — assigning to a bare field name or to `self` is rejected.
+    private func checkMethods(_ methods: [FuncDecl], fieldNames: [String]) {
+        for m in methods {
+            var lets = Set(fieldNames)
+            lets.insert("self")
+            checkBlock(m.body, lets: lets)
         }
     }
 

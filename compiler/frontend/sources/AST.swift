@@ -44,6 +44,7 @@ public enum TopDecl {
 public struct StructDecl {
     public let name: String
     public let fields: [VarField]
+    public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
     public let span: Span
 }
 
@@ -56,6 +57,7 @@ public struct VarField {
 public struct EnumDecl {
     public let name: String
     public let cases: [EnumCaseDecl]
+    public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
     public let span: Span
 }
 
@@ -68,6 +70,7 @@ public struct EnumCaseDecl {
 public struct ClassDecl {
     public let name: String
     public let fields: [VarField]
+    public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
     public let span: Span
 }
 

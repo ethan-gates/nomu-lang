@@ -1,0 +1,23 @@
+// T3: instance methods on value and reference types (read-only, reusing `fun`).
+// Inside a type body, `var` fields and `fun` members each begin their own line.
+
+struct Point {
+    var x: Int
+    var y: Int
+    fun sumSquares() -> Int { return x * x + y * y }
+    fun scaled(by: Int) -> Int { return self.x * by + self.y * by }
+}
+
+class Counter {
+    var n: Int
+    fun doubled() -> Int { return n + n }
+}
+
+fun main() {
+    let p = Point(x: 3, y: 4)
+    print(p.sumSquares())        // 25
+    print(p.scaled(by: 2))       // 14
+
+    let c = Counter(n: 21)
+    print(c.doubled())           // 42
+}

@@ -1,4 +1,4 @@
-// The typed mid-level IR (structured; m4.9-spec.md §4).
+// The typed mid-level IR (structured; design: compiler.md §1).
 //
 // Produced by the semantic pass (Sema) from the AST; codegen consumes it (T2).
 // Structured — keeps `if`/`switch`/closures as nested nodes, not a CFG. Every
@@ -29,6 +29,7 @@ public struct IRField {
 public struct IRStruct {
     public let name: String
     public let fields: [IRField]
+    public let methods: [IRFunc]   // T3: instance methods; each takes an implicit `self`
     public let span: Span
 }
 
@@ -41,12 +42,14 @@ public struct IREnumCase {
 public struct IREnum {
     public let name: String
     public let cases: [IREnumCase]
+    public let methods: [IRFunc]   // T3: instance methods; each takes an implicit `self`
     public let span: Span
 }
 
 public struct IRClass {
     public let name: String
     public let fields: [IRField]
+    public let methods: [IRFunc]   // T3: instance methods; each takes an implicit `self`
     public let span: Span
 }
 

@@ -10,7 +10,7 @@ final class ParserTests: XCTestCase {
     }
 
     func testStructDecl() {
-        let p = parse("struct Point { var x: Int var y: Int }")
+        let p = parse("struct Point {\nvar x: Int\nvar y: Int\n}")
         guard case .structDecl(let s) = p.decls[0] else { XCTFail(); return }
         XCTAssertEqual(s.name, "Point")
         XCTAssertEqual(s.fields.count, 2)
@@ -29,14 +29,43 @@ final class ParserTests: XCTestCase {
     }
 
     func testClassDecl() {
-        let p = parse("class Buffer { var data: Point }")
+        let p = parse("class Buffer {\nvar data: Point\n}")
         guard case .classDecl(let c) = p.decls[0] else { XCTFail(); return }
         XCTAssertEqual(c.name, "Buffer")
         XCTAssertEqual(c.fields.count, 1)
     }
 
+    func testStructWithMethod() {
+        // A `fun` member on its own line parses as a method, fields stay intact.
+        let p = parse("""
+        struct Point {
+            var x: Int
+            var y: Int
+            fun sum() -> Int { return x + y }
+        }
+        """)
+        guard case .structDecl(let s) = p.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(s.fields.count, 2)
+        XCTAssertEqual(s.methods.count, 1)
+        XCTAssertEqual(s.methods[0].name, "sum")
+        XCTAssertEqual(s.methods[0].returnType?.name, "Int")
+    }
+
+    func testClassWithMethod() {
+        let p = parse("""
+        class Counter {
+            var n: Int
+            fun get() -> Int { return n }
+        }
+        """)
+        guard case .classDecl(let c) = p.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(c.fields.count, 1)
+        XCTAssertEqual(c.methods.count, 1)
+        XCTAssertEqual(c.methods[0].name, "get")
+    }
+
     func testActorDecl() {
-        let p = parse("actor Counter { var count: Int = 0 on bump(by: Point) { count += by.x } }")
+        let p = parse("actor Counter {\nvar count: Int = 0\non bump(by: Point) { count += by.x } }")
         guard case .actorDecl(let a) = p.decls[0] else { XCTFail(); return }
         XCTAssertEqual(a.name, "Counter")
         XCTAssertEqual(a.fields.count, 1)
@@ -115,7 +144,7 @@ final class ParserTests: XCTestCase {
     }
 
     func testHandlerReturnType() {
-        let p = parse("actor Counter { var count: Int = 0 on getCount() -> Int { return count } }")
+        let p = parse("actor Counter {\nvar count: Int = 0\non getCount() -> Int { return count } }")
         guard case .actorDecl(let a) = p.decls[0] else { XCTFail(); return }
         XCTAssertEqual(a.handlers[0].returnType?.name, "Int")
     }

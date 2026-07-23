@@ -36,11 +36,19 @@ public struct Parser {
         let name = expectIdent()
         expect(.lBrace)
         var fields: [VarField] = []
+        var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
-            fields.append(parseVarField())
+            if check(.kwVar) {
+                fields.append(parseVarField())
+            } else if check(.kwFunc) {
+                requireLineStart("fun")
+                methods.append(parseFuncDecl())
+            } else {
+                error("expected 'var' or 'fun' in struct body, got \(currentKind)")
+            }
         }
         expect(.rBrace)
-        return StructDecl(name: name, fields: fields, span: spanFrom(start))
+        return StructDecl(name: name, fields: fields, methods: methods, span: spanFrom(start))
     }
 
     private mutating func parseEnumDecl() -> EnumDecl {
@@ -49,11 +57,19 @@ public struct Parser {
         let name = expectIdent()
         expect(.lBrace)
         var cases: [EnumCaseDecl] = []
+        var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
-            cases.append(parseEnumCaseDecl())
+            if check(.kwCase) {
+                cases.append(parseEnumCaseDecl())
+            } else if check(.kwFunc) {
+                requireLineStart("fun")
+                methods.append(parseFuncDecl())
+            } else {
+                error("expected 'case' or 'fun' in enum body, got \(currentKind)")
+            }
         }
         expect(.rBrace)
-        return EnumDecl(name: name, cases: cases, span: spanFrom(start))
+        return EnumDecl(name: name, cases: cases, methods: methods, span: spanFrom(start))
     }
 
     private mutating func parseEnumCaseDecl() -> EnumCaseDecl {
@@ -80,11 +96,19 @@ public struct Parser {
         let name = expectIdent()
         expect(.lBrace)
         var fields: [VarField] = []
-        while check(.kwVar) {
-            fields.append(parseVarField())
+        var methods: [FuncDecl] = []
+        while !check(.rBrace) && !check(.eof) {
+            if check(.kwVar) {
+                fields.append(parseVarField())
+            } else if check(.kwFunc) {
+                requireLineStart("fun")
+                methods.append(parseFuncDecl())
+            } else {
+                error("expected 'var' or 'fun' in class body, got \(currentKind)")
+            }
         }
         expect(.rBrace)
-        return ClassDecl(name: name, fields: fields, span: spanFrom(start))
+        return ClassDecl(name: name, fields: fields, methods: methods, span: spanFrom(start))
     }
 
     private mutating func parseActorDecl() -> ActorDecl {
@@ -124,6 +148,7 @@ public struct Parser {
 
     private mutating func parseVarField() -> VarField {
         let start = currentSpan
+        requireLineStart("var")
         expect(.kwVar)
         let name = expectIdent()
         expect(.colon)
@@ -133,6 +158,7 @@ public struct Parser {
 
     private mutating func parseActorField() -> ActorField {
         let start = currentSpan
+        requireLineStart("var")
         expect(.kwVar)
         let name = expectIdent()
         expect(.colon)
@@ -483,6 +509,17 @@ public struct Parser {
     }
 
     private func check(_ kind: TokenKind) -> Bool { currentKind == kind }
+
+    // Some declaration keywords must be the first token on their line (`var` fields
+    // and `fun` members), so declarations never share a line inside a type body.
+    // The lexer discards newlines, so this is checked against span line numbers:
+    // the previous token must end on an earlier line than this one begins.
+    private func requireLineStart(_ keyword: String) {
+        guard pos > 0 else { return }
+        if tokens[pos - 1].span.end.line >= currentSpan.begin.line {
+            error("'\(keyword)' must begin a new line")
+        }
+    }
 
     private func error(_ msg: String) -> Never {
         let s = currentSpan

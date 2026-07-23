@@ -22,7 +22,10 @@ final class SemaTests: XCTestCase {
 
     func testStructFieldAccess() {
         let r = sema("""
-        struct Point { var x: Int var y: Int }
+        struct Point {
+            var x: Int
+            var y: Int
+        }
         fun f(p: Point) -> Int { return p.x }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
@@ -36,7 +39,10 @@ final class SemaTests: XCTestCase {
 
     func testConstruction() {
         let r = sema("""
-        struct Point { var x: Int var y: Int }
+        struct Point {
+            var x: Int
+            var y: Int
+        }
         fun f() -> Point { return Point(x: 1, y: 2) }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
@@ -46,6 +52,52 @@ final class SemaTests: XCTestCase {
         XCTAssertEqual(typeName, "Point")
         XCTAssertEqual(args.count, 2)
         XCTAssertEqual(e.type, .named("Point", .struct_))
+    }
+
+    func testMethodCallTypes() {
+        // `s.method()` resolves to a methodCall and takes the method's return type.
+        let r = sema("""
+        struct Point {
+            var x: Int
+            var y: Int
+            fun sum() -> Int { return x + y }
+        }
+        fun f(p: Point) -> Int { return p.sum() }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let f) = r.module.decls[1],
+              case .ret(let e?) = f.body[0].kind,
+              case .methodCall(let recv, let method, let args) = e.kind else { XCTFail(); return }
+        XCTAssertEqual(method, "sum")
+        XCTAssertEqual(args.count, 0)
+        XCTAssertEqual(e.type, .int)
+        XCTAssertEqual(recv.type, .named("Point", .struct_))
+    }
+
+    func testMethodBodySeesFieldsAndSelf() {
+        // Inside a method, fields resolve by bare name and `self` is in scope.
+        let r = sema("""
+        struct Point {
+            var x: Int
+            var y: Int
+            fun scaled(by: Int) -> Int { return self.x + y * by }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .structDecl(let s) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(s.methods.count, 1)
+        XCTAssertEqual(s.methods[0].returnType, .int)
+    }
+
+    func testMissingMethodDiagnostic() {
+        let r = sema("""
+        struct Point {
+            var x: Int
+            var y: Int
+        }
+        fun f(p: Point) -> Int { return p.nope() }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
     }
 
     func testUndefinedNameDiagnostic() {

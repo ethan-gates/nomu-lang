@@ -8,17 +8,25 @@
 
 ## 1. Mid-level IR above the backend
 
-Build a typed **mid-level IR** between the typed AST and the code-generation backend (analog: Swift's SIL). Semantics-aware passes run on *this* IR, then lower to the backend. — **Decided.** First built in **M4.9** at a **structured altitude** (keeps `if`/`switch`/loops as nested nodes and closures first-class — not CFG/SSA); a lower CFG/SSA level lands in M6 when escape analysis / GC barriers need it (`m4.9-spec.md`).
+A typed **mid-level IR** sits between the parser and the code-generation backend; semantics-aware passes run on *this* IR, then lower to the backend (analog: Swift's SIL). — **Decided; the IR and the semantic pass that builds it were implemented in M4.9.**
 
-Passes that run on the mid-level IR:
-- **monomorphization**
-- **exhaustiveness checking**
-- **escape analysis** (`memory-model.md` §6.1)
-- **GC safepoint / barrier insertion**
-- **closure conversion**
-- **share analysis** — materializing shareability into module interfaces (`concurrency.md` §5)
+**Two representations, Rust-staged.** The pipeline is `source → lexer → parser (untyped AST) → semantic pass → typed IR → IR passes → codegen (emit C)`. There are deliberately only two trees: the untyped **AST** (parser output) and one **typed structured IR** the semantic pass builds *directly* from it — no separate "typed AST" step, because our AST is immutable `enum`s and can't be annotated in place the way Swift decorates its mutable AST. Our typed IR ≈ **Rust's THIR**; the lower CFG/SSA level (deferred to M6, for escape analysis / GC barriers) ≈ **Rust's MIR / Swift's SIL**.
 
-The backend (LLVM) does not understand the language's semantics, so running these passes on LLVM IR would be the wrong altitude. The IR also carries **debug info** (source spans, variable identity) through every pass — threading it in from day one is cheap; retrofitting is miserable, so it goes in from the start.
+**Altitude — structured, not CFG/SSA.** The IR keeps `if`/`switch`/loops as nested nodes and closures first-class, so codegen stays mechanical and the C backend keeps structured control flow. Every node is **typed** and carries a **source span** — debug info threaded from the start (cheap now; retrofitting is miserable) and preserved by every pass.
+
+**The semantic pass** (name/scope/member/method resolution, expression typing, call/argument checking, return checking) produces the IR and reports **collected diagnostics** (collect-and-continue, not exit-on-first-error). It replaced the old ad-hoc type tracking in codegen (`typeOf` + a `Scope: [String:String]` string map) with a real internal **`Type` model**: `int`/`bool`/`string`/`void`, `named(name, kind ∈ {struct, enum, class, actor})`, `function(params, ret)`, and `error` (suppresses cascades); backed by symbol tables and a lexical scope stack. M5 extends the model (`typeParam`, existentials, generic instances). (POD and let/var checks still run in a small separate AST pass before the semantic pass.)
+
+**The IR is the M5 seam.** Member/method dispatch is resolved in the IR — a method call names its concrete target — so codegen never re-resolves. M5 extends this: the call node gains a dynamic/witness form for `any`, and generic calls carry witness arguments.
+
+Passes over the mid-level IR:
+- **exhaustiveness checking** — *implemented (M4.9)*; runs on the typed IR, the altitude Rust uses (THIR).
+- **share analysis** — materializing shareability into module interfaces (`concurrency.md` §5). *Currently still in codegen* (spawn-capture + actor-handler-param checks); migrates to an IR pass with M5's shareability work.
+- **closure conversion** — *currently still in codegen* (closures stay first-class in the IR); promoted to a pass later.
+- **monomorphization** — M5.
+- **escape analysis** (`memory-model.md` §6.1) — M6.
+- **GC safepoint / barrier insertion** — M6.
+
+The backend (LLVM) does not understand the language's semantics, so running these passes on LLVM IR would be the wrong altitude.
 
 (The pass list changed with the memory-model pivot: ARC insertion / refcount elision / isolation-region checks are gone; escape analysis and GC barrier/safepoint insertion take their place, and monomorphization gains importance as a performance lever.)
 
@@ -109,13 +117,13 @@ Things to revisit when the C codegen is replaced by the LLVM backend (M8). The C
 
 ## 8. Pipeline boundary hardening (deferred)
 
-The M4.9 pipeline (typecheck → typed AST → IR → passes → codegen) is built as the **minimal amount to get something working**. The boundaries between phases warrant a deliberate later pass — careful consideration, not now. The checklist to revisit:
+The M4.9 pipeline (parse → semantic pass → typed IR → passes → codegen) is built as the **minimal amount to get something working**. The boundaries between phases warrant a deliberate later pass — careful consideration, not now. The checklist to revisit:
 
-- **Per-phase input→output testing** — golden tests at each boundary (source→tokens, tokens→AST, AST→typed AST, →IR, →C), so every phase is independently verifiable.
-- **Phase output formats designed for speed** — the serialized form of each phase's output (typed AST, IR) chosen to be fast to read/write, so caching and tooling aren't bottlenecked.
+- **Per-phase input→output testing** — golden tests at each boundary (source→tokens, tokens→AST, AST→typed IR, →C), so every phase is independently verifiable.
+- **Phase output formats designed for speed** — the serialized form of each phase's output (AST, typed IR) chosen to be fast to read/write, so caching and tooling aren't bottlenecked.
 - **Format stability** — versioned, backward-compatible boundary formats, so cached artifacts survive compiler changes (a prerequisite for incremental).
 - **Parallelism** — where phases, or per-decl/per-function work within a phase, can run concurrently.
 - **Incremental compilation** — recompute only what changed; ties to the query-based architecture (§3) and cached monomorphizations (§7).
-- **Per-phase debuggability** — inspect/dump each phase's output in isolation. `ASTDump` exists for the AST; M4.9 adds a **typed-AST dump** (`--dump-typed-ast`); an **IR dump** and dumps for later phases remain to extend.
+- **Per-phase debuggability** — inspect/dump each phase's output in isolation. `ASTDump` exists for the AST; M4.9 added a **typed-IR dump** (`--dump-typed-ast`); dumps for later phases remain to extend.
 
 Hooks already in place that keep the door open: the IR carries debug info/spans from the start (§1), `ASTDump` gives a dump pattern to extend, and §3 commits to the query/incremental direction. The hardening itself is deferred until the minimal pipeline works end to end. — **Deferred (noted 2026-07-21).**

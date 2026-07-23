@@ -24,15 +24,26 @@ public func compile(path: String, emit: EmitMode = .binary) {
     if emit == .typedAST {
         var sema = Sema(program)
         let result = sema.check()
+        checkExhaustiveness(result.module, into: result.diagnostics)
         if !result.diagnostics.isEmpty { fputs(result.diagnostics.render() + "\n", stderr) }
         print(dumpTypedIR(result.module))
         return
     }
 
+    // POD + let/var checks stay in the AST typechecker; run before Sema (T2 §4).
     var checker = Typechecker(program)
     checker.check()
 
-    var gen = Codegen(program)
+    var sema = Sema(program)
+    let semaResult = sema.check()
+    // T4: exhaustiveness as an IR pass over the typed module, into the same sink.
+    checkExhaustiveness(semaResult.module, into: semaResult.diagnostics)
+    if !semaResult.diagnostics.isEmpty {
+        fputs(semaResult.diagnostics.render() + "\n", stderr)
+        exit(1)
+    }
+
+    var gen = CodegenIR(semaResult.module)
     let cCode = gen.emit()
 
     if !gen.diagnostics.isEmpty {

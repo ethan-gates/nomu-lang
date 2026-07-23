@@ -1,5 +1,5 @@
 // A human-readable dump of the typed IR — the `--dump-typed-ast` output and the
-// minimum debug visibility into the typecheck phase (m4.9-spec.md §1, T1).
+// minimum debug visibility into the typecheck phase (design: compiler.md §1).
 //
 // Indented tree, printed like a pretty-printer: a subtree collapses onto ONE
 // line when its full flat rendering fits within `dumpWidth`; otherwise it breaks
@@ -34,15 +34,18 @@ private func appendDecl(_ decl: IRDecl, ind: String, into lines: inout [String])
     case .structDecl(let s):
         lines.append("\(ind)struct \(s.name)")
         for f in s.fields { lines.append("\(ind)  \(f.name) : \(f.type)") }
+        for m in s.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .enumDecl(let e):
         lines.append("\(ind)enum \(e.name)")
         for c in e.cases {
             let fs = c.fields.map { "\($0.name) : \($0.type)" }.joined(separator: ", ")
             lines.append("\(ind)  case \(c.name)(\(fs))")
         }
+        for m in e.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .classDecl(let c):
         lines.append("\(ind)class \(c.name)")
         for f in c.fields { lines.append("\(ind)  \(f.name) : \(f.type)") }
+        for m in c.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .actorDecl(let a):
         lines.append("\(ind)actor \(a.name)")
         for f in a.fields {
@@ -57,6 +60,12 @@ private func appendDecl(_ decl: IRDecl, ind: String, into lines: inout [String])
         lines.append("\(ind)fun \(f.name)\(signature(f.params, f.returnType))")
         for s in f.body { appendStmt(s, ind: ind + "  ", into: &lines) }
     }
+}
+
+// An instance method — a `fun` member with an implicit `self` receiver (T3).
+private func appendMethod(_ m: IRFunc, ind: String, into lines: inout [String]) {
+    lines.append("\(ind)fun \(m.name)\(signature(m.params, m.returnType))")
+    for s in m.body { appendStmt(s, ind: ind + "  ", into: &lines) }
 }
 
 private func signature(_ params: [IRParam], _ ret: Type) -> String {

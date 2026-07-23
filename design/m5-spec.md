@@ -4,6 +4,8 @@
 
 **Framing correction:** the roadmap calls M5 "generics + monomorphization," but the compiler has **no interfaces today** (concrete `struct`/`enum`/`class`/`actor`/`fun` only) and **no computed properties**. So M5 stacks three features — interfaces, computed properties, generics — plus error handling. Monomorphization is an *optional accelerator*, not the correctness baseline (see §5).
 
+**Prerequisites (M4.10, `m4.10-spec.md`):** grounding the exit criteria below against the code found two concrete features M5 assumes and the compiler lacks — **enum value construction** (needed for `Option<T>` in Phase B and `Result<T,E>` in Phase E) and **`let` fields** (needed for `Box<T> { let value: T }` in Phase B and Phase C's deeply-immutable-class shareability). Both are handled in **M4.10** before M5 starts. M4.10 also resolves the Phase A iteration demo (below), which assumes loops/collections the language doesn't have yet.
+
 ---
 
 ## 1. Scope
@@ -24,11 +26,11 @@
 
 ## 2. Compiler surface touched
 
-Current pipeline (Swift): `Lexer → Parser → AST → Typechecker → Codegen (emit C) → cc`. M5 touches every stage.
+Current pipeline (Swift, post-M4.9): `Lexer → Parser → AST → Typechecker (POD + let/var) → Sema (typed IR) → exhaustiveness pass → CodegenIR (emit C) → cc`. M5 touches every stage.
 
 - **Lexer** — keywords `interface`, `extension`, `some`, `any`, `shared`, `get`, `set`; disambiguate `<`/`>` as generic brackets vs. comparison; `&` type composition.
 - **AST** — `InterfaceDecl`, `ExtensionDecl`, generic parameter lists on decls, `TypeRef` carrying generic arguments + modifiers (`any`/`some`/`shared`), property declarations with accessor bodies, conformance clauses.
-- **Typechecker** — the bulk: conformance checking, witness resolution, modular generic checking against bounds, constraint solving, type-arg inference, exhaustiveness under generics, conditional conformance, `shared` propagation.
+- **Semantic pass (`Sema`)** — the bulk: conformance checking, witness resolution, modular generic checking against bounds, constraint solving, type-arg inference, exhaustiveness under generics, conditional conformance, `shared` propagation. (The `Type` model and symbol tables it extends were built in M4.9; `compiler.md` §1.)
 - **Codegen** — witness-table emission in C, witness-passing generic lowering, `any` boxing, `some`/concrete devirtualization to direct calls, accessor lowering (stored → field load), `Result` layout.
 
 ---
@@ -44,7 +46,7 @@ The prerequisite feature; everything else builds on witness tables.
 - Conformance: `extension T: I { … }` and `struct T: I { … }` sugar. Witness-table generation (accessor-shaped property slots — never offsets — plus method slots; reserve an unused type-witness slot for future associated types).
 - `any I` existentials (boxed, witness-dispatched); refinement `B: A`; `&` composition.
 - Dispatch: call-site property — direct/devirtualized on concrete + `some`; witness lookup through `any`.
-- **Exit:** an `interface Drawable` with a default method and a `{ get }` property; two concrete conformers; a `[any Drawable]` iterated with dynamic dispatch; a stored-backed `get` verified to lower to a field load on a concrete call.
+- **Exit:** an `interface Drawable` with a default method and a `{ get }` property; two concrete conformers; a `[any Drawable]` iterated with dynamic dispatch; a stored-backed `get` verified to lower to a field load on a concrete call. (The `[any Drawable]` iteration assumes loops + a collection type, neither of which exists in the language yet; `m4.10-spec.md` §5 resolves this demo — the interface feature itself needs neither.)
 
 ### Phase B — Generic parameters + constraints
 - Parse/typecheck `<T: I>`, `<T: I & J>` on `fun` and on types (`struct Box<T>`).
@@ -63,7 +65,7 @@ The prerequisite feature; everything else builds on witness tables.
 ### Phase D — Monomorphization (accelerator, descopable)
 - A specialization pass over Phase B's witness path: stamp concrete copies, devirtualize requirement calls, inline trivial accessors to loads.
 - Polymorphic-recursion termination: detect infinite specialization (`f<Box<T>>()`) and error.
-- Architectural note: this is where a **typed mid-level IR** (`compiler.md` §1) earns its place. If the IR isn't built, monomorphization can run as an AST→AST pass, but the IR is the intended home. Either way, **nothing depends on this phase for correctness** (goal 3) — it's the performance lever, and it may slip past M5's core without blocking the milestone.
+- Architectural note: this is where the **typed mid-level IR** (`compiler.md` §1, built in M4.9) earns its place — monomorphization is a specialization pass over it. **Nothing depends on this phase for correctness** (goal 3) — it's the performance lever, and it may slip past M5's core without blocking the milestone.
 - **Exit:** a specialized `Box<Int>` shows no witness indirection in the emitted C on the hot path; benchmark parity target noted, not required.
 
 ### Phase E — Error handling
@@ -107,7 +109,7 @@ M5 is a front-end + codegen milestone; the M4 scheduler (`runtime.md` §8 — fi
 
 ## 6. Risks / watch items
 
-- **Monomorphization vs. the mid-level IR.** Phase D wants the typed IR that doesn't exist yet; keep the pass descopable so the IR's absence can't block M5's core.
+- **Monomorphization is descopable.** Phase D runs on the typed IR (built in M4.9); keep it a pure accelerator so it can slip past M5's core without blocking the milestone (goal 3).
 - **Angle-bracket ambiguity.** `<`/`>` as generic brackets vs. comparison needs careful parser handling (the classic C++/Rust turbofish territory) — decide the disambiguation rule in Phase B.
 - **Mutating setters on value types.** New semantics in Phase A; keep read-only `{ get }` requirements the common path.
 - **Type-argument inference scope.** Bidirectional inference can sprawl; keep M5's inference to arguments + return position, explicit args otherwise.

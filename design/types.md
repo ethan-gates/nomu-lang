@@ -13,6 +13,7 @@
 - **Strong static typing, no classic inheritance.** — **Decided.** Abstraction and reuse come from interfaces + extensions, not a base-class hierarchy (`interfaces.md`).
 - **Value / reference split** as the layout and semantics backbone — `struct`/`enum` are values, `class` is a reference (`memory-model.md`). — **Decided.**
 - **Interfaces/protocols with default methods** — the abstraction mechanism, detailed in `interfaces.md`. — **Decided.**
+- **Modest local inference** — bottom-up expression typing plus declared annotations: `let x = expr` infers `x` from `expr`, a function's return is checked against its annotation, and closure params come from their annotations. No Hindley–Milner / global inference (generic inference is M5, `generics.md`). — **Decided (M4.9).**
 
 No inheritance + interfaces + extensions is the Swift-protocol / Rust-trait / Go-interface design — well-trodden and coherent.
 
@@ -41,9 +42,30 @@ fun area(s: Shape) -> Int {
 
 Enums are value types (tagged unions, laid out inline); a recursive enum (`indirect`) becomes a reference under the hood (`memory-model.md`). Payload matching binds fields per case.
 
+Exhaustiveness is checked as a pass over the typed mid-level IR (`compiler.md` §1), the same altitude Rust checks it (THIR). A `switch` on an enum that misses a case is a compile error; there is no `_`/default arm, so exhaustive means every declared case appears.
+
 ---
 
-## 3. Generics
+## 3. Methods on types
+
+**Instance methods on `struct`/`enum`/`class`**, declared with `fun` inside the type body — no separate keyword. — **Decided; landed M4.9 (read-only).**
+
+```
+struct Point {
+    var x: Int
+    var y: Int
+    fun sumSquares() -> Int { return x * x + y * y }
+}
+```
+
+- `self` is the receiver and is **immutable** in the current form. A method reads fields by bare name or via `self.`. Value types (`struct`/`enum`) take `self` by value; `class` takes it by reference.
+- **Mutating methods on value types are deferred** — they arrive with **property setters in M5** (`interfaces.md` for accessor-shaped properties; `memory-model.md` §4 for binding/immutability).
+- Methods are the seam for **interface method requirements** (M5, `interfaces.md`).
+- Surface: a `fun` member must begin its own line inside a type body (`syntax.md` §2).
+
+---
+
+## 4. Generics
 
 **Decided:** generics are real and first-class. **Open (highest-priority forward item):** the full design — dispatch strategy, power ceiling, and how the "shareable" bound rides on type parameters. The M5 working design (decided variance, deferred items, dispatch/checking direction) lives in `generics.md`; this section keeps the model overview.
 
@@ -56,7 +78,7 @@ Monomorphization is the leading candidate because it gives strong performance *a
 
 ---
 
-## 4. Error handling
+## 5. Error handling
 
 **Errors are values, not exceptions.** — **Decided (2026-07-16).** There is no `throw`/`catch` and no stack-unwinding exception mechanism; a failable operation returns its error as a value, propagated explicitly. This is load-bearing across the design: the cancellation model keeps cancellation distinct from errors precisely because errors are values (`concurrency.md` §7), closure failability rides in the return type (§6), and the continuation hands failures back as a value (`resume(Result)`, §3). It fits the small-runtime, no-mandatory-unwinding, legible-and-explicit style.
 
@@ -69,8 +91,8 @@ Finalize alongside generics (an error type is often generic). Go-philosophy expl
 
 ---
 
-## 5. Open questions
+## 6. Open questions
 
-- **Generics** — dispatch strategy (monomorphization vs. dictionary-passing), power ceiling (associated types, constraints; ~Rust-trait level, no HKT), the `<T: shareable>` bound spelling, and modular-vs-per-instantiation checking. Highest-priority forward item (§3).
-- **Error handling form** — errors-as-values is Decided (§4); open is the carrier (`Result`/tuple/other) and the `?` operator / typed-throws question.
+- **Generics** — dispatch strategy (monomorphization vs. dictionary-passing), power ceiling (associated types, constraints; ~Rust-trait level, no HKT), the `<T: shareable>` bound spelling, and modular-vs-per-instantiation checking. Highest-priority forward item (§4).
+- **Error handling form** — errors-as-values is Decided (§5); open is the carrier (`Result`/tuple/other) and the `?` operator / typed-throws question.
 - **Associated types / generic interfaces, conditional conformance, `some` mechanics** — tracked with the interface composition work (`interfaces.md` §4.5).
