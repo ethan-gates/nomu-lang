@@ -14,7 +14,7 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
     switch decl {
     case .structDecl(let s):
         lines.append("\(ind)StructDecl '\(s.name)'")
-        for f in s.fields { lines.append("\(ind)  Field \(f.name): \(f.type.name)") }
+        for f in s.fields { lines.append("\(ind)  \(f.isMutable ? "var" : "let") \(f.name): \(f.type.name)") }
         for m in s.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .enumDecl(let e):
         lines.append("\(ind)EnumDecl '\(e.name)'")
@@ -25,7 +25,7 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
         for m in e.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .classDecl(let c):
         lines.append("\(ind)ClassDecl '\(c.name)'")
-        for f in c.fields { lines.append("\(ind)  Field \(f.name): \(f.type.name)") }
+        for f in c.fields { lines.append("\(ind)  \(f.isMutable ? "var" : "let") \(f.name): \(f.type.name)") }
         for m in c.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .actorDecl(let a):
         lines.append("\(ind)ActorDecl '\(a.name)'")
@@ -103,6 +103,7 @@ private func describeExpr(_ e: Expr) -> String {
     case .stringLit(let v, _): return "\"\(v)\""
     case .ident(let n, _):     return n
     case .member(let b, let f, _): return "\(describeExpr(b)).\(f)"
+    case .implicitMember(let name, _): return ".\(name)"
     case .binary(let op, let l, let r, _):
         return "\(describeExpr(l)) \(describeOp(op)) \(describeExpr(r))"
     case .call(let callee, let args, _):

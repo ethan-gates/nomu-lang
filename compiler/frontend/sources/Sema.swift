@@ -21,6 +21,10 @@ public struct Sema {
     // Lexical scope stack for locals/params (name → type).
     private var scopes: [[String: Type]] = []
 
+    // Declared return type of the body being lowered — the contextual type for a
+    // `return .case(...)` leading-dot construction (M4.10).
+    private var currentReturnType: Type = .void
+
     private struct FnSig { let params: [Type]; let ret: Type }
 
     public init(_ program: Program) { self.program = program }
@@ -113,7 +117,7 @@ public struct Sema {
     }
 
     private func lowerField(_ f: VarField) -> IRField {
-        IRField(name: f.name, type: resolve(f.type), span: f.span)
+        IRField(name: f.name, type: resolve(f.type), isMutable: f.isMutable, span: f.span)
     }
 
     // Lower each `fun` member with `self` (immutable) and the receiver's fields
@@ -122,24 +126,30 @@ public struct Sema {
         var out: [IRFunc] = []
         for m in methods {
             let params = m.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+            let ret = resolve(m.returnType)
             pushScope()
             declare("self", selfType)
             for f in fields { declare(f.name, f.type) }
             for p in params { declare(p.name, p.type) }
+            let saved = currentReturnType; currentReturnType = ret
             let body = lowerBlock(m.body)
+            currentReturnType = saved
             popScope()
-            out.append(IRFunc(name: m.name, params: params, returnType: resolve(m.returnType), body: body, span: m.span))
+            out.append(IRFunc(name: m.name, params: params, returnType: ret, body: body, span: m.span))
         }
         return out
     }
 
     private mutating func lowerFunc(_ f: FuncDecl) -> IRFunc {
         let params = f.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+        let ret = resolve(f.returnType)
         pushScope()
         for p in params { declare(p.name, p.type) }
+        let saved = currentReturnType; currentReturnType = ret
         let body = lowerBlock(f.body)
+        currentReturnType = saved
         popScope()
-        return IRFunc(name: f.name, params: params, returnType: resolve(f.returnType), body: body, span: f.span)
+        return IRFunc(name: f.name, params: params, returnType: ret, body: body, span: f.span)
     }
 
     private mutating func lowerActor(_ a: ActorDecl) -> IRActor {
@@ -150,13 +160,15 @@ public struct Sema {
         var handlers: [IRHandler] = []
         for h in a.handlers {
             let params = h.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+            let ret = resolve(h.returnType)
             pushScope()
             for f in fields { declare(f.name, f.type) }   // handler body sees actor fields by name
             for p in params { declare(p.name, p.type) }
+            let saved = currentReturnType; currentReturnType = ret
             let body = lowerBlock(h.body)
+            currentReturnType = saved
             popScope()
-            handlers.append(IRHandler(name: h.name, params: params, returnType: resolve(h.returnType),
-                                      body: body, span: h.span))
+            handlers.append(IRHandler(name: h.name, params: params, returnType: ret, body: body, span: h.span))
         }
         return IRActor(name: a.name, fields: fields, handlers: handlers, span: a.span)
     }
@@ -173,8 +185,9 @@ public struct Sema {
     private mutating func lowerStmt(_ stmt: Stmt) -> IRStmt {
         switch stmt {
         case .binding(let b):
-            let value = checkExpr(b.value)
-            let type = b.type.map { resolve($0) } ?? value.type
+            let annotated = b.type.map { resolve($0) }
+            let value = checkExpr(b.value, expected: annotated)
+            let type = annotated ?? value.type
             declare(b.name, type)
             return IRStmt(kind: .letBinding(name: b.name, isMutable: b.isMutable, value: value), span: b.span)
 
@@ -184,13 +197,17 @@ public struct Sema {
             return IRStmt(kind: .spawnLet(name: name, value: v, resultType: v.type), span: span)
 
         case .assign(let lhs, let rhs, let span):
-            return IRStmt(kind: .assign(target: checkExpr(lhs), value: checkExpr(rhs)), span: span)
+            let target = checkExpr(lhs)
+            rejectLetFieldTarget(target)
+            return IRStmt(kind: .assign(target: target, value: checkExpr(rhs)), span: span)
 
         case .compoundAssign(let lhs, let rhs, let span):
-            return IRStmt(kind: .compoundAssign(target: checkExpr(lhs), value: checkExpr(rhs)), span: span)
+            let target = checkExpr(lhs)
+            rejectLetFieldTarget(target)
+            return IRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
 
         case .ret(let e, let span):
-            return IRStmt(kind: .ret(e.map { checkExpr($0) }), span: span)
+            return IRStmt(kind: .ret(e.map { checkExpr($0, expected: currentReturnType) }), span: span)
 
         case .ifStmt(let s):
             let cond = checkExpr(s.cond)
@@ -229,7 +246,10 @@ public struct Sema {
 
     // MARK: - Expressions
 
-    private mutating func checkExpr(_ e: Expr) -> IRExpr {
+    // `expected` carries a contextual type inward (binding annotation, return
+    // position, call-argument slot) so leading-dot `.case` construction can infer
+    // its enum (M4.10). nil elsewhere; most expressions ignore it.
+    private mutating func checkExpr(_ e: Expr, expected: Type? = nil) -> IRExpr {
         switch e {
         case .intLit(let v, let span):    return IRExpr(type: .int,    span: span, kind: .intLit(v))
         case .boolLit(let v, let span):   return IRExpr(type: .bool,   span: span, kind: .boolLit(v))
@@ -246,9 +266,17 @@ public struct Sema {
             return IRExpr(type: .error, span: span, kind: .varRef(name))
 
         case .member(let base, let field, let span):
+            // Qualified no-payload enum construction: `EnumType.case`. (A payload case
+            // used bare falls through buildEnumInit as a wrong-arity error.)
+            if case .ident(let typeName, _) = base, lookup(typeName) == nil, enums[typeName] != nil {
+                return buildEnumInit(typeName, field, [], at: span)
+            }
             let b = checkExpr(base)
             let type = fieldType(of: b.type, field: field, at: span)
             return IRExpr(type: type, span: span, kind: .fieldAccess(base: b, field: field))
+
+        case .implicitMember(let name, let span):
+            return buildImplicitEnum(name, [], expected: expected, at: span)
 
         case .binary(let op, let l, let r, let span):
             let lhs = checkExpr(l), rhs = checkExpr(r)
@@ -256,20 +284,32 @@ public struct Sema {
             return IRExpr(type: type, span: span, kind: .binary(op, lhs, rhs))
 
         case .call(let callee, let args, let span):
-            return checkCall(callee: callee, args: args, span: span)
+            return checkCall(callee: callee, args: args, span: span, expected: expected)
 
         case .closure(let params, let ret, let body, let span):
             let ps = params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+            let retTy = resolve(ret)
             pushScope()
             for p in ps { declare(p.name, p.type) }
+            let saved = currentReturnType; currentReturnType = retTy
             let irBody = lowerBlock(body)
+            currentReturnType = saved
             popScope()
-            let type = Type.function(params: ps.map(\.type), ret: resolve(ret))
+            let type = Type.function(params: ps.map(\.type), ret: retTy)
             return IRExpr(type: type, span: span, kind: .closure(params: ps, body: irBody))
         }
     }
 
-    private mutating func checkCall(callee: Expr, args: [Arg], span: Span) -> IRExpr {
+    private mutating func checkCall(callee: Expr, args: [Arg], span: Span, expected: Type? = nil) -> IRExpr {
+        // Qualified enum construction: `EnumType.case(args)`.
+        if case .member(let base, let caseName, _) = callee,
+           case .ident(let typeName, _) = base, lookup(typeName) == nil, enums[typeName] != nil {
+            return buildEnumInit(typeName, caseName, args, at: span)
+        }
+        // Leading-dot enum construction: `.case(args)` — enum inferred from context.
+        if case .implicitMember(let caseName, _) = callee {
+            return buildImplicitEnum(caseName, args, expected: expected, at: span)
+        }
         // Member call: base.member(args) — an actor send or an instance method.
         if case .member(let base, let name, _) = callee {
             let recv = checkExpr(base)
@@ -309,7 +349,7 @@ public struct Sema {
             }
             // Named function / non-print builtin.
             if let sig = funcs[name] {
-                let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
+                let irArgs = checkArgs(args, expectedParams: sig.params)
                 checkArgTypes(irArgs.map(\.value), against: sig.params, at: span)
                 let calleeType = Type.function(params: sig.params, ret: sig.ret)
                 return IRExpr(type: sig.ret, span: span, kind: .call(callee: irVar(name, calleeType, span), args: irArgs))
@@ -330,6 +370,23 @@ public struct Sema {
 
     // MARK: - Type checks
 
+    // Assigning to a `let` field is rejected (M4.10 field-level immutability). Bare
+    // field writes inside methods are already caught by the AST Typechecker (self is
+    // read-only); this covers `value.field = …` targets on struct/class values.
+    private func rejectLetFieldTarget(_ target: IRExpr) {
+        guard case .fieldAccess(let base, let field) = target.kind,
+              case .named(let typeName, let kind) = base.type else { return }
+        let fields: [VarField]
+        switch kind {
+        case .struct_: fields = structs[typeName]?.fields ?? []
+        case .class_:  fields = classes[typeName]?.fields ?? []
+        default:       return
+        }
+        if let f = fields.first(where: { $0.name == field }), !f.isMutable {
+            diags.error("cannot assign to 'let' field '\(field)'", at: target.span)
+        }
+    }
+
     private func fieldType(of type: Type, field: String, at span: Span) -> Type {
         guard case .named(let name, let kind) = type else {
             if type != .error { diags.error("value of type '\(type)' has no field '\(field)'", at: span) }
@@ -339,7 +396,7 @@ public struct Sema {
         switch kind {
         case .struct_: fields = structs[name]?.fields ?? []
         case .class_:  fields = classes[name]?.fields ?? []
-        case .actor_:  fields = actors[name]?.fields.map { VarField(name: $0.name, type: $0.type, span: $0.span) } ?? []
+        case .actor_:  fields = actors[name]?.fields.map { VarField(name: $0.name, type: $0.type, isMutable: true, span: $0.span) } ?? []
         case .enum_:   fields = []
         }
         if let f = fields.first(where: { $0.name == field }) { return resolve(f.type) }
@@ -370,6 +427,58 @@ public struct Sema {
         for (a, p) in zip(args, params) where a.type != p && a.type != .error && p != .error {
             diags.error("argument of type '\(a.type)' does not match expected '\(p)'", at: a.span)
         }
+    }
+
+    // Check call args, threading a per-position expected type inward (for leading-dot
+    // enum inference); `expectedParams` is nil where the slots aren't known.
+    private mutating func checkArgs(_ args: [Arg], expectedParams: [Type]?) -> [IRArg] {
+        var out: [IRArg] = []
+        for (i, a) in args.enumerated() {
+            let exp = expectedParams.flatMap { i < $0.count ? $0[i] : nil }
+            out.append(IRArg(label: a.label, value: checkExpr(a.value, expected: exp)))
+        }
+        return out
+    }
+
+    // Leading-dot `.case(...)`: resolve the enum from the expected type, then build.
+    private mutating func buildImplicitEnum(_ caseName: String, _ args: [Arg], expected: Type?, at span: Span) -> IRExpr {
+        guard case .named(let enumName, .enum_)? = expected, enums[enumName] != nil else {
+            diags.error("cannot infer enum type for '.\(caseName)' here", at: span)
+            let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
+            return IRExpr(type: .error, span: span, kind: .enumInit(typeName: "", caseName: caseName, args: irArgs))
+        }
+        return buildEnumInit(enumName, caseName, args, at: span)
+    }
+
+    // `EnumType.case(args)` → a typed enumInit, checking the payload against the case.
+    private mutating func buildEnumInit(_ enumName: String, _ caseName: String, _ args: [Arg], at span: Span) -> IRExpr {
+        let enumType = Type.named(enumName, .enum_)
+        guard let caseDecl = enums[enumName]?.cases.first(where: { $0.name == caseName }) else {
+            diags.error("enum '\(enumName)' has no case '\(caseName)'", at: span)
+            let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
+            return IRExpr(type: enumType, span: span, kind: .enumInit(typeName: enumName, caseName: caseName, args: irArgs))
+        }
+        let irArgs = matchEnumArgs(args, fields: caseDecl.fields, case: caseName, at: span)
+        return IRExpr(type: enumType, span: span, kind: .enumInit(typeName: enumName, caseName: caseName, args: irArgs))
+    }
+
+    // Pair payload args to the case's declared fields (by label, else by position),
+    // type-checking each against its field; arity/type mismatches are diagnostics.
+    private mutating func matchEnumArgs(_ args: [Arg], fields: [VarField], case caseName: String, at span: Span) -> [IRArg] {
+        if args.count != fields.count {
+            diags.error("case '\(caseName)' expects \(fields.count) argument(s), got \(args.count)", at: span)
+        }
+        var out: [IRArg] = []
+        for (i, field) in fields.enumerated() {
+            let fieldTy = resolve(field.type)
+            guard let arg = args.first(where: { $0.label == field.name }) ?? (i < args.count ? args[i] : nil) else { continue }
+            let v = checkExpr(arg.value, expected: fieldTy)
+            if v.type != fieldTy && v.type != .error && fieldTy != .error {
+                diags.error("argument of type '\(v.type)' does not match expected '\(fieldTy)'", at: v.span)
+            }
+            out.append(IRArg(label: field.name, value: v))
+        }
+        return out
     }
 
     private func irVar(_ name: String, _ type: Type, _ span: Span) -> IRExpr {

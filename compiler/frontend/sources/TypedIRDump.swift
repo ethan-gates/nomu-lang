@@ -33,7 +33,7 @@ private func appendDecl(_ decl: IRDecl, ind: String, into lines: inout [String])
     switch decl {
     case .structDecl(let s):
         lines.append("\(ind)struct \(s.name)")
-        for f in s.fields { lines.append("\(ind)  \(f.name) : \(f.type)") }
+        for f in s.fields { lines.append("\(ind)  \(f.isMutable ? "var" : "let") \(f.name) : \(f.type)") }
         for m in s.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .enumDecl(let e):
         lines.append("\(ind)enum \(e.name)")
@@ -44,7 +44,7 @@ private func appendDecl(_ decl: IRDecl, ind: String, into lines: inout [String])
         for m in e.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .classDecl(let c):
         lines.append("\(ind)class \(c.name)")
-        for f in c.fields { lines.append("\(ind)  \(f.name) : \(f.type)") }
+        for f in c.fields { lines.append("\(ind)  \(f.isMutable ? "var" : "let") \(f.name) : \(f.type)") }
         for m in c.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .actorDecl(let a):
         lines.append("\(ind)actor \(a.name)")
@@ -165,7 +165,7 @@ private func children(_ e: IRExpr) -> [(slot: String, expr: IRExpr)] {
         return []
     case .fieldAccess(let base, _):
         return [("base", base)]
-    case .construct(_, let args):
+    case .construct(_, let args), .enumInit(_, _, let args):
         return args.map { (argSlot($0), $0.value) }
     case .methodCall(let recv, _, let args):
         return [("receiver", recv)] + args.map { ("arg", $0) }
@@ -186,6 +186,7 @@ private func head(_ e: IRExpr) -> String {
     case .varRef(let n):           return "varRef \(n)"
     case .fieldAccess(_, let f):   return "fieldAccess .\(f)"
     case .construct(let t, _):     return "construct \(t)"
+    case .enumInit(let t, let c, _): return "enumInit \(t).\(c)"
     case .methodCall(_, let m, _): return "methodCall .\(m)"
     case .call:                    return "call"
     case .binary(let op, _, _):    return "binary \(opSym(op))"

@@ -423,6 +423,9 @@ public struct CodegenIR {
         case .construct(let typeName, let args):
             return emitConstruct(typeName: typeName, args: args)
 
+        case .enumInit(let typeName, let caseName, let args):
+            return emitEnumInit(typeName: typeName, caseName: caseName, args: args)
+
         case .methodCall(let receiver, let method, let args):
             return emitMethodCall(receiver: receiver, method: method, args: args)
 
@@ -466,6 +469,16 @@ public struct CodegenIR {
     // instance methods share this C shape; the receiver is emitted as-is — a value
     // for struct/enum, a pointer for class/actor — matching the method's `self`.
     // (Kept unified deliberately; the actor-handler-parameter share check is slice 3.)
+    // Enum value → tagged-union compound literal. Payload cases set the active union
+    // member (named by the case); a no-payload case sets only the tag.
+    private mutating func emitEnumInit(typeName: String, caseName: String, args: [IRArg]) -> String {
+        let tag = "\(typeName)_\(caseName)"
+        if args.isEmpty { return "(\(typeName)){ .tag = \(tag) }" }
+        var inits: [String] = []
+        for a in args { inits.append(".\(a.label ?? "") = \(emitExpr(a.value))") }
+        return "(\(typeName)){ .tag = \(tag), .payload.\(caseName) = { \(inits.joined(separator: ", ")) } }"
+    }
+
     private mutating func emitMethodCall(receiver: IRExpr, method: String, args: [IRExpr]) -> String {
         guard case .named(let typeName, _) = receiver.type else {
             return "/* non-object method call: \(method) */"
@@ -716,7 +729,7 @@ public struct CodegenIR {
             if !bound.contains(n) { used.append(n) }
         case .fieldAccess(let base, _):
             collectUsesExpr(base, bound: bound, used: &used)
-        case .construct(_, let args):
+        case .construct(_, let args), .enumInit(_, _, let args):
             for a in args { collectUsesExpr(a.value, bound: bound, used: &used) }
         case .methodCall(let receiver, _, let args):
             collectUsesExpr(receiver, bound: bound, used: &used)

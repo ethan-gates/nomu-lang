@@ -100,6 +100,66 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(r.diagnostics.hasErrors)
     }
 
+    func testEnumConstructionQualified() {
+        let r = sema("""
+        enum Shape { case circle(radius: Int) case rect(w: Int, h: Int) }
+        fun f() -> Shape { return Shape.circle(radius: 10) }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let f) = r.module.decls[1],
+              case .ret(let e?) = f.body[0].kind,
+              case .enumInit(let t, let c, let args) = e.kind else { XCTFail(); return }
+        XCTAssertEqual(t, "Shape")
+        XCTAssertEqual(c, "circle")
+        XCTAssertEqual(args.count, 1)
+        XCTAssertEqual(e.type, .named("Shape", .enum_))
+    }
+
+    func testEnumConstructionLeadingDot() {
+        // Enum inferred from the return type.
+        let r = sema("""
+        enum Shape { case circle(radius: Int) case rect(w: Int, h: Int) }
+        fun f() -> Shape { return .rect(w: 2, h: 3) }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let f) = r.module.decls[1],
+              case .ret(let e?) = f.body[0].kind,
+              case .enumInit(_, let c, _) = e.kind else { XCTFail(); return }
+        XCTAssertEqual(c, "rect")
+        XCTAssertEqual(e.type, .named("Shape", .enum_))
+    }
+
+    func testLeadingDotNoContextDiagnostic() {
+        let r = sema("""
+        enum Color { case red case blue }
+        fun f() { let c = .red }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testLetFieldMutabilityOnIR() {
+        let r = sema("""
+        struct P {
+            let x: Int
+            var y: Int
+        }
+        """)
+        guard case .structDecl(let s) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertFalse(s.fields[0].isMutable)
+        XCTAssertTrue(s.fields[1].isMutable)
+    }
+
+    func testAssignToLetFieldDiagnostic() {
+        let r = sema("""
+        struct P {
+            let x: Int
+            var y: Int
+        }
+        fun f(p: P) { p.x = 5 }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
     func testUndefinedNameDiagnostic() {
         let r = sema("fun f() -> Int { return zzz }")
         XCTAssertTrue(r.diagnostics.hasErrors)

@@ -23,6 +23,7 @@ public enum IRDecl {
 public struct IRField {
     public let name: String
     public let type: Type
+    public let isMutable: Bool   // `var` vs `let` field; read by M5-C's deeply-immutable check
     public let span: Span
 }
 
@@ -140,6 +141,7 @@ public indirect enum ExprKind {
     case varRef(String)                                 // resolved local / param / global name
     case fieldAccess(base: IRExpr, field: String)
     case construct(typeName: String, args: [IRArg])     // struct / class / actor construction
+    case enumInit(typeName: String, caseName: String, args: [IRArg])    // enum value construction (M4.10)
     case methodCall(receiver: IRExpr, method: String, args: [IRExpr])   // actor sends (T3: type methods)
     case call(callee: IRExpr, args: [IRArg])            // function / builtin call
     case binary(BinOp, IRExpr, IRExpr)

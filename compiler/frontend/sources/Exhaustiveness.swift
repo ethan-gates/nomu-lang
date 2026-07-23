@@ -11,7 +11,7 @@ public func checkExhaustiveness(_ module: IRModule, into diags: DiagnosticSink) 
     for decl in module.decls {
         if case .enumDecl(let e) = decl { enumCases[e.name] = e.cases.map(\.name) }
     }
-    var pass = ExhaustivenessPass(enumCases: enumCases, diags: diags)
+    let pass = ExhaustivenessPass(enumCases: enumCases, diags: diags)
     pass.run(module)
 }
 
@@ -68,7 +68,7 @@ private struct ExhaustivenessPass {
             break
         case .fieldAccess(let base, _):
             walkExpr(base)
-        case .construct(_, let args):
+        case .construct(_, let args), .enumInit(_, _, let args):
             for a in args { walkExpr(a.value) }
         case .methodCall(let receiver, _, let args):
             walkExpr(receiver); for a in args { walkExpr(a) }

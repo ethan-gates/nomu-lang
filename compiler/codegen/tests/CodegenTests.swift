@@ -313,6 +313,22 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(c.contains("switch (self.tag)"))
     }
 
+    func testEnumConstructionEmit() {
+        let c = gen("""
+        enum Shape { case circle(radius: Int) case rect(w: Int, h: Int) }
+        fun f() -> Shape { return Shape.circle(radius: 10) }
+        """)
+        XCTAssertTrue(c.contains("(Shape){ .tag = Shape_circle, .payload.circle = { .radius = 10 } }"))
+    }
+
+    func testEnumConstructionNoPayloadEmit() {
+        let c = gen("""
+        enum Color { case red case blue }
+        fun f() -> Color { return Color.blue }
+        """)
+        XCTAssertTrue(c.contains("(Color){ .tag = Color_blue }"))
+    }
+
     func testSleepBuiltin() {
         let c = gen("fun main() { let a = sleep(100) print(a) }")
         XCTAssertTrue(c.contains("#include <time.h>"))

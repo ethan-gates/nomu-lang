@@ -38,13 +38,13 @@ public struct Parser {
         var fields: [VarField] = []
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
-            if check(.kwVar) {
+            if check(.kwVar) || check(.kwLet) {
                 fields.append(parseVarField())
             } else if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseFuncDecl())
             } else {
-                error("expected 'var' or 'fun' in struct body, got \(currentKind)")
+                error("expected 'let', 'var', or 'fun' in struct body, got \(currentKind)")
             }
         }
         expect(.rBrace)
@@ -83,7 +83,7 @@ public struct Parser {
                 let fname = expectIdent()
                 expect(.colon)
                 let ftype = parseTypeRef()
-                fields.append(VarField(name: fname, type: ftype, span: spanFrom(fstart)))
+                fields.append(VarField(name: fname, type: ftype, isMutable: true, span: spanFrom(fstart)))
             } while eat(.comma)
             expect(.rParen)
         }
@@ -98,13 +98,13 @@ public struct Parser {
         var fields: [VarField] = []
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
-            if check(.kwVar) {
+            if check(.kwVar) || check(.kwLet) {
                 fields.append(parseVarField())
             } else if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseFuncDecl())
             } else {
-                error("expected 'var' or 'fun' in class body, got \(currentKind)")
+                error("expected 'let', 'var', or 'fun' in class body, got \(currentKind)")
             }
         }
         expect(.rBrace)
@@ -146,14 +146,16 @@ public struct Parser {
 
     // MARK: - Fields and params
 
+    // A `var` (mutable) or `let` (immutable) field; either keyword must begin its line.
     private mutating func parseVarField() -> VarField {
         let start = currentSpan
-        requireLineStart("var")
-        expect(.kwVar)
+        let isMutable = check(.kwVar)
+        requireLineStart(isMutable ? "var" : "let")
+        advance()   // consume `var` / `let`
         let name = expectIdent()
         expect(.colon)
         let type = parseTypeRef()
-        return VarField(name: name, type: type, span: spanFrom(start))
+        return VarField(name: name, type: type, isMutable: isMutable, span: spanFrom(start))
     }
 
     private mutating func parseActorField() -> ActorField {
@@ -428,6 +430,11 @@ public struct Parser {
             return parseClosure()
         case .ident(let name):
             advance(); return .ident(name, span: spanFrom(start))
+        case .dot:
+            // Leading-dot enum-case shorthand: `.circle` / `.circle(...)`. A trailing
+            // arg list, if any, is attached by parsePostfix as a call.
+            advance()
+            return .implicitMember(expectIdent(), span: spanFrom(start))
         default:
             error("expected expression, got \(currentKind)")
         }

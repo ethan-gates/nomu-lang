@@ -51,6 +51,7 @@ public struct StructDecl {
 public struct VarField {
     public let name: String
     public let type: TypeRef
+    public let isMutable: Bool   // `var` field vs `let` field (M4.10 field-level immutability)
     public let span: Span
 }
 
@@ -167,6 +168,8 @@ public indirect enum Expr {
     case stringLit(String, span: Span)
     case ident(String, span: Span)
     case member(Expr, String, span: Span)
+    case implicitMember(String, span: Span)   // leading-dot `.case` — enum type inferred from context
+
     case call(Expr, [Arg], span: Span)
     case binary(BinOp, Expr, Expr, span: Span)
     case closure(params: [Param], ret: TypeRef?, body: Block, span: Span)

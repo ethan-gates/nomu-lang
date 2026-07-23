@@ -64,6 +64,29 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(c.methods[0].name, "get")
     }
 
+    func testLetAndVarFields() {
+        let p = parse("""
+        struct P {
+            let x: Int
+            var y: Int
+        }
+        """)
+        guard case .structDecl(let s) = p.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(s.fields.count, 2)
+        XCTAssertFalse(s.fields[0].isMutable)   // let
+        XCTAssertTrue(s.fields[1].isMutable)    // var
+    }
+
+    func testLeadingDotParsesAsImplicitMember() {
+        let p = parse("fun f() { let t: Shape = .rect(w: 2, h: 3) }")
+        guard case .funcDecl(let f) = p.decls[0],
+              case .binding(let b) = f.body[0],
+              case .call(let callee, let args, _) = b.value,
+              case .implicitMember(let name, _) = callee else { XCTFail(); return }
+        XCTAssertEqual(name, "rect")
+        XCTAssertEqual(args.count, 2)
+    }
+
     func testActorDecl() {
         let p = parse("actor Counter {\nvar count: Int = 0\non bump(by: Point) { count += by.x } }")
         guard case .actorDecl(let a) = p.decls[0] else { XCTFail(); return }
