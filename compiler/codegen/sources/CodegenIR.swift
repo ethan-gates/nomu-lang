@@ -49,6 +49,14 @@ public struct CodegenIR {
     }
     private var handlerCtx: HandlerCtx? = nil
 
+    // Set while emitting a method body. In a **mutating** method, fields are accessed
+    // directly through `self` (no copy-to-locals) so nested self-calls see each other's
+    // writes; `methodFields` names those fields and `selfIsPointer` picks `->` vs `.`.
+    // A read-only method snapshots fields into locals instead (so closures can capture
+    // them), leaving `methodFields` empty.
+    private var methodFields: Set<String> = []
+    private var selfIsPointer = false
+
     public init(_ module: IRModule) {
         self.module = module
         for decl in module.decls {
@@ -236,12 +244,13 @@ public struct CodegenIR {
             : params.map { "\(cType($0.type)) \($0.name)" }.joined(separator: ", ")
     }
 
-    // MARK: - Instance methods (T3)
+    // MARK: - Instance methods (T3, mutating M4.11)
 
-    // `self` passing: value types (struct/enum) take `T self` by value; reference
-    // types (class) take `T* self`. Read-only in M4.9 — no mutex, no write-back.
-    private func selfCType(_ typeName: String, _ kind: NamedKind) -> String {
-        kind == .class_ ? "\(typeName)*" : typeName
+    // `self` passing: a read-only value-type (struct/enum) method takes `T self` by
+    // value; a **mutating** value-type method and every class method take `T* self`
+    // (a pointer), so writes reach the caller's value / the shared object.
+    private func selfIsPointerMethod(_ m: IRFunc, _ kind: NamedKind) -> Bool {
+        m.isMutating || kind == .class_
     }
 
     private mutating func emitMethodProtos(_ decl: IRDecl) {
@@ -267,24 +276,37 @@ public struct CodegenIR {
     }
 
     private func methodSig(_ m: IRFunc, _ typeName: String, _ kind: NamedKind) -> String {
-        var sig = "\(selfCType(typeName, kind)) self"
+        let selfC = selfIsPointerMethod(m, kind) ? "\(typeName)*" : typeName
+        var sig = "\(selfC) self"
         for p in m.params { sig += ", \(cType(p.type)) \(p.name)" }
         return sig
     }
 
     private mutating func emitMethodFunc(_ m: IRFunc, typeName: String, kind: NamedKind, fields: [IRField]) {
-        let op = kind == .class_ ? "->" : "."
+        let pointerSelf = selfIsPointerMethod(m, kind)
+        let op = pointerSelf ? "->" : "."
         out += "static \(cType(m.returnType)) \(typeName)_\(m.name)(\(methodSig(m, typeName, kind))) {\n"
         pushScope()                                   // self / fields / params live below the body frame
         declare("self", .named(typeName, kind))
-        // Copy fields to locals so the body reads them by bare name; read-only, so
-        // no write-back (mutating value-type methods are M5).
-        for f in fields {
-            out += "    \(cType(f.type)) \(f.name) = self\(op)\(f.name);\n"
-            declare(f.name, f.type)
+        let prevFields = methodFields, prevPointer = selfIsPointer
+        selfIsPointer = pointerSelf
+        if m.isMutating {
+            // Direct field access through `self` — reads/writes hit the real object,
+            // and a nested `self.other()` sees this method's writes (no stale copy).
+            methodFields = Set(fields.map(\.name))
+        } else {
+            // Read-only: snapshot fields into locals so the body reads them by bare
+            // name (and closures can capture them). No write-back.
+            methodFields = []
+            for f in fields {
+                out += "    \(cType(f.type)) \(f.name) = self\(op)\(f.name);\n"
+                declare(f.name, f.type)
+            }
         }
         for p in m.params { declare(p.name, p.type) }
         emitBlock(m.body, ind: "    ")
+        methodFields = prevFields
+        selfIsPointer = prevPointer
         popScope()
         out += "}\n\n"
     }
@@ -411,14 +433,20 @@ public struct CodegenIR {
         case .stringLit(let v): return "rt_str_lit(\(cStringLiteral(v)), \(v.utf8.count))"
 
         case .varRef(let n):
-            // Reading a spawn-bound name joins its fiber (idempotent) and yields the result.
-            if let l = lookupLocal(n), l.isSpawn {
-                return "(*(\(cType(l.type))*)spawn_join(&\(n)__h))"
+            if let l = lookupLocal(n) {
+                // Reading a spawn-bound name joins its fiber (idempotent), yielding the result.
+                if l.isSpawn { return "(*(\(cType(l.type))*)spawn_join(&\(n)__h))" }
+                return n
             }
+            // A field accessed by bare name inside a mutating method → through `self`.
+            if methodFields.contains(n) { return "self\(selfIsPointer ? "->" : ".")\(n)" }
             return n
 
         case .fieldAccess(let base, let field):
-            return "\(emitExpr(base))\(memberOp(base.type))\(field)"
+            // `self` is a pointer in a mutating value method / class method → `self->field`.
+            let op: String
+            if case .varRef("self") = base.kind, selfIsPointer { op = "->" } else { op = memberOp(base.type) }
+            return "\(emitExpr(base))\(op)\(field)"
 
         case .construct(let typeName, let args):
             return emitConstruct(typeName: typeName, args: args)
@@ -480,12 +508,26 @@ public struct CodegenIR {
     }
 
     private mutating func emitMethodCall(receiver: IRExpr, method: String, args: [IRExpr]) -> String {
-        guard case .named(let typeName, _) = receiver.type else {
+        guard case .named(let typeName, let kind) = receiver.type else {
             return "/* non-object method call: \(method) */"
         }
-        let recv = emitExpr(receiver)
+        // A mutating value-type (struct/enum) method takes `T* self`, so pass the
+        // receiver's address; the caller check guaranteed it's a mutable `var` lvalue.
+        // Class/actor receivers are already pointers, and so is `self` inside a
+        // pointer-self method (don't take its address again).
+        let byPointer = kind != .class_ && kind != .actor_ && methodIsMutating(typeName, method)
+        let recvAlreadyPointer: Bool = { if case .varRef("self") = receiver.kind { return selfIsPointer }; return false }()
+        let recvExpr = emitExpr(receiver)
+        let recv = (byPointer && !recvAlreadyPointer) ? "&\(recvExpr)" : recvExpr
         let argVals = args.map { emitExpr($0) }
         return "\(typeName)_\(method)(\(([recv] + argVals).joined(separator: ", ")))"
+    }
+
+    private func methodIsMutating(_ typeName: String, _ method: String) -> Bool {
+        let m = structs[typeName]?.methods.first { $0.name == method }
+            ?? enums[typeName]?.methods.first { $0.name == method }
+            ?? classes[typeName]?.methods.first { $0.name == method }
+        return m?.isMutating ?? false
     }
 
     private mutating func emitCall(callee: IRExpr, args: [IRArg]) -> String {

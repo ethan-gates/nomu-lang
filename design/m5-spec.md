@@ -4,7 +4,7 @@
 
 **Framing correction:** the roadmap calls M5 "generics + monomorphization," but the compiler has **no interfaces today** (concrete `struct`/`enum`/`class`/`actor`/`fun` only) and **no computed properties**. So M5 stacks three features — interfaces, computed properties, generics — plus error handling. Monomorphization is an *optional accelerator*, not the correctness baseline (see §5).
 
-**Prerequisites (M4.10, `m4.10-spec.md`):** grounding the exit criteria below against the code found two concrete features M5 assumes and the compiler lacks — **enum value construction** (needed for `Option<T>` in Phase B and `Result<T,E>` in Phase E) and **`let` fields** (needed for `Box<T> { let value: T }` in Phase B and Phase C's deeply-immutable-class shareability). Both are handled in **M4.10** before M5 starts. M4.10 also resolves the Phase A iteration demo (below), which assumes loops/collections the language doesn't have yet.
+**Prerequisites (M4.10, done):** grounding the exit criteria below against the code found two concrete features M5 assumes and the compiler lacked — **enum value construction** (needed for `Option<T>` in Phase B and `Result<T,E>` in Phase E) and **`let` fields** (needed for `Box<T> { let value: T }` in Phase B and Phase C's deeply-immutable-class shareability). Both shipped in **M4.10** (`types.md` §2 enum construction, `memory-model.md` §4 `let` fields). Mutating value-type methods, needed by Phase A's `{ get set }` setters, shipped in **M4.11** (`types.md` §3). The Phase A iteration demo (below) is also resolved — it assumes loops/collections the language doesn't have yet.
 
 ---
 
@@ -46,7 +46,7 @@ The prerequisite feature; everything else builds on witness tables.
 - Conformance: `extension T: I { … }` and `struct T: I { … }` sugar. Witness-table generation (accessor-shaped property slots — never offsets — plus method slots; reserve an unused type-witness slot for future associated types).
 - `any I` existentials (boxed, witness-dispatched); refinement `B: A`; `&` composition.
 - Dispatch: call-site property — direct/devirtualized on concrete + `some`; witness lookup through `any`.
-- **Exit:** an `interface Drawable` with a default method and a `{ get }` property; two concrete conformers; a `[any Drawable]` iterated with dynamic dispatch; a stored-backed `get` verified to lower to a field load on a concrete call. (The `[any Drawable]` iteration assumes loops + a collection type, neither of which exists in the language yet; `m4.10-spec.md` §5 resolves this demo — the interface feature itself needs neither.)
+- **Exit:** an `interface Drawable` with a default method and a `{ get }` property; two concrete conformers; a `[any Drawable]` iterated with dynamic dispatch; a stored-backed `get` verified to lower to a field load on a concrete call. (The `[any Drawable]` iteration assumes loops + a collection type, neither of which exists in the language yet. Resolve the demo by dispatching on individual `any Drawable` values instead, or pull minimal iteration forward — the interface feature itself needs neither.)
 
 ### Phase B — Generic parameters + constraints
 - Parse/typecheck `<T: I>`, `<T: I & J>` on `fun` and on types (`struct Box<T>`).

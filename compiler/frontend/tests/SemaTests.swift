@@ -160,6 +160,66 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(r.diagnostics.hasErrors)
     }
 
+    func testMutatingMethodInferred() {
+        let r = sema("""
+        struct C {
+            var count: Int
+            fun bump() { count = count + 1 }
+            fun get() -> Int { return count }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .structDecl(let s) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertTrue(s.methods.first { $0.name == "bump" }!.isMutating)
+        XCTAssertFalse(s.methods.first { $0.name == "get" }!.isMutating)
+    }
+
+    func testTransitiveMutatingInferred() {
+        // A method that calls a mutating method on `self` is itself mutating.
+        let r = sema("""
+        struct C {
+            var count: Int
+            fun bump() { count = count + 1 }
+            fun twice() { self.bump()  self.bump() }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .structDecl(let s) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertTrue(s.methods.first { $0.name == "twice" }!.isMutating)
+    }
+
+    func testMutatingCallOnLetRejected() {
+        let r = sema("""
+        struct C {
+            var count: Int
+            fun bump() { count = count + 1 }
+        }
+        fun f() { let c = C(count: 0)  c.bump() }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testMutatingCallOnVarAccepted() {
+        let r = sema("""
+        struct C {
+            var count: Int
+            fun bump() { count = count + 1 }
+        }
+        fun f() { var c = C(count: 0)  c.bump() }
+        """)
+        XCTAssertFalse(r.diagnostics.hasErrors, r.diagnostics.render())
+    }
+
+    func testReassignSelfRejected() {
+        let r = sema("""
+        struct C {
+            var count: Int
+            fun replace(o: C) { self = o }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
     func testUndefinedNameDiagnostic() {
         let r = sema("fun f() -> Int { return zzz }")
         XCTAssertTrue(r.diagnostics.hasErrors)

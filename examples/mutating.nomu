@@ -1,0 +1,29 @@
+// M4.11: mutating methods on value types. Mutating-ness is inferred (no keyword) —
+// a method that writes a field of `self`, or calls a mutating method on `self`, is
+// mutating, and can only be called on a `var` receiver.
+
+struct Counter {
+    var count: Int
+    fun bump() { count = count + 1 }
+    fun bumpBy(n: Int) { count = count + n }
+    fun bumpTwice() { self.bump()  self.bump() }   // transitive → inferred mutating
+    fun get() -> Int { return count }              // read-only → stays by value
+}
+
+class Box {
+    var val: Int
+    fun set(v: Int) { val = v }                    // classes are references: no var-receiver rule
+    fun get() -> Int { return val }
+}
+
+fun main() {
+    var c = Counter(count: 0)
+    c.bump()
+    c.bumpBy(n: 5)
+    c.bumpTwice()
+    print(c.get())        // 0 + 1 + 5 + 2 = 8
+
+    let b = Box(val: 10)  // a `let` binding to a class still allows mutation
+    b.set(v: 42)
+    print(b.get())        // 42
+}

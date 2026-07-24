@@ -86,23 +86,20 @@ public struct Typechecker {
             case .actorDecl(let a):
                 for h in a.handlers { checkBlock(h.body, lets: []) }
             case .structDecl(let s):
-                checkMethods(s.methods, fieldNames: s.fields.map(\.name))
+                checkMethods(s.methods)
             case .classDecl(let c):
-                checkMethods(c.methods, fieldNames: c.fields.map(\.name))
+                checkMethods(c.methods)
             case .enumDecl(let e):
-                checkMethods(e.methods, fieldNames: [])
+                checkMethods(e.methods)
             }
         }
     }
 
-    // Method bodies are read-only in M4.9: `self` and its fields are immutable, so
-    // seed them as `let`s — assigning to a bare field name or to `self` is rejected.
-    private func checkMethods(_ methods: [FuncDecl], fieldNames: [String]) {
-        for m in methods {
-            var lets = Set(fieldNames)
-            lets.insert("self")
-            checkBlock(m.body, lets: lets)
-        }
+    // Method bodies get the ordinary local let/var check. Field-write validity
+    // (`let` fields, reassigning `self`) is enforced in Sema (M4.11), which has the
+    // resolved receiver types the AST pass lacks; mutating-ness is inferred there.
+    private func checkMethods(_ methods: [FuncDecl]) {
+        for m in methods { checkBlock(m.body, lets: []) }
     }
 
     private func checkBlock(_ block: Block, lets: Set<String>) {

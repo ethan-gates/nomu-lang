@@ -329,6 +329,23 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(c.contains("(Color){ .tag = Color_blue }"))
     }
 
+    func testMutatingStructMethodEmit() {
+        // A mutating value-type method takes `self` by pointer, writes fields directly
+        // through it (no copy/write-back), and the call site passes the address.
+        let c = gen("""
+        struct Counter {
+            var count: Int
+            fun bump() { count = count + 1 }
+            fun get() -> Int { return count }
+        }
+        fun main() { var c = Counter(count: 0)  c.bump()  print(c.get()) }
+        """)
+        XCTAssertTrue(c.contains("static void Counter_bump(Counter* self)"))   // pointer self
+        XCTAssertTrue(c.contains("self->count = (self->count + 1)"))           // direct write
+        XCTAssertTrue(c.contains("static int64_t Counter_get(Counter self)"))  // read-only stays by value
+        XCTAssertTrue(c.contains("Counter_bump(&c)"))                          // address at the call site
+    }
+
     func testSleepBuiltin() {
         let c = gen("fun main() { let a = sleep(100) print(a) }")
         XCTAssertTrue(c.contains("#include <time.h>"))

@@ -13,7 +13,7 @@
 - **Strong static typing, no classic inheritance.** — **Decided.** Abstraction and reuse come from interfaces + extensions, not a base-class hierarchy (`interfaces.md`).
 - **Value / reference split** as the layout and semantics backbone — `struct`/`enum` are values, `class` is a reference (`memory-model.md`). — **Decided.**
 - **Interfaces/protocols with default methods** — the abstraction mechanism, detailed in `interfaces.md`. — **Decided.**
-- **Modest local inference** — bottom-up expression typing plus declared annotations: `let x = expr` infers `x` from `expr`, a function's return is checked against its annotation, and closure params come from their annotations. No Hindley–Milner / global inference (generic inference is M5, `generics.md`). — **Decided (M4.9).**
+- **Modest local inference** — bottom-up expression typing plus declared annotations: `let x = expr` infers `x` from `expr`, a function's return is checked against its annotation, and closure params come from their annotations. A contextual expected type also flows *inward* to a leading-dot enum case (`.circle(...)` — §2), from the binding annotation, argument slot, or return position; that is the one place typing is top-down rather than bottom-up. No Hindley–Milner / global inference (generic inference is M5, `generics.md`). — **Decided (M4.9; contextual enum inference M4.10).**
 
 No inheritance + interfaces + extensions is the Swift-protocol / Rust-trait / Go-interface design — well-trodden and coherent.
 
@@ -42,24 +42,29 @@ fun area(s: Shape) -> Int {
 
 Enums are value types (tagged unions, laid out inline); a recursive enum (`indirect`) becomes a reference under the hood (`memory-model.md`). Payload matching binds fields per case.
 
+**Construction** (landed M4.10): an enum value names a case and its payload, either **qualified** — `Shape.circle(radius: 10)` — or with the **leading-dot** shorthand `.circle(radius: 10)`, where the enum type is inferred from context (§1). A no-payload case constructs bare (`Color.red`, or `.red`); payload is **labeled**, matching struct construction.
+
 Exhaustiveness is checked as a pass over the typed mid-level IR (`compiler.md` §1), the same altitude Rust checks it (THIR). A `switch` on an enum that misses a case is a compile error; there is no `_`/default arm, so exhaustive means every declared case appears.
 
 ---
 
 ## 3. Methods on types
 
-**Instance methods on `struct`/`enum`/`class`**, declared with `fun` inside the type body — no separate keyword. — **Decided; landed M4.9 (read-only).**
+**Instance methods on `struct`/`enum`/`class`**, declared with `fun` inside the type body — no separate keyword. — **Decided; methods landed M4.9, mutating value-type methods M4.11.**
 
 ```
-struct Point {
-    var x: Int
-    var y: Int
-    fun sumSquares() -> Int { return x * x + y * y }
+struct Counter {
+    var count: Int
+    fun get() -> Int { return count }    // read-only
+    fun bump() { count = count + 1 }      // mutating (inferred)
 }
 ```
 
-- `self` is the receiver and is **immutable** in the current form. A method reads fields by bare name or via `self.`. Value types (`struct`/`enum`) take `self` by value; `class` takes it by reference.
-- **Mutating methods on value types are deferred** — they arrive with **property setters in M5** (`interfaces.md` for accessor-shaped properties; `memory-model.md` §4 for binding/immutability).
+- A method reads/writes fields by bare name or via `self.`. A **read-only** method takes `self` by value (`struct`/`enum`) or reference (`class`); a **mutating** value-type method takes `self` by reference so its writes reach the caller's value.
+- **Mutating-ness is inferred, not declared** — a method is mutating iff it writes a field of `self` or calls a mutating method on `self` (transitive). There is **no `mutating` keyword** (yet); the explicit form can be layered on later. — **Decided (2026-07-23).**
+  - **Calling a mutating value-type method requires a mutable (`var`) receiver.** A `let` value binding is immutable, so a mutating call on it is an error; assigning to a `let` field or reassigning `self` is an error. **Classes are reference types**, so their methods are callable on any binding (the reference is constant, the object is mutable).
+  - **The inferred bit is part of the method's exported contract** (`modules.md` §1): a body change that flips a method non-mutating → mutating is an API-breaking change with no signature-text change — the standing argument for eventually adding the explicit keyword.
+- **Property setters** — computed properties and `{ get set }` interface requirements build on mutating value-type methods and ship in M5 (`interfaces.md`; `memory-model.md` §4 for binding/immutability).
 - Methods are the seam for **interface method requirements** (M5, `interfaces.md`).
 - Surface: a `fun` member must begin its own line inside a type body (`syntax.md` §2).
 

@@ -64,7 +64,7 @@ private func appendDecl(_ decl: IRDecl, ind: String, into lines: inout [String])
 
 // An instance method — a `fun` member with an implicit `self` receiver (T3).
 private func appendMethod(_ m: IRFunc, ind: String, into lines: inout [String]) {
-    lines.append("\(ind)fun \(m.name)\(signature(m.params, m.returnType))")
+    lines.append("\(ind)\(m.isMutating ? "mutating " : "")fun \(m.name)\(signature(m.params, m.returnType))")
     for s in m.body { appendStmt(s, ind: ind + "  ", into: &lines) }
 }
 

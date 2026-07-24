@@ -18,12 +18,18 @@ public struct Sema {
     private var actors:  [String: ActorDecl]  = [:]
     private var funcs:   [String: FnSig]      = [:]   // named functions + non-print builtins
 
-    // Lexical scope stack for locals/params (name → type).
-    private var scopes: [[String: Type]] = []
+    // Lexical scope stack for locals/params (name → type + mutability).
+    private var scopes: [[String: Local]] = []
+    private struct Local { let type: Type; let isMutable: Bool }
 
     // Declared return type of the body being lowered — the contextual type for a
     // `return .case(...)` leading-dot construction (M4.10).
     private var currentReturnType: Type = .void
+
+    // Value-type method calls, recorded during lowering with their receiver's
+    // mutability; checked against inferred mutating-ness after the mutation pass (M4.11).
+    private struct CallSite { let callee: String; let receiverMutable: Bool; let span: Span }
+    private var methodCallSites: [CallSite] = []
 
     private struct FnSig { let params: [Type]; let ret: Type }
 
@@ -33,7 +39,14 @@ public struct Sema {
         collectGlobals()
         var decls: [IRDecl] = []
         for decl in program.decls { decls.append(lowerDecl(decl)) }
-        return SemaResult(module: IRModule(decls: decls), diagnostics: diags)
+
+        // M4.11: infer method mutating-ness, validate `let`-field / `self` writes,
+        // annotate the IR, then check that mutating value-type calls have a mutable receiver.
+        let mutation = analyzeMutation(IRModule(decls: decls), into: diags)
+        for site in methodCallSites where mutation.mutating.contains(site.callee) && !site.receiverMutable {
+            diags.error("cannot call mutating method on an immutable value — the receiver must be a 'var'", at: site.span)
+        }
+        return SemaResult(module: mutation.module, diagnostics: diags)
     }
 
     // MARK: - Global collection
@@ -135,7 +148,7 @@ public struct Sema {
             let body = lowerBlock(m.body)
             currentReturnType = saved
             popScope()
-            out.append(IRFunc(name: m.name, params: params, returnType: ret, body: body, span: m.span))
+            out.append(IRFunc(name: m.name, params: params, returnType: ret, body: body, isMutating: false, span: m.span))
         }
         return out
     }
@@ -149,7 +162,7 @@ public struct Sema {
         let body = lowerBlock(f.body)
         currentReturnType = saved
         popScope()
-        return IRFunc(name: f.name, params: params, returnType: ret, body: body, span: f.span)
+        return IRFunc(name: f.name, params: params, returnType: ret, body: body, isMutating: false, span: f.span)
     }
 
     private mutating func lowerActor(_ a: ActorDecl) -> IRActor {
@@ -188,7 +201,7 @@ public struct Sema {
             let annotated = b.type.map { resolve($0) }
             let value = checkExpr(b.value, expected: annotated)
             let type = annotated ?? value.type
-            declare(b.name, type)
+            declare(b.name, type, isMutable: b.isMutable)
             return IRStmt(kind: .letBinding(name: b.name, isMutable: b.isMutable, value: value), span: b.span)
 
         case .spawnLet(let name, _, let value, let span):
@@ -325,6 +338,12 @@ public struct Sema {
                 if let method = methodDecl(typeName, kind, name) {
                     let irArgs = args.map { checkExpr($0.value) }
                     checkArgTypes(irArgs, against: method.params.map { resolve($0.type) }, at: span)
+                    // Value types (struct/enum) get the mutating-receiver check; classes are
+                    // reference types, so a mutating method is callable on any binding.
+                    if kind != .class_ {
+                        methodCallSites.append(CallSite(callee: "\(typeName).\(name)",
+                                                        receiverMutable: isMutableReceiver(base), span: span))
+                    }
                     return IRExpr(type: resolve(method.returnType), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
@@ -485,14 +504,33 @@ public struct Sema {
         IRExpr(type: type, span: span, kind: .varRef(name))
     }
 
+    // A mutable receiver for a mutating method call (M4.11, conservative first cut):
+    // a `var` local, or `self` (mutation through self makes the enclosing method
+    // mutating by inference, which keeps the check sound). Anything else — a `let`
+    // local, a parameter, a field access, a temporary — is immutable.
+    private func isMutableReceiver(_ base: Expr) -> Bool {
+        if case .ident(let name, _) = base {
+            return name == "self" || lookupMutable(name)
+        }
+        return false
+    }
+
     // MARK: - Scopes
 
     private mutating func pushScope() { scopes.append([:]) }
     private mutating func popScope()  { scopes.removeLast() }
-    private mutating func declare(_ name: String, _ type: Type) { scopes[scopes.count - 1][name] = type }
+    private mutating func declare(_ name: String, _ type: Type, isMutable: Bool = false) {
+        scopes[scopes.count - 1][name] = Local(type: type, isMutable: isMutable)
+    }
 
     private func lookup(_ name: String) -> Type? {
-        for scope in scopes.reversed() { if let t = scope[name] { return t } }
+        for scope in scopes.reversed() { if let l = scope[name] { return l.type } }
         return nil
+    }
+
+    // Whether `name` is a mutable (`var`) local — used by the M4.11 caller check.
+    private func lookupMutable(_ name: String) -> Bool {
+        for scope in scopes.reversed() { if let l = scope[name] { return l.isMutable } }
+        return false
     }
 }

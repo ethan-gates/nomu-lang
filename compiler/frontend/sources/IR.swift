@@ -88,6 +88,7 @@ public struct IRFunc {
     public let params: [IRParam]
     public let returnType: Type       // .void if none declared
     public let body: [IRStmt]
+    public let isMutating: Bool       // inferred: a method that mutates `self` (M4.11); false for free functions
     public let span: Span
 }
 

@@ -68,7 +68,7 @@ This is the Swift model, and it replaces the retired `shared let`/`val` freeze m
 
 - `let` — the name cannot be rebound. For a **value type** this makes the whole value immutable (value semantics do the work). For a **reference type** it prevents rebinding the name; the object's interior mutability follows the type's fields.
 - `var` — rebindable; for a value type, mutable in place.
-- **Field-level:** a field declared `let` is immutable through any binding; an unmarked field follows the binding.
+- **Field-level:** a field declared `let` is immutable through any binding; an unmarked field follows the binding. (`let`/`var` fields on `struct`/`class` landed M4.10 — assigning to a `let` field is a compile error; the flag also feeds the deeply-immutable-class check for shareability, `concurrency.md` §5.)
 
 A class whose fields are all `let` (recursively) is a deeply-immutable type — the basis for safe concurrent read-sharing.
 

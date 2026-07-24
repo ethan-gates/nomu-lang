@@ -18,7 +18,7 @@
 ## 1. Modules — Open
 
 - **What a module is** — a compilation unit and namespace: a directory, an explicitly declared unit, or a package. Undecided.
-- **Separate compilation & the compiled interface** — the unit the share analysis materializes into (binary now, textual option later, `concurrency.md` §5). Its format and what it carries (signatures, shareability, inlinable bodies, monomorphization info) is undecided.
+- **Separate compilation & the compiled interface** — the unit the share analysis materializes into (binary now, textual option later, `concurrency.md` §5). Its format and what it carries (signatures, shareability, **method mutating-ness**, inlinable bodies, monomorphization info) is undecided. Note: method mutating-ness is **inferred** from the body (`types.md` §3), so it's part of the exported interface even though it's not in the signature text — a body change that flips it is an API-breaking change (the standing argument for an explicit `mutating` keyword later).
 - **Packages / dependencies** — how modules are grouped, versioned, and resolved. Undecided.
 - **Import / visibility across modules** — how names cross a module boundary.
 

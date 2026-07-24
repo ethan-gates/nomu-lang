@@ -20,6 +20,7 @@ A typed **mid-level IR** sits between the parser and the code-generation backend
 
 Passes over the mid-level IR:
 - **exhaustiveness checking** — *implemented (M4.9)*; runs on the typed IR, the altitude Rust uses (THIR).
+- **mutation analysis** — *implemented (M4.11)*; infers each method's mutating-ness (writes to `self`, transitively through self-calls) and validates `let`-field / `self` writes (`types.md` §3).
 - **share analysis** — materializing shareability into module interfaces (`concurrency.md` §5). *Currently still in codegen* (spawn-capture + actor-handler-param checks); migrates to an IR pass with M5's shareability work.
 - **closure conversion** — *currently still in codegen* (closures stay first-class in the IR); promoted to a pass later.
 - **monomorphization** — M5.
