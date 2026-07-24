@@ -4,7 +4,13 @@
 
 **Framing correction:** the roadmap calls M5 "generics + monomorphization," but the compiler has **no interfaces today** (concrete `struct`/`enum`/`class`/`actor`/`fun` only) and **no computed properties**. So M5 stacks three features — interfaces, computed properties, generics — plus error handling. Monomorphization is an *optional accelerator*, not the correctness baseline (see §5).
 
-**Prerequisites (M4.10, done):** grounding the exit criteria below against the code found two concrete features M5 assumes and the compiler lacked — **enum value construction** (needed for `Option<T>` in Phase B and `Result<T,E>` in Phase E) and **`let` fields** (needed for `Box<T> { let value: T }` in Phase B and Phase C's deeply-immutable-class shareability). Both shipped in **M4.10** (`types.md` §2 enum construction, `memory-model.md` §4 `let` fields). Mutating value-type methods, needed by Phase A's `{ get set }` setters, shipped in **M4.11** (`types.md` §3). The Phase A iteration demo (below) is also resolved — it assumes loops/collections the language doesn't have yet.
+**Prerequisites:** grounding the exit criteria below against the code found concrete features M5 assumes and the compiler lacked, each shipped as a short pre-M5 slice:
+- **Enum value construction** (needed for `Option<T>` in Phase B and `Result<T,E>` in Phase E) and **`let` fields** (needed for `Box<T> { let value: T }` in Phase B and Phase C's deeply-immutable-class shareability) — **M4.10** (`types.md` §2, `memory-model.md` §4).
+- **Mutating value-type methods**, needed by Phase A's `{ get set }` setters and computed-property setters — **M4.11** (`types.md` §3).
+- **Plain extensions** `extension T { … }` (non-conformance), the parse/member-merge path Phase A's conformance extensions reuse — **M4.12** (`interfaces.md` §1, plain form as built). The compiler had no `extension` construct at all.
+- **Nomu prelude mechanism** (the home for Phase B/E's `Option`/`Result`/`Box`, compiled alongside user code) plus the C-source split — **M4.13** (`m4.13-spec.md`). There is no stdlib/prelude path today; hard-gates Phase B.
+
+The Phase A iteration demo (below) is also resolved — it assumes loops/collections the language doesn't have yet.
 
 ---
 
@@ -12,8 +18,9 @@
 
 **Ships in M5:**
 - Interfaces: declaration, requirements (method + property), overridable defaults, refinement (`B: A`), `&` composition.
-- Conformance via `extension T: I { … }` (and `struct T: I { … }` at-type sugar); witness tables.
-- Existentials `any I`; opaque types `some I`.
+- Conformance via `extension T: I { … }` (the conformance form; the plain form `extension T { … }` shipped in **M4.12**) and `struct T: I { … }` at-type sugar; witness tables.
+- `Self`-type in requirements + the existential-legality rule: constraint-only baseline in Phase A (a `Self`-mentioning interface is usable as `<T: I>` / `some I`, not `any I`), relaxed in **Phase F (M5.1)** to a position-sensitive rule so covariant-`Self` (`-> Self`) interfaces regain `any I` via erasure.
+- Existentials `any I`; opaque types `some I` (return-position, one underlying type, statically dispatched).
 - Computed properties + get/set accessors (language feature).
 - Generic parameters + interface bounds `<T: I>`; modular checking; type-argument inference; witness-passing lowering.
 - Exhaustiveness under generics.
@@ -39,14 +46,31 @@ Current pipeline (Swift, post-M4.9): `Lexer → Parser → AST → Typechecker (
 
 Phases are ordered by dependency. Each has an exit criterion expressed as programs that compile and run.
 
-### Phase A — Interfaces + computed properties
-The prerequisite feature; everything else builds on witness tables.
+### Phase A — Interfaces + computed properties + `some`
+The prerequisite feature; everything else builds on witness tables. Split into three coherent sub-parts.
+
+**A1 — interface core.**
 - Parse/typecheck `interface I { … }`: method requirements, property requirements (`var x: T { get }` / `{ get set }`), overridable defaults.
 - Computed properties + get/set accessors as a language feature (structs gain accessors; stored fields auto-synthesize trivial ones). Mutating setters on value types.
-- Conformance: `extension T: I { … }` and `struct T: I { … }` sugar. Witness-table generation (accessor-shaped property slots — never offsets — plus method slots; reserve an unused type-witness slot for future associated types).
-- `any I` existentials (boxed, witness-dispatched); refinement `B: A`; `&` composition.
-- Dispatch: call-site property — direct/devirtualized on concrete + `some`; witness lookup through `any`.
-- **Exit:** an `interface Drawable` with a default method and a `{ get }` property; two concrete conformers; a `[any Drawable]` iterated with dynamic dispatch; a stored-backed `get` verified to lower to a field load on a concrete call. (The `[any Drawable]` iteration assumes loops + a collection type, neither of which exists in the language yet. Resolve the demo by dispatching on individual `any Drawable` values instead, or pull minimal iteration forward — the interface feature itself needs neither.)
+- Conformance: `extension T: I { … }` (extends M4.12's plain extension with a conformance clause + witness generation) and `struct T: I { … }` sugar. Witness-table generation (accessor-shaped property slots — never offsets — plus method slots; reserve an unused type-witness slot for future associated types).
+- Refinement `B: A` (requirement aggregation + subtype edge; most-specific default wins, incomparable sibling defaults **cancel → mandatory**, `interfaces.md` §4.3); `&` composition.
+
+**A2 — `Self`-type requirements + existential legality.**
+- Allow `Self` in requirement signatures (`fun clone() -> Self`, `fun combined(with: Self) -> Self`). In a generic body `<T: I>` and behind `some I`, `Self` binds to the one known/hidden concrete type, so witness calls are well-typed.
+- **Existential restriction (interim, tightened in Phase F):** an interface that mentions `Self` anywhere in a requirement is **constraint-only** — legal as a generic bound and as `some I`, **rejected as `any I`** with a local error (a heterogeneous box can't guarantee two `Self`s are the same type). This blanket rule is the sound baseline; **Phase F (M5.1)** relaxes it to a position-sensitive one so covariant-`Self` interfaces regain `any I`.
+- The check is a property of the interface computed at declaration; refinement propagates it (`B: A` is constraint-only if `A` is).
+
+**A3 — `some I` opaque types.**
+- Parse/typecheck `some I` in **return position** (`fun makeShape() -> some Drawable`). Parameter-position `some` (anonymous-generic sugar for `<T: I>`) is **deferred** — Phase B's `<T: I>` already covers it (decision below).
+- **One underlying type:** every `return` in the body must yield the *same* concrete type; the caller sees an opaque type with identity that conforms to `I` but whose concrete identity is hidden.
+- **Lowering — no box, static dispatch.** The concrete type is fixed and compiler-known (only *hidden from the caller*), so requirement calls on a `some I` value devirtualize to direct calls / field loads — mono-independent static dispatch (`generics.md` §1, the reason `some` is core rather than deferred). Contrast `any I`, which boxes and dispatches through the witness.
+
+**Dispatch (all of A):** call-site property — direct/devirtualized on a concrete receiver and on `some I`; witness lookup through `any I`.
+
+**Exit:**
+- An `interface Drawable` with a default method and a `{ get }` property; two concrete conformers; individual `any Drawable` values dispatched dynamically; a stored-backed `get` verified to lower to a field load on a concrete call. (A collection of `[any Drawable]` iterated in a loop is the natural demo but assumes loops + a collection type the language lacks — dispatch on individual `any Drawable` values instead, or pull minimal iteration forward; the interface feature needs neither.)
+- A `fun makeShape() -> some Drawable` returns a hidden concrete type; the caller calls a requirement on it and the emitted C shows a **direct call, no witness indirection**; a body returning two different concrete types is a clean local error.
+- An interface with a `Self` requirement is usable as `some I` / a generic bound and **rejected** as `any I` with a clear message.
 
 ### Phase B — Generic parameters + constraints
 - Parse/typecheck `<T: I>`, `<T: I & J>` on `fun` and on types (`struct Box<T>`).
@@ -69,23 +93,31 @@ The prerequisite feature; everything else builds on witness tables.
 - **Exit:** a specialized `Box<Int>` shows no witness indirection in the emitted C on the hot path; benchmark parity target noted, not required.
 
 ### Phase E — Error handling
-- `Result<T, E>` as a generic enum in the stdlib (depends on Phase B generic enums).
+- `Result<T, E>` as a generic enum in the stdlib — a `stdlib/*.nomu` prelude citizen (the mechanism ships in M4.13; depends on Phase B generic enums).
 - Explicit `match` handling; no `?` operator, no typed throws (deferred).
 - **Exit:** a failable function returns `Result`, and a caller handles both cases via `match`.
+
+### Phase F — Covariant-`Self` existential erasure (M5.1, last)
+Sequenced last in M5; relaxes Phase A2's blanket constraint-only rule. Depends only on Phase A (existentials + `Self`-requirements), not on B–E, but scheduled after them as the closing M5 item.
+- **Position analysis on `Self`.** Classify each `Self` occurrence in a requirement as **covariant** (return position) or **contravariant/invariant** (parameter position; a `Self`-typed `{ get set }` property; `Self` nested under a mutable/`&`-composed slot).
+- **Refined existential rule.** An interface whose `Self` occurrences are **all covariant** becomes usable as `any I` again: a `-> Self` requirement **erases to `-> any I`** at the existential boundary (the box hands back another existential, which is sound — the caller never asserts two boxes share a concrete type). An interface with any contravariant/invariant `Self` stays **constraint-only** (the Phase A2 rule).
+- **Lowering.** Through `any I`, a covariant-`Self` requirement's witness returns the concrete `Self`, re-boxed as `any I` at the call boundary; concrete and `some I` sites are unaffected (they already know the type).
+- **Exit:** `interface Cloneable { fun clone() -> Self }` is usable as `any Cloneable` and `c.clone()` yields an `any Cloneable`; `interface Combinable { fun combined(with: Self) -> Self }` (contravariant `Self`) remains rejected as `any I` with the Phase A2 message; both stay usable as `<T: I>` / `some I`.
 
 ---
 
 ## 4. Dependencies
 
 ```
-A (interfaces + computed properties)
-└─ B (generics: params, constraints, witness-passing)
-   ├─ C (shared bound + conditional conformance)
-   ├─ D (monomorphization)          [accelerator, descopable]
-   └─ E (Result / error handling)
+A (interfaces + computed properties + Self-reqs + some)
+├─ B (generics: params, constraints, witness-passing)
+│  ├─ C (shared bound + conditional conformance)
+│  ├─ D (monomorphization)          [accelerator, descopable]
+│  └─ E (Result / error handling)
+└─ F (covariant-Self existential erasure)   [M5.1, sequenced last]
 ```
 
-A gates everything (witness tables). B gates C/D/E. C, D, E are independent of each other.
+A gates everything (witness tables). B gates C/D/E. C, D, E are independent of each other. F depends only on A but is sequenced last, closing M5.
 
 ---
 
@@ -113,3 +145,15 @@ M5 is a front-end + codegen milestone; the M4 scheduler (`runtime.md` §8 — fi
 - **Angle-bracket ambiguity.** `<`/`>` as generic brackets vs. comparison needs careful parser handling (the classic C++/Rust turbofish territory) — decide the disambiguation rule in Phase B.
 - **Mutating setters on value types.** New semantics in Phase A; keep read-only `{ get }` requirements the common path.
 - **Type-argument inference scope.** Bidirectional inference can sprawl; keep M5's inference to arguments + return position, explicit args otherwise.
+- **`some I` underlying-type unification.** The "all returns yield one concrete type" check is the delicate part of opaque types; without generic parameters in Phase A it is a straight equality over the return expressions' concrete types, but keep it a distinct pass so Phase B/D can extend it to specialized bodies.
+- **`Self`-requirement / existential split.** Once an interface is constraint-only, `any I` uses must be diagnosed early (at type-formation) rather than at call sites; keep read-only, `Self`-free interfaces the common existential path.
+
+---
+
+## 7. Deferred cleanups (parked, decide later)
+
+Cleanups spotted while doing adjacent work (M4.13 onward) but intentionally **not** done there, to keep those diffs behavior-preserving. Parked here to decide/schedule deliberately.
+
+- **Symbol mangling for generated code (from M4.13).** Generated Nomu functions emit into C's global namespace, so a Nomu name that collides with a libc symbol in scope (`stdio`/`pthread` are included into `user.c`) is a C compile error — surfaced when the prelude's `abs` clashed with libc `abs`. M4.13 sidestepped it (routed `free` through `rt_free` to keep `<stdlib.h>` out of `user.c`, and the seeded names avoid the remaining `stdio`/`pthread` surface), but `printf`, `remove`, etc. would still collide. Real fix: **mangle Nomu symbols** (e.g. a `nomu_` prefix / module-qualified names), which also subsumes the existing `main`→`nomu_main` special-case. Wants deciding alongside the module system (`modules.md`).
+- **Parallelism knob (pre-existing, now in `src/runtime/runtime.c`).** Carrier count is hardcoded `ncarriers = 4`; the `GOMAXPROCS`-equivalent is unwired (`runtime.md` §... poller/knob). Untouched by M4.13.
+- **`rt_alloc` header pointer-arithmetic hack** — already tracked in §5a invariant 2; drop it with the M5 object-model work.

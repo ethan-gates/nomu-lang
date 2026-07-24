@@ -1,0 +1,4 @@
+# Nomu project root marker. The compiler walks up from a source file to the nearest
+# directory containing this file to determine the output root (<root>/build/).
+# Configuration fields will be added later; for now only its existence matters.
+name: nomu-lang

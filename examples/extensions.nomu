@@ -1,0 +1,60 @@
+// M4.12: plain extensions. `extension T { … }` adds non-conformance instance
+// methods to an existing struct/enum/class — statically dispatched, merged into the
+// type as if written in its body. Extensions cannot declare stored properties, and
+// a mutating extension method on a value type follows the usual `var`-receiver rule.
+
+struct Rect {
+    var width: Int
+    var height: Int
+}
+
+extension Rect {
+    fun area() -> Int { return width * height }
+    fun scaledArea(by: Int) -> Int { return self.area() * by * by }   // calls another method
+    fun grow(by: Int) { width = width + by  height = height + by }    // inferred mutating
+}
+
+enum Dir {
+    case north
+    case south
+}
+
+extension Dir {
+    fun opposite() -> Dir {
+        switch self {
+        case .north: return .south
+        case .south: return .north
+        }
+    }
+    fun code() -> Int {
+        switch self {
+        case .north: return 0
+        case .south: return 1
+        }
+    }
+}
+
+class Account {
+    var balance: Int
+}
+
+extension Account {
+    fun deposit(amount: Int) { balance = balance + amount }   // class: no var-receiver rule
+    fun report() -> Int { return balance }
+}
+
+fun main() {
+    var r = Rect(width: 3, height: 4)
+    print(r.area())            // 12
+    print(r.scaledArea(by: 2)) // 12 * 4 = 48
+    r.grow(by: 1)              // 4 x 5
+    print(r.area())            // 20
+
+    let d = Dir.north
+    print(d.code())              // 0
+    print(d.opposite().code())   // 1 — extension method returning the enum
+
+    let a = Account(balance: 100)   // `let` binding to a class still allows mutation
+    a.deposit(amount: 50)
+    print(a.report())          // 150
+}

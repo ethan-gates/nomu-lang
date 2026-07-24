@@ -2,7 +2,5 @@ bazel-*
 .DS_Store
 bin/
 
-# Compiled example binaries (built next to their .nomu source). Keep sources only.
-examples/*
-!examples/*.nomu
-!examples/*.md
+# Compiler outputs — everything lands under <project-root>/build/.
+build/

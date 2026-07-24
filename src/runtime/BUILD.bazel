@@ -1,0 +1,26 @@
+load("@rules_swift//swift:swift.bzl", "swift_library")
+
+# Embed the runtime C sources + the Nomu prelude into a Swift constants file, so
+# nomuc carries them and stays a single relocatable binary (M4.13; m4.13-spec.md §3).
+# The .c/.h/.nomu files are the editable source of truth; this only bundles them.
+genrule(
+    name = "embedded_sources",
+    srcs = [
+        "runtime.h",
+        "runtime.c",
+        "core.c",
+        "//src/stdlib:core.nomu",
+    ],
+    outs = ["EmbeddedSources.swift"],
+    tools = ["embed.sh"],
+    cmd = "bash $(location embed.sh) $@ " +
+          "$(location runtime.h) $(location runtime.c) " +
+          "$(location core.c) $(location //src/stdlib:core.nomu)",
+)
+
+swift_library(
+    name = "embedded",
+    srcs = [":embedded_sources"],
+    module_name = "embedded",
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,4 @@
+# The Nomu standard library (prelude). Sources are embedded into nomuc by the
+# runtime package's genrule; they are not compiled by Bazel (nomuc compiles them
+# alongside user code at run time).
+exports_files(glob(["*.nomu"]))

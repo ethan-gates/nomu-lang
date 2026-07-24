@@ -1,0 +1,21 @@
+// Nomu standard library — core (M4.13).
+//
+// The first Nomu-written stdlib: compiled alongside every user program (prepended
+// under the single compilation unit), so these are callable with no import. Seeded
+// with monomorphic Int helpers that need no generics or new primitives. Generic
+// citizens (Option/Result/Box) arrive with M5. (Design: m4.13-spec.md §2.)
+
+fun abs(n: Int) -> Int {
+    if n < 0 { return 0 - n }
+    return n
+}
+
+fun max(a: Int, b: Int) -> Int {
+    if a > b { return a }
+    return b
+}
+
+fun min(a: Int, b: Int) -> Int {
+    if a < b { return a }
+    return b
+}

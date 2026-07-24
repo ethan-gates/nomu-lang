@@ -2,7 +2,7 @@
 
 alias(
     name = "nomuc",
-    actual = "//compiler/nomu-cli:nomuc",
+    actual = "//src/nomu-cli:nomuc",
 )
 
 alias(
