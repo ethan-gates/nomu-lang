@@ -15,6 +15,7 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
     case .structDecl(let s):
         lines.append("\(ind)StructDecl '\(s.name)'")
         for f in s.fields { lines.append("\(ind)  \(f.isMutable ? "var" : "let") \(f.name): \(f.type.name)") }
+        for p in s.properties { appendProperty(p, ind: ind + "  ", into: &lines) }
         for m in s.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .enumDecl(let e):
         lines.append("\(ind)EnumDecl '\(e.name)'")
@@ -22,10 +23,12 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
             let fields = c.fields.map { "\($0.name): \($0.type.name)" }.joined(separator: ", ")
             lines.append("\(ind)  Case '\(c.name)'(\(fields))")
         }
+        for p in e.properties { appendProperty(p, ind: ind + "  ", into: &lines) }
         for m in e.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .classDecl(let c):
         lines.append("\(ind)ClassDecl '\(c.name)'")
         for f in c.fields { lines.append("\(ind)  \(f.isMutable ? "var" : "let") \(f.name): \(f.type.name)") }
+        for p in c.properties { appendProperty(p, ind: ind + "  ", into: &lines) }
         for m in c.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .actorDecl(let a):
         lines.append("\(ind)ActorDecl '\(a.name)'")
@@ -56,6 +59,17 @@ private func appendMethod(_ m: FuncDecl, ind: String, into lines: inout [String]
     let ret = m.returnType.map { " -> \($0.name)" } ?? ""
     lines.append("\(ind)Method '\(m.name)'(\(params))\(ret)")
     appendBlock(m.body, ind: ind + "  ", into: &lines)
+}
+
+// A computed property: its getter body, and a setter body if settable (M5 A1).
+private func appendProperty(_ p: ComputedProperty, ind: String, into lines: inout [String]) {
+    lines.append("\(ind)Property '\(p.name)': \(p.type.name)")
+    lines.append("\(ind)  get")
+    appendBlock(p.getter, ind: ind + "    ", into: &lines)
+    if let setter = p.setter {
+        lines.append("\(ind)  set(\(setter.paramName))")
+        appendBlock(setter.body, ind: ind + "    ", into: &lines)
+    }
 }
 
 // MARK: - Statements

@@ -60,6 +60,7 @@ public struct ExtensionDecl {
 public struct StructDecl {
     public let name: String
     public let fields: [VarField]
+    public let properties: [ComputedProperty]   // M5 A1: computed properties (get / get-set)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
     public let span: Span
 }
@@ -71,9 +72,27 @@ public struct VarField {
     public let span: Span
 }
 
+// A computed property `var x: T { get { … } set(v) { … } }` (M5 A1; generics.md §3a).
+// Not storage — the getter (and optional setter) are accessor bodies. A bare-body
+// form `var x: T { <expr> }` is an implicit read-only get (setter == nil). The setter
+// binds its incoming value explicitly (`set(v)`), not Swift's implicit `newValue`.
+public struct ComputedProperty {
+    public let name: String
+    public let type: TypeRef
+    public let getter: Block
+    public let setter: Setter?        // nil = read-only
+    public let span: Span
+}
+
+public struct Setter {
+    public let paramName: String      // the explicit `set(name)` binding
+    public let body: Block
+}
+
 public struct EnumDecl {
     public let name: String
     public let cases: [EnumCaseDecl]
+    public let properties: [ComputedProperty]   // M5 A1: computed properties (enums store nothing)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
     public let span: Span
 }
@@ -87,6 +106,7 @@ public struct EnumCaseDecl {
 public struct ClassDecl {
     public let name: String
     public let fields: [VarField]
+    public let properties: [ComputedProperty]   // M5 A1: computed properties (get / get-set)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
     public let span: Span
 }

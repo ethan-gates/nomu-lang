@@ -88,10 +88,13 @@ public struct Typechecker {
                 for h in a.handlers { checkBlock(h.body, lets: []) }
             case .structDecl(let s):
                 checkMethods(s.methods)
+                checkProperties(s.properties)
             case .classDecl(let c):
                 checkMethods(c.methods)
+                checkProperties(c.properties)
             case .enumDecl(let e):
                 checkMethods(e.methods)
+                checkProperties(e.properties)
             case .extensionDecl:
                 break   // merged into its target before this pass (M4.12)
             }
@@ -103,6 +106,14 @@ public struct Typechecker {
     // resolved receiver types the AST pass lacks; mutating-ness is inferred there.
     private func checkMethods(_ methods: [FuncDecl]) {
         for m in methods { checkBlock(m.body, lets: []) }
+    }
+
+    // Accessor bodies get the same local let/var check as method bodies.
+    private func checkProperties(_ properties: [ComputedProperty]) {
+        for p in properties {
+            checkBlock(p.getter, lets: [])
+            if let setter = p.setter { checkBlock(setter.body, lets: []) }
+        }
     }
 
     private func checkBlock(_ block: Block, lets: Set<String>) {

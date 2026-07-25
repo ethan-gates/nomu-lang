@@ -171,4 +171,25 @@ final class ParserTests: XCTestCase {
         guard case .actorDecl(let a) = p.decls[0] else { XCTFail(); return }
         XCTAssertEqual(a.handlers[0].returnType?.name, "Int")
     }
+
+    func testComputedProperty() {
+        // A bare-body property is read-only; a get/set property records its setter param.
+        let p = parse("""
+        struct Rect {
+            var w: Int
+            var area: Int { w * w }
+            var scale: Int {
+                get { w }
+                set(s) { w = s }
+            }
+        }
+        """)
+        guard case .structDecl(let s) = p.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(s.fields.count, 1)          // only `w` is stored
+        XCTAssertEqual(s.properties.count, 2)
+        XCTAssertEqual(s.properties[0].name, "area")
+        XCTAssertNil(s.properties[0].setter)
+        XCTAssertEqual(s.properties[1].name, "scale")
+        XCTAssertEqual(s.properties[1].setter?.paramName, "s")
+    }
 }

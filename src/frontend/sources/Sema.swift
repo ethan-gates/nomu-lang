@@ -18,6 +18,11 @@ public struct Sema {
     private var actors:  [String: ActorDecl]  = [:]
     private var funcs:   [String: FnSig]      = [:]   // named functions + non-print builtins
 
+    // Computed properties (M5 A1), by owning type then property name. Drives member
+    // read → getter-call and assignment → setter-call routing during body lowering.
+    private struct PropInfo { let type: Type; let hasSetter: Bool }
+    private var computedProps: [String: [String: PropInfo]] = [:]
+
     // Lexical scope stack for locals/params (name → type + mutability).
     private var scopes: [[String: Local]] = []
     private struct Local { let type: Type; let isMutable: Bool }
@@ -63,6 +68,16 @@ public struct Sema {
                                       ret: resolve(f.returnType))
             case .extensionDecl:
                 break   // merged into its target before Sema (M4.12)
+            }
+        }
+        // Computed-property tables need the type dicts above populated first (a property
+        // type may name any user type), so register them in a second pass.
+        for decl in program.decls {
+            switch decl {
+            case .structDecl(let s): registerProps(s.name, s.properties)
+            case .enumDecl(let e):   registerProps(e.name, e.properties)
+            case .classDecl(let c):  registerProps(c.name, c.properties)
+            default: break
             }
         }
         // Prototype builtins (print is special-cased in checkCall — it is variadic-ish).
@@ -114,15 +129,18 @@ public struct Sema {
         switch decl {
         case .structDecl(let s):
             let fields = s.fields.map(lowerField)
-            let methods = lowerMethods(s.methods, selfType: .named(s.name, .struct_), fields: fields)
+            var methods = lowerMethods(s.methods, selfType: .named(s.name, .struct_), fields: fields)
+            methods += lowerAccessors(s.properties, selfType: .named(s.name, .struct_), fields: fields)
             return .structDecl(IRStruct(name: s.name, fields: fields, methods: methods, span: s.span))
         case .enumDecl(let e):
             let cases = e.cases.map { IREnumCase(name: $0.name, fields: $0.fields.map(lowerField), span: $0.span) }
-            let methods = lowerMethods(e.methods, selfType: .named(e.name, .enum_), fields: [])
+            var methods = lowerMethods(e.methods, selfType: .named(e.name, .enum_), fields: [])
+            methods += lowerAccessors(e.properties, selfType: .named(e.name, .enum_), fields: [])
             return .enumDecl(IREnum(name: e.name, cases: cases, methods: methods, span: e.span))
         case .classDecl(let c):
             let fields = c.fields.map(lowerField)
-            let methods = lowerMethods(c.methods, selfType: .named(c.name, .class_), fields: fields)
+            var methods = lowerMethods(c.methods, selfType: .named(c.name, .class_), fields: fields)
+            methods += lowerAccessors(c.properties, selfType: .named(c.name, .class_), fields: fields)
             return .classDecl(IRClass(name: c.name, fields: fields, methods: methods, span: c.span))
         case .actorDecl(let a):
             return .actorDecl(lowerActor(a))
@@ -155,6 +173,56 @@ public struct Sema {
             out.append(IRFunc(name: m.name, params: params, returnType: ret, body: body, isMutating: false, span: m.span))
         }
         return out
+    }
+
+    private mutating func registerProps(_ typeName: String, _ props: [ComputedProperty]) {
+        var table: [String: PropInfo] = [:]
+        for p in props { table[p.name] = PropInfo(type: resolve(p.type), hasSetter: p.setter != nil) }
+        computedProps[typeName] = table
+    }
+
+    // A computed property lowers to accessor methods on its type: a getter `prop.get`
+    // (() -> T) and, if settable, a setter `prop.set` ((T) -> Void). The `.` keeps
+    // their names out of any user method's namespace (Mangle z-encodes it), and being
+    // ordinary methods they reuse method codegen, self-passing, and mutation inference
+    // (the setter is inferred mutating because it writes a field).
+    private mutating func lowerAccessors(_ props: [ComputedProperty], selfType: Type, fields: [IRField]) -> [IRFunc] {
+        var out: [IRFunc] = []
+        for p in props {
+            let propType = resolve(p.type)
+            let getBody = accessorBody(p.getter, returnType: propType, selfType: selfType,
+                                       fields: fields, params: [], span: p.span)
+            out.append(IRFunc(name: "\(p.name).get", params: [], returnType: propType,
+                              body: getBody, isMutating: false, span: p.span))
+            if let setter = p.setter {
+                let param = IRParam(label: setter.paramName, name: setter.paramName, type: propType, span: p.span)
+                let setBody = accessorBody(setter.body, returnType: .void, selfType: selfType,
+                                           fields: fields, params: [param], span: p.span)
+                out.append(IRFunc(name: "\(p.name).set", params: [param], returnType: .void,
+                                  body: setBody, isMutating: false, span: p.span))
+            }
+        }
+        return out
+    }
+
+    // Lowers an accessor body with `self`, the type's fields, and any accessor param in
+    // scope (mirroring `lowerMethods`). A single-expression getter body is an implicit
+    // `return` of that expression (the bare-body shorthand, and the common `get` form).
+    private mutating func accessorBody(_ block: Block, returnType: Type, selfType: Type,
+                                       fields: [IRField], params: [IRParam], span: Span) -> [IRStmt] {
+        var block = block
+        if returnType != .void, block.count == 1, case .expr(let e) = block[0] {
+            block = [.ret(e, span: span)]
+        }
+        pushScope()
+        declare("self", selfType)
+        for f in fields { declare(f.name, f.type) }
+        for p in params { declare(p.name, p.type) }
+        let saved = currentReturnType; currentReturnType = returnType
+        let body = lowerBlock(block)
+        currentReturnType = saved
+        popScope()
+        return body
     }
 
     private mutating func lowerFunc(_ f: FuncDecl) -> IRFunc {
@@ -214,11 +282,45 @@ public struct Sema {
             return IRStmt(kind: .spawnLet(name: name, value: v, resultType: v.type), span: span)
 
         case .assign(let lhs, let rhs, let span):
+            // A write to a computed property lowers to a setter accessor call (M5 A1).
+            if case .member(let base, let field, let mspan) = lhs {
+                let b = checkExpr(base)
+                if case .named(let tn, let kind) = b.type, let info = computedProps[tn]?[field] {
+                    guard info.hasSetter else {
+                        diags.error("cannot assign to read-only computed property '\(field)'", at: span)
+                        return IRStmt(kind: .exprStmt(checkExpr(rhs, expected: info.type)), span: span)
+                    }
+                    let value = checkExpr(rhs, expected: info.type)
+                    // The setter mutates the value; on a value type it needs a mutable receiver.
+                    if kind != .class_ {
+                        methodCallSites.append(CallSite(callee: "\(tn).\(field).set",
+                                                        receiverMutable: isMutableReceiver(base), span: span))
+                    }
+                    let call = IRExpr(type: .void, span: span,
+                                      kind: .methodCall(receiver: b, method: "\(field).set", args: [value]))
+                    return IRStmt(kind: .exprStmt(call), span: span)
+                }
+                let ftype = fieldType(of: b.type, field: field, at: mspan)
+                let target = IRExpr(type: ftype, span: mspan, kind: .fieldAccess(base: b, field: field))
+                rejectLetFieldTarget(target)
+                return IRStmt(kind: .assign(target: target, value: checkExpr(rhs)), span: span)
+            }
             let target = checkExpr(lhs)
             rejectLetFieldTarget(target)
             return IRStmt(kind: .assign(target: target, value: checkExpr(rhs)), span: span)
 
         case .compoundAssign(let lhs, let rhs, let span):
+            if case .member(let base, let field, let mspan) = lhs {
+                let b = checkExpr(base)
+                if case .named(let tn, _) = b.type, computedProps[tn]?[field] != nil {
+                    diags.error("compound assignment ('+=') to a computed property is not supported yet", at: span)
+                    return IRStmt(kind: .exprStmt(checkExpr(rhs)), span: span)
+                }
+                let ftype = fieldType(of: b.type, field: field, at: mspan)
+                let target = IRExpr(type: ftype, span: mspan, kind: .fieldAccess(base: b, field: field))
+                rejectLetFieldTarget(target)
+                return IRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
+            }
             let target = checkExpr(lhs)
             rejectLetFieldTarget(target)
             return IRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
@@ -289,6 +391,11 @@ public struct Sema {
                 return buildEnumInit(typeName, field, [], at: span)
             }
             let b = checkExpr(base)
+            // A computed-property read lowers to a getter accessor call (M5 A1).
+            if case .named(let tn, _) = b.type, let info = computedProps[tn]?[field] {
+                return IRExpr(type: info.type, span: span,
+                              kind: .methodCall(receiver: b, method: "\(field).get", args: []))
+            }
             let type = fieldType(of: b.type, field: field, at: span)
             return IRExpr(type: type, span: span, kind: .fieldAccess(base: b, field: field))
 

@@ -37,10 +37,14 @@ public struct Parser {
         let name = expectIdent()
         expect(.lBrace)
         var fields: [VarField] = []
+        var properties: [ComputedProperty] = []
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
             if check(.kwVar) || check(.kwLet) {
-                fields.append(parseVarField())
+                switch parseFieldOrProperty() {
+                case .field(let f):    fields.append(f)
+                case .property(let p): properties.append(p)
+                }
             } else if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseFuncDecl())
@@ -49,7 +53,7 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return StructDecl(name: name, fields: fields, methods: methods, span: spanFrom(start))
+        return StructDecl(name: name, fields: fields, properties: properties, methods: methods, span: spanFrom(start))
     }
 
     private mutating func parseEnumDecl() -> EnumDecl {
@@ -58,19 +62,28 @@ public struct Parser {
         let name = expectIdent()
         expect(.lBrace)
         var cases: [EnumCaseDecl] = []
+        var properties: [ComputedProperty] = []
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
             if check(.kwCase) {
                 cases.append(parseEnumCaseDecl())
+            } else if check(.kwVar) {
+                // Enums store nothing, so a `var` member must be a computed property.
+                switch parseFieldOrProperty() {
+                case .property(let p): properties.append(p)
+                case .field:           error("enums cannot store fields; a 'var' member must be a computed property")
+                }
+            } else if check(.kwLet) {
+                error("enums cannot store fields")
             } else if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseFuncDecl())
             } else {
-                error("expected 'case' or 'fun' in enum body, got \(currentKind)")
+                error("expected 'case', 'var', or 'fun' in enum body, got \(currentKind)")
             }
         }
         expect(.rBrace)
-        return EnumDecl(name: name, cases: cases, methods: methods, span: spanFrom(start))
+        return EnumDecl(name: name, cases: cases, properties: properties, methods: methods, span: spanFrom(start))
     }
 
     private mutating func parseEnumCaseDecl() -> EnumCaseDecl {
@@ -97,10 +110,14 @@ public struct Parser {
         let name = expectIdent()
         expect(.lBrace)
         var fields: [VarField] = []
+        var properties: [ComputedProperty] = []
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
             if check(.kwVar) || check(.kwLet) {
-                fields.append(parseVarField())
+                switch parseFieldOrProperty() {
+                case .field(let f):    fields.append(f)
+                case .property(let p): properties.append(p)
+                }
             } else if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseFuncDecl())
@@ -109,7 +126,7 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return ClassDecl(name: name, fields: fields, methods: methods, span: spanFrom(start))
+        return ClassDecl(name: name, fields: fields, properties: properties, methods: methods, span: spanFrom(start))
     }
 
     // A plain extension `extension T { … }` whose body holds only `fun` members.
@@ -174,8 +191,11 @@ public struct Parser {
 
     // MARK: - Fields and params
 
-    // A `var` (mutable) or `let` (immutable) field; either keyword must begin its line.
-    private mutating func parseVarField() -> VarField {
+    // A `var`/`let` member is a stored field unless a `{` follows its type, in which
+    // case it is a computed property (M5 A1). Computed properties must be `var`.
+    private enum Member { case field(VarField); case property(ComputedProperty) }
+
+    private mutating func parseFieldOrProperty() -> Member {
         let start = currentSpan
         let isMutable = check(.kwVar)
         requireLineStart(isMutable ? "var" : "let")
@@ -183,7 +203,52 @@ public struct Parser {
         let name = expectIdent()
         expect(.colon)
         let type = parseTypeRef()
-        return VarField(name: name, type: type, isMutable: isMutable, span: spanFrom(start))
+        if check(.lBrace) {
+            guard isMutable else { error("computed properties must be declared with 'var'") }
+            let (getter, setter) = parseAccessorBlock()
+            return .property(ComputedProperty(name: name, type: type, getter: getter, setter: setter, span: spanFrom(start)))
+        }
+        return .field(VarField(name: name, type: type, isMutable: isMutable, span: spanFrom(start)))
+    }
+
+    // `{ get { … } set(v) { … } }` — or a bare body `{ <stmts> }` that is an implicit
+    // read-only get. `get`/`set` are contextual (recognized only here by the `{`/`(`
+    // that must follow), so they stay usable as ordinary identifiers elsewhere.
+    private mutating func parseAccessorBlock() -> (Block, Setter?) {
+        expect(.lBrace)
+        if accessorKeyword("get") || accessorKeyword("set") {
+            var getter: Block? = nil
+            var setter: Setter? = nil
+            while !check(.rBrace) && !check(.eof) {
+                if accessorKeyword("get") {
+                    advance()   // `get`
+                    getter = parseBlock()
+                } else if accessorKeyword("set") {
+                    advance()   // `set`
+                    expect(.lParen)
+                    let param = expectIdent()
+                    expect(.rParen)
+                    setter = Setter(paramName: param, body: parseBlock())
+                } else {
+                    error("expected 'get' or 'set' in accessor block, got \(currentKind)")
+                }
+            }
+            expect(.rBrace)
+            guard let g = getter else { error("a computed property needs a 'get' accessor") }
+            return (g, setter)
+        }
+        // Bare body: the whole brace group is the getter (implicit read-only get).
+        var stmts: [Stmt] = []
+        while !check(.rBrace) && !check(.eof) { stmts.append(parseStmt()) }
+        expect(.rBrace)
+        return (stmts, nil)
+    }
+
+    // `get` immediately followed by `{`, or `set` immediately followed by `(` — the
+    // shapes that mark an accessor keyword rather than an ordinary identifier.
+    private func accessorKeyword(_ kw: String) -> Bool {
+        guard case .ident(let s) = currentKind, s == kw else { return false }
+        return kw == "get" ? peek() == .lBrace : peek() == .lParen
     }
 
     private mutating func parseActorField() -> ActorField {

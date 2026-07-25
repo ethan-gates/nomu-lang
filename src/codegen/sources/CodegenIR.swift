@@ -523,7 +523,13 @@ public struct CodegenIR {
         let byPointer = kind != .class_ && kind != .actor_ && methodIsMutating(typeName, method)
         let recvAlreadyPointer: Bool = { if case .varRef("self") = receiver.kind { return selfIsPointer }; return false }()
         let recvExpr = emitExpr(receiver)
-        let recv = (byPointer && !recvAlreadyPointer) ? "&\(recvExpr)" : recvExpr
+        // Match the callee's `self`: take the address for a mutating value method, or
+        // dereference `self` when a by-value method (e.g. a getter) is called from a
+        // pointer-`self` context (a mutating method).
+        let recv: String
+        if byPointer && !recvAlreadyPointer      { recv = "&\(recvExpr)" }
+        else if !byPointer && recvAlreadyPointer { recv = "(*\(recvExpr))" }
+        else                                     { recv = recvExpr }
         let argVals = args.map { emitExpr($0) }
         return "\(Mangle.method(typeName, method))(\(([recv] + argVals).joined(separator: ", ")))"
     }

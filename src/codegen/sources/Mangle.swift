@@ -21,8 +21,10 @@ enum Mangle {
     static let module = "main"
 
     // z-encode one Nomu identifier component. Nomu identifiers are [A-Za-z0-9_], so
-    // only `_` (freed for use as the component separator) and `z` (the escape) need
-    // escaping today; richer characters (generic `<>`, `,`) get added with M5.
+    // `_` (freed for use as the component separator) and `z` (the escape) need
+    // escaping; `.` appears in compiler-synthesized accessor names (`area.get`,
+    // M5 A1) and encodes too, keeping those out of any user method's name space.
+    // Richer characters (generic `<>`, `,`) get added later with monomorphization.
     static func z(_ s: String) -> String {
         var out = ""
         out.reserveCapacity(s.count)
@@ -30,6 +32,7 @@ enum Mangle {
             switch ch {
             case "z": out += "zz"
             case "_": out += "zu"
+            case ".": out += "zd"
             default:  out.append(ch)
             }
         }

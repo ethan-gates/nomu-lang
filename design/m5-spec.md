@@ -51,7 +51,7 @@ The prerequisite feature; everything else builds on witness tables. Split into t
 
 **A1 — interface core.**
 - Parse/typecheck `interface I { … }`: method requirements, property requirements (`var x: T { get }` / `{ get set }`), overridable defaults.
-- Computed properties + get/set accessors as a language feature (structs gain accessors; stored fields auto-synthesize trivial ones). Mutating setters on value types.
+- Computed properties + get/set accessors as a language feature on **all three type kinds — struct, enum, and class** (resolved 2026-07-25, matching Swift: only *stored* properties are struct/class-only; enums get computed properties, typically a `get` over `match self`). Stored fields auto-synthesize trivial accessors; the get/set lowering is one method pair regardless of kind, and stored-field auto-synthesis is already handled per-kind (M4.9 methods, M4.10 `let`/`var` fields, M4.11 mutating value-type receivers). Mutating setters on value types. **Accessor spelling** (`generics.md` §3a): `var area: Int { get { … } set(v) { … } }`; a bare body is an implicit read-only get; the setter binds its incoming value explicitly as `set(name)` (not Swift's implicit `newValue`).
 - Conformance: `extension T: I { … }` (extends M4.12's plain extension with a conformance clause + witness generation) and `struct T: I { … }` sugar. Witness-table generation (accessor-shaped property slots — never offsets — plus method slots; reserve an unused type-witness slot for future associated types).
 - Refinement `B: A` (requirement aggregation + subtype edge; most-specific default wins, incomparable sibling defaults **cancel → mandatory**, `interfaces.md` §4.3); `&` composition.
 
@@ -75,7 +75,7 @@ The prerequisite feature; everything else builds on witness tables. Split into t
 ### Phase B — Generic parameters + constraints
 - Parse/typecheck `<T: I>`, `<T: I & J>` on `fun` and on types (`struct Box<T>`).
 - **Modular checking** against declared bounds (the locked invariant — bodies checked once against what the bound promises).
-- Type-argument inference (bidirectional: from arguments and return position; explicit `f<Int>(…)` fallback).
+- Type-argument inference (bidirectional: from arguments and return position). No explicit call-site type args (Swift model, §6); where inference can't resolve `T`, the caller supplies type context (an annotation), not a `f<Int>(…)` form.
 - Lowering: **witness-passing** (dictionary) — the correctness baseline; a generic body receives witness tables for its bounds. Reuses the exact `any` conformance representation.
 - Exhaustiveness under generics — checked on the generic enum definition; instantiation adds no cases.
 - **Exit:** `Option<T>`, `Box<T>`, a generic `fun map<T, U>(…)` over closures, and `fun describe<T: Drawable>(x: T)` all compile and run; a bound violation is a clean local error.
@@ -142,7 +142,7 @@ M5 is a front-end + codegen milestone; the M4 scheduler (`runtime.md` §8 — fi
 ## 6. Risks / watch items
 
 - **Monomorphization is descopable.** Phase D runs on the typed IR (built in M4.9); keep it a pure accelerator so it can slip past M5's core without blocking the milestone (goal 3).
-- **Angle-bracket ambiguity.** `<`/`>` as generic brackets vs. comparison needs careful parser handling (the classic C++/Rust turbofish territory) — decide the disambiguation rule in Phase B.
+- **Angle-bracket ambiguity — resolved (2026-07-25): Swift model.** `<`/`>` are generic brackets only in **declaration position** (`fun f<T>`, `struct Box<T>`) and **type position** (annotations like `let b: Box<Int>`), both unambiguous; in **expression position `<` is always comparison**. There is no explicit call-site type-argument form (`f<Int>(x)` does not exist) — inference plus type context cover it. Generic construction stays inference-based (`Box(3)` with the type from context/annotation), so generic brackets never appear in expression position and the parser needs no lookahead/backtracking. Turbofish rejected (new syntax); a whitespace-significance rule rejected (would make whitespace semantically significant across all expressions to buy a feature inference already covers). The whitespace rule stays available as a future escape hatch if explicit call-site type args are ever genuinely needed, since type/decl positions are already unambiguous. (`generics.md` §3a.)
 - **Mutating setters on value types.** New semantics in Phase A; keep read-only `{ get }` requirements the common path.
 - **Type-argument inference scope.** Bidirectional inference can sprawl; keep M5's inference to arguments + return position, explicit args otherwise.
 - **`some I` underlying-type unification.** The "all returns yield one concrete type" check is the delicate part of opaque types; without generic parameters in Phase A it is a straight equality over the return expressions' concrete types, but keep it a distinct pass so Phase B/D can extend it to specialized bodies.

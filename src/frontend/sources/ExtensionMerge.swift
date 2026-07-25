@@ -51,13 +51,13 @@ private struct ExtensionMerger {
             switch decl {
             case .structDecl(let s):
                 let methods = merged(s.methods, into: s.name)
-                out.append(.structDecl(StructDecl(name: s.name, fields: s.fields, methods: methods, span: s.span)))
+                out.append(.structDecl(StructDecl(name: s.name, fields: s.fields, properties: s.properties, methods: methods, span: s.span)))
             case .enumDecl(let e):
                 let methods = merged(e.methods, into: e.name)
-                out.append(.enumDecl(EnumDecl(name: e.name, cases: e.cases, methods: methods, span: e.span)))
+                out.append(.enumDecl(EnumDecl(name: e.name, cases: e.cases, properties: e.properties, methods: methods, span: e.span)))
             case .classDecl(let c):
                 let methods = merged(c.methods, into: c.name)
-                out.append(.classDecl(ClassDecl(name: c.name, fields: c.fields, methods: methods, span: c.span)))
+                out.append(.classDecl(ClassDecl(name: c.name, fields: c.fields, properties: c.properties, methods: methods, span: c.span)))
             case .actorDecl, .funcDecl:
                 out.append(decl)
             case .extensionDecl:

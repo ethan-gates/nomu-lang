@@ -229,4 +229,100 @@ final class SemaTests: XCTestCase {
         let r = sema("fun f(x: Nope) -> Int { return 0 }")
         XCTAssertTrue(r.diagnostics.hasErrors)
     }
+
+    // MARK: - Computed properties (M5 A1)
+
+    func testComputedPropertyReadIsGetterCall() {
+        let r = sema("""
+        struct Rect {
+            var w: Int
+            var area: Int { w * w }
+        }
+        fun f(r: Rect) -> Int { return r.area }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let f) = r.module.decls[1],
+              case .ret(let e?) = f.body[0].kind,
+              case .methodCall(_, let method, let args) = e.kind else { XCTFail(); return }
+        XCTAssertEqual(method, "area.get")
+        XCTAssertEqual(args.count, 0)
+        XCTAssertEqual(e.type, .int)
+    }
+
+    func testComputedPropertyWriteIsSetterCall() {
+        let r = sema("""
+        struct Rect {
+            var w: Int
+            var scale: Int {
+                get { w }
+                set(s) { w = s }
+            }
+        }
+        fun f() {
+            var r = Rect(w: 2)
+            r.scale = 3
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let f) = r.module.decls[1],
+              case .exprStmt(let e) = f.body[1].kind,
+              case .methodCall(_, let method, let args) = e.kind else { XCTFail(); return }
+        XCTAssertEqual(method, "scale.set")
+        XCTAssertEqual(args.count, 1)
+    }
+
+    func testAssignReadOnlyComputedPropertyErrors() {
+        let r = sema("""
+        struct Rect {
+            var w: Int
+            var area: Int { w * w }
+        }
+        fun f() {
+            var r = Rect(w: 2)
+            r.area = 9
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testSetComputedPropertyOnLetReceiverErrors() {
+        let r = sema("""
+        struct Rect {
+            var w: Int
+            var scale: Int {
+                get { w }
+                set(s) { w = s }
+            }
+        }
+        fun f() {
+            let r = Rect(w: 2)
+            r.scale = 3
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testEnumComputedProperty() {
+        let r = sema("""
+        enum Shape {
+            case dot
+            case square(side: Int)
+            var area: Int {
+                get {
+                    switch self {
+                    case .dot: return 0
+                    case .square(let s): return s * s
+                    }
+                }
+            }
+        }
+        fun f(s: Shape) -> Int { return s.area }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let f) = r.module.decls[1],
+              case .ret(let e?) = f.body[0].kind,
+              case .methodCall(_, let method, _) = e.kind else { XCTFail(); return }
+        XCTAssertEqual(method, "area.get")
+        XCTAssertEqual(e.type, .int)
+    }
 }

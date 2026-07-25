@@ -1,0 +1,39 @@
+// M5 A1: computed properties on struct/enum/class. A bare body is an implicit
+// read-only get; a { get { } set(v) { } } block adds a setter that binds its
+// incoming value explicitly. Access is field-shaped — `r.area`, `r.scale = 5` —
+// but lowers to accessor calls, not stored-field loads.
+
+struct Rect {
+    var w: Int
+    var h: Int
+    var area: Int { w * h }              // read-only shorthand
+    var scale: Int {
+        get { w / h }
+        set(s) { w = h * s }
+    }
+}
+
+enum Shape {
+    case dot
+    case square(side: Int)
+    var area: Int {                      // enums store nothing; a get over `match self`
+        get {
+            switch self {
+            case .dot: return 0
+            case .square(let s): return s * s
+            }
+        }
+    }
+}
+
+fun main() {
+    var r = Rect(w: 6, h: 3)
+    print(r.area)            // 18
+    print(r.scale)           // 2
+    r.scale = 5              // w = h * 5 = 15
+    print(r.w)               // 15
+    print(r.area)            // 45
+
+    print(Shape.square(side: 4).area)   // 16
+    print(Shape.dot.area)               // 0
+}

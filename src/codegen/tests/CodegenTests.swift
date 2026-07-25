@@ -461,4 +461,37 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(c.contains("nomu_main_Node* n = nomu_main_Node_new(42);"))
         XCTAssertFalse(c.contains("nomu_main_Node_release(n);"))
     }
+
+    // A computed property emits accessor functions (the `.` in `area.get` z-encodes to
+    // `zd`), and a read of it calls the getter rather than loading a field (M5 A1).
+    func testComputedPropertyEmit() {
+        let c = gen("""
+        struct Rect {
+            var w: Int
+            var area: Int { w * w }
+        }
+        fun f(r: Rect) -> Int { return r.area }
+        """)
+        XCTAssertTrue(c.contains("nomu_main_Rect_areazdget("))       // getter defined + called
+        XCTAssertFalse(c.contains("r.area"))                          // not a struct field load
+    }
+
+    func testComputedPropertySetterMutates() {
+        // The setter writes a field, so it is inferred mutating and takes `Rect* self`.
+        let c = gen("""
+        struct Rect {
+            var w: Int
+            var scale: Int {
+                get { w }
+                set(s) { w = s }
+            }
+        }
+        fun f() {
+            var r = Rect(w: 2)
+            r.scale = 3
+        }
+        """)
+        XCTAssertTrue(c.contains("nomu_main_Rect_scalezdset(nomu_main_Rect* self"))
+        XCTAssertTrue(c.contains("nomu_main_Rect_scalezdset(&r, 3)"))
+    }
 }
