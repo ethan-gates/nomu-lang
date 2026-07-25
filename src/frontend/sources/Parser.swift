@@ -24,6 +24,7 @@ public struct Parser {
         case .kwEnum:   return .enumDecl(parseEnumDecl())
         case .kwClass:  return .classDecl(parseClassDecl())
         case .kwActor:  return .actorDecl(parseActorDecl())
+        case .kwInterface: return .interfaceDecl(parseInterfaceDecl())
         case .kwExtension: return .extensionDecl(parseExtensionDecl())
         case .kwFunc:   return .funcDecl(parseFuncDecl())
         default:
@@ -31,10 +32,22 @@ public struct Parser {
         }
     }
 
+    // An optional `: I1, I2` conformance clause following a type name (M5 A1.3).
+    private mutating func parseConformanceClause() -> [Conformance] {
+        guard eat(.colon) else { return [] }
+        var out: [Conformance] = []
+        repeat {
+            let span = currentSpan
+            out.append(Conformance(name: expectIdent(), span: span))
+        } while eat(.comma)
+        return out
+    }
+
     private mutating func parseStructDecl() -> StructDecl {
         let start = currentSpan
         expect(.kwStruct)
         let name = expectIdent()
+        let conformances = parseConformanceClause()
         expect(.lBrace)
         var fields: [VarField] = []
         var properties: [ComputedProperty] = []
@@ -53,13 +66,15 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return StructDecl(name: name, fields: fields, properties: properties, methods: methods, span: spanFrom(start))
+        return StructDecl(name: name, fields: fields, properties: properties, methods: methods,
+                          conformances: conformances, span: spanFrom(start))
     }
 
     private mutating func parseEnumDecl() -> EnumDecl {
         let start = currentSpan
         expect(.kwEnum)
         let name = expectIdent()
+        let conformances = parseConformanceClause()
         expect(.lBrace)
         var cases: [EnumCaseDecl] = []
         var properties: [ComputedProperty] = []
@@ -83,7 +98,8 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return EnumDecl(name: name, cases: cases, properties: properties, methods: methods, span: spanFrom(start))
+        return EnumDecl(name: name, cases: cases, properties: properties, methods: methods,
+                        conformances: conformances, span: spanFrom(start))
     }
 
     private mutating func parseEnumCaseDecl() -> EnumCaseDecl {
@@ -108,6 +124,7 @@ public struct Parser {
         let start = currentSpan
         expect(.kwClass)
         let name = expectIdent()
+        let conformances = parseConformanceClause()
         expect(.lBrace)
         var fields: [VarField] = []
         var properties: [ComputedProperty] = []
@@ -126,7 +143,8 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return ClassDecl(name: name, fields: fields, properties: properties, methods: methods, span: spanFrom(start))
+        return ClassDecl(name: name, fields: fields, properties: properties, methods: methods,
+                         conformances: conformances, span: spanFrom(start))
     }
 
     // A plain extension `extension T { … }` whose body holds only `fun` members.
@@ -137,8 +155,11 @@ public struct Parser {
         expect(.kwExtension)
         let nameSpan = currentSpan
         let name = expectIdent()
-        if check(.colon) {
-            error("conformance extensions ('extension T: I') arrive in M5; M4.12 supports plain 'extension T { … }' only")
+        // `extension T: I` is a conformance extension (M5 A1.3); bare `extension T` is plain.
+        var conformance: Conformance? = nil
+        if eat(.colon) {
+            let ifaceSpan = currentSpan
+            conformance = Conformance(name: expectIdent(), span: ifaceSpan)
         }
         expect(.lBrace)
         var methods: [FuncDecl] = []
@@ -153,13 +174,80 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return ExtensionDecl(typeName: name, typeNameSpan: nameSpan, methods: methods, span: spanFrom(start))
+        return ExtensionDecl(typeName: name, typeNameSpan: nameSpan, conformance: conformance,
+                             methods: methods, span: spanFrom(start))
+    }
+
+    // interface I {
+    //     fun draw() -> String            // mandatory requirement (no body)
+    //     fun describe() -> String { … }   // overridable default (has a body)
+    //     var name: String { get }         // read-only property requirement
+    //     var count: Int { get set }       // settable property requirement
+    // }
+    private mutating func parseInterfaceDecl() -> InterfaceDecl {
+        let start = currentSpan
+        expect(.kwInterface)
+        let name = expectIdent()
+        expect(.lBrace)
+        var methods: [InterfaceMethod] = []
+        var properties: [InterfacePropertyReq] = []
+        while !check(.rBrace) && !check(.eof) {
+            if check(.kwFunc) {
+                requireLineStart("fun")
+                methods.append(parseInterfaceMethod())
+            } else if check(.kwVar) {
+                requireLineStart("var")
+                properties.append(parseInterfacePropertyReq())
+            } else {
+                error("expected 'fun' or 'var' requirement in interface body, got \(currentKind)")
+            }
+        }
+        expect(.rBrace)
+        return InterfaceDecl(name: name, methods: methods, properties: properties, span: spanFrom(start))
+    }
+
+    // A method requirement: a signature, optionally followed by a `{ … }` default body.
+    private mutating func parseInterfaceMethod() -> InterfaceMethod {
+        let start = currentSpan
+        expect(.kwFunc)
+        let name = expectIdent()
+        let params = parseParamList()
+        var returnType: TypeRef? = nil
+        if eat(.arrow) { returnType = parseTypeRef() }
+        let defaultBody: Block? = check(.lBrace) ? parseBlock() : nil
+        return InterfaceMethod(name: name, params: params, returnType: returnType,
+                               defaultBody: defaultBody, span: spanFrom(start))
+    }
+
+    // A property requirement: `var name: T { get }` or `{ get set }` — accessor shapes
+    // only, no bodies. `get`/`set` are contextual here, like in computed properties.
+    private mutating func parseInterfacePropertyReq() -> InterfacePropertyReq {
+        let start = currentSpan
+        expect(.kwVar)
+        let name = expectIdent()
+        expect(.colon)
+        let type = parseTypeRef()
+        expect(.lBrace)
+        guard accessorReqKeyword("get") else { error("property requirement needs 'get'") }
+        advance()   // `get`
+        var settable = false
+        if accessorReqKeyword("set") { advance(); settable = true }
+        expect(.rBrace)
+        return InterfacePropertyReq(name: name, type: type, isSettable: settable, span: spanFrom(start))
+    }
+
+    // `get`/`set` as bare words inside a property-requirement brace group (no `{`/`(`
+    // follows, unlike computed-property accessors).
+    private func accessorReqKeyword(_ kw: String) -> Bool {
+        if case .ident(let s) = currentKind, s == kw { return true }
+        return false
     }
 
     private mutating func parseActorDecl() -> ActorDecl {
         let start = currentSpan
         expect(.kwActor)
         let name = expectIdent()
+        let conformances = parseConformanceClause()
         expect(.lBrace)
         var fields: [ActorField] = []
         var handlers: [OnHandler] = []
@@ -173,7 +261,8 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return ActorDecl(name: name, fields: fields, handlers: handlers, span: spanFrom(start))
+        return ActorDecl(name: name, fields: fields, handlers: handlers,
+                         conformances: conformances, span: spanFrom(start))
     }
 
     private mutating func parseFuncDecl() -> FuncDecl {

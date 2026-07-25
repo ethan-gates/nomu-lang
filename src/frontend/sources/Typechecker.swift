@@ -9,7 +9,7 @@ public struct Typechecker {
     ]
 
     private enum DeclKind {
-        case struct_, enum_, class_, actor_, builtin
+        case struct_, enum_, class_, actor_, interface_, builtin
     }
 
     public init(_ program: Program) {
@@ -31,6 +31,7 @@ public struct Typechecker {
             case .enumDecl(let e):   typeKinds[e.name] = .enum_
             case .classDecl(let c):  typeKinds[c.name] = .class_
             case .actorDecl(let a):  typeKinds[a.name] = .actor_
+            case .interfaceDecl(let i): typeKinds[i.name] = .interface_
             case .funcDecl:          break
             case .extensionDecl:     break   // merged into its target before this pass (M4.12)
             }
@@ -72,7 +73,7 @@ public struct Typechecker {
         case .enum_:
             return enumDecl(named: name)?
                 .cases.flatMap(\.fields).contains { containsReference($0.type.name) } ?? false
-        case .builtin, nil:
+        case .interface_, .builtin, nil:
             return false
         }
     }
@@ -95,6 +96,8 @@ public struct Typechecker {
             case .enumDecl(let e):
                 checkMethods(e.methods)
                 checkProperties(e.properties)
+            case .interfaceDecl(let i):
+                for m in i.methods { if let body = m.defaultBody { checkBlock(body, lets: []) } }
             case .extensionDecl:
                 break   // merged into its target before this pass (M4.12)
             }

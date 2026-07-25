@@ -192,4 +192,39 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(s.properties[1].name, "scale")
         XCTAssertEqual(s.properties[1].setter?.paramName, "s")
     }
+
+    func testInterfaceDecl() {
+        let p = parse("""
+        interface Drawable {
+            fun draw() -> String
+            var name: String { get }
+            var count: Int { get set }
+            fun describe() -> String { return name }
+        }
+        """)
+        guard case .interfaceDecl(let i) = p.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(i.name, "Drawable")
+        XCTAssertEqual(i.methods.count, 2)
+        XCTAssertNil(i.methods[0].defaultBody)        // `draw` is a mandatory requirement
+        XCTAssertNotNil(i.methods[1].defaultBody)     // `describe` is an overridable default
+        XCTAssertEqual(i.properties.count, 2)
+        XCTAssertFalse(i.properties[0].isSettable)    // name { get }
+        XCTAssertTrue(i.properties[1].isSettable)     // count { get set }
+    }
+
+    func testConformanceClauseParses() {
+        let p = parse("""
+        struct Circle: Drawable {
+            var name: String
+            fun draw() -> String { return name }
+        }
+        extension Circle: Sized {
+            fun size() -> Int { return 1 }
+        }
+        """)
+        guard case .structDecl(let s) = p.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(s.conformances.map(\.name), ["Drawable"])
+        guard case .extensionDecl(let x) = p.decls[1] else { XCTFail(); return }
+        XCTAssertEqual(x.conformance?.name, "Sized")
+    }
 }

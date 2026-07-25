@@ -3,6 +3,7 @@
 
 public enum NamedKind: Equatable {
     case struct_, enum_, class_, actor_
+    case interface_   // M5 A1: the type of `self` inside an interface default body
 }
 
 public indirect enum Type: Equatable {

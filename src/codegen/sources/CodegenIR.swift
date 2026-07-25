@@ -850,6 +850,7 @@ public struct CodegenIR {
             switch kind {
             case .class_, .actor_: return Mangle.type(n) + "*"
             case .struct_, .enum_: return Mangle.type(n)
+            case .interface_:      return "void* /* any \(n) */"   // A1.4 defines the box; unreached in A1.2
             }
         case .error:      return "int64_t"   // unreachable for well-typed programs
         }

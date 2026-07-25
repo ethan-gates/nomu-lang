@@ -13,12 +13,12 @@ public func dumpAST(_ program: Program) -> String {
 private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [String]) {
     switch decl {
     case .structDecl(let s):
-        lines.append("\(ind)StructDecl '\(s.name)'")
+        lines.append("\(ind)StructDecl '\(s.name)'\(conformanceSuffix(s.conformances))")
         for f in s.fields { lines.append("\(ind)  \(f.isMutable ? "var" : "let") \(f.name): \(f.type.name)") }
         for p in s.properties { appendProperty(p, ind: ind + "  ", into: &lines) }
         for m in s.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .enumDecl(let e):
-        lines.append("\(ind)EnumDecl '\(e.name)'")
+        lines.append("\(ind)EnumDecl '\(e.name)'\(conformanceSuffix(e.conformances))")
         for c in e.cases {
             let fields = c.fields.map { "\($0.name): \($0.type.name)" }.joined(separator: ", ")
             lines.append("\(ind)  Case '\(c.name)'(\(fields))")
@@ -26,12 +26,12 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
         for p in e.properties { appendProperty(p, ind: ind + "  ", into: &lines) }
         for m in e.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .classDecl(let c):
-        lines.append("\(ind)ClassDecl '\(c.name)'")
+        lines.append("\(ind)ClassDecl '\(c.name)'\(conformanceSuffix(c.conformances))")
         for f in c.fields { lines.append("\(ind)  \(f.isMutable ? "var" : "let") \(f.name): \(f.type.name)") }
         for p in c.properties { appendProperty(p, ind: ind + "  ", into: &lines) }
         for m in c.methods { appendMethod(m, ind: ind + "  ", into: &lines) }
     case .actorDecl(let a):
-        lines.append("\(ind)ActorDecl '\(a.name)'")
+        lines.append("\(ind)ActorDecl '\(a.name)'\(conformanceSuffix(a.conformances))")
         for f in a.fields {
             let init_ = f.initializer.map { " = \(describeExpr($0))" } ?? ""
             lines.append("\(ind)  Field \(f.name): \(f.type.name)\(init_)")
@@ -41,6 +41,18 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
             let ret = h.returnType.map { " -> \($0.name)" } ?? ""
             lines.append("\(ind)  OnHandler '\(h.name)'(\(params))\(ret)")
             appendBlock(h.body, ind: ind + "    ", into: &lines)
+        }
+    case .interfaceDecl(let i):
+        lines.append("\(ind)InterfaceDecl '\(i.name)'")
+        for m in i.methods {
+            let params = m.params.map { "\($0.label): \($0.type.name)" }.joined(separator: ", ")
+            let ret = m.returnType.map { " -> \($0.name)" } ?? ""
+            let kind = m.defaultBody == nil ? "Requirement" : "Default"
+            lines.append("\(ind)  \(kind) '\(m.name)'(\(params))\(ret)")
+            if let body = m.defaultBody { appendBlock(body, ind: ind + "    ", into: &lines) }
+        }
+        for p in i.properties {
+            lines.append("\(ind)  PropertyReq '\(p.name)': \(p.type.name) { get\(p.isSettable ? " set" : "") }")
         }
     case .funcDecl(let f):
         let params = f.params.map { "\($0.label): \($0.type.name)" }.joined(separator: ", ")
@@ -59,6 +71,10 @@ private func appendMethod(_ m: FuncDecl, ind: String, into lines: inout [String]
     let ret = m.returnType.map { " -> \($0.name)" } ?? ""
     lines.append("\(ind)Method '\(m.name)'(\(params))\(ret)")
     appendBlock(m.body, ind: ind + "  ", into: &lines)
+}
+
+private func conformanceSuffix(_ cs: [Conformance]) -> String {
+    cs.isEmpty ? "" : ": " + cs.map(\.name).joined(separator: ", ")
 }
 
 // A computed property: its getter body, and a setter body if settable (M5 A1).

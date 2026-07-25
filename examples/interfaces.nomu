@@ -1,0 +1,39 @@
+// M5 A1: interfaces + conformance (struct/enum/class). A mandatory requirement must
+// be satisfied by a matching member; an overridable default may be omitted; property
+// requirements are satisfied by a stored field or a computed property (a `{ get set }`
+// requirement needs a settable one). Conformance is declared at the type (`struct T: I`)
+// or in a conformance extension (`extension T: I`). Dynamic dispatch through `any I`
+// arrives in a later slice — this checks that conformance holds.
+
+interface Drawable {
+    fun draw() -> String            // mandatory requirement
+    var name: String { get }        // read-only property requirement
+    fun label() -> String {         // overridable default
+        return concat(name, self.draw())
+    }
+}
+
+struct Circle: Drawable {
+    var name: String
+    var radius: Int
+    fun draw() -> String { return "O" }     // satisfies the requirement
+    // `label` inherited from the default
+}
+
+// A conformance can also be supplied in an extension (methods); the enum body carries
+// the state, including a computed property that satisfies the `{ get }` requirement.
+enum Suit {
+    case spade
+    case heart
+    var name: String { "suit" }             // computed property satisfies `{ get }`
+}
+extension Suit: Drawable {
+    fun draw() -> String { return "card" }
+}
+
+fun main() {
+    let c = Circle(name: "c", radius: 3)
+    print(c.draw())      // O
+    print(c.name)        // c
+    print(Suit.spade.draw())   // card
+}

@@ -38,6 +38,7 @@ private struct ExtensionMerger {
             case .enumDecl(let e):   kinds[e.name] = .enum_
             case .classDecl(let c):  kinds[c.name] = .class_
             case .actorDecl(let a):  kinds[a.name] = .actor_
+            case .interfaceDecl:     break   // interfaces aren't extension targets in A1.2
             case .funcDecl(let f):   funcNames.insert(f.name)
             case .extensionDecl(let x): byType[x.typeName, default: []].append(x)
             }
@@ -51,14 +52,14 @@ private struct ExtensionMerger {
             switch decl {
             case .structDecl(let s):
                 let methods = merged(s.methods, into: s.name)
-                out.append(.structDecl(StructDecl(name: s.name, fields: s.fields, properties: s.properties, methods: methods, span: s.span)))
+                out.append(.structDecl(StructDecl(name: s.name, fields: s.fields, properties: s.properties, methods: methods, conformances: s.conformances + extConformances(s.name), span: s.span)))
             case .enumDecl(let e):
                 let methods = merged(e.methods, into: e.name)
-                out.append(.enumDecl(EnumDecl(name: e.name, cases: e.cases, properties: e.properties, methods: methods, span: e.span)))
+                out.append(.enumDecl(EnumDecl(name: e.name, cases: e.cases, properties: e.properties, methods: methods, conformances: e.conformances + extConformances(e.name), span: e.span)))
             case .classDecl(let c):
                 let methods = merged(c.methods, into: c.name)
-                out.append(.classDecl(ClassDecl(name: c.name, fields: c.fields, properties: c.properties, methods: methods, span: c.span)))
-            case .actorDecl, .funcDecl:
+                out.append(.classDecl(ClassDecl(name: c.name, fields: c.fields, properties: c.properties, methods: methods, conformances: c.conformances + extConformances(c.name), span: c.span)))
+            case .actorDecl, .interfaceDecl, .funcDecl:
                 out.append(decl)
             case .extensionDecl:
                 break   // folded into its target above, or reported invalid
@@ -113,5 +114,10 @@ private struct ExtensionMerger {
 
     private func signature(_ m: FuncDecl) -> String {
         m.name + "(" + m.params.map { $0.type.name }.joined(separator: ",") + ")"
+    }
+
+    // Conformances contributed by `extension T: I` forms targeting `typeName` (M5 A1.3).
+    private func extConformances(_ typeName: String) -> [Conformance] {
+        (byType[typeName] ?? []).compactMap { $0.conformance }
     }
 }

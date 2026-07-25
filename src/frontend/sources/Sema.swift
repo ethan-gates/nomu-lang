@@ -16,6 +16,7 @@ public struct Sema {
     private var enums:   [String: EnumDecl]   = [:]
     private var classes: [String: ClassDecl]  = [:]
     private var actors:  [String: ActorDecl]  = [:]
+    private var interfaces: [String: InterfaceDecl] = [:]   // M5 A1
     private var funcs:   [String: FnSig]      = [:]   // named functions + non-print builtins
 
     // Computed properties (M5 A1), by owning type then property name. Drives member
@@ -42,8 +43,14 @@ public struct Sema {
 
     public mutating func check() -> SemaResult {
         collectGlobals()
+        checkConformances()
         var decls: [IRDecl] = []
-        for decl in program.decls { decls.append(lowerDecl(decl)) }
+        for decl in program.decls {
+            // Interfaces are abstract: validate them, but emit no IR (conformance in a
+            // later slice generates the concrete witnesses that carry the defaults).
+            if case .interfaceDecl(let i) = decl { checkInterface(i); continue }
+            decls.append(lowerDecl(decl))
+        }
 
         // M4.11: infer method mutating-ness, validate `let`-field / `self` writes,
         // annotate the IR, then check that mutating value-type calls have a mutable receiver.
@@ -63,6 +70,7 @@ public struct Sema {
             case .enumDecl(let e):   enums[e.name]   = e
             case .classDecl(let c):  classes[c.name] = c
             case .actorDecl(let a):  actors[a.name]  = a
+            case .interfaceDecl(let i): interfaces[i.name] = i
             case .funcDecl(let f):
                 funcs[f.name] = FnSig(params: f.params.map { resolve($0.type) },
                                       ret: resolve(f.returnType))
@@ -99,7 +107,15 @@ public struct Sema {
         case "String": return .string
         case "Void":   return .void
         default:
-            if let k = kindOf(ref.name) { return .named(ref.name, k) }
+            if let k = kindOf(ref.name) {
+                // A bare interface name isn't a usable type — `any I` / `some I` (later
+                // slices) make the erasure explicit (interfaces.md §4.4).
+                if k == .interface_ {
+                    diags.error("interface type '\(ref.name)' must be written as 'any \(ref.name)' or 'some \(ref.name)'", at: ref.span)
+                    return .error
+                }
+                return .named(ref.name, k)
+            }
             diags.error("unknown type '\(ref.name)'", at: ref.span)
             return .error
         }
@@ -110,6 +126,7 @@ public struct Sema {
         if enums[name]   != nil { return .enum_ }
         if classes[name] != nil { return .class_ }
         if actors[name]  != nil { return .actor_ }
+        if interfaces[name] != nil { return .interface_ }
         return nil
     }
 
@@ -119,7 +136,7 @@ public struct Sema {
         case .struct_: return structs[typeName]?.methods.first { $0.name == name }
         case .enum_:   return enums[typeName]?.methods.first { $0.name == name }
         case .class_:  return classes[typeName]?.methods.first { $0.name == name }
-        case .actor_:  return nil
+        case .actor_, .interface_:  return nil
         }
     }
 
@@ -146,9 +163,126 @@ public struct Sema {
             return .actorDecl(lowerActor(a))
         case .funcDecl(let f):
             return .funcDecl(lowerFunc(f))
+        case .interfaceDecl:
+            preconditionFailure("interfaces are validated in check(), not lowered (M5 A1)")
         case .extensionDecl:
             preconditionFailure("extensions must be merged before Sema (M4.12)")
         }
+    }
+
+    // Validate an interface (M5 A1): its requirement signatures must resolve, and each
+    // overridable default body must typecheck. In a default, `self` is the interface
+    // type, its property requirements are visible by bare name, and `self.req(...)` /
+    // `self.prop` resolve against the requirement set. No IR is retained — conformance
+    // (a later slice) compiles the defaults into each conformer's witnesses.
+    private mutating func checkInterface(_ i: InterfaceDecl) {
+        for m in i.methods {
+            for p in m.params { _ = resolve(p.type) }
+            _ = resolve(m.returnType)
+        }
+        for p in i.properties { _ = resolve(p.type) }
+
+        let selfType = Type.named(i.name, .interface_)
+        for m in i.methods {
+            guard let body = m.defaultBody else { continue }
+            let params = m.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+            let ret = resolve(m.returnType)
+            pushScope()
+            declare("self", selfType)
+            for p in i.properties { declare(p.name, resolve(p.type), isMutable: p.isSettable) }
+            for p in params { declare(p.name, p.type) }
+            let saved = currentReturnType; currentReturnType = ret
+            _ = lowerBlock(body)
+            currentReturnType = saved
+            popScope()
+        }
+    }
+
+    // A method requirement (or default) named `name` on an interface, if any.
+    private func interfaceMethod(_ typeName: String, _ name: String) -> InterfaceMethod? {
+        interfaces[typeName]?.methods.first { $0.name == name }
+    }
+
+    // MARK: - Conformance checking (M5 A1.3)
+
+    // Verify each declared conformance: every requirement of the interface is satisfied
+    // by a matching member (or an interface default). Struct/enum/class only — actor
+    // conformance is parked post-M5 (interfaces.md §1). No witnesses yet (A1.4).
+    private mutating func checkConformances() {
+        for decl in program.decls {
+            switch decl {
+            case .structDecl(let s):
+                checkConformance(s.name, s.conformances, methods: s.methods, fields: s.fields, properties: s.properties)
+            case .enumDecl(let e):
+                checkConformance(e.name, e.conformances, methods: e.methods, fields: [], properties: e.properties)
+            case .classDecl(let c):
+                checkConformance(c.name, c.conformances, methods: c.methods, fields: c.fields, properties: c.properties)
+            case .actorDecl(let a):
+                for conf in a.conformances {
+                    diags.error("actors cannot conform to interfaces yet ('\(a.name): \(conf.name)') — parked post-M5", at: conf.span)
+                }
+            default:
+                break
+            }
+        }
+    }
+
+    private mutating func checkConformance(_ typeName: String, _ conformances: [Conformance],
+                                           methods: [FuncDecl], fields: [VarField], properties: [ComputedProperty]) {
+        for conf in conformances {
+            guard let iface = interfaces[conf.name] else {
+                if kindOf(conf.name) != nil {
+                    diags.error("'\(conf.name)' is not an interface; '\(typeName)' can only conform to interfaces", at: conf.span)
+                } else {
+                    diags.error("unknown interface '\(conf.name)'", at: conf.span)
+                }
+                continue
+            }
+            for req in iface.methods { checkMethodRequirement(req, typeName: typeName, interface: conf, methods: methods) }
+            for req in iface.properties { checkPropertyRequirement(req, typeName: typeName, interface: conf, fields: fields, properties: properties) }
+        }
+    }
+
+    // A method requirement is satisfied by a same-named method with matching parameter
+    // types and return type, or (if none) by the interface's overridable default.
+    private mutating func checkMethodRequirement(_ req: InterfaceMethod, typeName: String, interface conf: Conformance, methods: [FuncDecl]) {
+        let named = methods.filter { $0.name == req.name }
+        if named.contains(where: { methodMatches(req, $0) }) { return }
+        if req.defaultBody != nil { return }
+        if named.isEmpty {
+            diags.error("type '\(typeName)' does not conform to '\(conf.name)': missing method '\(req.name)'", at: conf.span)
+        } else {
+            diags.error("type '\(typeName)' does not conform to '\(conf.name)': method '\(req.name)' has the wrong signature", at: conf.span)
+        }
+    }
+
+    private func methodMatches(_ req: InterfaceMethod, _ impl: FuncDecl) -> Bool {
+        guard req.params.count == impl.params.count else { return false }
+        for (rp, ip) in zip(req.params, impl.params) where resolve(rp.type) != resolve(ip.type) { return false }
+        return resolve(req.returnType) == resolve(impl.returnType)
+    }
+
+    // A property requirement is satisfied by a stored field or computed property of the
+    // same name and type; a `{ get set }` requirement needs a settable member.
+    private mutating func checkPropertyRequirement(_ req: InterfacePropertyReq, typeName: String, interface conf: Conformance, fields: [VarField], properties: [ComputedProperty]) {
+        let reqType = resolve(req.type)
+        if let f = fields.first(where: { $0.name == req.name }) {
+            if resolve(f.type) != reqType {
+                diags.error("type '\(typeName)' does not conform to '\(conf.name)': property '\(req.name)' has type '\(resolve(f.type))', expected '\(reqType)'", at: conf.span)
+            } else if req.isSettable && !f.isMutable {
+                diags.error("type '\(typeName)' does not conform to '\(conf.name)': property '\(req.name)' must be a 'var' to satisfy '{ get set }'", at: conf.span)
+            }
+            return
+        }
+        if let p = properties.first(where: { $0.name == req.name }) {
+            if resolve(p.type) != reqType {
+                diags.error("type '\(typeName)' does not conform to '\(conf.name)': property '\(req.name)' has type '\(resolve(p.type))', expected '\(reqType)'", at: conf.span)
+            } else if req.isSettable && p.setter == nil {
+                diags.error("type '\(typeName)' does not conform to '\(conf.name)': computed property '\(req.name)' needs a setter to satisfy '{ get set }'", at: conf.span)
+            }
+            return
+        }
+        diags.error("type '\(typeName)' does not conform to '\(conf.name)': missing property '\(req.name)'", at: conf.span)
     }
 
     private func lowerField(_ f: VarField) -> IRField {
@@ -391,6 +525,11 @@ public struct Sema {
                 return buildEnumInit(typeName, field, [], at: span)
             }
             let b = checkExpr(base)
+            // A property-requirement read inside an interface default (self: interface).
+            if case .named(let tn, .interface_) = b.type,
+               let prop = interfaces[tn]?.properties.first(where: { $0.name == field }) {
+                return IRExpr(type: resolve(prop.type), span: span, kind: .fieldAccess(base: b, field: field))
+            }
             // A computed-property read lowers to a getter accessor call (M5 A1).
             if case .named(let tn, _) = b.type, let info = computedProps[tn]?[field] {
                 return IRExpr(type: info.type, span: span,
@@ -443,6 +582,13 @@ public struct Sema {
                     let irArgs = args.map { checkExpr($0.value) }
                     checkArgTypes(irArgs, against: handler.params.map { resolve($0.type) }, at: span)
                     return IRExpr(type: resolve(handler.returnType), span: span,
+                                  kind: .methodCall(receiver: recv, method: name, args: irArgs))
+                }
+                // Requirement call inside an interface default (self: interface).
+                if kind == .interface_, let req = interfaceMethod(typeName, name) {
+                    let irArgs = args.map { checkExpr($0.value) }
+                    checkArgTypes(irArgs, against: req.params.map { resolve($0.type) }, at: span)
+                    return IRExpr(type: resolve(req.returnType), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
                 // Instance method on a struct/enum/class value.
@@ -527,7 +673,7 @@ public struct Sema {
         case .struct_: fields = structs[name]?.fields ?? []
         case .class_:  fields = classes[name]?.fields ?? []
         case .actor_:  fields = actors[name]?.fields.map { VarField(name: $0.name, type: $0.type, isMutable: true, span: $0.span) } ?? []
-        case .enum_:   fields = []
+        case .enum_, .interface_:   fields = []
         }
         if let f = fields.first(where: { $0.name == field }) { return resolve(f.type) }
         diags.error("type '\(name)' has no field '\(field)'", at: span)

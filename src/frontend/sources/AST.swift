@@ -42,17 +42,52 @@ public enum TopDecl {
     case enumDecl(EnumDecl)
     case classDecl(ClassDecl)
     case actorDecl(ActorDecl)
+    case interfaceDecl(InterfaceDecl)
     case funcDecl(FuncDecl)
     case extensionDecl(ExtensionDecl)
 }
 
-// A plain extension (`extension T { … }`) — adds non-conformance instance methods
-// to an existing struct/enum/class. Its methods are folded into the target type's
-// member set by the merge pass before typechecking (M4.12; design: m4.12-spec.md).
-// The conformance form (`extension T: I`) and stored properties are not allowed here.
+// An interface (M5 A1; interfaces.md §1). Its body holds method requirements — a bare
+// signature is mandatory, a signature with a body is an overridable default — and
+// property requirements (`var x: T { get }` / `{ get set }`, accessor-shaped, never
+// storage). Conformance (`extension T: I`), `any`/`some`, and refinement come later.
+public struct InterfaceDecl {
+    public let name: String
+    public let methods: [InterfaceMethod]
+    public let properties: [InterfacePropertyReq]
+    public let span: Span
+}
+
+public struct InterfaceMethod {
+    public let name: String
+    public let params: [Param]
+    public let returnType: TypeRef?
+    public let defaultBody: Block?    // nil = mandatory requirement; non-nil = overridable default
+    public let span: Span
+}
+
+public struct InterfacePropertyReq {
+    public let name: String
+    public let type: TypeRef
+    public let isSettable: Bool        // `{ get }` vs `{ get set }`
+    public let span: Span
+}
+
+// A named interface a type declares conformance to (`struct T: I`, `extension T: I`).
+// Carries the name's span for locality in conformance diagnostics (M5 A1.3).
+public struct Conformance {
+    public let name: String
+    public let span: Span
+}
+
+// An extension: `extension T { … }` (plain, M4.12) or `extension T: I { … }` (a
+// conformance extension supplying I's witnesses, M5 A1.3). Its methods are folded
+// into the target type's member set by the merge pass, and a conformance form also
+// records `T: I` onto the target. Stored properties are not allowed here.
 public struct ExtensionDecl {
     public let typeName: String
     public let typeNameSpan: Span   // for target-validation diagnostics
+    public let conformance: Conformance?   // nil = plain extension; set = `extension T: I`
     public let methods: [FuncDecl]
     public let span: Span
 }
@@ -62,6 +97,7 @@ public struct StructDecl {
     public let fields: [VarField]
     public let properties: [ComputedProperty]   // M5 A1: computed properties (get / get-set)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
+    public let conformances: [Conformance]   // M5 A1.3: interfaces this type conforms to
     public let span: Span
 }
 
@@ -94,6 +130,7 @@ public struct EnumDecl {
     public let cases: [EnumCaseDecl]
     public let properties: [ComputedProperty]   // M5 A1: computed properties (enums store nothing)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
+    public let conformances: [Conformance]   // M5 A1.3: interfaces this type conforms to
     public let span: Span
 }
 
@@ -108,6 +145,7 @@ public struct ClassDecl {
     public let fields: [VarField]
     public let properties: [ComputedProperty]   // M5 A1: computed properties (get / get-set)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
+    public let conformances: [Conformance]   // M5 A1.3: interfaces this type conforms to
     public let span: Span
 }
 
@@ -115,6 +153,7 @@ public struct ActorDecl {
     public let name: String
     public let fields: [ActorField]
     public let handlers: [OnHandler]
+    public let conformances: [Conformance]   // M5 A1.3: parsed, but actor conformance is rejected (parked)
     public let span: Span
 }
 

@@ -325,4 +325,138 @@ final class SemaTests: XCTestCase {
         XCTAssertEqual(method, "area.get")
         XCTAssertEqual(e.type, .int)
     }
+
+    // MARK: - Interfaces (M5 A1.2)
+
+    func testInterfaceDefaultTypechecksAndEmitsNoIR() {
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+            var name: String { get }
+            var count: Int { get set }
+            fun describe() -> String { return self.draw() }
+            fun bump() { count = count + 1 }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        XCTAssertTrue(r.module.decls.isEmpty)   // interfaces are abstract — no codegen
+    }
+
+    func testBareInterfaceTypeRejected() {
+        let r = sema("""
+        interface Shape {
+            fun area() -> Int
+        }
+        fun f(s: Shape) -> Int { return s.area() }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testInterfaceDefaultCallingUnknownRequirementRejected() {
+        let r = sema("""
+        interface I {
+            fun a() -> Int
+            fun b() -> Int { return self.nope() }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    // MARK: - Conformance checking (M5 A1.3)
+
+    func testValidConformance() {
+        // A default requirement may be omitted; a method + stored field satisfy the rest.
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+            var name: String { get }
+            fun describe() -> String { return self.draw() }
+        }
+        struct Circle: Drawable {
+            var name: String
+            fun draw() -> String { return name }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+    }
+
+    func testMissingRequirementRejected() {
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+            var name: String { get }
+        }
+        struct Bad: Drawable {
+            var r: Int
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testWrongSignatureRejected() {
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        struct Bad: Drawable {
+            fun draw() -> Int { return 0 }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testGetSetRequirementNeedsSettableMember() {
+        let r = sema("""
+        interface Counter {
+            var count: Int { get set }
+        }
+        struct Bad: Counter {
+            let count: Int
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testConformingToNonInterfaceRejected() {
+        let r = sema("""
+        struct Helper {
+            var x: Int
+        }
+        struct Bad: Helper {
+            var x: Int
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testActorConformanceRejected() {
+        let r = sema("""
+        interface Pingable {
+            fun ping() -> Int
+        }
+        actor Server: Pingable {
+            var n: Int = 0
+            on ping() -> Int { return n }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testComputedPropertySatisfiesRequirement() {
+        let r = sema("""
+        interface Sized {
+            var area: Int { get }
+            var scale: Int { get set }
+        }
+        struct Rect: Sized {
+            var w: Int
+            var area: Int { w * w }
+            var scale: Int {
+                get { w }
+                set(s) { w = s }
+            }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+    }
 }
