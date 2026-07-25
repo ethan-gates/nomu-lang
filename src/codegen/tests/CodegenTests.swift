@@ -27,13 +27,13 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(c.contains("typedef struct {"))
         XCTAssertTrue(c.contains("int64_t x;"))
         XCTAssertTrue(c.contains("int64_t y;"))
-        XCTAssertTrue(c.contains("} Point;"))
+        XCTAssertTrue(c.contains("} nomu_main_Point;"))
     }
 
     func testEnumEmit() {
         let c = gen("enum Shape { case circle(radius: Int) case rect(w: Int, h: Int) }")
-        XCTAssertTrue(c.contains("Shape_circle, Shape_rect"))
-        XCTAssertTrue(c.contains("Shape_tag tag;"))
+        XCTAssertTrue(c.contains("nomu_main_Shape_circle, nomu_main_Shape_rect"))
+        XCTAssertTrue(c.contains("nomu_main_Shape_tag tag;"))
         XCTAssertTrue(c.contains("int64_t radius;"))
         XCTAssertTrue(c.contains("} circle;"))
         XCTAssertTrue(c.contains("int64_t w;"))
@@ -42,13 +42,13 @@ final class CodegenTests: XCTestCase {
 
     func testFuncEmit() {
         let c = gen("fun add(a: Int, b: Int) -> Int { return a }")
-        XCTAssertTrue(c.contains("int64_t add(int64_t a, int64_t b)"))
+        XCTAssertTrue(c.contains("int64_t nomu_main_add(int64_t a, int64_t b)"))
         XCTAssertTrue(c.contains("return a;"))
     }
 
     func testMainRenamedToNomuMain() {
         // User `main` becomes `nomu_main`; the `int main` entry that calls it lives in
-        // the runtime translation unit (nomu_runtime.c), not the generated code (M4.13).
+        // the runtime translation unit (nomu_main_runtime.c), not the generated code (M4.13).
         let c = gen("fun main() { }")
         XCTAssertTrue(c.contains("void nomu_main(void)"))
         XCTAssertFalse(c.contains("int main(void)"))
@@ -62,7 +62,7 @@ final class CodegenTests: XCTestCase {
         }
         fun main() { let p = Point(x: 1, y: 2) }
         """)
-        XCTAssertTrue(c.contains("Point p = (Point){ .x = 1, .y = 2 };"))
+        XCTAssertTrue(c.contains("nomu_main_Point p = (nomu_main_Point){ .x = 1, .y = 2 };"))
     }
 
     func testMemberAccess() {
@@ -93,9 +93,9 @@ final class CodegenTests: XCTestCase {
         }
         """)
         XCTAssertTrue(c.contains("switch (s.tag)"))
-        XCTAssertTrue(c.contains("case Shape_circle:"))
+        XCTAssertTrue(c.contains("case nomu_main_Shape_circle:"))
         XCTAssertTrue(c.contains("int64_t r = s.payload.circle.radius;"))
-        XCTAssertTrue(c.contains("case Shape_rect:"))
+        XCTAssertTrue(c.contains("case nomu_main_Shape_rect:"))
         XCTAssertTrue(c.contains("int64_t w = s.payload.rect.w;"))
         XCTAssertTrue(c.contains("int64_t h = s.payload.rect.h;"))
     }
@@ -131,7 +131,7 @@ final class CodegenTests: XCTestCase {
         """)
         XCTAssertTrue(c.contains("static int64_t nomu_clo0(void* __envv, int64_t x)"))
         XCTAssertTrue(c.contains("int64_t base = __env->base;"))          // capture read in impl
-        XCTAssertTrue(c.contains("int64_t apply(Closure f, int64_t x)"))  // closure-typed param
+        XCTAssertTrue(c.contains("int64_t nomu_main_apply(Closure f, int64_t x)"))  // closure-typed param
         XCTAssertTrue(c.contains("__e->base = base;"))                    // capture by value at site
         XCTAssertTrue(c.contains(".fn = (void*)nomu_clo0"))
     }
@@ -150,7 +150,7 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(c.contains("static void* nomu_spawn0(void* __envv)"))     // thunk
         XCTAssertTrue(c.contains("SpawnHandle a__h; a__h.fiber = fiber_spawn(nomu_spawn0, a__e);"))
         XCTAssertTrue(c.contains("(*(int64_t*)spawn_join(&a__h))"))             // reading joins
-        XCTAssertTrue(c.contains("int64_t sq(int64_t n);"))                     // forward prototype
+        XCTAssertTrue(c.contains("int64_t nomu_main_sq(int64_t n);"))                     // forward prototype
     }
 
     func testEarlyReturnJoins() {
@@ -264,11 +264,11 @@ final class CodegenTests: XCTestCase {
             print(p.sum())
         }
         """)
-        XCTAssertTrue(c.contains("static int64_t Point_sum(Point self);"))   // prototype
-        XCTAssertTrue(c.contains("static int64_t Point_sum(Point self) {"))  // definition
+        XCTAssertTrue(c.contains("static int64_t nomu_main_Point_sum(nomu_main_Point self);"))   // prototype
+        XCTAssertTrue(c.contains("static int64_t nomu_main_Point_sum(nomu_main_Point self) {"))  // definition
         XCTAssertTrue(c.contains("int64_t x = self.x;"))                     // field copied by value
         XCTAssertTrue(c.contains("return (x + y);"))
-        XCTAssertTrue(c.contains("Point_sum(p)"))                           // call site
+        XCTAssertTrue(c.contains("nomu_main_Point_sum(p)"))                           // call site
     }
 
     func testClassMethodEmit() {
@@ -283,9 +283,9 @@ final class CodegenTests: XCTestCase {
             print(c.get())
         }
         """)
-        XCTAssertTrue(c.contains("static int64_t Counter_get(Counter* self)"))
+        XCTAssertTrue(c.contains("static int64_t nomu_main_Counter_get(nomu_main_Counter* self)"))
         XCTAssertTrue(c.contains("int64_t n = self->n;"))
-        XCTAssertTrue(c.contains("Counter_get(c)"))
+        XCTAssertTrue(c.contains("nomu_main_Counter_get(c)"))
     }
 
     func testEnumMethodEmit() {
@@ -300,7 +300,7 @@ final class CodegenTests: XCTestCase {
             }
         }
         """)
-        XCTAssertTrue(c.contains("static int64_t Shape_area(Shape self)"))
+        XCTAssertTrue(c.contains("static int64_t nomu_main_Shape_area(nomu_main_Shape self)"))
         XCTAssertTrue(c.contains("switch (self.tag)"))
     }
 
@@ -309,7 +309,7 @@ final class CodegenTests: XCTestCase {
         enum Shape { case circle(radius: Int) case rect(w: Int, h: Int) }
         fun f() -> Shape { return Shape.circle(radius: 10) }
         """)
-        XCTAssertTrue(c.contains("(Shape){ .tag = Shape_circle, .payload.circle = { .radius = 10 } }"))
+        XCTAssertTrue(c.contains("(nomu_main_Shape){ .tag = nomu_main_Shape_circle, .payload.circle = { .radius = 10 } }"))
     }
 
     func testEnumConstructionNoPayloadEmit() {
@@ -317,7 +317,7 @@ final class CodegenTests: XCTestCase {
         enum Color { case red case blue }
         fun f() -> Color { return Color.blue }
         """)
-        XCTAssertTrue(c.contains("(Color){ .tag = Color_blue }"))
+        XCTAssertTrue(c.contains("(nomu_main_Color){ .tag = nomu_main_Color_blue }"))
     }
 
     func testMutatingStructMethodEmit() {
@@ -331,10 +331,10 @@ final class CodegenTests: XCTestCase {
         }
         fun main() { var c = Counter(count: 0)  c.bump()  print(c.get()) }
         """)
-        XCTAssertTrue(c.contains("static void Counter_bump(Counter* self)"))   // pointer self
+        XCTAssertTrue(c.contains("static void nomu_main_Counter_bump(nomu_main_Counter* self)"))   // pointer self
         XCTAssertTrue(c.contains("self->count = (self->count + 1)"))           // direct write
-        XCTAssertTrue(c.contains("static int64_t Counter_get(Counter self)"))  // read-only stays by value
-        XCTAssertTrue(c.contains("Counter_bump(&c)"))                          // address at the call site
+        XCTAssertTrue(c.contains("static int64_t nomu_main_Counter_get(nomu_main_Counter self)"))  // read-only stays by value
+        XCTAssertTrue(c.contains("nomu_main_Counter_bump(&c)"))                          // address at the call site
     }
 
     func testSleepBuiltin() {
@@ -354,22 +354,22 @@ final class CodegenTests: XCTestCase {
         let c = gen("class Node {\nvar val: Int\n}")
         XCTAssertTrue(c.contains("ObjectHeader header;"))
         XCTAssertTrue(c.contains("int64_t val;"))
-        XCTAssertTrue(c.contains("} Node;"))
+        XCTAssertTrue(c.contains("} nomu_main_Node;"))
     }
 
     func testClassConstructor() {
         let c = gen("class Node {\nvar val: Int\n}")
-        XCTAssertTrue(c.contains("static Node* Node_new(int64_t val)"))
+        XCTAssertTrue(c.contains("static nomu_main_Node* nomu_main_Node_new(int64_t val)"))
         XCTAssertTrue(c.contains("self->val = val;"))
-        XCTAssertTrue(c.contains("rt_alloc(sizeof(Node))"))
+        XCTAssertTrue(c.contains("rt_alloc(sizeof(nomu_main_Node))"))
     }
 
     func testClassBumpAndLeak() {
         // Classes allocate and leak under M2: no deinit, no release, no free.
         let c = gen("class Node {\nvar val: Int\n}")
-        XCTAssertTrue(c.contains("static Node* Node_new(int64_t val)"))
-        XCTAssertFalse(c.contains("Node_deinit"))
-        XCTAssertFalse(c.contains("Node_release"))
+        XCTAssertTrue(c.contains("static nomu_main_Node* nomu_main_Node_new(int64_t val)"))
+        XCTAssertFalse(c.contains("nomu_main_Node_deinit"))
+        XCTAssertFalse(c.contains("nomu_main_Node_release"))
     }
 
     func testActorStructAndMailbox() {
@@ -387,24 +387,24 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(c.contains("ObjectHeader header;"))
         XCTAssertTrue(c.contains("int64_t count;"))
         XCTAssertTrue(c.contains("pthread_mutex_t mu;"))
-        XCTAssertFalse(c.contains("Counter_run"), "no dedicated run loop in M3 actor")
+        XCTAssertFalse(c.contains("nomu_main_Counter_run"), "no dedicated run loop in M3 actor")
         XCTAssertFalse(c.contains("pthread_cond_t"), "no condvar in the actor itself")
         // Per-handler blocking functions
-        XCTAssertTrue(c.contains("static void Counter_bump(Counter* self, int64_t by)"))
-        XCTAssertTrue(c.contains("static int64_t Counter_getCount(Counter* self)"))
+        XCTAssertTrue(c.contains("static void nomu_main_Counter_bump(nomu_main_Counter* self, int64_t by)"))
+        XCTAssertTrue(c.contains("static int64_t nomu_main_Counter_getCount(nomu_main_Counter* self)"))
         // Each function locks, runs body, writes back, unlocks
         XCTAssertTrue(c.contains("pthread_mutex_lock(&self->mu)"))
         XCTAssertTrue(c.contains("count += by"))
         XCTAssertTrue(c.contains("self->count = count;"))
         XCTAssertTrue(c.contains("pthread_mutex_unlock(&self->mu)"))
         // Constructor initializes mutex, no thread spawn
-        XCTAssertTrue(c.contains("static Counter* Counter_new(void)"))
+        XCTAssertTrue(c.contains("static nomu_main_Counter* nomu_main_Counter_new(void)"))
         XCTAssertTrue(c.contains("self->count = 0;"))
         XCTAssertTrue(c.contains("pthread_mutex_init(&self->mu, NULL)"))
         XCTAssertFalse(c.contains("pthread_create"), "actor constructor spawns no thread")
         // Deinit destroys mutex + release for refcount
         XCTAssertTrue(c.contains("pthread_mutex_destroy(&self->mu)"))
-        XCTAssertTrue(c.contains("static void Counter_release(Counter* self)"))
+        XCTAssertTrue(c.contains("static void nomu_main_Counter_release(nomu_main_Counter* self)"))
     }
 
     func testActorMethodCallCodegen() {
@@ -421,13 +421,13 @@ final class CodegenTests: XCTestCase {
         }
         """)
         // Actor construction via plain call
-        XCTAssertTrue(c.contains("Counter* c = Counter_new();"))
+        XCTAssertTrue(c.contains("nomu_main_Counter* c = nomu_main_Counter_new();"))
         // Void handler call
-        XCTAssertTrue(c.contains("Counter_bump(c, 10);"))
+        XCTAssertTrue(c.contains("nomu_main_Counter_bump(c, 10);"))
         // Returning handler call (used inside print)
-        XCTAssertTrue(c.contains("Counter_getCount(c)"))
+        XCTAssertTrue(c.contains("nomu_main_Counter_getCount(c)"))
         // ARC release at scope end
-        XCTAssertTrue(c.contains("Counter_release(c);"))
+        XCTAssertTrue(c.contains("nomu_main_Counter_release(c);"))
     }
 
     func testActorHandleIsShareable() {
@@ -458,7 +458,7 @@ final class CodegenTests: XCTestCase {
         }
         fun main() { let n = Node(val: 42) }
         """)
-        XCTAssertTrue(c.contains("Node* n = Node_new(42);"))
-        XCTAssertFalse(c.contains("Node_release(n);"))
+        XCTAssertTrue(c.contains("nomu_main_Node* n = nomu_main_Node_new(42);"))
+        XCTAssertFalse(c.contains("nomu_main_Node_release(n);"))
     }
 }

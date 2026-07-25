@@ -50,6 +50,17 @@ This is the gating runtime engineering and must be co-designed with codegen.
 
 ---
 
+## 2a. Symbol mangling (C backend) — Decided (M4.15)
+
+Generated Nomu symbols share C's global namespace, so an unmangled name matching a libc symbol (`abs`, `read`, `free`, `time`, …) is a compile/link collision (surfaced when the prelude's `abs` clashed with libc `abs`). Every **globally-visible generated identifier** is therefore mangled through **one module — `src/codegen/sources/Mangle.swift`** (the single swap point; the scheme can be replaced by rewriting that file).
+
+- **Scheme:** fully-qualified `nomu_<module>_<scope…>_<symbol>` — the module, any enclosing scopes, then the symbol, each **z-encoded** (GHC-style, reversible) and joined by `_`, so the join is unambiguous (a literal `_` becomes `zu`, the escape `z` becomes `zz`). A top-level symbol has no scope (`abs` → `nomu_main_abs`); a method's scope is its type (`Rect.area` → `nomu_main_Rect_area`). The **module is an implied `main`** until real modules exist (`modules.md`). Plain names stay readable; noise appears only on underscores and the rare `z`. Fully de-mangleable.
+- **Scope:** free functions, nominal types, methods / actor handlers, enum value tags (+ the tag enum type), and synthesized constructor / `release` / `deinit`. **Not** mangled: struct fields and locals/params (scoped in C, so no global collision) and runtime ABI symbols (`rt_*`, `String`, `Closure`, `printf`…). **`main` → `nomu_main`** is the sole exemption — the runtime entry calls it by that fixed name.
+- **Why this scheme (priority order: no-collision > readable > de-mangleable > perf):** ruled out the naive `_`-join (ambiguous on underscores/overloads); rejected `$` (a GCC/Clang extension, not ISO C) and `__`/leading-`_` delimiters (**reserved by the C standard** — UB / libc-internal clashes); rejected Itanium-style dense mangling and disambiguator hashes (unreadable, and perf/size is the lowest priority). Z-encoding is portable ISO C, reversible, and clean for the common case.
+- **Forward (M5+):** the module segment is already in the grammar (real module names replace the implied `main` when modules land); extend `Mangle` to encode **generic type arguments** for monomorphized instances (e.g. `Box<Int>`) and **arg types** if/when overloading is wired into codegen — all additive to the same grammar.
+
+---
+
 ## 3. Tooling-first / query architecture
 
 Architect the compiler **as a server** from early on — query-based, so an LSP can cheaply ask "what's the type here?", with incremental compilation and stable parser error-recovery. — **Decided (architectural commitment).**

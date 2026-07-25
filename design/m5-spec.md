@@ -8,7 +8,7 @@
 - **Enum value construction** (needed for `Option<T>` in Phase B and `Result<T,E>` in Phase E) and **`let` fields** (needed for `Box<T> { let value: T }` in Phase B and Phase C's deeply-immutable-class shareability) — **M4.10** (`types.md` §2, `memory-model.md` §4).
 - **Mutating value-type methods**, needed by Phase A's `{ get set }` setters and computed-property setters — **M4.11** (`types.md` §3).
 - **Plain extensions** `extension T { … }` (non-conformance), the parse/member-merge path Phase A's conformance extensions reuse — **M4.12** (`interfaces.md` §1, plain form as built). The compiler had no `extension` construct at all.
-- **Nomu prelude mechanism** (the home for Phase B/E's `Option`/`Result`/`Box`, compiled alongside user code) plus the C-source split — **M4.13** (`m4.13-spec.md`). There is no stdlib/prelude path today; hard-gates Phase B.
+- **Nomu prelude mechanism** (the home for Phase B/E's `Option`/`Result`/`Box`, compiled alongside user code) plus the C-source split — **M4.13** (roadmap; `src/stdlib/`, `src/runtime/`). There is no stdlib/prelude path today; hard-gates Phase B.
 
 The Phase A iteration demo (below) is also resolved — it assumes loops/collections the language doesn't have yet.
 
@@ -154,6 +154,6 @@ M5 is a front-end + codegen milestone; the M4 scheduler (`runtime.md` §8 — fi
 
 Cleanups spotted while doing adjacent work (M4.13 onward) but intentionally **not** done there, to keep those diffs behavior-preserving. Parked here to decide/schedule deliberately.
 
-- **Symbol mangling for generated code (from M4.13).** Generated Nomu functions emit into C's global namespace, so a Nomu name that collides with a libc symbol in scope (`stdio`/`pthread` are included into `user.c`) is a C compile error — surfaced when the prelude's `abs` clashed with libc `abs`. M4.13 sidestepped it (routed `free` through `rt_free` to keep `<stdlib.h>` out of `user.c`, and the seeded names avoid the remaining `stdio`/`pthread` surface), but `printf`, `remove`, etc. would still collide. Real fix: **mangle Nomu symbols** (e.g. a `nomu_` prefix / module-qualified names), which also subsumes the existing `main`→`nomu_main` special-case. Wants deciding alongside the module system (`modules.md`).
+- **Symbol mangling — DONE (M4.15).** Generated identifiers are `nomu_`-prefixed + z-encoded via `src/codegen/sources/Mangle.swift`, so Nomu names can't collide with libc. Design: `compiler.md` §2a. **M5 note:** when generics land, extend `Mangle` to encode type arguments for monomorphized instances (and arg types if overloading is wired).
 - **Parallelism knob (pre-existing, now in `src/runtime/runtime.c`).** Carrier count is hardcoded `ncarriers = 4`; the `GOMAXPROCS`-equivalent is unwired (`runtime.md` §... poller/knob). Untouched by M4.13.
 - **`rt_alloc` header pointer-arithmetic hack** — already tracked in §5a invariant 2; drop it with the M5 object-model work.

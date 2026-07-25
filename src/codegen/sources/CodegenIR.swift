@@ -113,14 +113,14 @@ public struct CodegenIR {
     private mutating func emitStruct(_ s: IRStruct) {
         out += "typedef struct {\n"
         for f in s.fields { out += "    \(cType(f.type)) \(f.name);\n" }
-        out += "} \(s.name);\n\n"
+        out += "} \(Mangle.type(s.name));\n\n"
     }
 
     private mutating func emitEnum(_ e: IREnum) {
-        let tags = e.cases.map { "\(e.name)_\($0.name)" }.joined(separator: ", ")
-        out += "typedef enum { \(tags) } \(e.name)_tag;\n"
+        let tags = e.cases.map { Mangle.tag(e.name, $0.name) }.joined(separator: ", ")
+        out += "typedef enum { \(tags) } \(Mangle.tagType(e.name));\n"
         out += "typedef struct {\n"
-        out += "    \(e.name)_tag tag;\n"
+        out += "    \(Mangle.tagType(e.name)) tag;\n"
         out += "    union {\n"
         for c in e.cases {
             if c.fields.isEmpty {
@@ -132,7 +132,7 @@ public struct CodegenIR {
             }
         }
         out += "    } payload;\n"
-        out += "} \(e.name);\n\n"
+        out += "} \(Mangle.type(e.name));\n\n"
     }
 
     private mutating func emitClass(_ c: IRClass) {
@@ -141,13 +141,14 @@ public struct CodegenIR {
         out += "typedef struct {\n"
         out += "    ObjectHeader header;\n"
         for f in c.fields { out += "    \(cType(f.type)) \(f.name);\n" }
-        out += "} \(c.name);\n\n"
+        let cn = Mangle.type(c.name)
+        out += "} \(cn);\n\n"
 
         let ctorParams = c.fields.isEmpty
             ? "void"
             : c.fields.map { "\(cType($0.type)) \($0.name)" }.joined(separator: ", ")
-        out += "static \(c.name)* \(c.name)_new(\(ctorParams)) {\n"
-        out += "    \(c.name)* self = (\(c.name)*)rt_alloc(sizeof(\(c.name)));\n"
+        out += "static \(cn)* \(Mangle.ctor(c.name))(\(ctorParams)) {\n"
+        out += "    \(cn)* self = (\(cn)*)rt_alloc(sizeof(\(cn)));\n"
         for f in c.fields { out += "    self->\(f.name) = \(f.name);\n" }
         out += "    return self;\n"
         out += "}\n\n"
@@ -159,13 +160,14 @@ public struct CodegenIR {
     // runs the body under the lock, writes fields back, unlocks (see slice 2/4).
     private mutating func emitActor(_ a: IRActor) {
         let name = a.name
+        let cn = Mangle.type(name)
 
         out += "// ===== actor \(name) =====\n"
         out += "typedef struct {\n"
         out += "    ObjectHeader header;\n"
         for f in a.fields { out += "    \(cType(f.type)) \(f.name);\n" }
         out += "    pthread_mutex_t mu;\n"
-        out += "} \(name);\n\n"
+        out += "} \(cn);\n\n"
 
         for h in a.handlers { emitHandlerFunc(h, actor: a) }
 
@@ -174,8 +176,8 @@ public struct CodegenIR {
         let ctorParams = ctorFields.isEmpty
             ? "void"
             : ctorFields.map { "\(cType($0.type)) \($0.name)" }.joined(separator: ", ")
-        out += "static \(name)* \(name)_new(\(ctorParams)) {\n"
-        out += "    \(name)* self = (\(name)*)rt_alloc(sizeof(\(name)));\n"
+        out += "static \(cn)* \(Mangle.ctor(name))(\(ctorParams)) {\n"
+        out += "    \(cn)* self = (\(cn)*)rt_alloc(sizeof(\(cn)));\n"
         for f in a.fields {
             if let initializer = f.initializer {
                 out += "    self->\(f.name) = \(emitExpr(initializer));\n"
@@ -187,13 +189,13 @@ public struct CodegenIR {
         out += "    return self;\n"
         out += "}\n\n"
 
-        out += "static void \(name)_deinit(\(name)* self) {\n"
+        out += "static void \(Mangle.deinitFn(name))(\(cn)* self) {\n"
         out += "    pthread_mutex_destroy(&self->mu);\n"
         out += "}\n\n"
 
-        out += "static void \(name)_release(\(name)* self) {\n"
+        out += "static void \(Mangle.release(name))(\(cn)* self) {\n"
         out += "    if (self && --self->header.refcount == 0) {\n"
-        out += "        \(name)_deinit(self);\n"
+        out += "        \(Mangle.deinitFn(name))(self);\n"
         out += "        rt_free(self);\n"
         out += "    }\n"
         out += "}\n\n"
@@ -201,9 +203,9 @@ public struct CodegenIR {
 
     private mutating func emitHandlerFunc(_ h: IRHandler, actor a: IRActor) {
         let retC = cType(h.returnType)
-        var sig = "\(a.name)* self"
+        var sig = "\(Mangle.type(a.name))* self"
         for p in h.params { sig += ", \(cType(p.type)) \(p.name)" }
-        out += "static \(retC) \(a.name)_\(h.name)(\(sig)) {\n"
+        out += "static \(retC) \(Mangle.method(a.name, h.name))(\(sig)) {\n"
         out += "    pthread_mutex_lock(&self->mu);\n"
         // Copy actor fields to locals so the body reads/writes them by name; params
         // and field locals live below the body frame (never released here).
@@ -227,12 +229,12 @@ public struct CodegenIR {
     // MARK: - Functions
 
     private mutating func emitFuncProto(_ f: IRFunc) {
-        let cName = f.name == "main" ? "nomu_main" : f.name
+        let cName = Mangle.function(f.name)
         out += "\(cType(f.returnType)) \(cName)(\(paramList(f.params)));\n"
     }
 
     private mutating func emitFunc(_ f: IRFunc) {
-        let cName = f.name == "main" ? "nomu_main" : f.name
+        let cName = Mangle.function(f.name)
         out += "\(cType(f.returnType)) \(cName)(\(paramList(f.params))) {\n"
         pushScope()                                   // params live below the body frame
         for p in f.params { declare(p.name, p.type) }
@@ -265,7 +267,7 @@ public struct CodegenIR {
     }
 
     private mutating func emitMethodProto(_ m: IRFunc, typeName: String, kind: NamedKind) {
-        out += "static \(cType(m.returnType)) \(typeName)_\(m.name)(\(methodSig(m, typeName, kind)));\n"
+        out += "static \(cType(m.returnType)) \(Mangle.method(typeName, m.name))(\(methodSig(m, typeName, kind)));\n"
     }
 
     private mutating func emitMethodBodies(_ decl: IRDecl) {
@@ -278,7 +280,7 @@ public struct CodegenIR {
     }
 
     private func methodSig(_ m: IRFunc, _ typeName: String, _ kind: NamedKind) -> String {
-        let selfC = selfIsPointerMethod(m, kind) ? "\(typeName)*" : typeName
+        let selfC = selfIsPointerMethod(m, kind) ? "\(Mangle.type(typeName))*" : Mangle.type(typeName)
         var sig = "\(selfC) self"
         for p in m.params { sig += ", \(cType(p.type)) \(p.name)" }
         return sig
@@ -287,7 +289,7 @@ public struct CodegenIR {
     private mutating func emitMethodFunc(_ m: IRFunc, typeName: String, kind: NamedKind, fields: [IRField]) {
         let pointerSelf = selfIsPointerMethod(m, kind)
         let op = pointerSelf ? "->" : "."
-        out += "static \(cType(m.returnType)) \(typeName)_\(m.name)(\(methodSig(m, typeName, kind))) {\n"
+        out += "static \(cType(m.returnType)) \(Mangle.method(typeName, m.name))(\(methodSig(m, typeName, kind))) {\n"
         pushScope()                                   // self / fields / params live below the body frame
         declare("self", .named(typeName, kind))
         let prevFields = methodFields, prevPointer = selfIsPointer
@@ -340,7 +342,7 @@ public struct CodegenIR {
             if l.isSpawn {
                 out += "\(ind)spawn_join(&\(l.name)__h);\n"       // join before leaving scope
             } else if case .named(let n, .actor_) = l.type {
-                out += "\(ind)\(n)_release(\(l.name));\n"
+                out += "\(ind)\(Mangle.release(n))(\(l.name));\n"
             }
         }
         popScope()
@@ -410,7 +412,7 @@ public struct CodegenIR {
         out += "\(ind)switch (\(subj).tag) {\n"
         for arm in sw.arms {
             guard let cd = ed.cases.first(where: { $0.name == arm.caseName }) else { continue }
-            out += "\(ind)    case \(enumName)_\(arm.caseName): {\n"
+            out += "\(ind)    case \(Mangle.tag(enumName, arm.caseName)): {\n"
             pushScope()   // payload bindings live for the arm
             for (binding, field) in zip(arm.bindings, cd.fields) {
                 out += "\(ind)        \(cType(binding.type)) \(binding.name) = \(subj).payload.\(arm.caseName).\(field.name);\n"
@@ -442,7 +444,8 @@ public struct CodegenIR {
             }
             // A field accessed by bare name inside a mutating method → through `self`.
             if methodFields.contains(n) { return "self\(selfIsPointer ? "->" : ".")\(n)" }
-            return n
+            // Not a local or field → a top-level function referenced as a value.
+            return Mangle.function(n)
 
         case .fieldAccess(let base, let field):
             // `self` is a pointer in a mutating value method / class method → `self->field`.
@@ -483,14 +486,14 @@ public struct CodegenIR {
                     fields.append(".\(f.name) = 0")
                 }
             }
-            return "(\(typeName)){ \(fields.joined(separator: ", ")) }"
+            return "(\(Mangle.type(typeName))){ \(fields.joined(separator: ", ")) }"
         }
         if let c = classes[typeName] {
-            return "\(typeName)_new(\(emitLabeled(c.fields.map(\.name), args).joined(separator: ", ")))"
+            return "\(Mangle.ctor(typeName))(\(emitLabeled(c.fields.map(\.name), args).joined(separator: ", ")))"
         }
         if let a = actors[typeName] {
             let labels = a.fields.filter { $0.initializer == nil }.map(\.name)
-            return "\(typeName)_new(\(emitLabeled(labels, args).joined(separator: ", ")))"
+            return "\(Mangle.ctor(typeName))(\(emitLabeled(labels, args).joined(separator: ", ")))"
         }
         return "/* unknown type \(typeName) */"
     }
@@ -502,11 +505,11 @@ public struct CodegenIR {
     // Enum value → tagged-union compound literal. Payload cases set the active union
     // member (named by the case); a no-payload case sets only the tag.
     private mutating func emitEnumInit(typeName: String, caseName: String, args: [IRArg]) -> String {
-        let tag = "\(typeName)_\(caseName)"
-        if args.isEmpty { return "(\(typeName)){ .tag = \(tag) }" }
+        let tag = Mangle.tag(typeName, caseName)
+        if args.isEmpty { return "(\(Mangle.type(typeName))){ .tag = \(tag) }" }
         var inits: [String] = []
         for a in args { inits.append(".\(a.label ?? "") = \(emitExpr(a.value))") }
-        return "(\(typeName)){ .tag = \(tag), .payload.\(caseName) = { \(inits.joined(separator: ", ")) } }"
+        return "(\(Mangle.type(typeName))){ .tag = \(tag), .payload.\(caseName) = { \(inits.joined(separator: ", ")) } }"
     }
 
     private mutating func emitMethodCall(receiver: IRExpr, method: String, args: [IRExpr]) -> String {
@@ -522,7 +525,7 @@ public struct CodegenIR {
         let recvExpr = emitExpr(receiver)
         let recv = (byPointer && !recvAlreadyPointer) ? "&\(recvExpr)" : recvExpr
         let argVals = args.map { emitExpr($0) }
-        return "\(typeName)_\(method)(\(([recv] + argVals).joined(separator: ", ")))"
+        return "\(Mangle.method(typeName, method))(\(([recv] + argVals).joined(separator: ", ")))"
     }
 
     private func methodIsMutating(_ typeName: String, _ method: String) -> Bool {
@@ -562,7 +565,7 @@ public struct CodegenIR {
                 let tail     = vals.isEmpty ? "" : ", " + vals.joined(separator: ", ")
                 return "((\(sig))\(name).fn)(\(name).env\(tail))"
             }
-            return "\(name)(\(emitArgs(args).joined(separator: ", ")))"
+            return "\(Mangle.function(name))(\(emitArgs(args).joined(separator: ", ")))"
         }
         return "\(emitExpr(callee))(\(emitArgs(args).joined(separator: ", ")))"
     }
@@ -839,8 +842,8 @@ public struct CodegenIR {
         case .function:   return "Closure"
         case .named(let n, let kind):
             switch kind {
-            case .class_, .actor_: return "\(n)*"
-            case .struct_, .enum_: return n
+            case .class_, .actor_: return Mangle.type(n) + "*"
+            case .struct_, .enum_: return Mangle.type(n)
             }
         case .error:      return "int64_t"   // unreachable for well-typed programs
         }
