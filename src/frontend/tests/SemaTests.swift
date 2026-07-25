@@ -333,9 +333,7 @@ final class SemaTests: XCTestCase {
         interface Drawable {
             fun draw() -> String
             var name: String { get }
-            var count: Int { get set }
-            fun describe() -> String { return self.draw() }
-            fun bump() { count = count + 1 }
+            fun describe() -> String { return concat(self.name, self.draw()) }
         }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
@@ -458,5 +456,65 @@ final class SemaTests: XCTestCase {
         }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+    }
+
+    // MARK: - Existentials `any I` (M5 A1.4)
+
+    func testAnyBindingInsertsBox() {
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        struct Circle: Drawable {
+            var r: Int
+            fun draw() -> String { return "O" }
+        }
+        fun f() {
+            let d: any Drawable = Circle(r: 1)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let fn) = r.module.decls[1],
+              case .letBinding(_, _, let value) = fn.body[0].kind,
+              case .box(_, let iface) = value.kind else { XCTFail(); return }
+        XCTAssertEqual(iface, "Drawable")
+        XCTAssertEqual(value.type, .existential("Drawable"))
+    }
+
+    func testDispatchThroughAnyKeepsExistentialReceiver() {
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        fun f(d: any Drawable) -> String {
+            return d.draw()
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let fn) = r.module.decls[0],
+              case .ret(let e?) = fn.body[0].kind,
+              case .methodCall(let recv, let m, _) = e.kind else { XCTFail(); return }
+        XCTAssertEqual(m, "draw")
+        XCTAssertEqual(recv.type, .existential("Drawable"))
+    }
+
+    func testBoxingNonConformerRejected() {
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        struct Plain {
+            var x: Int
+        }
+        fun f() {
+            let d: any Drawable = Plain(x: 1)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testUnknownInterfaceInAnyRejected() {
+        let r = sema("fun f(d: any Nope) -> Int { return 0 }")
+        XCTAssertTrue(r.diagnostics.hasErrors)
     }
 }

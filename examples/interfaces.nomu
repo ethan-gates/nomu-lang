@@ -1,15 +1,16 @@
-// M5 A1: interfaces + conformance (struct/enum/class). A mandatory requirement must
-// be satisfied by a matching member; an overridable default may be omitted; property
-// requirements are satisfied by a stored field or a computed property (a `{ get set }`
-// requirement needs a settable one). Conformance is declared at the type (`struct T: I`)
-// or in a conformance extension (`extension T: I`). Dynamic dispatch through `any I`
-// arrives in a later slice — this checks that conformance holds.
+// M5 A1: interfaces, conformance, and dynamic dispatch through `any I`. A mandatory
+// requirement is satisfied by a matching member; an overridable default may be omitted
+// (it is compiled into each conformer); property requirements are satisfied by a stored
+// field or a computed property. Conformance is declared at the type (`struct T: I`) or
+// in a conformance extension (`extension T: I`). An `any I` value boxes a concrete
+// conformer and dispatches requirements dynamically through a witness table; a default
+// accesses other requirements via `self`.
 
 interface Drawable {
     fun draw() -> String            // mandatory requirement
     var name: String { get }        // read-only property requirement
     fun label() -> String {         // overridable default
-        return concat(name, self.draw())
+        return concat(self.name, self.draw())
     }
 }
 
@@ -31,9 +32,19 @@ extension Suit: Drawable {
     fun draw() -> String { return "card" }
 }
 
+// Takes any conformer; the requirement + default dispatch through the witness table.
+fun render(d: any Drawable) -> String {
+    return d.label()
+}
+
 fun main() {
     let c = Circle(name: "c", radius: 3)
-    print(c.draw())      // O
-    print(c.name)        // c
+    print(c.draw())            // O          (concrete: a direct call)
+    print(c.name)              // c          (concrete: a field load)
     print(Suit.spade.draw())   // card
+
+    let d: any Drawable = c
+    print(d.draw())            // O          (dynamic: through the witness)
+    print(render(c))           // cO         (boxed at the call; default via witness)
+    print(render(Suit.heart))  // suitcard   (a different concrete type, same param)
 }

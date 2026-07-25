@@ -476,6 +476,32 @@ final class CodegenTests: XCTestCase {
         XCTAssertFalse(c.contains("r.area"))                          // not a struct field load
     }
 
+    // `any I`: a per-interface witness struct, a per-conformance instance, boxing that
+    // wraps a value with the witness, and dispatch through the witness pointer (M5 A1.4).
+    func testWitnessTableAndAnyDispatchEmit() {
+        let c = gen("""
+        interface Drawable {
+            fun draw() -> String
+            var name: String { get }
+        }
+        struct Circle: Drawable {
+            var name: String
+            fun draw() -> String { return name }
+        }
+        fun render(d: any Drawable) -> String {
+            return d.draw()
+        }
+        fun main() {
+            let x: any Drawable = Circle(name: "c")
+            print(render(x))
+        }
+        """)
+        XCTAssertTrue(c.contains("} nomu_main_Drawable_witness;"))              // witness struct type
+        XCTAssertTrue(c.contains("nomu_main_Circle_Drawable_witness = {"))      // instance for Circle
+        XCTAssertTrue(c.contains(".witness = &nomu_main_Circle_Drawable_witness"))  // boxing
+        XCTAssertTrue(c.contains("->draw("))                                    // dispatch via witness pointer
+    }
+
     func testComputedPropertySetterMutates() {
         // The setter writes a field, so it is inferred mutating and takes `Rect* self`.
         let c = gen("""

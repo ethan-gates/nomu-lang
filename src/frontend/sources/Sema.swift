@@ -24,6 +24,11 @@ public struct Sema {
     private struct PropInfo { let type: Type; let hasSetter: Bool }
     private var computedProps: [String: [String: PropInfo]] = [:]
 
+    // Conformance facts (M5 A1.4), filled by checkConformances before body lowering.
+    private var conformsTo: [String: Set<String>] = [:]      // type name → interface names
+    private var conformanceList: [IRConformance] = []        // one per valid `T: I`
+    private var inheritedDefaults: [String: [InterfaceMethod]] = [:]   // defaulted reqs a type inherits
+
     // Lexical scope stack for locals/params (name → type + mutability).
     private var scopes: [[String: Local]] = []
     private struct Local { let type: Type; let isMutable: Bool }
@@ -54,7 +59,8 @@ public struct Sema {
 
         // M4.11: infer method mutating-ness, validate `let`-field / `self` writes,
         // annotate the IR, then check that mutating value-type calls have a mutable receiver.
-        let mutation = analyzeMutation(IRModule(decls: decls), into: diags)
+        let module0 = IRModule(decls: decls, interfaces: buildIRInterfaces(), conformances: conformanceList)
+        let mutation = analyzeMutation(module0, into: diags)
         for site in methodCallSites where mutation.mutating.contains(site.callee) && !site.receiverMutable {
             diags.error("cannot call mutating method on an immutable value — the receiver must be a 'var'", at: site.span)
         }
@@ -98,6 +104,11 @@ public struct Sema {
 
     private func resolve(_ ref: TypeRef?) -> Type {
         guard let ref else { return .void }
+        if let iface = ref.existentialOf {   // `any I` (M5 A1.4)
+            if interfaces[iface] != nil { return .existential(iface) }
+            diags.error("unknown interface '\(iface)' in 'any \(iface)'", at: ref.span)
+            return .error
+        }
         if let fn = ref.fn {
             return .function(params: fn.params.map { resolve($0) }, ret: resolve(fn.ret))
         }
@@ -148,16 +159,19 @@ public struct Sema {
             let fields = s.fields.map(lowerField)
             var methods = lowerMethods(s.methods, selfType: .named(s.name, .struct_), fields: fields)
             methods += lowerAccessors(s.properties, selfType: .named(s.name, .struct_), fields: fields)
+            methods += lowerInheritedDefaults(s.name, selfType: .named(s.name, .struct_), fields: fields)
             return .structDecl(IRStruct(name: s.name, fields: fields, methods: methods, span: s.span))
         case .enumDecl(let e):
             let cases = e.cases.map { IREnumCase(name: $0.name, fields: $0.fields.map(lowerField), span: $0.span) }
             var methods = lowerMethods(e.methods, selfType: .named(e.name, .enum_), fields: [])
             methods += lowerAccessors(e.properties, selfType: .named(e.name, .enum_), fields: [])
+            methods += lowerInheritedDefaults(e.name, selfType: .named(e.name, .enum_), fields: [])
             return .enumDecl(IREnum(name: e.name, cases: cases, methods: methods, span: e.span))
         case .classDecl(let c):
             let fields = c.fields.map(lowerField)
             var methods = lowerMethods(c.methods, selfType: .named(c.name, .class_), fields: fields)
             methods += lowerAccessors(c.properties, selfType: .named(c.name, .class_), fields: fields)
+            methods += lowerInheritedDefaults(c.name, selfType: .named(c.name, .class_), fields: fields)
             return .classDecl(IRClass(name: c.name, fields: fields, methods: methods, span: c.span))
         case .actorDecl(let a):
             return .actorDecl(lowerActor(a))
@@ -189,7 +203,6 @@ public struct Sema {
             let ret = resolve(m.returnType)
             pushScope()
             declare("self", selfType)
-            for p in i.properties { declare(p.name, resolve(p.type), isMutable: p.isSettable) }
             for p in params { declare(p.name, p.type) }
             let saved = currentReturnType; currentReturnType = ret
             _ = lowerBlock(body)
@@ -203,6 +216,42 @@ public struct Sema {
         interfaces[typeName]?.methods.first { $0.name == name }
     }
 
+    // The interfaces' requirement surface, resolved to types, for witness-table layout.
+    private func buildIRInterfaces() -> [IRInterface] {
+        var out: [IRInterface] = []
+        for decl in program.decls {
+            guard case .interfaceDecl(let i) = decl else { continue }
+            let methods = i.methods.map { IRMethodReq(name: $0.name, params: $0.params.map { resolve($0.type) }, ret: resolve($0.returnType)) }
+            let props = i.properties.map { IRPropReq(name: $0.name, type: resolve($0.type), isSettable: $0.isSettable) }
+            out.append(IRInterface(name: i.name, methods: methods, properties: props))
+        }
+        return out
+    }
+
+    // Synthesize a concrete method on `T` for each defaulted requirement it inherits: the
+    // default body lowered with `self: T`, so both concrete calls and witness slots resolve
+    // to it (M5 A1.4). First cut: a default may reference directly-implemented requirements
+    // (via `self.req()`) and stored-field state (bare name); default-calling-default and
+    // computed-backed bare access are later work.
+    private mutating func lowerInheritedDefaults(_ typeName: String, selfType: Type, fields: [IRField]) -> [IRFunc] {
+        var out: [IRFunc] = []
+        for req in inheritedDefaults[typeName] ?? [] {
+            guard let body = req.defaultBody else { continue }
+            let params = req.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+            let ret = resolve(req.returnType)
+            pushScope()
+            declare("self", selfType)
+            for f in fields { declare(f.name, f.type) }
+            for p in params { declare(p.name, p.type) }
+            let saved = currentReturnType; currentReturnType = ret
+            let irBody = lowerBlock(body)
+            currentReturnType = saved
+            popScope()
+            out.append(IRFunc(name: req.name, params: params, returnType: ret, body: irBody, isMutating: false, span: req.span))
+        }
+        return out
+    }
+
     // MARK: - Conformance checking (M5 A1.3)
 
     // Verify each declared conformance: every requirement of the interface is satisfied
@@ -212,11 +261,11 @@ public struct Sema {
         for decl in program.decls {
             switch decl {
             case .structDecl(let s):
-                checkConformance(s.name, s.conformances, methods: s.methods, fields: s.fields, properties: s.properties)
+                checkConformance(s.name, .struct_, s.conformances, methods: s.methods, fields: s.fields, properties: s.properties)
             case .enumDecl(let e):
-                checkConformance(e.name, e.conformances, methods: e.methods, fields: [], properties: e.properties)
+                checkConformance(e.name, .enum_, e.conformances, methods: e.methods, fields: [], properties: e.properties)
             case .classDecl(let c):
-                checkConformance(c.name, c.conformances, methods: c.methods, fields: c.fields, properties: c.properties)
+                checkConformance(c.name, .class_, c.conformances, methods: c.methods, fields: c.fields, properties: c.properties)
             case .actorDecl(let a):
                 for conf in a.conformances {
                     diags.error("actors cannot conform to interfaces yet ('\(a.name): \(conf.name)') — parked post-M5", at: conf.span)
@@ -227,7 +276,7 @@ public struct Sema {
         }
     }
 
-    private mutating func checkConformance(_ typeName: String, _ conformances: [Conformance],
+    private mutating func checkConformance(_ typeName: String, _ kind: NamedKind, _ conformances: [Conformance],
                                            methods: [FuncDecl], fields: [VarField], properties: [ComputedProperty]) {
         for conf in conformances {
             guard let iface = interfaces[conf.name] else {
@@ -238,6 +287,8 @@ public struct Sema {
                 }
                 continue
             }
+            conformsTo[typeName, default: []].insert(conf.name)
+            conformanceList.append(IRConformance(typeName: typeName, typeKind: kind, interfaceName: conf.name))
             for req in iface.methods { checkMethodRequirement(req, typeName: typeName, interface: conf, methods: methods) }
             for req in iface.properties { checkPropertyRequirement(req, typeName: typeName, interface: conf, fields: fields, properties: properties) }
         }
@@ -248,7 +299,12 @@ public struct Sema {
     private mutating func checkMethodRequirement(_ req: InterfaceMethod, typeName: String, interface conf: Conformance, methods: [FuncDecl]) {
         let named = methods.filter { $0.name == req.name }
         if named.contains(where: { methodMatches(req, $0) }) { return }
-        if req.defaultBody != nil { return }
+        if req.defaultBody != nil {
+            // Satisfied by the interface's overridable default — this conformer inherits
+            // it, so it is synthesized as a concrete method of the type (M5 A1.4).
+            inheritedDefaults[typeName, default: []].append(req)
+            return
+        }
         if named.isEmpty {
             diags.error("type '\(typeName)' does not conform to '\(conf.name)': missing method '\(req.name)'", at: conf.span)
         } else {
@@ -405,7 +461,7 @@ public struct Sema {
         switch stmt {
         case .binding(let b):
             let annotated = b.type.map { resolve($0) }
-            let value = checkExpr(b.value, expected: annotated)
+            let value = coerce(checkExpr(b.value, expected: annotated), to: annotated)
             let type = annotated ?? value.type
             declare(b.name, type, isMutable: b.isMutable)
             return IRStmt(kind: .letBinding(name: b.name, isMutable: b.isMutable, value: value), span: b.span)
@@ -460,7 +516,7 @@ public struct Sema {
             return IRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
 
         case .ret(let e, let span):
-            return IRStmt(kind: .ret(e.map { checkExpr($0, expected: currentReturnType) }), span: span)
+            return IRStmt(kind: .ret(e.map { coerce(checkExpr($0, expected: currentReturnType), to: currentReturnType) }), span: span)
 
         case .ifStmt(let s):
             let cond = checkExpr(s.cond)
@@ -499,6 +555,28 @@ public struct Sema {
 
     // MARK: - Expressions
 
+    // Coerce a concrete conformer to `any I` where an existential is expected, inserting
+    // a box (M5 A1.4). A type/conformance mismatch against an existential is diagnosed here.
+    private mutating func coerce(_ e: IRExpr, to expected: Type?) -> IRExpr {
+        guard case .existential(let iface)? = expected else { return e }
+        switch e.type {
+        case .existential(let have):
+            if have != iface { diags.error("cannot convert 'any \(have)' to 'any \(iface)'", at: e.span) }
+            return e
+        case .named(let t, _):
+            if conformsTo[t]?.contains(iface) == true {
+                return IRExpr(type: .existential(iface), span: e.span, kind: .box(value: e, interface: iface))
+            }
+            diags.error("type '\(t)' does not conform to '\(iface)'", at: e.span)
+            return e
+        case .error:
+            return e
+        default:
+            diags.error("cannot convert '\(e.type)' to 'any \(iface)'", at: e.span)
+            return e
+        }
+    }
+
     // `expected` carries a contextual type inward (binding annotation, return
     // position, call-argument slot) so leading-dot `.case` construction can infer
     // its enum (M4.10). nil elsewhere; most expressions ignore it.
@@ -525,6 +603,12 @@ public struct Sema {
                 return buildEnumInit(typeName, field, [], at: span)
             }
             let b = checkExpr(base)
+            // A property-requirement read through `any I` — dispatched via the getter slot.
+            if case .existential(let iface) = b.type,
+               let prop = interfaces[iface]?.properties.first(where: { $0.name == field }) {
+                return IRExpr(type: resolve(prop.type), span: span,
+                              kind: .methodCall(receiver: b, method: "\(field).get", args: []))
+            }
             // A property-requirement read inside an interface default (self: interface).
             if case .named(let tn, .interface_) = b.type,
                let prop = interfaces[tn]?.properties.first(where: { $0.name == field }) {
@@ -576,6 +660,14 @@ public struct Sema {
         // Member call: base.member(args) — an actor send or an instance method.
         if case .member(let base, let name, _) = callee {
             let recv = checkExpr(base)
+            // A method-requirement call through `any I` — dispatched via the witness slot.
+            if case .existential(let iface) = recv.type,
+               let req = interfaces[iface]?.methods.first(where: { $0.name == name }) {
+                let irArgs = args.map { checkExpr($0.value) }
+                checkArgTypes(irArgs, against: req.params.map { resolve($0.type) }, at: span)
+                return IRExpr(type: resolve(req.returnType), span: span,
+                              kind: .methodCall(receiver: recv, method: name, args: irArgs))
+            }
             if case .named(let typeName, let kind) = recv.type {
                 // Actor send: base.handler(args).
                 if kind == .actor_, let handler = actors[typeName]?.handlers.first(where: { $0.name == name }) {
@@ -602,6 +694,13 @@ public struct Sema {
                                                         receiverMutable: isMutableReceiver(base), span: span))
                     }
                     return IRExpr(type: resolve(method.returnType), span: span,
+                                  kind: .methodCall(receiver: recv, method: name, args: irArgs))
+                }
+                // A default requirement this type inherits (synthesized as a concrete method).
+                if let req = (inheritedDefaults[typeName] ?? []).first(where: { $0.name == name }) {
+                    let irArgs = args.map { checkExpr($0.value) }
+                    checkArgTypes(irArgs, against: req.params.map { resolve($0.type) }, at: span)
+                    return IRExpr(type: resolve(req.returnType), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
             }
@@ -711,7 +810,7 @@ public struct Sema {
         var out: [IRArg] = []
         for (i, a) in args.enumerated() {
             let exp = expectedParams.flatMap { i < $0.count ? $0[i] : nil }
-            out.append(IRArg(label: a.label, value: checkExpr(a.value, expected: exp)))
+            out.append(IRArg(label: a.label, value: coerce(checkExpr(a.value, expected: exp), to: exp)))
         }
         return out
     }

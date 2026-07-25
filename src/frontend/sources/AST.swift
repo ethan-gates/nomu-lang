@@ -6,11 +6,13 @@
 public final class TypeRef {
     public let name: String
     public let fn: FnType?
+    public let existentialOf: String?   // set for `any I` — the interface name (M5 A1.4)
     public let span: Span
 
-    public init(name: String, fn: FnType? = nil, span: Span) {
+    public init(name: String, fn: FnType? = nil, existentialOf: String? = nil, span: Span) {
         self.name = name
         self.fn = fn
+        self.existentialOf = existentialOf
         self.span = span
     }
 }

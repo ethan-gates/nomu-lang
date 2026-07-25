@@ -78,6 +78,8 @@ private struct ExhaustivenessPass {
             walkExpr(l); walkExpr(r)
         case .closure(_, let body):
             walk(body)
+        case .box(let value, _):
+            walkExpr(value)
         }
     }
 

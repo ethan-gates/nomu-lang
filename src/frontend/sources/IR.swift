@@ -8,6 +8,42 @@
 
 public struct IRModule {
     public let decls: [IRDecl]
+    public let interfaces: [IRInterface]      // M5 A1.4: drives witness-table type emission
+    public let conformances: [IRConformance]  // M5 A1.4: drives witness-table instance emission
+
+    public init(decls: [IRDecl], interfaces: [IRInterface] = [], conformances: [IRConformance] = []) {
+        self.decls = decls
+        self.interfaces = interfaces
+        self.conformances = conformances
+    }
+}
+
+// The requirement surface of an interface, resolved to types — enough for codegen to
+// lay out a witness-table struct (a function-pointer slot per requirement, method then
+// property accessors, then the reserved type-witness slot).
+public struct IRInterface {
+    public let name: String
+    public let methods: [IRMethodReq]
+    public let properties: [IRPropReq]
+}
+
+public struct IRMethodReq {
+    public let name: String
+    public let params: [Type]
+    public let ret: Type
+}
+
+public struct IRPropReq {
+    public let name: String
+    public let type: Type
+    public let isSettable: Bool
+}
+
+// A checked conformance `T: I` — codegen emits one witness-table instance per entry.
+public struct IRConformance {
+    public let typeName: String
+    public let typeKind: NamedKind
+    public let interfaceName: String
 }
 
 public enum IRDecl {
@@ -147,6 +183,7 @@ public indirect enum ExprKind {
     case call(callee: IRExpr, args: [IRArg])            // function / builtin call
     case binary(BinOp, IRExpr, IRExpr)
     case closure(params: [IRParam], body: [IRStmt])
+    case box(value: IRExpr, interface: String)          // M5 A1.4: wrap a concrete conformer as `any I`
 }
 
 public struct IRArg {

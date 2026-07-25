@@ -173,6 +173,8 @@ private func children(_ e: IRExpr) -> [(slot: String, expr: IRExpr)] {
         return [("callee", callee)] + args.map { (argSlot($0), $0.value) }
     case .binary(_, let l, let r):
         return [("lhs", l), ("rhs", r)]
+    case .box(let value, _):
+        return [("value", value)]
     }
 }
 
@@ -191,6 +193,7 @@ private func head(_ e: IRExpr) -> String {
     case .call:                    return "call"
     case .binary(let op, _, _):    return "binary \(opSym(op))"
     case .closure:                 return "closure"
+    case .box(_, let iface):       return "box any \(iface)"
     }
 }
 

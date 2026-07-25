@@ -65,6 +65,12 @@ enum Mangle {
     }
     static func tagType(_ enumName: String) -> String { qualify([enumName]) + "_tag" }
 
+    // Witness tables (M5 A1.4): the per-interface struct type, the per-conformance
+    // instance, and the uniform-signature thunk wrapping one requirement's impl.
+    static func witnessType(_ iface: String) -> String { qualify([iface]) + "_witness" }
+    static func witnessInstance(_ type: String, _ iface: String) -> String { qualify([type, iface]) + "_witness" }
+    static func witnessThunk(_ type: String, _ iface: String, _ slot: String) -> String { qualify([type, iface, slot]) + "_thunk" }
+
     // Compiler-synthesized members on a reference type.
     static func ctor(_ typeName: String) -> String { qualify([typeName]) + "_new" }
     static func release(_ typeName: String) -> String { qualify([typeName]) + "_release" }

@@ -147,6 +147,8 @@ private final class MutationAnalyzer {
         case .binary(_, let l, let r):
             scanExpr(l, type: type, selfCalls: &selfCalls)
             scanExpr(r, type: type, selfCalls: &selfCalls)
+        case .box(let v, _):
+            scanExpr(v, type: type, selfCalls: &selfCalls)
         case .intLit, .boolLit, .stringLit, .varRef, .closure:
             break
         }
@@ -173,6 +175,6 @@ private final class MutationAnalyzer {
                 return decl
             }
         }
-        return IRModule(decls: decls)
+        return IRModule(decls: decls, interfaces: module.interfaces, conformances: module.conformances)
     }
 }

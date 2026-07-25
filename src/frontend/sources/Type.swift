@@ -12,10 +12,11 @@ public indirect enum Type: Equatable {
     case string
     case void
     case named(String, NamedKind)                 // struct / enum / class / actor
+    case existential(String)                       // `any I` — a boxed value conforming to interface I (M5 A1.4)
     case function(params: [Type], ret: Type)       // closures and named functions share this
     case error                                     // unresolved / failed typing; suppresses cascades
 
-    // Extension points for M5: `.typeParam`, `.existential`, `.opaque`, `.generic`.
+    // Extension points for M5: `.typeParam`, `.opaque`, `.generic`.
 }
 
 extension Type: CustomStringConvertible {
@@ -27,6 +28,7 @@ extension Type: CustomStringConvertible {
         case .void:   return "Void"
         case .error:  return "<error>"
         case .named(let name, _): return name
+        case .existential(let name): return "any \(name)"
         case .function(let params, let ret):
             return "(" + params.map(\.description).joined(separator: ", ") + ") -> \(ret)"
         }

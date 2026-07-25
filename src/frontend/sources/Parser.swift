@@ -389,6 +389,13 @@ public struct Parser {
 
     private mutating func parseTypeRef() -> TypeRef {
         let start = currentSpan
+        // `any I` — an existential over interface I (M5 A1.4). `any` is contextual: it
+        // introduces an existential only when a type name follows.
+        if case .ident("any") = currentKind, case .ident = peek() {
+            advance()   // `any`
+            let iface = expectIdent()
+            return TypeRef(name: "any \(iface)", existentialOf: iface, span: spanFrom(start))
+        }
         if check(.lParen) {
             // Function type: (T1, T2) -> R
             expect(.lParen)

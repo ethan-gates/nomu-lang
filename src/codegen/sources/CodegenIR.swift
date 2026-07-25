@@ -19,6 +19,8 @@ public struct CodegenIR {
     private var classes: [String: IRClass]  = [:]
     private var actors:  [String: IRActor]  = [:]
     private var funcs:   [String: IRFunc]   = [:]
+    private var interfaceDefs: [String: IRInterface] = [:]   // M5 A1.4: witness-table layout
+    private var conformances: [IRConformance] = []           // M5 A1.4: one witness instance each
 
     // Hoisted closure/spawn env-struct + impl-function definitions, spliced in at
     // the marker; monotonic counters give each a unique name.
@@ -68,6 +70,8 @@ public struct CodegenIR {
             case .funcDecl(let f):   funcs[f.name]   = f
             }
         }
+        for i in module.interfaces { interfaceDefs[i.name] = i }
+        conformances = module.conformances
     }
 
     public mutating func emit() -> String {
@@ -75,6 +79,9 @@ public struct CodegenIR {
         // units (src/runtime/*, compiled beside this by the driver); generated code
         // reaches them through the shared ABI header (M4.13).
         out += "#include \"runtime.h\"\n\n"
+        // `any I` box: a witness-table pointer + a payload pointer (M5 A1.4). Defined
+        // before user types so any-typed fields resolve.
+        out += "typedef struct { const void* witness; void* payload; } AnyBox;\n\n"
         // Type declarations first — closure env structs may reference user types.
         for decl in module.decls {
             if case .funcDecl = decl { continue }
@@ -85,6 +92,9 @@ public struct CodegenIR {
         for decl in module.decls {
             if case .funcDecl(let f) = decl { emitFuncProto(f) }
         }
+        // Witness-table types, thunks, and per-conformance instances (after protos, so
+        // thunks can call the concrete methods they wrap; before bodies, which box/dispatch).
+        emitWitnessTables()
         out += "\n"
         // Marker where hoisted closure/spawn definitions get spliced in.
         let marker = "/*__NOMU_CLOSURES__*/\n"
@@ -315,6 +325,101 @@ public struct CodegenIR {
         out += "}\n\n"
     }
 
+    // MARK: - Witness tables (M5 A1.4)
+
+    // Per interface (that has conformers): a struct of function pointers — one slot per
+    // method requirement, get/set slots per property requirement, and a reserved
+    // type-witness slot for future associated types. Then, per conformance, uniform-
+    // signature thunks (self as void*) wrapping the concrete impls, and one instance.
+    private mutating func emitWitnessTables() {
+        let used = Set(conformances.map(\.interfaceName))
+        for i in module.interfaces where used.contains(i.name) { emitWitnessType(i) }
+        for c in conformances {
+            guard let i = interfaceDefs[c.interfaceName] else { continue }
+            emitWitnessInstance(c, i)
+        }
+    }
+
+    private mutating func emitWitnessType(_ i: IRInterface) {
+        out += "typedef struct {\n"
+        for m in i.methods {
+            var params = "void*"
+            for pt in m.params { params += ", \(cType(pt))" }
+            out += "    \(cType(m.ret)) (*\(m.name))(\(params));\n"
+        }
+        for p in i.properties {
+            out += "    \(cType(p.type)) (*\(p.name)_get)(void*);\n"
+            if p.isSettable { out += "    void (*\(p.name)_set)(void*, \(cType(p.type)));\n" }
+        }
+        out += "    const void* type_witness;\n"
+        out += "} \(Mangle.witnessType(i.name));\n\n"
+    }
+
+    private mutating func emitWitnessInstance(_ c: IRConformance, _ i: IRInterface) {
+        let t = c.typeName, kind = c.typeKind, iface = i.name
+        for m in i.methods { emitMethodThunk(t, kind, iface, m) }
+        for p in i.properties { emitPropertyThunks(t, kind, iface, p) }
+
+        out += "static const \(Mangle.witnessType(iface)) \(Mangle.witnessInstance(t, iface)) = {\n"
+        for m in i.methods { out += "    .\(m.name) = \(Mangle.witnessThunk(t, iface, m.name)),\n" }
+        for p in i.properties {
+            out += "    .\(p.name)_get = \(Mangle.witnessThunk(t, iface, "\(p.name)_get")),\n"
+            if p.isSettable { out += "    .\(p.name)_set = \(Mangle.witnessThunk(t, iface, "\(p.name)_set")),\n" }
+        }
+        out += "    .type_witness = 0,\n};\n\n"
+    }
+
+    private mutating func emitMethodThunk(_ t: String, _ kind: NamedKind, _ iface: String, _ m: IRMethodReq) {
+        var sig = "void* self"
+        for (idx, pt) in m.params.enumerated() { sig += ", \(cType(pt)) a\(idx)" }
+        out += "static \(cType(m.ret)) \(Mangle.witnessThunk(t, iface, m.name))(\(sig)) {\n"
+        let selfArg = witnessSelfArg(t, kind, m.name)
+        let argNames = (0..<m.params.count).map { "a\($0)" }
+        let call = "\(Mangle.method(t, m.name))(\(([selfArg] + argNames).joined(separator: ", ")))"
+        out += m.ret == .void ? "    \(call);\n" : "    return \(call);\n"
+        out += "}\n"
+    }
+
+    // Getter (and setter, if the requirement is settable). A stored field reads/writes
+    // directly; a computed property routes through its A1.1 accessor method.
+    private mutating func emitPropertyThunks(_ t: String, _ kind: NamedKind, _ iface: String, _ p: IRPropReq) {
+        let cast = "((\(Mangle.type(t))*)self)"
+        let backedByField = typeFields(t, kind).contains { $0.name == p.name }
+        out += "static \(cType(p.type)) \(Mangle.witnessThunk(t, iface, "\(p.name)_get"))(void* self) {\n"
+        if backedByField {
+            out += "    return \(cast)->\(p.name);\n"
+        } else {
+            out += "    return \(Mangle.method(t, "\(p.name).get"))(\(witnessSelfArg(t, kind, "\(p.name).get")));\n"
+        }
+        out += "}\n"
+        if p.isSettable {
+            out += "static void \(Mangle.witnessThunk(t, iface, "\(p.name)_set"))(void* self, \(cType(p.type)) a0) {\n"
+            if backedByField {
+                out += "    \(cast)->\(p.name) = a0;\n"
+            } else {
+                out += "    \(Mangle.method(t, "\(p.name).set"))(\(witnessSelfArg(t, kind, "\(p.name).set")), a0);\n"
+            }
+            out += "}\n"
+        }
+    }
+
+    // How to hand `self` (a void* payload) to a concrete impl: class and mutating value
+    // methods take a pointer; a read-only value method takes the value.
+    private func witnessSelfArg(_ type: String, _ kind: NamedKind, _ method: String) -> String {
+        let cast = "(\(Mangle.type(type))*)self"
+        if kind == .class_ { return cast }
+        if methodIsMutating(type, method) { return cast }
+        return "(*\(cast))"
+    }
+
+    private func typeFields(_ name: String, _ kind: NamedKind) -> [IRField] {
+        switch kind {
+        case .struct_: return structs[name]?.fields ?? []
+        case .class_:  return classes[name]?.fields ?? []
+        default:       return []
+        }
+    }
+
     // MARK: - Scopes
 
     private mutating func pushScope() { frames.append([]) }
@@ -472,7 +577,23 @@ public struct CodegenIR {
             var ret = Type.void
             if case .function(_, let r) = e.type { ret = r }
             return emitClosure(params: params, body: body, ret: ret)
+
+        case .box(let value, let iface):
+            return emitBox(value: value, interface: iface)
         }
+    }
+
+    // Wrap a concrete conformer as `any I`: a value type is heap-boxed (a copy that
+    // outlives the temporary); a reference type's pointer is the payload directly.
+    private mutating func emitBox(value: IRExpr, interface iface: String) -> String {
+        let v = emitExpr(value)
+        guard case .named(let t, let kind) = value.type else { return "/* box of non-nominal */" }
+        let witness = "&\(Mangle.witnessInstance(t, iface))"
+        if kind == .class_ || kind == .actor_ {
+            return "(AnyBox){ .witness = \(witness), .payload = (void*)\(v) }"
+        }
+        let ct = Mangle.type(t)
+        return "({ \(ct)* __p = (\(ct)*)rt_alloc(sizeof(\(ct))); *__p = \(v); (AnyBox){ .witness = \(witness), .payload = (void*)__p }; })"
     }
 
     // struct → compound literal; class/actor → Name_new(...).
@@ -513,6 +634,15 @@ public struct CodegenIR {
     }
 
     private mutating func emitMethodCall(receiver: IRExpr, method: String, args: [IRExpr]) -> String {
+        // Requirement call through `any I` — dispatch via the witness slot (M5 A1.4).
+        // Property reads arrive as `prop.get`; the `.` maps to the `_get` slot field.
+        if case .existential(let iface) = receiver.type {
+            let box = emitExpr(receiver)
+            let slot = method.replacingOccurrences(of: ".", with: "_")
+            let argVals = args.map { emitExpr($0) }
+            let callArgs = (["__b.payload"] + argVals).joined(separator: ", ")
+            return "({ AnyBox __b = \(box); ((const \(Mangle.witnessType(iface))*)__b.witness)->\(slot)(\(callArgs)); })"
+        }
         guard case .named(let typeName, let kind) = receiver.type else {
             return "/* non-object method call: \(method) */"
         }
@@ -520,16 +650,18 @@ public struct CodegenIR {
         // receiver's address; the caller check guaranteed it's a mutable `var` lvalue.
         // Class/actor receivers are already pointers, and so is `self` inside a
         // pointer-self method (don't take its address again).
-        let byPointer = kind != .class_ && kind != .actor_ && methodIsMutating(typeName, method)
-        let recvAlreadyPointer: Bool = { if case .varRef("self") = receiver.kind { return selfIsPointer }; return false }()
+        // Class/actor methods and mutating value methods take `self` by pointer; a
+        // read-only value method takes it by value. A class/actor receiver value is
+        // already a pointer, as is a pointer-`self`; a struct/enum value is not. Bridge
+        // the two: take an address of a value, or dereference a pointer, only on mismatch.
+        let calleeWantsPointer = kind == .class_ || kind == .actor_ || methodIsMutating(typeName, method)
+        let isSelf: Bool = { if case .varRef("self") = receiver.kind { return true }; return false }()
+        let recvIsPointer = kind == .class_ || kind == .actor_ || (isSelf && selfIsPointer)
         let recvExpr = emitExpr(receiver)
-        // Match the callee's `self`: take the address for a mutating value method, or
-        // dereference `self` when a by-value method (e.g. a getter) is called from a
-        // pointer-`self` context (a mutating method).
         let recv: String
-        if byPointer && !recvAlreadyPointer      { recv = "&\(recvExpr)" }
-        else if !byPointer && recvAlreadyPointer { recv = "(*\(recvExpr))" }
-        else                                     { recv = recvExpr }
+        if calleeWantsPointer == recvIsPointer { recv = recvExpr }
+        else if calleeWantsPointer             { recv = "&\(recvExpr)" }
+        else                                   { recv = "(*\(recvExpr))" }
         let argVals = args.map { emitExpr($0) }
         return "\(Mangle.method(typeName, method))(\(([recv] + argVals).joined(separator: ", ")))"
     }
@@ -797,6 +929,8 @@ public struct CodegenIR {
             var nb = bound
             for p in ps { nb.insert(p.name) }
             collectUsesBlock(cbody, bound: &nb, used: &used)
+        case .box(let value, _):
+            collectUsesExpr(value, bound: bound, used: &used)
         }
     }
 
@@ -846,11 +980,12 @@ public struct CodegenIR {
         case .string:     return "String"
         case .void:       return "void"
         case .function:   return "Closure"
+        case .existential: return "AnyBox"
         case .named(let n, let kind):
             switch kind {
             case .class_, .actor_: return Mangle.type(n) + "*"
             case .struct_, .enum_: return Mangle.type(n)
-            case .interface_:      return "void* /* any \(n) */"   // A1.4 defines the box; unreached in A1.2
+            case .interface_:      return "AnyBox /* self: any \(n) */"   // interface default self (A1.2)
             }
         case .error:      return "int64_t"   // unreachable for well-typed programs
         }
