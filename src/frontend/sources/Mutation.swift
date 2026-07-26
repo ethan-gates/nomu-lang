@@ -175,6 +175,7 @@ private final class MutationAnalyzer {
                 return decl
             }
         }
-        return IRModule(decls: decls, interfaces: module.interfaces, conformances: module.conformances)
+        return IRModule(decls: decls, interfaces: module.interfaces,
+                        conformances: module.conformances, composites: module.composites)
     }
 }

@@ -30,6 +30,8 @@ public struct Sema {
     private var conformancePairs: Set<String> = []           // "T:I" seen, so witnesses aren't duplicated
     private var inheritedDefaults: [String: [InterfaceMethod]] = [:]   // defaulted reqs a type inherits
     private var interfaceBases: [String: [Conformance]] = [:]   // M5 A1.5: interface → direct base interfaces
+    private var compositeList: [IRComposite] = []               // M5 A1.5b: (type, any A & B) pairs boxed
+    private var compositePairs: Set<String> = []
 
     // Lexical scope stack for locals/params (name → type + mutability).
     private var scopes: [[String: Local]] = []
@@ -62,7 +64,8 @@ public struct Sema {
 
         // M4.11: infer method mutating-ness, validate `let`-field / `self` writes,
         // annotate the IR, then check that mutating value-type calls have a mutable receiver.
-        let module0 = IRModule(decls: decls, interfaces: buildIRInterfaces(), conformances: conformanceList)
+        let module0 = IRModule(decls: decls, interfaces: buildIRInterfaces(),
+                               conformances: conformanceList, composites: compositeList)
         let mutation = analyzeMutation(module0, into: diags)
         for site in methodCallSites where mutation.mutating.contains(site.callee) && !site.receiverMutable {
             diags.error("cannot call mutating method on an immutable value — the receiver must be a 'var'", at: site.span)
@@ -107,10 +110,8 @@ public struct Sema {
 
     private func resolve(_ ref: TypeRef?) -> Type {
         guard let ref else { return .void }
-        if let iface = ref.existentialOf {   // `any I` (M5 A1.4)
-            if interfaces[iface] != nil { return .existential(iface) }
-            diags.error("unknown interface '\(iface)' in 'any \(iface)'", at: ref.span)
-            return .error
+        if let ifaces = ref.existentialOf {   // `any I` / `any A & B` (M5 A1.4/A1.5b)
+            return resolveExistential(ifaces, at: ref.span)
         }
         if let fn = ref.fn {
             return .function(params: fn.params.map { resolve($0) }, ret: resolve(fn.ret))
@@ -132,6 +133,30 @@ public struct Sema {
             }
             diags.error("unknown type '\(ref.name)'", at: ref.span)
             return .error
+        }
+    }
+
+    // Resolve `any A & B …` to an existential (one interface) or a composition (several).
+    // Canonicalize: validate each is an interface, dedup, drop any interface implied by a
+    // refiner already present (`A & B` collapses to `B` when `B: A`), and sort — so `A & B`
+    // and `B & A` are the same type (M5 A1.5b, interfaces.md §4.4).
+    private func resolveExistential(_ names: [String], at span: Span) -> Type {
+        for n in names where interfaces[n] == nil {
+            diags.error("'\(n)' is not an interface in 'any \(names.joined(separator: " & "))'", at: span)
+            return .error
+        }
+        var set = Array(Set(names))
+        set = set.filter { i in !set.contains { j in j != i && transitiveBases(j).contains(i) } }
+        set.sort()
+        return set.count == 1 ? .existential(set[0]) : .composition(set)
+    }
+
+    // The interface(s) an existential/composition ranges over; empty for other types.
+    private func existentialInterfaces(_ type: Type) -> [String] {
+        switch type {
+        case .existential(let i): return [i]
+        case .composition(let is_): return is_
+        default: return []
         }
     }
 
@@ -657,31 +682,41 @@ public struct Sema {
 
     // MARK: - Expressions
 
-    // Coerce a concrete conformer to `any I` where an existential is expected, inserting
-    // a box (M5 A1.4). A type/conformance mismatch against an existential is diagnosed here.
+    // Coerce a concrete conformer to `any I` / `any A & B` where an existential is
+    // expected, inserting a box (M5 A1.4/A1.5b). A conformance mismatch is diagnosed here.
     private mutating func coerce(_ e: IRExpr, to expected: Type?) -> IRExpr {
-        guard case .existential(let iface)? = expected else { return e }
+        let target: [String]
+        switch expected {
+        case .existential(let iface): target = [iface]
+        case .composition(let ifaces): target = ifaces
+        default: return e
+        }
+        // Already this existential/composition.
+        if e.type == expected { return e }
         switch e.type {
-        case .existential(let have):
-            if have != iface {
-                if transitiveBases(have).contains(iface) {
-                    diags.error("existential upcast 'any \(have)' → 'any \(iface)' is not supported yet; box the concrete value directly", at: e.span)
-                } else {
-                    diags.error("cannot convert 'any \(have)' to 'any \(iface)'", at: e.span)
-                }
+        case .named(let t, let kind):
+            let missing = target.filter { conformsTo[t]?.contains($0) != true }
+            if missing.isEmpty {
+                if target.count > 1 { recordComposite(t, kind, target) }
+                return IRExpr(type: expected!, span: e.span, kind: .box(value: e, interfaces: target))
             }
+            diags.error("type '\(t)' does not conform to '\(missing.joined(separator: " & "))'", at: e.span)
             return e
-        case .named(let t, _):
-            if conformsTo[t]?.contains(iface) == true {
-                return IRExpr(type: .existential(iface), span: e.span, kind: .box(value: e, interface: iface))
-            }
-            diags.error("type '\(t)' does not conform to '\(iface)'", at: e.span)
+        case .existential, .composition:
+            diags.error("existential upcast to 'any \(target.joined(separator: " & "))' is not supported yet; box the concrete value directly", at: e.span)
             return e
         case .error:
             return e
         default:
-            diags.error("cannot convert '\(e.type)' to 'any \(iface)'", at: e.span)
+            diags.error("cannot convert '\(e.type)' to 'any \(target.joined(separator: " & "))'", at: e.span)
             return e
+        }
+    }
+
+    private mutating func recordComposite(_ typeName: String, _ kind: NamedKind, _ ifaces: [String]) {
+        let key = "\(typeName):\(ifaces.joined(separator: "&"))"
+        if compositePairs.insert(key).inserted {
+            compositeList.append(IRComposite(typeName: typeName, typeKind: kind, interfaces: ifaces))
         }
     }
 
@@ -711,8 +746,8 @@ public struct Sema {
                 return buildEnumInit(typeName, field, [], at: span)
             }
             let b = checkExpr(base)
-            // A property-requirement read through `any I` — dispatched via the getter slot.
-            if case .existential(let iface) = b.type,
+            // A property-requirement read through `any I` / `any A & B` — via the getter slot.
+            if let iface = existentialInterfaces(b.type).first(where: { aggregatedProperties($0).contains { $0.name == field } }),
                let prop = aggregatedProperties(iface).first(where: { $0.name == field }) {
                 return IRExpr(type: resolve(prop.type), span: span,
                               kind: .methodCall(receiver: b, method: "\(field).get", args: []))
@@ -768,9 +803,9 @@ public struct Sema {
         // Member call: base.member(args) — an actor send or an instance method.
         if case .member(let base, let name, _) = callee {
             let recv = checkExpr(base)
-            // A method-requirement call through `any I` — dispatched via the witness slot
-            // (including requirements inherited by refinement, M5 A1.5).
-            if case .existential(let iface) = recv.type,
+            // A method-requirement call through `any I` / `any A & B` — dispatched via the
+            // witness slot (including requirements inherited by refinement, M5 A1.5).
+            if let iface = existentialInterfaces(recv.type).first(where: { aggregatedMethods($0).contains { $0.name == name } }),
                let req = aggregatedMethods(iface).first(where: { $0.name == name }) {
                 let irArgs = args.map { checkExpr($0.value) }
                 checkArgTypes(irArgs, against: req.params.map { resolve($0.type) }, at: span)

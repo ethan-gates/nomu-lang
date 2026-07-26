@@ -193,7 +193,7 @@ private func head(_ e: IRExpr) -> String {
     case .call:                    return "call"
     case .binary(let op, _, _):    return "binary \(opSym(op))"
     case .closure:                 return "closure"
-    case .box(_, let iface):       return "box any \(iface)"
+    case .box(_, let ifaces):      return "box any \(ifaces.joined(separator: " & "))"
     }
 }
 

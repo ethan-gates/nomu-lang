@@ -21,6 +21,7 @@ public struct CodegenIR {
     private var funcs:   [String: IRFunc]   = [:]
     private var interfaceDefs: [String: IRInterface] = [:]   // M5 A1.4: witness-table layout
     private var conformances: [IRConformance] = []           // M5 A1.4: one witness instance each
+    private var composites: [IRComposite] = []               // M5 A1.5b: composite (any A & B) witnesses
 
     // Hoisted closure/spawn env-struct + impl-function definitions, spliced in at
     // the marker; monotonic counters give each a unique name.
@@ -72,6 +73,7 @@ public struct CodegenIR {
         }
         for i in module.interfaces { interfaceDefs[i.name] = i }
         conformances = module.conformances
+        composites = module.composites
     }
 
     public mutating func emit() -> String {
@@ -338,6 +340,37 @@ public struct CodegenIR {
             guard let i = interfaceDefs[c.interfaceName] else { continue }
             emitWitnessInstance(c, i)
         }
+        emitCompositeWitnesses()
+    }
+
+    // A composite witness struct per distinct `any A & B` (one witness-table pointer per
+    // interface), then an instance per boxed type referencing the single-interface
+    // witnesses (already emitted, since T conforms to each) (M5 A1.5b).
+    private mutating func emitCompositeWitnesses() {
+        var emittedTypes = Set<String>()
+        for c in composites {
+            let key = c.interfaces.joined(separator: "&")
+            if emittedTypes.insert(key).inserted {
+                out += "typedef struct {\n"
+                for i in c.interfaces { out += "    const \(Mangle.witnessType(i))* \(i);\n" }
+                out += "} \(Mangle.compositeType(c.interfaces));\n\n"
+            }
+        }
+        for c in composites {
+            out += "static const \(Mangle.compositeType(c.interfaces)) \(Mangle.compositeInstance(c.typeName, c.interfaces)) = {\n"
+            for i in c.interfaces { out += "    .\(i) = &\(Mangle.witnessInstance(c.typeName, i)),\n" }
+            out += "};\n\n"
+        }
+    }
+
+    // Which interface of a composition owns `method` (a requirement name, or `prop.get`).
+    private func compositionOwner(_ ifaces: [String], _ method: String) -> String {
+        for i in ifaces {
+            guard let def = interfaceDefs[i] else { continue }
+            if def.methods.contains(where: { $0.name == method }) { return i }
+            if def.properties.contains(where: { "\($0.name).get" == method || "\($0.name).set" == method }) { return i }
+        }
+        return ifaces.first ?? "?"
     }
 
     private mutating func emitWitnessType(_ i: IRInterface) {
@@ -578,17 +611,21 @@ public struct CodegenIR {
             if case .function(_, let r) = e.type { ret = r }
             return emitClosure(params: params, body: body, ret: ret)
 
-        case .box(let value, let iface):
-            return emitBox(value: value, interface: iface)
+        case .box(let value, let ifaces):
+            return emitBox(value: value, interfaces: ifaces)
         }
     }
 
-    // Wrap a concrete conformer as `any I`: a value type is heap-boxed (a copy that
-    // outlives the temporary); a reference type's pointer is the payload directly.
-    private mutating func emitBox(value: IRExpr, interface iface: String) -> String {
+    // Wrap a concrete conformer as `any I` / `any A & B`: a value type is heap-boxed (a
+    // copy that outlives the temporary); a reference type's pointer is the payload
+    // directly. The witness is the single witness table, or — for a composition — the
+    // composite witness struct holding one table pointer per interface.
+    private mutating func emitBox(value: IRExpr, interfaces ifaces: [String]) -> String {
         let v = emitExpr(value)
         guard case .named(let t, let kind) = value.type else { return "/* box of non-nominal */" }
-        let witness = "&\(Mangle.witnessInstance(t, iface))"
+        let witness = ifaces.count == 1
+            ? "&\(Mangle.witnessInstance(t, ifaces[0]))"
+            : "&\(Mangle.compositeInstance(t, ifaces))"
         if kind == .class_ || kind == .actor_ {
             return "(AnyBox){ .witness = \(witness), .payload = (void*)\(v) }"
         }
@@ -642,6 +679,16 @@ public struct CodegenIR {
             let argVals = args.map { emitExpr($0) }
             let callArgs = (["__b.payload"] + argVals).joined(separator: ", ")
             return "({ AnyBox __b = \(box); ((const \(Mangle.witnessType(iface))*)__b.witness)->\(slot)(\(callArgs)); })"
+        }
+        // Through `any A & B` — the witness is a composite struct; index the owning
+        // interface's sub-table, then its slot (M5 A1.5b).
+        if case .composition(let ifaces) = receiver.type {
+            let box = emitExpr(receiver)
+            let slot = method.replacingOccurrences(of: ".", with: "_")
+            let owner = compositionOwner(ifaces, method)
+            let argVals = args.map { emitExpr($0) }
+            let callArgs = (["__b.payload"] + argVals).joined(separator: ", ")
+            return "({ AnyBox __b = \(box); ((const \(Mangle.compositeType(ifaces))*)__b.witness)->\(owner)->\(slot)(\(callArgs)); })"
         }
         guard case .named(let typeName, let kind) = receiver.type else {
             return "/* non-object method call: \(method) */"
@@ -980,7 +1027,7 @@ public struct CodegenIR {
         case .string:     return "String"
         case .void:       return "void"
         case .function:   return "Closure"
-        case .existential: return "AnyBox"
+        case .existential, .composition: return "AnyBox"
         case .named(let n, let kind):
             switch kind {
             case .class_, .actor_: return Mangle.type(n) + "*"

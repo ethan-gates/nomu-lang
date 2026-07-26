@@ -1,0 +1,31 @@
+// M5 A1.5b: `&` interface composition. `any A & B` is a value conforming to both A and
+// B — structural, no named declaration. It is commutative and canonical (`A & B` is the
+// same type as `B & A`), and collapses when one refines the other (`Drawable & Named`
+// becomes `Drawable` if Drawable: Named). The box carries a witness table per interface;
+// dispatch indexes the owning interface's table.
+
+interface Drawable {
+    fun draw() -> String
+}
+interface Named {
+    var name: String { get }
+}
+
+struct Circle: Drawable, Named {
+    var name: String
+    fun draw() -> String { return "O" }
+}
+
+// Requires both interfaces; requirements from each dispatch through the composite witness.
+fun show(x: any Drawable & Named) -> String {
+    return concat(x.name, x.draw())
+}
+
+fun main() {
+    let c = Circle(name: "circ-")
+    print(show(c))                       // circ-O
+
+    let both: any Named & Drawable = c   // order-independent — same canonical type
+    print(both.draw())                   // O       (Drawable's requirement)
+    print(both.name)                     // circ-   (Named's requirement)
+}

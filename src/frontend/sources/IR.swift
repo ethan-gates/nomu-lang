@@ -10,12 +10,23 @@ public struct IRModule {
     public let decls: [IRDecl]
     public let interfaces: [IRInterface]      // M5 A1.4: drives witness-table type emission
     public let conformances: [IRConformance]  // M5 A1.4: drives witness-table instance emission
+    public let composites: [IRComposite]      // M5 A1.5b: composite (any A & B) witnesses to emit
 
-    public init(decls: [IRDecl], interfaces: [IRInterface] = [], conformances: [IRConformance] = []) {
+    public init(decls: [IRDecl], interfaces: [IRInterface] = [], conformances: [IRConformance] = [],
+                composites: [IRComposite] = []) {
         self.decls = decls
         self.interfaces = interfaces
         self.conformances = conformances
+        self.composites = composites
     }
+}
+
+// A concrete type boxed as `any A & B` — codegen emits a composite witness struct (one
+// witness-table pointer per interface) and an instance referencing the single witnesses.
+public struct IRComposite {
+    public let typeName: String
+    public let typeKind: NamedKind
+    public let interfaces: [String]   // canonical
 }
 
 // The requirement surface of an interface, resolved to types — enough for codegen to
@@ -183,7 +194,7 @@ public indirect enum ExprKind {
     case call(callee: IRExpr, args: [IRArg])            // function / builtin call
     case binary(BinOp, IRExpr, IRExpr)
     case closure(params: [IRParam], body: [IRStmt])
-    case box(value: IRExpr, interface: String)          // M5 A1.4: wrap a concrete conformer as `any I`
+    case box(value: IRExpr, interfaces: [String])       // M5 A1.4/A1.5b: wrap a conformer as `any I` / `any A & B`
 }
 
 public struct IRArg {

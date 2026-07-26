@@ -71,6 +71,10 @@ enum Mangle {
     static func witnessInstance(_ type: String, _ iface: String) -> String { qualify([type, iface]) + "_witness" }
     static func witnessThunk(_ type: String, _ iface: String, _ slot: String) -> String { qualify([type, iface, slot]) + "_thunk" }
 
+    // Composite witnesses (M5 A1.5b): the per-composition struct type and per-type instance.
+    static func compositeType(_ ifaces: [String]) -> String { qualify(["comp"] + ifaces) }
+    static func compositeInstance(_ type: String, _ ifaces: [String]) -> String { qualify([type, "comp"] + ifaces) }
+
     // Compiler-synthesized members on a reference type.
     static func ctor(_ typeName: String) -> String { qualify([typeName]) + "_new" }
     static func release(_ typeName: String) -> String { qualify([typeName]) + "_release" }

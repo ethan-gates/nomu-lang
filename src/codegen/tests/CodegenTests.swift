@@ -529,6 +529,34 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(c.contains("nomu_main_Circle_Named_witness = {"))     // and for the base
     }
 
+    // `any A & B`: a composite witness struct (a witness-table pointer per interface),
+    // an instance for the boxed type, and dispatch that indexes the owning interface's
+    // sub-table (M5 A1.5b).
+    func testCompositionWitnessAndDispatchEmit() {
+        let c = gen("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        interface Named {
+            var name: String { get }
+        }
+        struct Circle: Drawable, Named {
+            var name: String
+            fun draw() -> String { return name }
+        }
+        fun show(x: any Drawable & Named) -> String {
+            return x.draw()
+        }
+        fun main() {
+            let c: any Drawable & Named = Circle(name: "c")
+            print(show(c))
+        }
+        """)
+        XCTAssertTrue(c.contains("} nomu_main_comp_Drawable_Named;"))            // composite struct type
+        XCTAssertTrue(c.contains("nomu_main_Circle_comp_Drawable_Named = {"))    // composite instance
+        XCTAssertTrue(c.contains("->Drawable->draw("))                           // indexed dispatch
+    }
+
     func testComputedPropertySetterMutates() {
         // The setter writes a field, so it is inferred mutating and takes `Rect* self`.
         let c = gen("""

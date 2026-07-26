@@ -476,8 +476,8 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
         guard case .funcDecl(let fn) = r.module.decls[1],
               case .letBinding(_, _, let value) = fn.body[0].kind,
-              case .box(_, let iface) = value.kind else { XCTFail(); return }
-        XCTAssertEqual(iface, "Drawable")
+              case .box(_, let ifaces) = value.kind else { XCTFail(); return }
+        XCTAssertEqual(ifaces, ["Drawable"])
         XCTAssertEqual(value.type, .existential("Drawable"))
     }
 
@@ -574,8 +574,8 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
         guard case .funcDecl(let fn) = r.module.decls[1],
               case .letBinding(_, _, let value) = fn.body[0].kind,
-              case .box(_, let iface) = value.kind else { XCTFail(); return }
-        XCTAssertEqual(iface, "Named")
+              case .box(_, let ifaces) = value.kind else { XCTFail(); return }
+        XCTAssertEqual(ifaces, ["Named"])
     }
 
     func testIncomparableSiblingDefaultsCancelToMandatory() {
@@ -602,5 +602,57 @@ final class SemaTests: XCTestCase {
         }
         """)
         XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    // MARK: - `&` composition (M5 A1.5b)
+
+    func testCompositionIsCanonicalAndOrderIndependent() {
+        // `any B & A` resolves to the same canonical composition as `any A & B`.
+        let r = sema("""
+        interface A {
+            fun a() -> Int
+        }
+        interface B {
+            fun b() -> Int
+        }
+        fun f(x: any B & A) -> Int { return x.a() }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let fn) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(fn.params[0].type, .composition(["A", "B"]))
+    }
+
+    func testCompositionCollapsesToRefiner() {
+        // `any Drawable & Named` where Drawable: Named collapses to `any Drawable`.
+        let r = sema("""
+        interface Named {
+            var name: String { get }
+        }
+        interface Drawable: Named {
+            fun draw() -> String
+        }
+        fun f(x: any Drawable & Named) -> String { return x.draw() }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let fn) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(fn.params[0].type, .existential("Drawable"))
+    }
+
+    func testCompositionRequiresConformanceToAll() {
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        interface Named {
+            var name: String { get }
+        }
+        struct OnlyDraw: Drawable {
+            fun draw() -> String { return "x" }
+        }
+        fun f() {
+            let x: any Drawable & Named = OnlyDraw()
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)   // OnlyDraw isn't Named
     }
 }

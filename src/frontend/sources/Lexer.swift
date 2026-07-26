@@ -33,6 +33,7 @@ public enum TokenKind: Equatable {
     case plus, minus, star, slash
     case eqEq, bangEq
     case lt, gt, ltEq, gtEq
+    case amp                  // & — interface composition
 
     case eof
 }
@@ -122,6 +123,7 @@ public struct Lexer {
         case ">":
             if peek() == "=" { pos += 1; return .gtEq }
             return .gt
+        case "&": return .amp
         default:
             error("unexpected character '\(c)'", at: pos - 1)
         }
