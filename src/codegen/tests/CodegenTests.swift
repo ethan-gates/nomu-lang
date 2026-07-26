@@ -502,6 +502,33 @@ final class CodegenTests: XCTestCase {
         XCTAssertTrue(c.contains("->draw("))                                    // dispatch via witness pointer
     }
 
+    // A refining interface's witness table carries inherited slots, and a witness
+    // instance is generated for the interface and every base it refines (M5 A1.5).
+    func testRefinedWitnessIncludesInheritedSlots() {
+        let c = gen("""
+        interface Named {
+            var name: String { get }
+        }
+        interface Drawable: Named {
+            fun draw() -> String
+        }
+        struct Circle: Drawable {
+            var name: String
+            fun draw() -> String { return name }
+        }
+        fun f(d: any Drawable) -> String {
+            return d.name
+        }
+        fun main() {
+            let x: any Drawable = Circle(name: "c")
+            print(f(x))
+        }
+        """)
+        XCTAssertTrue(c.contains("(*name_get)(void*)"))                     // inherited slot in Drawable's table
+        XCTAssertTrue(c.contains("nomu_main_Circle_Drawable_witness = {"))  // witness for the refiner
+        XCTAssertTrue(c.contains("nomu_main_Circle_Named_witness = {"))     // and for the base
+    }
+
     func testComputedPropertySetterMutates() {
         // The setter writes a field, so it is inferred mutating and takes `Rect* self`.
         let c = gen("""

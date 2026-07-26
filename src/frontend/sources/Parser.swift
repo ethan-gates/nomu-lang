@@ -188,6 +188,7 @@ public struct Parser {
         let start = currentSpan
         expect(.kwInterface)
         let name = expectIdent()
+        let refines = parseConformanceClause()   // `interface B: A, C` (M5 A1.5)
         expect(.lBrace)
         var methods: [InterfaceMethod] = []
         var properties: [InterfacePropertyReq] = []
@@ -203,7 +204,7 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return InterfaceDecl(name: name, methods: methods, properties: properties, span: spanFrom(start))
+        return InterfaceDecl(name: name, refines: refines, methods: methods, properties: properties, span: spanFrom(start))
     }
 
     // A method requirement: a signature, optionally followed by a `{ … }` default body.

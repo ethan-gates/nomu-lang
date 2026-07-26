@@ -517,4 +517,90 @@ final class SemaTests: XCTestCase {
         let r = sema("fun f(d: any Nope) -> Int { return 0 }")
         XCTAssertTrue(r.diagnostics.hasErrors)
     }
+
+    // MARK: - Refinement (M5 A1.5)
+
+    func testRefinementRequiresInheritedRequirements() {
+        let r = sema("""
+        interface Named {
+            var name: String { get }
+        }
+        interface Drawable: Named {
+            fun draw() -> String
+        }
+        struct Bad: Drawable {
+            fun draw() -> String { return "x" }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)   // missing inherited `name`
+    }
+
+    func testInheritedRequirementDispatchesThroughAny() {
+        let r = sema("""
+        interface Named {
+            var name: String { get }
+        }
+        interface Drawable: Named {
+            fun draw() -> String
+        }
+        fun f(d: any Drawable) -> String {
+            return d.name
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let fn) = r.module.decls[0],
+              case .ret(let e?) = fn.body[0].kind,
+              case .methodCall(let recv, let m, _) = e.kind else { XCTFail(); return }
+        XCTAssertEqual(m, "name.get")
+        XCTAssertEqual(recv.type, .existential("Drawable"))
+    }
+
+    func testConcreteRefinerBoxesAsBaseInterface() {
+        let r = sema("""
+        interface Named {
+            var name: String { get }
+        }
+        interface Drawable: Named {
+            fun draw() -> String
+        }
+        struct Circle: Drawable {
+            var name: String
+            fun draw() -> String { return "O" }
+        }
+        fun f() {
+            let n: any Named = Circle(name: "c")
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let fn) = r.module.decls[1],
+              case .letBinding(_, _, let value) = fn.body[0].kind,
+              case .box(_, let iface) = value.kind else { XCTFail(); return }
+        XCTAssertEqual(iface, "Named")
+    }
+
+    func testIncomparableSiblingDefaultsCancelToMandatory() {
+        let r = sema("""
+        interface A {
+            fun tag() -> String { return "A" }
+        }
+        interface B {
+            fun tag() -> String { return "B" }
+        }
+        interface C: A, B {
+        }
+        struct T: C {
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)   // tag cancels to mandatory; T omits it
+    }
+
+    func testRefinementCycleRejected() {
+        let r = sema("""
+        interface A: B {
+        }
+        interface B: A {
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
 }

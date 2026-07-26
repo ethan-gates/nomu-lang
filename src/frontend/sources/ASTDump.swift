@@ -43,7 +43,7 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
             appendBlock(h.body, ind: ind + "    ", into: &lines)
         }
     case .interfaceDecl(let i):
-        lines.append("\(ind)InterfaceDecl '\(i.name)'")
+        lines.append("\(ind)InterfaceDecl '\(i.name)'\(conformanceSuffix(i.refines))")
         for m in i.methods {
             let params = m.params.map { "\($0.label): \($0.type.name)" }.joined(separator: ", ")
             let ret = m.returnType.map { " -> \($0.name)" } ?? ""

@@ -1,0 +1,43 @@
+// M5 A1.5: interface refinement (`interface B: A`). A refining interface aggregates
+// its bases' requirements — a conformer of B must satisfy A's requirements too, and
+// `any B` can dispatch inherited requirements and defaults. A concrete conformer of B
+// boxes directly as `any A` (a base). Default resolution: a refining interface's
+// default overrides its base's (most-specific wins); incomparable sibling defaults
+// cancel, making the member mandatory.
+
+interface Named {
+    var name: String { get }
+    fun greeting() -> String {          // default operating on a required property
+        return concat("hi ", self.name)
+    }
+}
+
+interface Greeter: Named {
+    fun greeting() -> String {          // overrides Named's default (most-specific wins)
+        return concat("hello ", self.name)
+    }
+}
+
+struct Person: Greeter {
+    var name: String                    // satisfies the inherited `name` requirement
+}
+
+// Takes any Greeter; `name` (inherited) and `greeting` (overridden default) both
+// dispatch through the witness table.
+fun announce(g: any Greeter) -> String {
+    return concat(g.greeting(), concat(" / ", g.name))
+}
+
+// A base existential accepts a concrete refiner, boxed directly. Person has one
+// `greeting` implementation (Greeter's override), and that single witness is used
+// however it is reached — so even as `any Named` it stays the overridden version.
+fun plain(n: any Named) -> String {
+    return n.greeting()
+}
+
+fun main() {
+    let p = Person(name: "Ada")
+    print(p.greeting())     // hello Ada        (overridden default, concrete)
+    print(announce(p))      // hello Ada / Ada  (dynamic: inherited prop + overridden default)
+    print(plain(p))         // hello Ada        (as any Named — same witness, consistent dispatch)
+}

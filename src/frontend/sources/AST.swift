@@ -55,6 +55,7 @@ public enum TopDecl {
 // storage). Conformance (`extension T: I`), `any`/`some`, and refinement come later.
 public struct InterfaceDecl {
     public let name: String
+    public let refines: [Conformance]   // M5 A1.5: base interfaces (`interface B: A`)
     public let methods: [InterfaceMethod]
     public let properties: [InterfacePropertyReq]
     public let span: Span

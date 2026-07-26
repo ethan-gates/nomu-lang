@@ -27,7 +27,9 @@ public struct Sema {
     // Conformance facts (M5 A1.4), filled by checkConformances before body lowering.
     private var conformsTo: [String: Set<String>] = [:]      // type name → interface names
     private var conformanceList: [IRConformance] = []        // one per valid `T: I`
+    private var conformancePairs: Set<String> = []           // "T:I" seen, so witnesses aren't duplicated
     private var inheritedDefaults: [String: [InterfaceMethod]] = [:]   // defaulted reqs a type inherits
+    private var interfaceBases: [String: [Conformance]] = [:]   // M5 A1.5: interface → direct base interfaces
 
     // Lexical scope stack for locals/params (name → type + mutability).
     private var scopes: [[String: Local]] = []
@@ -48,6 +50,7 @@ public struct Sema {
 
     public mutating func check() -> SemaResult {
         collectGlobals()
+        validateInterfaceGraph()
         checkConformances()
         var decls: [IRDecl] = []
         for decl in program.decls {
@@ -76,7 +79,7 @@ public struct Sema {
             case .enumDecl(let e):   enums[e.name]   = e
             case .classDecl(let c):  classes[c.name] = c
             case .actorDecl(let a):  actors[a.name]  = a
-            case .interfaceDecl(let i): interfaces[i.name] = i
+            case .interfaceDecl(let i): interfaces[i.name] = i; interfaceBases[i.name] = i.refines
             case .funcDecl(let f):
                 funcs[f.name] = FnSig(params: f.params.map { resolve($0.type) },
                                       ret: resolve(f.returnType))
@@ -211,9 +214,98 @@ public struct Sema {
         }
     }
 
-    // A method requirement (or default) named `name` on an interface, if any.
+    // A method requirement (or default) named `name` reachable from an interface,
+    // including inherited requirements (aggregated over the refinement graph).
     private func interfaceMethod(_ typeName: String, _ name: String) -> InterfaceMethod? {
-        interfaces[typeName]?.methods.first { $0.name == name }
+        aggregatedMethods(typeName).first { $0.name == name }
+    }
+
+    // MARK: - Refinement graph (M5 A1.5)
+
+    // Base interfaces reachable from `iface` (transitive), cycle-guarded.
+    private func transitiveBases(_ iface: String) -> [String] {
+        var result: [String] = []
+        var seen: Set<String> = [iface]
+        var stack = (interfaceBases[iface] ?? []).map(\.name)
+        while let b = stack.popLast() {
+            guard !seen.contains(b) else { continue }
+            seen.insert(b)
+            result.append(b)
+            stack.append(contentsOf: (interfaceBases[b] ?? []).map(\.name))
+        }
+        return result
+    }
+
+    private func methodKey(_ m: InterfaceMethod) -> String {
+        m.name + "(" + m.params.map { resolve($0.type).description }.joined(separator: ",") + ")"
+    }
+
+    // The full method-requirement set of `iface` = its own plus every inherited one,
+    // deduplicated by signature; each carries its resolved default (§4.3).
+    private func aggregatedMethods(_ iface: String) -> [InterfaceMethod] {
+        let all = [iface] + transitiveBases(iface)
+        var order: [String] = []
+        var rep: [String: InterfaceMethod] = [:]
+        var defaults: [String: [(String, Block)]] = [:]   // key → [(declaring interface, default body)]
+        for ifn in all {
+            for m in interfaces[ifn]?.methods ?? [] {
+                let key = methodKey(m)
+                if rep[key] == nil { rep[key] = m; order.append(key) }
+                if let body = m.defaultBody { defaults[key, default: []].append((ifn, body)) }
+            }
+        }
+        return order.map { key in
+            let m = rep[key]!
+            return InterfaceMethod(name: m.name, params: m.params, returnType: m.returnType,
+                                   defaultBody: resolveDefault(defaults[key] ?? []), span: m.span)
+        }
+    }
+
+    // Most-specific default wins; incomparable sibling defaults cancel → mandatory (nil).
+    private func resolveDefault(_ candidates: [(String, Block)]) -> Block? {
+        guard candidates.count != 1 else { return candidates[0].1 }
+        guard !candidates.isEmpty else { return nil }
+        // A candidate dominates if it refines (or equals) every other candidate's interface.
+        let dominators = candidates.filter { x in
+            candidates.allSatisfy { y in x.0 == y.0 || transitiveBases(x.0).contains(y.0) }
+        }
+        return dominators.count == 1 ? dominators[0].1 : nil
+    }
+
+    private func aggregatedProperties(_ iface: String) -> [InterfacePropertyReq] {
+        let all = [iface] + transitiveBases(iface)
+        var order: [String] = []
+        var byName: [String: InterfacePropertyReq] = [:]
+        for ifn in all {
+            for p in interfaces[ifn]?.properties ?? [] {
+                if let existing = byName[p.name] {
+                    // A settable requirement anywhere makes the aggregated one settable.
+                    byName[p.name] = InterfacePropertyReq(name: p.name, type: p.type,
+                                                          isSettable: existing.isSettable || p.isSettable, span: p.span)
+                } else {
+                    byName[p.name] = p
+                    order.append(p.name)
+                }
+            }
+        }
+        return order.map { byName[$0]! }
+    }
+
+    // Each base must name an interface, and refinement must be acyclic.
+    private func validateInterfaceGraph() {
+        for (name, bases) in interfaceBases {
+            for base in bases {
+                if interfaces[base.name] == nil {
+                    if kindOf(base.name) != nil {
+                        diags.error("'\(base.name)' is not an interface; an interface may only refine interfaces", at: base.span)
+                    } else {
+                        diags.error("unknown interface '\(base.name)'", at: base.span)
+                    }
+                } else if base.name == name || transitiveBases(base.name).contains(name) {
+                    diags.error("interface '\(name)' refinement is cyclic through '\(base.name)'", at: base.span)
+                }
+            }
+        }
     }
 
     // The interfaces' requirement surface, resolved to types, for witness-table layout.
@@ -221,8 +313,9 @@ public struct Sema {
         var out: [IRInterface] = []
         for decl in program.decls {
             guard case .interfaceDecl(let i) = decl else { continue }
-            let methods = i.methods.map { IRMethodReq(name: $0.name, params: $0.params.map { resolve($0.type) }, ret: resolve($0.returnType)) }
-            let props = i.properties.map { IRPropReq(name: $0.name, type: resolve($0.type), isSettable: $0.isSettable) }
+            // Aggregated (flattened) surface: the witness table carries inherited slots too.
+            let methods = aggregatedMethods(i.name).map { IRMethodReq(name: $0.name, params: $0.params.map { resolve($0.type) }, ret: resolve($0.returnType)) }
+            let props = aggregatedProperties(i.name).map { IRPropReq(name: $0.name, type: resolve($0.type), isSettable: $0.isSettable) }
             out.append(IRInterface(name: i.name, methods: methods, properties: props))
         }
         return out
@@ -279,7 +372,7 @@ public struct Sema {
     private mutating func checkConformance(_ typeName: String, _ kind: NamedKind, _ conformances: [Conformance],
                                            methods: [FuncDecl], fields: [VarField], properties: [ComputedProperty]) {
         for conf in conformances {
-            guard let iface = interfaces[conf.name] else {
+            guard interfaces[conf.name] != nil else {
                 if kindOf(conf.name) != nil {
                     diags.error("'\(conf.name)' is not an interface; '\(typeName)' can only conform to interfaces", at: conf.span)
                 } else {
@@ -287,10 +380,17 @@ public struct Sema {
                 }
                 continue
             }
-            conformsTo[typeName, default: []].insert(conf.name)
-            conformanceList.append(IRConformance(typeName: typeName, typeKind: kind, interfaceName: conf.name))
-            for req in iface.methods { checkMethodRequirement(req, typeName: typeName, interface: conf, methods: methods) }
-            for req in iface.properties { checkPropertyRequirement(req, typeName: typeName, interface: conf, fields: fields, properties: properties) }
+            // Conforming to a refining interface conforms to every base too, so a witness
+            // exists for each (dedup so one isn't emitted twice, M5 A1.5).
+            for iface in [conf.name] + transitiveBases(conf.name) {
+                conformsTo[typeName, default: []].insert(iface)
+                if conformancePairs.insert("\(typeName):\(iface)").inserted {
+                    conformanceList.append(IRConformance(typeName: typeName, typeKind: kind, interfaceName: iface))
+                }
+            }
+            // Check the full (aggregated) requirement set, so inherited requirements count.
+            for req in aggregatedMethods(conf.name) { checkMethodRequirement(req, typeName: typeName, interface: conf, methods: methods) }
+            for req in aggregatedProperties(conf.name) { checkPropertyRequirement(req, typeName: typeName, interface: conf, fields: fields, properties: properties) }
         }
     }
 
@@ -301,8 +401,10 @@ public struct Sema {
         if named.contains(where: { methodMatches(req, $0) }) { return }
         if req.defaultBody != nil {
             // Satisfied by the interface's overridable default — this conformer inherits
-            // it, so it is synthesized as a concrete method of the type (M5 A1.4).
-            inheritedDefaults[typeName, default: []].append(req)
+            // it, so it is synthesized once as a concrete method of the type (M5 A1.4).
+            if !(inheritedDefaults[typeName] ?? []).contains(where: { $0.name == req.name }) {
+                inheritedDefaults[typeName, default: []].append(req)
+            }
             return
         }
         if named.isEmpty {
@@ -561,7 +663,13 @@ public struct Sema {
         guard case .existential(let iface)? = expected else { return e }
         switch e.type {
         case .existential(let have):
-            if have != iface { diags.error("cannot convert 'any \(have)' to 'any \(iface)'", at: e.span) }
+            if have != iface {
+                if transitiveBases(have).contains(iface) {
+                    diags.error("existential upcast 'any \(have)' → 'any \(iface)' is not supported yet; box the concrete value directly", at: e.span)
+                } else {
+                    diags.error("cannot convert 'any \(have)' to 'any \(iface)'", at: e.span)
+                }
+            }
             return e
         case .named(let t, _):
             if conformsTo[t]?.contains(iface) == true {
@@ -605,13 +713,13 @@ public struct Sema {
             let b = checkExpr(base)
             // A property-requirement read through `any I` — dispatched via the getter slot.
             if case .existential(let iface) = b.type,
-               let prop = interfaces[iface]?.properties.first(where: { $0.name == field }) {
+               let prop = aggregatedProperties(iface).first(where: { $0.name == field }) {
                 return IRExpr(type: resolve(prop.type), span: span,
                               kind: .methodCall(receiver: b, method: "\(field).get", args: []))
             }
             // A property-requirement read inside an interface default (self: interface).
             if case .named(let tn, .interface_) = b.type,
-               let prop = interfaces[tn]?.properties.first(where: { $0.name == field }) {
+               let prop = aggregatedProperties(tn).first(where: { $0.name == field }) {
                 return IRExpr(type: resolve(prop.type), span: span, kind: .fieldAccess(base: b, field: field))
             }
             // A computed-property read lowers to a getter accessor call (M5 A1).
@@ -660,9 +768,10 @@ public struct Sema {
         // Member call: base.member(args) — an actor send or an instance method.
         if case .member(let base, let name, _) = callee {
             let recv = checkExpr(base)
-            // A method-requirement call through `any I` — dispatched via the witness slot.
+            // A method-requirement call through `any I` — dispatched via the witness slot
+            // (including requirements inherited by refinement, M5 A1.5).
             if case .existential(let iface) = recv.type,
-               let req = interfaces[iface]?.methods.first(where: { $0.name == name }) {
+               let req = aggregatedMethods(iface).first(where: { $0.name == name }) {
                 let irArgs = args.map { checkExpr($0.value) }
                 checkArgTypes(irArgs, against: req.params.map { resolve($0.type) }, at: span)
                 return IRExpr(type: resolve(req.returnType), span: span,

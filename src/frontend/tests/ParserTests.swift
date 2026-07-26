@@ -227,4 +227,18 @@ final class ParserTests: XCTestCase {
         guard case .extensionDecl(let x) = p.decls[1] else { XCTFail(); return }
         XCTAssertEqual(x.conformance?.name, "Sized")
     }
+
+    func testInterfaceRefinement() {
+        let p = parse("""
+        interface Named {
+            var name: String { get }
+        }
+        interface Drawable: Named {
+            fun draw() -> String
+        }
+        """)
+        guard case .interfaceDecl(let i) = p.decls[1] else { XCTFail(); return }
+        XCTAssertEqual(i.name, "Drawable")
+        XCTAssertEqual(i.refines.map(\.name), ["Named"])
+    }
 }
