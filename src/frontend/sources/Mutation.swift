@@ -141,7 +141,7 @@ private final class MutationAnalyzer {
             scanExpr(base, type: type, selfCalls: &selfCalls)
         case .construct(_, let args), .enumInit(_, _, let args):
             for a in args { scanExpr(a.value, type: type, selfCalls: &selfCalls) }
-        case .call(let callee, let args):
+        case .call(let callee, let args, _):
             scanExpr(callee, type: type, selfCalls: &selfCalls)
             for a in args { scanExpr(a.value, type: type, selfCalls: &selfCalls) }
         case .binary(_, let l, let r):
@@ -159,7 +159,7 @@ private final class MutationAnalyzer {
     private func annotate(_ module: IRModule, mutating: Set<String>) -> IRModule {
         func ann(_ typeName: String, _ ms: [IRFunc]) -> [IRFunc] {
             ms.map { m in
-                IRFunc(name: m.name, params: m.params, returnType: m.returnType, body: m.body,
+                IRFunc(name: m.name, generics: m.generics, params: m.params, returnType: m.returnType, body: m.body,
                        isMutating: mutating.contains(methodKey(typeName, m.name)), span: m.span)
             }
         }

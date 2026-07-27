@@ -72,7 +72,7 @@ private struct ExhaustivenessPass {
             for a in args { walkExpr(a.value) }
         case .methodCall(let receiver, _, let args):
             walkExpr(receiver); for a in args { walkExpr(a) }
-        case .call(let callee, let args):
+        case .call(let callee, let args, _):
             walkExpr(callee); for a in args { walkExpr(a.value) }
         case .binary(_, let l, let r):
             walkExpr(l); walkExpr(r)

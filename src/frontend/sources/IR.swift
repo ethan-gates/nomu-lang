@@ -133,13 +133,34 @@ public struct IRParam {
     public let span: Span
 }
 
+// A generic type parameter carried into codegen: its name and the interfaces it is bound to.
+// Codegen adds a witness-table parameter per (param, bound) and dispatches requirement calls
+// on a `.typeParam` receiver through it (M5 5.2.2).
+public struct IRGenericParam {
+    public let name: String
+    public let bounds: [String]
+    public init(name: String, bounds: [String]) { self.name = name; self.bounds = bounds }
+}
+
 public struct IRFunc {
     public let name: String
+    public let generics: [IRGenericParam]   // M5 5.2.2: type parameters (empty for a non-generic function)
     public let params: [IRParam]
     public let returnType: Type       // .void if none declared
     public let body: [IRStmt]
     public let isMutating: Bool       // inferred: a method that mutates `self` (M4.11); false for free functions
     public let span: Span
+
+    public init(name: String, generics: [IRGenericParam] = [], params: [IRParam], returnType: Type,
+                body: [IRStmt], isMutating: Bool, span: Span) {
+        self.name = name
+        self.generics = generics
+        self.params = params
+        self.returnType = returnType
+        self.body = body
+        self.isMutating = isMutating
+        self.span = span
+    }
 }
 
 // MARK: - Statements
@@ -194,7 +215,7 @@ public indirect enum ExprKind {
     case construct(typeName: String, args: [IRArg])     // struct / class / actor construction
     case enumInit(typeName: String, caseName: String, args: [IRArg])    // enum value construction (M4.10)
     case methodCall(receiver: IRExpr, method: String, args: [IRExpr])   // actor sends (T3: type methods)
-    case call(callee: IRExpr, args: [IRArg])            // function / builtin call
+    case call(callee: IRExpr, args: [IRArg], typeArgs: [Type])   // function / builtin call; typeArgs non-empty for a generic call (M5 5.2.2)
     case binary(BinOp, IRExpr, IRExpr)
     case closure(params: [IRParam], body: [IRStmt])
     case box(value: IRExpr, interfaces: [String])       // M5 A1.4/A1.5b: wrap a conformer as `any I` / `any A & B`

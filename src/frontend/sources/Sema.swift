@@ -59,7 +59,11 @@ public struct Sema {
     private struct CallSite { let callee: String; let receiverMutable: Bool; let span: Span }
     private var methodCallSites: [CallSite] = []
 
-    private struct FnSig { let params: [Type]; let ret: Type }
+    private struct FnSig { let params: [Type]; let ret: Type; var generics: [GenericParam] = [] }
+
+    // M5 5.2.2: the bounds of each generic type parameter in scope (`T` → its interfaces),
+    // so a requirement call on a `.typeParam` receiver dispatches through the right witness.
+    private var genericBounds: [String: [String]] = [:]
 
     public init(_ program: Program) { self.program = program }
 
@@ -72,9 +76,9 @@ public struct Sema {
             // Interfaces are abstract: validate them, but emit no IR (conformance in a
             // later slice generates the concrete witnesses that carry the defaults).
             if case .interfaceDecl(let i) = decl { checkInterface(i); continue }
-            // Generic decls parse and type-check but aren't lowered yet — witness-passing
-            // lowering is 5.2.2 (functions) / 5.2.3 (types). Validate signatures, emit no IR.
-            if isGenericDecl(decl) { checkGenericDecl(decl); continue }
+            // Generic *types* parse and type-check but aren't lowered yet — value-witness
+            // lowering is 5.2.3. Generic *functions* are lowered here (witness-passing, 5.2.2).
+            if isGenericType(decl) { checkGenericType(decl); continue }
             decls.append(lowerDecl(decl))
         }
 
@@ -103,7 +107,8 @@ public struct Sema {
             case .funcDecl(let f):
                 let saved = genericScope; genericScope = Set(f.generics.map(\.name))
                 funcs[f.name] = FnSig(params: f.params.map { resolve($0.type) },
-                                      ret: resolve(f.returnType, opaqueOwner: "fn:\(f.name)"))
+                                      ret: resolve(f.returnType, opaqueOwner: "fn:\(f.name)"),
+                                      generics: f.generics)
                 genericScope = saved
             case .extensionDecl:
                 break   // merged into its target before Sema (M4.12)
@@ -344,41 +349,45 @@ public struct Sema {
 
     // MARK: - Generic decls (M5 5.2.1)
 
-    private func isGenericDecl(_ decl: TopDecl) -> Bool {
+    // A generic bound must name an interface. A constraint-only (`Self`-mentioning) bound is
+    // valid in the design but needs a Self-carrying witness — deferred past 5.2.2 (M5).
+    private func validateBounds(_ generics: [GenericParam]) {
+        for g in generics {
+            for b in g.bounds {
+                if interfaces[b.name] == nil {
+                    diags.error("'\(b.name)' is not an interface — a generic bound must name an interface", at: b.span)
+                } else if constraintOnly(b.name) {
+                    diags.error("interface '\(b.name)' mentions Self — using it as a generic bound isn't supported yet (needs a Self-witness)", at: b.span)
+                }
+            }
+        }
+    }
+
+    private func isGenericType(_ decl: TopDecl) -> Bool {
         switch decl {
         case .structDecl(let s): return !s.generics.isEmpty
         case .enumDecl(let e):   return !e.generics.isEmpty
         case .classDecl(let c):  return !c.generics.isEmpty
-        case .funcDecl(let f):   return !f.generics.isEmpty
         default: return false
         }
     }
 
-    // Validate a generic decl's parameter bounds and signatures with its type parameters in
-    // scope, emitting no IR (M5 5.2.1). Witness-passing lowering is 5.2.2 (functions) / 5.2.3
-    // (types); bodies and conformance are checked there.
-    private mutating func checkGenericDecl(_ decl: TopDecl) {
+    // Validate a generic *type*'s parameter bounds and field signatures with its type
+    // parameters in scope, emitting no IR (M5 5.2.1). Value-witness lowering is 5.2.3.
+    private mutating func checkGenericType(_ decl: TopDecl) {
         let generics: [GenericParam]
         switch decl {
         case .structDecl(let s): generics = s.generics
         case .enumDecl(let e):   generics = e.generics
         case .classDecl(let c):  generics = c.generics
-        case .funcDecl(let f):   generics = f.generics
         default: return
         }
         let saved = genericScope; genericScope = Set(generics.map(\.name)); defer { genericScope = saved }
-        for g in generics {
-            for b in g.bounds where interfaces[b.name] == nil {
-                diags.error("'\(b.name)' is not an interface — a generic bound must name an interface", at: b.span)
-            }
-        }
+        validateBounds(generics)
         switch decl {
         case .structDecl(let s): for f in s.fields { _ = resolve(f.type) }
         case .classDecl(let c):  for f in c.fields { _ = resolve(f.type) }
         case .enumDecl(let e):   for cse in e.cases { for f in cse.fields { _ = resolve(f.type) } }
-        case .funcDecl(let f):
-            for p in f.params { _ = resolve(p.type) }
-            _ = resolve(f.returnType)
         default: break
         }
     }
@@ -556,7 +565,7 @@ public struct Sema {
     private mutating func checkConformances() {
         for decl in program.decls {
             // A generic type's conformance is checked when it is lowered (5.2.3), not here.
-            if isGenericDecl(decl) { continue }
+            if isGenericType(decl) { continue }
             switch decl {
             case .structDecl(let s):
                 checkConformance(s.name, .struct_, s.conformances, methods: s.methods, fields: s.fields, properties: s.properties)
@@ -740,6 +749,13 @@ public struct Sema {
     }
 
     private mutating func lowerFunc(_ f: FuncDecl) -> IRFunc {
+        // A generic function's type parameters + bounds are in scope while lowering its body,
+        // so `x: T` typechecks and `x.req()` dispatches through the bound's witness (M5 5.2.2).
+        let savedScope = genericScope, savedBounds = genericBounds
+        genericScope = Set(f.generics.map(\.name))
+        genericBounds = Dictionary(f.generics.map { ($0.name, $0.bounds.map(\.name)) }, uniquingKeysWith: { a, _ in a })
+        defer { genericScope = savedScope; genericBounds = savedBounds }
+        validateBounds(f.generics)
         let params = f.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
         let ret = resolve(f.returnType, opaqueOwner: "fn:\(f.name)")
         pushScope()
@@ -748,7 +764,8 @@ public struct Sema {
         let body = lowerBlock(f.body)
         currentReturnType = saved
         popScope()
-        return IRFunc(name: f.name, params: params, returnType: ret, body: body, isMutating: false, span: f.span)
+        let irGenerics = f.generics.map { IRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name)) }
+        return IRFunc(name: f.name, generics: irGenerics, params: params, returnType: ret, body: body, isMutating: false, span: f.span)
     }
 
     private mutating func lowerActor(_ a: ActorDecl) -> IRActor {
@@ -1053,6 +1070,14 @@ public struct Sema {
                 let ty = resolve(prop.type, selfAs: opaqueUnderlyings[owner] ?? b.type)
                 return IRExpr(type: ty, span: span, kind: .methodCall(receiver: b, method: "\(field).get", args: []))
             }
+            // A property-requirement read through a bounded type parameter `T: I` — via the
+            // bound's witness getter slot (M5 5.2.2).
+            if case .typeParam(let t) = b.type,
+               let iface = (genericBounds[t] ?? []).first(where: { aggregatedProperties($0).contains { $0.name == field } }),
+               let prop = aggregatedProperties(iface).first(where: { $0.name == field }) {
+                return IRExpr(type: resolve(prop.type, selfAs: b.type), span: span,
+                              kind: .methodCall(receiver: b, method: "\(field).get", args: []))
+            }
             // A property-requirement read inside an interface default (self: interface).
             if case .named(let tn, .interface_) = b.type,
                let prop = aggregatedProperties(tn).first(where: { $0.name == field }) {
@@ -1091,6 +1116,66 @@ public struct Sema {
         }
     }
 
+    // A call to a generic function (M5 5.2.2): infer each type parameter from the arguments,
+    // check every inferred type satisfies the parameter's bounds (a witness must exist), and
+    // record the inferred type arguments so codegen can pass the witnesses.
+    private mutating func checkGenericCall(_ name: String, _ sig: FnSig, _ args: [IRArg], at span: Span) -> IRExpr {
+        if args.count != sig.params.count {
+            diags.error("function '\(name)' expects \(sig.params.count) argument(s), got \(args.count)", at: span)
+        }
+        var subst: [String: Type] = [:]
+        for (p, a) in zip(sig.params, args) { unify(param: p, arg: a.value.type, into: &subst, at: span) }
+        for g in sig.generics where subst[g.name] == nil {
+            diags.error("cannot infer type parameter '\(g.name)' of '\(name)' from the arguments", at: span)
+            subst[g.name] = .error
+        }
+        for g in sig.generics {
+            let inferred = subst[g.name] ?? .error
+            for b in g.bounds where inferred != .error && !typeConforms(inferred, to: b.name) {
+                diags.error("type '\(inferred)' does not conform to '\(b.name)', required by type parameter '\(g.name)' of '\(name)'", at: span)
+            }
+        }
+        let typeArgs = sig.generics.map { subst[$0.name] ?? .error }
+        let calleeType = Type.function(params: sig.params, ret: sig.ret)
+        return IRExpr(type: substitute(sig.ret, subst), span: span,
+                      kind: .call(callee: irVar(name, calleeType, span), args: args, typeArgs: typeArgs))
+    }
+
+    // Unify a (possibly type-parameter) parameter type against a concrete argument type,
+    // binding type parameters in `subst` (M5 5.2.2). Shallow — enough for `T` and concrete
+    // params; nested generic arguments extend this in a later slice.
+    private mutating func unify(param: Type, arg: Type, into subst: inout [String: Type], at span: Span) {
+        if case .typeParam(let t) = param {
+            if let existing = subst[t] {
+                if existing != arg && existing != .error && arg != .error {
+                    diags.error("conflicting types inferred for '\(t)': '\(existing)' and '\(arg)'", at: span)
+                }
+            } else {
+                subst[t] = arg
+            }
+            return
+        }
+        if param != arg && param != .error && arg != .error {
+            diags.error("argument of type '\(arg)' does not match expected '\(param)'", at: span)
+        }
+    }
+
+    // Substitute inferred type parameters into a type (M5 5.2.2).
+    private func substitute(_ t: Type, _ subst: [String: Type]) -> Type {
+        switch t {
+        case .typeParam(let n):        return subst[n] ?? t
+        case .generic(let b, let a):   return .generic(base: b, args: a.map { substitute($0, subst) })
+        case .function(let p, let r):  return .function(params: p.map { substitute($0, subst) }, ret: substitute(r, subst))
+        default:                        return t
+        }
+    }
+
+    // Does a concrete type conform to an interface, with a witness available (M5 5.2.2)?
+    private func typeConforms(_ t: Type, to iface: String) -> Bool {
+        if case .named(let tn, _) = t { return conformsTo[tn]?.contains(iface) == true }
+        return false
+    }
+
     private mutating func checkCall(callee: Expr, args: [Arg], span: Span, expected: Type? = nil) -> IRExpr {
         // Qualified enum construction: `EnumType.case(args)`.
         if case .member(let base, let caseName, _) = callee,
@@ -1124,6 +1209,16 @@ public struct Sema {
                 let selfBind = opaqueUnderlyings[owner] ?? recv.type
                 checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: selfBind) }, at: span)
                 return IRExpr(type: resolve(req.returnType, selfAs: selfBind), span: span,
+                              kind: .methodCall(receiver: recv, method: name, args: irArgs))
+            }
+            // A requirement call through a bounded type parameter `T: I` — dispatched via the
+            // witness passed for that bound (M5 5.2.2). `Self` binds to `T`.
+            if case .typeParam(let t) = recv.type,
+               let iface = (genericBounds[t] ?? []).first(where: { aggregatedMethods($0).contains { $0.name == name } }),
+               let req = aggregatedMethods(iface).first(where: { $0.name == name }) {
+                let irArgs = args.map { checkExpr($0.value) }
+                checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: recv.type) }, at: span)
+                return IRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
                               kind: .methodCall(receiver: recv, method: name, args: irArgs))
             }
             if case .named(let typeName, let kind) = recv.type {
@@ -1175,7 +1270,7 @@ public struct Sema {
             // print — accepts zero or one arg of any printable type.
             if name == "print" {
                 let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
-                return IRExpr(type: .void, span: span, kind: .call(callee: irVar(name, .void, span), args: irArgs))
+                return IRExpr(type: .void, span: span, kind: .call(callee: irVar(name, .void, span), args: irArgs, typeArgs: []))
             }
             // Construction: TypeName(...) for struct/class/actor.
             if let k = kindOf(name), k != .enum_ {
@@ -1184,10 +1279,14 @@ public struct Sema {
             }
             // Named function / non-print builtin.
             if let sig = funcs[name] {
+                if !sig.generics.isEmpty {
+                    let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
+                    return checkGenericCall(name, sig, irArgs, at: span)
+                }
                 let irArgs = checkArgs(args, expectedParams: sig.params)
                 checkArgTypes(irArgs.map(\.value), against: sig.params, at: span)
                 let calleeType = Type.function(params: sig.params, ret: sig.ret)
-                return IRExpr(type: sig.ret, span: span, kind: .call(callee: irVar(name, calleeType, span), args: irArgs))
+                return IRExpr(type: sig.ret, span: span, kind: .call(callee: irVar(name, calleeType, span), args: irArgs, typeArgs: []))
             }
         }
 
@@ -1195,12 +1294,12 @@ public struct Sema {
         let c = checkExpr(callee)
         let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
         if case .function(_, let ret) = c.type {
-            return IRExpr(type: ret, span: span, kind: .call(callee: c, args: irArgs))
+            return IRExpr(type: ret, span: span, kind: .call(callee: c, args: irArgs, typeArgs: []))
         }
         if c.type != .error {
             diags.error("value of type '\(c.type)' is not callable", at: span)
         }
-        return IRExpr(type: .error, span: span, kind: .call(callee: c, args: irArgs))
+        return IRExpr(type: .error, span: span, kind: .call(callee: c, args: irArgs, typeArgs: []))
     }
 
     // MARK: - Type checks

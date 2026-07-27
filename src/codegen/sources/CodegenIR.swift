@@ -60,6 +60,10 @@ public struct CodegenIR {
     private var methodFields: Set<String> = []
     private var selfIsPointer = false
 
+    // The generic parameters of the function whose body is being emitted (M5 5.2.2), so a
+    // requirement call on a `.typeParam` receiver dispatches through the right witness param.
+    private var currentGenerics: [IRGenericParam] = []
+
     public init(_ module: IRModule) {
         self.module = module
         for decl in module.decls {
@@ -89,15 +93,15 @@ public struct CodegenIR {
             if case .funcDecl = decl { continue }
             emitTopDecl(decl)
         }
-        // Forward-declare methods and functions so bodies and mutual calls resolve.
+        // Forward-declare methods so witness thunks and bodies resolve.
         for decl in module.decls { emitMethodProtos(decl) }
+        // Witness-table types, thunks, and per-conformance instances — before function protos
+        // (a generic function's proto names a witness type) and bodies (which box/dispatch).
+        emitWitnessTables()
+        out += "\n"
         for decl in module.decls {
             if case .funcDecl(let f) = decl { emitFuncProto(f) }
         }
-        // Witness-table types, thunks, and per-conformance instances (after protos, so
-        // thunks can call the concrete methods they wrap; before bodies, which box/dispatch).
-        emitWitnessTables()
-        out += "\n"
         // Marker where hoisted closure/spawn definitions get spliced in.
         let marker = "/*__NOMU_CLOSURES__*/\n"
         out += marker
@@ -242,12 +246,13 @@ public struct CodegenIR {
 
     private mutating func emitFuncProto(_ f: IRFunc) {
         let cName = Mangle.function(f.name)
-        out += "\(cType(f.returnType)) \(cName)(\(paramList(f.params)));\n"
+        out += "\(cType(f.returnType)) \(cName)(\(fullParamList(f)));\n"
     }
 
     private mutating func emitFunc(_ f: IRFunc) {
         let cName = Mangle.function(f.name)
-        out += "\(cType(f.returnType)) \(cName)(\(paramList(f.params))) {\n"
+        let savedG = currentGenerics; currentGenerics = f.generics; defer { currentGenerics = savedG }
+        out += "\(cType(f.returnType)) \(cName)(\(fullParamList(f))) {\n"
         pushScope()                                   // params live below the body frame
         for p in f.params { declare(p.name, p.type) }
         emitBlock(f.body, ind: "    ")
@@ -258,6 +263,28 @@ public struct CodegenIR {
     private func paramList(_ params: [IRParam]) -> String {
         params.isEmpty ? "void"
             : params.map { "\(cType($0.type)) \($0.name)" }.joined(separator: ", ")
+    }
+
+    // A generic function's C parameters: its value parameters (a `.typeParam` value is `void*`),
+    // then one witness-table pointer per (type parameter, bound) — the witness-passing ABI (M5 5.2.2).
+    private func fullParamList(_ f: IRFunc) -> String {
+        var parts = f.params.map { "\(cType($0.type)) \($0.name)" }
+        for g in f.generics { for b in g.bounds { parts.append("const \(Mangle.witnessType(b))* \(witnessParamName(g.name, b))") } }
+        return parts.isEmpty ? "void" : parts.joined(separator: ", ")
+    }
+
+    private func witnessParamName(_ tp: String, _ iface: String) -> String { "wt_\(tp)_\(iface)" }
+
+    // The bound interface of type parameter `tp` that declares `method` (a requirement name or
+    // `prop.get`/`prop.set`), so codegen picks the right witness param (M5 5.2.2).
+    private func boundIface(for tp: String, method: String) -> String? {
+        guard let g = currentGenerics.first(where: { $0.name == tp }) else { return nil }
+        for b in g.bounds {
+            guard let i = interfaceDefs[b] else { continue }
+            if i.methods.contains(where: { $0.name == method }) { return b }
+            if i.properties.contains(where: { "\($0.name).get" == method || "\($0.name).set" == method }) { return b }
+        }
+        return g.bounds.first
     }
 
     // MARK: - Instance methods (T3, mutating M4.11)
@@ -608,8 +635,8 @@ public struct CodegenIR {
         case .methodCall(let receiver, let method, let args):
             return emitMethodCall(receiver: receiver, method: method, args: args)
 
-        case .call(let callee, let args):
-            return emitCall(callee: callee, args: args)
+        case .call(let callee, let args, let typeArgs):
+            return emitCall(callee: callee, args: args, typeArgs: typeArgs)
 
         case .binary(let op, let l, let r):
             return "(\(emitExpr(l)) \(cOp(op)) \(emitExpr(r)))"
@@ -704,6 +731,13 @@ public struct CodegenIR {
             let callArgs = (["__b.payload"] + argVals).joined(separator: ", ")
             return "({ AnyBox __b = \(box); ((const \(Mangle.compositeType(ifaces))*)__b.witness)->\(owner)->\(slot)(\(callArgs)); })"
         }
+        // A requirement call through a bounded type parameter `T: I` — dispatched through the
+        // witness passed for that bound (M5 5.2.2). The receiver is a `void*` to the value.
+        if case .typeParam(let tp) = receiver.type, let iface = boundIface(for: tp, method: method) {
+            let slot = method.replacingOccurrences(of: ".", with: "_")
+            let callArgs = ([emitExpr(receiver)] + args.map { emitExpr($0) }).joined(separator: ", ")
+            return "\(witnessParamName(tp, iface))->\(slot)(\(callArgs))"
+        }
         // A requirement call through `some I` devirtualizes: the receiver's C value is already
         // the concrete underlying (cType maps the opaque to it), so dispatch as a direct call
         // on that concrete type — no witness, no box (M5 A3).
@@ -751,8 +785,13 @@ public struct CodegenIR {
         return m?.isMutating ?? false
     }
 
-    private mutating func emitCall(callee: IRExpr, args: [IRArg]) -> String {
+    private mutating func emitCall(callee: IRExpr, args: [IRArg], typeArgs: [Type] = []) -> String {
         if case .varRef(let name) = callee.kind {
+            // A generic call: box type-parameter arguments (pass a pointer) and append the
+            // witness instance for each (type parameter, bound) — witness-passing ABI (M5 5.2.2).
+            if let f = funcs[name], !f.generics.isEmpty {
+                return emitGenericCall(f, args: args, typeArgs: typeArgs)
+            }
             if name == "print" {
                 if args.isEmpty { return "printf(\"\\n\")" }
                 let argExpr = args[0].value
@@ -784,6 +823,40 @@ public struct CodegenIR {
             return "\(Mangle.function(name))(\(emitArgs(args).joined(separator: ", ")))"
         }
         return "\(emitExpr(callee))(\(emitArgs(args).joined(separator: ", ")))"
+    }
+
+    // A call to a generic function: value args (type-parameter args boxed to a `void*`),
+    // then a witness instance per (type parameter, bound). If the function returns a type
+    // parameter, the `void*` result is read back as the inferred concrete type (M5 5.2.2).
+    private mutating func emitGenericCall(_ f: IRFunc, args: [IRArg], typeArgs: [Type]) -> String {
+        var subst: [String: Type] = [:]
+        for (g, t) in zip(f.generics, typeArgs) { subst[g.name] = t }
+        var vals: [String] = []
+        for (p, a) in zip(f.params, args) {
+            if case .typeParam = p.type { vals.append(boxGenericValue(a.value)) }
+            else { vals.append(emitExpr(a.value)) }
+        }
+        for g in f.generics {
+            for b in g.bounds {
+                if case .named(let tn, _)? = subst[g.name] { vals.append("&\(Mangle.witnessInstance(tn, b))") }
+            }
+        }
+        let call = "\(Mangle.function(f.name))(\(vals.joined(separator: ", ")))"
+        // Read a type-parameter return back into its inferred concrete type.
+        if case .typeParam(let rt) = f.returnType, case .named(let tn, let k)? = subst[rt] {
+            return (k == .class_ || k == .actor_) ? "(\(Mangle.type(tn))*)\(call)" : "(*(\(Mangle.type(tn))*)\(call))"
+        }
+        return call
+    }
+
+    // Prepare a value to pass where a type parameter is expected: a `void*` to the value —
+    // a reference type is already a pointer; a value type is copied to a fresh allocation.
+    private mutating func boxGenericValue(_ v: IRExpr) -> String {
+        let e = emitExpr(v)
+        guard case .named(let t, let kind) = v.type else { return "(void*)(\(e))" }
+        if kind == .class_ || kind == .actor_ { return "(void*)\(e)" }
+        let ct = Mangle.type(t)
+        return "({ \(ct)* __p = (\(ct)*)rt_alloc(sizeof(\(ct))); *__p = \(e); (void*)__p; })"
     }
 
     // Emit each argument in order (a loop, to avoid mutating self inside a map closure).
@@ -997,7 +1070,7 @@ public struct CodegenIR {
         case .methodCall(let receiver, _, let args):
             collectUsesExpr(receiver, bound: bound, used: &used)
             for a in args { collectUsesExpr(a, bound: bound, used: &used) }
-        case .call(let callee, let args):
+        case .call(let callee, let args, _):
             collectUsesExpr(callee, bound: bound, used: &used)
             for a in args { collectUsesExpr(a.value, bound: bound, used: &used) }
         case .binary(_, let l, let r):
@@ -1062,7 +1135,8 @@ public struct CodegenIR {
         case .existential, .composition: return "AnyBox"
         case .selfType: preconditionFailure("'Self' escaped to codegen — constraint-only interfaces emit no witnesses (M5 A2)")
         case .opaque: return cType(concreteUnderlying(t))   // `some I` is unboxed — the concrete underlying's C type (M5 A3)
-        case .typeParam, .generic: preconditionFailure("generics aren't lowered yet — no codegen (M5 5.2.1)")
+        case .typeParam: return "void*"   // a generic value is held by pointer under witness-passing (M5 5.2.2)
+        case .generic: preconditionFailure("generic types aren't lowered yet — no codegen (M5 5.2.3)")
         case .named(let n, let kind):
             switch kind {
             case .class_, .actor_: return Mangle.type(n) + "*"

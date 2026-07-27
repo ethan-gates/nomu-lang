@@ -1,0 +1,44 @@
+// M5 5.2.2: generic functions with an interface bound, lowered by witness-passing. A
+// `<T: Drawable>` function is compiled once; each call passes the concrete type's Drawable
+// witness table (and the value by pointer), and requirement calls in the body dispatch
+// through that witness — the Swift baseline (monomorphization is a later, optional pass).
+
+interface Drawable {
+    fun draw() -> String
+    var name: String { get }
+}
+
+struct Circle: Drawable {
+    var name: String
+    var radius: Int
+    fun draw() -> String {
+        return "O"
+    }
+}
+
+struct Square: Drawable {
+    var name: String
+    fun draw() -> String {
+        return "[]"
+    }
+}
+
+// One compiled body; `x.name` (a stored-field-backed requirement) and `x.draw()` dispatch
+// through the witness passed for T's Drawable bound.
+fun describe<T: Drawable>(x: T) -> String {
+    return concat(x.name, x.draw())
+}
+
+// A type parameter in return position: the caller gets the concrete type back.
+fun echo<T: Drawable>(x: T) -> T {
+    return x
+}
+
+fun main() {
+    print(describe(Circle(name: "c", radius: 3)))   // cO
+    print(describe(Square(name: "s")))              // s[]
+
+    let c = echo(Circle(name: "e", radius: 7))
+    print(c.draw())                                  // O   (c is a Circle — direct call)
+    print(c.radius)                                  // 7   (a Circle-only field)
+}

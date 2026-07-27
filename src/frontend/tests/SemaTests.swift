@@ -1217,7 +1217,8 @@ final class SemaTests: XCTestCase {
     }
 
     func testGenericFunctionSignatureResolves() {
-        // A generic function's signature type-checks (type params in scope) and emits no IR yet.
+        // A generic function's signature type-checks with its type params in scope, and it is
+        // lowered (witness-passing, 5.2.2) carrying its generic parameters.
         let r = sema("""
         interface Drawable {
             fun draw() -> String
@@ -1227,7 +1228,9 @@ final class SemaTests: XCTestCase {
         }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
-        XCTAssertTrue(r.module.decls.isEmpty)   // the generic function is not lowered yet
+        guard case .funcDecl(let fn) = r.module.decls.first else { XCTFail(); return }
+        XCTAssertEqual(fn.generics.map(\.name), ["T"])
+        XCTAssertEqual(fn.generics.first?.bounds, ["Drawable"])
     }
 
     func testTypeParamOutsideGenericScopeRejected() {
@@ -1237,5 +1240,104 @@ final class SemaTests: XCTestCase {
         }
         """)
         XCTAssertTrue(r.diagnostics.hasErrors)   // T isn't a declared type or a parameter here
+    }
+
+    // MARK: - Generic functions: witness-passing + inference (5.2.2)
+
+    func testGenericFunctionCallTypechecks() {
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+            var name: String { get }
+        }
+        struct Circle: Drawable {
+            var name: String
+            fun draw() -> String {
+                return "O"
+            }
+        }
+        fun describe<T: Drawable>(x: T) -> String {
+            return concat(x.name, x.draw())
+        }
+        fun main() {
+            print(describe(Circle(name: "c")))
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+    }
+
+    func testGenericBoundViolationRejected() {
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        struct Plain {
+            var x: Int
+        }
+        fun describe<T: Drawable>(x: T) -> String {
+            return x.draw()
+        }
+        fun main() {
+            print(describe(Plain(x: 1)))
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("does not conform to 'Drawable'"), r.diagnostics.render())
+    }
+
+    func testGenericConflictingInferenceRejected() {
+        let r = sema("""
+        struct A {
+            var x: Int
+        }
+        struct B {
+            var y: Int
+        }
+        fun pair<T>(a: T, b: T) -> Int {
+            return 0
+        }
+        fun main() {
+            print(pair(A(x: 1), B(y: 2)))
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("conflicting types"), r.diagnostics.render())
+    }
+
+    func testGenericReturnTypeParamSubstitutes() {
+        // `echo<T>(x: T) -> T` — the call's result is the inferred concrete type, so `.radius`
+        // (a Circle-only field) resolves.
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        struct Circle: Drawable {
+            var radius: Int
+            fun draw() -> String {
+                return "O"
+            }
+        }
+        fun echo<T: Drawable>(x: T) -> T {
+            return x
+        }
+        fun main() {
+            let c = echo(Circle(radius: 5))
+            print(c.radius)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+    }
+
+    func testConstraintOnlyBoundRejected() {
+        let r = sema("""
+        interface Cloneable {
+            fun clone() -> Self
+        }
+        fun f<T: Cloneable>(x: T) -> Int {
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("supported yet"), r.diagnostics.render())
     }
 }

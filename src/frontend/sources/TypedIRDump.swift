@@ -169,7 +169,7 @@ private func children(_ e: IRExpr) -> [(slot: String, expr: IRExpr)] {
         return args.map { (argSlot($0), $0.value) }
     case .methodCall(let recv, _, let args):
         return [("receiver", recv)] + args.map { ("arg", $0) }
-    case .call(let callee, let args):
+    case .call(let callee, let args, _):
         return [("callee", callee)] + args.map { (argSlot($0), $0.value) }
     case .binary(_, let l, let r):
         return [("lhs", l), ("rhs", r)]
