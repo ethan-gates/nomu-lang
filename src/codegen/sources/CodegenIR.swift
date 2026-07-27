@@ -579,7 +579,16 @@ public struct CodegenIR {
 
     private mutating func emitSwitch(_ sw: IRSwitch, ind: String) {
         let subj = emitExpr(sw.subject)
-        guard case .named(let enumName, .enum_) = sw.subject.type, let ed = enums[enumName] else {
+        // A concrete enum (`.named`) or an applied generic one (`.generic`, M5 5.2.3) — both
+        // switch on `.tag`; a generic enum's `T` payload fields are stored boxed.
+        let enumName: String
+        switch sw.subject.type {
+        case .named(let n, .enum_):  enumName = n
+        case .generic(let n, _):     enumName = n
+        default:
+            out += "\(ind)/* switch: non-enum subject */\n"; return
+        }
+        guard let ed = enums[enumName] else {
             out += "\(ind)/* switch: non-enum subject */\n"; return
         }
         out += "\(ind)switch (\(subj).tag) {\n"
@@ -588,7 +597,10 @@ public struct CodegenIR {
             out += "\(ind)    case \(Mangle.tag(enumName, arm.caseName)): {\n"
             pushScope()   // payload bindings live for the arm
             for (binding, field) in zip(arm.bindings, cd.fields) {
-                out += "\(ind)        \(cType(binding.type)) \(binding.name) = \(subj).payload.\(arm.caseName).\(field.name);\n"
+                let raw = "\(subj).payload.\(arm.caseName).\(field.name)"
+                let rhs: String
+                if case .typeParam = field.type { rhs = unboxGenericValue(raw, as: binding.type) } else { rhs = raw }
+                out += "\(ind)        \(cType(binding.type)) \(binding.name) = \(rhs);\n"
                 declare(binding.name, binding.type)
             }
             emitBlock(arm.body, ind: ind + "        ")
@@ -624,7 +636,10 @@ public struct CodegenIR {
             // `self` is a pointer in a mutating value method / class method → `self->field`.
             let op: String
             if case .varRef("self") = base.kind, selfIsPointer { op = "->" } else { op = memberOp(base.type) }
-            return "\(emitExpr(base))\(op)\(field)"
+            let raw = "\(emitExpr(base))\(op)\(field)"
+            // A `T` field on a generic type is stored boxed (`void*`); read it back concretely (M5 5.2.3).
+            if isBoxedGenericField(base.type, field) { return unboxGenericValue(raw, as: e.type) }
+            return raw
 
         case .construct(let typeName, let args):
             return emitConstruct(typeName: typeName, args: args)
@@ -677,18 +692,12 @@ public struct CodegenIR {
     // struct → compound literal; class/actor → Name_new(...).
     private mutating func emitConstruct(typeName: String, args: [IRArg]) -> String {
         if let s = structs[typeName] {
-            var fields: [String] = []
-            for f in s.fields {
-                if let a = args.first(where: { $0.label == f.name }) {
-                    fields.append(".\(f.name) = \(emitExpr(a.value))")
-                } else {
-                    fields.append(".\(f.name) = 0")
-                }
-            }
+            let fields = s.fields.map { ".\($0.name) = \(constructFieldValue($0, args))" }
             return "(\(Mangle.type(typeName))){ \(fields.joined(separator: ", ")) }"
         }
         if let c = classes[typeName] {
-            return "\(Mangle.ctor(typeName))(\(emitLabeled(c.fields.map(\.name), args).joined(separator: ", ")))"
+            let vals = c.fields.map { constructFieldValue($0, args) }
+            return "\(Mangle.ctor(typeName))(\(vals.joined(separator: ", ")))"
         }
         if let a = actors[typeName] {
             let labels = a.fields.filter { $0.initializer == nil }.map(\.name)
@@ -706,8 +715,15 @@ public struct CodegenIR {
     private mutating func emitEnumInit(typeName: String, caseName: String, args: [IRArg]) -> String {
         let tag = Mangle.tag(typeName, caseName)
         if args.isEmpty { return "(\(Mangle.type(typeName))){ .tag = \(tag) }" }
+        // A `T` payload field on a generic enum is stored boxed (`void*`) (M5 5.2.3).
+        let caseFields = enums[typeName]?.cases.first { $0.name == caseName }?.fields ?? []
         var inits: [String] = []
-        for a in args { inits.append(".\(a.label ?? "") = \(emitExpr(a.value))") }
+        for a in args {
+            let f = caseFields.first { $0.name == a.label }
+            let val: String
+            if let f, case .typeParam = f.type { val = boxGenericValue(a.value) } else { val = emitExpr(a.value) }
+            inits.append(".\(a.label ?? "") = \(val)")
+        }
         return "(\(Mangle.type(typeName))){ .tag = \(tag), .payload.\(caseName) = { \(inits.joined(separator: ", ")) } }"
     }
 
@@ -843,20 +859,30 @@ public struct CodegenIR {
         }
         let call = "\(Mangle.function(f.name))(\(vals.joined(separator: ", ")))"
         // Read a type-parameter return back into its inferred concrete type.
-        if case .typeParam(let rt) = f.returnType, case .named(let tn, let k)? = subst[rt] {
-            return (k == .class_ || k == .actor_) ? "(\(Mangle.type(tn))*)\(call)" : "(*(\(Mangle.type(tn))*)\(call))"
+        if case .typeParam(let rt) = f.returnType, let concrete = subst[rt] {
+            return unboxGenericValue(call, as: concrete)
         }
         return call
     }
 
-    // Prepare a value to pass where a type parameter is expected: a `void*` to the value —
-    // a reference type is already a pointer; a value type is copied to a fresh allocation.
+    // Prepare a value to pass where a type parameter is expected: a `void*` to the value — a
+    // reference type is already a pointer; anything else (Int/Bool/String, struct, enum) is
+    // copied to a fresh heap allocation so the `void*` outlives the temporary (M5 5.2.2/5.2.3).
     private mutating func boxGenericValue(_ v: IRExpr) -> String {
         let e = emitExpr(v)
-        guard case .named(let t, let kind) = v.type else { return "(void*)(\(e))" }
-        if kind == .class_ || kind == .actor_ { return "(void*)\(e)" }
-        let ct = Mangle.type(t)
+        if case .named(_, .class_) = v.type { return "(void*)\(e)" }
+        if case .named(_, .actor_) = v.type { return "(void*)\(e)" }
+        let ct = cType(v.type)
         return "({ \(ct)* __p = (\(ct)*)rt_alloc(sizeof(\(ct))); *__p = \(e); (void*)__p; })"
+    }
+
+    // Read a `void*`-boxed generic value back as its concrete type: a reference type is the
+    // pointer itself; anything else is dereferenced through the concrete C type (M5 5.2.3).
+    private func unboxGenericValue(_ ptr: String, as t: Type) -> String {
+        switch t {
+        case .named(_, .class_), .named(_, .actor_): return "((\(cType(t)))\(ptr))"
+        default:                                     return "(*(\(cType(t))*)\(ptr))"
+        }
     }
 
     // Emit each argument in order (a loop, to avoid mutating self inside a map closure).
@@ -1088,9 +1114,33 @@ public struct CodegenIR {
     // MARK: - C helpers
 
     private func memberOp(_ base: Type) -> String {
+        // A generic value type is accessed by value; a generic class by pointer (M5 5.2.3).
+        if case .generic(let g, _) = base { return classes[g] != nil ? "->" : "." }
         // A `some I` value is stored as its concrete underlying, so pick the operator by that.
         if case .named(_, let k) = concreteUnderlying(base), k == .class_ || k == .actor_ { return "->" }
         return "."
+    }
+
+    // The stored field `field` on the generic type `base` (struct or class), if any.
+    private func genericStoredField(_ base: String, _ field: String) -> IRField? {
+        if let s = structs[base] { return s.fields.first { $0.name == field } }
+        if let c = classes[base] { return c.fields.first { $0.name == field } }
+        return nil
+    }
+
+    // Is `field` on a value of this type a `T`-typed slot (stored boxed as `void*`)? (M5 5.2.3)
+    private func isBoxedGenericField(_ baseType: Type, _ field: String) -> Bool {
+        guard case .generic(let base, _) = baseType, let f = genericStoredField(base, field) else { return false }
+        if case .typeParam = f.type { return true }
+        return false
+    }
+
+    // The C value for a constructor field: a `T` field is boxed to a `void*`; a concrete field
+    // is emitted directly; a missing field zero-initializes (M5 5.2.3).
+    private mutating func constructFieldValue(_ f: IRField, _ args: [IRArg]) -> String {
+        guard let a = args.first(where: { $0.label == f.name }) else { return "0" }
+        if case .typeParam = f.type { return boxGenericValue(a.value) }
+        return emitExpr(a.value)
     }
 
     private func cStringLiteral(_ s: String) -> String {
@@ -1136,7 +1186,8 @@ public struct CodegenIR {
         case .selfType: preconditionFailure("'Self' escaped to codegen — constraint-only interfaces emit no witnesses (M5 A2)")
         case .opaque: return cType(concreteUnderlying(t))   // `some I` is unboxed — the concrete underlying's C type (M5 A3)
         case .typeParam: return "void*"   // a generic value is held by pointer under witness-passing (M5 5.2.2)
-        case .generic: preconditionFailure("generic types aren't lowered yet — no codegen (M5 5.2.3)")
+        case .generic(let base, _):       // one C shape per generic base; `T` fields are `void*` (M5 5.2.3)
+            return classes[base] != nil ? Mangle.type(base) + "*" : Mangle.type(base)
         case .named(let n, let kind):
             switch kind {
             case .class_, .actor_: return Mangle.type(n) + "*"

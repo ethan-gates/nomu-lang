@@ -166,11 +166,11 @@ private final class MutationAnalyzer {
         let decls: [IRDecl] = module.decls.map { decl in
             switch decl {
             case .structDecl(let s):
-                return .structDecl(IRStruct(name: s.name, fields: s.fields, methods: ann(s.name, s.methods), span: s.span))
+                return .structDecl(IRStruct(name: s.name, generics: s.generics, fields: s.fields, methods: ann(s.name, s.methods), span: s.span))
             case .classDecl(let c):
-                return .classDecl(IRClass(name: c.name, fields: c.fields, methods: ann(c.name, c.methods), span: c.span))
+                return .classDecl(IRClass(name: c.name, generics: c.generics, fields: c.fields, methods: ann(c.name, c.methods), span: c.span))
             case .enumDecl(let e):
-                return .enumDecl(IREnum(name: e.name, cases: e.cases, methods: ann(e.name, e.methods), span: e.span))
+                return .enumDecl(IREnum(name: e.name, generics: e.generics, cases: e.cases, methods: ann(e.name, e.methods), span: e.span))
             default:
                 return decl
             }

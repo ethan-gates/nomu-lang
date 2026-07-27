@@ -1153,7 +1153,8 @@ final class SemaTests: XCTestCase {
     // MARK: - Generics: parsing + type model (5.2.1)
 
     func testGenericTypeReferenceResolves() {
-        // `Box<Int>` in a signature resolves to `.generic`; the generic decl emits no IR yet.
+        // `Box<Int>` in a signature resolves to `.generic`; the generic decl now lowers to one
+        // uniform shape carrying its type parameter, a `T` field held as `.typeParam` (5.2.3).
         let r = sema("""
         struct Box<T> {
             var value: T
@@ -1163,9 +1164,104 @@ final class SemaTests: XCTestCase {
         }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
-        XCTAssertEqual(r.module.decls.count, 1)   // only `unwrap`; generic `Box` is not lowered
-        guard case .funcDecl(let fn) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(r.module.decls.count, 2)   // generic `Box` is lowered (5.2.3), plus `unwrap`
+        guard case .structDecl(let box) = r.module.decls[0] else { XCTFail("expected Box"); return }
+        XCTAssertEqual(box.generics.map(\.name), ["T"])
+        XCTAssertEqual(box.fields.first?.type, .typeParam("T"))
+        guard case .funcDecl(let fn) = r.module.decls[1] else { XCTFail("expected unwrap"); return }
         XCTAssertEqual(fn.params[0].type, .generic(base: "Box", args: [.int]))
+    }
+
+    // MARK: - Generic types: construction, match, bounds (5.2.3)
+
+    func testGenericStructConstructionInfersTypeArg() {
+        // `Box(value: 42)` infers `T = Int` from the field, yielding `Box<Int>` (5.2.3).
+        let r = sema("""
+        struct Box<T> {
+            let value: T
+        }
+        fun f() {
+            let b = Box(value: 42)
+            print(b.value)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let fn)? = r.module.decls.first(where: {
+            if case .funcDecl(let f) = $0 { return f.name == "f" }; return false
+        }) else { XCTFail("expected f"); return }
+        guard case .letBinding(_, _, let value) = fn.body.first?.kind else { XCTFail("expected let"); return }
+        XCTAssertEqual(value.type, .generic(base: "Box", args: [.int]))
+    }
+
+    func testGenericEnumConstructionInfersTypeArg() {
+        // `.some(value: 7)` infers `T = Int`; the annotation fixes the enum (5.2.3).
+        let r = sema("""
+        enum Option<T> {
+            case some(value: T)
+            case none
+        }
+        fun f() {
+            let o: Option<Int> = .some(value: 7)
+            switch o {
+            case .some(let v): print(v)
+            case .none:        print(0)
+            }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let fn)? = r.module.decls.first(where: {
+            if case .funcDecl(let f) = $0 { return f.name == "f" }; return false
+        }) else { XCTFail("expected f"); return }
+        guard case .letBinding(_, _, let value) = fn.body.first?.kind else { XCTFail("expected let"); return }
+        XCTAssertEqual(value.type, .generic(base: "Option", args: [.int]))
+    }
+
+    func testGenericConstructionBoundViolationRejected() {
+        // A non-conforming type argument is a clean local error (5.2.3 exit).
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        struct Wrapper<T: Drawable> {
+            let item: T
+        }
+        struct Plain {
+            let n: Int
+        }
+        fun f() {
+            let w = Wrapper(item: Plain(n: 1))
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("does not conform to 'Drawable'"), r.diagnostics.render())
+    }
+
+    func testGenericClosureParameterRejected() {
+        // A type parameter inside a closure parameter needs a reabstraction thunk (deferred).
+        let r = sema("""
+        fun apply<T, U>(x: T, f: (T) -> U) -> U {
+            return f(x)
+        }
+        fun f() {
+            print(apply(5, {(n: Int) -> Int in return n * 2}))
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("reabstraction thunk"), r.diagnostics.render())
+    }
+
+    func testGenericMethodsRejected() {
+        // Instance methods on a generic type are deferred past 5.2.3.
+        let r = sema("""
+        struct Box<T> {
+            let value: T
+            fun get() -> T {
+                return value
+            }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("aren't supported yet"), r.diagnostics.render())
     }
 
     func testGenericArityMismatchRejected() {

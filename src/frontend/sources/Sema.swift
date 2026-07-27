@@ -76,9 +76,10 @@ public struct Sema {
             // Interfaces are abstract: validate them, but emit no IR (conformance in a
             // later slice generates the concrete witnesses that carry the defaults).
             if case .interfaceDecl(let i) = decl { checkInterface(i); continue }
-            // Generic *types* parse and type-check but aren't lowered yet — value-witness
-            // lowering is 5.2.3. Generic *functions* are lowered here (witness-passing, 5.2.2).
-            if isGenericType(decl) { checkGenericType(decl); continue }
+            // Generic *types* lower to one uniform C shape — a `T` field is held boxed
+            // (`void*`), sized/copied at construction where the concrete `T` is known; no
+            // value witness (M5 5.2.3). Generic *functions* are witness-passed (5.2.2).
+            if isGenericType(decl) { decls.append(lowerGenericDecl(decl)); continue }
             decls.append(lowerDecl(decl))
         }
 
@@ -374,21 +375,44 @@ public struct Sema {
 
     // Validate a generic *type*'s parameter bounds and field signatures with its type
     // parameters in scope, emitting no IR (M5 5.2.1). Value-witness lowering is 5.2.3.
-    private mutating func checkGenericType(_ decl: TopDecl) {
+    // Lower a generic type to one uniform IR shape (M5 5.2.3): its type parameters are in
+    // scope while resolving fields (so a `T` field becomes `.typeParam("T")`), the bounds are
+    // recorded, and the generic params ride onto the IR decl for codegen. Instance methods /
+    // computed properties on a generic type are deferred — rejected with a clear message.
+    private mutating func lowerGenericDecl(_ decl: TopDecl) -> IRDecl {
         let generics: [GenericParam]
         switch decl {
         case .structDecl(let s): generics = s.generics
         case .enumDecl(let e):   generics = e.generics
         case .classDecl(let c):  generics = c.generics
-        default: return
+        default: preconditionFailure("lowerGenericDecl on a non-generic-capable decl")
         }
-        let saved = genericScope; genericScope = Set(generics.map(\.name)); defer { genericScope = saved }
+        let savedScope = genericScope; let savedBounds = genericBounds
+        genericScope = Set(generics.map(\.name))
+        for g in generics { genericBounds[g.name] = g.bounds.map(\.name) }
+        defer { genericScope = savedScope; genericBounds = savedBounds }
         validateBounds(generics)
+        let irGenerics = generics.map { IRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name)) }
         switch decl {
-        case .structDecl(let s): for f in s.fields { _ = resolve(f.type) }
-        case .classDecl(let c):  for f in c.fields { _ = resolve(f.type) }
-        case .enumDecl(let e):   for cse in e.cases { for f in cse.fields { _ = resolve(f.type) } }
-        default: break
+        case .structDecl(let s):
+            rejectGenericMembers(s.methods, s.properties, at: s.span)
+            return .structDecl(IRStruct(name: s.name, generics: irGenerics,
+                                        fields: s.fields.map(lowerField), methods: [], span: s.span))
+        case .classDecl(let c):
+            rejectGenericMembers(c.methods, c.properties, at: c.span)
+            return .classDecl(IRClass(name: c.name, generics: irGenerics,
+                                      fields: c.fields.map(lowerField), methods: [], span: c.span))
+        case .enumDecl(let e):
+            rejectGenericMembers(e.methods, e.properties, at: e.span)
+            let cases = e.cases.map { IREnumCase(name: $0.name, fields: $0.fields.map(lowerField), span: $0.span) }
+            return .enumDecl(IREnum(name: e.name, generics: irGenerics, cases: cases, methods: [], span: e.span))
+        default: preconditionFailure("unreachable")
+        }
+    }
+
+    private mutating func rejectGenericMembers(_ methods: [FuncDecl], _ properties: [ComputedProperty], at span: Span) {
+        if !methods.isEmpty || !properties.isEmpty {
+            diags.error("methods and computed properties on a generic type aren't supported yet (M5 5.2.3)", at: span)
         }
     }
 
@@ -924,14 +948,28 @@ public struct Sema {
 
     private mutating func lowerSwitch(_ sw: SwitchStmt) -> IRSwitch {
         let subject = checkExpr(sw.subject)
-        // The subject's enum, if any, gives payload binding types.
-        let enumDecl: EnumDecl? = { if case .named(let n, .enum_) = subject.type { return enums[n] }; return nil }()
+        // The subject's enum, if any, gives payload binding types. An applied generic enum
+        // (`Option<Int>`) substitutes its type arguments into each payload binding (M5 5.2.3).
+        let enumDecl: EnumDecl?
+        var enumSubst: [String: Type] = [:]
+        switch subject.type {
+        case .named(let n, .enum_):
+            enumDecl = enums[n]
+        case .generic(let n, let a):
+            enumDecl = enums[n]
+            for (p, t) in zip(enums[n]?.generics ?? [], a) { enumSubst[p.name] = t }
+        default:
+            enumDecl = nil
+        }
+        let savedScope = genericScope
+        if let g = enumDecl?.generics, !g.isEmpty { genericScope = Set(g.map(\.name)) }
+        defer { genericScope = savedScope }
         var arms: [IRCaseArm] = []
         for arm in sw.cases {
             guard case .enumCase(let name, let names, _) = arm.pattern else { continue }
             let caseDecl = enumDecl?.cases.first { $0.name == name }
             let bindings: [IRBinding] = zip(names, caseDecl?.fields ?? []).map {
-                IRBinding(name: $0.0, type: resolve($0.1.type))
+                IRBinding(name: $0.0, type: substitute(resolve($0.1.type), enumSubst))
             }
             pushScope()
             for b in bindings { declare(b.name, b.type) }
@@ -1050,7 +1088,7 @@ public struct Sema {
             // Qualified no-payload enum construction: `EnumType.case`. (A payload case
             // used bare falls through buildEnumInit as a wrong-arity error.)
             if case .ident(let typeName, _) = base, lookup(typeName) == nil, enums[typeName] != nil {
-                return buildEnumInit(typeName, field, [], at: span)
+                return buildEnumInit(typeName, field, [], expected: expected, at: span)
             }
             let b = checkExpr(base)
             // A property-requirement read through `any I` / `any A & B` — via the getter slot.
@@ -1088,6 +1126,12 @@ public struct Sema {
                 return IRExpr(type: info.type, span: span,
                               kind: .methodCall(receiver: b, method: "\(field).get", args: []))
             }
+            // A field read on an applied generic type `Box<Int>` (M5 5.2.3): the field is stored
+            // boxed; its declared `T` substitutes to the concrete argument for the result type.
+            if case .generic(let gbase, let gargs) = b.type {
+                let type = genericMemberType(gbase, gargs, field, at: span)
+                return IRExpr(type: type, span: span, kind: .fieldAccess(base: b, field: field))
+            }
             let type = fieldType(of: b.type, field: field, at: span)
             return IRExpr(type: type, span: span, kind: .fieldAccess(base: b, field: field))
 
@@ -1123,6 +1167,13 @@ public struct Sema {
         if args.count != sig.params.count {
             diags.error("function '\(name)' expects \(sig.params.count) argument(s), got \(args.count)", at: span)
         }
+        // A type parameter inside a closure parameter (`f: (T) -> U`) would need a reabstraction
+        // thunk (box/unbox at the call boundary) that isn't generated yet — reject rather than
+        // miscompile (M5 5.2.3; the thunk is the remaining exit item).
+        let tparams = Set(sig.generics.map(\.name))
+        if sig.params.contains(where: { typeParamUnderFunction($0, tparams) }) {
+            diags.error("a generic function with a closure parameter that involves a type parameter isn't supported yet (M5 5.2.3 — needs a reabstraction thunk)", at: span)
+        }
         var subst: [String: Type] = [:]
         for (p, a) in zip(sig.params, args) { unify(param: p, arg: a.value.type, into: &subst, at: span) }
         for g in sig.generics where subst[g.name] == nil {
@@ -1145,7 +1196,8 @@ public struct Sema {
     // binding type parameters in `subst` (M5 5.2.2). Shallow — enough for `T` and concrete
     // params; nested generic arguments extend this in a later slice.
     private mutating func unify(param: Type, arg: Type, into subst: inout [String: Type], at span: Span) {
-        if case .typeParam(let t) = param {
+        switch param {
+        case .typeParam(let t):
             if let existing = subst[t] {
                 if existing != arg && existing != .error && arg != .error {
                     diags.error("conflicting types inferred for '\(t)': '\(existing)' and '\(arg)'", at: span)
@@ -1153,10 +1205,42 @@ public struct Sema {
             } else {
                 subst[t] = arg
             }
-            return
+        // Structural cases: recurse so a `T` nested in a closure (`(T) -> U`) or an applied
+        // generic (`Option<T>`) is inferred from the argument's shape (M5 5.2.3).
+        case .function(let pp, let pr):
+            guard case .function(let ap, let ar) = arg, pp.count == ap.count else { return mismatch(param, arg, at: span) }
+            for (p, a) in zip(pp, ap) { unify(param: p, arg: a, into: &subst, at: span) }
+            unify(param: pr, arg: ar, into: &subst, at: span)
+        case .generic(let pb, let pargs):
+            guard case .generic(let ab, let aargs) = arg, pb == ab, pargs.count == aargs.count else { return mismatch(param, arg, at: span) }
+            for (p, a) in zip(pargs, aargs) { unify(param: p, arg: a, into: &subst, at: span) }
+        default:
+            if param != arg { mismatch(param, arg, at: span) }
         }
-        if param != arg && param != .error && arg != .error {
+    }
+
+    private mutating func mismatch(_ param: Type, _ arg: Type, at span: Span) {
+        if param != .error && arg != .error {
             diags.error("argument of type '\(arg)' does not match expected '\(param)'", at: span)
+        }
+    }
+
+    // Does a type parameter appear inside a function type within `t`? Such a position needs a
+    // reabstraction thunk at the call boundary, which 5.2.3 doesn't emit yet.
+    private func typeParamUnderFunction(_ t: Type, _ tparams: Set<String>) -> Bool {
+        switch t {
+        case .function(let p, let r): return p.contains { mentionsTypeParam($0, tparams) } || mentionsTypeParam(r, tparams)
+        case .generic(_, let a):      return a.contains { typeParamUnderFunction($0, tparams) }
+        default:                      return false
+        }
+    }
+
+    private func mentionsTypeParam(_ t: Type, _ tparams: Set<String>) -> Bool {
+        switch t {
+        case .typeParam(let n):        return tparams.contains(n)
+        case .function(let p, let r):  return p.contains { mentionsTypeParam($0, tparams) } || mentionsTypeParam(r, tparams)
+        case .generic(_, let a):       return a.contains { mentionsTypeParam($0, tparams) }
+        default:                       return false
         }
     }
 
@@ -1176,11 +1260,78 @@ public struct Sema {
         return false
     }
 
+    // MARK: - Generic types (M5 5.2.3)
+
+    // The type parameters and stored fields of a generic struct/class, or nil if `name` names
+    // neither (a generic enum constructs through `buildEnumInit`).
+    private func genericTypeShape(_ name: String) -> (generics: [GenericParam], fields: [VarField])? {
+        if let s = structs[name] { return (s.generics, s.fields) }
+        if let c = classes[name] { return (c.generics, c.fields) }
+        return nil
+    }
+
+    // `Box(value: e)` — infer each type parameter by unifying the field's declared type
+    // (a `T` resolves to `.typeParam`) against the argument, then bound-check (M5 5.2.3).
+    private mutating func checkGenericConstruct(_ name: String, _ args: [Arg], at span: Span) -> IRExpr {
+        guard let shape = genericTypeShape(name) else {
+            diags.error("generic enum '\(name)' is constructed through one of its cases, e.g. '\(name).case(...)'", at: span)
+            return IRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
+        }
+        let saved = genericScope; genericScope = Set(shape.generics.map(\.name)); defer { genericScope = saved }
+        var subst: [String: Type] = [:]
+        var irArgs: [IRArg] = []
+        for f in shape.fields {
+            let fieldTy = resolve(f.type)
+            let expected: Type? = { if case .typeParam = fieldTy { return nil }; return fieldTy }()
+            guard let arg = args.first(where: { $0.label == f.name }) else {
+                diags.error("missing argument for field '\(f.name)'", at: span); continue
+            }
+            let v = checkExpr(arg.value, expected: expected)
+            unify(param: fieldTy, arg: v.type, into: &subst, at: span)
+            irArgs.append(IRArg(label: f.name, value: v))
+        }
+        let typeArgs = inferredTypeArgs(shape.generics, subst, owner: name, at: span)
+        return IRExpr(type: .generic(base: name, args: typeArgs), span: span,
+                      kind: .construct(typeName: name, args: irArgs))
+    }
+
+    // Finish inference for a generic decl: every parameter must be bound, and each inferred
+    // type must satisfy the parameter's bounds (a witness must exist). Shared by generic
+    // struct construction and generic enum construction (M5 5.2.3).
+    private mutating func inferredTypeArgs(_ generics: [GenericParam], _ subst: [String: Type],
+                                           owner: String, at span: Span) -> [Type] {
+        var subst = subst
+        for g in generics where subst[g.name] == nil {
+            diags.error("cannot infer type parameter '\(g.name)' of '\(owner)' — add a type annotation", at: span)
+            subst[g.name] = .error
+        }
+        for g in generics {
+            let inferred = subst[g.name] ?? .error
+            for b in g.bounds where inferred != .error && !typeConforms(inferred, to: b.name) {
+                diags.error("type '\(inferred)' does not conform to '\(b.name)', required by type parameter '\(g.name)' of '\(owner)'", at: span)
+            }
+        }
+        return generics.map { subst[$0.name] ?? .error }
+    }
+
+    // A field read on `Box<Int>`: resolve the field's declared type with the type's parameters
+    // in scope, then substitute the applied arguments to get the concrete result type (M5 5.2.3).
+    private mutating func genericMemberType(_ base: String, _ args: [Type], _ field: String, at span: Span) -> Type {
+        guard let shape = genericTypeShape(base), let f = shape.fields.first(where: { $0.name == field }) else {
+            diags.error("type '\(base)' has no field '\(field)'", at: span)
+            return .error
+        }
+        let saved = genericScope; genericScope = Set(shape.generics.map(\.name)); defer { genericScope = saved }
+        var subst: [String: Type] = [:]
+        for (p, a) in zip(shape.generics, args) { subst[p.name] = a }
+        return substitute(resolve(f.type), subst)
+    }
+
     private mutating func checkCall(callee: Expr, args: [Arg], span: Span, expected: Type? = nil) -> IRExpr {
         // Qualified enum construction: `EnumType.case(args)`.
         if case .member(let base, let caseName, _) = callee,
            case .ident(let typeName, _) = base, lookup(typeName) == nil, enums[typeName] != nil {
-            return buildEnumInit(typeName, caseName, args, at: span)
+            return buildEnumInit(typeName, caseName, args, expected: expected, at: span)
         }
         // Leading-dot enum construction: `.case(args)` — enum inferred from context.
         if case .implicitMember(let caseName, _) = callee {
@@ -1271,6 +1422,10 @@ public struct Sema {
             if name == "print" {
                 let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
                 return IRExpr(type: .void, span: span, kind: .call(callee: irVar(name, .void, span), args: irArgs, typeArgs: []))
+            }
+            // Construction of a generic type — infer the type arguments from the fields (M5 5.2.3).
+            if genericArity(name) != nil {
+                return checkGenericConstruct(name, args, at: span)
             }
             // Construction: TypeName(...) for struct/class/actor.
             if let k = kindOf(name), k != .enum_ {
@@ -1374,26 +1529,68 @@ public struct Sema {
         return out
     }
 
-    // Leading-dot `.case(...)`: resolve the enum from the expected type, then build.
+    // Leading-dot `.case(...)`: resolve the enum from the expected type, then build. The
+    // context may name a concrete enum (`.named`) or an applied generic one (`.generic`, M5 5.2.3).
     private mutating func buildImplicitEnum(_ caseName: String, _ args: [Arg], expected: Type?, at span: Span) -> IRExpr {
-        guard case .named(let enumName, .enum_)? = expected, enums[enumName] != nil else {
+        let enumName: String?
+        switch expected {
+        case .named(let n, .enum_) where enums[n] != nil:    enumName = n
+        case .generic(let n, _) where enums[n] != nil:       enumName = n
+        default:                                             enumName = nil
+        }
+        guard let enumName else {
             diags.error("cannot infer enum type for '.\(caseName)' here", at: span)
             let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
             return IRExpr(type: .error, span: span, kind: .enumInit(typeName: "", caseName: caseName, args: irArgs))
         }
-        return buildEnumInit(enumName, caseName, args, at: span)
+        return buildEnumInit(enumName, caseName, args, expected: expected, at: span)
     }
 
-    // `EnumType.case(args)` → a typed enumInit, checking the payload against the case.
-    private mutating func buildEnumInit(_ enumName: String, _ caseName: String, _ args: [Arg], at span: Span) -> IRExpr {
-        let enumType = Type.named(enumName, .enum_)
+    // `EnumType.case(args)` → a typed enumInit, checking the payload against the case. For a
+    // generic enum (`Option<T>`) the type argument is inferred from the payload — and, for a
+    // no-payload case like `.none`, seeded from the expected type context (M5 5.2.3).
+    private mutating func buildEnumInit(_ enumName: String, _ caseName: String, _ args: [Arg],
+                                        expected: Type? = nil, at span: Span) -> IRExpr {
         guard let caseDecl = enums[enumName]?.cases.first(where: { $0.name == caseName }) else {
             diags.error("enum '\(enumName)' has no case '\(caseName)'", at: span)
             let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
-            return IRExpr(type: enumType, span: span, kind: .enumInit(typeName: enumName, caseName: caseName, args: irArgs))
+            return IRExpr(type: .named(enumName, .enum_), span: span, kind: .enumInit(typeName: enumName, caseName: caseName, args: irArgs))
+        }
+        if let generics = enums[enumName]?.generics, !generics.isEmpty {
+            return buildGenericEnumInit(enumName, generics, caseDecl, args, expected: expected, at: span)
         }
         let irArgs = matchEnumArgs(args, fields: caseDecl.fields, case: caseName, at: span)
-        return IRExpr(type: enumType, span: span, kind: .enumInit(typeName: enumName, caseName: caseName, args: irArgs))
+        return IRExpr(type: .named(enumName, .enum_), span: span,
+                      kind: .enumInit(typeName: enumName, caseName: caseName, args: irArgs))
+    }
+
+    // A generic enum case: unify each payload arg against the case field's declared type
+    // (a `T` payload resolves to `.typeParam`), seed inference from the expected type when the
+    // case carries no payload, then bound-check — yielding a `.generic(base, args)` (M5 5.2.3).
+    private mutating func buildGenericEnumInit(_ enumName: String, _ generics: [GenericParam],
+                                               _ caseDecl: EnumCaseDecl, _ args: [Arg],
+                                               expected: Type?, at span: Span) -> IRExpr {
+        let saved = genericScope; genericScope = Set(generics.map(\.name)); defer { genericScope = saved }
+        var subst: [String: Type] = [:]
+        if case .generic(let b, let eargs)? = expected, b == enumName, eargs.count == generics.count {
+            for (p, a) in zip(generics, eargs) { subst[p.name] = a }
+        }
+        if args.count != caseDecl.fields.count {
+            diags.error("case '\(caseDecl.name)' expects \(caseDecl.fields.count) argument(s), got \(args.count)", at: span)
+        }
+        var irArgs: [IRArg] = []
+        for (i, field) in caseDecl.fields.enumerated() {
+            let fieldTy = resolve(field.type)
+            let expArg = substitute(fieldTy, subst)
+            let hint: Type? = { if case .typeParam = expArg { return nil }; return expArg }()
+            guard let arg = args.first(where: { $0.label == field.name }) ?? (i < args.count ? args[i] : nil) else { continue }
+            let v = checkExpr(arg.value, expected: hint)
+            unify(param: fieldTy, arg: v.type, into: &subst, at: span)
+            irArgs.append(IRArg(label: field.name, value: v))
+        }
+        let typeArgs = inferredTypeArgs(generics, subst, owner: enumName, at: span)
+        return IRExpr(type: .generic(base: enumName, args: typeArgs), span: span,
+                      kind: .enumInit(typeName: enumName, caseName: caseDecl.name, args: irArgs))
     }
 
     // Pair payload args to the case's declared fields (by label, else by position),

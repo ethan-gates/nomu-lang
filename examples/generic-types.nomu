@@ -1,0 +1,40 @@
+// M5 5.2.3: generic *types* — one uniform C shape per base, a `T` field held boxed (`void*`),
+// sized/copied at construction where the concrete `T` is known. No value witness: reference
+// payloads leak until the M6 GC reclaims them (design/m5-spec.md §5.2.3).
+
+struct Box<T> {
+    let value: T
+}
+
+enum Option<T> {
+    case some(value: T)
+    case none
+}
+
+fun main() {
+    // A generic struct at two concrete instantiations — one C `Box` shape, boxed field.
+    let bi = Box(value: 42)
+    print(bi.value)              // 42
+    let bs = Box(value: "hi")
+    print(bs.value)              // hi
+
+    // A generic enum: `.some` infers T from the payload; `.none` from the annotation.
+    let some: Option<Int> = .some(value: 7)
+    switch some {
+    case .some(let v): print(v)  // 7
+    case .none:        print(0)
+    }
+
+    let none: Option<Int> = .none
+    switch none {
+    case .some(let v): print(v)
+    case .none:        print(100) // 100
+    }
+
+    // A String payload rides the same one Option shape.
+    let name: Option<String> = .some(value: "nomu")
+    switch name {
+    case .some(let s): print(s)  // nomu
+    case .none:        print("none")
+    }
+}

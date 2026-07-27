@@ -79,9 +79,13 @@ public struct IRField {
 
 public struct IRStruct {
     public let name: String
+    public let generics: [IRGenericParam]   // M5 5.2.3: type parameters (empty for a non-generic type)
     public let fields: [IRField]
     public let methods: [IRFunc]   // T3: instance methods; each takes an implicit `self`
     public let span: Span
+    public init(name: String, generics: [IRGenericParam] = [], fields: [IRField], methods: [IRFunc], span: Span) {
+        self.name = name; self.generics = generics; self.fields = fields; self.methods = methods; self.span = span
+    }
 }
 
 public struct IREnumCase {
@@ -92,16 +96,24 @@ public struct IREnumCase {
 
 public struct IREnum {
     public let name: String
+    public let generics: [IRGenericParam]   // M5 5.2.3
     public let cases: [IREnumCase]
     public let methods: [IRFunc]   // T3: instance methods; each takes an implicit `self`
     public let span: Span
+    public init(name: String, generics: [IRGenericParam] = [], cases: [IREnumCase], methods: [IRFunc], span: Span) {
+        self.name = name; self.generics = generics; self.cases = cases; self.methods = methods; self.span = span
+    }
 }
 
 public struct IRClass {
     public let name: String
+    public let generics: [IRGenericParam]   // M5 5.2.3
     public let fields: [IRField]
     public let methods: [IRFunc]   // T3: instance methods; each takes an implicit `self`
     public let span: Span
+    public init(name: String, generics: [IRGenericParam] = [], fields: [IRField], methods: [IRFunc], span: Span) {
+        self.name = name; self.generics = generics; self.fields = fields; self.methods = methods; self.span = span
+    }
 }
 
 public struct IRActorField {

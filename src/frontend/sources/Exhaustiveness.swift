@@ -86,8 +86,15 @@ private struct ExhaustivenessPass {
     // MARK: - The check
 
     private func checkSwitch(_ sw: IRSwitch, at span: Span) {
-        guard case .named(let enumName, .enum_) = sw.subject.type,
-              let allCases = enumCases[enumName] else { return }
+        // A concrete enum (`.named`) or an applied generic one (`.generic`, M5 5.2.3): the case
+        // set is the generic definition's — instantiation adds no cases.
+        let enumName: String
+        switch sw.subject.type {
+        case .named(let n, .enum_): enumName = n
+        case .generic(let n, _):    enumName = n
+        default:                    return
+        }
+        guard let allCases = enumCases[enumName] else { return }
         let covered = Set(sw.arms.map(\.caseName))
         let missing = allCases.filter { !covered.contains($0) }
         if !missing.isEmpty {
