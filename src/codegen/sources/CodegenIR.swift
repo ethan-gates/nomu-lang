@@ -537,9 +537,17 @@ public struct CodegenIR {
             declare(name, resultType, isSpawn: true)   // reads of `name` join and yield
 
         case .assign(let target, let value):
-            // Bind before appending: emitExpr may mutate `out` (closure hoisting).
-            let l = emitExpr(target); let r = emitExpr(value)
-            out += "\(ind)\(l) = \(r);\n"
+            // Writing a `T` field overwrites the boxed slot with a freshly boxed value — this
+            // works for value and reference `T` alike (the old box leaks; the M6 GC reclaims it).
+            if case .fieldAccess(let base, let field) = target.kind, isBoxedGenericField(base.type, field) {
+                let slot = rawMemberAccess(base, field)
+                let boxed = boxGenericValue(value)
+                out += "\(ind)\(slot) = \(boxed);\n"
+            } else {
+                // Bind before appending: emitExpr may mutate `out` (closure hoisting).
+                let l = emitExpr(target); let r = emitExpr(value)
+                out += "\(ind)\(l) = \(r);\n"
+            }
 
         case .compoundAssign(let target, let value):
             let l = emitExpr(target); let r = emitExpr(value)
@@ -633,10 +641,7 @@ public struct CodegenIR {
             return Mangle.function(n)
 
         case .fieldAccess(let base, let field):
-            // `self` is a pointer in a mutating value method / class method → `self->field`.
-            let op: String
-            if case .varRef("self") = base.kind, selfIsPointer { op = "->" } else { op = memberOp(base.type) }
-            let raw = "\(emitExpr(base))\(op)\(field)"
+            let raw = rawMemberAccess(base, field)
             // A `T` field on a generic type is stored boxed (`void*`); read it back concretely (M5 5.2.3).
             if isBoxedGenericField(base.type, field) { return unboxGenericValue(raw, as: e.type) }
             return raw
@@ -849,8 +854,15 @@ public struct CodegenIR {
         for (g, t) in zip(f.generics, typeArgs) { subst[g.name] = t }
         var vals: [String] = []
         for (p, a) in zip(f.params, args) {
-            if case .typeParam = p.type { vals.append(boxGenericValue(a.value)) }
-            else { vals.append(emitExpr(a.value)) }
+            if case .typeParam = p.type {
+                vals.append(boxGenericValue(a.value))
+            } else if case .function = p.type, containsTypeParam(p.type) {
+                // A closure whose type mentions a type parameter is bridged to the generic
+                // body's boxed ABI by a reabstraction thunk (M5 5.2.3).
+                vals.append(emitReabstraction(a.value, declFn: p.type, subst: subst))
+            } else {
+                vals.append(emitExpr(a.value))
+            }
         }
         for g in f.generics {
             for b in g.bounds {
@@ -870,6 +882,9 @@ public struct CodegenIR {
     // copied to a fresh heap allocation so the `void*` outlives the temporary (M5 5.2.2/5.2.3).
     private mutating func boxGenericValue(_ v: IRExpr) -> String {
         let e = emitExpr(v)
+        // Already a `void*` box (a type parameter in a generic body) — pass it through; boxing
+        // again would store the pointer bits in a fresh box and read back garbage (M5 5.2.3).
+        if case .typeParam = v.type { return e }
         if case .named(_, .class_) = v.type { return "(void*)\(e)" }
         if case .named(_, .actor_) = v.type { return "(void*)\(e)" }
         let ct = cType(v.type)
@@ -883,6 +898,77 @@ public struct CodegenIR {
         case .named(_, .class_), .named(_, .actor_): return "((\(cType(t)))\(ptr))"
         default:                                     return "(*(\(cType(t))*)\(ptr))"
         }
+    }
+
+    // Box a concrete C rvalue string to a `void*` — the string form of `boxGenericValue`,
+    // for use inside a synthesized thunk where there is no IRExpr (M5 5.2.3).
+    private func boxConcrete(_ e: String, as t: Type) -> String {
+        switch t {
+        case .named(_, .class_), .named(_, .actor_): return "(void*)\(e)"
+        default:
+            let ct = cType(t)
+            return "({ \(ct)* __p = (\(ct)*)rt_alloc(sizeof(\(ct))); *__p = \(e); (void*)__p; })"
+        }
+    }
+
+    private func containsTypeParam(_ t: Type) -> Bool {
+        switch t {
+        case .typeParam:               return true
+        case .function(let p, let r):  return p.contains(where: containsTypeParam) || containsTypeParam(r)
+        case .generic(_, let a):       return a.contains(where: containsTypeParam)
+        default:                       return false
+        }
+    }
+
+    private func substituteType(_ t: Type, _ subst: [String: Type]) -> Type {
+        switch t {
+        case .typeParam(let n):        return subst[n] ?? t
+        case .generic(let b, let a):   return .generic(base: b, args: a.map { substituteType($0, subst) })
+        case .function(let p, let r):  return .function(params: p.map { substituteType($0, subst) }, ret: substituteType(r, subst))
+        default:                       return t
+        }
+    }
+
+    // A reabstraction thunk (M5 5.2.3): a generic body invokes a closure parameter through the
+    // boxed ABI (a `T` position is a `void*`), but the concrete closure was compiled with its
+    // real C types. Wrap it in a thunk that unboxes each `T`-position argument, calls the real
+    // closure, and boxes a `T`-position result — generated where the type arguments are concrete.
+    // The thunk's env holds the concrete closure; the site returns a `Closure` over the thunk.
+    private mutating func emitReabstraction(_ closure: IRExpr, declFn: Type, subst: [String: Type]) -> String {
+        guard case .function(let declParams, let declRet) = declFn else { return emitExpr(closure) }
+        let idx = closureSeq; closureSeq += 1
+        let name    = "__nomu_reabs\(idx)"
+        let envName = "\(name)_env"
+        // A position's body-facing C type: `void*` where it is a type parameter, else concrete.
+        func bodyFacing(_ t: Type) -> String { if case .typeParam = t { return "void*" }; return cType(t) }
+
+        var def = "typedef struct { Closure inner; } \(envName);\n"
+        let sigParams = (["void* env"] + declParams.enumerated().map { "\(bodyFacing($1)) a\($0)" }).joined(separator: ", ")
+        def += "static \(bodyFacing(declRet)) \(name)(\(sigParams)) {\n"
+        def += "    Closure inner = ((\(envName)*)env)->inner;\n"
+        // The concrete closure's ABI: fully-substituted C types, env first.
+        let realRet   = substituteType(declRet, subst)
+        let realArgs  = declParams.map { substituteType($0, subst) }
+        let realCast  = "\(cType(realRet))(*)(void*\(realArgs.isEmpty ? "" : ", " + realArgs.map { cType($0) }.joined(separator: ", ")))"
+        var callArgs  = ["inner.env"]
+        for (i, d) in declParams.enumerated() {
+            if case .typeParam = d { callArgs.append(unboxGenericValue("a\(i)", as: realArgs[i])) }
+            else { callArgs.append("a\(i)") }
+        }
+        let realCall = "((\(realCast))inner.fn)(\(callArgs.joined(separator: ", ")))"
+        if realRet == .void {
+            def += "    \(realCall);\n"
+        } else if case .typeParam = declRet {
+            def += "    \(cType(realRet)) __r = \(realCall);\n"
+            def += "    return \(boxConcrete("__r", as: realRet));\n"
+        } else {
+            def += "    return \(realCall);\n"
+        }
+        def += "}\n"
+        closureDefs += def
+
+        let inner = emitExpr(closure)
+        return "({ \(envName)* __re = (\(envName)*)rt_alloc(sizeof(\(envName))); __re->inner = \(inner); (Closure){ .fn = (void*)\(name), .env = (void*)__re }; })"
     }
 
     // Emit each argument in order (a loop, to avoid mutating self inside a map closure).
@@ -1119,6 +1205,15 @@ public struct CodegenIR {
         // A `some I` value is stored as its concrete underlying, so pick the operator by that.
         if case .named(_, let k) = concreteUnderlying(base), k == .class_ || k == .actor_ { return "->" }
         return "."
+    }
+
+    // A member access `base.field` / `base->field` as a raw C lvalue (no generic unboxing).
+    // `self` is a pointer in a mutating value/class method; otherwise the operator follows the
+    // receiver's kind.
+    private mutating func rawMemberAccess(_ base: IRExpr, _ field: String) -> String {
+        let op: String
+        if case .varRef("self") = base.kind, selfIsPointer { op = "->" } else { op = memberOp(base.type) }
+        return "\(emitExpr(base))\(op)\(field)"
     }
 
     // The stored field `field` on the generic type `base` (struct or class), if any.

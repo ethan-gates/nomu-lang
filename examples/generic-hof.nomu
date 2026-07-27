@@ -1,0 +1,18 @@
+// M5 5.2.3: generic higher-order functions. A closure parameter whose type mentions a type
+// parameter (`f: (T) -> U`) is bridged into the generic body's boxed ABI by a *reabstraction
+// thunk* generated at the call site — where the type arguments are concrete, the thunk unboxes
+// each `T`-position argument, calls the real closure, and boxes a `T`-position result.
+
+fun map<T, U>(x: T, f: (T) -> U) -> U {
+    return f(x)
+}
+
+fun combine<A, B, C>(a: A, b: B, f: (A, B) -> C) -> C {
+    return f(a, b)
+}
+
+fun main() {
+    print(map(5, {(n: Int) -> Int in return n * 2}))                      // 10
+    print(map("nomu", {(s: String) -> String in return concat(s, "!")})) // nomu!
+    print(combine(3, 4, {(a: Int, b: Int) -> Int in return a + b}))      // 7
+}

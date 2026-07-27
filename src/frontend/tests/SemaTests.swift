@@ -1236,18 +1236,60 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(r.diagnostics.render().contains("does not conform to 'Drawable'"), r.diagnostics.render())
     }
 
-    func testGenericClosureParameterRejected() {
-        // A type parameter inside a closure parameter needs a reabstraction thunk (deferred).
+    func testGenericClosureParameterAccepted() {
+        // A type parameter inside a closure parameter is bridged by a reabstraction thunk (5.2.3),
+        // so a generic higher-order call type-checks clean and the result reads back concretely.
         let r = sema("""
         fun apply<T, U>(x: T, f: (T) -> U) -> U {
             return f(x)
         }
+        fun caller() {
+            let y = apply(5, {(n: Int) -> Int in return n * 2})
+            print(y)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let fn)? = r.module.decls.first(where: {
+            if case .funcDecl(let f) = $0 { return f.name == "caller" }; return false
+        }) else { XCTFail("expected caller"); return }
+        guard case .letBinding(_, _, let value) = fn.body.first?.kind else { XCTFail("expected let"); return }
+        XCTAssertEqual(value.type, .int)   // apply<Int,Int> returns Int
+    }
+
+    func testGenericContainerReturnPositionAccepted() {
+        // Building and returning a generic container over the type parameter is sound — the boxed
+        // value moves out uniformly (no value witness). Only receiving one as a param is deferred.
+        let r = sema("""
+        struct Box<T> {
+            let value: T
+        }
+        fun wrap<T>(x: T) -> Box<T> {
+            return Box(value: x)
+        }
+        fun caller() {
+            print(wrap(5).value)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+    }
+
+    func testGenericTypeParameterUnderGenericRejected() {
+        // A type parameter nested in a generic-type parameter (`Option<T>`) would let the body
+        // construct/destructure an abstract `T`, which needs value witnesses — deferred.
+        let r = sema("""
+        enum Option<T> {
+            case some(value: T)
+            case none
+        }
+        fun unwrap<T>(o: Option<T>, fallback: T) -> T {
+            return fallback
+        }
         fun f() {
-            print(apply(5, {(n: Int) -> Int in return n * 2}))
+            print(unwrap(Option.none, 0))
         }
         """)
         XCTAssertTrue(r.diagnostics.hasErrors)
-        XCTAssertTrue(r.diagnostics.render().contains("reabstraction thunk"), r.diagnostics.render())
+        XCTAssertTrue(r.diagnostics.render().contains("value witnesses"), r.diagnostics.render())
     }
 
     func testGenericMethodsRejected() {
@@ -1262,6 +1304,64 @@ final class SemaTests: XCTestCase {
         """)
         XCTAssertTrue(r.diagnostics.hasErrors)
         XCTAssertTrue(r.diagnostics.render().contains("aren't supported yet"), r.diagnostics.render())
+    }
+
+    func testGenericBindingTypeMismatchRejected() {
+        // `Box<Int>` and `Box<String>` are distinct types — one C layout, but a binding
+        // annotation mismatch is caught in Sema, not left to silently pass (5.2.3).
+        let r = sema("""
+        struct Box<T> {
+            let value: T
+        }
+        fun f() {
+            let b: Box<String> = Box(value: 5)
+            print(b.value)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("Box<Int>") && r.diagnostics.render().contains("Box<String>"), r.diagnostics.render())
+    }
+
+    func testGenericReturnTypeMismatchRejected() {
+        let r = sema("""
+        struct Box<T> {
+            let value: T
+        }
+        fun make() -> Box<String> {
+            return Box(value: 5)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("cannot return"), r.diagnostics.render())
+    }
+
+    func testGenericMutableFieldWriteAccepted() {
+        // A `var` `T` field can be written; the assignment re-boxes the slot (5.2.3).
+        let r = sema("""
+        struct Cell<T> {
+            var value: T
+        }
+        fun f() {
+            var c = Cell(value: 1)
+            c.value = 99
+            print(c.value)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+    }
+
+    func testGenericLetFieldWriteRejected() {
+        let r = sema("""
+        struct Box<T> {
+            let value: T
+        }
+        fun f() {
+            var b = Box(value: 1)
+            b.value = 2
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("'let' field"), r.diagnostics.render())
     }
 
     func testGenericArityMismatchRejected() {

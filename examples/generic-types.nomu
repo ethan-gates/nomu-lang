@@ -6,9 +6,20 @@ struct Box<T> {
     let value: T
 }
 
+struct Cell<T> {
+    var value: T
+}
+
 enum Option<T> {
     case some(value: T)
     case none
+}
+
+// A generic function may *build and return* a generic container over its type parameter — the
+// boxed value moves out uniformly, no value witness needed. (Receiving `Box<T>`/`Option<T>` as a
+// parameter and destructuring an abstract `T` is what still needs the witness — deferred.)
+fun wrap<T>(x: T) -> Box<T> {
+    return Box(value: x)
 }
 
 fun main() {
@@ -37,4 +48,13 @@ fun main() {
     case .some(let s): print(s)  // nomu
     case .none:        print("none")
     }
+
+    // A mutable `T` field: the write re-boxes the slot (the old box leaks until the M6 GC).
+    var cell = Cell(value: 1)
+    cell.value = 99
+    print(cell.value)            // 99
+
+    // Build a generic container over an abstract `T` inside a generic function, at two types.
+    print(wrap(8).value)         // 8
+    print(wrap("gen").value)     // gen
 }

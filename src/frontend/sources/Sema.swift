@@ -840,6 +840,7 @@ public struct Sema {
             }
             let annotated = b.type.map { resolve($0) }
             let value = coerce(checkExpr(b.value, expected: annotated), to: annotated)
+            checkAssignable(value.type, to: annotated, role: "bind", at: b.span)
             let type = annotated ?? value.type
             declare(b.name, type, isMutable: b.isMutable)
             return IRStmt(kind: .letBinding(name: b.name, isMutable: b.isMutable, value: value), span: b.span)
@@ -899,11 +900,15 @@ public struct Sema {
                 let ftype = fieldType(of: b.type, field: field, at: mspan)
                 let target = IRExpr(type: ftype, span: mspan, kind: .fieldAccess(base: b, field: field))
                 rejectLetFieldTarget(target)
-                return IRStmt(kind: .assign(target: target, value: checkExpr(rhs)), span: span)
+                let value = coerce(checkExpr(rhs, expected: ftype), to: ftype)
+                checkAssignable(value.type, to: ftype, role: "assign", at: span)
+                return IRStmt(kind: .assign(target: target, value: value), span: span)
             }
             let target = checkExpr(lhs)
             rejectLetFieldTarget(target)
-            return IRStmt(kind: .assign(target: target, value: checkExpr(rhs)), span: span)
+            let value = coerce(checkExpr(rhs, expected: target.type), to: target.type)
+            checkAssignable(value.type, to: target.type, role: "assign", at: span)
+            return IRStmt(kind: .assign(target: target, value: value), span: span)
 
         case .compoundAssign(let lhs, let rhs, let span):
             if case .member(let base, let field, let mspan) = lhs {
@@ -929,7 +934,9 @@ public struct Sema {
                 if let v { recordOpaque(v, interfaces: ifaces, owner: owner, at: span) }
                 return IRStmt(kind: .ret(v), span: span)
             }
-            return IRStmt(kind: .ret(e.map { coerce(checkExpr($0, expected: currentReturnType), to: currentReturnType) }), span: span)
+            let ret = e.map { coerce(checkExpr($0, expected: currentReturnType), to: currentReturnType) }
+            if let ret { checkAssignable(ret.type, to: currentReturnType, role: "return", at: span) }
+            return IRStmt(kind: .ret(ret), span: span)
 
         case .ifStmt(let s):
             let cond = checkExpr(s.cond)
@@ -984,6 +991,19 @@ public struct Sema {
 
     // Coerce a concrete conformer to `any I` / `any A & B` where an existential is
     // expected, inserting a box (M5 A1.4/A1.5b). A conformance mismatch is diagnosed here.
+    // A binding/return annotation must match the value's type once coercions have run
+    // (existential/opaque targets already rewrote the type). Anything still unequal is a
+    // mismatch — caught here rather than leaking to the C compiler, and (for generics, whose
+    // instantiations share one C layout) rather than passing silently.
+    private mutating func checkAssignable(_ actual: Type, to expected: Type?, role: String, at span: Span) {
+        guard let expected, actual != expected, actual != .error, expected != .error else { return }
+        switch role {
+        case "return": diags.error("cannot return value of type '\(actual)' where '\(expected)' is expected", at: span)
+        case "assign": diags.error("cannot assign value of type '\(actual)' to '\(expected)'", at: span)
+        default:       diags.error("cannot bind value of type '\(actual)' to '\(expected)'", at: span)
+        }
+    }
+
     private mutating func coerce(_ e: IRExpr, to expected: Type?) -> IRExpr {
         let target: [String]
         switch expected {
@@ -1167,12 +1187,14 @@ public struct Sema {
         if args.count != sig.params.count {
             diags.error("function '\(name)' expects \(sig.params.count) argument(s), got \(args.count)", at: span)
         }
-        // A type parameter inside a closure parameter (`f: (T) -> U`) would need a reabstraction
-        // thunk (box/unbox at the call boundary) that isn't generated yet — reject rather than
-        // miscompile (M5 5.2.3; the thunk is the remaining exit item).
+        // A type parameter inside a closure parameter (`f: (T) -> U`) is bridged by a
+        // reabstraction thunk in codegen (M5 5.2.3). A type parameter nested in a generic-type
+        // *parameter* (`o: Option<T>`) lets the body destructure/rebuild an abstract container,
+        // which needs value witnesses — deferred; reject cleanly rather than miscompile.
+        // (Return position — `-> Box<T>` — is fine: it only moves a boxed value out.)
         let tparams = Set(sig.generics.map(\.name))
-        if sig.params.contains(where: { typeParamUnderFunction($0, tparams) }) {
-            diags.error("a generic function with a closure parameter that involves a type parameter isn't supported yet (M5 5.2.3 — needs a reabstraction thunk)", at: span)
+        if sig.params.contains(where: { typeParamUnderGeneric($0, tparams) }) {
+            diags.error("a generic function with a generic-type parameter over a type variable (e.g. 'Option<T>') isn't supported yet (M5 5.2.3 — needs value witnesses)", at: span)
         }
         var subst: [String: Type] = [:]
         for (p, a) in zip(sig.params, args) { unify(param: p, arg: a.value.type, into: &subst, at: span) }
@@ -1225,12 +1247,13 @@ public struct Sema {
         }
     }
 
-    // Does a type parameter appear inside a function type within `t`? Such a position needs a
-    // reabstraction thunk at the call boundary, which 5.2.3 doesn't emit yet.
-    private func typeParamUnderFunction(_ t: Type, _ tparams: Set<String>) -> Bool {
+    // Does a type parameter appear inside an applied generic type within `t` (e.g. `Option<T>`)?
+    // Such a parameter would let a generic body build/destructure an abstract `T` — deferred to
+    // value witnesses (M5). A type parameter under a *function* type is handled by a thunk.
+    private func typeParamUnderGeneric(_ t: Type, _ tparams: Set<String>) -> Bool {
         switch t {
-        case .function(let p, let r): return p.contains { mentionsTypeParam($0, tparams) } || mentionsTypeParam(r, tparams)
-        case .generic(_, let a):      return a.contains { typeParamUnderFunction($0, tparams) }
+        case .generic(_, let a):      return a.contains { mentionsTypeParam($0, tparams) }
+        case .function(let p, let r): return p.contains { typeParamUnderGeneric($0, tparams) } || typeParamUnderGeneric(r, tparams)
         default:                      return false
         }
     }
@@ -1463,20 +1486,24 @@ public struct Sema {
     // field writes inside methods are already caught by the AST Typechecker (self is
     // read-only); this covers `value.field = …` targets on struct/class values.
     private func rejectLetFieldTarget(_ target: IRExpr) {
-        guard case .fieldAccess(let base, let field) = target.kind,
-              case .named(let typeName, let kind) = base.type else { return }
-        let fields: [VarField]
-        switch kind {
-        case .struct_: fields = structs[typeName]?.fields ?? []
-        case .class_:  fields = classes[typeName]?.fields ?? []
-        default:       return
+        guard case .fieldAccess(let base, let field) = target.kind else { return }
+        let typeName: String
+        switch base.type {
+        case .named(let n, .struct_), .named(let n, .class_): typeName = n   // concrete value/reference
+        case .generic(let n, _):                              typeName = n   // an applied generic type (5.2.3)
+        default:                                              return
         }
+        let fields = structs[typeName]?.fields ?? classes[typeName]?.fields ?? []
         if let f = fields.first(where: { $0.name == field }), !f.isMutable {
             diags.error("cannot assign to 'let' field '\(field)'", at: target.span)
         }
     }
 
-    private func fieldType(of type: Type, field: String, at span: Span) -> Type {
+    private mutating func fieldType(of type: Type, field: String, at span: Span) -> Type {
+        // A field on an applied generic type `Box<Int>` — substitute the arguments (M5 5.2.3).
+        if case .generic(let base, let args) = type {
+            return genericMemberType(base, args, field, at: span)
+        }
         guard case .named(let name, let kind) = type else {
             if type != .error { diags.error("value of type '\(type)' has no field '\(field)'", at: span) }
             return .error
