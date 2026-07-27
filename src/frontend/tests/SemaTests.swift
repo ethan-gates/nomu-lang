@@ -1149,4 +1149,93 @@ final class SemaTests: XCTestCase {
         """)
         XCTAssertTrue(r.diagnostics.hasErrors)   // A does not refine B
     }
+
+    // MARK: - Generics: parsing + type model (5.2.1)
+
+    func testGenericTypeReferenceResolves() {
+        // `Box<Int>` in a signature resolves to `.generic`; the generic decl emits no IR yet.
+        let r = sema("""
+        struct Box<T> {
+            var value: T
+        }
+        fun unwrap(b: Box<Int>) -> Int {
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        XCTAssertEqual(r.module.decls.count, 1)   // only `unwrap`; generic `Box` is not lowered
+        guard case .funcDecl(let fn) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(fn.params[0].type, .generic(base: "Box", args: [.int]))
+    }
+
+    func testGenericArityMismatchRejected() {
+        let r = sema("""
+        struct Box<T> {
+            var value: T
+        }
+        fun f(b: Box<Int, Bool>) -> Int {
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("expects 1 type argument"), r.diagnostics.render())
+    }
+
+    func testNonGenericTypeWithArgsRejected() {
+        let r = sema("""
+        struct Plain {
+            var x: Int
+        }
+        fun f(p: Plain<Int>) -> Int {
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("is not generic"), r.diagnostics.render())
+    }
+
+    func testUnknownGenericRejected() {
+        let r = sema("""
+        fun f(x: Nope<Int>) -> Int {
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testGenericBoundMustBeInterface() {
+        let r = sema("""
+        struct Helper {
+            var x: Int
+        }
+        fun f<T: Helper>(x: T) -> Int {
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("must name an interface"), r.diagnostics.render())
+    }
+
+    func testGenericFunctionSignatureResolves() {
+        // A generic function's signature type-checks (type params in scope) and emits no IR yet.
+        let r = sema("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        fun describe<T: Drawable>(x: T) -> String {
+            return "x"
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        XCTAssertTrue(r.module.decls.isEmpty)   // the generic function is not lowered yet
+    }
+
+    func testTypeParamOutsideGenericScopeRejected() {
+        let r = sema("""
+        fun f(x: T) -> Int {
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)   // T isn't a declared type or a parameter here
+    }
 }

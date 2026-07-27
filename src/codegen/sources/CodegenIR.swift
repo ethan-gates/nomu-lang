@@ -1062,6 +1062,7 @@ public struct CodegenIR {
         case .existential, .composition: return "AnyBox"
         case .selfType: preconditionFailure("'Self' escaped to codegen — constraint-only interfaces emit no witnesses (M5 A2)")
         case .opaque: return cType(concreteUnderlying(t))   // `some I` is unboxed — the concrete underlying's C type (M5 A3)
+        case .typeParam, .generic: preconditionFailure("generics aren't lowered yet — no codegen (M5 5.2.1)")
         case .named(let n, let kind):
             switch kind {
             case .class_, .actor_: return Mangle.type(n) + "*"

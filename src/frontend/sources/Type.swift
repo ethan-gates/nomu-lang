@@ -16,10 +16,10 @@ public indirect enum Type: Equatable {
     case composition([String])                     // `any A & B` — conforms to several interfaces (canonical, M5 A1.5b)
     case selfType                                  // `Self` in an interface requirement (M5 A2); constraint-only, never reaches codegen
     case opaque(interfaces: [String], owner: String)  // `some I` / `some A & B` — one hidden concrete underlying (M5 A3). `owner` gives per-function/binding identity (Swift-style); the underlying is looked up in IRModule.opaqueUnderlyings. Unboxed, statically dispatched.
+    case typeParam(String)                          // a generic type parameter `T` in scope (M5 5.2.1)
+    case generic(base: String, args: [Type])        // an applied generic type `Box<Int>` (M5 5.2.1)
     case function(params: [Type], ret: Type)       // closures and named functions share this
     case error                                     // unresolved / failed typing; suppresses cascades
-
-    // Extension points for M5: `.typeParam`, `.opaque`, `.generic`.
 }
 
 extension Type: CustomStringConvertible {
@@ -35,6 +35,8 @@ extension Type: CustomStringConvertible {
         case .composition(let names): return "any " + names.joined(separator: " & ")
         case .selfType: return "Self"
         case .opaque(let interfaces, _): return "some " + interfaces.joined(separator: " & ")
+        case .typeParam(let n): return n
+        case .generic(let base, let args): return base + "<" + args.map(\.description).joined(separator: ", ") + ">"
         case .function(let params, let ret):
             return "(" + params.map(\.description).joined(separator: ", ") + ") -> \(ret)"
         }

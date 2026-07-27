@@ -8,13 +8,15 @@ public final class TypeRef {
     public let fn: FnType?
     public let existentialOf: [String]?   // set for `any I` / `any A & B` — the interface names (M5 A1.4/A1.5b)
     public let opaqueOf: [String]?        // set for `some I` / `some A & B` — the interface names (M5 A3)
+    public let genericArgs: [TypeRef]?    // set for an applied generic type `Box<Int>` (M5 5.2.1)
     public let span: Span
 
-    public init(name: String, fn: FnType? = nil, existentialOf: [String]? = nil, opaqueOf: [String]? = nil, span: Span) {
+    public init(name: String, fn: FnType? = nil, existentialOf: [String]? = nil, opaqueOf: [String]? = nil, genericArgs: [TypeRef]? = nil, span: Span) {
         self.name = name
         self.fn = fn
         self.existentialOf = existentialOf
         self.opaqueOf = opaqueOf
+        self.genericArgs = genericArgs
         self.span = span
     }
 }
@@ -85,6 +87,14 @@ public struct Conformance {
     public let span: Span
 }
 
+// A generic type parameter with optional interface bounds: `<T>`, `<T: I>`, `<T: I & J>`
+// (M5 5.2.1). Bounds reuse `Conformance` (name + span).
+public struct GenericParam {
+    public let name: String
+    public let bounds: [Conformance]
+    public let span: Span
+}
+
 // An extension: `extension T { … }` (plain, M4.12) or `extension T: I { … }` (a
 // conformance extension supplying I's witnesses, M5 A1.3). Its methods are folded
 // into the target type's member set by the merge pass, and a conformance form also
@@ -100,6 +110,7 @@ public struct ExtensionDecl {
 
 public struct StructDecl {
     public let name: String
+    public let generics: [GenericParam]   // M5 5.2.1: `struct Box<T>` type parameters (empty for non-generic)
     public let fields: [VarField]
     public let properties: [ComputedProperty]   // M5 A1: computed properties (get / get-set)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
@@ -133,6 +144,7 @@ public struct Setter {
 
 public struct EnumDecl {
     public let name: String
+    public let generics: [GenericParam]   // M5 5.2.1: `enum Option<T>` type parameters (empty for non-generic)
     public let cases: [EnumCaseDecl]
     public let properties: [ComputedProperty]   // M5 A1: computed properties (enums store nothing)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
@@ -148,6 +160,7 @@ public struct EnumCaseDecl {
 
 public struct ClassDecl {
     public let name: String
+    public let generics: [GenericParam]   // M5 5.2.1: `class Ref<T>` type parameters (empty for non-generic)
     public let fields: [VarField]
     public let properties: [ComputedProperty]   // M5 A1: computed properties (get / get-set)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
@@ -180,6 +193,7 @@ public struct OnHandler {
 
 public struct FuncDecl {
     public let name: String
+    public let generics: [GenericParam]   // M5 5.2.1: `fun map<T, U>(…)` type parameters (empty for non-generic)
     public let params: [Param]
     public let returnType: TypeRef?
     public let body: Block

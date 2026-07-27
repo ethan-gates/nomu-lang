@@ -42,6 +42,10 @@ public struct Sema {
     private var opaqueUnderlyings: [String: Type] = [:]
     private var opaqueBindingCounter = 0
 
+    // M5 5.2.1: the generic type parameters (`T`, `U`) in scope while resolving a generic
+    // decl's signatures — a bare name here resolves to `.typeParam`, not an unknown type.
+    private var genericScope: Set<String> = []
+
     // Lexical scope stack for locals/params (name → type + mutability).
     private var scopes: [[String: Local]] = []
     private struct Local { let type: Type; let isMutable: Bool }
@@ -68,6 +72,9 @@ public struct Sema {
             // Interfaces are abstract: validate them, but emit no IR (conformance in a
             // later slice generates the concrete witnesses that carry the defaults).
             if case .interfaceDecl(let i) = decl { checkInterface(i); continue }
+            // Generic decls parse and type-check but aren't lowered yet — witness-passing
+            // lowering is 5.2.2 (functions) / 5.2.3 (types). Validate signatures, emit no IR.
+            if isGenericDecl(decl) { checkGenericDecl(decl); continue }
             decls.append(lowerDecl(decl))
         }
 
@@ -94,8 +101,10 @@ public struct Sema {
             case .actorDecl(let a):  actors[a.name]  = a
             case .interfaceDecl(let i): interfaces[i.name] = i; interfaceBases[i.name] = i.refines
             case .funcDecl(let f):
+                let saved = genericScope; genericScope = Set(f.generics.map(\.name))
                 funcs[f.name] = FnSig(params: f.params.map { resolve($0.type) },
                                       ret: resolve(f.returnType, opaqueOwner: "fn:\(f.name)"))
+                genericScope = saved
             case .extensionDecl:
                 break   // merged into its target before Sema (M4.12)
             }
@@ -104,9 +113,9 @@ public struct Sema {
         // type may name any user type), so register them in a second pass.
         for decl in program.decls {
             switch decl {
-            case .structDecl(let s): registerProps(s.name, s.properties)
-            case .enumDecl(let e):   registerProps(e.name, e.properties)
-            case .classDecl(let c):  registerProps(c.name, c.properties)
+            case .structDecl(let s): registerProps(s.name, s.properties, generics: s.generics)
+            case .enumDecl(let e):   registerProps(e.name, e.properties, generics: e.generics)
+            case .classDecl(let c):  registerProps(c.name, c.properties, generics: c.generics)
             default: break
             }
         }
@@ -132,6 +141,12 @@ public struct Sema {
         }
         if let ifaces = ref.opaqueOf {        // `some I` / `some A & B` (M5 A3)
             return resolveOpaque(ifaces, owner: opaqueOwner, at: ref.span)
+        }
+        if let args = ref.genericArgs {       // `Box<Int>` — an applied generic type (M5 5.2.1)
+            return resolveGeneric(ref.name, args: args, selfAs: selfAs, at: ref.span)
+        }
+        if genericScope.contains(ref.name) {  // a generic type parameter `T` in scope (M5 5.2.1)
+            return .typeParam(ref.name)
         }
         if let fn = ref.fn {
             return .function(params: fn.params.map { resolve($0, selfAs: selfAs) }, ret: resolve(fn.ret, selfAs: selfAs))
@@ -200,6 +215,30 @@ public struct Sema {
         }
         guard let set = canonicalInterfaces(names, keyword: "some", at: span) else { return .error }
         return .opaque(interfaces: set, owner: owner)
+    }
+
+    // Resolve `Box<Int>` to `.generic` (M5 5.2.1): the base must be a declared generic type,
+    // the argument count must match, and each argument resolves in the current scope.
+    private func resolveGeneric(_ base: String, args: [TypeRef], selfAs: Type?, at span: Span) -> Type {
+        guard let arity = genericArity(base) else {
+            if kindOf(base) != nil {
+                diags.error("type '\(base)' is not generic — it takes no type arguments", at: span)
+            } else {
+                diags.error("unknown generic type '\(base)'", at: span)
+            }
+            return .error
+        }
+        if arity != args.count {
+            diags.error("generic type '\(base)' expects \(arity) type argument(s), got \(args.count)", at: span)
+            return .error
+        }
+        return .generic(base: base, args: args.map { resolve($0, selfAs: selfAs) })
+    }
+
+    // The number of type parameters of a declared type, or nil if it isn't generic (M5 5.2.1).
+    private func genericArity(_ name: String) -> Int? {
+        let n = structs[name]?.generics.count ?? enums[name]?.generics.count ?? classes[name]?.generics.count ?? 0
+        return n > 0 ? n : nil
     }
 
     // The interface(s) an existential/composition ranges over; empty for other types.
@@ -300,6 +339,47 @@ public struct Sema {
             _ = lowerBlock(body)
             currentReturnType = saved
             popScope()
+        }
+    }
+
+    // MARK: - Generic decls (M5 5.2.1)
+
+    private func isGenericDecl(_ decl: TopDecl) -> Bool {
+        switch decl {
+        case .structDecl(let s): return !s.generics.isEmpty
+        case .enumDecl(let e):   return !e.generics.isEmpty
+        case .classDecl(let c):  return !c.generics.isEmpty
+        case .funcDecl(let f):   return !f.generics.isEmpty
+        default: return false
+        }
+    }
+
+    // Validate a generic decl's parameter bounds and signatures with its type parameters in
+    // scope, emitting no IR (M5 5.2.1). Witness-passing lowering is 5.2.2 (functions) / 5.2.3
+    // (types); bodies and conformance are checked there.
+    private mutating func checkGenericDecl(_ decl: TopDecl) {
+        let generics: [GenericParam]
+        switch decl {
+        case .structDecl(let s): generics = s.generics
+        case .enumDecl(let e):   generics = e.generics
+        case .classDecl(let c):  generics = c.generics
+        case .funcDecl(let f):   generics = f.generics
+        default: return
+        }
+        let saved = genericScope; genericScope = Set(generics.map(\.name)); defer { genericScope = saved }
+        for g in generics {
+            for b in g.bounds where interfaces[b.name] == nil {
+                diags.error("'\(b.name)' is not an interface — a generic bound must name an interface", at: b.span)
+            }
+        }
+        switch decl {
+        case .structDecl(let s): for f in s.fields { _ = resolve(f.type) }
+        case .classDecl(let c):  for f in c.fields { _ = resolve(f.type) }
+        case .enumDecl(let e):   for cse in e.cases { for f in cse.fields { _ = resolve(f.type) } }
+        case .funcDecl(let f):
+            for p in f.params { _ = resolve(p.type) }
+            _ = resolve(f.returnType)
+        default: break
         }
     }
 
@@ -475,6 +555,8 @@ public struct Sema {
     // conformance is parked post-M5 (interfaces.md §1). No witnesses yet (A1.4).
     private mutating func checkConformances() {
         for decl in program.decls {
+            // A generic type's conformance is checked when it is lowered (5.2.3), not here.
+            if isGenericDecl(decl) { continue }
             switch decl {
             case .structDecl(let s):
                 checkConformance(s.name, .struct_, s.conformances, methods: s.methods, fields: s.fields, properties: s.properties)
@@ -606,7 +688,8 @@ public struct Sema {
         return out
     }
 
-    private mutating func registerProps(_ typeName: String, _ props: [ComputedProperty]) {
+    private mutating func registerProps(_ typeName: String, _ props: [ComputedProperty], generics: [GenericParam] = []) {
+        let saved = genericScope; genericScope = Set(generics.map(\.name)); defer { genericScope = saved }
         var table: [String: PropInfo] = [:]
         for p in props { table[p.name] = PropInfo(type: resolve(p.type), hasSetter: p.setter != nil) }
         computedProps[typeName] = table

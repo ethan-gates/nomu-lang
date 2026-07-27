@@ -43,10 +43,31 @@ public struct Parser {
         return out
     }
 
+    // `<T>`, `<T: I>`, `<T: I & J>, U` — a generic parameter list (M5 5.2.1). Empty when no `<`.
+    private mutating func parseGenericParams() -> [GenericParam] {
+        guard eat(.lt) else { return [] }
+        var params: [GenericParam] = []
+        repeat {
+            let pspan = currentSpan
+            let name = expectIdent()
+            var bounds: [Conformance] = []
+            if eat(.colon) {
+                repeat {
+                    let bspan = currentSpan
+                    bounds.append(Conformance(name: expectIdent(), span: bspan))
+                } while eat(.amp)
+            }
+            params.append(GenericParam(name: name, bounds: bounds, span: pspan))
+        } while eat(.comma)
+        expect(.gt)
+        return params
+    }
+
     private mutating func parseStructDecl() -> StructDecl {
         let start = currentSpan
         expect(.kwStruct)
         let name = expectIdent()
+        let generics = parseGenericParams()
         let conformances = parseConformanceClause()
         expect(.lBrace)
         var fields: [VarField] = []
@@ -66,7 +87,7 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return StructDecl(name: name, fields: fields, properties: properties, methods: methods,
+        return StructDecl(name: name, generics: generics, fields: fields, properties: properties, methods: methods,
                           conformances: conformances, span: spanFrom(start))
     }
 
@@ -74,6 +95,7 @@ public struct Parser {
         let start = currentSpan
         expect(.kwEnum)
         let name = expectIdent()
+        let generics = parseGenericParams()
         let conformances = parseConformanceClause()
         expect(.lBrace)
         var cases: [EnumCaseDecl] = []
@@ -98,7 +120,7 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return EnumDecl(name: name, cases: cases, properties: properties, methods: methods,
+        return EnumDecl(name: name, generics: generics, cases: cases, properties: properties, methods: methods,
                         conformances: conformances, span: spanFrom(start))
     }
 
@@ -124,6 +146,7 @@ public struct Parser {
         let start = currentSpan
         expect(.kwClass)
         let name = expectIdent()
+        let generics = parseGenericParams()
         let conformances = parseConformanceClause()
         expect(.lBrace)
         var fields: [VarField] = []
@@ -143,7 +166,7 @@ public struct Parser {
             }
         }
         expect(.rBrace)
-        return ClassDecl(name: name, fields: fields, properties: properties, methods: methods,
+        return ClassDecl(name: name, generics: generics, fields: fields, properties: properties, methods: methods,
                          conformances: conformances, span: spanFrom(start))
     }
 
@@ -276,13 +299,14 @@ public struct Parser {
         let start = currentSpan
         expect(.kwFunc)
         let name = expectIdent()
+        let generics = parseGenericParams()
         let params = parseParamList()
         var returnType: TypeRef? = nil
         if eat(.arrow) {
             returnType = parseTypeRef()
         }
         let body = parseBlock()
-        return FuncDecl(name: name, params: params, returnType: returnType, body: body, span: spanFrom(start))
+        return FuncDecl(name: name, generics: generics, params: params, returnType: returnType, body: body, span: spanFrom(start))
     }
 
     // MARK: - Fields and params
@@ -426,6 +450,15 @@ public struct Parser {
             return TypeRef(name: renderFnType(params, ret), fn: FnType(params: params, ret: ret), span: spanFrom(start))
         }
         let name = expectIdent()
+        // Applied generic type `Box<Int>` / `Map<String, Int>` (M5 5.2.1). Angle brackets are
+        // generic only in type position (decided, 5.0.6), so a `<` here is unambiguous.
+        if check(.lt) {
+            var args: [TypeRef] = []
+            expect(.lt)
+            repeat { args.append(parseTypeRef()) } while eat(.comma)
+            expect(.gt)
+            return TypeRef(name: name, genericArgs: args, span: spanFrom(start))   // `name` is the base; args carry the arguments
+        }
         return TypeRef(name: name, span: spanFrom(start))
     }
 
