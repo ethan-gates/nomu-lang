@@ -14,6 +14,8 @@ public indirect enum Type: Equatable {
     case named(String, NamedKind)                 // struct / enum / class / actor
     case existential(String)                       // `any I` — a boxed value conforming to interface I (M5 A1.4)
     case composition([String])                     // `any A & B` — conforms to several interfaces (canonical, M5 A1.5b)
+    case selfType                                  // `Self` in an interface requirement (M5 A2); constraint-only, never reaches codegen
+    case opaque(interfaces: [String], owner: String)  // `some I` / `some A & B` — one hidden concrete underlying (M5 A3). `owner` gives per-function/binding identity (Swift-style); the underlying is looked up in IRModule.opaqueUnderlyings. Unboxed, statically dispatched.
     case function(params: [Type], ret: Type)       // closures and named functions share this
     case error                                     // unresolved / failed typing; suppresses cascades
 
@@ -31,6 +33,8 @@ extension Type: CustomStringConvertible {
         case .named(let name, _): return name
         case .existential(let name): return "any \(name)"
         case .composition(let names): return "any " + names.joined(separator: " & ")
+        case .selfType: return "Self"
+        case .opaque(let interfaces, _): return "some " + interfaces.joined(separator: " & ")
         case .function(let params, let ret):
             return "(" + params.map(\.description).joined(separator: ", ") + ") -> \(ret)"
         }

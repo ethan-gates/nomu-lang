@@ -176,6 +176,7 @@ private final class MutationAnalyzer {
             }
         }
         return IRModule(decls: decls, interfaces: module.interfaces,
-                        conformances: module.conformances, composites: module.composites)
+                        conformances: module.conformances, composites: module.composites,
+                        opaqueUnderlyings: module.opaqueUnderlyings)
     }
 }

@@ -52,13 +52,13 @@ private struct ExtensionMerger {
             switch decl {
             case .structDecl(let s):
                 let methods = merged(s.methods, into: s.name)
-                out.append(.structDecl(StructDecl(name: s.name, fields: s.fields, properties: s.properties, methods: methods, conformances: s.conformances + extConformances(s.name), span: s.span)))
+                out.append(.structDecl(StructDecl(name: s.name, fields: s.fields, properties: mergedProperties(s.properties, into: s.name), methods: methods, conformances: s.conformances + extConformances(s.name), span: s.span)))
             case .enumDecl(let e):
                 let methods = merged(e.methods, into: e.name)
-                out.append(.enumDecl(EnumDecl(name: e.name, cases: e.cases, properties: e.properties, methods: methods, conformances: e.conformances + extConformances(e.name), span: e.span)))
+                out.append(.enumDecl(EnumDecl(name: e.name, cases: e.cases, properties: mergedProperties(e.properties, into: e.name), methods: methods, conformances: e.conformances + extConformances(e.name), span: e.span)))
             case .classDecl(let c):
                 let methods = merged(c.methods, into: c.name)
-                out.append(.classDecl(ClassDecl(name: c.name, fields: c.fields, properties: c.properties, methods: methods, conformances: c.conformances + extConformances(c.name), span: c.span)))
+                out.append(.classDecl(ClassDecl(name: c.name, fields: c.fields, properties: mergedProperties(c.properties, into: c.name), methods: methods, conformances: c.conformances + extConformances(c.name), span: c.span)))
             case .actorDecl, .interfaceDecl, .funcDecl:
                 out.append(decl)
             case .extensionDecl:
@@ -114,6 +114,26 @@ private struct ExtensionMerger {
 
     private func signature(_ m: FuncDecl) -> String {
         m.name + "(" + m.params.map { $0.type.name }.joined(separator: ",") + ")"
+    }
+
+    // Body computed properties followed by extension computed properties (M5), skipping any
+    // whose name duplicates one already present. Lets a conformance extension satisfy a
+    // property requirement with a computed property (interfaces.md §1).
+    private func mergedProperties(_ body: [ComputedProperty], into typeName: String) -> [ComputedProperty] {
+        guard let exts = byType[typeName] else { return body }
+        var result = body
+        var seen = Set(body.map(\.name))
+        for ext in exts {
+            for p in ext.properties {
+                if seen.contains(p.name) {
+                    diags.error("extension property '\(p.name)' collides with an existing member on '\(typeName)'", at: p.span)
+                    continue
+                }
+                seen.insert(p.name)
+                result.append(p)
+            }
+        }
+        return result
     }
 
     // Conformances contributed by `extension T: I` forms targeting `typeName` (M5 A1.3).

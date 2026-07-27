@@ -1,0 +1,78 @@
+// M5 A3: `some I` opaque return types. A function returning `some I` yields one hidden
+// concrete type — the caller sees only "conforms to I", but the compiler knows the exact
+// type, so requirement calls lower to direct calls (no box, no witness indirection). This
+// is the language's guaranteed-static-dispatch lever; contrast `any I`, which boxes and
+// dispatches dynamically. Unlike a generic `<T: I>` (caller-chosen, witness-passing),
+// `some I` is implementation-chosen, one fixed type, always devirtualized.
+
+interface Drawable {
+    fun draw() -> String
+    var name: String { get }        // property requirement (stored-field-backed below)
+}
+
+interface Named {
+    var name: String { get }
+}
+
+struct Circle: Drawable, Named {
+    var name: String
+    var radius: Int
+    fun draw() -> String {
+        return "O"
+    }
+}
+
+// The underlying concrete type (Circle) is hidden from the caller but fixed and known to
+// the compiler. Every `return` must yield that one type. `s.draw()` / `s.name` below emit
+// direct calls / a field load — check the generated .c: no AnyBox, no witness slot.
+fun makeShape() -> some Drawable {
+    return Circle(name: "shape", radius: 3)
+}
+
+// `some A & B` composes requirements the same way; still one concrete underlying.
+fun makeComposed() -> some Drawable & Named {
+    return Circle(name: "both", radius: 1)
+}
+
+// A `Self`-mentioning (constraint-only) interface is usable as `some I` even though it is
+// rejected as `any I`: `some` fixes one concrete type, so `Self` binds to it. Calling the
+// `-> Self` requirement hands back the concrete underlying (the A3 decision), so `twin` is
+// a Point and `twin.x` reads.
+interface Cloneable {
+    fun clone() -> Self
+    fun tag() -> String
+}
+
+struct Point: Cloneable {
+    var x: Int
+    fun clone() -> Point {
+        return Point(x: x)
+    }
+    fun tag() -> String {
+        return "pt"
+    }
+}
+
+fun makePoint() -> some Cloneable {
+    return Point(x: 42)
+}
+
+fun main() {
+    let s = makeShape()
+    print(s.draw())          // O   (direct call to Circle.draw)
+    print(s.name)            // shape (direct field load)
+
+    let c = makeComposed()
+    print(c.draw())          // O
+    print(c.name)            // both
+
+    // `let x: some I = concrete` — a local opaque binding (its own opaque identity).
+    let d: some Drawable = Circle(name: "local", radius: 2)
+    print(d.draw())          // O
+    print(d.name)            // local
+
+    let p = makePoint()
+    let twin = p.clone()     // yields the concrete Point (A3: Self → underlying)
+    print(twin.x)            // 42
+    print(p.tag())           // pt
+}

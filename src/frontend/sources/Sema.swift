@@ -33,6 +33,15 @@ public struct Sema {
     private var compositeList: [IRComposite] = []               // M5 A1.5b: (type, any A & B) pairs boxed
     private var compositePairs: Set<String> = []
 
+    // M5 A3: `some I` opaque types. `allConformsTo` records every checked conformance
+    // (including constraint-only interfaces, which have no witness) so `some I` can verify
+    // its underlying conforms; `conformsTo` above stays witness-only for `any`. `opaqueUnderlyings`
+    // maps an opaque owner (a `some`-returning function/method, or a `let`/`var: some I` binding)
+    // to its single hidden concrete type, filled during lowering and read by codegen.
+    private var allConformsTo: [String: Set<String>] = [:]
+    private var opaqueUnderlyings: [String: Type] = [:]
+    private var opaqueBindingCounter = 0
+
     // Lexical scope stack for locals/params (name → type + mutability).
     private var scopes: [[String: Local]] = []
     private struct Local { let type: Type; let isMutable: Bool }
@@ -65,7 +74,8 @@ public struct Sema {
         // M4.11: infer method mutating-ness, validate `let`-field / `self` writes,
         // annotate the IR, then check that mutating value-type calls have a mutable receiver.
         let module0 = IRModule(decls: decls, interfaces: buildIRInterfaces(),
-                               conformances: conformanceList, composites: compositeList)
+                               conformances: conformanceList, composites: compositeList,
+                               opaqueUnderlyings: opaqueUnderlyings)
         let mutation = analyzeMutation(module0, into: diags)
         for site in methodCallSites where mutation.mutating.contains(site.callee) && !site.receiverMutable {
             diags.error("cannot call mutating method on an immutable value — the receiver must be a 'var'", at: site.span)
@@ -85,7 +95,7 @@ public struct Sema {
             case .interfaceDecl(let i): interfaces[i.name] = i; interfaceBases[i.name] = i.refines
             case .funcDecl(let f):
                 funcs[f.name] = FnSig(params: f.params.map { resolve($0.type) },
-                                      ret: resolve(f.returnType))
+                                      ret: resolve(f.returnType, opaqueOwner: "fn:\(f.name)"))
             case .extensionDecl:
                 break   // merged into its target before Sema (M4.12)
             }
@@ -108,13 +118,28 @@ public struct Sema {
 
     // MARK: - Type resolution (syntax → semantics)
 
-    private func resolve(_ ref: TypeRef?) -> Type {
+    // `selfAs` gives the type `Self` resolves to (M5 A2): the abstract `.selfType` while
+    // laying out an interface's requirements, the conformer's concrete type while matching
+    // conformance. nil (the default) means `Self` is illegal here — it is contextual to
+    // interface requirements (interfaces.md §4.4).
+    // `opaqueOwner`, when set, is the identity key for a `some I` type at this position
+    // (per-function/binding identity, M5 A3). nil means `some` is illegal here (only return
+    // types and let/var bindings supply an owner).
+    private func resolve(_ ref: TypeRef?, selfAs: Type? = nil, opaqueOwner: String? = nil) -> Type {
         guard let ref else { return .void }
         if let ifaces = ref.existentialOf {   // `any I` / `any A & B` (M5 A1.4/A1.5b)
             return resolveExistential(ifaces, at: ref.span)
         }
+        if let ifaces = ref.opaqueOf {        // `some I` / `some A & B` (M5 A3)
+            return resolveOpaque(ifaces, owner: opaqueOwner, at: ref.span)
+        }
         if let fn = ref.fn {
-            return .function(params: fn.params.map { resolve($0) }, ret: resolve(fn.ret))
+            return .function(params: fn.params.map { resolve($0, selfAs: selfAs) }, ret: resolve(fn.ret, selfAs: selfAs))
+        }
+        if ref.name == "Self" {
+            if let selfAs { return selfAs }
+            diags.error("'Self' can only be used in an interface requirement", at: ref.span)
+            return .error
         }
         switch ref.name {
         case "Int":    return .int
@@ -136,19 +161,45 @@ public struct Sema {
         }
     }
 
-    // Resolve `any A & B …` to an existential (one interface) or a composition (several).
-    // Canonicalize: validate each is an interface, dedup, drop any interface implied by a
-    // refiner already present (`A & B` collapses to `B` when `B: A`), and sort — so `A & B`
-    // and `B & A` are the same type (M5 A1.5b, interfaces.md §4.4).
-    private func resolveExistential(_ names: [String], at span: Span) -> Type {
+    // Validate/canonicalize an interface list shared by `any` and `some`: each name must be
+    // an interface; dedup; drop any interface implied by a refiner already present (`A & B`
+    // collapses to `B` when `B: A`); sort — so `A & B` and `B & A` are the same (M5 A1.5b).
+    // Returns nil after a diagnostic when a name isn't an interface. `keyword` shapes the message.
+    private func canonicalInterfaces(_ names: [String], keyword: String, at span: Span) -> [String]? {
         for n in names where interfaces[n] == nil {
-            diags.error("'\(n)' is not an interface in 'any \(names.joined(separator: " & "))'", at: span)
-            return .error
+            diags.error("'\(n)' is not an interface in '\(keyword) \(names.joined(separator: " & "))'", at: span)
+            return nil
         }
         var set = Array(Set(names))
         set = set.filter { i in !set.contains { j in j != i && transitiveBases(j).contains(i) } }
         set.sort()
+        return set
+    }
+
+    // Resolve `any A & B …` to an existential (one interface) or a composition (several).
+    private func resolveExistential(_ names: [String], at span: Span) -> Type {
+        guard let set = canonicalInterfaces(names, keyword: "any", at: span) else { return .error }
+        // A `Self`-mentioning interface is constraint-only: a type-erased box can't guarantee
+        // two `Self` values share a concrete type, so `any I` is rejected at type formation
+        // (M5 A2, interfaces.md §4.4). `some I` / a generic bound `<T: I>` remain fine.
+        for n in set where constraintOnly(n) {
+            diags.error("interface '\(n)' mentions Self and is constraint-only — use 'some \(n)' or a generic bound '<T: \(n)>', not 'any \(n)'", at: span)
+            return .error
+        }
         return set.count == 1 ? .existential(set[0]) : .composition(set)
+    }
+
+    // Resolve `some A & B …` to an opaque type (M5 A3). Unlike `any`, a constraint-only
+    // (`Self`-mentioning) interface is allowed — `some I` fixes one concrete underlying, so
+    // `Self` binds to a single known type. The `owner` is the opaque's identity (per-function/
+    // binding); it is absent (→ a diagnostic) anywhere `some` isn't legal.
+    private func resolveOpaque(_ names: [String], owner: String?, at span: Span) -> Type {
+        guard let owner else {
+            diags.error("'some \(names.joined(separator: " & "))' is only allowed as a return type or a 'let'/'var' binding type", at: span)
+            return .error
+        }
+        guard let set = canonicalInterfaces(names, keyword: "some", at: span) else { return .error }
+        return .opaque(interfaces: set, owner: owner)
     }
 
     // The interface(s) an existential/composition ranges over; empty for other types.
@@ -157,6 +208,17 @@ public struct Sema {
         case .existential(let i): return [i]
         case .composition(let is_): return is_
         default: return []
+        }
+    }
+
+    // Is `name` a property member reachable by bare name through `self`? A property
+    // requirement when `self` is an interface (default body), or a computed property on a
+    // concrete receiver. Stored fields are bound by name already, so they aren't here (M5).
+    private func bareMemberOfSelf(_ selfTy: Type, _ name: String) -> Bool {
+        switch selfTy {
+        case .named(let iface, .interface_): return aggregatedProperties(iface).contains { $0.name == name }
+        case .named(let tn, _):              return computedProps[tn]?[name] != nil
+        default:                             return false
         }
     }
 
@@ -218,17 +280,19 @@ public struct Sema {
     // `self.prop` resolve against the requirement set. No IR is retained — conformance
     // (a later slice) compiles the defaults into each conformer's witnesses.
     private mutating func checkInterface(_ i: InterfaceDecl) {
-        for m in i.methods {
-            for p in m.params { _ = resolve(p.type) }
-            _ = resolve(m.returnType)
-        }
-        for p in i.properties { _ = resolve(p.type) }
-
+        // Within an interface, `Self` ≡ the interface's own type (its `self` value's type,
+        // §4.4): requirement signatures validate against it and default bodies read it (M5 A2).
         let selfType = Type.named(i.name, .interface_)
         for m in i.methods {
+            for p in m.params { _ = resolve(p.type, selfAs: selfType) }
+            _ = resolve(m.returnType, selfAs: selfType)
+        }
+        for p in i.properties { _ = resolve(p.type, selfAs: selfType) }
+
+        for m in i.methods {
             guard let body = m.defaultBody else { continue }
-            let params = m.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
-            let ret = resolve(m.returnType)
+            let params = m.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type, selfAs: selfType), span: $0.span) }
+            let ret = resolve(m.returnType, selfAs: selfType)
             pushScope()
             declare("self", selfType)
             for p in params { declare(p.name, p.type) }
@@ -262,7 +326,34 @@ public struct Sema {
     }
 
     private func methodKey(_ m: InterfaceMethod) -> String {
-        m.name + "(" + m.params.map { resolve($0.type).description }.joined(separator: ",") + ")"
+        m.name + "(" + m.params.map { resolve($0.type, selfAs: .selfType).description }.joined(separator: ",") + ")"
+    }
+
+    // MARK: - `Self`-requirement / constraint-only analysis (M5 A2)
+
+    // Does this type reference mention `Self` (directly or nested in a function type)?
+    private func mentionsSelf(_ ref: TypeRef?) -> Bool {
+        guard let ref else { return false }
+        if ref.name == "Self" { return true }
+        if let fn = ref.fn { return fn.params.contains(where: mentionsSelf) || mentionsSelf(fn.ret) }
+        return false
+    }
+
+    // Does an interface mention `Self` in any of its *own* requirement signatures?
+    private func ownMentionsSelf(_ iface: String) -> Bool {
+        guard let d = interfaces[iface] else { return false }
+        for m in d.methods where m.params.contains(where: { mentionsSelf($0.type) }) || mentionsSelf(m.returnType) {
+            return true
+        }
+        return d.properties.contains { mentionsSelf($0.type) }
+    }
+
+    // An interface is constraint-only if it — or any interface it refines — mentions `Self`.
+    // Refinement propagates the property (`B: A` is constraint-only if `A` is), matching the
+    // decision in interfaces.md §4.4. Constraint-only interfaces are usable as `some I` / a
+    // generic bound but rejected as `any I`, and emit no witnesses (M5 A2).
+    private func constraintOnly(_ iface: String) -> Bool {
+        ownMentionsSelf(iface) || transitiveBases(iface).contains { ownMentionsSelf($0) }
     }
 
     // The full method-requirement set of `iface` = its own plus every inherited one,
@@ -338,10 +429,15 @@ public struct Sema {
         var out: [IRInterface] = []
         for decl in program.decls {
             guard case .interfaceDecl(let i) = decl else { continue }
+            // Constraint-only interfaces can't be `any I`, so they get no witness table — a
+            // `Self` slot has no concrete representation in a type-erased box (M5 A2).
+            if constraintOnly(i.name) { continue }
             // Aggregated (flattened) surface: the witness table carries inherited slots too.
             let methods = aggregatedMethods(i.name).map { IRMethodReq(name: $0.name, params: $0.params.map { resolve($0.type) }, ret: resolve($0.returnType)) }
             let props = aggregatedProperties(i.name).map { IRPropReq(name: $0.name, type: resolve($0.type), isSettable: $0.isSettable) }
-            out.append(IRInterface(name: i.name, methods: methods, properties: props))
+            // Only any-able bases carry a witness, so only they get a base pointer (M5 A1.4 upcast).
+            let bases = transitiveBases(i.name).filter { !constraintOnly($0) }.sorted()
+            out.append(IRInterface(name: i.name, methods: methods, properties: props, bases: bases))
         }
         return out
     }
@@ -355,8 +451,10 @@ public struct Sema {
         var out: [IRFunc] = []
         for req in inheritedDefaults[typeName] ?? [] {
             guard let body = req.defaultBody else { continue }
-            let params = req.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
-            let ret = resolve(req.returnType)
+            // A default is synthesized as a concrete method of the conformer, so `Self` binds
+            // to the conformer's concrete type here (M5 A2).
+            let params = req.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type, selfAs: selfType), span: $0.span) }
+            let ret = resolve(req.returnType, selfAs: selfType)
             pushScope()
             declare("self", selfType)
             for f in fields { declare(f.name, f.type) }
@@ -406,24 +504,34 @@ public struct Sema {
                 continue
             }
             // Conforming to a refining interface conforms to every base too, so a witness
-            // exists for each (dedup so one isn't emitted twice, M5 A1.5).
+            // exists for each (dedup so one isn't emitted twice, M5 A1.5). A constraint-only
+            // (`Self`-mentioning) interface emits no witness (M5 A2) — it can't be `any I`, so
+            // no table/instance is needed — but this is decided *per interface*: a constraint-
+            // only refiner of an any-able base still needs the base's witness, so `any Base`
+            // accepts the conformer. Its conformance is still checked below for correctness.
             for iface in [conf.name] + transitiveBases(conf.name) {
+                // The conformance fact is recorded for every interface (incl. constraint-only),
+                // so `some I` can verify its underlying (M5 A3).
+                allConformsTo[typeName, default: []].insert(iface)
+                // A witness is emitted only for an any-able (not constraint-only) interface.
+                guard !constraintOnly(iface) else { continue }
                 conformsTo[typeName, default: []].insert(iface)
                 if conformancePairs.insert("\(typeName):\(iface)").inserted {
                     conformanceList.append(IRConformance(typeName: typeName, typeKind: kind, interfaceName: iface))
                 }
             }
             // Check the full (aggregated) requirement set, so inherited requirements count.
-            for req in aggregatedMethods(conf.name) { checkMethodRequirement(req, typeName: typeName, interface: conf, methods: methods) }
-            for req in aggregatedProperties(conf.name) { checkPropertyRequirement(req, typeName: typeName, interface: conf, fields: fields, properties: properties) }
+            for req in aggregatedMethods(conf.name) { checkMethodRequirement(req, typeName: typeName, kind: kind, interface: conf, methods: methods) }
+            for req in aggregatedProperties(conf.name) { checkPropertyRequirement(req, typeName: typeName, kind: kind, interface: conf, fields: fields, properties: properties) }
         }
     }
 
     // A method requirement is satisfied by a same-named method with matching parameter
     // types and return type, or (if none) by the interface's overridable default.
-    private mutating func checkMethodRequirement(_ req: InterfaceMethod, typeName: String, interface conf: Conformance, methods: [FuncDecl]) {
+    private mutating func checkMethodRequirement(_ req: InterfaceMethod, typeName: String, kind: NamedKind, interface conf: Conformance, methods: [FuncDecl]) {
+        let selfType = Type.named(typeName, kind)
         let named = methods.filter { $0.name == req.name }
-        if named.contains(where: { methodMatches(req, $0) }) { return }
+        if named.contains(where: { methodMatches(req, $0, selfAs: selfType) }) { return }
         if req.defaultBody != nil {
             // Satisfied by the interface's overridable default — this conformer inherits
             // it, so it is synthesized once as a concrete method of the type (M5 A1.4).
@@ -439,16 +547,19 @@ public struct Sema {
         }
     }
 
-    private func methodMatches(_ req: InterfaceMethod, _ impl: FuncDecl) -> Bool {
+    // A requirement's `Self` binds to the conformer's concrete type when matching, so
+    // `fun clone() -> Self` is satisfied by `fun clone() -> Point` on `Point` (M5 A2). The
+    // implementation is concrete, so its own signature never mentions `Self`.
+    private func methodMatches(_ req: InterfaceMethod, _ impl: FuncDecl, selfAs: Type) -> Bool {
         guard req.params.count == impl.params.count else { return false }
-        for (rp, ip) in zip(req.params, impl.params) where resolve(rp.type) != resolve(ip.type) { return false }
-        return resolve(req.returnType) == resolve(impl.returnType)
+        for (rp, ip) in zip(req.params, impl.params) where resolve(rp.type, selfAs: selfAs) != resolve(ip.type) { return false }
+        return resolve(req.returnType, selfAs: selfAs) == resolve(impl.returnType)
     }
 
     // A property requirement is satisfied by a stored field or computed property of the
     // same name and type; a `{ get set }` requirement needs a settable member.
-    private mutating func checkPropertyRequirement(_ req: InterfacePropertyReq, typeName: String, interface conf: Conformance, fields: [VarField], properties: [ComputedProperty]) {
-        let reqType = resolve(req.type)
+    private mutating func checkPropertyRequirement(_ req: InterfacePropertyReq, typeName: String, kind: NamedKind, interface conf: Conformance, fields: [VarField], properties: [ComputedProperty]) {
+        let reqType = resolve(req.type, selfAs: .named(typeName, kind))
         if let f = fields.first(where: { $0.name == req.name }) {
             if resolve(f.type) != reqType {
                 diags.error("type '\(typeName)' does not conform to '\(conf.name)': property '\(req.name)' has type '\(resolve(f.type))', expected '\(reqType)'", at: conf.span)
@@ -476,9 +587,12 @@ public struct Sema {
     // declared by bare name, mirroring how actor handlers see their fields (T3).
     private mutating func lowerMethods(_ methods: [FuncDecl], selfType: Type, fields: [IRField]) -> [IRFunc] {
         var out: [IRFunc] = []
+        let ownerType: String? = { if case .named(let n, _) = selfType { return n }; return nil }()
         for m in methods {
             let params = m.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
-            let ret = resolve(m.returnType)
+            // A `some I` method return keys its opaque identity by "m:Type.method" — the same
+            // key the call site uses when it resolves the method's return type (M5 A3).
+            let ret = resolve(m.returnType, opaqueOwner: ownerType.map { "m:\($0).\(m.name)" })
             pushScope()
             declare("self", selfType)
             for f in fields { declare(f.name, f.type) }
@@ -544,7 +658,7 @@ public struct Sema {
 
     private mutating func lowerFunc(_ f: FuncDecl) -> IRFunc {
         let params = f.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
-        let ret = resolve(f.returnType)
+        let ret = resolve(f.returnType, opaqueOwner: "fn:\(f.name)")
         pushScope()
         for p in params { declare(p.name, p.type) }
         let saved = currentReturnType; currentReturnType = ret
@@ -587,6 +701,19 @@ public struct Sema {
     private mutating func lowerStmt(_ stmt: Stmt) -> IRStmt {
         switch stmt {
         case .binding(let b):
+            // `let x: some I = expr` — a fresh opaque binding whose hidden underlying is
+            // `expr`'s concrete type (M5 A3). Each such binding gets its own opaque identity.
+            if let tref = b.type, tref.opaqueOf != nil {
+                opaqueBindingCounter += 1
+                let owner = "let:\(opaqueBindingCounter)"
+                let ann = resolve(tref, opaqueOwner: owner)
+                let value = checkExpr(b.value)
+                if case .opaque(let ifaces, _) = ann {
+                    recordOpaque(value, interfaces: ifaces, owner: owner, at: b.span)
+                }
+                declare(b.name, ann, isMutable: b.isMutable)
+                return IRStmt(kind: .letBinding(name: b.name, isMutable: b.isMutable, value: value), span: b.span)
+            }
             let annotated = b.type.map { resolve($0) }
             let value = coerce(checkExpr(b.value, expected: annotated), to: annotated)
             let type = annotated ?? value.type
@@ -602,6 +729,34 @@ public struct Sema {
             // A write to a computed property lowers to a setter accessor call (M5 A1).
             if case .member(let base, let field, let mspan) = lhs {
                 let b = checkExpr(base)
+                // A property write through `any I` / `any A & B` — dispatched via the witness
+                // set slot (M5 A1.4). A get-only requirement is a clean local error.
+                if let iface = existentialInterfaces(b.type).first(where: { aggregatedProperties($0).contains { $0.name == field } }),
+                   let prop = aggregatedProperties(iface).first(where: { $0.name == field }) {
+                    let propType = resolve(prop.type)
+                    guard prop.isSettable else {
+                        diags.error("cannot assign to read-only property '\(field)' of 'any \(iface)'", at: span)
+                        return IRStmt(kind: .exprStmt(checkExpr(rhs, expected: propType)), span: span)
+                    }
+                    let value = checkExpr(rhs, expected: propType)
+                    let call = IRExpr(type: .void, span: span,
+                                      kind: .methodCall(receiver: b, method: "\(field).set", args: [value]))
+                    return IRStmt(kind: .exprStmt(call), span: span)
+                }
+                // A property write inside an interface default (self: interface) — routes to the
+                // set slot; the concrete synthesized copy writes the real field/setter (M5).
+                if case .named(let tn, .interface_) = b.type,
+                   let prop = aggregatedProperties(tn).first(where: { $0.name == field }) {
+                    let propType = resolve(prop.type)
+                    guard prop.isSettable else {
+                        diags.error("cannot assign to read-only property '\(field)' of '\(tn)'", at: span)
+                        return IRStmt(kind: .exprStmt(checkExpr(rhs, expected: propType)), span: span)
+                    }
+                    let value = checkExpr(rhs, expected: propType)
+                    let call = IRExpr(type: .void, span: span,
+                                      kind: .methodCall(receiver: b, method: "\(field).set", args: [value]))
+                    return IRStmt(kind: .exprStmt(call), span: span)
+                }
                 if case .named(let tn, let kind) = b.type, let info = computedProps[tn]?[field] {
                     guard info.hasSetter else {
                         diags.error("cannot assign to read-only computed property '\(field)'", at: span)
@@ -643,6 +798,13 @@ public struct Sema {
             return IRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
 
         case .ret(let e, let span):
+            // A `some I` return is not a coercion target — it yields the concrete value
+            // unboxed and records the one hidden underlying type (M5 A3).
+            if case .opaque(let ifaces, let owner) = currentReturnType {
+                let v = e.map { checkExpr($0) }
+                if let v { recordOpaque(v, interfaces: ifaces, owner: owner, at: span) }
+                return IRStmt(kind: .ret(v), span: span)
+            }
             return IRStmt(kind: .ret(e.map { coerce(checkExpr($0, expected: currentReturnType), to: currentReturnType) }), span: span)
 
         case .ifStmt(let s):
@@ -702,8 +864,16 @@ public struct Sema {
             }
             diags.error("type '\(t)' does not conform to '\(missing.joined(separator: " & "))'", at: e.span)
             return e
-        case .existential, .composition:
-            diags.error("existential upcast to 'any \(target.joined(separator: " & "))' is not supported yet; box the concrete value directly", at: e.span)
+        case .existential(let src):
+            // `any B` → `any A` where B refines A: re-box through the source witness's base
+            // pointer (M5 A1.4). Composition targets/sources stay unsupported for now.
+            if target.count == 1, target[0] == src || transitiveBases(src).contains(target[0]) {
+                return IRExpr(type: expected!, span: e.span, kind: .box(value: e, interfaces: target))
+            }
+            diags.error("cannot convert 'any \(src)' to 'any \(target.joined(separator: " & "))' — 'any B' only widens to a base interface of B", at: e.span)
+            return e
+        case .composition:
+            diags.error("existential upcast from a composition is not supported yet; box the concrete value directly", at: e.span)
             return e
         case .error:
             return e
@@ -711,6 +881,37 @@ public struct Sema {
             diags.error("cannot convert '\(e.type)' to 'any \(target.joined(separator: " & "))'", at: e.span)
             return e
         }
+    }
+
+    // Validate and record the hidden underlying of a `some I` site (M5 A3): the value must be
+    // a concrete type conforming to every listed interface, and — across a function's returns —
+    // must be the *same* concrete type each time (the one underlying).
+    private mutating func recordOpaque(_ v: IRExpr, interfaces: [String], owner: String, at span: Span) {
+        // Look through an opaque initializer/return to its concrete underlying (M5 A3): a
+        // `some I` value can be produced by returning / binding another opaque of a known
+        // underlying, not only a concrete literal.
+        var concrete = v.type
+        if case .opaque(_, let innerOwner) = concrete {
+            guard let u = opaqueUnderlyings[innerOwner] else {
+                diags.error("cannot resolve the underlying type of this opaque value yet — declare the producing function before this use", at: span)
+                return
+            }
+            concrete = u
+        }
+        guard case .named(let tn, _) = concrete else {
+            if concrete != .error {
+                diags.error("a 'some \(interfaces.joined(separator: " & "))' value must be a concrete type; got '\(v.type)'", at: span)
+            }
+            return
+        }
+        for i in interfaces where allConformsTo[tn]?.contains(i) != true {
+            diags.error("type '\(tn)' does not conform to '\(i)', so it can't be returned as 'some \(interfaces.joined(separator: " & "))'", at: span)
+        }
+        if let existing = opaqueUnderlyings[owner], existing != concrete {
+            diags.error("a 'some' type resolves to one concrete type — this also yields '\(existing)', not just '\(tn)'", at: span)
+            return
+        }
+        opaqueUnderlyings[owner] = concrete
     }
 
     private mutating func recordComposite(_ typeName: String, _ kind: NamedKind, _ ifaces: [String]) {
@@ -733,6 +934,12 @@ public struct Sema {
             if let t = lookup(name) {
                 return IRExpr(type: t, span: span, kind: .varRef(name))
             }
+            // Bare access to a property member of `self` — `p` means `self.p` (M5). Fires for
+            // an interface default (self: interface, a property requirement) and for a computed
+            // property on a concrete receiver; stored fields are already bound by name.
+            if let selfTy = lookup("self"), bareMemberOfSelf(selfTy, name) {
+                return checkExpr(.member(.ident("self", span: span), name, span: span))
+            }
             if let sig = funcs[name] {
                 return IRExpr(type: .function(params: sig.params, ret: sig.ret), span: span, kind: .varRef(name))
             }
@@ -751,6 +958,17 @@ public struct Sema {
                let prop = aggregatedProperties(iface).first(where: { $0.name == field }) {
                 return IRExpr(type: resolve(prop.type), span: span,
                               kind: .methodCall(receiver: b, method: "\(field).get", args: []))
+            }
+            // A property-requirement read through `some I` — statically dispatched to the hidden
+            // underlying (M5 A3). Emit the getter form uniformly; codegen resolves it to a direct
+            // field load or a getter call once the underlying is known (so a forward reference to
+            // a later-declared producer needs no underlying at check time). A `Self`-typed
+            // property binds to the underlying when it is already resolved, else stays opaque.
+            if case .opaque(let ifaces, let owner) = b.type,
+               let iface = ifaces.first(where: { aggregatedProperties($0).contains { $0.name == field } }),
+               let prop = aggregatedProperties(iface).first(where: { $0.name == field }) {
+                let ty = resolve(prop.type, selfAs: opaqueUnderlyings[owner] ?? b.type)
+                return IRExpr(type: ty, span: span, kind: .methodCall(receiver: b, method: "\(field).get", args: []))
             }
             // A property-requirement read inside an interface default (self: interface).
             if case .named(let tn, .interface_) = b.type,
@@ -812,6 +1030,19 @@ public struct Sema {
                 return IRExpr(type: resolve(req.returnType), span: span,
                               kind: .methodCall(receiver: recv, method: name, args: irArgs))
             }
+            // A method-requirement call through `some I` — statically dispatched to the hidden
+            // underlying (M5 A3). `Self` binds to the underlying concrete type (chosen: the
+            // caller gets the concrete type back), falling back to the opaque type itself if the
+            // underlying isn't resolved yet (a forward reference to a later-declared producer).
+            if case .opaque(let ifaces, let owner) = recv.type,
+               let iface = ifaces.first(where: { aggregatedMethods($0).contains { $0.name == name } }),
+               let req = aggregatedMethods(iface).first(where: { $0.name == name }) {
+                let irArgs = args.map { checkExpr($0.value) }
+                let selfBind = opaqueUnderlyings[owner] ?? recv.type
+                checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: selfBind) }, at: span)
+                return IRExpr(type: resolve(req.returnType, selfAs: selfBind), span: span,
+                              kind: .methodCall(receiver: recv, method: name, args: irArgs))
+            }
             if case .named(let typeName, let kind) = recv.type {
                 // Actor send: base.handler(args).
                 if kind == .actor_, let handler = actors[typeName]?.handlers.first(where: { $0.name == name }) {
@@ -820,11 +1051,12 @@ public struct Sema {
                     return IRExpr(type: resolve(handler.returnType), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
-                // Requirement call inside an interface default (self: interface).
+                // Requirement call inside an interface default (self: interface). `Self` in the
+                // requirement binds to the receiver's type (M5 A2).
                 if kind == .interface_, let req = interfaceMethod(typeName, name) {
                     let irArgs = args.map { checkExpr($0.value) }
-                    checkArgTypes(irArgs, against: req.params.map { resolve($0.type) }, at: span)
-                    return IRExpr(type: resolve(req.returnType), span: span,
+                    checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: recv.type) }, at: span)
+                    return IRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
                 // Instance method on a struct/enum/class value.
@@ -841,10 +1073,11 @@ public struct Sema {
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
                 // A default requirement this type inherits (synthesized as a concrete method).
+                // `Self` in the requirement binds to the concrete receiver type (M5 A2).
                 if let req = (inheritedDefaults[typeName] ?? []).first(where: { $0.name == name }) {
                     let irArgs = args.map { checkExpr($0.value) }
-                    checkArgTypes(irArgs, against: req.params.map { resolve($0.type) }, at: span)
-                    return IRExpr(type: resolve(req.returnType), span: span,
+                    checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: recv.type) }, at: span)
+                    return IRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
             }

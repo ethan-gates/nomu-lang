@@ -7,12 +7,14 @@ public final class TypeRef {
     public let name: String
     public let fn: FnType?
     public let existentialOf: [String]?   // set for `any I` / `any A & B` — the interface names (M5 A1.4/A1.5b)
+    public let opaqueOf: [String]?        // set for `some I` / `some A & B` — the interface names (M5 A3)
     public let span: Span
 
-    public init(name: String, fn: FnType? = nil, existentialOf: [String]? = nil, span: Span) {
+    public init(name: String, fn: FnType? = nil, existentialOf: [String]? = nil, opaqueOf: [String]? = nil, span: Span) {
         self.name = name
         self.fn = fn
         self.existentialOf = existentialOf
+        self.opaqueOf = opaqueOf
         self.span = span
     }
 }
@@ -92,6 +94,7 @@ public struct ExtensionDecl {
     public let typeNameSpan: Span   // for target-validation diagnostics
     public let conformance: Conformance?   // nil = plain extension; set = `extension T: I`
     public let methods: [FuncDecl]
+    public let properties: [ComputedProperty]   // M5: computed properties (get/set); stored fields rejected
     public let span: Span
 }
 

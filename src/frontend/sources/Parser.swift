@@ -163,19 +163,25 @@ public struct Parser {
         }
         expect(.lBrace)
         var methods: [FuncDecl] = []
+        var properties: [ComputedProperty] = []
         while !check(.rBrace) && !check(.eof) {
             if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseFuncDecl())
             } else if check(.kwVar) || check(.kwLet) {
-                error("extensions cannot declare stored properties")
+                // A computed property (`var x: T { … }`) is allowed in an extension; a stored
+                // field is not (Swift's rule — extensions add no storage).
+                switch parseFieldOrProperty() {
+                case .field:           error("extensions cannot declare stored properties")
+                case .property(let p): properties.append(p)
+                }
             } else {
-                error("expected 'fun' in extension body, got \(currentKind)")
+                error("expected 'fun' or a computed property in extension body, got \(currentKind)")
             }
         }
         expect(.rBrace)
         return ExtensionDecl(typeName: name, typeNameSpan: nameSpan, conformance: conformance,
-                             methods: methods, span: spanFrom(start))
+                             methods: methods, properties: properties, span: spanFrom(start))
     }
 
     // interface I {
@@ -397,6 +403,14 @@ public struct Parser {
             var ifaces = [expectIdent()]
             while eat(.amp) { ifaces.append(expectIdent()) }
             return TypeRef(name: "any " + ifaces.joined(separator: " & "), existentialOf: ifaces, span: spanFrom(start))
+        }
+        // `some I` / `some A & B` — an opaque type over one or more interfaces (M5 A3).
+        // Like `any`, `some` is contextual: it opens an opaque type only when a name follows.
+        if case .ident("some") = currentKind, case .ident = peek() {
+            advance()   // `some`
+            var ifaces = [expectIdent()]
+            while eat(.amp) { ifaces.append(expectIdent()) }
+            return TypeRef(name: "some " + ifaces.joined(separator: " & "), opaqueOf: ifaces, span: spanFrom(start))
         }
         if check(.lParen) {
             // Function type: (T1, T2) -> R

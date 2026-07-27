@@ -11,13 +11,15 @@ public struct IRModule {
     public let interfaces: [IRInterface]      // M5 A1.4: drives witness-table type emission
     public let conformances: [IRConformance]  // M5 A1.4: drives witness-table instance emission
     public let composites: [IRComposite]      // M5 A1.5b: composite (any A & B) witnesses to emit
+    public let opaqueUnderlyings: [String: Type]   // M5 A3: opaque owner → hidden concrete underlying type
 
     public init(decls: [IRDecl], interfaces: [IRInterface] = [], conformances: [IRConformance] = [],
-                composites: [IRComposite] = []) {
+                composites: [IRComposite] = [], opaqueUnderlyings: [String: Type] = [:]) {
         self.decls = decls
         self.interfaces = interfaces
         self.conformances = conformances
         self.composites = composites
+        self.opaqueUnderlyings = opaqueUnderlyings
     }
 }
 
@@ -36,6 +38,7 @@ public struct IRInterface {
     public let name: String
     public let methods: [IRMethodReq]
     public let properties: [IRPropReq]
+    public let bases: [String]   // M5 A1.4: transitive base interfaces — a witness carries a pointer to each, so `any B` upcasts to `any A`
 }
 
 public struct IRMethodReq {

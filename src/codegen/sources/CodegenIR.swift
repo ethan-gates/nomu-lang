@@ -336,7 +336,10 @@ public struct CodegenIR {
     private mutating func emitWitnessTables() {
         let used = Set(conformances.map(\.interfaceName))
         for i in module.interfaces where used.contains(i.name) { emitWitnessType(i) }
-        for c in conformances {
+        // Emit instances bases-first: a witness sets base pointers to its base witnesses, which
+        // must already be defined. An interface's transitive-base count is a valid topo rank.
+        let ordered = conformances.sorted { (interfaceDefs[$0.interfaceName]?.bases.count ?? 0) < (interfaceDefs[$1.interfaceName]?.bases.count ?? 0) }
+        for c in ordered {
             guard let i = interfaceDefs[c.interfaceName] else { continue }
             emitWitnessInstance(c, i)
         }
@@ -384,6 +387,8 @@ public struct CodegenIR {
             out += "    \(cType(p.type)) (*\(p.name)_get)(void*);\n"
             if p.isSettable { out += "    void (*\(p.name)_set)(void*, \(cType(p.type)));\n" }
         }
+        // One pointer per transitive base, so `any I` widens to `any Base` by reading the slot.
+        for b in i.bases { out += "    const void* base_\(b);\n" }
         out += "    const void* type_witness;\n"
         out += "} \(Mangle.witnessType(i.name));\n\n"
     }
@@ -399,6 +404,9 @@ public struct CodegenIR {
             out += "    .\(p.name)_get = \(Mangle.witnessThunk(t, iface, "\(p.name)_get")),\n"
             if p.isSettable { out += "    .\(p.name)_set = \(Mangle.witnessThunk(t, iface, "\(p.name)_set")),\n" }
         }
+        // Base pointers reference this same conformer's base witnesses (emitted earlier, since
+        // instances are ordered bases-first), so an `any I` box can widen to `any Base`.
+        for b in i.bases { out += "    .base_\(b) = &\(Mangle.witnessInstance(t, b)),\n" }
         out += "    .type_witness = 0,\n};\n\n"
     }
 
@@ -621,6 +629,12 @@ public struct CodegenIR {
     // directly. The witness is the single witness table, or — for a composition — the
     // composite witness struct holding one table pointer per interface.
     private mutating func emitBox(value: IRExpr, interfaces ifaces: [String]) -> String {
+        // `any B` → `any A` upcast: re-box through the source witness's base pointer, keeping the
+        // payload. The source is a single existential; the target is one base interface (M5 A1.4).
+        if case .existential(let src) = value.type, ifaces.count == 1 {
+            let box = emitExpr(value)
+            return "({ AnyBox __b = \(box); (AnyBox){ .witness = ((const \(Mangle.witnessType(src))*)__b.witness)->base_\(ifaces[0]), .payload = __b.payload }; })"
+        }
         let v = emitExpr(value)
         guard case .named(let t, let kind) = value.type else { return "/* box of non-nominal */" }
         let witness = ifaces.count == 1
@@ -690,8 +704,17 @@ public struct CodegenIR {
             let callArgs = (["__b.payload"] + argVals).joined(separator: ", ")
             return "({ AnyBox __b = \(box); ((const \(Mangle.compositeType(ifaces))*)__b.witness)->\(owner)->\(slot)(\(callArgs)); })"
         }
-        guard case .named(let typeName, let kind) = receiver.type else {
+        // A requirement call through `some I` devirtualizes: the receiver's C value is already
+        // the concrete underlying (cType maps the opaque to it), so dispatch as a direct call
+        // on that concrete type — no witness, no box (M5 A3).
+        guard case .named(let typeName, let kind) = concreteUnderlying(receiver.type) else {
             return "/* non-object method call: \(method) */"
+        }
+        // A property getter that the concrete underlying backs with a *stored field* is a direct
+        // field load, not a call (matches the `any`-witness thunk's stored-field path). This is
+        // what lets a `some I` property read resolve without the underlying being known in Sema.
+        if method.hasSuffix(".get"), typeFields(typeName, kind).contains(where: { $0.name == String(method.dropLast(4)) }) {
+            return "\(emitExpr(receiver))\(memberOp(receiver.type))\(String(method.dropLast(4)))"
         }
         // A mutating value-type (struct/enum) method takes `T* self`, so pass the
         // receiver's address; the caller check guaranteed it's a mutable `var` lvalue.
@@ -711,6 +734,14 @@ public struct CodegenIR {
         else                                   { recv = "(*\(recvExpr))" }
         let argVals = args.map { emitExpr($0) }
         return "\(Mangle.method(typeName, method))(\(([recv] + argVals).joined(separator: ", ")))"
+    }
+
+    // Resolve a `some I` opaque type to its hidden concrete underlying (M5 A3); other types
+    // pass through unchanged. The underlying is always known by codegen (every opaque site was
+    // resolved during Sema).
+    private func concreteUnderlying(_ t: Type) -> Type {
+        if case .opaque(_, let owner) = t, let u = module.opaqueUnderlyings[owner] { return u }
+        return t
     }
 
     private func methodIsMutating(_ typeName: String, _ method: String) -> Bool {
@@ -984,7 +1015,8 @@ public struct CodegenIR {
     // MARK: - C helpers
 
     private func memberOp(_ base: Type) -> String {
-        if case .named(_, let k) = base, k == .class_ || k == .actor_ { return "->" }
+        // A `some I` value is stored as its concrete underlying, so pick the operator by that.
+        if case .named(_, let k) = concreteUnderlying(base), k == .class_ || k == .actor_ { return "->" }
         return "."
     }
 
@@ -1028,6 +1060,8 @@ public struct CodegenIR {
         case .void:       return "void"
         case .function:   return "Closure"
         case .existential, .composition: return "AnyBox"
+        case .selfType: preconditionFailure("'Self' escaped to codegen — constraint-only interfaces emit no witnesses (M5 A2)")
+        case .opaque: return cType(concreteUnderlying(t))   // `some I` is unboxed — the concrete underlying's C type (M5 A3)
         case .named(let n, let kind):
             switch kind {
             case .class_, .actor_: return Mangle.type(n) + "*"

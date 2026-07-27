@@ -1,0 +1,52 @@
+// M5 Phase A follow-ups (m5-spec 5.0.8): existential upcast, property-set through `any I`,
+// a computed property in a conformance extension, and default bodies reading a requirement
+// by bare name / writing a settable one.
+
+interface Named {
+    var name: String { get }
+    fun greeting() -> String {
+        return concat("hi ", name)            // bare requirement access (not self.name)
+    }
+}
+
+// A refining interface with a settable requirement and an overriding default.
+interface Badge: Named {
+    var count: Int { get set }
+    fun greeting() -> String {
+        return concat("hello ", name)
+    }
+    fun stamp() {
+        self.count = 1                        // property write inside a default
+    }
+}
+
+class Person: Badge {
+    var name: String
+    var count: Int
+}
+
+// A stored-only struct gains a `{ get }` conformance via an extension computed property.
+struct Robot {
+    var serial: Int
+}
+extension Robot: Named {
+    var name: String {
+        return "unit"
+    }
+}
+
+fun asNamed(n: any Named) -> String {
+    return n.greeting()
+}
+
+fun main() {
+    let b: any Badge = Person(name: "Ada", count: 0)
+    b.count = 7                               // set through `any Badge` (witness set slot)
+    print(b.greeting())                       // hello Ada  (overridden default)
+
+    let n: any Named = b                      // upcast `any Badge` -> `any Named`
+    print(n.greeting())                       // hello Ada  (same witness, consistent dispatch)
+    print(asNamed(b))                         // hello Ada  (upcast at the call boundary)
+
+    print(asNamed(Robot(serial: 42)))         // hi unit    (extension property + inherited default)
+}

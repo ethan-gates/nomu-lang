@@ -1,0 +1,42 @@
+// M5 A2: `Self`-type requirements. A requirement may mention `Self` — the conforming
+// type substituted at each use. A concrete type satisfies `fun clone() -> Self` with a
+// method returning its own type; on a concrete value the call is a direct call and yields
+// that concrete type.
+//
+// An interface that mentions `Self` anywhere is *constraint-only*: it will be usable as a
+// generic bound `<T: Cloneable>` / `some Cloneable` (A3 / Phase B), but is rejected as
+// `any Cloneable` — a type-erased box can't guarantee two `Self` values share a concrete
+// type. So there is no `any Cloneable` demo here; that's a clean compile error (see the
+// A2 tests). This example exercises the runtime-observable piece: concrete conformance.
+
+interface Cloneable {
+    fun clone() -> Self
+}
+
+struct Point: Cloneable {
+    var x: Int
+    var y: Int
+    fun clone() -> Point { return Point(x: x, y: y) }   // `-> Self` satisfied by `-> Point`
+}
+
+// `Self` in parameter position substitutes the same way.
+interface Combinable {
+    fun combined(with: Self) -> Self
+}
+
+struct Tally: Combinable {
+    var total: Int
+    fun combined(with: Tally) -> Tally { return Tally(total: total + with.total) }
+}
+
+fun main() {
+    let p = Point(x: 3, y: 4)
+    let q = p.clone()          // direct call; q is a Point
+    print(q.x)                 // 3
+    print(q.y)                 // 4
+
+    let a = Tally(total: 10)
+    let b = Tally(total: 32)
+    let c = a.combined(with: b)
+    print(c.total)             // 42
+}
