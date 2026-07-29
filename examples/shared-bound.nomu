@@ -1,0 +1,40 @@
+// Conditional conformance + deeply-immutable classes (M5 5.3.1).
+// A generic value is shareable iff its type arguments are (structural /
+// conditional conformance); a class is shareable only when deeply immutable.
+
+struct Box<T> {
+    let value: T
+}
+
+// Deeply immutable — all `let`, shareable fields (String is shareable, M5 5.3).
+// M3 conservatively rejected every class; this one now crosses a task boundary.
+class Config {
+    let host: String
+    let port: Int
+}
+
+fun unbox(b: Box<Int>) -> Int { return b.value }
+
+fun host(c: Config) -> String { return c.host }
+
+fun main() {
+    // Box<Int>: base is a value struct, T = Int is shareable → shareable.
+    let bi = Box(value: 7)
+    spawn let a = unbox(bi)
+    print(a)            // 7
+
+    // A deeply-immutable class crosses the boundary (M3 rejected this).
+    let cfg = Config(host: "localhost", port: 8080)
+    spawn let h = host(cfg)
+    print(h)            // localhost
+}
+
+// ── Uncomment to see the non-shareable rejections ───────────────────────────
+//
+// class Counter { var n: Int }            // has a `var` → not deeply immutable
+// fun peek(b: Box<Counter>) -> Int { return b.value.n }
+// fun bad() {
+//     let bc = Box(value: Counter(n: 1))
+//     spawn let x = peek(bc)   // error: 'bc' has type 'Box<Counter>' which cannot cross a task boundary
+//     print(x)
+// }

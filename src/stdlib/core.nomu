@@ -2,8 +2,16 @@
 //
 // The first Nomu-written stdlib: compiled alongside every user program (prepended
 // under the single compilation unit), so these are callable with no import. Seeded
-// with monomorphic Int helpers that need no generics or new primitives. Generic
-// citizens (Option/Result/Box) arrive with M5. (Design: m4.13-spec.md §2.)
+// with monomorphic Int helpers that need no generics or new primitives. `Option<T>`
+// is the first generic citizen (M5 5.2.4); `Result<T, E>` follows in Phase E.
+// (Design: m4.13-spec.md §2, m5-spec.md §5.2.4.)
+
+// A value that is present (`some`) or absent (`none`). Payloads are labelled, so the
+// spelling is `Option.some(value: x)` / `.some(value: x)` and `case .some(let v)`.
+enum Option<T> {
+    case some(value: T)
+    case none
+}
 
 fun abs(n: Int) -> Int {
     if n < 0 { return 0 - n }

@@ -1,10 +1,22 @@
-// M4.13: the Nomu standard library. `abs`, `max`, `min` are written in Nomu
-// (src/stdlib/core.nomu), compiled alongside this program, and callable with no
-// import — the first dogfooding of a Nomu-written stdlib.
+// M4.13 + M5 5.2.4: the Nomu standard library. `abs`, `max`, `min` and the generic
+// `Option<T>` are written in Nomu (src/stdlib/core.nomu), compiled alongside this
+// program, and usable with no import — the dogfooding of a Nomu-written stdlib.
 
 fun main() {
     print(abs(0 - 7))          // 7
     print(max(3, 9))           // 9
     print(min(3, 9))           // 3
     print(max(abs(0 - 4), 2))  // 4  — composed
+
+    // `Option<T>` is a prelude citizen — no definition, no import (M5 5.2.4).
+    let found: Option<Int> = .some(value: max(2, 5))
+    switch found {
+    case .some(let v): print(v)      // 5
+    case .none:        print(0)
+    }
+    let missing: Option<Int> = .none
+    switch missing {
+    case .some(let v): print(v)
+    case .none:        print(min(8, 1))   // 1
+    }
 }

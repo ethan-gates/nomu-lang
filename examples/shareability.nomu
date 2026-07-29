@@ -38,12 +38,12 @@ fun main() {
 
 // ── Uncomment the block below to see the shareability error ──────────────────
 //
-class Box {
-    var val: Int
-}
-fun getVal(b: Box) -> Int { return b.val }
-fun badMain() {
-    let b = Box(val: 42)
-    spawn let v = getVal(b)   // error: 'b' has type 'Box' which cannot cross a task boundary
-    print(v)
-}
+// class Box {
+//     var val: Int
+// }
+// fun getVal(b: Box) -> Int { return b.val }
+// fun badMain() {
+//     let b = Box(val: 42)
+//     spawn let v = getVal(b)   // error: 'b' has type 'Box' which cannot cross a task boundary
+//     print(v)
+// }

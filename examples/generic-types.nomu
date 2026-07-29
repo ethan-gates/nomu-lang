@@ -10,10 +10,8 @@ struct Cell<T> {
     var value: T
 }
 
-enum Option<T> {
-    case some(value: T)
-    case none
-}
+// `Option<T>` is a prelude citizen (M5 5.2.4, src/stdlib/core.nomu) — usable with no
+// definition here.
 
 // A generic function may *build and return* a generic container over its type parameter — the
 // boxed value moves out uniformly, no value witness needed. (Receiving `Box<T>`/`Option<T>` as a

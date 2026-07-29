@@ -1119,14 +1119,94 @@ public struct CodegenIR {
         }
     }
 
-    // A type is shareable if it can safely cross a task boundary: primitives and
-    // value types (structs, enums), plus actor handles (self-synchronizing).
-    // Strings, classes, and closures are not (closures are checked per-binding).
-    private func isShareable(_ t: Type) -> Bool {
+    // A type can cross a task boundary if it is value-like or deeply immutable
+    // (design: concurrency.md §5, m5-spec 5.3). The check is **structural**:
+    //   - primitives, strings (immutable), and actor handles (self-synchronizing)
+    //     are always shareable;
+    //   - a struct / enum is shareable iff every stored field (across all enum
+    //     cases) is shareable;
+    //   - a class is shareable only when **deeply immutable** — every field `let`
+    //     and itself shareable (the case M3 conservatively rejected);
+    //   - a generic instance `Box<T>` is shareable iff the base is once its type
+    //     arguments are substituted in (conditional conformance).
+    // `visiting` breaks cycles on recursive types (a back-edge is assumed
+    // shareable; the decision falls to the other fields). Closures are checked
+    // per-binding (`shareableClosureBindings`), so a bare function type is not.
+    private func isShareable(_ t: Type, visiting: Set<String> = []) -> Bool {
         switch t {
-        case .int, .bool:                                        return true
-        case .named(_, .struct_), .named(_, .enum_), .named(_, .actor_): return true
-        default:                                                 return false
+        case .int, .bool, .string, .named(_, .actor_):
+            return true
+        case .named(let name, .struct_):
+            guard let s = structs[name] else { return false }
+            return fieldsShareable(key: name, fields: s.fields, immutableOnly: false,
+                                   subst: [:], visiting: visiting)
+        case .named(let name, .class_):
+            guard let c = classes[name] else { return false }
+            return fieldsShareable(key: name, fields: c.fields, immutableOnly: true,
+                                   subst: [:], visiting: visiting)
+        case .named(let name, .enum_):
+            guard let e = enums[name] else { return false }
+            return casesShareable(key: name, cases: e.cases, subst: [:], visiting: visiting)
+        case .generic(let base, let args):
+            return genericShareable(base: base, args: args, visiting: visiting)
+        default:
+            return false
+        }
+    }
+
+    // A generic instance is shareable iff the base decl's fields are, with the
+    // type parameters substituted by `args` (conditional conformance).
+    private func genericShareable(base: String, args: [Type], visiting: Set<String>) -> Bool {
+        let key = "\(base)<\(args.map(\.description).joined(separator: ","))>"
+        if let s = structs[base] {
+            let m = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
+            return fieldsShareable(key: key, fields: s.fields, immutableOnly: false,
+                                   subst: m, visiting: visiting)
+        }
+        if let c = classes[base] {
+            let m = Dictionary(uniqueKeysWithValues: zip(c.generics.map(\.name), args))
+            return fieldsShareable(key: key, fields: c.fields, immutableOnly: true,
+                                   subst: m, visiting: visiting)
+        }
+        if let e = enums[base] {
+            let m = Dictionary(uniqueKeysWithValues: zip(e.generics.map(\.name), args))
+            return casesShareable(key: key, cases: e.cases, subst: m, visiting: visiting)
+        }
+        return false
+    }
+
+    // Structural field check shared by struct / class / generic-instance paths.
+    // `immutableOnly` demands every field be `let` (the deeply-immutable-class rule).
+    private func fieldsShareable(key: String, fields: [IRField], immutableOnly: Bool,
+                                 subst: [String: Type], visiting: Set<String>) -> Bool {
+        if visiting.contains(key) { return true }            // cycle back-edge
+        if immutableOnly && fields.contains(where: { $0.isMutable }) { return false }
+        let v = visiting.union([key])
+        return fields.allSatisfy { isShareable(substitute($0.type, subst), visiting: v) }
+    }
+
+    private func casesShareable(key: String, cases: [IREnumCase],
+                                subst: [String: Type], visiting: Set<String>) -> Bool {
+        if visiting.contains(key) { return true }            // cycle back-edge
+        let v = visiting.union([key])
+        return cases.allSatisfy { c in
+            c.fields.allSatisfy { isShareable(substitute($0.type, subst), visiting: v) }
+        }
+    }
+
+    // Apply a type-parameter substitution (built from a generic base's params →
+    // concrete args) to a field type, recursing through nested generics/functions.
+    private func substitute(_ t: Type, _ m: [String: Type]) -> Type {
+        guard !m.isEmpty else { return t }
+        switch t {
+        case .typeParam(let p):
+            return m[p] ?? t
+        case .generic(let base, let args):
+            return .generic(base: base, args: args.map { substitute($0, m) })
+        case .function(let ps, let r):
+            return .function(params: ps.map { substitute($0, m) }, ret: substitute(r, m))
+        default:
+            return t
         }
     }
 
