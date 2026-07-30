@@ -1,0 +1,42 @@
+// The `shared` bound (M5 5.3.2). A generic function that forwards its type
+// parameter across a task boundary declares `<shared T>`; inside the body a
+// `shared T` may cross the boundary, and every caller must pass a shareable type.
+
+struct Pair {
+    let a: Int
+    let b: Int
+}
+
+fun onTask<shared T>(x: T) -> T {
+    spawn let r = x        // ok: T is `shared`, so it may cross the task boundary
+    return r
+}
+
+fun main() {
+    // Int is shareable → the `shared` bound is satisfied.
+    let n = onTask(41)
+    print(n)               // 41
+
+    // A value struct with shareable fields is shareable too.
+    let p = onTask(Pair(a: 1, b: 2))
+    print(p.a)             // 1
+}
+
+// ── Uncomment to see the bound rejected at the call site ────────────────────
+//
+// class Counter {
+//     var n: Int
+// }
+// fun bad() {
+//     let c = Counter(n: 0)
+//     let x = onTask(c)   // error: type 'Counter' is not shareable, but type
+//                         // parameter 'T' of 'onTask' is declared 'shared'
+//     print(x.n)
+// }
+//
+// ── Without the `shared` bound, the body can't forward T across the boundary ──
+//
+// fun leaky<T>(x: T) -> T {
+//     spawn let r = x     // error: 'x' has type 'T' which cannot cross a task boundary
+//     return r
+// }

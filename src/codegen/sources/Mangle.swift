@@ -7,12 +7,17 @@
 // reversible encoding. Struct fields and locals are scoped, so they are left alone.
 //
 // Fully-qualified form: `nomu_<module>_<scope…>_<symbol>`, each component
-// **z-encoded** (GHC-style) so the `_` join is unambiguous — a literal `_` in a
-// Nomu name becomes `zu`, and the escape char `z` becomes `zz`. A top-level symbol
-// has no scope (`abs` → `nomu_main_abs`); a method's scope is its type
+// **9-encoded** so the `_` join is unambiguous — a literal `_` in a Nomu name
+// becomes `90`, a `.` becomes `91`, and the escape char `9` itself becomes `99`.
+// The escape and its code are **all digits** on purpose: letters are never touched,
+// so every letter in a mangled name is a real source letter and words stay readable;
+// a digit run is always machinery. A top-level symbol has no scope
+// (`abs` → `nomu_main_abs`); a method's scope is its type
 // (`Rect.area` → `nomu_main_Rect_area`). The module is an implied "main" until real
-// modules exist (modules.md). Plain names stay readable; only underscores and `z`s
-// pick up noise. Fully de-mangleable. This whole scheme is swappable here.
+// modules exist (modules.md). Plain names stay readable; only underscores, dots, and
+// the rare digit-`9` pick up noise. Components are never at position 0 (the `nomu_`
+// prefix leads), so a digit-led escape can't start an identifier. Fully
+// de-mangleable. This whole scheme is swappable here.
 enum Mangle {
     static let prefix = "nomu_"
 
@@ -20,19 +25,24 @@ enum Mangle {
     // (modules.md); until then every symbol is qualified under an implied "main".
     static let module = "main"
 
-    // z-encode one Nomu identifier component. Nomu identifiers are [A-Za-z0-9_], so
-    // `_` (freed for use as the component separator) and `z` (the escape) need
+    // 9-encode one Nomu identifier component. Nomu identifiers are [A-Za-z0-9_], so
+    // `_` (freed for use as the component separator) and `9` (the escape) need
     // escaping; `.` appears in compiler-synthesized accessor names (`area.get`,
     // M5 A1) and encodes too, keeping those out of any user method's name space.
-    // Richer characters (generic `<>`, `,`) get added later with monomorphization.
-    static func z(_ s: String) -> String {
+    // Escape and codes are all digits (not letters), so every letter in a mangled
+    // name is a real source letter. The generic-instance brackets from monomorphization
+    // (M5 5.4) — a specialized name is `Box<Int>` / `describe<Circle>` — encode too.
+    static func encode(_ s: String) -> String {
         var out = ""
         out.reserveCapacity(s.count)
         for ch in s {
             switch ch {
-            case "z": out += "zz"
-            case "_": out += "zu"
-            case ".": out += "zd"
+            case "9": out += "99"
+            case "_": out += "90"
+            case ".": out += "91"
+            case "<": out += "92"   // generic-instance open (M5 5.4)
+            case ">": out += "93"   // generic-instance close
+            case ",": out += "94"   // type-argument separator
             default:  out.append(ch)
             }
         }
@@ -40,9 +50,9 @@ enum Mangle {
     }
 
     // nomu_<module>_<scope…>_<symbol>: the module, then any enclosing scopes, then
-    // the symbol — each z-encoded, joined by `_`.
+    // the symbol — each 9-encoded, joined by `_`.
     static func qualify(_ scopesAndSymbol: [String]) -> String {
-        prefix + ([module] + scopesAndSymbol).map(z).joined(separator: "_")
+        prefix + ([module] + scopesAndSymbol).map(encode).joined(separator: "_")
     }
 
     // A free (top-level) function. `main` is the process entry the runtime calls by a

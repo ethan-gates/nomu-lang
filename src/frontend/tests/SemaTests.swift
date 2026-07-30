@@ -1273,23 +1273,27 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
     }
 
-    func testGenericTypeParameterUnderGenericRejected() {
-        // A type parameter nested in a generic-type parameter (`Option<T>`) would let the body
-        // construct/destructure an abstract `T`, which needs value witnesses — deferred.
+    func testGenericTypeParameterUnderGenericAccepted() {
+        // A type parameter nested in a generic-type parameter (`Option<T>`) is now accepted:
+        // whole-program monomorphization (M5 5.4) specializes the function to a concrete copy,
+        // so the abstract body never reaches codegen (the old value-witness miscompile is gone).
         let r = sema("""
         enum Option<T> {
             case some(value: T)
             case none
         }
         fun unwrap<T>(o: Option<T>, fallback: T) -> T {
-            return fallback
+            switch o {
+            case .some(let v): return v
+            case .none: return fallback
+            }
         }
         fun f() {
-            print(unwrap(Option.none, 0))
+            let a: Option<Int> = .some(value: 5)
+            print(unwrap(a, 0))
         }
         """)
-        XCTAssertTrue(r.diagnostics.hasErrors)
-        XCTAssertTrue(r.diagnostics.render().contains("value witnesses"), r.diagnostics.render())
+        XCTAssertFalse(r.diagnostics.hasErrors, r.diagnostics.render())
     }
 
     func testGenericMethodsRejected() {
@@ -1535,5 +1539,89 @@ final class SemaTests: XCTestCase {
         """)
         XCTAssertTrue(r.diagnostics.hasErrors)
         XCTAssertTrue(r.diagnostics.render().contains("supported yet"), r.diagnostics.render())
+    }
+
+    // M5 5.3.2 — the `shared` bound.
+
+    func testSharedBoundAcceptsShareableArg() {
+        let r = sema("""
+        struct Pair {
+            let a: Int
+            let b: Int
+        }
+        fun onTask<shared T>(x: T) -> T {
+            return x
+        }
+        fun main() {
+            let n = onTask(1)
+            let p = onTask(Pair(a: 1, b: 2))
+            print(n)
+            print(p.a)
+        }
+        """)
+        XCTAssertFalse(r.diagnostics.hasErrors, r.diagnostics.render())
+    }
+
+    func testSharedBoundRejectsNonShareableArg() {
+        let r = sema("""
+        class Counter {
+            var n: Int
+        }
+        fun onTask<shared T>(x: T) -> T {
+            return x
+        }
+        fun main() {
+            let c = Counter(n: 0)
+            let x = onTask(c)
+            print(x.n)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("is not shareable"), r.diagnostics.render())
+    }
+
+    func testSharedBoundAcceptsDeeplyImmutableClass() {
+        let r = sema("""
+        class Config {
+            let host: String
+            let port: Int
+        }
+        fun onTask<shared T>(x: T) -> T {
+            return x
+        }
+        fun main() {
+            let c = Config(host: "h", port: 1)
+            let x = onTask(c)
+            print(x.host)
+        }
+        """)
+        XCTAssertFalse(r.diagnostics.hasErrors, r.diagnostics.render())
+    }
+
+    func testSharedParamForwardsToSharedBound() {
+        // A `shared T` in scope is itself shareable, so it satisfies another `shared` bound.
+        let r = sema("""
+        fun inner<shared U>(y: U) -> U {
+            return y
+        }
+        fun outer<shared T>(x: T) -> T {
+            return inner(x)
+        }
+        """)
+        XCTAssertFalse(r.diagnostics.hasErrors, r.diagnostics.render())
+    }
+
+    func testNonSharedParamRejectedBySharedBound() {
+        // A plain `<T>` is not known shareable, so it can't discharge a `shared` bound.
+        let r = sema("""
+        fun inner<shared U>(y: U) -> U {
+            return y
+        }
+        fun outer<T>(x: T) -> T {
+            return inner(x)
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("is not shareable"), r.diagnostics.render())
     }
 }

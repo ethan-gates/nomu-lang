@@ -17,6 +17,7 @@ Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease
 - [macros.md](macros.md) — typed hygienic AST macros; extension-only role.
 - [compiler.md](compiler.md) — compiler architecture, mid-level IR, backend strategy, tooling, debugger.
 - [roadmap.md](roadmap.md) — milestones (provisional, post-pivot).
+- [deferred.md](deferred.md) — TODO backlog: feature work intentionally postponed, each with its un-park trigger.
 
 The full decision history and rationale used to live in a separate `early-design.md`; it has been dissolved into the per-subsystem docs above, each of which now carries its own rationale and open questions.
 

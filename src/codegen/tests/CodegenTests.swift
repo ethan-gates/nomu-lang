@@ -462,8 +462,8 @@ final class CodegenTests: XCTestCase {
         XCTAssertFalse(c.contains("nomu_main_Node_release(n);"))
     }
 
-    // A computed property emits accessor functions (the `.` in `area.get` z-encodes to
-    // `zd`), and a read of it calls the getter rather than loading a field (M5 A1).
+    // A computed property emits accessor functions (the `.` in `area.get` 9-encodes to
+    // `91`), and a read of it calls the getter rather than loading a field (M5 A1).
     func testComputedPropertyEmit() {
         let c = gen("""
         struct Rect {
@@ -472,7 +472,7 @@ final class CodegenTests: XCTestCase {
         }
         fun f(r: Rect) -> Int { return r.area }
         """)
-        XCTAssertTrue(c.contains("nomu_main_Rect_areazdget("))       // getter defined + called
+        XCTAssertTrue(c.contains("nomu_main_Rect_area91get("))       // getter defined + called
         XCTAssertFalse(c.contains("r.area"))                          // not a struct field load
     }
 
@@ -572,7 +572,56 @@ final class CodegenTests: XCTestCase {
             r.scale = 3
         }
         """)
-        XCTAssertTrue(c.contains("nomu_main_Rect_scalezdset(nomu_main_Rect* self"))
-        XCTAssertTrue(c.contains("nomu_main_Rect_scalezdset(&r, 3)"))
+        XCTAssertTrue(c.contains("nomu_main_Rect_scale91set(nomu_main_Rect* self"))
+        XCTAssertTrue(c.contains("nomu_main_Rect_scale91set(&r, 3)"))
+    }
+
+    // M5 5.4 — monomorphization. `genMono` runs the specialization pass (as the driver does)
+    // before codegen, so these assert the concrete, devirtualized output.
+    private func genMono(_ source: String) -> String {
+        var lexer = Lexer(source)
+        var parser = Parser(lexer.tokenize())
+        var sema = Sema(parser.parse())
+        let mono = monomorphize(sema.check().module, into: DiagnosticSink())
+        var codegen = CodegenIR(mono)
+        return codegen.emit()
+    }
+
+    func testMonoDevirtualizesRequirementCall() {
+        let c = genMono("""
+        interface Drawable {
+            fun draw() -> String
+        }
+        struct Circle: Drawable {
+            var r: Int
+            fun draw() -> String {
+                return "O"
+            }
+        }
+        fun describe<T: Drawable>(x: T) -> String {
+            return x.draw()
+        }
+        fun main() {
+            print(describe(Circle(r: 1)))
+        }
+        """)
+        XCTAssertTrue(c.contains("describe92Circle"), c)             // specialized symbol
+        XCTAssertTrue(c.contains("nomu_main_Circle_draw("), c)      // direct call, devirtualized
+        XCTAssertFalse(c.contains("wt_T_Drawable"), c)              // no witness-passing param
+    }
+
+    func testMonoUnboxesGenericType() {
+        let c = genMono("""
+        struct Box<T> {
+            let value: T
+        }
+        fun main() {
+            let b = Box(value: 7)
+            print(b.value)
+        }
+        """)
+        XCTAssertTrue(c.contains("nomu_main_Box92Int"), c)          // distinct specialized struct
+        XCTAssertTrue(c.contains("int64_t value;"), c)             // real field, not a void* box
+        XCTAssertFalse(c.contains("void* value;"), c)
     }
 }

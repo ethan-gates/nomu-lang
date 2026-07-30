@@ -151,7 +151,10 @@ public struct IRParam {
 public struct IRGenericParam {
     public let name: String
     public let bounds: [String]
-    public init(name: String, bounds: [String]) { self.name = name; self.bounds = bounds }
+    public let isShared: Bool   // `<shared T>` — codegen's spawn check treats such a T as shareable (M5 5.3.2)
+    public init(name: String, bounds: [String], isShared: Bool = false) {
+        self.name = name; self.bounds = bounds; self.isShared = isShared
+    }
 }
 
 public struct IRFunc {

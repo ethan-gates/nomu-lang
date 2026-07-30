@@ -49,6 +49,10 @@ public struct Parser {
         var params: [GenericParam] = []
         repeat {
             let pspan = currentSpan
+            // `<shared T>` — an orthogonal capability prefix (contextual, like `any`/`some`),
+            // requiring the type argument to be shareable (M5 5.3.2, generics.md §3a).
+            var isShared = false
+            if case .ident("shared") = currentKind, case .ident = peek() { advance(); isShared = true }
             let name = expectIdent()
             var bounds: [Conformance] = []
             if eat(.colon) {
@@ -57,7 +61,7 @@ public struct Parser {
                     bounds.append(Conformance(name: expectIdent(), span: bspan))
                 } while eat(.amp)
             }
-            params.append(GenericParam(name: name, bounds: bounds, span: pspan))
+            params.append(GenericParam(name: name, bounds: bounds, isShared: isShared, span: pspan))
         } while eat(.comma)
         expect(.gt)
         return params

@@ -74,7 +74,17 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
         exit(1)
     }
 
-    var gen = CodegenIR(semaResult.module)
+    // Monomorphization (M5 5.4): specialize every generic instantiation into concrete
+    // decls (whole-program mono under the single compilation unit). An IR→IR pass; `any I`
+    // stays dynamic. Runs only on error-free IR.
+    let monoDiags = DiagnosticSink()
+    let monoModule = monomorphize(semaResult.module, into: monoDiags)
+    if !monoDiags.isEmpty {
+        fputs(monoDiags.render() + "\n", stderr)
+        exit(1)
+    }
+
+    var gen = CodegenIR(monoModule)
     let cCode = gen.emit()
 
     if !gen.diagnostics.isEmpty {

@@ -65,10 +65,19 @@ public struct Sema {
     // so a requirement call on a `.typeParam` receiver dispatches through the right witness.
     private var genericBounds: [String: [String]] = [:]
 
+    // M5 5.3.2: the `shared` type parameters in scope (`<shared T>`), so a shared `T`
+    // used inside the body counts as shareable when passed to another `shared` bound.
+    private var sharedParams: Set<String> = []
+
+    // M5 5.3.2: the structural share-analysis predicate over the program's types,
+    // built once after global collection; discharges `<shared T>` bounds at call sites.
+    private var shareChecker = Shareability(lookup: { _ in nil })
+
     public init(_ program: Program) { self.program = program }
 
     public mutating func check() -> SemaResult {
         collectGlobals()
+        buildShareChecker()
         validateInterfaceGraph()
         checkConformances()
         var decls: [IRDecl] = []
@@ -129,6 +138,43 @@ public struct Sema {
         funcs["concat"]   = FnSig(params: [.string, .string], ret: .string)
         funcs["readLine"] = FnSig(params: [], ret: .string)
         funcs["sleep"]    = FnSig(params: [.int], ret: .int)
+    }
+
+    // MARK: - Share analysis (M5 5.3.2)
+
+    // Build the structural share-analysis predicate over every declared type. Field
+    // types are resolved under each decl's own generic scope so a `T` field becomes
+    // `.typeParam("T")` for the conditional-conformance substitution to work.
+    private mutating func buildShareChecker() {
+        var table: [String: Shareability.Decl] = [:]
+        for (n, s) in structs {
+            table[n] = Shareability.Decl(fields: resolveFields(s.fields, params: s.generics),
+                                         isClass: false, params: s.generics.map(\.name))
+        }
+        for (n, c) in classes {
+            table[n] = Shareability.Decl(fields: resolveFields(c.fields, params: c.generics),
+                                         isClass: true, params: c.generics.map(\.name))
+        }
+        for (n, e) in enums {
+            let caseFields = e.cases.flatMap { $0.fields }
+            table[n] = Shareability.Decl(fields: resolveFields(caseFields, params: e.generics),
+                                         isClass: false, params: e.generics.map(\.name))
+        }
+        shareChecker = Shareability(lookup: { table[$0] })
+    }
+
+    private mutating func resolveFields(_ fields: [VarField], params: [GenericParam]) -> [(type: Type, isMutable: Bool)] {
+        let saved = genericScope
+        genericScope = saved.union(params.map(\.name))
+        defer { genericScope = saved }
+        return fields.map { (type: resolve($0.type), isMutable: $0.isMutable) }
+    }
+
+    // A type is shareable if it can cross a task boundary. A bare `.typeParam` is
+    // shareable only when its parameter is declared `<shared T>` and thus in scope here.
+    private func isShareable(_ t: Type) -> Bool {
+        if case .typeParam(let p) = t { return sharedParams.contains(p) }
+        return shareChecker.isShareable(t)
     }
 
     // MARK: - Type resolution (syntax → semantics)
@@ -392,7 +438,7 @@ public struct Sema {
         for g in generics { genericBounds[g.name] = g.bounds.map(\.name) }
         defer { genericScope = savedScope; genericBounds = savedBounds }
         validateBounds(generics)
-        let irGenerics = generics.map { IRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name)) }
+        let irGenerics = generics.map { IRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name), isShared: $0.isShared) }
         switch decl {
         case .structDecl(let s):
             rejectGenericMembers(s.methods, s.properties, at: s.span)
@@ -730,7 +776,7 @@ public struct Sema {
 
     // A computed property lowers to accessor methods on its type: a getter `prop.get`
     // (() -> T) and, if settable, a setter `prop.set` ((T) -> Void). The `.` keeps
-    // their names out of any user method's namespace (Mangle z-encodes it), and being
+    // their names out of any user method's namespace (Mangle 9-encodes it), and being
     // ordinary methods they reuse method codegen, self-passing, and mutation inference
     // (the setter is inferred mutating because it writes a field).
     private mutating func lowerAccessors(_ props: [ComputedProperty], selfType: Type, fields: [IRField]) -> [IRFunc] {
@@ -775,10 +821,11 @@ public struct Sema {
     private mutating func lowerFunc(_ f: FuncDecl) -> IRFunc {
         // A generic function's type parameters + bounds are in scope while lowering its body,
         // so `x: T` typechecks and `x.req()` dispatches through the bound's witness (M5 5.2.2).
-        let savedScope = genericScope, savedBounds = genericBounds
+        let savedScope = genericScope, savedBounds = genericBounds, savedShared = sharedParams
         genericScope = Set(f.generics.map(\.name))
         genericBounds = Dictionary(f.generics.map { ($0.name, $0.bounds.map(\.name)) }, uniquingKeysWith: { a, _ in a })
-        defer { genericScope = savedScope; genericBounds = savedBounds }
+        sharedParams = Set(f.generics.filter(\.isShared).map(\.name))
+        defer { genericScope = savedScope; genericBounds = savedBounds; sharedParams = savedShared }
         validateBounds(f.generics)
         let params = f.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
         let ret = resolve(f.returnType, opaqueOwner: "fn:\(f.name)")
@@ -788,7 +835,7 @@ public struct Sema {
         let body = lowerBlock(f.body)
         currentReturnType = saved
         popScope()
-        let irGenerics = f.generics.map { IRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name)) }
+        let irGenerics = f.generics.map { IRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name), isShared: $0.isShared) }
         return IRFunc(name: f.name, generics: irGenerics, params: params, returnType: ret, body: body, isMutating: false, span: f.span)
     }
 
@@ -1187,15 +1234,12 @@ public struct Sema {
         if args.count != sig.params.count {
             diags.error("function '\(name)' expects \(sig.params.count) argument(s), got \(args.count)", at: span)
         }
-        // A type parameter inside a closure parameter (`f: (T) -> U`) is bridged by a
-        // reabstraction thunk in codegen (M5 5.2.3). A type parameter nested in a generic-type
-        // *parameter* (`o: Option<T>`) lets the body destructure/rebuild an abstract container,
-        // which needs value witnesses — deferred; reject cleanly rather than miscompile.
-        // (Return position — `-> Box<T>` — is fine: it only moves a boxed value out.)
-        let tparams = Set(sig.generics.map(\.name))
-        if sig.params.contains(where: { typeParamUnderGeneric($0, tparams) }) {
-            diags.error("a generic function with a generic-type parameter over a type variable (e.g. 'Option<T>') isn't supported yet (M5 5.2.3 — needs value witnesses)", at: span)
-        }
+        // A type parameter nested in a generic-type *parameter* (`o: Option<T>`) used to be
+        // rejected: witness-passing had to destructure an abstract container, which needs value
+        // witnesses and miscompiled. Whole-program monomorphization (M5 5.4) specializes such a
+        // function to a concrete copy (`Option<Int>`), so the abstract body never reaches codegen
+        // — the restriction is lifted. Inference of `T` *through* the container is still shallow
+        // (a `.none` argument can't pin `T`); that surfaces as the ordinary "cannot infer" error.
         var subst: [String: Type] = [:]
         for (p, a) in zip(sig.params, args) { unify(param: p, arg: a.value.type, into: &subst, at: span) }
         for g in sig.generics where subst[g.name] == nil {
@@ -1206,6 +1250,10 @@ public struct Sema {
             let inferred = subst[g.name] ?? .error
             for b in g.bounds where inferred != .error && !typeConforms(inferred, to: b.name) {
                 diags.error("type '\(inferred)' does not conform to '\(b.name)', required by type parameter '\(g.name)' of '\(name)'", at: span)
+            }
+            // Discharge a `<shared T>` bound: the inferred type argument must be shareable (M5 5.3.2).
+            if g.isShared && inferred != .error && !isShareable(inferred) {
+                diags.error("type '\(inferred)' is not shareable, but type parameter '\(g.name)' of '\(name)' is declared 'shared'", at: span)
             }
         }
         let typeArgs = sig.generics.map { subst[$0.name] ?? .error }

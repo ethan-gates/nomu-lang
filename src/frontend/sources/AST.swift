@@ -92,7 +92,12 @@ public struct Conformance {
 public struct GenericParam {
     public let name: String
     public let bounds: [Conformance]
+    public let isShared: Bool   // `<shared T>` — the type argument must be shareable (M5 5.3.2)
     public let span: Span
+
+    public init(name: String, bounds: [Conformance], isShared: Bool = false, span: Span) {
+        self.name = name; self.bounds = bounds; self.isShared = isShared; self.span = span
+    }
 }
 
 // An extension: `extension T { … }` (plain, M4.12) or `extension T: I { … }` (a
