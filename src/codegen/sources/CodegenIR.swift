@@ -385,6 +385,13 @@ public struct CodegenIR {
     private mutating func emitWitnessTables() {
         let used = Set(conformances.map(\.interfaceName))
         for i in module.interfaces where used.contains(i.name) { emitWitnessType(i) }
+        // Forward-declare every witness instance before the thunks: a covariant-`Self` requirement's
+        // thunk re-boxes its result using `&<witness instance>` (M5 5.6), a back-reference to an
+        // instance defined later. (Base pointers already needed bases-first ordering below.)
+        for c in conformances {
+            out += "static const \(Mangle.witnessType(c.interfaceName)) \(Mangle.witnessInstance(c.typeName, c.interfaceName));\n"
+        }
+        out += "\n"
         // Emit instances bases-first: a witness sets base pointers to its base witnesses, which
         // must already be defined. An interface's transitive-base count is a valid topo rank.
         let ordered = conformances.sorted { (interfaceDefs[$0.interfaceName]?.bases.count ?? 0) < (interfaceDefs[$1.interfaceName]?.bases.count ?? 0) }
@@ -466,6 +473,21 @@ public struct CodegenIR {
         let selfArg = witnessSelfArg(t, kind, m.name)
         let argNames = (0..<m.params.count).map { "a\($0)" }
         let call = "\(Mangle.method(t, m.name))(\(([selfArg] + argNames).joined(separator: ", ")))"
+        // A covariant-`Self` requirement's slot is erased to `any I` (M5 5.6): the concrete method
+        // returns the conformer type `t`, which the thunk re-boxes as `any iface` before returning.
+        if case .existential = m.ret {
+            let ct = Mangle.type(t)
+            let witness = "&\(Mangle.witnessInstance(t, iface))"
+            out += "    \(ct) __r = \(call);\n"
+            if kind == .class_ || kind == .actor_ {
+                out += "    return (AnyBox){ .witness = \(witness), .payload = (void*)__r };\n"
+            } else {
+                out += "    \(ct)* __p = (\(ct)*)rt_alloc(sizeof(\(ct))); *__p = __r;\n"
+                out += "    return (AnyBox){ .witness = \(witness), .payload = (void*)__p };\n"
+            }
+            out += "}\n"
+            return
+        }
         out += m.ret == .void ? "    \(call);\n" : "    return \(call);\n"
         out += "}\n"
     }

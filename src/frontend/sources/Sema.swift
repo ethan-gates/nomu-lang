@@ -246,11 +246,12 @@ public struct Sema {
     // Resolve `any A & B …` to an existential (one interface) or a composition (several).
     private func resolveExistential(_ names: [String], at span: Span) -> Type {
         guard let set = canonicalInterfaces(names, keyword: "any", at: span) else { return .error }
-        // A `Self`-mentioning interface is constraint-only: a type-erased box can't guarantee
-        // two `Self` values share a concrete type, so `any I` is rejected at type formation
-        // (M5 A2, interfaces.md §4.4). `some I` / a generic bound `<T: I>` remain fine.
-        for n in set where constraintOnly(n) {
-            diags.error("interface '\(n)' mentions Self and is constraint-only — use 'some \(n)' or a generic bound '<T: \(n)>', not 'any \(n)'", at: span)
+        // An interface with a *non-covariant* `Self` is constraint-only: a type-erased box can't
+        // guarantee two `Self` values share a concrete type, so `any I` is rejected at type
+        // formation (M5 5.6, interfaces.md §4.4). Covariant-only `Self` (return position) is
+        // erasure-safe and allowed. `some I` / a generic bound `<T: I>` remain fine for both.
+        for n in set where hasNonCovariantSelf(n) {
+            diags.error("interface '\(n)' uses Self in a non-covariant position (a parameter, a settable property, or nested in a function type) and is constraint-only — use 'some \(n)' or a generic bound '<T: \(n)>', not 'any \(n)'", at: span)
             return .error
         }
         return set.count == 1 ? .existential(set[0]) : .composition(set)
@@ -396,16 +397,13 @@ public struct Sema {
 
     // MARK: - Generic decls (M5 5.2.1)
 
-    // A generic bound must name an interface. A constraint-only (`Self`-mentioning) bound is
-    // valid in the design but needs a Self-carrying witness — deferred past 5.2.2 (M5).
+    // A generic bound must name an interface. A `Self`-mentioning (constraint-only) bound is now
+    // allowed: monomorphization (M5 5.4) specializes `<T: I>` to a concrete `T` where `-> Self` is
+    // a direct call — no Self-witness needed — so the 5.2.2 deferral is lifted (M5 5.6).
     private func validateBounds(_ generics: [GenericParam]) {
         for g in generics {
-            for b in g.bounds {
-                if interfaces[b.name] == nil {
-                    diags.error("'\(b.name)' is not an interface — a generic bound must name an interface", at: b.span)
-                } else if constraintOnly(b.name) {
-                    diags.error("interface '\(b.name)' mentions Self — using it as a generic bound isn't supported yet (needs a Self-witness)", at: b.span)
-                }
+            for b in g.bounds where interfaces[b.name] == nil {
+                diags.error("'\(b.name)' is not an interface — a generic bound must name an interface", at: b.span)
             }
         }
     }
@@ -498,21 +496,33 @@ public struct Sema {
         return false
     }
 
-    // Does an interface mention `Self` in any of its *own* requirement signatures?
-    private func ownMentionsSelf(_ iface: String) -> Bool {
+    // `Self` used covariantly is safe to erase behind `any I` (it only *produces* a Self, handed
+    // back as another box); used contravariantly/invariantly it is not (M5 5.6, interfaces.md §4.4).
+    // Conservative rule: covariant = a bare `-> Self` method return, or a `{ get }`-only `Self`
+    // property. Non-covariant = `Self` in a parameter, a `{ get set }` `Self` property, or `Self`
+    // nested inside a function type (either side — the full variance calculus is deferred).
+    private func isBareSelf(_ ref: TypeRef?) -> Bool { ref?.name == "Self" && ref?.fn == nil }
+
+    // Does an interface's *own* requirements use `Self` in a non-covariant position?
+    private func ownHasNonCovariantSelf(_ iface: String) -> Bool {
         guard let d = interfaces[iface] else { return false }
-        for m in d.methods where m.params.contains(where: { mentionsSelf($0.type) }) || mentionsSelf(m.returnType) {
-            return true
+        for m in d.methods {
+            if m.params.contains(where: { mentionsSelf($0.type) }) { return true }        // parameter
+            if mentionsSelf(m.returnType) && !isBareSelf(m.returnType) { return true }     // nested in return
         }
-        return d.properties.contains { mentionsSelf($0.type) }
+        for p in d.properties where mentionsSelf(p.type) {
+            if !isBareSelf(p.type) || p.isSettable { return true }                         // nested, or get set
+        }
+        return false
     }
 
-    // An interface is constraint-only if it — or any interface it refines — mentions `Self`.
-    // Refinement propagates the property (`B: A` is constraint-only if `A` is), matching the
-    // decision in interfaces.md §4.4. Constraint-only interfaces are usable as `some I` / a
-    // generic bound but rejected as `any I`, and emit no witnesses (M5 A2).
-    private func constraintOnly(_ iface: String) -> Bool {
-        ownMentionsSelf(iface) || transitiveBases(iface).contains { ownMentionsSelf($0) }
+    // Constraint-only after 5.6: has a non-covariant `Self` (own or inherited) — usable as a
+    // generic bound / `some I` but rejected as `any I`, and it emits no witness table. A
+    // covariant-only `Self` interface (or one with no `Self`) is existential-legal: it *does*
+    // emit a witness, with each `-> Self` requirement erased to `-> any I` at the box boundary.
+    // Refinement propagates the property (`B: A` is constraint-only if `A` is).
+    private func hasNonCovariantSelf(_ iface: String) -> Bool {
+        ownHasNonCovariantSelf(iface) || transitiveBases(iface).contains { ownHasNonCovariantSelf($0) }
     }
 
     // The full method-requirement set of `iface` = its own plus every inherited one,
@@ -588,14 +598,17 @@ public struct Sema {
         var out: [IRInterface] = []
         for decl in program.decls {
             guard case .interfaceDecl(let i) = decl else { continue }
-            // Constraint-only interfaces can't be `any I`, so they get no witness table — a
-            // `Self` slot has no concrete representation in a type-erased box (M5 A2).
-            if constraintOnly(i.name) { continue }
+            // A non-covariant-`Self` (constraint-only) interface can't be `any I`, so it gets no
+            // witness table. A covariant-only interface *does* — each `-> Self` requirement's slot
+            // is **erased to `any I`** (`selfAs: .existential`), so the slot has a uniform concrete
+            // representation (`AnyBox`); the thunk re-boxes the concrete result (M5 5.6).
+            if hasNonCovariantSelf(i.name) { continue }
+            let selfErased = Type.existential(i.name)
             // Aggregated (flattened) surface: the witness table carries inherited slots too.
-            let methods = aggregatedMethods(i.name).map { IRMethodReq(name: $0.name, params: $0.params.map { resolve($0.type) }, ret: resolve($0.returnType)) }
-            let props = aggregatedProperties(i.name).map { IRPropReq(name: $0.name, type: resolve($0.type), isSettable: $0.isSettable) }
+            let methods = aggregatedMethods(i.name).map { IRMethodReq(name: $0.name, params: $0.params.map { resolve($0.type, selfAs: selfErased) }, ret: resolve($0.returnType, selfAs: selfErased)) }
+            let props = aggregatedProperties(i.name).map { IRPropReq(name: $0.name, type: resolve($0.type, selfAs: selfErased), isSettable: $0.isSettable) }
             // Only any-able bases carry a witness, so only they get a base pointer (M5 A1.4 upcast).
-            let bases = transitiveBases(i.name).filter { !constraintOnly($0) }.sorted()
+            let bases = transitiveBases(i.name).filter { !hasNonCovariantSelf($0) }.sorted()
             out.append(IRInterface(name: i.name, methods: methods, properties: props, bases: bases))
         }
         return out
@@ -674,8 +687,9 @@ public struct Sema {
                 // The conformance fact is recorded for every interface (incl. constraint-only),
                 // so `some I` can verify its underlying (M5 A3).
                 allConformsTo[typeName, default: []].insert(iface)
-                // A witness is emitted only for an any-able (not constraint-only) interface.
-                guard !constraintOnly(iface) else { continue }
+                // A witness is emitted only for an any-able (covariant-only-`Self`) interface;
+                // a non-covariant-`Self` interface stays witness-less (M5 5.6).
+                guard !hasNonCovariantSelf(iface) else { continue }
                 conformsTo[typeName, default: []].insert(iface)
                 if conformancePairs.insert("\(typeName):\(iface)").inserted {
                     conformanceList.append(IRConformance(typeName: typeName, typeKind: kind, interfaceName: iface))
@@ -1326,8 +1340,11 @@ public struct Sema {
     }
 
     // Does a concrete type conform to an interface, with a witness available (M5 5.2.2)?
+    // Bound satisfaction consults *all* checked conformances (incl. constraint-only), not just
+    // the witnessed ones: a `<T: Cloneable>` / `<T: Combinable>` bound is discharged by mono, which
+    // specializes to a concrete `T` — no witness required (M5 5.6).
     private func typeConforms(_ t: Type, to iface: String) -> Bool {
-        if case .named(let tn, _) = t { return conformsTo[tn]?.contains(iface) == true }
+        if case .named(let tn, _) = t { return allConformsTo[tn]?.contains(iface) == true }
         return false
     }
 
@@ -1416,8 +1433,11 @@ public struct Sema {
             if let iface = existentialInterfaces(recv.type).first(where: { aggregatedMethods($0).contains { $0.name == name } }),
                let req = aggregatedMethods(iface).first(where: { $0.name == name }) {
                 let irArgs = args.map { checkExpr($0.value) }
-                checkArgTypes(irArgs, against: req.params.map { resolve($0.type) }, at: span)
-                return IRExpr(type: resolve(req.returnType), span: span,
+                // Covariant `Self` erases to the receiver's own existential type: `c.clone()` on
+                // `any B` yields `any B` (M5 5.6). Params are `Self`-free here (a contravariant
+                // `Self` would have made the interface non-existential-legal).
+                checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: recv.type) }, at: span)
+                return IRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
                               kind: .methodCall(receiver: recv, method: name, args: irArgs))
             }
             // A method-requirement call through `some I` — statically dispatched to the hidden

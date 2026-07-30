@@ -1,0 +1,181 @@
+// ============================================================================
+//  `Self`-type requirements & existential legality — a case catalog
+//  (M5 5.1.2 baseline  →  5.6 covariant-`Self` existential erasure)
+// ============================================================================
+//
+//  A requirement may mention `Self`, which stands for the conforming type. Whether
+//  an interface can be used as `any I` — a type-erased, heap-boxed value — depends
+//  on WHERE `Self` appears, because an `any I` box hides the concrete type.
+//
+//  Each interface below is used (or attempted) at the four sites that matter:
+//      • a concrete value        (static, direct call)
+//      • `some I`                 (one hidden underlying type; static dispatch)
+//      • a generic bound `<T: I>` (specialized by monomorphization, M5 5.4)
+//      • `any I`                  (dynamic, type-erased, witness dispatch)
+//
+//  Outcome legend used in the comments:
+//      [today]      compiles right now
+//      [after 5.6]  compiles once covariant-`Self` erasure lands
+//      [rejected]   a clean compile error — and stays one even after 5.6
+//
+//  Live code (uncommented) is everything that compiles TODAY. Cases marked
+//  [after 5.6] are shown in comment blocks; uncomment them as 5.6 lands — this file
+//  doubles as the 5.6 acceptance catalog. Companion runtime demo: self_requirement.nomu.
+
+
+// ----------------------------------------------------------------------------
+//  1. COVARIANT `Self`  —  return position only.  `clone()` PRODUCES a Self, never
+//     consumes one, so a box can hand the result back as another box. Existential-legal.
+// ----------------------------------------------------------------------------
+
+interface Cloneable {
+    fun clone() -> Self               // covariant `Self`
+    fun describe() -> String          // a plain covariant requirement, so a boxed value is observable
+}
+
+struct Point: Cloneable {
+    var x: Int
+    var y: Int
+    fun clone() -> Point {           // `-> Self` satisfied by `-> Point`
+        return Point(x: x, y: y)
+    }
+    fun describe() -> String {
+        return "point"
+    }
+}
+
+//  • concrete:  p.clone() -> Point, a direct call.                        [today]
+//  • some I:    a.clone() -> the concrete underlying (Point).             [today]
+//               (a `some Cloneable` fixes one hidden type, so `Self` is known.)
+//  Both are exercised live in main() below.
+
+//  • generic bound `<T: Cloneable>`:                                      [now live, 5.6]
+//    Monomorphization (5.4) specializes T to a concrete type where `clone() -> Self` is
+//    `-> Point`, a direct call — no witness needed. 5.6 lifted the bound guard.
+fun duplicate<T: Cloneable>(v: T) -> T {
+    return v.clone()                     // -> T (the concrete type)
+}
+
+//  • any I:  `any Cloneable`                                             [now live, 5.6]
+//    `clone()` only produces a Self, so at the box boundary `-> Self` ERASES to
+//    `-> any Cloneable` — the witness returns the concrete Point and re-boxes it as another
+//    `any Cloneable`. The caller never asserts two boxes share a type.
+fun cloneErased(c: any Cloneable) -> any Cloneable {
+    return c.clone()                     // yields `any Cloneable`, not the concrete type
+}
+
+
+// ----------------------------------------------------------------------------
+//  2. CONTRAVARIANT `Self`  —  parameter position.  `combined(with: Self)` CONSUMES a
+//     Self, so through `any I` two boxes could hold different concrete types. Unsound to
+//     erase — stays constraint-only even after 5.6.
+// ----------------------------------------------------------------------------
+
+interface Combinable {
+    fun combined(with: Self) -> Self
+}
+
+struct Tally: Combinable {
+    var total: Int
+    fun combined(with: Tally) -> Tally {
+        return Tally(total: total + with.total)
+    }
+}
+
+//  • concrete:  a.combined(with: b) -> Tally, a direct call.              [today]
+//    Exercised live in main().
+//  • generic bound `<T: Combinable>`:                                     [after 5.6]
+//    Same story as Cloneable — specialization makes `with:`/`-> Self` concrete.
+//  • some I:  a legal type, but `combined(with:)` is effectively uncallable on it —
+//    you can't name/produce a second value of the hidden underlying type to pass.
+//
+//  • any I:  `any Combinable`                                            [rejected]
+//    Rejected today AND after 5.6 — this is the sound core the whole rule protects:
+//
+//    // fun addErased(a: any Combinable, b: any Combinable) -> any Combinable {
+//    //     return a.combined(with: b)   // ✗ b's box may hold a different concrete type than a's
+//    // }
+//    //   error: interface 'Combinable' mentions Self and is constraint-only …
+
+
+// ----------------------------------------------------------------------------
+//  3. INVARIANT `Self`  —  a `Self`-typed `{ get set }` property. The GETTER is covariant
+//     (produces Self) but the SETTER is contravariant (consumes Self), so the pair is
+//     invariant → constraint-only. A `{ get }`-only `Self` property would be covariant.
+// ----------------------------------------------------------------------------
+
+interface Pairable {
+    var twin: Self { get set }       // get set → invariant `Self`
+}
+
+//  • any I:  `any Pairable`                                              [rejected]
+//    The setter takes a `Self`, same hazard as case 2 — stays rejected after 5.6.
+//    (A `var twin: Self { get }` — getter only — would be covariant and become
+//    `any`-legal after 5.6, erasing the read to `any Pairable`.)
+
+
+// ----------------------------------------------------------------------------
+//  4. NESTED `Self`  —  inside a function type. `accept(f: (Self) -> Bool)` has `Self` in
+//     the parameter of a closure that is itself a parameter (a double sign-flip that is
+//     technically covariant). 5.6 takes the CONSERVATIVE rule: any `Self` nested in a
+//     function type is constraint-only. Sound; the full variance calculus is deferred.
+// ----------------------------------------------------------------------------
+
+interface Visitable {
+    fun accept(f: (Self) -> Bool) -> Bool
+}
+
+//  • any I:  `any Visitable`                                             [rejected]
+//    Conservatively rejected even after 5.6 (nested `Self` isn't classified covariant).
+
+
+// ----------------------------------------------------------------------------
+//  5. REFINEMENT PROPAGATION  —  the property is computed per interface and inherited.
+//     A refiner is existential-legal only if it AND every base are.
+// ----------------------------------------------------------------------------
+
+interface Copyable: Cloneable {   // refines a covariant interface, adds no bad Self
+    fun label() -> String
+}
+
+interface Mergeable: Combinable {   // refines a contravariant interface
+    fun label() -> String
+}
+
+//  • `any Copyable`   → covariant throughout    → [after 5.6] legal; `c.clone()` yields `any Copyable`
+//  • `any Mergeable`  → base has contravariant Self → [rejected] stays constraint-only
+
+
+// ----------------------------------------------------------------------------
+//  Live today: concrete conformance + `some I`. Runs and prints the values.
+// ----------------------------------------------------------------------------
+
+fun makeCloneable() -> some Cloneable {
+    return Point(x: 3, y: 4)
+}
+
+fun main() {
+    // Covariant Self, concrete receiver — direct call, concrete result.
+    let p = Point(x: 3, y: 4)
+    let q = p.clone()
+    print(q.x)                       // 3
+    print(q.y)                       // 4
+
+    // Covariant Self through `some I` — clone() yields the concrete underlying (5.1.3).
+    let s = makeCloneable()
+    print(s.clone().x)               // 3
+
+    // Contravariant Self, concrete receiver — direct call.
+    let a = Tally(total: 10)
+    let b = Tally(total: 32)
+    print(a.combined(with: b).total) // 42
+
+    // Covariant Self through a generic bound — specialized by mono, direct call. [5.6]
+    print(duplicate(Point(x: 7, y: 8)).x)   // 7
+
+    // Covariant Self through `any I` — clone() erases to `any Cloneable`, dispatched
+    // dynamically; a heterogeneous use generic bounds can't express. [5.6]
+    let boxed: any Cloneable = Point(x: 5, y: 6)
+    let cloned = cloneErased(boxed)          // cloned : any Cloneable
+    print(cloned.describe())                 // point   (dispatched through the erased clone)
+}

@@ -9,6 +9,7 @@ Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease
 - [vision.md](vision.md) — what Nomu is for: goals, performance profile, design principles, rejected directions, and the tiebreaker for future decisions.
 - [memory-model.md](memory-model.md) — the value/reference split, the GC (MMTk), immutability, escape analysis, the performance recipe, and every binding form's memory meaning.
 - [types.md](types.md) — type system apart from interfaces: generics + dispatch, sum types + exhaustive matching, error handling.
+- [generics.md](generics.md) — **authoritative as-built spec** for generics: parameters, inference, checking, witness-passing + monomorphization, generic types, the `shared` bound + conditional conformance, exhaustiveness, `Result`.
 - [interfaces.md](interfaces.md) — conformance, dispatch, extensions, and composition.
 - [modules.md](modules.md) — **stub**: modules / compilation units and access control (undesigned; reserved).
 - [concurrency.md](concurrency.md) — concurrency model, suspension primitive, share analysis, closures, continuations.
@@ -36,7 +37,7 @@ Docs also carry an **API scope** note where relevant: no concrete keyword or API
 
 Each doc owns its own rollup; the cross-cutting highlights:
 
-- **Generics** — dispatch strategy, power ceiling, the `shareable` bound, checking model. Highest-priority forward item (`types.md` §5, `interfaces.md` §4.5).
+- **Generics** — **built through M5** and specified as-built in `generics.md` (parameters, inference, checking, witness-passing + monomorphization, generic types, `shared` bound, exhaustiveness, `Result`). Remaining open items are the deferred surface listed there (§10): operators-as-requirements, associated types, `?`/typed-throws, the newtype mechanism.
 - **Concurrency** — the model is essentially complete (`concurrency.md`): the shareability rule (§1), suspension core (§2), continuations (§3, §6), channels as a deferred library (§4), share analysis (§5), the **cancellation model** (§7), the **scope surface** (§8), and the **actor surface** (§9) are all decided. The **shared-mutable primitive** is decided-deferred (§10 — reserved fourth shareable category). Remaining: the **spelling batch** and the shared-mutable design when generics land.
 - **Runtime/scheduler** — work-stealing internals, stack growth, task-locals, remote-wake primitive, platform/syscall (no-libc) strategy, and deferred FFI attach/pinning (`runtime.md` §7).
 - **Deterministic resource cleanup** — `defer` is Decided; linear / non-copyable types deferred to M7 (`memory-model.md` §6.2).

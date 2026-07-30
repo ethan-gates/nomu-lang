@@ -703,38 +703,22 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
     }
 
-    func testConstraintOnlyInterfaceRejectedAsAny() {
-        // A `Self`-mentioning interface can't be `any I` — the box can't guarantee two
-        // `Self` values share a concrete type.
+    func testContravariantSelfRejectedAsAny() {
+        // A *contravariant* `Self` (parameter position) stays constraint-only after 5.6 — the box
+        // can't guarantee two `Self` values share a concrete type.
         let r = sema("""
-        interface Cloneable {
-            fun clone() -> Self
+        interface Combinable {
+            fun combined(with: Self) -> Self
         }
-        fun f(c: any Cloneable) -> Int { return 0 }
+        fun f(c: any Combinable) -> Int { return 0 }
         """)
         XCTAssertTrue(r.diagnostics.hasErrors)
         XCTAssertTrue(r.diagnostics.render().contains("constraint-only"), r.diagnostics.render())
     }
 
-    func testConstraintOnlyPropagatesThroughRefinement() {
-        // `Duplicable: Cloneable` inherits the constraint-only property, so `any Duplicable`
-        // is rejected too even though Duplicable itself doesn't mention `Self`.
-        let r = sema("""
-        interface Cloneable {
-            fun clone() -> Self
-        }
-        interface Duplicable: Cloneable {
-            fun tag() -> String
-        }
-        fun f(d: any Duplicable) -> Int { return 0 }
-        """)
-        XCTAssertTrue(r.diagnostics.hasErrors)
-        XCTAssertTrue(r.diagnostics.render().contains("constraint-only"), r.diagnostics.render())
-    }
-
-    func testConstraintOnlyInterfaceEmitsNoWitnesses() {
-        // A constraint-only interface has no `any I` form, so no witness table / conformance
-        // instance is emitted (M5 A2). Conformance is still checked for correctness.
+    func testCovariantSelfAcceptedAsAny() {
+        // A *covariant* `Self` (return position) is erasure-safe: `any Cloneable` is legal and a
+        // witness table is emitted, with `clone()`'s slot erased to `any I` (M5 5.6).
         let r = sema("""
         interface Cloneable {
             fun clone() -> Self
@@ -743,10 +727,44 @@ final class SemaTests: XCTestCase {
             var x: Int
             fun clone() -> Point { return Point(x: x) }
         }
+        fun f(c: any Cloneable) -> any Cloneable { return c.clone() }
+        """)
+        XCTAssertFalse(r.diagnostics.hasErrors, r.diagnostics.render())
+        XCTAssertTrue(r.module.interfaces.contains { $0.name == "Cloneable" })       // witness layout emitted
+        XCTAssertTrue(r.module.conformances.contains { $0.interfaceName == "Cloneable" })
+    }
+
+    func testContravariantSelfPropagatesThroughRefinement() {
+        // `Mergeable: Combinable` inherits the (contravariant) constraint-only property, so
+        // `any Mergeable` is rejected even though Mergeable itself doesn't mention `Self`.
+        let r = sema("""
+        interface Combinable {
+            fun combined(with: Self) -> Self
+        }
+        interface Mergeable: Combinable {
+            fun tag() -> String
+        }
+        fun f(d: any Mergeable) -> Int { return 0 }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("constraint-only"), r.diagnostics.render())
+    }
+
+    func testContravariantSelfEmitsNoWitness() {
+        // A contravariant-`Self` interface has no `any I` form, so no witness table / conformance
+        // instance is emitted. Conformance is still checked for correctness.
+        let r = sema("""
+        interface Combinable {
+            fun combined(with: Self) -> Self
+        }
+        struct Tally: Combinable {
+            var n: Int
+            fun combined(with: Tally) -> Tally { return Tally(n: n + with.n) }
+        }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
-        XCTAssertTrue(r.module.interfaces.isEmpty)     // no witness-table layout
-        XCTAssertTrue(r.module.conformances.isEmpty)   // no witness instance
+        XCTAssertFalse(r.module.interfaces.contains { $0.name == "Combinable" })     // no witness-table layout
+        XCTAssertFalse(r.module.conformances.contains { $0.interfaceName == "Combinable" })
     }
 
     func testSelfOutsideInterfaceRejected() {
@@ -760,31 +778,32 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(r.diagnostics.hasErrors)
     }
 
-    func testConstraintOnlyRefinerKeepsAnyableBaseWitness() {
-        // `Cloneable: Named` is constraint-only (mentions Self), but its base `Named` is not.
-        // A conformer of Cloneable still conforms to `any Named` — the base witness is emitted
-        // per interface, so `any Named = point` is legal (the mixed case, M5 A2).
+    func testContravariantRefinerKeepsAnyableBaseWitness() {
+        // `Combinable: Named` is constraint-only (contravariant Self), but its base `Named` is not.
+        // A conformer of Combinable still conforms to `any Named` — the base witness is emitted per
+        // interface, so `any Named = tally` is legal (the mixed case).
         let r = sema("""
         interface Named {
             var name: String { get }
         }
-        interface Cloneable: Named {
-            fun clone() -> Self
+        interface Combinable: Named {
+            fun combined(with: Self) -> Self
         }
-        struct Point: Cloneable {
+        struct Tally: Combinable {
             var name: String
-            fun clone() -> Point { return Point(name: name) }
+            var n: Int
+            fun combined(with: Tally) -> Tally { return Tally(name: name, n: n + with.n) }
         }
         fun f(n: any Named) -> String { return n.name }
         fun main() {
-            let p = Point(name: "p")
-            print(f(p))
+            let t = Tally(name: "t", n: 1)
+            print(f(t))
         }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
-        // A Named witness exists; no Cloneable witness (it's constraint-only).
-        XCTAssertTrue(r.module.conformances.contains { $0.typeName == "Point" && $0.interfaceName == "Named" })
-        XCTAssertFalse(r.module.conformances.contains { $0.interfaceName == "Cloneable" })
+        // A Named witness exists; no Combinable witness (it's constraint-only).
+        XCTAssertTrue(r.module.conformances.contains { $0.typeName == "Tally" && $0.interfaceName == "Named" })
+        XCTAssertFalse(r.module.conformances.contains { $0.interfaceName == "Combinable" })
     }
 
     func testSelfFreeInterfaceStillAnyUsable() {
@@ -1528,17 +1547,33 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
     }
 
-    func testConstraintOnlyBoundRejected() {
+    func testSelfBoundAccepted() {
+        // A `Self`-mentioning interface is now usable as a generic bound (M5 5.6) — monomorphization
+        // specializes the body to a concrete `T`, so `-> Self` is a direct call with no witness.
+        // Both covariant (Cloneable) and contravariant (Combinable) bounds are allowed.
         let r = sema("""
         interface Cloneable {
             fun clone() -> Self
         }
-        fun f<T: Cloneable>(x: T) -> Int {
-            return 0
+        interface Combinable {
+            fun combined(with: Self) -> Self
+        }
+        struct P: Cloneable {
+            var x: Int
+            fun clone() -> P { return P(x: x) }
+        }
+        struct Q: Combinable {
+            var n: Int
+            fun combined(with: Q) -> Q { return Q(n: n + with.n) }
+        }
+        fun dup<T: Cloneable>(v: T) -> T { return v.clone() }
+        fun add<T: Combinable>(a: T, b: T) -> T { return a.combined(with: b) }
+        fun main() {
+            print(dup(P(x: 1)).x)
+            print(add(Q(n: 2), Q(n: 3)).n)
         }
         """)
-        XCTAssertTrue(r.diagnostics.hasErrors)
-        XCTAssertTrue(r.diagnostics.render().contains("supported yet"), r.diagnostics.render())
+        XCTAssertFalse(r.diagnostics.hasErrors, r.diagnostics.render())
     }
 
     // M5 5.3.2 — the `shared` bound.
