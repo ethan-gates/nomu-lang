@@ -1,0 +1,24 @@
+// Error handling with the prelude `Result<T, E>` (M5 5.5). No local definition and
+// no import — `Result` is a stdlib citizen, like `Option`. Handling is explicit
+// `switch` over `.ok` / `.err`; there is no `?` operator and no typed throws.
+
+fun divide(a: Int, b: Int) -> Result<Int, String> {
+    if b == 0 {
+        return .err(error: "divide by zero")
+    }
+    return .ok(value: a / b)
+}
+
+fun main() {
+    let good = divide(10, 2)
+    switch good {
+    case .ok(let v):  print(v)          // 5
+    case .err(let e): print(e)
+    }
+
+    let bad = divide(1, 0)
+    switch bad {
+    case .ok(let v):  print(v)
+    case .err(let e): print(e)          // divide by zero
+    }
+}
