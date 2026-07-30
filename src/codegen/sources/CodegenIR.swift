@@ -1164,7 +1164,7 @@ public struct CodegenIR {
     }
 
     // Whether a value can cross a task boundary. The structural rule lives in the
-    // frontend `Shareability` helper (design: concurrency.md §5, m5-spec 5.3), built
+    // frontend `Shareability` helper (design: concurrency.md §5, generics.md §7), built
     // once in `init` from the IR type decls; here we add the one codegen-local case:
     // a bare `.typeParam` T is shareable iff T is a `<shared T>` parameter of the
     // function whose body is being emitted (M5 5.3.2).

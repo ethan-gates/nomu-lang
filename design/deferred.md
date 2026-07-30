@@ -13,10 +13,10 @@ Status vocabulary matches `readme.md` §"Reading the status tags".
 ## `shared` on function-type / existential spellings
 
 - **What.** The explicit `shared (A) -> B` (shareable closure/function type) and
-  `shared any I` (shareable existential) spellings from `generics.md` §3a. The
-  `<shared T>` *bound* shipped in M5 (m5-spec 5.3.2); these two spellings did not.
+  `shared any I` (shareable existential) spellings (`generics.md` §2). The
+  `<shared T>` *bound* shipped in M5 (`generics.md` §7); these two spellings did not.
 - **Why deferred (Decided 2026-07-28).** No consumer in M5. Shareability is
-  auto-derived structurally (m5-spec 5.3.1), so no annotation is needed for the
+  auto-derived structurally (`generics.md` §7), so no annotation is needed for the
   common case. The explicit marker is only required on a **closure/generic parameter
   forwarded to a task where the forwarding body is hidden from the caller**
   (`concurrency.md` §5). Those hidden-body boundaries are **interface method
@@ -36,4 +36,4 @@ Status vocabulary matches `readme.md` §"Reading the status tags".
   param's shareability requirement from a visible body (`concurrency.md` §5,
   "inferred bottom-up" — a *Leaning* item) keeps `shared` unwritten for ordinary
   functions. Larger analysis; independent of the spelling above.
-- **Refs.** `generics.md` §3a; `concurrency.md` §5; `m5-spec.md` 5.3.3.
+- **Refs.** `generics.md` §2, §10; `concurrency.md` §5; `interfaces.md` §8.

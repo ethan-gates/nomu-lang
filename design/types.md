@@ -72,32 +72,31 @@ struct Counter {
 
 ## 4. Generics
 
-**Decided:** generics are real and first-class. **Open (highest-priority forward item):** the full design — dispatch strategy, power ceiling, and how the "shareable" bound rides on type parameters. The M5 working design (decided variance, deferred items, dispatch/checking direction) lives in `generics.md`; this section keeps the model overview.
+Generics are real and first-class, **built through M5 and specified as-built in `generics.md`** — parameters, type-argument inference, checking, witness-passing + monomorphization, generic types, the `shared` bound + conditional conformance, exhaustiveness, and `Result`. This section keeps only the model overview; `generics.md` is authoritative.
 
-- **Dispatch strategy — leaning monomorphization, not locked.** Monomorphization gives zero-cost generics, no witness table, and a small runtime, and it is the same specialization that would close the performance gap to Swift (`memory-model.md` §8). Dictionary-passing / existential lowering is not ruled out. **`any Interface` existentials** (dynamic dispatch) are opt-in regardless of this choice. — **Open (leaning monomorphization).**
-- **Power ceiling** — associated types, constraints; target ~Rust-trait level, **no HKT**. Associated types / generic interfaces, conditional conformance, and `some` (opaque type) mechanics are the highest-complexity area, tracked in `interfaces.md` §4.5. — **Open.**
-- **The "shareable" bound rides on type parameters** — a `<T: shareable>` bound is **declared, not inferred-at-instantiation**, for local errors, honest signatures, and because generics aren't guaranteed to monomorphize (a dictionary-passing/existential generic is checked once against its bound). Full share analysis in `concurrency.md` §5. — **Decided (bound is declared); spelling open.**
-- **Checking model** — whether generic bodies are checked modularly against the bound (Rust-style) or per-instantiation (C++-style) is open and ties to the dispatch choice (`interfaces.md` §3). — **Open.**
-
-Monomorphization is the leading candidate because it gives strong performance *and* a small runtime. Under the GC pivot the generics design sheds the region-summary coupling that made it hard in the ARC era. Decide the details when generics are actually implemented.
+- **Dispatch — witness-passing baseline + monomorphization (Decided; built).** A generic body compiles once against its bounds' protocol witnesses (dictionary-passing); monomorphization is a specialization pass that, under the single compilation unit, runs on **everything**, so generic code is static in practice. **`any I` existentials** are the opt-in dynamic form. The *guaranteed*-static levers (independent of specialization) are **concrete types** and **`some I`** (`generics.md` §1, §6).
+- **Checking — modular against declared bounds (Decided; built).** A body is checked once against exactly what `T: I` promises, which keeps witness-passing, monomorphization, and future GC value-witness stenciling all reachable (`generics.md` §4).
+- **Power ceiling — ~Rust-trait level, no HKT.** Associated types / generic interfaces, general (user-declared) conditional conformance, and operators-as-requirements are the deferred surface (`generics.md` §10, `interfaces.md` §8).
+- **The `<shared T>` bound rides on type parameters — declared, not inferred (built).** A declared bound gives local errors and honest signatures and works whether or not the generic monomorphizes. Full share analysis: `concurrency.md` §5; as-built: `generics.md` §7.
 
 ---
 
 ## 5. Error handling
 
-**Errors are values, not exceptions.** — **Decided (2026-07-16).** There is no `throw`/`catch` and no stack-unwinding exception mechanism; a failable operation returns its error as a value, propagated explicitly. This is load-bearing across the design: the cancellation model keeps cancellation distinct from errors precisely because errors are values (`concurrency.md` §7), closure failability rides in the return type (§6), and the continuation hands failures back as a value (`resume(Result)`, §3). It fits the small-runtime, no-mandatory-unwinding, legible-and-explicit style.
+**Errors are values, not exceptions.** — **Decided (2026-07-16).** There is no `throw`/`catch` and no stack-unwinding exception mechanism; a failable operation returns its error as a value, propagated explicitly. This runs through the design: cancellation stays distinct from errors precisely because errors are values (`concurrency.md` §7), closure failability rides in the return type (`concurrency.md` §6), and the continuation hands failures back as a value (`resume(Result)`, `concurrency.md` §3). It fits the small-runtime, no-mandatory-unwinding, explicit style.
 
-**The form is open.** — **Open (leaning a `Result` sum type + a `?`-style propagation operator).** Sub-items:
-- **The carrier** — a `Result` sum type vs. a Go-style tuple vs. **other approaches worth exploring** when the time comes (the author wants to consider options beyond sum types and tuples, not just pick between those two).
-- **The `?` operator** — whether to adopt a propagation operator, and its form.
+**Carrier — `Result<T, E>`. — Decided (2026-07-19); built (M5).** A generic sum type `enum Result<T, E> { case ok(value: T)  case err(error: E) }`, a **prelude citizen** in `src/stdlib/core.nomu` (usable with no import, like `Option`), handled by explicit `match`/`switch` over `.ok`/`.err`. The alternatives weighed and dropped were a Go-style tuple and other carriers; the sum type won. As-built detail: `generics.md` §9.
+
+**Deferred:**
+- **The `?` operator** — a propagation operator, and its form.
 - **Typed throws** — whether error types appear in signatures.
 
-Finalize alongside generics (an error type is often generic). Go-philosophy explicit handling is the leaning.
+Go-philosophy explicit `match` handling is the shipped baseline; the sugar above is later work.
 
 ---
 
 ## 6. Open questions
 
-- **Generics** — dispatch strategy (monomorphization vs. dictionary-passing), power ceiling (associated types, constraints; ~Rust-trait level, no HKT), the `<T: shareable>` bound spelling, and modular-vs-per-instantiation checking. Highest-priority forward item (§4).
-- **Error handling form** — errors-as-values is Decided (§5); open is the carrier (`Result`/tuple/other) and the `?` operator / typed-throws question.
-- **Associated types / generic interfaces, conditional conformance, `some` mechanics** — tracked with the interface composition work (`interfaces.md` §4.5).
+- **Generics** — **built through M5** (dispatch, checking, the `<shared T>` bound, and `some` mechanics all resolved; §4, `generics.md`). Remaining open items are the deferred surface in `generics.md` §10: associated types, operators-as-requirements, general conditional conformance, the newtype mechanism.
+- **Error handling form** — errors-as-values is Decided and the `Result<T, E>` carrier is built (§5); open is the `?` operator and typed throws.
+- **Associated types / generic interfaces, general conditional conformance** — tracked with the interface + generics work (`interfaces.md` §8, `generics.md` §10). (`some` opaque-type mechanics are Decided and built — `interfaces.md` §5.2.)

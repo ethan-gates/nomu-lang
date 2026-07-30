@@ -4,7 +4,7 @@
 // under the single compilation unit), so these are callable with no import. Seeded
 // with monomorphic Int helpers that need no generics or new primitives. `Option<T>`
 // is the first generic citizen (M5 5.2.4); `Result<T, E>` the second (M5 5.5).
-// (Design: m4.13-spec.md §2, m5-spec.md §5.2.4, §5.5.)
+// (Design: generics.md §5 (Option), §9 (Result).)
 
 // A value that is present (`some`) or absent (`none`). Payloads are labelled, so the
 // spelling is `Option.some(value: x)` / `.some(value: x)` and `case .some(let v)`.

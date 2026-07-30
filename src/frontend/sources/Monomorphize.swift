@@ -1,5 +1,5 @@
-// Monomorphization — the specialization pass (m5-spec 5.4; design: generics.md §1,
-// compiler.md §1). An IR→IR pass, run after Sema/exhaustiveness and before codegen.
+// Monomorphization — the specialization pass (design: generics.md §6, compiler.md §1).
+// An IR→IR pass, run after Sema/exhaustiveness and before codegen.
 //
 // Under a single compilation unit there is no ABI boundary to preserve, so this
 // specializes **every** generic instantiation (Swift's whole-module optimization).
@@ -17,7 +17,7 @@
 //
 // Whole-program mono is a policy for the single-CU world; when multi-file/module builds
 // land it is rescoped to within-module (cross-module specialization opt-in), preserving
-// the stable-ABI default at module edges (m5-spec 5.4).
+// the stable-ABI default at module edges (generics.md §6).
 
 public func monomorphize(_ module: IRModule, into diags: DiagnosticSink) -> IRModule {
     Monomorphizer(module: module, diags: diags).run()

@@ -1,4 +1,4 @@
-// The structural share-analysis predicate (design: concurrency.md §5, m5-spec 5.3):
+// The structural share-analysis predicate (design: concurrency.md §5, generics.md §7):
 // which types can cross a task boundary. Shared by Sema (discharging a `<shared T>`
 // bound at generic call sites, on AST decls) and codegen (the `spawn`-capture check,
 // on IR decls) — each supplies a `lookup` that reports a named type's fields.
