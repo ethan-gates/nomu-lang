@@ -83,4 +83,23 @@ final class LexerTests: XCTestCase {
                        Span(file: "t.nomu", begin: Pos(line: 2, col: 3), end: Pos(line: 2, col: 5)))
         XCTAssertEqual(toks[2].kind, .eof)
     }
+
+    // An unexpected character is reported and skipped; lexing continues (no crash),
+    // so the surrounding tokens still come through.
+    func testUnexpectedCharacterIsSkipped() {
+        let diags = DiagnosticSink()
+        var lexer = Lexer("a # b", diagnostics: diags)
+        let kinds = lexer.tokenize().map(\.kind)
+        XCTAssertTrue(diags.hasErrors)
+        XCTAssertEqual(kinds, [.ident("a"), .ident("b"), .eof])
+    }
+
+    // An unterminated string reports and returns what it read, up to EOF.
+    func testUnterminatedStringRecovers() {
+        let diags = DiagnosticSink()
+        var lexer = Lexer("\"hello", diagnostics: diags)
+        let kinds = lexer.tokenize().map(\.kind)
+        XCTAssertTrue(diags.hasErrors)
+        XCTAssertEqual(kinds, [.stringLit("hello"), .eof])
+    }
 }

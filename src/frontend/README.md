@@ -13,20 +13,30 @@ incremental compilation (§8), and debug info (§1/§4). Seeded 2026-07-30 from 
 architecture evaluation. Design deferrals (features, not architecture) live in
 `design/deferred.md`.
 
-### P0 — no-crash contract + parser error recovery
-The **one live architectural blocker** for the query-server / LSP goal. The
-frontend currently **aborts the process on the first error** — `exit(1)` in
-`Lexer.swift:227`, `Parser.swift:776` (`error(_:) -> Never`), and
-`Typechecker.swift:179`. A server can't `exit` on a keystroke, and there is no
-resilient tree from broken input (the parser bails; only Sema collect-and-continues).
-- Route lexer/parser/typechecker errors into the **`DiagnosticSink`** (already the
-  Sema model), never `exit` / `-> Never`.
-- Add **parser error recovery** (resilient parsing): on an unexpected token,
-  synthesize an error node and resynchronize (e.g. to the next statement/decl
-  boundary or a closing brace) so a usable AST comes out of broken input.
-- Contract to hold going forward: **library layers return diagnostics, never crash.**
-  Exit codes belong to the CLI/driver only. Audit `preconditionFailure` in
-  `Sema.swift` (362/364/434/455) — keep only for genuinely-unreachable invariants.
+### P0 — no-crash contract + parser error recovery — **done (2026-07-30)**
+Was the **one live architectural blocker** for the query-server / LSP goal: the
+frontend aborted the process on the first error (`exit(1)` in the lexer, parser, and
+typechecker `error/fail -> Never`). Now:
+- Lexer, parser, and typechecker take an injected **`DiagnosticSink`** and collect
+  errors instead of exiting; all three `-> Never` reporters are gone. The driver is
+  the only exit boundary — it reports the sink and `exit(1)` after the parse phase (if
+  errors) and after the typecheck phase.
+- **Parser error recovery**: `error(_:)` enters panic mode (one diagnostic per broken
+  construct, cleared at the next member/statement boundary); `expect`/`expectIdent`
+  synthesize a placeholder without consuming; unparseable expressions become an
+  `Expr.error` node (`AST.swift`); type-body loops `recover(to:)` a member/decl
+  boundary and statement/arg loops carry a no-progress guard, so a usable AST always
+  comes out of broken input and parsing never stalls. Coverage in
+  `tests/ParserRecoveryTests.swift` and the two lexer-recovery tests.
+- Contract now holding: **library layers return diagnostics, never crash.** The four
+  `preconditionFailure`s in `Sema.swift` were audited — all guard genuinely-unreachable
+  internal invariants (interfaces filtered before `lowerDecl`, extensions merged
+  pre-Sema, two exhaustive-dispatch defaults), none see user input; kept as-is.
+- **Still future (LSP, not this pass):** Sema/typecheck are still run *only* when the
+  parse sink is clean — the driver stops after parse errors, so `Expr.error` nodes never
+  reach Sema. A query server will want to continue into Sema over a partial tree; that
+  needs `Expr.error` threaded through Sema's checker (it has a compile-time case today
+  that returns an `.error`-typed placeholder, but the path is untested end-to-end).
 
 ### P1 — structured diagnostics
 Today a `Diagnostic` is `severity + message + span`. LSP quality (and stable tests)

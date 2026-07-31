@@ -273,6 +273,11 @@ public indirect enum Expr {
     case call(Expr, [Arg], span: Span)
     case binary(BinOp, Expr, Expr, span: Span)
     case closure(params: [Param], ret: TypeRef?, body: Block, span: Span)
+
+    // A placeholder for an expression the parser could not build from broken input.
+    // Only produced during error recovery — a diagnostic is always reported alongside
+    // it, and the driver stops before Sema when the parse sink holds errors.
+    case error(span: Span)
 }
 
 public struct Arg {

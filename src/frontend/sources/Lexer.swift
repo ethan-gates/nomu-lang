@@ -1,6 +1,6 @@
 import Foundation
 
-public enum TokenKind: Equatable {
+public enum TokenKind: Hashable {
     // Literals
     case intLit(Int)
     case boolLit(Bool)
@@ -59,10 +59,15 @@ public struct Lexer {
     private let file: String
     private let lineStarts: [Int]   // char offset of the start of each line
     private var pos: Int = 0
+    // Errors are collected, not fatal: an unexpected character is reported and skipped so
+    // lexing continues (the no-crash contract — frontend/README.md P0). A reference type,
+    // so the driver can share one sink across the lexer and parser.
+    private let diags: DiagnosticSink
 
-    public init(_ source: String, file: String = "<input>") {
+    public init(_ source: String, file: String = "<input>", diagnostics: DiagnosticSink = DiagnosticSink()) {
         src = Array(source)
         self.file = file
+        self.diags = diagnostics
         var starts = [0]
         for (i, c) in src.enumerated() where c == "\n" { starts.append(i + 1) }
         lineStarts = starts
@@ -79,14 +84,20 @@ public struct Lexer {
     }
 
     private mutating func next() -> Token {
-        skipWhitespaceAndComments()
-        let start = pos
-        let kind = scanKind()
-        return Token(kind: kind, span: Span(file: file, begin: posAt(start), end: posAt(pos)))
+        // Loop past any characters that produced no token (reported + skipped), so a bad
+        // character never yields a spurious token and never stalls tokenization.
+        while true {
+            skipWhitespaceAndComments()
+            let start = pos
+            if let kind = scanKind() {
+                return Token(kind: kind, span: Span(file: file, begin: posAt(start), end: posAt(pos)))
+            }
+        }
     }
 
-    // Scans one token's kind, advancing `pos` past it.
-    private mutating func scanKind() -> TokenKind {
+    // Scans one token's kind, advancing `pos` past it. Returns nil when it reported an
+    // error and skipped the offending character — the caller retries for the next token.
+    private mutating func scanKind() -> TokenKind? {
         guard pos < src.count else { return .eof }
 
         let c = src[pos]
@@ -115,7 +126,7 @@ public struct Lexer {
             if peek() == "=" { pos += 1; return .eqEq }
             return .eq
         case "!":
-            guard peek() == "=" else { error("unexpected character '!'", at: pos - 1) }
+            guard peek() == "=" else { error("unexpected character '!'", at: pos - 1); return nil }
             pos += 1; return .bangEq
         case "<":
             if peek() == "=" { pos += 1; return .ltEq }
@@ -126,6 +137,7 @@ public struct Lexer {
         case "&": return .amp
         default:
             error("unexpected character '\(c)'", at: pos - 1)
+            return nil
         }
     }
 
@@ -200,7 +212,12 @@ public struct Lexer {
             }
             pos += 1
         }
-        guard pos < src.count else { error("unterminated string literal", at: startOffset) }
+        guard pos < src.count else {
+            // Ran off the end without a closing quote: report and take what we have, so the
+            // rest of the token stream (up to EOF) is still usable.
+            error("unterminated string literal", at: startOffset)
+            return .stringLit(value)
+        }
         pos += 1  // consume closing "
         return .stringLit(value)
     }
@@ -221,9 +238,8 @@ public struct Lexer {
         return Pos(line: lo + 1, col: offset - lineStarts[lo] + 1)
     }
 
-    private func error(_ msg: String, at offset: Int) -> Never {
+    private func error(_ msg: String, at offset: Int) {
         let p = posAt(offset)
-        fputs("error:\(p.line):\(p.col): \(msg)\n", stderr)
-        exit(1)
+        diags.error(msg, at: Span(file: file, begin: p, end: p))
     }
 }

@@ -37,8 +37,10 @@ The backend (LLVM) does not understand the language's semantics, so running thes
 
 - **Prototype: emit C or bind a simple backend** — throwaway scaffolding to get native execution fast and validate the surface + type system + runtime integration without building production codegen. — **Decided (direction).**
 - **Release builds: LLVM**, for peak native performance, driven via a stable interface. — **Decided (post-prototype).**
-- **Debug/dev builds: consider Cranelift** for fast compiles. — **Deferred.**
-- **MLIR** if heavy language-specific optimization is wanted. — **Open.**
+- **Debug/dev builds: consider Cranelift** for fast compiles. — **Deferred** (past M8 — a later fast-compile play once LLVM iteration pain bites).
+- **MLIR** if heavy language-specific optimization is wanted. — **Not pursued for M8 (2026-07-31)**; plain LLVM. Reconsidered only if heavy custom optimization is later wanted.
+
+**M8 mechanism — Decided (2026-07-31, build plan in `m8-spec.md`).** Drive LLVM's **C++ API behind a thin C++ shim** (our own `.cpp` exposing a narrow Swift-facing interface — the Rust `RustWrapper.cpp` pattern), not the C-API or raw Swift/C++ interop. **GC roots via LLVM statepoints** (`addrspace(1)` + `statepoint-example` + RewriteStatepointsForGC → stack maps the MMTk binding reads as precise roots) — the mechanism built for *moving* collectors and the easiest MMTk integration. Lower the **structured typed IR straight to LLVM** (no bespoke MIR until escape analysis needs it, §1). Scope is **LLVM-only, minimal-correct** — no MLIR, no Cranelift, no incremental in M8.
 
 LLVM is right eventually but is a big time sink that obscures the early questions, so the prototype gets native execution by a cheaper route first. The **GC integration (via MMTk)** is the real, new backend work:
 
@@ -119,9 +121,9 @@ Things to revisit when the C codegen is replaced by the LLVM backend (M8). The C
 ## 7. Open questions
 
 - **Runtime language + MMTk binding (M6).** — MMTk is Rust and exposes a C ABI; the irreducible Rust is a `VMBinding` binding crate, while callers can stay C. Open: keep the runtime (scheduler/allocator) in C with a thin Rust binding and codegen-inlined alloc fast path + barriers, vs. move the runtime to Rust for cleaner MMTk integration (rewrites the M4 scheduler). Codegen target stays C either way (emitting Rust rejected — `unsafe`-everywhere, throwaway before LLVM). Decided (2026-07-21) to **defer to M6** and proceed under two invariants (held through M5) so every M6 option stays open: (1) **single allocation seam** — every heap allocation goes through one codegen-controlled call (`rt_alloc` today), so the allocator can be swapped for MMTk's with a localized change; (2) **explicit, scannable object model** — the M5 object shapes (`any` boxes, witness tables, generic instances) carry a clear header and discoverable pointer layout, so a C or Rust binding (and later LLVM-emitted barriers/maps) can scan them precisely — no representation tricks that assume conservative-only scanning, and the `rt_alloc` header pointer-arithmetic hack (§6) is to be dropped with the M6 object-model work.
-- **GC precision vs. backend (M6 ↔ M8 coupling).** — A moving collector (Immix) needs **precise stack maps**, which the C backend can't emit (§6). So precise MMTk may couple to LLVM (M8) more than the M6-before-M8 order implies. Alternatives on the C path: a **shadow stack** (codegen-maintained root list, portable, per-call overhead) or **conservative stack scanning** (no maps, but pins objects — fights a moving GC). Parked fiber stacks make precise scanning harder still. May reorder M6/M8; open.
-- **MLIR vs. plain LLVM** for the release backend (§2).
-- **Cranelift** for fast debug builds — when it earns its place (§2).
+- **GC precision vs. backend (M6 ↔ M8 coupling).** — **Resolved (2026-07-30): M8 (LLVM) precedes M6.** A moving collector (Immix) needs **precise stack maps**, which the C backend can't emit (§6). The C-path bridges — a **shadow stack** (portable, throwaway) or **conservative scanning** (pins, fights moving and muddies the footprint numbers under test) — were rejected because M6's purpose is to validate the *performance* thesis, which those degrade. So LLVM statepoints supply precise roots first, then the moving collector rests on them (`roadmap.md`, `m6-spec.md` 6.0.4). Parked fiber stacks are scanned precisely via per-fiber saved SP/PC + frame maps (`m6-spec.md` 6.2.2).
+- ~~**MLIR vs. plain LLVM** for the release backend~~ — Resolved: plain LLVM, MLIR not pursued for M8 (§2, `m8-spec.md`).
+- **Cranelift** for fast debug builds — deferred past M8; when it earns its place (§2).
 - **Incremental compilation + cached monomorphizations** — the shape that keeps LLVM iteration bearable.
 - **Runtime-structure layout** for the Tier-3 debugger plugin — co-designed with the scheduler/actor runtime (`concurrency.md`).
 

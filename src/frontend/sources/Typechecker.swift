@@ -1,7 +1,7 @@
-import Foundation
-
 public struct Typechecker {
     private let program: Program
+    // Errors are collected, not fatal (the no-crash contract — frontend/README.md P0).
+    private let diags: DiagnosticSink
     private var typeKinds: [String: DeclKind] = [
         "Int": .builtin,
         "Bool": .builtin,
@@ -12,14 +12,17 @@ public struct Typechecker {
         case struct_, enum_, class_, actor_, interface_, builtin
     }
 
-    public init(_ program: Program) {
+    public init(_ program: Program, diagnostics: DiagnosticSink = DiagnosticSink()) {
         self.program = program
+        self.diags = diagnostics
     }
 
-    public mutating func check() {
+    @discardableResult
+    public mutating func check() -> DiagnosticSink {
         collectTypeKinds()
         checkPOD()
         checkLetVar()
+        return diags
     }
 
     // MARK: - Phase 1: collect declared type names
@@ -174,8 +177,7 @@ public struct Typechecker {
 
     // MARK: - Error reporting
 
-    private func fail(_ msg: String, span: Span) -> Never {
-        fputs("error:\(span.begin.line):\(span.begin.col): \(msg)\n", stderr)
-        exit(1)
+    private func fail(_ msg: String, span: Span) {
+        diags.error(msg, at: span)
     }
 }

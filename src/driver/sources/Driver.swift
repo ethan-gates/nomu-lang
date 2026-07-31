@@ -9,10 +9,13 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
         exit(1)
     }
 
-    var lexer = Lexer(source, file: path)
+    // Lexer and parser share one sink and collect errors rather than exiting on the first
+    // (the no-crash contract — frontend/README.md P0); the driver is the exit boundary.
+    let parseDiags = DiagnosticSink()
+    var lexer = Lexer(source, file: path, diagnostics: parseDiags)
     let tokens = lexer.tokenize()
 
-    var parser = Parser(tokens)
+    var parser = Parser(tokens, diagnostics: parseDiags)
     var program = parser.parse()
 
     // Resolve the output location up front — every artifact lands under
@@ -34,7 +37,16 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     if options.ast || options.stopAt == .ast {
         writeArtifact(dumpAST(program), toFile: stem + ".ast")
     }
-    if options.stopAt == .ast { return }
+    if options.stopAt == .ast {
+        if !parseDiags.isEmpty { fputs(parseDiags.render() + "\n", stderr) }
+        return
+    }
+    // Lex/parse errors are fatal to compilation — the recovered AST has holes, so the
+    // later phases would report noise. Report the collected diagnostics and stop here.
+    if parseDiags.hasErrors {
+        fputs(parseDiags.render() + "\n", stderr)
+        exit(1)
+    }
 
     // Prepend the Nomu standard library, compiled with every program (M4.13). Under
     // the single compilation unit this is a decl concatenation; prelude symbols are
@@ -51,8 +63,13 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     }
 
     // Semantic pass → typed IR. POD + let/var checks (AST typechecker) run first (T2 §4).
-    var checker = Typechecker(program)
+    let typeDiags = DiagnosticSink()
+    var checker = Typechecker(program, diagnostics: typeDiags)
     checker.check()
+    if typeDiags.hasErrors {
+        fputs(typeDiags.render() + "\n", stderr)
+        exit(1)
+    }
 
     var sema = Sema(program)
     let semaResult = sema.check()
@@ -164,11 +181,17 @@ private func outputDirectory(for input: URL, root: URL) -> String {
     return rel.isEmpty ? build : build + "/" + rel
 }
 
-// Lex + parse the embedded prelude and prepend its decls to the program (M4.13).
+// Lex + parse the embedded prelude and prepend its decls to the program (M4.13). The
+// prelude is trusted source, so a diagnostic here is a compiler bug, not user error.
 private func prependPrelude(_ program: Program) -> Program {
-    var lexer = Lexer(EmbeddedSources.preludeSource, file: EmbeddedSources.preludeName)
-    var parser = Parser(lexer.tokenize())
+    let preludeDiags = DiagnosticSink()
+    var lexer = Lexer(EmbeddedSources.preludeSource, file: EmbeddedSources.preludeName, diagnostics: preludeDiags)
+    var parser = Parser(lexer.tokenize(), diagnostics: preludeDiags)
     let prelude = parser.parse()
+    if preludeDiags.hasErrors {
+        fputs("internal error: failed to parse the embedded prelude\n" + preludeDiags.render() + "\n", stderr)
+        exit(1)
+    }
     return Program(decls: prelude.decls + program.decls)
 }
 

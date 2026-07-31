@@ -47,6 +47,8 @@ This is the primary performance lever. Value types pay no allocation and no coll
 
 Reference-type memory is managed by a **tracing garbage collector**, integrated via **MMTk** (the Memory Management Toolkit). Ship on **generational Immix** first; an **LXR-style reference-counting collector** (Zhao/Blackburn/McKinley, PLDI 2022 — RC-primary + Immix backing + backup tracing) is the footprint endgame. Swapping collectors is a runtime choice, not a language change. — **Decided.**
 
+**Sourcing (Decided 2026-07-30):** ship on **mainline GenImmix** — a maintained, production plan, a genuine live borrow. The **LXR branch is unmerged/stalled**, so the RC-hybrid endgame is a later **owned** reimplementation behind the same MMTk interface, *not* a dependency on the stalled upstream: depending on abandoned research code costs as much as owning it, with more friction. Commit to the interface so owning/swapping the collector stays localized. Build sequence in `m6-spec.md`.
+
 A tracing GC gives memory safety directly — no use-after-free, no dangling, cycles collected automatically with no `weak`/`unowned` and nothing to annotate. The programmer never reasons about memory. MMTk provides production and research collectors behind one binding interface, so Nomu commits to the *interface* (object model, root/stack scanning, barriers) rather than to any single collector, and can move from a mature collector to the tight-footprint one without touching the language. MMTk is written in Rust, which fits Nomu's Rust-oriented codegen.
 
 **Rejected alternatives:**

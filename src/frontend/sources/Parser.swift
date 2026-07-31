@@ -3,22 +3,32 @@ import Foundation
 public struct Parser {
     private let tokens: [Token]
     private var pos: Int = 0
+    // Errors are collected, not fatal (the no-crash contract — frontend/README.md P0). A
+    // shared reference type so the driver can thread one sink through the lexer and parser.
+    private let diags: DiagnosticSink
+    // Panic mode: once an error is reported, further errors are suppressed until a recovery
+    // routine resynchronizes to a known boundary — this collapses one broken construct into
+    // a single diagnostic instead of a cascade.
+    private var panicking = false
 
-    public init(_ tokens: [Token]) {
+    public init(_ tokens: [Token], diagnostics: DiagnosticSink = DiagnosticSink()) {
         self.tokens = tokens
+        self.diags = diagnostics
     }
 
     public mutating func parse() -> Program {
         var decls: [TopDecl] = []
         while !check(.eof) {
-            decls.append(parseTopDecl())
+            if let decl = parseTopDecl() { decls.append(decl) }
         }
         return Program(decls: decls)
     }
 
     // MARK: - Top-level declarations
 
-    private mutating func parseTopDecl() -> TopDecl {
+    // Returns nil when the current token starts no declaration: the token is reported and
+    // recovery skips to the next declaration boundary, so later decls still parse.
+    private mutating func parseTopDecl() -> TopDecl? {
         switch currentKind {
         case .kwStruct: return .structDecl(parseStructDecl())
         case .kwEnum:   return .enumDecl(parseEnumDecl())
@@ -29,8 +39,19 @@ public struct Parser {
         case .kwFunc:   return .funcDecl(parseFuncDecl())
         default:
             error("expected top-level declaration, got \(currentKind)")
+            recover(to: Self.declStart)
+            return nil
         }
     }
+
+    // Tokens that begin a top-level declaration — the resync set for declaration recovery.
+    private static let declStart: Set<TokenKind> =
+        [.kwStruct, .kwEnum, .kwClass, .kwActor, .kwInterface, .kwExtension, .kwFunc]
+
+    // Tokens that introduce a member inside any type body (plus the closing brace) — the
+    // resync set when a type-body loop meets a token that starts no member.
+    private static let memberBoundary: Set<TokenKind> =
+        [.kwVar, .kwLet, .kwFunc, .kwCase, .kwOn, .rBrace]
 
     // An optional `: I1, I2` conformance clause following a type name (M5 A1.3).
     private mutating func parseConformanceClause() -> [Conformance] {
@@ -78,6 +99,7 @@ public struct Parser {
         var properties: [ComputedProperty] = []
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
+            panicking = false
             if check(.kwVar) || check(.kwLet) {
                 switch parseFieldOrProperty() {
                 case .field(let f):    fields.append(f)
@@ -88,6 +110,7 @@ public struct Parser {
                 methods.append(parseFuncDecl())
             } else {
                 error("expected 'let', 'var', or 'fun' in struct body, got \(currentKind)")
+                recover(to: Self.memberBoundary)
             }
         }
         expect(.rBrace)
@@ -106,6 +129,7 @@ public struct Parser {
         var properties: [ComputedProperty] = []
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
+            panicking = false
             if check(.kwCase) {
                 cases.append(parseEnumCaseDecl())
             } else if check(.kwVar) {
@@ -116,11 +140,14 @@ public struct Parser {
                 }
             } else if check(.kwLet) {
                 error("enums cannot store fields")
+                advance()   // consume `let`, then skip the field's tokens to the next member
+                recover(to: Self.memberBoundary)
             } else if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseFuncDecl())
             } else {
                 error("expected 'case', 'var', or 'fun' in enum body, got \(currentKind)")
+                recover(to: Self.memberBoundary)
             }
         }
         expect(.rBrace)
@@ -157,6 +184,7 @@ public struct Parser {
         var properties: [ComputedProperty] = []
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
+            panicking = false
             if check(.kwVar) || check(.kwLet) {
                 switch parseFieldOrProperty() {
                 case .field(let f):    fields.append(f)
@@ -167,6 +195,7 @@ public struct Parser {
                 methods.append(parseFuncDecl())
             } else {
                 error("expected 'let', 'var', or 'fun' in class body, got \(currentKind)")
+                recover(to: Self.memberBoundary)
             }
         }
         expect(.rBrace)
@@ -192,6 +221,7 @@ public struct Parser {
         var methods: [FuncDecl] = []
         var properties: [ComputedProperty] = []
         while !check(.rBrace) && !check(.eof) {
+            panicking = false
             if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseFuncDecl())
@@ -204,6 +234,7 @@ public struct Parser {
                 }
             } else {
                 error("expected 'fun' or a computed property in extension body, got \(currentKind)")
+                recover(to: Self.memberBoundary)
             }
         }
         expect(.rBrace)
@@ -226,6 +257,7 @@ public struct Parser {
         var methods: [InterfaceMethod] = []
         var properties: [InterfacePropertyReq] = []
         while !check(.rBrace) && !check(.eof) {
+            panicking = false
             if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseInterfaceMethod())
@@ -234,6 +266,7 @@ public struct Parser {
                 properties.append(parseInterfacePropertyReq())
             } else {
                 error("expected 'fun' or 'var' requirement in interface body, got \(currentKind)")
+                recover(to: Self.memberBoundary)
             }
         }
         expect(.rBrace)
@@ -262,8 +295,8 @@ public struct Parser {
         expect(.colon)
         let type = parseTypeRef()
         expect(.lBrace)
-        guard accessorReqKeyword("get") else { error("property requirement needs 'get'") }
-        advance()   // `get`
+        // Recover by continuing as if `get` were present, so `{ get set }` shape still parses.
+        if accessorReqKeyword("get") { advance() } else { error("property requirement needs 'get'") }
         var settable = false
         if accessorReqKeyword("set") { advance(); settable = true }
         expect(.rBrace)
@@ -286,12 +319,14 @@ public struct Parser {
         var fields: [ActorField] = []
         var handlers: [OnHandler] = []
         while !check(.rBrace) && !check(.eof) {
+            panicking = false
             if check(.kwVar) {
                 fields.append(parseActorField())
             } else if check(.kwOn) {
                 handlers.append(parseOnHandler())
             } else {
                 error("expected 'var' or 'on' in actor body, got \(currentKind)")
+                recover(to: Self.memberBoundary)
             }
         }
         expect(.rBrace)
@@ -328,7 +363,7 @@ public struct Parser {
         expect(.colon)
         let type = parseTypeRef()
         if check(.lBrace) {
-            guard isMutable else { error("computed properties must be declared with 'var'") }
+            if !isMutable { error("computed properties must be declared with 'var'") }
             let (getter, setter) = parseAccessorBlock()
             return .property(ComputedProperty(name: name, type: type, getter: getter, setter: setter, span: spanFrom(start)))
         }
@@ -344,6 +379,7 @@ public struct Parser {
             var getter: Block? = nil
             var setter: Setter? = nil
             while !check(.rBrace) && !check(.eof) {
+                let before = pos
                 if accessorKeyword("get") {
                     advance()   // `get`
                     getter = parseBlock()
@@ -356,14 +392,23 @@ public struct Parser {
                 } else {
                     error("expected 'get' or 'set' in accessor block, got \(currentKind)")
                 }
+                if pos == before { advance() }   // unexpected token: skip to guarantee progress
             }
             expect(.rBrace)
-            guard let g = getter else { error("a computed property needs a 'get' accessor") }
+            // A missing getter is only an error when the recovery didn't already report one.
+            guard let g = getter else {
+                error("a computed property needs a 'get' accessor")
+                return ([], setter)
+            }
             return (g, setter)
         }
         // Bare body: the whole brace group is the getter (implicit read-only get).
         var stmts: [Stmt] = []
-        while !check(.rBrace) && !check(.eof) { stmts.append(parseStmt()) }
+        while !check(.rBrace) && !check(.eof) {
+            let before = pos
+            stmts.append(parseStmt())
+            if pos == before { advance() }   // unparseable token: skip to guarantee progress
+        }
         expect(.rBrace)
         return (stmts, nil)
     }
@@ -404,6 +449,7 @@ public struct Parser {
         expect(.lParen)
         var params: [Param] = []
         while !check(.rParen) && !check(.eof) {
+            let before = pos
             if !params.isEmpty { expect(.comma) }
             let start = currentSpan
             let label = expectIdent()
@@ -417,6 +463,7 @@ public struct Parser {
             expect(.colon)
             let type = parseTypeRef()
             params.append(Param(label: label, name: name, type: type, span: spanFrom(start)))
+            if pos == before { advance() }   // no token consumed on a malformed param: force progress
         }
         expect(.rParen)
         return params
@@ -476,7 +523,10 @@ public struct Parser {
         expect(.lBrace)
         var stmts: [Stmt] = []
         while !check(.rBrace) && !check(.eof) {
+            panicking = false
+            let before = pos
             stmts.append(parseStmt())
+            if pos == before { advance() }   // unparseable token: skip to guarantee progress
         }
         expect(.rBrace)
         return stmts
@@ -485,7 +535,10 @@ public struct Parser {
     private mutating func parseCaseBody() -> Block {
         var stmts: [Stmt] = []
         while !check(.kwCase) && !check(.rBrace) && !check(.eof) {
+            panicking = false
+            let before = pos
             stmts.append(parseStmt())
+            if pos == before { advance() }   // unparseable token: skip to guarantee progress
         }
         return stmts
     }
@@ -678,7 +731,10 @@ public struct Parser {
             advance()
             return .implicitMember(expectIdent(), span: spanFrom(start))
         default:
+            // No expression here: report and yield an error placeholder. The token is left
+            // for the enclosing statement/argument loop to resynchronize on.
             error("expected expression, got \(currentKind)")
+            return .error(span: currentSpan)
         }
     }
 
@@ -692,7 +748,10 @@ public struct Parser {
         expect(.kwIn)
         var body: [Stmt] = []
         while !check(.rBrace) && !check(.eof) {
+            panicking = false
+            let before = pos
             body.append(parseStmt())
+            if pos == before { advance() }   // unparseable token: skip to guarantee progress
         }
         expect(.rBrace)
         return .closure(params: params, ret: ret, body: body, span: spanFrom(start))
@@ -702,6 +761,7 @@ public struct Parser {
         expect(.lParen)
         var args: [Arg] = []
         while !check(.rParen) && !check(.eof) {
+            let before = pos
             if !args.isEmpty { expect(.comma) }
             // IDENT ':' → labeled argument
             if case .ident(let label) = currentKind, peek() == .colon {
@@ -711,6 +771,7 @@ public struct Parser {
             } else {
                 args.append(Arg(value: parseExpr()))
             }
+            if pos == before { advance() }   // no token consumed on a malformed arg: force progress
         }
         expect(.rParen)
         return args
@@ -733,10 +794,14 @@ public struct Parser {
         if pos + 1 < tokens.count { pos += 1 }
     }
 
+    // On a mismatch, report and return the current token as a placeholder *without*
+    // consuming it — the missing token is synthesized, so the enclosing construct keeps
+    // its shape and later real tokens are not swallowed.
     @discardableResult
     private mutating func expect(_ kind: TokenKind) -> Token {
         guard currentKind == kind else {
             error("expected \(kind), got \(currentKind)")
+            return tokens[pos]
         }
         let tok = tokens[pos]
         advance()
@@ -749,9 +814,12 @@ public struct Parser {
         return true
     }
 
+    // Like `expect`, but yields a placeholder name for a missing identifier so the AST
+    // node can still be built; the diagnostic marks it as an error.
     private mutating func expectIdent() -> String {
         guard case .ident(let name) = currentKind else {
             error("expected identifier, got \(currentKind)")
+            return "<error>"
         }
         advance()
         return name
@@ -763,16 +831,27 @@ public struct Parser {
     // and `fun` members), so declarations never share a line inside a type body.
     // The lexer discards newlines, so this is checked against span line numbers:
     // the previous token must end on an earlier line than this one begins.
-    private func requireLineStart(_ keyword: String) {
+    private mutating func requireLineStart(_ keyword: String) {
         guard pos > 0 else { return }
         if tokens[pos - 1].span.end.line >= currentSpan.begin.line {
             error("'\(keyword)' must begin a new line")
         }
     }
 
-    private func error(_ msg: String) -> Never {
-        let s = currentSpan
-        fputs("error:\(s.begin.line):\(s.begin.col): \(msg)\n", stderr)
-        exit(1)
+    // Report an error at the current token and enter panic mode. While panicking, further
+    // errors are suppressed (one diagnostic per broken construct); a loop-top reset or a
+    // `recover(to:)` clears it at the next boundary.
+    private mutating func error(_ msg: String) {
+        guard !panicking else { return }
+        diags.error(msg, at: currentSpan)
+        panicking = true
+    }
+
+    // Skip tokens until the current one is in `sync` (or EOF), then leave panic mode. Used
+    // to resynchronize after an error to a known boundary — a declaration keyword, a member
+    // introducer, or a closing brace — so parsing can resume cleanly.
+    private mutating func recover(to sync: Set<TokenKind>) {
+        while !check(.eof) && !sync.contains(currentKind) { advance() }
+        panicking = false
     }
 }

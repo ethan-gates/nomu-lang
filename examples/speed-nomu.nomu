@@ -1,18 +1,17 @@
 
 
-fun test_speed() {
-    var count = 1
-
-    // 100 million iterations
-    for i in range(10000) {
-        for j in range(10000) {
-            if count > 10000 {
-                count = (count - i) / 2
-            } else {
-                count = (count + j) * 3
-            }
-        }
+fun fib(n: Int) -> Int {
+    if n == 1 {
+        return 1
     }
+
+    if n == 0 {
+        return 0
+    }
+
+    return fib(n: n - 1) + fib(n: n - 2)
 }
 
-test_speed()
+fun main() {
+    let r = fib(n: 35)
+}

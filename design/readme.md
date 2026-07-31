@@ -17,6 +17,8 @@ Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease
 - [syntax.md](syntax.md) — surface-syntax principles (one canonical form per concept).
 - [macros.md](macros.md) — typed hygienic AST macros; extension-only role.
 - [compiler.md](compiler.md) — compiler architecture, mid-level IR, backend strategy, tooling, debugger.
+- [m8-spec.md](m8-spec.md) — **working draft (design-opening)**: M8 implementation spec for the LLVM backend — IR production, DWARF, the GC/cancellation/preemption safepoint substrate, runtime-as-library. The next build milestone (precedes M6). Big forks open in 8.0.4.
+- [m6-spec.md](m6-spec.md) — **working draft**: M6 implementation spec (build plan) for the real GC (MMTk) — binding, object model, precise roots, safepoints/barriers, moving GenImmix. Gated on M8 (LLVM). Follows `lang-project/milestone-doc-guide.md`.
 - [roadmap.md](roadmap.md) — milestones (provisional, post-pivot).
 - [deferred.md](deferred.md) — TODO backlog: feature work intentionally postponed, each with its un-park trigger.
 

@@ -1238,6 +1238,12 @@ public struct Sema {
             popScope()
             let type = Type.function(params: ps.map(\.type), ret: retTy)
             return IRExpr(type: type, span: span, kind: .closure(params: ps, body: irBody))
+
+        case .error(let span):
+            // A parser error-recovery placeholder. The driver stops before Sema when the
+            // parse sink holds errors, so this is unreachable in the normal flow; type it
+            // `.error` (which suppresses further diagnostics) and emit no new diagnostic.
+            return IRExpr(type: .error, span: span, kind: .intLit(0))
         }
     }
 
