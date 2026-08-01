@@ -15,9 +15,17 @@ swift_library(
         "-Xcc",
         "-std=c++17",
     ],
+    visibility = ["//visibility:public"],  # 8.1.4: the driver's --backend=llvm path deps on this
     deps = [
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Analysis",  # LLVMVerifyModule
+        # 8.1.4 object emission (llvm-c/TargetMachine.h): the TargetMachine C API lives in
+        # :Target; :AllTargetsCodeGens registers the host backend that LLVMInitializeNativeTarget
+        # / …AsmPrinter dispatch to (TargetInfo + Target + TargetMC + AsmPrinter).
+        "@llvm-project//llvm:Target",
+        "@llvm-project//llvm:CodeGen",
+        "@llvm-project//llvm:MC",
+        "@llvm-project//llvm:AllTargetsCodeGens",
     ],
 )
 

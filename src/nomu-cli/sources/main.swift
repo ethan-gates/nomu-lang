@@ -18,12 +18,21 @@ for arg in CommandLine.arguments.dropFirst() {
               --emit-ast         also emit the parsed AST (<name>.ast)
               --emit-typedir     also emit the typed IR (<name>.typedir)
               --stop=STAGE       halt after STAGE (ast | typedir | binary); default binary
+              --backend=NAME     code path to the binary (c | llvm); default c
               -h, --help         show this help
             """)
         exit(0)
     case "--emit-ast":         options.ast = true
     case "--emit-typedir":     options.typedIR = true
     case "--emit-c", "-c":     options.c = true
+    case let a where a.hasPrefix("--backend="):
+        switch String(a.dropFirst("--backend=".count)) {
+        case "c":    options.backend = .c
+        case "llvm": options.backend = .llvm
+        case let s:
+            fputs("error: unknown backend '\(s)' for --backend (expected c or llvm)\n", stderr)
+            exit(1)
+        }
     case let a where a.hasPrefix("--stop="):
         switch String(a.dropFirst("--stop=".count)) {
         case "ast":     options.stopAt = .ast

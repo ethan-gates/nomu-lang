@@ -4,6 +4,11 @@ swift_library(
     name = "driver",
     srcs = glob(["sources/*.swift"]),
     module_name = "driver",
-    deps = ["//src/frontend", "//src/codegen", "//src/runtime:embedded"],
+    copts = [
+        "-cxx-interoperability-mode=default",
+        "-Xcc",
+        "-std=c++17",
+    ],
+    deps = ["//src/frontend", "//src/codegen", "//src/runtime:embedded", "//src/llvmgen:llvmswift"],
     visibility = ["//visibility:public"],
 )

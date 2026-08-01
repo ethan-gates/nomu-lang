@@ -28,8 +28,8 @@ public struct BuiltModule {
     public let ir: String
 }
 
-/// 8.1.3 — build, entirely via the LLVM C API, the equivalent of Nomu's
-/// `fun main { print(2 + 3) }`:
+/// Construct, entirely via the LLVM C API, the equivalent of Nomu's `fun main { print(2 + 3) }`
+/// into `ctx` (the caller owns `ctx` and the returned module):
 ///
 ///   define i32 @main() {
 ///   entry:
@@ -39,11 +39,9 @@ public struct BuiltModule {
 ///   }
 ///
 /// `print(int)` mirrors the C backend's lowering (`CodegenIR.swift`): `printf("%lld\n", n)`.
-/// This constructs and verifies the IR only; object emission + linking is 8.1.4.
-public func buildHelloWorldModule() -> BuiltModule {
-    let ctx = LLVMContextCreate()!
-    defer { LLVMContextDispose(ctx) }
-    let mod = LLVMModuleCreateWithNameInContext("nomu_main", ctx)
+/// 8.1.5 replaces this fixed module with real lowering from the typed IR.
+private func buildHelloWorld(in ctx: LLVMContextRef) -> LLVMModuleRef {
+    let mod = LLVMModuleCreateWithNameInContext("nomu_main", ctx)!
     let b = LLVMCreateBuilderInContext(ctx)
     defer { LLVMDisposeBuilder(b) }
 
@@ -79,6 +77,14 @@ public func buildHelloWorldModule() -> BuiltModule {
 
     // ret i32 0
     _ = LLVMBuildRet(b, LLVMConstInt(i32, 0, 0))
+    return mod
+}
+
+/// 8.1.3 — build + verify the hello-world module and return its textual IR.
+public func buildHelloWorldModule() -> BuiltModule {
+    let ctx = LLVMContextCreate()!
+    defer { LLVMContextDispose(ctx) }
+    let mod = buildHelloWorld(in: ctx)
 
     let verified = LLVMVerifyModule(mod, LLVMReturnStatusAction, nil) == 0
 
@@ -87,4 +93,63 @@ public func buildHelloWorldModule() -> BuiltModule {
     LLVMDisposeMessage(cstr)
 
     return BuiltModule(verified: verified, ir: ir)
+}
+
+/// 8.1.4 — emit the hello-world module as a native object file for the host triple, via
+/// `llvm-c/TargetMachine.h`. Self-contained: all LLVM_C use stays inside this module, so the
+/// driver's LLVM path is a flat `String → String?` surface (nil = success, else an error).
+public func emitHelloWorldObject(to path: String) -> String? {
+    // Register the host target + asm printer; both are required to emit objects. These return
+    // nonzero when LLVM was configured without a native target (won't happen for our host build).
+    guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
+    guard LLVMInitializeNativeAsmPrinter() == 0 else { return "LLVM: no native asm printer configured" }
+
+    let ctx = LLVMContextCreate()!
+    defer { LLVMContextDispose(ctx) }
+    let mod = buildHelloWorld(in: ctx)
+
+    if LLVMVerifyModule(mod, LLVMReturnStatusAction, nil) != 0 {
+        return "LLVM: module failed verification"
+    }
+
+    let triple = LLVMGetDefaultTargetTriple()!
+    defer { LLVMDisposeMessage(triple) }
+    LLVMSetTarget(mod, triple)
+
+    var target: LLVMTargetRef? = nil
+    var tErr: UnsafeMutablePointer<CChar>? = nil
+    if LLVMGetTargetFromTriple(triple, &target, &tErr) != 0 {
+        let m = tErr.map { String(cString: $0) } ?? "unknown"
+        LLVMDisposeMessage(tErr)
+        return "LLVM: no target for host triple: \(m)"
+    }
+
+    let cpu = LLVMGetHostCPUName()!
+    defer { LLVMDisposeMessage(cpu) }
+    let features = LLVMGetHostCPUFeatures()!
+    defer { LLVMDisposeMessage(features) }
+
+    guard let tm = LLVMCreateTargetMachine(
+        target, triple, cpu, features,
+        LLVMCodeGenLevelDefault, LLVMRelocPIC, LLVMCodeModelDefault)
+    else { return "LLVM: failed to create target machine" }
+    defer { LLVMDisposeTargetMachine(tm) }
+
+    // Stamp the target's data layout onto the module so it and the object agree.
+    let dl = LLVMCreateTargetDataLayout(tm)
+    let dlStr = LLVMCopyStringRepOfTargetData(dl)
+    LLVMSetDataLayout(mod, dlStr)
+    LLVMDisposeMessage(dlStr)
+    LLVMDisposeTargetData(dl)
+
+    var emitErr: UnsafeMutablePointer<CChar>? = nil
+    let rc = path.withCString { cpath in
+        LLVMTargetMachineEmitToFile(tm, mod, cpath, LLVMObjectFile, &emitErr)
+    }
+    if rc != 0 {
+        let m = emitErr.map { String(cString: $0) } ?? "unknown"
+        LLVMDisposeMessage(emitErr)
+        return "LLVM: object emission failed: \(m)"
+    }
+    return nil
 }

@@ -2,6 +2,7 @@ import Foundation
 import frontend
 import codegen
 import embedded
+import LLVMBridge
 
 public func compile(path: String, options: EmitOptions = EmitOptions()) {
     guard let source = try? String(contentsOfFile: path, encoding: .utf8) else {
@@ -101,6 +102,15 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
         exit(1)
     }
 
+    // LLVM backend (M8): drive LLVM via its C API → object → link with the runtime .a. The
+    // full front/middle pipeline above still runs (errors surface identically), but the emitted
+    // module is the fixed 8.1.3 hello-world — typed-IR lowering arrives in 8.1.5, which feeds
+    // `monoModule` here. The C backend stays the default and the differential oracle.
+    if options.backend == .llvm {
+        emitLLVMBinary(stem: stem, outputDir: outputDir)
+        return
+    }
+
     var gen = CodegenIR(monoModule)
     let cCode = gen.emit()
 
@@ -193,6 +203,63 @@ private func prependPrelude(_ program: Program) -> Program {
         exit(1)
     }
     return Program(decls: prelude.decls + program.decls)
+}
+
+// LLVM backend binary stage (8.1.4): emit a host object via the LLVM C API, build the runtime
+// static archive, and link them into a native executable. Reports the binary path (like the C
+// path). Everything LLVM stays behind `emitHelloWorldObject` in LLVMBridge — this only orchestrates
+// object → .a → link.
+private func emitLLVMBinary(stem: String, outputDir: String) {
+    let objPath = stem + ".o"
+    if let err = emitHelloWorldObject(to: objPath) {
+        fputs("error: \(err)\n", stderr)
+        exit(1)
+    }
+    writeRuntimeSources(toDir: outputDir)
+    guard let archive = buildRuntimeArchive(inDir: outputDir) else { exit(1) }
+
+    let binPath = stem
+    if runProcess("/usr/bin/cc", ["-o", binPath, objPath, archive]) != 0 {
+        fputs("error: link failed\n", stderr)
+        exit(1)
+    }
+    print(binPath)
+}
+
+// Compile the runtime C sources to objects and archive them into `libnomuruntime.a` (the
+// `compiler.md` §6 "runtime library" item, real for the LLVM path). Replaces the C backend's
+// per-file `cc` co-compile. Returns the archive path, or nil on failure (message on stderr).
+private func buildRuntimeArchive(inDir dir: String) -> String? {
+    let runtimeO = dir + "/runtime.o"
+    let coreO = dir + "/core.o"
+    let archive = dir + "/libnomuruntime.a"
+    if runProcess("/usr/bin/cc", ["-w", "-I", dir, "-c", dir + "/runtime.c", "-o", runtimeO]) != 0 {
+        fputs("error: failed to compile runtime.c\n", stderr); return nil
+    }
+    if runProcess("/usr/bin/cc", ["-w", "-I", dir, "-c", dir + "/core.c", "-o", coreO]) != 0 {
+        fputs("error: failed to compile core.c\n", stderr); return nil
+    }
+    // Rebuild from scratch so stale members never accumulate; `rcs` creates + indexes the archive.
+    try? FileManager.default.removeItem(atPath: archive)
+    if runProcess("/usr/bin/ar", ["rcs", archive, runtimeO, coreO]) != 0 {
+        fputs("error: failed to archive runtime\n", stderr); return nil
+    }
+    return archive
+}
+
+// Run `exe args`, wait, and return its exit status (or 1 if it could not be launched).
+private func runProcess(_ exe: String, _ args: [String]) -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: exe)
+    p.arguments = args
+    do {
+        try p.run()
+        p.waitUntilExit()
+    } catch {
+        fputs("error: failed to launch \(exe): \(error)\n", stderr)
+        return 1
+    }
+    return p.terminationStatus
 }
 
 // Write the embedded runtime/core C sources + ABI header into `dir` (M4.13).
