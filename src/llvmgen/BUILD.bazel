@@ -1,5 +1,37 @@
 # M8.1 · 8.1.1 — LLVM toolchain bring-up. Smoke target proving @llvm-project links.
 load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_swift//swift:swift.bzl", "swift_binary", "swift_library")
+
+# 8.1.2 — prove Swift drives LLVM's C API (LLVM_C module) against @llvm-project.
+swift_library(
+    name = "llvmswift",
+    srcs = ["LLVMBridge.swift"],
+    module_name = "LLVMBridge",
+    # C++ mode required even for LLVM's C API: LLVM_C transitively pulls LLVM_Config, whose
+    # Clang module `requires cplusplus`. The C headers don't hit the C++ template pitfalls
+    # (e.g. Support/Format.h) that break importing LLVM's C++ modules directly.
+    copts = [
+        "-cxx-interoperability-mode=default",
+        "-Xcc",
+        "-std=c++17",
+    ],
+    deps = [
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Analysis",  # LLVMVerifyModule
+    ],
+)
+
+swift_binary(
+    name = "llvmswift_smoke",
+    srcs = ["main.swift"],
+    # cxx-interop is viral: importing LLVMBridge re-resolves the LLVM_C Clang module here too.
+    copts = [
+        "-cxx-interoperability-mode=default",
+        "-Xcc",
+        "-std=c++17",
+    ],
+    deps = [":llvmswift"],
+)
 
 cc_binary(
     name = "llvm_smoke",

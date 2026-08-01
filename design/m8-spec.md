@@ -84,15 +84,15 @@ depend on 8.2 and are independent of each other. 8.5 trails and is descopable.
 
 ### 8.0.4 · Big design decisions
 
-- **A · LLVM IR production: C++ API via `swift-llvm-bindings` — Decided (2026-07-31; refined in
-  `m8.1-spec.md` 8.1.0.4).** Drive LLVM's **C++ API** through the **official Swift-project
-  `swift-llvm-bindings`** (Swift/C++ interop directly to LLVM) as the primary API, rather than a
-  hand-written shim — least bespoke C++, rides the Swift team's interop work. The repo is
-  **actively maintained** (the "WIP" README is stale); the real residual risk is **API
-  coverage**, so pin a `stable/*` branch and add a **thin local supplement** (the hand-shim,
-  kept minimal) where coverage is missing (likely object emission / `DIBuilder` / statepoints).
-  Full detail, risks, and the `llvm-project`-overlay build path are in **`m8.1-spec.md`**. *Optional:* a throwaway
-  textual-`.ll` spike in 8.1 to reach native fast — a bootstrap, not the endpoint.
+- **A · LLVM IR production: the LLVM **C API** from Swift — Decided (2026-08-01 in `m8.1-spec.md`
+  8.1.0.4; supersedes the earlier "C++ API via `swift-llvm-bindings`" pick).** Importing LLVM's
+  **C++** modules via Swift cxx-interop **does not build** (`Support/Format.h` `operator<<`
+  ambiguity under interop — the first of many such incompatibilities). The LLVM **C API**
+  (`import LLVM_C`) builds/links/runs end-to-end and covers the M8 backend needs (IR,
+  `TargetMachine`, `DIBuilder`, pass pipeline incl. statepoints). C++ reach is preserved via a
+  **thin C++ shim** (normal C++, no interop) for the rare gap (`DIBuilder` variant parts,
+  custom passes) — see `m8.1-spec.md` 8.1.0.4-A/A′ for coverage + shim triggers. `swift-llvm-bindings`
+  not used (≈2 KB over LLVM's own module map).
 
 - **B · GC roots via LLVM statepoints; no bespoke MIR — Decided (2026-07-31).** Governed by
   *what is fastest for MMTk*, not what is easiest. LLVM **statepoints** (`addrspace(1)` GC
