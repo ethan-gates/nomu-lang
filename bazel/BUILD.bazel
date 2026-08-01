@@ -1,0 +1,1 @@
+# Marks bazel/ as a package so //bazel:llvm_extensions.bzl is loadable. (M8.1)

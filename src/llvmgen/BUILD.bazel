@@ -1,0 +1,11 @@
+# M8.1 · 8.1.1 — LLVM toolchain bring-up. Smoke target proving @llvm-project links.
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+cc_binary(
+    name = "llvm_smoke",
+    srcs = ["llvm_smoke.cpp"],
+    deps = [
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+    ],
+)

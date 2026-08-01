@@ -11,3 +11,35 @@ rust.toolchain(
     edition = "2024",
     versions = [ "1.97.1" ],
 )
+
+# ---- LLVM (M8.1 · 8.1.1) ----
+# The official llvm/llvm-project Bazel overlay (utils/bazel), pinned to LLVM 23, built from
+# source. `llvm_configure` generates @llvm-project//llvm:Core, :Support, … cc_library targets
+# our compiler links against (design: m8.1-spec.md 8.1.1). LLVM's Bazel build is peripheral-tier,
+# so the commit is pinned deliberately (in bazel/llvm_extensions.bzl).
+
+# Transitive deps the overlay's generated BUILD files reference (repo_name matters).
+bazel_dep(name = "rules_cc", version = "0.2.19")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "rules_python", version = "1.8.0")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+bazel_dep(name = "llvm", version = "0.8.5")  # overlay platform-config (@llvm//platforms/config)
+bazel_dep(name = "zlib-ng", version = "2.3.3", repo_name = "llvm_zlib")
+bazel_dep(name = "zstd", version = "1.5.7.bcr.1", repo_name = "llvm_zstd")
+bazel_dep(name = "apple_support", version = "2.6.1", repo_name = "build_bazel_apple_support")
+
+# Fetch the pinned llvm-project source (@llvm-raw) + pyyaml via our extension, so llvm_configure
+# (loaded from @llvm-raw) is visible. See bazel/llvm_extensions.bzl for why.
+llvm_raw = use_extension("//bazel:llvm_extensions.bzl", "llvm_raw")
+use_repo(llvm_raw, "llvm-raw", "pyyaml")
+
+llvm_configure = use_repo_rule("@llvm-raw//utils/bazel:configure.bzl", "llvm_configure")
+llvm_configure(name = "llvm-project")
+
+# Pulling in rules_cc + the LLVM overlay perturbed C++ toolchain resolution, so rules_swift
+# started seeing the autodetected "local" CC toolchain (Invalid target triple: local) instead
+# of Apple's. Register apple_support's macOS toolchain from the root so it wins. (M8.1 · 8.1.1)
+apple_cc = use_extension("@build_bazel_apple_support//crosstool:setup.bzl", "apple_cc_configure_extension")
+use_repo(apple_cc, "local_config_apple_cc_toolchains")
+register_toolchains("@local_config_apple_cc_toolchains//:all")

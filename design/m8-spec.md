@@ -2,9 +2,12 @@
 
 **Status:** working draft — the ordered work plan for M8, derived from `compiler.md` (§1 IR,
 §2 backend strategy, §4 debugger, §6 C→LLVM transition checklist), `memory-model.md` §3/§6,
-and `runtime.md`. It pins the build sequence; the design lives in those docs. **Design is
-opening** — the big backend forks (8.0.4) are `Open`; this records them and a phased sketch,
-not a settled plan.
+and `runtime.md`. It pins the build sequence; the design lives in those docs. The big backend
+forks (8.0.4) are **Decided (2026-07-31)** and the phased build plan (8.1–8.5) is laid out with
+per-slice work and exit criteria; slice records fill in as they land. The IR-production
+mechanism (A) was refined in **`m8.1-spec.md`**: adopt **`swift-llvm-bindings`** (official
+Swift/C++-interop LLVM bindings) + a thin supplement, LLVM via the **`llvm/llvm-project` Bazel
+overlay** (`http_archive` at a pinned commit).
 
 > Authoring conventions per `lang-project/milestone-doc-guide.md`.
 
@@ -57,52 +60,55 @@ oracle** for differential testing until M8 is green.
 ### 8.0.2 · Compiler surface touched
 
 Current: `… → typed IR → CodegenIR (emit C strings) → cc`. M8 replaces the last two stages.
-- **New backend** — typed IR → **LLVM IR** via the **C++ shim** (module / function /
+- **New backend** — typed IR → **LLVM IR** via **`swift-llvm-bindings`** (module / function /
   basic-block construction, not string emission). The per-node lowering *logic* in `CodegenIR`
   carries over; the *string emitter* does not. `Mangle.swift` survives (symbol names are
-  backend-neutral). New build component: the C++ shim lib + its Swift-facing interface.
+  backend-neutral). New build components: the `llvm-project` Bazel overlay, the vendored
+  bindings, an optional supplement (`m8.1-spec.md`).
 - **Debug info** — `DIBuilder` threaded from the IR's spans (carried on every node, §1).
 - **Runtime** — preamble carved into a compiled `.a`; codegen emits calls and links it.
 - **Closure conversion / share analysis** — "still in codegen" today (§1); either kept inline
   in lowering or promoted to a pre-LLVM pass (8.0.4-B).
 
-### 8.0.3 · Dependencies (sketch — firms up after 8.0.4)
+### 8.0.3 · Dependencies
 
 ```
-8.1 (LLVM IR production: native hello-world via the chosen mechanism)
+8.1 (toolchain bring-up + native hello-world: swift-llvm-bindings, llvm-project overlay, runtime .a)
 └─ 8.2 (full language lowering: every IR node → LLVM, C-backend parity)
    ├─ 8.3 (DWARF Tier 0 via DIBuilder)
-   ├─ 8.4 (GC substrate: statepoints + stack maps + barrier/poll seams)  [serves M6/M7]
-   └─ 8.5 (runtime → .a, link path)
-8.6 (perf tail: ucontext→asm, i1 Bool, opt pipeline)   [descopable]
+   └─ 8.4 (GC substrate: statepoints + stack maps + inlinable seams)  [serves M6/M7]
+8.5 (perf tail: ucontext→asm, i1 Bool, opt pipeline, fiber-aware mutex)   [descopable]
 ```
+8.1 gates everything (nothing lowers until the bindings path runs). 8.2 is the bulk. 8.3 and 8.4
+depend on 8.2 and are independent of each other. 8.5 trails and is descopable.
 
 ### 8.0.4 · Big design decisions
 
-- **A · LLVM IR production: C++ API behind a thin C++ shim — Decided (2026-07-31).** Drive
-  LLVM's full **C++ API** (not the narrower stable C-API) from a hand-written **C++ shim** —
-  our own `.cpp` that uses LLVM internally and exposes a narrow, stable interface to Swift
-  (the Rust `RustWrapper.cpp` pattern). Swift calls the shim; the shim calls LLVM; the C++
-  complexity stays isolated and grows one wrapper function at a time. Chosen for scalability:
-  full API reach (`DIBuilder`, statepoint intrinsics, the pass manager) with a controlled
-  Swift↔native surface, vs. the C-API's capability ceiling or raw Swift/C++ interop against
-  LLVM's templated headers. *Optional:* a throwaway textual-`.ll` spike in 8.1 to reach native
-  fast before the shim is broad — a bootstrap, not the endpoint.
+- **A · LLVM IR production: C++ API via `swift-llvm-bindings` — Decided (2026-07-31; refined in
+  `m8.1-spec.md` 8.1.0.4).** Drive LLVM's **C++ API** through the **official Swift-project
+  `swift-llvm-bindings`** (Swift/C++ interop directly to LLVM) as the primary API, rather than a
+  hand-written shim — least bespoke C++, rides the Swift team's interop work. The repo is
+  **actively maintained** (the "WIP" README is stale); the real residual risk is **API
+  coverage**, so pin a `stable/*` branch and add a **thin local supplement** (the hand-shim,
+  kept minimal) where coverage is missing (likely object emission / `DIBuilder` / statepoints).
+  Full detail, risks, and the `llvm-project`-overlay build path are in **`m8.1-spec.md`**. *Optional:* a throwaway
+  textual-`.ll` spike in 8.1 to reach native fast — a bootstrap, not the endpoint.
 
 - **B · GC roots via LLVM statepoints; no bespoke MIR — Decided (2026-07-31).** Governed by
-  *what integrates most easily with MMTk* (the stated criterion): MMTk needs **precise roots**,
-  and LLVM **statepoints** (`addrspace(1)` GC pointers + `gc "statepoint-example"` +
-  RewriteStatepointsForGC) emit exactly the per-safepoint **stack maps** whose slots the MMTk
-  binding reports as roots — and statepoints are **purpose-built for *moving* collectors**
-  (they thread the relocated pointer back out after GC), which Immix/LXR require. The
-  shadow-stack alternative fights relocation and was already rejected (`m6-spec.md` 6.0.4).
-  **No own MIR in M8:** LLVM IR is itself CFG/SSA, so lower the **structured typed IR straight
-  to LLVM**; a bespoke MIR (≈ Rust MIR / Swift SIL — a low CFG/SSA form to host language-aware
-  passes) is built only when **escape analysis** needs language types LLVM has discarded
-  (`compiler.md` §1).
+  *what is fastest for MMTk*, not what is easiest. LLVM **statepoints** (`addrspace(1)` GC
+  pointers + `gc "statepoint-example"` + RewriteStatepointsForGC) emit return-address-keyed
+  **stack maps** — the state-of-the-art precise-root mechanism (HotSpot / .NET): GC pointers
+  stay in registers/stack in steady state and root cost is paid **only at collection**. The
+  **shadow-stack** alternative taxes *every call* with push/pop bookkeeping regardless of GC
+  and is rejected **on performance**, not merely as throwaway. Statepoints also handle
+  relocation natively (Immix/LXR). The mutator-performance battleground is *not* the root
+  mechanism but the **inlinable alloc/barrier/poll seams** (8.0.7). **No own MIR in M8:** LLVM
+  IR is itself CFG/SSA, so lower the **structured typed IR straight to LLVM**; a bespoke MIR
+  (≈ Rust MIR / Swift SIL — a low CFG/SSA form to host language-aware passes) is built only
+  when **escape analysis** needs language types LLVM has discarded (`compiler.md` §1).
 
 - **C · Scope fence: LLVM-only, minimal-correct — Decided (2026-07-31).** No MLIR, no Cranelift
-  second backend, no incremental compilation in M8; debug info Tier 0 only; perf items (8.6) to
+  second backend, no incremental compilation in M8; debug info Tier 0 only; perf items (8.5) to
   the tail. Keeps M8 small and unblocks M6/M7 fast; must not *foreclose* incremental
   (`compiler.md` §8), but does not build it.
 
@@ -113,11 +119,36 @@ becomes a compiled `.a`. The alloc seam stays `rt_alloc` (routed to MMTk in M6).
 emits are **triple-purpose**: GC roots (M6), cancellation poll (M7), preemption (runtime). No
 new surface syntax; no language-semantics change — M8 is a backend swap.
 
-### 8.0.6 · Risks / watch items
+### 8.0.7 · Performance posture (the levers "down here")
 
-- **C++ shim + LLVM version pinning** — the shim's Swift-facing interface + a pinned LLVM
-  version are the blast radius; bazel + LLVM (+ Swift↔C++ shim) build integration is real setup
-  work and the riskiest early unknown.
+Max performance at the backend is a stated goal; the levers, in rough order of mutator impact:
+- **Inlined write barriers (highest — and the LXR premise).** LXR is an RC collector: its
+  barrier fires on pointer writes and is the *dominant* mutator cost. The barrier **fast path
+  must be inlined at the LLVM level**, only the slow path a call. If barriers are emitted as
+  call stubs, LXR's performance premise is lost. (Seam built in M8/8.4; filled in M6.)
+- **Inlined allocation fast path.** MMTk's bump-pointer alloc emitted **inline** (compare, bump,
+  branch-to-slow), not a `rt_alloc` call — allocation is hot.
+- **Safepoint poll form.** Predicted conditional branch on a per-thread flag vs. a HotSpot-style
+  **protected-page load** (near-zero in the common case). Decided with measurement in 8.4.
+- **Statepoint placement.** Run the LLVM optimizer *first*, insert statepoints **late**
+  (`RewriteStatepointsForGC` is designed for this) so opts run on normal pointers; keep
+  safepoints **sparse** (calls + loop back-edges only) and **minimize GC-pointer liveness
+  across** them, since statepoints do add reload overhead.
+- **Codegen basics** — `Bool` → `i1`/`i8`, `-O` release pipeline, `ucontext`→asm (8.5).
+
+The through-line: M8 builds the alloc/barrier/poll **seams as inlinable primitives**, not
+function calls — that inlinability is what lets M6/LXR be fast.
+
+### 8.0.8 · Risks / watch items
+
+- **Bindings + LLVM version pinning** — the vendored `swift-llvm-bindings` commit + the pinned
+  `llvm-project` overlay commit are the blast radius; the bazel integration of both (incl. the
+  overlay's from-source LLVM build) is real setup work and the riskiest early unknown
+  (`m8.1-spec.md`).
+- **Statepoint codegen quality** — statepoints add reload/spill overhead around safepoints and
+  can inhibit opts; mitigated by late insertion + sparse safepoints + minimal cross-safepoint
+  liveness (8.0.7). Keep the binding boundary clean enough to revisit the root mechanism if
+  measured quality is inadequate.
 - **Statepoint discipline** — `addrspace(1)` hygiene and RewriteStatepointsForGC constraints
   (every GC pointer live across a safepoint must be discoverable); the object/pointer model
   must satisfy it (co-designed with `m6-spec.md` 6.1).
@@ -130,39 +161,99 @@ new surface syntax; no language-semantics change — M8 is a backend swap.
 
 ---
 
-## 8.1–8.6 · Phased plan (sketch — firms up after 8.0.4)
+## 8.1 · Toolchain bring-up + native hello-world ⬜  → **expanded in `m8.1-spec.md`**
 
-## 8.1 · LLVM IR production — native hello-world ⬜
-Stand up the **C++ shim** + Swift interop + bazel/LLVM build end to end: a trivial program
-(`main` + arithmetic + `print`) lowered to LLVM IR through the shim, compiled, run. This slice
-is mostly build/interop plumbing — the riskiest unknown, so it goes first. *Optional* de-risk:
-a throwaway textual-`.ll` path to reach native output before the shim is broad. **Exit:** a
-native binary from the LLVM path prints correctly; bazel + LLVM + Swift↔C++ shim integration
-green.
+Intent: stand up the whole LLVM path end to end on a trivial program — mostly build/interop
+plumbing, the riskiest unknown, so it goes first. Deps: none. Approach (8.0.4-A, refined):
+`swift-llvm-bindings` + the `llvm-project` Bazel overlay, called from Swift; the runtime compiled
+to a `.a` and linked.
 
-## 8.2 · Full language lowering (C-backend parity) ⬜
-Lower every typed-IR node to LLVM — value/reference types, `struct`/`enum`/`class`/`actor`,
-`match`, closures, monomorphized generics, `any`/witness dispatch, `Result`, spawn/actors.
-Approach: port `CodegenIR`'s per-node lowering to IR construction; closure conversion inline or
-as a pre-pass (8.0.4-B). **Exit:** the full M5 example/test suite produces identical results
-under the LLVM and C backends (differential).
+This phase is large enough to carry its own spec — **`m8.1-spec.md`** (adopt
+`swift-llvm-bindings`, LLVM via the `llvm-project` overlay, object emission, link). Its phases
+8.1.1–8.1.5 supersede the slice sketch below.
+
+**Exit:** `fun main` with integer arithmetic and `print` compiles through the LLVM path to a
+native binary that runs and prints the correct value; `bazel build`/`test` green with the LLVM
++ bindings targets; the C backend still builds (the differential oracle is preserved).
+
+## 8.2 · Full language lowering — C-backend parity ⬜
+
+Intent: lower every typed-IR node to LLVM until the LLVM backend matches the C backend on the
+whole suite. Deps: 8.1. Approach: port `CodegenIR`'s per-node lowering *logic* to the bindings'
+IR-construction API, sliced by feature area; closure conversion stays inline (as today) unless a
+pre-pass proves cleaner (8.0.4-B). Differential-tested against the C backend throughout.
+
+- **8.2.1 ⬜** — primitives + control flow + functions: Int/Bool/String literals,
+  arithmetic/comparison, `let`/`var`, assignment + `+=`, `if`/`else`, `return`, calls, `print`,
+  string concat (`rt_str_concat`).
+- **8.2.2 ⬜** — value types: `struct` construction, field load/store, methods, mutating
+  methods (`self` by-ref), computed properties (get/set).
+- **8.2.3 ⬜** — enums + `match`: payload-carrying enum construction (tag + payload layout),
+  `switch` lowering (discriminant branch + pattern bindings), enum methods/properties
+  (exhaustiveness already checked upstream).
+- **8.2.4 ⬜** — reference types + closures: `class` construction/fields/methods; closures
+  (env as heap struct + code pointer), closure calls, reabstraction thunks.
+- **8.2.5 ⬜** — interfaces + generics + `Result`: witness-table emission, `any` boxing +
+  dynamic dispatch, `any A & B` composition, `some`/opaque static dispatch, monomorphized
+  generic instances, `Result<T, E>`.
+- **8.2.6 ⬜** — concurrency: `actor` layout (+ mutex/mailbox), `on`-handler dispatch,
+  `spawn let` + structured spawn/join, colorless blocking calls (`rt_sleep_ms`, `rt_read_line`).
+
+**Exit:** a **differential harness** runs every `examples/*.nomu` plus the `src/codegen/tests`
+programs through both backends and asserts identical stdout + exit code — all pass. The
+lowering `switch` covers every typed-IR node kind (no `default`/unhandled case remains).
 
 ## 8.3 · DWARF Tier 0 ⬜
-Line tables + basic types via `DIBuilder` from IR spans. **Exit:** breakpoints, stepping,
-backtraces, and primitive inspection work in lldb on an LLVM-built binary.
 
-## 8.4 · GC substrate — statepoints + stack maps + seams ⬜  [serves M6/M7]
-The safepoint/statepoint machinery: `addrspace(1)` GC pointers, `statepoint-example` GC,
-RewriteStatepointsForGC → stack maps; the **write-barrier** insertion hook (inert until M6);
-the **per-fiber cancellation poll** at safepoints (inert until M7). **Exit:** stack maps
-emitted and parseable at every safepoint; a smoke test enumerates roots at a forced safepoint;
-barrier/poll seams present and inert.
+Intent: near-free debug info — line tables + basic types via `DIBuilder`, from the spans every
+IR node already carries (`compiler.md` §1, §4). Deps: 8.2. Approach: `DIBuilder` via the
+bindings (or the supplement, if uncovered).
 
-## 8.5 · Runtime as a linked library ⬜
-Preamble → compiled `.a`; link path. **Exit:** no per-file preamble inlining; the runtime
-builds once as `.a` and links; all examples run.
+- **8.3.1 ⬜** — `DIBuilder`: compile unit + per-function subprogram + line table
+  from node spans.
+- **8.3.2 ⬜** — basic-type DWARF for Int/Bool/String + struct field layout; locals/params
+  given locations.
 
-## 8.6 · Perf tail (descopable) ⬜
-`ucontext`→hand-written arm64/x86-64 asm; `Bool` → `i1`/`i8`; LLVM opt pipeline (new pass
-manager, `-O` levels); fiber-aware mutex. **Exit:** measurable improvement; correctness
-unchanged.
+**Exit:** on an LLVM-built binary, a scripted lldb (`lldb-dap`) session sets a line breakpoint,
+single-steps in source order, prints a correct backtrace, and reads a primitive local — over a
+sample program in the test suite.
+
+## 8.4 · GC substrate — statepoints, stack maps, inlinable seams ⬜  [serves M6/M7]
+
+Intent: build the safepoint/statepoint machinery and the inlinable alloc/barrier/poll seams M6
+(GC) and M7 (cancellation) will fill — inert now, but shaped for performance (8.0.7). Deps:
+8.2. Approach (8.0.4-B): `addrspace(1)` GC pointers, `statepoint-example` GC,
+`RewriteStatepointsForGC` inserted **late**; seams emitted **inline** (fast path inline, slow
+path a call).
+
+- **8.4.1 ⬜** — mark heap-object pointers `addrspace(1)`; set the GC strategy; run
+  `RewriteStatepointsForGC` after the opt pipeline.
+- **8.4.2 ⬜** — safepoints at call sites + loop back-edges, kept **sparse**; poll form (branch
+  vs. protected-page) chosen with a microbenchmark.
+- **8.4.3 ⬜** — stack-map emission + a runtime parser; a smoke test enumerates the precise
+  roots live at a forced safepoint.
+- **8.4.4 ⬜** — the **alloc fast-path**, **write-barrier**, and **cancellation-poll** seams as
+  inlinable primitives (inline fast path + out-of-line slow-path stub), inert (slow path a
+  no-op / plain `rt_alloc`) until M6/M7.
+
+**Exit:** every safepoint emits a parseable stack map; the smoke test recovers the *exact* set
+of live GC roots on a known-answer program; the three seams are present, inline-shaped, and
+provably inert (differential harness output unchanged vs. 8.2). Hands M6 a working precise-root
++ barrier substrate.
+
+## 8.5 · Perf tail (descopable) ⬜
+
+Intent: recover backend performance once correctness is green; can trail M8 or spill to a
+follow-on. Deps: 8.2 (asm/mutex), 8.4 (opt↔statepoint ordering).
+
+- **8.5.1 ⬜** — `ucontext` `swapcontext`/`makecontext` → ~20-line arm64 + x86-64 fiber-switch
+  asm (drops the macOS signal-mask syscall per switch).
+- **8.5.2 ⬜** — `Bool` → `i1`/`i8` (from `int64_t`); audit remaining C-ism artifacts
+  (`compiler.md` §6).
+- **8.5.3 ⬜** — LLVM opt pipeline: new pass manager, `-O` release vs. debug levels, ordered
+  **before** statepoint rewriting (8.0.7).
+- **8.5.4 ⬜** — fiber-aware mutex (park/unpark) replacing actor `pthread_mutex_t`, so a held
+  handler doesn't block a carrier (`compiler.md` §6).
+
+**Exit:** measurable throughput/latency improvement over the 8.2 baseline on a benchmark (e.g.
+`examples/speed-nomu.nomu`); correctness unchanged (differential harness still green).
