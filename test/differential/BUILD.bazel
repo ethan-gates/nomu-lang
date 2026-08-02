@@ -9,6 +9,8 @@ PROGRAMS = [
     "strings.nomu",
     "structs.nomu",
     "enums.nomu",
+    "classes.nomu",
+    "closures.nomu",
 ]
 
 sh_test(

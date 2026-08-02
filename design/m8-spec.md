@@ -220,8 +220,21 @@ pre-pass proves cleaner (8.0.4-B). Differential-tested against the C backend thr
   (self by value / by pointer). Differential-tested (`test/differential/enums.nomu`): Int/String/
   struct payloads, no-payload cases, `switch` with bindings, and an enum method matching the C
   backend.
-- **8.2.4 ⬜** — reference types + closures: `class` construction/fields/methods; closures
-  (env as heap struct + code pointer), closure calls, reabstraction thunks.
+- **8.2.4 ✅ (2026-08-02)** — reference types + closures. **Classes**: `{ i64 header, fields… }`
+  heap objects (`rt_alloc`, bump-and-leak — the header slot mirrors `ObjectHeader.refcount`,
+  unused until M6); a class value is the object pointer (reference semantics), fields at index
+  i+1 (past the header). Field access and methods generalize the struct machinery via an
+  `AggKind` (struct-value vs class-ref): a struct field GEPs off the value's address, a class
+  field off the pointer; `self` is always the object pointer for a class method (by value for a
+  read-only struct/enum method, by pointer when mutating). **Closures**: a closure value is
+  `{ ptr fn, ptr env }` (matches runtime `Closure`); the body is hoisted to `nomu_cloN(ptr env,
+  params…)`, the site `rt_alloc`s the env and copies captures by value. Captures are the body's
+  free variables naming enclosing locals (free-var walk mirrors `CodegenIR`, respecting
+  shadowing). Calls: a global name is direct; a closure-typed value loads `fn`/`env` and calls
+  `fn(env, args…)` indirectly (also the path for a closure passed as an argument — `.function`
+  params lower to `closureTy`). Differential-tested (`test/differential/{classes,closures}.nomu`):
+  class methods + reference mutation across a call, String fields, capturing/no-arg/higher-order
+  closures — all match the C backend.
 - **8.2.5 ⬜** — interfaces + generics + `Result`: witness-table emission, `any` boxing +
   dynamic dispatch, `any A & B` composition, `some`/opaque static dispatch, monomorphized
   generic instances, `Result<T, E>`.
