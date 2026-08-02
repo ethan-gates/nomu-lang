@@ -5,7 +5,7 @@ load("@rules_swift//swift:swift.bzl", "swift_binary", "swift_library")
 # 8.1.2 — prove Swift drives LLVM's C API (LLVM_C module) against @llvm-project.
 swift_library(
     name = "llvmswift",
-    srcs = ["LLVMBridge.swift"],
+    srcs = ["LLVMBridge.swift", "Lowering.swift"],
     module_name = "LLVMBridge",
     # C++ mode required even for LLVM's C API: LLVM_C transitively pulls LLVM_Config, whose
     # Clang module `requires cplusplus`. The C headers don't hit the C++ template pitfalls
@@ -17,6 +17,7 @@ swift_library(
     ],
     visibility = ["//visibility:public"],  # 8.1.4: the driver's --backend=llvm path deps on this
     deps = [
+        "//src/frontend",  # 8.1.5: IRModule / the typed IR that IRToLLVM lowers
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Analysis",  # LLVMVerifyModule
         # 8.1.4 object emission (llvm-c/TargetMachine.h): the TargetMachine C API lives in

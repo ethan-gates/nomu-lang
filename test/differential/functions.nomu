@@ -1,0 +1,9 @@
+fun sq(x: Int) -> Int { return x * x }
+fun fib(n: Int) -> Int {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+fun main() {
+  print(sq(9))
+  print(fib(12))
+}

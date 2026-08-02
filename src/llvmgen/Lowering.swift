@@ -1,0 +1,521 @@
+// M8.1 · 8.1.5 / M8 · 8.2.1 / 8.2.2 — lower the typed IR (frontend `IRModule`) to an LLVM module
+// via the C API. The LLVM sibling of `CodegenIR`; it mirrors that backend's per-node logic so the
+// two agree (the differential harness, test/differential).
+//
+//   8.2.1 — primitives + control flow + functions: Int/Bool/String literals, arithmetic/
+//           comparison, let/var, assignment + `+=`, if/else, return, user + builtin calls
+//           (`print`, string `concat`).
+//   8.2.2 — value types: `struct` construction, stored-field load/store, methods (self by value),
+//           mutating methods (self by pointer), computed properties (get/set).
+//
+// Nodes outside the covered set set `error` (a `file:line:col`-prefixed message, not a crash) —
+// the boundary later slices push. ABI parity with `CodegenIR.cType`: Int and Bool are both **i64**
+// (bool 0/1); String is the runtime `{ i8*, i64 }` struct; a `struct` is an LLVM struct in field
+// order, passed/returned by value (mutating `self` is a pointer to it). Nomu `main` → `nomu_main`.
+import LLVM_C
+import frontend
+
+final class IRToLLVM {
+    private let ctx: LLVMContextRef
+    private let mod: LLVMModuleRef
+    private let b: LLVMBuilderRef
+
+    private let i8ptr: LLVMTypeRef
+    private let i32: LLVMTypeRef
+    private let i64: LLVMTypeRef
+    private let voidTy: LLVMTypeRef
+    private let strTy: LLVMTypeRef   // { i8* data, i64 len } — matches runtime.h `String`
+
+    private var runtimeFns: [String: (fn: LLVMValueRef, ty: LLVMTypeRef)] = [:]
+    private var intFmt: LLVMValueRef?
+    private var strFmt: LLVMValueRef?
+
+    // Type + function registries. `structMap`/`structTypes`: Nomu structs and their (cached) LLVM
+    // struct types. `funcMap`: top-level functions. `callables`: LLVM functions declared on demand
+    // (free functions keyed `f:<name>`, methods `m:<type>:<method>`), with `pending` bodies.
+    private var structMap: [String: IRStruct] = [:]
+    private var structTypes: [String: LLVMTypeRef] = [:]
+    private var funcMap: [String: IRFunc] = [:]
+
+    private struct Callable {
+        let fn: LLVMValueRef
+        let ty: LLVMTypeRef
+        let ir: IRFunc
+        let selfType: String?     // struct type name when this is a method
+        let selfByPointer: Bool   // mutating method → self is `T*`
+    }
+    private var callables: [String: Callable] = [:]
+    private var pending: [String] = []
+
+    // A local (param / let / self) → the address holding its value, and the value's LLVM type.
+    private var locals: [String: (addr: LLVMValueRef, ty: LLVMTypeRef)] = [:]
+    private var currentFn: LLVMValueRef?
+
+    // While lowering a method body: the receiver, so a bare field reference (`x` inside a method)
+    // resolves through `self`.
+    private struct SelfCtx {
+        let s: IRStruct
+        let structTy: LLVMTypeRef
+        let addr: LLVMValueRef   // pointer to the receiver value
+    }
+    private var currentSelf: SelfCtx?
+
+    private(set) var loweredMain = false
+    private(set) var error: String?
+
+    init(ctx: LLVMContextRef, mod: LLVMModuleRef) {
+        self.ctx = ctx
+        self.mod = mod
+        b = LLVMCreateBuilderInContext(ctx)
+        i8ptr = LLVMPointerType(LLVMInt8TypeInContext(ctx), 0)
+        i32 = LLVMInt32TypeInContext(ctx)
+        i64 = LLVMInt64TypeInContext(ctx)
+        voidTy = LLVMVoidTypeInContext(ctx)
+        var fields: [LLVMTypeRef?] = [i8ptr, i64]
+        strTy = fields.withUnsafeMutableBufferPointer {
+            LLVMStructTypeInContext(ctx, $0.baseAddress, 2, /*packed=*/0)
+        }
+    }
+
+    deinit { LLVMDisposeBuilder(b) }
+
+    func lower(_ module: IRModule) {
+        for decl in module.decls {
+            switch decl {
+            case .funcDecl(let f):   funcMap[f.name] = f
+            case .structDecl(let s): structMap[s.name] = s
+            default: break   // classes/enums/actors are later slices
+            }
+        }
+        guard funcMap["main"] != nil else { return }   // `loweredMain` stays false → caller errors
+        declareFree("main")
+        while error == nil, !pending.isEmpty {
+            defineBody(pending.removeFirst())
+        }
+        if error == nil { loweredMain = callables["f:main"] != nil }
+    }
+
+    // MARK: - Types
+
+    private func structType(_ name: String) -> LLVMTypeRef? {
+        if let t = structTypes[name] { return t }
+        guard let s = structMap[name] else { return nil }
+        let st = LLVMStructCreateNamed(ctx, "struct.\(name)")!
+        structTypes[name] = st   // cache before filling (value structs never self-nest, but be safe)
+        var elems: [LLVMTypeRef?] = []
+        for f in s.fields {
+            guard let ft = llvmType(f.type, f.span) else { return nil }
+            elems.append(ft)
+        }
+        elems.withUnsafeMutableBufferPointer {
+            LLVMStructSetBody(st, $0.baseAddress, UInt32(s.fields.count), 0)
+        }
+        return st
+    }
+
+    private func llvmType(_ t: Type, _ span: Span) -> LLVMTypeRef? {
+        switch t {
+        case .int, .bool: return i64
+        case .string:     return strTy
+        case .void:       return voidTy
+        case .named(let n, .struct_):
+            if let st = structType(n) { return st }
+            fail("8.2.2: unknown struct '\(n)'", span)
+            return nil
+        default:
+            fail("8.2.2: unsupported type '\(t)'", span)
+            return nil
+        }
+    }
+
+    // MARK: - Callable declaration + definition
+
+    private func declareFree(_ name: String) {
+        let key = "f:\(name)"
+        guard callables[key] == nil, let f = funcMap[name] else { return }
+        let llvmName = name == "main" ? "nomu_main" : "nomu_fn_\(name)"
+        declareCallable(key: key, llvmName: llvmName, ir: f, selfType: nil, selfByPointer: false)
+    }
+
+    private func declareMethod(_ typeName: String, _ method: String) {
+        let key = "m:\(typeName):\(method)"
+        guard callables[key] == nil else { return }
+        guard let s = structMap[typeName], let f = s.methods.first(where: { $0.name == method }) else {
+            fail("8.2.2: unknown method '\(typeName).\(method)'", Span(file: "", begin: Pos(line: 0, col: 0), end: Pos(line: 0, col: 0)))
+            return
+        }
+        let sanitized = method.replacingOccurrences(of: ".", with: "_")
+        declareCallable(key: key, llvmName: "nomu_m_\(typeName)_\(sanitized)",
+                        ir: f, selfType: typeName, selfByPointer: f.isMutating)
+    }
+
+    private func declareCallable(key: String, llvmName: String, ir f: IRFunc,
+                                 selfType: String?, selfByPointer: Bool) {
+        guard let retTy = llvmType(f.returnType, f.span) else { return }
+        var paramTys: [LLVMTypeRef?] = []
+        if let selfType = selfType {
+            guard let st = structType(selfType) else { return }
+            paramTys.append(selfByPointer ? LLVMPointerType(st, 0) : st)
+        }
+        for p in f.params {
+            guard let t = llvmType(p.type, p.span) else { return }
+            paramTys.append(t)
+        }
+        let pn = UInt32(paramTys.count)
+        let fnTy = paramTys.withUnsafeMutableBufferPointer {
+            LLVMFunctionType(retTy, $0.baseAddress, pn, 0)
+        }!
+        let fn = LLVMAddFunction(mod, llvmName, fnTy)!
+        callables[key] = Callable(fn: fn, ty: fnTy, ir: f, selfType: selfType, selfByPointer: selfByPointer)
+        pending.append(key)
+    }
+
+    private func defineBody(_ key: String) {
+        guard let c = callables[key] else { return }
+        let f = c.ir
+        currentFn = c.fn
+        let block = LLVMAppendBasicBlockInContext(ctx, c.fn, "entry")
+        LLVMPositionBuilderAtEnd(b, block)
+
+        let savedLocals = locals; let savedSelf = currentSelf
+        locals = [:]; currentSelf = nil
+
+        var paramBase: UInt32 = 0
+        if let selfType = c.selfType, let s = structMap[selfType], let st = structType(selfType) {
+            let selfAddr: LLVMValueRef
+            if c.selfByPointer {
+                selfAddr = LLVMGetParam(c.fn, 0)   // mutating: the incoming pointer is the address
+            } else {
+                selfAddr = LLVMBuildAlloca(b, st, "self")!   // by value: keep a local copy
+                LLVMBuildStore(b, LLVMGetParam(c.fn, 0), selfAddr)
+            }
+            currentSelf = SelfCtx(s: s, structTy: st, addr: selfAddr)
+            locals["self"] = (selfAddr, st)
+            paramBase = 1
+        }
+
+        for (i, p) in f.params.enumerated() {
+            guard let t = llvmType(p.type, p.span) else { break }
+            let slot = LLVMBuildAlloca(b, t, p.name)!
+            LLVMBuildStore(b, LLVMGetParam(c.fn, UInt32(i) + paramBase), slot)
+            locals[p.name] = (slot, t)
+        }
+        lowerBlock(f.body)
+        if !blockTerminated() {
+            if f.returnType == .void { LLVMBuildRetVoid(b) } else { LLVMBuildUnreachable(b) }
+        }
+        locals = savedLocals; currentSelf = savedSelf
+    }
+
+    private func blockTerminated() -> Bool {
+        LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(b)) != nil
+    }
+
+    // MARK: - Statements
+
+    private func lowerBlock(_ stmts: [IRStmt]) {
+        for s in stmts {
+            if error != nil || blockTerminated() { return }
+            lowerStmt(s)
+        }
+    }
+
+    private func lowerStmt(_ stmt: IRStmt) {
+        switch stmt.kind {
+        case .letBinding(let name, _, let value):
+            guard let ty = llvmType(value.type, stmt.span), let v = lowerExpr(value) else { return }
+            let slot = LLVMBuildAlloca(b, ty, name)!
+            LLVMBuildStore(b, v, slot)
+            locals[name] = (slot, ty)
+
+        case .assign(let target, let value):
+            guard let dst = lvalue(target) else { return }
+            guard let v = lowerExpr(value) else { return }
+            LLVMBuildStore(b, v, dst.addr)
+
+        case .compoundAssign(let target, let value):
+            // Nomu's only compound assignment is `+=`, on Int (CodegenIR emits `l += r`).
+            guard let dst = lvalue(target) else { return }
+            guard let v = lowerExpr(value) else { return }
+            let cur = LLVMBuildLoad2(b, dst.ty, dst.addr, "cur")
+            LLVMBuildStore(b, LLVMBuildAdd(b, cur, v, "add"), dst.addr)
+
+        case .ret(let e):
+            if let e = e {
+                guard let v = lowerExpr(e) else { return }
+                LLVMBuildRet(b, v)
+            } else {
+                LLVMBuildRetVoid(b)
+            }
+
+        case .ifStmt(let cond, let then, let els):
+            lowerIf(cond: cond, then: then, els: els)
+
+        case .exprStmt(let e):
+            _ = lowerExpr(e)
+
+        default:
+            fail("8.2.2: unsupported statement", stmt.span)
+        }
+    }
+
+    private func lowerIf(cond: IRExpr, then: [IRStmt], els: [IRStmt]?) {
+        guard let fn = currentFn, let condV = lowerExpr(cond) else { return }
+        let condBit = LLVMBuildICmp(b, LLVMIntNE, condV, LLVMConstInt(i64, 0, 0), "cond")
+        let thenBB = LLVMAppendBasicBlockInContext(ctx, fn, "then")
+        let elseBB = els != nil ? LLVMAppendBasicBlockInContext(ctx, fn, "else") : nil
+        let mergeBB = LLVMAppendBasicBlockInContext(ctx, fn, "ifcont")
+
+        LLVMBuildCondBr(b, condBit, thenBB, elseBB ?? mergeBB)
+
+        LLVMPositionBuilderAtEnd(b, thenBB)
+        var saved = locals; lowerBlock(then); locals = saved
+        if !blockTerminated() { LLVMBuildBr(b, mergeBB) }
+
+        if let els = els, let elseBB = elseBB {
+            LLVMPositionBuilderAtEnd(b, elseBB)
+            saved = locals; lowerBlock(els); locals = saved
+            if !blockTerminated() { LLVMBuildBr(b, mergeBB) }
+        }
+        LLVMPositionBuilderAtEnd(b, mergeBB)
+    }
+
+    // MARK: - Expressions
+
+    private func lowerExpr(_ e: IRExpr) -> LLVMValueRef? {
+        switch e.kind {
+        case .intLit(let n):
+            return LLVMConstInt(i64, UInt64(bitPattern: Int64(n)), /*SignExtend=*/1)
+        case .boolLit(let v):
+            return LLVMConstInt(i64, v ? 1 : 0, 0)
+        case .stringLit(let s):
+            return lowerStringLit(s)
+        case .varRef, .fieldAccess:
+            guard let lv = lvalue(e) else { return nil }
+            return LLVMBuildLoad2(b, lv.ty, lv.addr, "ld")
+        case .binary(let op, let l, let r):
+            return lowerBinary(op, l, r)
+        case .construct(let typeName, let args):
+            return lowerConstruct(typeName, args, e.span)
+        case .methodCall(let receiver, let method, let args):
+            return lowerMethodCall(receiver: receiver, method: method, args: args, span: e.span)
+        case .call(let callee, let args, _):
+            return lowerCall(callee: callee, args: args, span: e.span)
+        default:
+            fail("8.2.2: unsupported expression", e.span)
+            return nil
+        }
+    }
+
+    // The address of an assignable/aggregate expression. A local or self-field yields its slot; a
+    // field access GEPs into its base's address; any other value is spilled to a temp alloca so a
+    // field read off an rvalue (e.g. `makePoint().x`) still works.
+    private func lvalue(_ e: IRExpr) -> (addr: LLVMValueRef, ty: LLVMTypeRef)? {
+        switch e.kind {
+        case .varRef(let name):
+            if let l = locals[name] { return l }
+            if let cs = currentSelf, let idx = cs.s.fields.firstIndex(where: { $0.name == name }) {
+                guard let fieldTy = llvmType(cs.s.fields[idx].type, e.span) else { return nil }
+                return (structGEP(cs.structTy, cs.addr, idx), fieldTy)
+            }
+            fail("8.2.2: unknown variable '\(name)'", e.span)
+            return nil
+        case .fieldAccess(let base, let field):
+            guard case .named(let typeName, .struct_) = base.type, let s = structMap[typeName],
+                  let st = structType(typeName),
+                  let idx = s.fields.firstIndex(where: { $0.name == field }) else {
+                fail("8.2.2: field access on a non-struct", e.span)
+                return nil
+            }
+            guard let baseAddr = lvalue(base) else { return nil }
+            guard let fieldTy = llvmType(s.fields[idx].type, e.span) else { return nil }
+            return (structGEP(st, baseAddr.addr, idx), fieldTy)
+        default:
+            // An rvalue (e.g. a call result): materialize it in a temp so it has an address.
+            guard let ty = llvmType(e.type, e.span), let v = lowerExpr(e) else { return nil }
+            let slot = LLVMBuildAlloca(b, ty, "tmp")!
+            LLVMBuildStore(b, v, slot)
+            return (slot, ty)
+        }
+    }
+
+    private func lowerBinary(_ op: BinOp, _ l: IRExpr, _ r: IRExpr) -> LLVMValueRef? {
+        guard let lv = lowerExpr(l), let rv = lowerExpr(r) else { return nil }
+        switch op {
+        case .add: return LLVMBuildAdd(b, lv, rv, "add")
+        case .sub: return LLVMBuildSub(b, lv, rv, "sub")
+        case .mul: return LLVMBuildMul(b, lv, rv, "mul")
+        case .div: return LLVMBuildSDiv(b, lv, rv, "div")
+        case .eq, .neq, .lt, .gt, .lte, .gte:
+            // Comparisons on Int yield Bool (i64 0/1): icmp → i1, then zext.
+            let pred: LLVMIntPredicate
+            switch op {
+            case .eq:  pred = LLVMIntEQ
+            case .neq: pred = LLVMIntNE
+            case .lt:  pred = LLVMIntSLT
+            case .gt:  pred = LLVMIntSGT
+            case .lte: pred = LLVMIntSLE
+            default:   pred = LLVMIntSGE   // .gte
+            }
+            return LLVMBuildZExt(b, LLVMBuildICmp(b, pred, lv, rv, "cmp"), i64, "cmpi")
+        }
+    }
+
+    private func lowerConstruct(_ typeName: String, _ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+        guard let st = structType(typeName), let s = structMap[typeName] else {
+            fail("8.2.2: cannot construct '\(typeName)' (not a struct)", span)
+            return nil
+        }
+        var agg = LLVMGetUndef(st)
+        for (idx, field) in s.fields.enumerated() {
+            guard let arg = args.first(where: { $0.label == field.name }) else {
+                fail("8.2.2: missing field '\(field.name)' in construction of '\(typeName)'", span)
+                return nil
+            }
+            guard let v = lowerExpr(arg.value) else { return nil }
+            agg = LLVMBuildInsertValue(b, agg, v, UInt32(idx), "")
+        }
+        return agg
+    }
+
+    private func lowerMethodCall(receiver: IRExpr, method: String, args: [IRExpr], span: Span) -> LLVMValueRef? {
+        guard case .named(let typeName, .struct_) = receiver.type else {
+            fail("8.2.2: only concrete struct method calls are supported", span)
+            return nil
+        }
+        declareMethod(typeName, method)
+        guard let c = callables["m:\(typeName):\(method)"] else { return nil }
+
+        // Mutating methods take `self` by pointer (Sema proved the receiver is a mutable lvalue);
+        // read-only ones take it by value.
+        let selfArg: LLVMValueRef?
+        if c.selfByPointer {
+            selfArg = lvalue(receiver)?.addr
+        } else {
+            selfArg = lowerExpr(receiver)
+        }
+        guard let selfVal = selfArg else { return nil }
+
+        var argVals: [LLVMValueRef?] = [selfVal]
+        for a in args {
+            guard let v = lowerExpr(a) else { return nil }
+            argVals.append(v)
+        }
+        let n = UInt32(argVals.count)
+        return argVals.withUnsafeMutableBufferPointer {
+            LLVMBuildCall2(b, c.ty, c.fn, $0.baseAddress, n, "")
+        }
+    }
+
+    private func lowerCall(callee: IRExpr, args: [IRArg], span: Span) -> LLVMValueRef? {
+        guard case .varRef(let name) = callee.kind else {
+            fail("8.2.2: only direct function calls are supported", span)
+            return nil
+        }
+        switch name {
+        case "print":  return lowerPrint(args, span)
+        case "concat": return lowerConcat(args, span)
+        default:       break
+        }
+        guard funcMap[name] != nil else {
+            fail("8.2.2: unsupported call to '\(name)'", span)
+            return nil
+        }
+        declareFree(name)
+        guard let c = callables["f:\(name)"] else { return nil }
+        var argVals: [LLVMValueRef?] = []
+        for a in args {
+            guard let v = lowerExpr(a.value) else { return nil }
+            argVals.append(v)
+        }
+        let n = UInt32(argVals.count)
+        return argVals.withUnsafeMutableBufferPointer {
+            LLVMBuildCall2(b, c.ty, c.fn, $0.baseAddress, n, "")
+        }
+    }
+
+    // print(Int|Bool) → printf("%lld\n", n);  print(String) → printf("%.*s\n", (int)len, data).
+    private func lowerPrint(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+        guard let arg = args.first, let value = lowerExpr(arg.value) else {
+            fail("8.2.1: print expects one argument", span)
+            return nil
+        }
+        let (fn, ty) = runtimeFn("printf", ret: i32, params: [i8ptr], varArg: true)
+        switch arg.value.type {
+        case .int, .bool:
+            return buildCall(fn, ty, [intFormat(), value])
+        case .string:
+            let data = LLVMBuildExtractValue(b, value, 0, "data")
+            let len = LLVMBuildExtractValue(b, value, 1, "len")
+            let len32 = LLVMBuildTrunc(b, len, i32, "len32")
+            return buildCall(fn, ty, [strFormat(), len32, data])
+        default:
+            fail("8.2.1: print supports Int, Bool, or String", arg.value.span)
+            return nil
+        }
+    }
+
+    private func lowerConcat(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+        guard args.count == 2 else {
+            fail("8.2.1: concat expects two String arguments", span)
+            return nil
+        }
+        guard let a = lowerExpr(args[0].value), let c = lowerExpr(args[1].value) else { return nil }
+        let (fn, ty) = runtimeFn("rt_str_concat", ret: strTy, params: [strTy, strTy], varArg: false)
+        return buildCall(fn, ty, [a, c])
+    }
+
+    private func lowerStringLit(_ s: String) -> LLVMValueRef {
+        let data = LLVMBuildGlobalStringPtr(b, s, "str")!
+        let len = LLVMConstInt(i64, UInt64(s.utf8.count), 0)
+        let (fn, ty) = runtimeFn("rt_str_lit", ret: strTy, params: [i8ptr, i64], varArg: false)
+        return buildCall(fn, ty, [data, len])!
+    }
+
+    // MARK: - Helpers
+
+    private func structGEP(_ structTy: LLVMTypeRef, _ addr: LLVMValueRef, _ idx: Int) -> LLVMValueRef {
+        var idxs: [LLVMValueRef?] = [LLVMConstInt(i32, 0, 0), LLVMConstInt(i32, UInt64(idx), 0)]
+        return idxs.withUnsafeMutableBufferPointer {
+            LLVMBuildGEP2(b, structTy, addr, $0.baseAddress, 2, "fld")
+        }!
+    }
+
+    private func buildCall(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?]) -> LLVMValueRef? {
+        var a = args
+        return a.withUnsafeMutableBufferPointer {
+            LLVMBuildCall2(b, ty, fn, $0.baseAddress, UInt32(args.count), "")
+        }
+    }
+
+    private func runtimeFn(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef], varArg: Bool)
+        -> (LLVMValueRef, LLVMTypeRef)
+    {
+        if let cached = runtimeFns[name] { return cached }
+        var ps: [LLVMTypeRef?] = params.map { $0 }
+        let ty = ps.withUnsafeMutableBufferPointer {
+            LLVMFunctionType(ret, $0.baseAddress, UInt32(params.count), varArg ? 1 : 0)
+        }!
+        let fn = LLVMAddFunction(mod, name, ty)!
+        runtimeFns[name] = (fn, ty)
+        return (fn, ty)
+    }
+
+    private func intFormat() -> LLVMValueRef {
+        if let f = intFmt { return f }
+        let f = LLVMBuildGlobalStringPtr(b, "%lld\n", "fmt_int")!
+        intFmt = f
+        return f
+    }
+
+    private func strFormat() -> LLVMValueRef {
+        if let f = strFmt { return f }
+        let f = LLVMBuildGlobalStringPtr(b, "%.*s\n", "fmt_str")!
+        strFmt = f
+        return f
+    }
+
+    private func fail(_ msg: String, _ span: Span) {
+        if error == nil { error = "\(span): \(msg)" }
+    }
+}

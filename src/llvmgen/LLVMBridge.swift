@@ -1,9 +1,9 @@
 // M8.1 · 8.1.2 — prove Swift can import an LLVM Clang module via cxx-interop against
 // @llvm-project (the C API module `LLVM_C`, pure C — no C++ interop hazards).
 // M8.1 · 8.1.3 — hand-build the hello-world module (int arithmetic + external print) through
-// the same C API, sufficient for one program. No language lowering yet (that is 8.1.5); this
-// answers "can the C-API surface express main + i64 add + a call to printf + ret + verify?".
+// the same C API. M8.1 · 8.1.5 — lower a real `main` from the typed IR (`IRToLLVM`) and emit it.
 import LLVM_C
+import frontend
 
 public func llvmInteropOK() -> Bool {
     // Prove the C API is usable from Swift: build a module, a fn `answer()->i64 { ret 42 }`.
@@ -95,10 +95,11 @@ public func buildHelloWorldModule() -> BuiltModule {
     return BuiltModule(verified: verified, ir: ir)
 }
 
-/// 8.1.4 — emit the hello-world module as a native object file for the host triple, via
-/// `llvm-c/TargetMachine.h`. Self-contained: all LLVM_C use stays inside this module, so the
-/// driver's LLVM path is a flat `String → String?` surface (nil = success, else an error).
-public func emitHelloWorldObject(to path: String) -> String? {
+/// 8.1.5 — lower a `main` from the typed IR (`IRModule`) and emit it as a native object file for
+/// the host triple. The first real Nomu-through-LLVM slice. Self-contained: all LLVM_C use stays
+/// inside this module, so the driver's LLVM path is a flat `IRModule → String?` surface (nil =
+/// success, else an error). Coverage is the 8.1.5 sliver (`IRToLLVM`); 8.2 broadens it.
+public func emitObject(_ module: IRModule, to path: String) -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
@@ -106,12 +107,22 @@ public func emitHelloWorldObject(to path: String) -> String? {
 
     let ctx = LLVMContextCreate()!
     defer { LLVMContextDispose(ctx) }
-    let mod = buildHelloWorld(in: ctx)
+    let mod = LLVMModuleCreateWithNameInContext("nomu", ctx)!
+
+    let lowerer = IRToLLVM(ctx: ctx, mod: mod)
+    lowerer.lower(module)
+    if let err = lowerer.error { return err }
+    guard lowerer.loweredMain else { return "LLVM: no `main` function to lower" }
 
     if LLVMVerifyModule(mod, LLVMReturnStatusAction, nil) != 0 {
         return "LLVM: module failed verification"
     }
+    return emitModuleObject(mod, to: path)
+}
 
+/// Emit an already-built, verified module to a native object file for the host triple, via
+/// `llvm-c/TargetMachine.h`. Returns nil on success, else an error message.
+private func emitModuleObject(_ mod: LLVMModuleRef, to path: String) -> String? {
     let triple = LLVMGetDefaultTargetTriple()!
     defer { LLVMDisposeMessage(triple) }
     LLVMSetTarget(mod, triple)

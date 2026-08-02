@@ -102,12 +102,10 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
         exit(1)
     }
 
-    // LLVM backend (M8): drive LLVM via its C API → object → link with the runtime .a. The
-    // full front/middle pipeline above still runs (errors surface identically), but the emitted
-    // module is the fixed 8.1.3 hello-world — typed-IR lowering arrives in 8.1.5, which feeds
-    // `monoModule` here. The C backend stays the default and the differential oracle.
+    // LLVM backend (M8): lower the typed IR via LLVM's C API → object → link with the runtime
+    // .a. The C backend stays the default and the differential oracle.
     if options.backend == .llvm {
-        emitLLVMBinary(stem: stem, outputDir: outputDir)
+        emitLLVMBinary(monoModule, stem: stem, outputDir: outputDir)
         return
     }
 
@@ -209,9 +207,9 @@ private func prependPrelude(_ program: Program) -> Program {
 // static archive, and link them into a native executable. Reports the binary path (like the C
 // path). Everything LLVM stays behind `emitHelloWorldObject` in LLVMBridge — this only orchestrates
 // object → .a → link.
-private func emitLLVMBinary(stem: String, outputDir: String) {
+private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String) {
     let objPath = stem + ".o"
-    if let err = emitHelloWorldObject(to: objPath) {
+    if let err = emitObject(module, to: objPath) {
         fputs("error: \(err)\n", stderr)
         exit(1)
     }

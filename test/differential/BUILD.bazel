@@ -1,0 +1,18 @@
+# M8.1 · 8.1.5 — differential seed: `--backend=llvm` must match `--backend=c` (stdout + exit).
+# The C backend is the oracle; 8.2 extends this by adding programs to `args`/`data`.
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+PROGRAMS = [
+    "hello.nomu",
+    "control.nomu",
+    "functions.nomu",
+    "strings.nomu",
+    "structs.nomu",
+]
+
+sh_test(
+    name = "differential_test",
+    srcs = ["diff_backends.sh"],
+    args = ["$(location //src/nomu-cli:nomuc)"] + ["$(location %s)" % p for p in PROGRAMS],
+    data = PROGRAMS + ["//src/nomu-cli:nomuc"],
+)

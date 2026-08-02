@@ -1,0 +1,12 @@
+fun main() {
+  var n = 0
+  n = n + 10
+  n += 5
+  if n > 10 {
+    print(n)
+  } else {
+    print(0)
+  }
+  print(1 < 2)
+  print(3 == 4)
+}
