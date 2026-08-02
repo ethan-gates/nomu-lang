@@ -208,9 +208,18 @@ pre-pass proves cleaner (8.0.4-B). Differential-tested against the C backend thr
   named `prop.get`/`prop.set`. Differential-tested (`test/differential/structs.nomu`): fields,
   method calls, in-place mutation, computed props, and nested structs (`box.origin.y = 55`) all
   match the C backend.
-- **8.2.3 ⬜** — enums + `match`: payload-carrying enum construction (tag + payload layout),
-  `switch` lowering (discriminant branch + pattern bindings), enum methods/properties
-  (exhaustiveness already checked upstream).
+- **8.2.3 ✅ (2026-08-02)** — enums + `match`: payload-carrying enum construction (tag + payload
+  layout), `switch` lowering (discriminant branch + pattern bindings), enum methods/properties
+  (exhaustiveness already checked upstream). An enum is `{ i64 tag, [P x i64] payload }` — since
+  enums never cross the runtime C ABI, the layout is internal and need not match `CodegenIR`'s
+  union; all supported field types are 8-aligned/8-multiple, so a case's storage is exactly its
+  field-slot count and P is the largest case's. `enumInit` writes the case index as the tag and
+  each payload field via the case's struct type GEP'd over the payload region; `switch` reads the
+  tag into an LLVM `switch` (exhaustive → `unreachable` default), and each arm binds its payload
+  fields (local copies) before its body. Enum methods reuse the struct callable/self machinery
+  (self by value / by pointer). Differential-tested (`test/differential/enums.nomu`): Int/String/
+  struct payloads, no-payload cases, `switch` with bindings, and an enum method matching the C
+  backend.
 - **8.2.4 ⬜** — reference types + closures: `class` construction/fields/methods; closures
   (env as heap struct + code pointer), closure calls, reabstraction thunks.
 - **8.2.5 ⬜** — interfaces + generics + `Result`: witness-table emission, `any` boxing +

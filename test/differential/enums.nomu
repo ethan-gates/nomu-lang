@@ -1,0 +1,36 @@
+struct Pt {
+  var x: Int
+  var y: Int
+}
+enum Shape {
+  case circle(r: Int)
+  case rect(w: Int, h: Int)
+  case at(p: Pt)
+  case dot
+  fun area() -> Int {
+    switch self {
+      case .circle(let r): return r * r * 3
+      case .rect(let w, let h): return w * h
+      case .at(let p): return p.x + p.y
+      case .dot: return 0
+    }
+  }
+}
+enum Msg {
+  case text(s: String)
+  case code(n: Int)
+}
+fun render(m: Msg) -> String {
+  switch m {
+    case .text(let s): return concat("t:", s)
+    case .code(let n): return "code"
+  }
+}
+fun main() {
+  print(Shape.circle(r: 4).area())
+  print(Shape.rect(w: 3, h: 5).area())
+  print(Shape.at(p: Pt(x: 10, y: 20)).area())
+  print(Shape.dot.area())
+  print(render(Msg.text(s: "hi")))
+  print(render(Msg.code(n: 7)))
+}

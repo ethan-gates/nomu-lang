@@ -8,6 +8,7 @@ PROGRAMS = [
     "functions.nomu",
     "strings.nomu",
     "structs.nomu",
+    "enums.nomu",
 ]
 
 sh_test(

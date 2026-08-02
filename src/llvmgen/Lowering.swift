@@ -35,6 +35,8 @@ final class IRToLLVM {
     // (free functions keyed `f:<name>`, methods `m:<type>:<method>`), with `pending` bodies.
     private var structMap: [String: IRStruct] = [:]
     private var structTypes: [String: LLVMTypeRef] = [:]
+    private var enumMap: [String: IREnum] = [:]
+    private var enumTypes: [String: LLVMTypeRef] = [:]
     private var funcMap: [String: IRFunc] = [:]
 
     private struct Callable {
@@ -54,8 +56,8 @@ final class IRToLLVM {
     // While lowering a method body: the receiver, so a bare field reference (`x` inside a method)
     // resolves through `self`.
     private struct SelfCtx {
-        let s: IRStruct
-        let structTy: LLVMTypeRef
+        let fields: [IRField]    // struct fields for bare-name access inside a method; [] for enums
+        let llvmTy: LLVMTypeRef
         let addr: LLVMValueRef   // pointer to the receiver value
     }
     private var currentSelf: SelfCtx?
@@ -84,7 +86,8 @@ final class IRToLLVM {
             switch decl {
             case .funcDecl(let f):   funcMap[f.name] = f
             case .structDecl(let s): structMap[s.name] = s
-            default: break   // classes/enums/actors are later slices
+            case .enumDecl(let e):   enumMap[e.name] = e
+            default: break   // classes/actors are later slices
             }
         }
         guard funcMap["main"] != nil else { return }   // `loweredMain` stays false → caller errors
@@ -122,9 +125,55 @@ final class IRToLLVM {
             if let st = structType(n) { return st }
             fail("8.2.2: unknown struct '\(n)'", span)
             return nil
-        default:
-            fail("8.2.2: unsupported type '\(t)'", span)
+        case .named(let n, .enum_):
+            if let et = enumType(n) { return et }
+            fail("8.2.3: unknown enum '\(n)'", span)
             return nil
+        default:
+            fail("8.2.3: unsupported type '\(t)'", span)
+            return nil
+        }
+    }
+
+    // An enum lowers to `{ i64 tag, [P x i64] payload }`. All supported field types are 8-aligned
+    // and a multiple of 8 bytes, so a case's storage is exactly its field-slot count; P is the
+    // largest case's. Payload fields are read/written by GEPing the case's struct type over the
+    // payload region (opaque pointers make the reinterpretation free). This layout is internal to
+    // the LLVM object (enums never cross the runtime C ABI), so it need not match `CodegenIR`'s.
+    private func enumType(_ name: String) -> LLVMTypeRef? {
+        if let t = enumTypes[name] { return t }
+        guard let e = enumMap[name] else { return nil }
+        let et = LLVMStructCreateNamed(ctx, "enum.\(name)")!
+        enumTypes[name] = et
+        let slots = e.cases.map { caseSlots($0) }.max() ?? 0
+        var elems: [LLVMTypeRef?] = [i64, LLVMArrayType2(i64, UInt64(slots))]
+        elems.withUnsafeMutableBufferPointer { LLVMStructSetBody(et, $0.baseAddress, 2, 0) }
+        return et
+    }
+
+    // The struct of a case's payload field types — GEP'd over the enum's payload region.
+    private func caseStructType(_ enumName: String, _ c: IREnumCase) -> LLVMTypeRef? {
+        var elems: [LLVMTypeRef?] = []
+        for f in c.fields {
+            guard let t = llvmType(f.type, f.span) else { return nil }
+            elems.append(t)
+        }
+        return elems.withUnsafeMutableBufferPointer {
+            LLVMStructTypeInContext(ctx, $0.baseAddress, UInt32(c.fields.count), 0)
+        }
+    }
+
+    private func caseSlots(_ c: IREnumCase) -> Int { c.fields.reduce(0) { $0 + slotCount($1.type) } }
+
+    // 8-byte slots a value occupies in an enum payload. Every supported leaf is 8-aligned, so a
+    // struct/enum is just the sum/tag+max of its parts — no padding to account for.
+    private func slotCount(_ t: Type) -> Int {
+        switch t {
+        case .int, .bool: return 1
+        case .string:     return 2
+        case .named(let n, .struct_): return structMap[n]?.fields.reduce(0) { $0 + slotCount($1.type) } ?? 1
+        case .named(let n, .enum_):   return 1 + (enumMap[n]?.cases.map { caseSlots($0) }.max() ?? 0)
+        default: return 1
         }
     }
 
@@ -140,8 +189,8 @@ final class IRToLLVM {
     private func declareMethod(_ typeName: String, _ method: String) {
         let key = "m:\(typeName):\(method)"
         guard callables[key] == nil else { return }
-        guard let s = structMap[typeName], let f = s.methods.first(where: { $0.name == method }) else {
-            fail("8.2.2: unknown method '\(typeName).\(method)'", Span(file: "", begin: Pos(line: 0, col: 0), end: Pos(line: 0, col: 0)))
+        guard let f = typeMethods(typeName).first(where: { $0.name == method }) else {
+            fail("8.2.3: unknown method '\(typeName).\(method)'", Span(file: "", begin: Pos(line: 0, col: 0), end: Pos(line: 0, col: 0)))
             return
         }
         let sanitized = method.replacingOccurrences(of: ".", with: "_")
@@ -149,12 +198,22 @@ final class IRToLLVM {
                         ir: f, selfType: typeName, selfByPointer: f.isMutating)
     }
 
+    private func typeMethods(_ typeName: String) -> [IRFunc] {
+        structMap[typeName]?.methods ?? enumMap[typeName]?.methods ?? []
+    }
+
+    private func selfLLVMType(_ typeName: String) -> LLVMTypeRef? {
+        if structMap[typeName] != nil { return structType(typeName) }
+        if enumMap[typeName] != nil { return enumType(typeName) }
+        return nil
+    }
+
     private func declareCallable(key: String, llvmName: String, ir f: IRFunc,
                                  selfType: String?, selfByPointer: Bool) {
         guard let retTy = llvmType(f.returnType, f.span) else { return }
         var paramTys: [LLVMTypeRef?] = []
         if let selfType = selfType {
-            guard let st = structType(selfType) else { return }
+            guard let st = selfLLVMType(selfType) else { return }
             paramTys.append(selfByPointer ? LLVMPointerType(st, 0) : st)
         }
         for p in f.params {
@@ -181,7 +240,7 @@ final class IRToLLVM {
         locals = [:]; currentSelf = nil
 
         var paramBase: UInt32 = 0
-        if let selfType = c.selfType, let s = structMap[selfType], let st = structType(selfType) {
+        if let selfType = c.selfType, let st = selfLLVMType(selfType) {
             let selfAddr: LLVMValueRef
             if c.selfByPointer {
                 selfAddr = LLVMGetParam(c.fn, 0)   // mutating: the incoming pointer is the address
@@ -189,7 +248,7 @@ final class IRToLLVM {
                 selfAddr = LLVMBuildAlloca(b, st, "self")!   // by value: keep a local copy
                 LLVMBuildStore(b, LLVMGetParam(c.fn, 0), selfAddr)
             }
-            currentSelf = SelfCtx(s: s, structTy: st, addr: selfAddr)
+            currentSelf = SelfCtx(fields: structMap[selfType]?.fields ?? [], llvmTy: st, addr: selfAddr)
             locals["self"] = (selfAddr, st)
             paramBase = 1
         }
@@ -251,11 +310,14 @@ final class IRToLLVM {
         case .ifStmt(let cond, let then, let els):
             lowerIf(cond: cond, then: then, els: els)
 
+        case .switchStmt(let sw):
+            lowerSwitch(sw)
+
         case .exprStmt(let e):
             _ = lowerExpr(e)
 
         default:
-            fail("8.2.2: unsupported statement", stmt.span)
+            fail("8.2.3: unsupported statement", stmt.span)
         }
     }
 
@@ -297,6 +359,8 @@ final class IRToLLVM {
             return lowerBinary(op, l, r)
         case .construct(let typeName, let args):
             return lowerConstruct(typeName, args, e.span)
+        case .enumInit(let typeName, let caseName, let args):
+            return lowerEnumInit(typeName, caseName, args, e.span)
         case .methodCall(let receiver, let method, let args):
             return lowerMethodCall(receiver: receiver, method: method, args: args, span: e.span)
         case .call(let callee, let args, _):
@@ -314,9 +378,9 @@ final class IRToLLVM {
         switch e.kind {
         case .varRef(let name):
             if let l = locals[name] { return l }
-            if let cs = currentSelf, let idx = cs.s.fields.firstIndex(where: { $0.name == name }) {
-                guard let fieldTy = llvmType(cs.s.fields[idx].type, e.span) else { return nil }
-                return (structGEP(cs.structTy, cs.addr, idx), fieldTy)
+            if let cs = currentSelf, let idx = cs.fields.firstIndex(where: { $0.name == name }) {
+                guard let fieldTy = llvmType(cs.fields[idx].type, e.span) else { return nil }
+                return (structGEP(cs.llvmTy, cs.addr, idx), fieldTy)
             }
             fail("8.2.2: unknown variable '\(name)'", e.span)
             return nil
@@ -378,9 +442,79 @@ final class IRToLLVM {
         return agg
     }
 
+    // Build an enum value in a temp: store the case index as the tag, then each payload field via
+    // the case's struct type GEP'd over the payload region; return the loaded aggregate.
+    private func lowerEnumInit(_ typeName: String, _ caseName: String, _ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+        guard let et = enumType(typeName), let e = enumMap[typeName],
+              let caseIdx = e.cases.firstIndex(where: { $0.name == caseName }) else {
+            fail("8.2.3: cannot construct '\(typeName).\(caseName)'", span)
+            return nil
+        }
+        let c = e.cases[caseIdx]
+        let slot = LLVMBuildAlloca(b, et, "enum")!
+        LLVMBuildStore(b, LLVMConstInt(i64, UInt64(caseIdx), 0), structGEP(et, slot, 0))
+        if !c.fields.isEmpty {
+            guard let cst = caseStructType(typeName, c) else { return nil }
+            let payload = structGEP(et, slot, 1)
+            for (idx, field) in c.fields.enumerated() {
+                guard let arg = args.first(where: { $0.label == field.name }) else {
+                    fail("8.2.3: missing payload field '\(field.name)' for '\(typeName).\(caseName)'", span)
+                    return nil
+                }
+                guard let v = lowerExpr(arg.value) else { return nil }
+                LLVMBuildStore(b, v, structGEP(cst, payload, idx))
+            }
+        }
+        return LLVMBuildLoad2(b, et, slot, "enumv")
+    }
+
+    // switch on the enum tag: an LLVM `switch` with one block per arm (exhaustive → default is
+    // unreachable). Each arm binds its payload fields (as local copies) then lowers its body.
+    private func lowerSwitch(_ sw: IRSwitch) {
+        guard let fn = currentFn else { return }
+        guard case .named(let enumName, .enum_) = sw.subject.type,
+              let e = enumMap[enumName], let et = enumType(enumName) else {
+            fail("8.2.3: switch subject must be a concrete enum", sw.subject.span)
+            return
+        }
+        guard let subj = lvalue(sw.subject) else { return }
+        let tag = LLVMBuildLoad2(b, i64, structGEP(et, subj.addr, 0), "tag")
+
+        let defaultBB = LLVMAppendBasicBlockInContext(ctx, fn, "sw.default")
+        let mergeBB = LLVMAppendBasicBlockInContext(ctx, fn, "sw.merge")
+        let inst = LLVMBuildSwitch(b, tag, defaultBB, UInt32(sw.arms.count))
+
+        for arm in sw.arms {
+            guard let caseIdx = e.cases.firstIndex(where: { $0.name == arm.caseName }) else { continue }
+            let c = e.cases[caseIdx]
+            let armBB = LLVMAppendBasicBlockInContext(ctx, fn, "sw.\(arm.caseName)")
+            LLVMAddCase(inst, LLVMConstInt(i64, UInt64(caseIdx), 0), armBB)
+            LLVMPositionBuilderAtEnd(b, armBB)
+
+            let saved = locals
+            if !arm.bindings.isEmpty, let cst = caseStructType(enumName, c) {
+                let payload = structGEP(et, subj.addr, 1)
+                for (i, binding) in arm.bindings.enumerated() {
+                    guard let bty = llvmType(binding.type, sw.subject.span) else { break }
+                    let val = LLVMBuildLoad2(b, bty, structGEP(cst, payload, i), binding.name)
+                    let bslot = LLVMBuildAlloca(b, bty, binding.name)!
+                    LLVMBuildStore(b, val, bslot)
+                    locals[binding.name] = (bslot, bty)
+                }
+            }
+            lowerBlock(arm.body)
+            if !blockTerminated() { LLVMBuildBr(b, mergeBB) }
+            locals = saved
+        }
+
+        LLVMPositionBuilderAtEnd(b, defaultBB)
+        LLVMBuildUnreachable(b)
+        LLVMPositionBuilderAtEnd(b, mergeBB)
+    }
+
     private func lowerMethodCall(receiver: IRExpr, method: String, args: [IRExpr], span: Span) -> LLVMValueRef? {
-        guard case .named(let typeName, .struct_) = receiver.type else {
-            fail("8.2.2: only concrete struct method calls are supported", span)
+        guard case .named(let typeName, let kind) = receiver.type, kind == .struct_ || kind == .enum_ else {
+            fail("8.2.3: only concrete struct/enum method calls are supported", span)
             return nil
         }
         declareMethod(typeName, method)
