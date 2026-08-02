@@ -100,6 +100,7 @@ public struct Parser {
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
             panicking = false
+            let before = pos
             if check(.kwVar) || check(.kwLet) {
                 switch parseFieldOrProperty() {
                 case .field(let f):    fields.append(f)
@@ -112,6 +113,10 @@ public struct Parser {
                 error("expected 'let', 'var', or 'fun' in struct body, got \(currentKind)")
                 recover(to: Self.memberBoundary)
             }
+            // A member introducer for a *different* body kind (e.g. `case`/`on` here) is in the
+            // recovery set, so recover() stops on it without consuming — force progress. (Same
+            // guard as parseBlock/parseParamList; without it a stray boundary token spins.)
+            if pos == before { advance() }
         }
         expect(.rBrace)
         return StructDecl(name: name, generics: generics, fields: fields, properties: properties, methods: methods,
@@ -130,6 +135,7 @@ public struct Parser {
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
             panicking = false
+            let before = pos
             if check(.kwCase) {
                 cases.append(parseEnumCaseDecl())
             } else if check(.kwVar) {
@@ -149,6 +155,7 @@ public struct Parser {
                 error("expected 'case', 'var', or 'fun' in enum body, got \(currentKind)")
                 recover(to: Self.memberBoundary)
             }
+            if pos == before { advance() }   // stray boundary token (e.g. `on`): force progress
         }
         expect(.rBrace)
         return EnumDecl(name: name, generics: generics, cases: cases, properties: properties, methods: methods,
@@ -185,6 +192,7 @@ public struct Parser {
         var methods: [FuncDecl] = []
         while !check(.rBrace) && !check(.eof) {
             panicking = false
+            let before = pos
             if check(.kwVar) || check(.kwLet) {
                 switch parseFieldOrProperty() {
                 case .field(let f):    fields.append(f)
@@ -197,6 +205,7 @@ public struct Parser {
                 error("expected 'let', 'var', or 'fun' in class body, got \(currentKind)")
                 recover(to: Self.memberBoundary)
             }
+            if pos == before { advance() }   // stray boundary token (e.g. `case`/`on`): force progress
         }
         expect(.rBrace)
         return ClassDecl(name: name, generics: generics, fields: fields, properties: properties, methods: methods,
@@ -222,6 +231,7 @@ public struct Parser {
         var properties: [ComputedProperty] = []
         while !check(.rBrace) && !check(.eof) {
             panicking = false
+            let before = pos
             if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseFuncDecl())
@@ -236,6 +246,7 @@ public struct Parser {
                 error("expected 'fun' or a computed property in extension body, got \(currentKind)")
                 recover(to: Self.memberBoundary)
             }
+            if pos == before { advance() }   // stray boundary token (e.g. `case`/`on`): force progress
         }
         expect(.rBrace)
         return ExtensionDecl(typeName: name, typeNameSpan: nameSpan, conformance: conformance,
@@ -258,6 +269,7 @@ public struct Parser {
         var properties: [InterfacePropertyReq] = []
         while !check(.rBrace) && !check(.eof) {
             panicking = false
+            let before = pos
             if check(.kwFunc) {
                 requireLineStart("fun")
                 methods.append(parseInterfaceMethod())
@@ -268,6 +280,7 @@ public struct Parser {
                 error("expected 'fun' or 'var' requirement in interface body, got \(currentKind)")
                 recover(to: Self.memberBoundary)
             }
+            if pos == before { advance() }   // stray boundary token (e.g. `case`/`on`): force progress
         }
         expect(.rBrace)
         return InterfaceDecl(name: name, refines: refines, methods: methods, properties: properties, span: spanFrom(start))
@@ -320,6 +333,7 @@ public struct Parser {
         var handlers: [OnHandler] = []
         while !check(.rBrace) && !check(.eof) {
             panicking = false
+            let before = pos
             if check(.kwVar) {
                 fields.append(parseActorField())
             } else if check(.kwOn) {
@@ -328,6 +342,7 @@ public struct Parser {
                 error("expected 'var' or 'on' in actor body, got \(currentKind)")
                 recover(to: Self.memberBoundary)
             }
+            if pos == before { advance() }   // stray boundary token (e.g. `case`): force progress
         }
         expect(.rBrace)
         return ActorDecl(name: name, fields: fields, handlers: handlers,
@@ -492,8 +507,12 @@ public struct Parser {
             expect(.lParen)
             var params: [TypeRef] = []
             while !check(.rParen) && !check(.eof) {
+                let before = pos
                 if !params.isEmpty { expect(.comma) }
                 params.append(parseTypeRef())
+                // A non-type token here (e.g. a literal) makes parseTypeRef consume nothing;
+                // without this guard the loop spins forever. Force progress.
+                if pos == before { advance() }
             }
             expect(.rParen)
             expect(.arrow)

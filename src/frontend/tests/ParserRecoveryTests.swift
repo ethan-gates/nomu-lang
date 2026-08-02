@@ -68,4 +68,31 @@ final class ParserRecoveryTests: XCTestCase {
         let (_, diags) = parse("}{ )( : > , struct")
         XCTAssertTrue(diags.hasErrors)
     }
+
+    // The following inputs once hung the parser: a loop whose sub-parser consumed no token and
+    // whose recovery set already held the offending token, so neither made progress. Each must
+    // now *terminate* (if it regresses, the test run hangs) and report the error. The
+    // progress-guard (`if pos == before { advance() }`) in every such loop is what guarantees it.
+
+    func testMissingParamParensTerminates() {
+        // `fun main {` — no `()`; recovery once spun in the function-type parameter loop.
+        let (_, diags) = parse("fun main {\n  print(2 + 3)\n}")
+        XCTAssertTrue(diags.hasErrors)
+    }
+
+    func testStrayMemberBoundaryTokenTerminates() {
+        // `on`/`case` are member introducers for *other* body kinds, so they sit in the member
+        // recovery set; encountering one in a struct/actor body must not spin.
+        for src in ["struct S { on x }", "struct S { case y }", "actor A { case z }",
+                    "interface I { on q }"] {
+            let (_, diags) = parse(src)
+            XCTAssertTrue(diags.hasErrors, "expected errors for \(src)")
+        }
+    }
+
+    func testFunctionTypeWithNonTypeTokenTerminates() {
+        // A literal where a type is expected inside a function type `( … )` consumed nothing.
+        let (_, diags) = parse("fun f(g: (2) -> Int) {}")
+        XCTAssertTrue(diags.hasErrors)
+    }
 }
