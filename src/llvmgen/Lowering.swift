@@ -35,14 +35,19 @@ final class IRToLLVM {
     private let mod: LLVMModuleRef
     private let b: LLVMBuilderRef
 
-    private let i8ptr: LLVMTypeRef
+    private let i8ptr: LLVMTypeRef      // opaque `ptr` (addrspace 0) — code / static / C-owned memory
+    private let p1: LLVMTypeRef         // opaque `ptr addrspace(1)` — a managed (GC-heap) reference (8.4.1 D1)
     private let i32: LLVMTypeRef
     private let i64: LLVMTypeRef
     private let voidTy: LLVMTypeRef
     private let strTy: LLVMTypeRef      // { i8* data, i64 len } — matches runtime.h `String`
-    private let closureTy: LLVMTypeRef  // { ptr fn, ptr env } — matches runtime.h `Closure`
-    private let anyBoxTy: LLVMTypeRef   // { ptr witness, ptr payload } — an `any I` box (8.2.5)
-    private let spawnHandleTy: LLVMTypeRef  // { ptr fiber } — matches runtime.h `SpawnHandle` (8.2.6)
+    // Heap-box layouts (8.4.1). A closure / `any I` *value* is a managed `p1` pointer to one of
+    // these heap objects, so no GC pointer ever rides inside a by-value aggregate across a safepoint
+    // (RewriteStatepointsForGC can't relocate GC pointers nested in first-class aggregates). A
+    // closure fuses its captures inline after the fn pointer, so creation is a single allocation.
+    private let closureHdrTy: LLVMTypeRef  // { ptr fn } — the fixed prefix of a heap closure { fn, caps… }
+    private let anyBoxTy: LLVMTypeRef      // { ptr witness (addr0), ptr addrspace(1) payload } — the `any I` heap box (D1)
+    private let spawnHandleTy: LLVMTypeRef // { ptr fiber (addr0, runtime-owned) } — SpawnHandle (8.2.6)
 
     private let zeroSpan = Span(file: "", begin: Pos(line: 0, col: 0), end: Pos(line: 0, col: 0))
 
@@ -144,6 +149,7 @@ final class IRToLLVM {
         self.mod = mod
         b = LLVMCreateBuilderInContext(ctx)
         i8ptr = LLVMPointerType(LLVMInt8TypeInContext(ctx), 0)
+        p1 = LLVMPointerType(LLVMInt8TypeInContext(ctx), 1)
         i32 = LLVMInt32TypeInContext(ctx)
         i64 = LLVMInt64TypeInContext(ctx)
         voidTy = LLVMVoidTypeInContext(ctx)
@@ -151,11 +157,11 @@ final class IRToLLVM {
         strTy = fields.withUnsafeMutableBufferPointer {
             LLVMStructTypeInContext(ctx, $0.baseAddress, 2, /*packed=*/0)
         }
-        var clo: [LLVMTypeRef?] = [i8ptr, i8ptr]
-        closureTy = clo.withUnsafeMutableBufferPointer {
-            LLVMStructTypeInContext(ctx, $0.baseAddress, 2, 0)
+        var clo: [LLVMTypeRef?] = [i8ptr]   // fn is a code pointer (addr0); captures follow, per closure
+        closureHdrTy = clo.withUnsafeMutableBufferPointer {
+            LLVMStructTypeInContext(ctx, $0.baseAddress, 1, 0)
         }
-        var box: [LLVMTypeRef?] = [i8ptr, i8ptr]
+        var box: [LLVMTypeRef?] = [i8ptr, p1]   // witness is a static table (addr0); payload is managed (addr1)
         anyBoxTy = box.withUnsafeMutableBufferPointer {
             LLVMStructTypeInContext(ctx, $0.baseAddress, 2, 0)
         }
@@ -393,7 +399,7 @@ final class IRToLLVM {
         case .int, .bool: return i64
         case .string:     return strTy
         case .void:       return voidTy
-        case .function:   return closureTy   // a closure value is { fn, env }
+        case .function:   return p1   // a closure value is a managed pointer to a heap { fn, caps… } object (8.4.1)
         case .named(let n, .struct_):
             if let st = structType(n) { return st }
             fail("8.2.2: unknown struct '\(n)'", span)
@@ -403,15 +409,15 @@ final class IRToLLVM {
             fail("8.2.3: unknown enum '\(n)'", span)
             return nil
         case .named(let n, .class_):
-            if classMap[n] != nil { return i8ptr }   // a class value is a pointer to its object
+            if classMap[n] != nil { return p1 }   // a class value is a managed pointer to its object (D1)
             fail("8.2.4: unknown class '\(n)'", span)
             return nil
         case .named(let n, .actor_):
-            if actorMap[n] != nil { return i8ptr }    // an actor handle is a pointer to its object
+            if actorMap[n] != nil { return p1 }    // an actor handle is a managed pointer to its object (D1)
             fail("8.2.6: unknown actor '\(n)'", span)
             return nil
         case .existential, .composition:
-            return anyBoxTy                          // `any I` / `any A & B` — a { witness, payload } box
+            return p1   // `any I` / `any A & B` — a managed pointer to a heap { witness, payload } box (8.4.1)
         case .opaque:
             let u = concreteUnderlying(t)
             if case .opaque = u { fail("8.2.5: opaque type with no known underlying", span); return nil }
@@ -505,8 +511,8 @@ final class IRToLLVM {
         switch t {
         case .int, .bool: return 1
         case .string:     return 2
-        case .function:   return 2   // { fn, env }
-        case .existential, .composition: return 2   // { witness, payload }
+        case .function:   return 1   // a managed pointer to a heap { fn, caps… } box (8.4.1)
+        case .existential, .composition: return 1   // a managed pointer to a heap { witness, payload } box
         case .opaque:     return slotCount(concreteUnderlying(t))
         case .named(_, .class_), .named(_, .actor_): return 1   // a pointer
         case .named(let n, .struct_): return structMap[n]?.fields.reduce(0) { $0 + slotCount($1.type) } ?? 1
@@ -574,7 +580,14 @@ final class IRToLLVM {
         var paramTys: [LLVMTypeRef] = []
         if let selfType = selfType {
             guard let st = selfLLVMType(selfType) else { return }
-            paramTys.append(selfByPointer ? LLVMPointerType(st, 0) : st)
+            if selfByPointer {
+                // A class/actor receiver is the managed object pointer (addrspace 1). A struct/enum
+                // mutating receiver is a pointer to the stack-resident value (addrspace 0).
+                let isReference = classMap[selfType] != nil || actorMap[selfType] != nil
+                paramTys.append(isReference ? p1 : LLVMPointerType(st, 0)!)
+            } else {
+                paramTys.append(st)
+            }
         }
         for p in f.params {
             guard let t = llvmType(p.type, p.span) else { return }
@@ -616,10 +629,11 @@ final class IRToLLVM {
             currentSelf = SelfCtx(fields: fields, kind: isReference ? .classRef : .structVal,
                                   llvmTy: st, addr: selfPtr)
             if isReference {
-                // `self` as a value is the object pointer; keep it in a ptr slot for `varRef self`.
-                let slot = LLVMBuildAlloca(b, i8ptr, "self")!
+                // `self` as a value is the managed object pointer; keep it in an addrspace(1) slot
+                // for `varRef self` (mem2reg promotes it so the rewrite pass tracks it as a root).
+                let slot = LLVMBuildAlloca(b, p1, "self")!
                 LLVMBuildStore(b, selfPtr, slot)
-                locals["self"] = (slot, i8ptr)
+                locals["self"] = (slot, p1)
             } else {
                 locals["self"] = (selfPtr, st)   // loading the slot yields the struct/enum value
             }
@@ -918,7 +932,7 @@ final class IRToLLVM {
             // Heap-allocate the object (rt_alloc, bump-and-leak), then store each field past the
             // header. The class value is the returned pointer (reference semantics).
             let slots = 1 + c.fields.reduce(0) { $0 + slotCount($1.type) }
-            let obj = buildCall(rtAlloc(), rtAllocTy(), [LLVMConstInt(i64, UInt64(slots * 8), 0)])!
+            let obj = rtAllocManaged(LLVMConstInt(i64, UInt64(slots * 8), 0))
             for (idx, field) in c.fields.enumerated() {
                 guard let v = constructField(field, args, typeName, span) else { return nil }
                 LLVMBuildStore(b, v, structGEP(ct, obj, fieldLLVMIndex(.classRef, idx)))
@@ -929,7 +943,7 @@ final class IRToLLVM {
             // Heap-allocate the object, initialize each field (a declared initializer, else the
             // matching constructor argument), then install a fresh runtime mutex in the last slot.
             let slots = 2 + a.fields.reduce(0) { $0 + slotCount($1.type) }   // header + fields + mu
-            let obj = buildCall(rtAlloc(), rtAllocTy(), [LLVMConstInt(i64, UInt64(slots * 8), 0)])!
+            let obj = rtAllocManaged(LLVMConstInt(i64, UInt64(slots * 8), 0))
             for (idx, field) in a.fields.enumerated() {
                 let v: LLVMValueRef?
                 if let initE = field.initializer { v = lowerExpr(initE) }
@@ -1038,8 +1052,8 @@ final class IRToLLVM {
         // Requirement call through `any I` — dispatch dynamically via the box's witness slot.
         if case .existential(let iface) = receiver.type {
             guard let box = lowerExpr(receiver) else { return nil }
-            let witnessPtr = LLVMBuildExtractValue(b, box, 0, "wt")!
-            let payload = LLVMBuildExtractValue(b, box, 1, "pl")!
+            let witnessPtr = anyBoxWitness(box)
+            let payload = anyBoxPayload(box)
             return witnessDispatch(witnessPtr: witnessPtr, iface: iface, method: method,
                                    payload: payload, args: args, resultType: resultType, span: span)
         }
@@ -1047,8 +1061,8 @@ final class IRToLLVM {
         // sub-table, then dispatch through its slot.
         if case .composition(let ifaces) = receiver.type {
             guard let box = lowerExpr(receiver) else { return nil }
-            let compPtr = LLVMBuildExtractValue(b, box, 0, "wt")!
-            let payload = LLVMBuildExtractValue(b, box, 1, "pl")!
+            let compPtr = anyBoxWitness(box)
+            let payload = anyBoxPayload(box)
             let owner = compositionOwner(ifaces, method)
             guard let ownerIdx = ifaces.firstIndex(of: owner) else {
                 fail("8.2.5: no interface owns '\(method)' in composition", span); return nil
@@ -1198,7 +1212,12 @@ final class IRToLLVM {
     // Bridge a thunk's `payload` pointer to the impl's `self`: a by-pointer (mutating/class) method
     // takes it directly; a by-value method loads the concrete value out of it.
     private func bridgeThunkSelf(_ payload: LLVMValueRef, _ type: String, _ c: Callable) -> LLVMValueRef? {
-        if c.selfByPointer { return payload }
+        if c.selfByPointer {
+            // A class/actor impl takes the managed object pointer directly. A struct/enum mutating
+            // impl takes an addrspace(0) pointer to a stack-ABI value, so cast the heap box down.
+            if classMap[type] != nil || actorMap[type] != nil { return payload }
+            return toUnmanaged(payload)
+        }
         guard let st = selfLLVMType(type) else { return nil }
         return LLVMBuildLoad2(b, st, payload, "self")
     }
@@ -1208,7 +1227,7 @@ final class IRToLLVM {
     // pointer for a mutating / class method — and re-boxes a covariant-`Self` result as `any iface`.
     private func methodThunk(_ type: String, _ iface: String, _ m: IRMethodReq) -> LLVMValueRef? {
         guard let retTy = llvmType(m.ret, zeroSpan) else { return nil }
-        var paramTys: [LLVMTypeRef] = [i8ptr]
+        var paramTys: [LLVMTypeRef] = [p1]   // self/payload — the managed box pointer (addrspace 1)
         for pt in m.params {
             guard let t = llvmType(pt, zeroSpan) else { return nil }
             paramTys.append(t)
@@ -1243,7 +1262,7 @@ final class IRToLLVM {
     // computed one routes through the concrete accessor method (`prop.get` / `prop.set`).
     private func propThunk(_ type: String, _ iface: String, _ p: IRPropReq, setter: Bool) -> LLVMValueRef? {
         guard let propTy = llvmType(p.type, zeroSpan) else { return nil }
-        var paramTys: [LLVMTypeRef] = [i8ptr]
+        var paramTys: [LLVMTypeRef] = [p1]   // self/payload — the managed box pointer (addrspace 1)
         if setter { paramTys.append(propTy) }
         let slot = setter ? "\(p.name)_set" : "\(p.name)_get"
         let (fn, _) = emitFunction("wt_\(type)_\(iface)_\(slot)",
@@ -1323,7 +1342,7 @@ final class IRToLLVM {
         let fnPtr = LLVMBuildLoad2(b, i8ptr, structGEP(witnessType(iface), witnessPtr, idx), "slot")!
 
         guard let retTy = llvmType(resultType, span) else { return nil }
-        var paramTys: [LLVMTypeRef] = [i8ptr]
+        var paramTys: [LLVMTypeRef] = [p1]   // self/payload — the managed box pointer (addrspace 1)
         var argVals: [LLVMValueRef?] = [payload]
         for a in args {
             guard let t = llvmType(a.type, span), let v = lowerExpr(a) else { return nil }
@@ -1337,8 +1356,8 @@ final class IRToLLVM {
         // `any B` → `any A`: re-box through the source witness's base pointer, keeping the payload.
         if case .existential(let src) = value.type, ifaces.count == 1 {
             guard let box = lowerExpr(value) else { return nil }
-            let witnessPtr = LLVMBuildExtractValue(b, box, 0, "wt")!
-            let payload = LLVMBuildExtractValue(b, box, 1, "pl")!
+            let witnessPtr = anyBoxWitness(box)
+            let payload = anyBoxPayload(box)
             let idx = witnessSlotIndex(src, "base_\(ifaces[0])")
             guard idx >= 0 else { fail("8.2.5: '\(src)' has no base '\(ifaces[0])'", span); return nil }
             let base = LLVMBuildLoad2(b, i8ptr, structGEP(witnessType(src), witnessPtr, idx), "base")!
@@ -1361,17 +1380,29 @@ final class IRToLLVM {
             return v
         default:
             let bytes = max(slotCount(t) * 8, 8)
-            let p = buildCall(rtAlloc(), rtAllocTy(), [LLVMConstInt(i64, UInt64(bytes), 0)])!
+            let p = rtAllocManaged(LLVMConstInt(i64, UInt64(bytes), 0))
             LLVMBuildStore(b, v, p)
             return p
         }
     }
 
+    // An `any I` value is a managed pointer to a heap `{ i8ptr witness, p1 payload }` box (8.4.1):
+    // keeping the box behind a `p1` pointer means the value the mutator holds and passes across
+    // calls is a single scalar GC reference the rewrite pass tracks, never a first-class aggregate
+    // with a GC pointer nested inside (which the pass cannot relocate). The witness is a static
+    // table (addrspace 0); the payload is the managed object / heap value-copy pointer (addrspace 1).
     private func makeAnyBox(_ witness: LLVMValueRef, _ payload: LLVMValueRef) -> LLVMValueRef {
-        var box: LLVMValueRef = LLVMGetUndef(anyBoxTy)!
-        box = LLVMBuildInsertValue(b, box, witness, 0, "")!
-        box = LLVMBuildInsertValue(b, box, payload, 1, "")!
+        let box = rtAllocManaged(LLVMConstInt(i64, 16, 0))
+        LLVMBuildStore(b, witness, structGEP(anyBoxTy, box, 0))
+        LLVMBuildStore(b, payload, structGEP(anyBoxTy, box, 1))
         return box
+    }
+
+    private func anyBoxWitness(_ box: LLVMValueRef) -> LLVMValueRef {
+        LLVMBuildLoad2(b, i8ptr, structGEP(anyBoxTy, box, 0), "wt")!
+    }
+    private func anyBoxPayload(_ box: LLVMValueRef) -> LLVMValueRef {
+        LLVMBuildLoad2(b, p1, structGEP(anyBoxTy, box, 1), "pl")!
     }
 
     // Reposition the builder to a freshly built thunk, saving the enclosing lowering state; the
@@ -1430,19 +1461,24 @@ final class IRToLLVM {
     }
 
     // Inside a freshly entered thunk: copy each capture out of `env` into a fresh local slot.
-    private func loadCapturesIntoScope(_ caps: [Capture], _ envTy: LLVMTypeRef, _ env: LLVMValueRef) {
+    // `baseIndex` is the field index of the first capture in `envTy` — 0 for a spawn env object,
+    // 1 for a fused closure object (whose field 0 is the fn pointer).
+    private func loadCapturesIntoScope(_ caps: [Capture], _ envTy: LLVMTypeRef, _ env: LLVMValueRef, baseIndex: Int = 0) {
         for (i, cap) in caps.enumerated() {
             let slot = LLVMBuildAlloca(b, cap.local.ty, cap.name)!
-            let v = LLVMBuildLoad2(b, cap.local.ty, structGEP(envTy, env, i), cap.name)
+            let v = LLVMBuildLoad2(b, cap.local.ty, structGEP(envTy, env, i + baseIndex), cap.name)
             LLVMBuildStore(b, v, slot)
             locals[cap.name] = (slot, cap.local.ty)
         }
     }
 
-    // At the capture site: heap-allocate the env and copy each capture's current value into it.
+    // At a `spawn` capture site: heap-allocate the env and copy each capture's current value into
+    // it. The env is a managed (addrspace 1) object; the spawn site casts it to addrspace(0) for
+    // the `fiber_spawn` boundary (D1). (Closures don't use this — they fuse captures into the
+    // closure object; see `lowerClosure`.)
     private func allocAndFillEnv(_ caps: [Capture], _ envTy: LLVMTypeRef) -> LLVMValueRef {
         let bytes = caps.reduce(0) { $0 + abiSlots($1.local.ty) } * 8
-        let envPtr = buildCall(rtAlloc(), rtAllocTy(), [LLVMConstInt(i64, UInt64(max(bytes, 8)), 0)])!
+        let envPtr = rtAllocManaged(LLVMConstInt(i64, UInt64(max(bytes, 8)), 0))
         for (i, cap) in caps.enumerated() {
             let v = LLVMBuildLoad2(b, cap.local.ty, cap.local.addr, cap.name)
             LLVMBuildStore(b, v, structGEP(envTy, envPtr, i))
@@ -1450,18 +1486,21 @@ final class IRToLLVM {
         return envPtr
     }
 
-    // A closure lowers to a hoisted impl function `ret nomu_cloN(ptr env, params…)` plus a site
-    // that heap-allocates the env (captures copied by value) and yields `{ fn, env }`. Captures
-    // are the body's free variables that name enclosing locals (mirrors CodegenIR).
+    // A closure lowers to a hoisted impl function `ret nomu_cloN(ptr obj, params…)` plus a site
+    // that heap-allocates one fused object `{ fn, caps… }` and yields a managed pointer to it (the
+    // closure value). Fusing the captures inline after the fn pointer makes creation a single
+    // allocation, and the value is one scalar `p1` the rewrite pass tracks — no `{fn,env}` aggregate
+    // rides across a safepoint (8.4.1). The impl receives the object as its first param and reads
+    // its captures from fields 1…N. Captures are the body's free variables that name enclosing locals.
     private func lowerClosure(params: [IRParam], body: [IRStmt], ret: Type, span: Span) -> LLVMValueRef? {
         var bound = Set(params.map(\.name))
         var used: [String] = []
         collectUses(body, bound: &bound, used: &used)
         let caps = resolveCaptures(used)
-        let envTy = captureEnvType(caps)
+        let objTy = structTy([i8ptr] + caps.map { $0.local.ty })   // { fn, cap0, cap1, … }
 
         guard let retTy = llvmType(ret, span) else { return nil }
-        var paramTys: [LLVMTypeRef] = [i8ptr]   // env
+        var paramTys: [LLVMTypeRef] = [p1]   // the closure object itself (managed), captures read via GEP
         for p in params {
             guard let t = llvmType(p.type, p.span) else { return nil }
             paramTys.append(t)
@@ -1470,12 +1509,12 @@ final class IRToLLVM {
                                    debug: ("closure", span.begin.line))
         closureSeq += 1
 
-        // Define the impl body against a fresh scope (captures loaded from env + params), then
-        // restore the enclosing builder position and lowering state.
-        // A fresh scope, including spawn/actor state — the body's `return` must not join the
-        // enclosing function's spawns (that would reference its allocas from another function).
+        // Define the impl body against a fresh scope (captures loaded from the object + params),
+        // then restore the enclosing builder position and lowering state. A fresh scope, including
+        // spawn/actor state — the body's `return` must not join the enclosing function's spawns
+        // (that would reference its allocas from another function).
         let saved = enterThunk(fn, line: span.begin.line)
-        loadCapturesIntoScope(caps, envTy, LLVMGetParam(fn, 0)!)
+        loadCapturesIntoScope(caps, objTy, LLVMGetParam(fn, 0)!, baseIndex: 1)
         for (i, p) in params.enumerated() {
             guard let t = llvmType(p.type, p.span) else { break }
             let slot = LLVMBuildAlloca(b, t, p.name)!
@@ -1490,12 +1529,16 @@ final class IRToLLVM {
         }
         leaveThunk(saved)
 
-        // Site: allocate + fill the env, then build the { fn, env } value.
-        let envPtr = allocAndFillEnv(caps, envTy)
-        var clo = LLVMGetUndef(closureTy)
-        clo = LLVMBuildInsertValue(b, clo, fn, 0, "")
-        clo = LLVMBuildInsertValue(b, clo, envPtr, 1, "")
-        return clo
+        // Site: allocate the fused object, store the fn pointer then each capture by value, and
+        // yield the managed pointer as the closure value.
+        let slots = 1 + caps.reduce(0) { $0 + abiSlots($1.local.ty) }
+        let obj = rtAllocManaged(LLVMConstInt(i64, UInt64(slots * 8), 0))
+        LLVMBuildStore(b, fn, structGEP(objTy, obj, 0))
+        for (i, cap) in caps.enumerated() {
+            let v = LLVMBuildLoad2(b, cap.local.ty, cap.local.addr, cap.name)
+            LLVMBuildStore(b, v, structGEP(objTy, obj, i + 1))
+        }
+        return obj
     }
 
     // MARK: - Structured concurrency (8.2.6)
@@ -1520,18 +1563,24 @@ final class IRToLLVM {
         loadCapturesIntoScope(caps, envTy, LLVMGetParam(fn, 0)!)
         if let rv = lowerExpr(value) {
             let bytes = max(slotCount(resultType) * 8, 8)
-            let boxp = buildCall(rtAlloc(), rtAllocTy(), [LLVMConstInt(i64, UInt64(bytes), 0)])!
+            let boxp = rtAllocManaged(LLVMConstInt(i64, UInt64(bytes), 0))
             LLVMBuildStore(b, rv, boxp)
-            LLVMBuildRet(b, boxp)
+            // The routine returns the box to the runtime as a `void*` (addrspace 0); `spawn_join`
+            // hands it back and `joinSpawn` reads the result out of it.
+            LLVMBuildRet(b, toUnmanaged(boxp))
         } else if !blockTerminated() {
             LLVMBuildRet(b, LLVMConstPointerNull(i8ptr))
         }
         leaveThunk(saved)
 
-        // Site: allocate + fill the env, start the fiber, keep its handle for joins.
+        // Site: allocate + fill the env, start the fiber, keep its handle for joins. The env is
+        // managed (addrspace 1), but the runtime holds it as a `void*` between spawn and the
+        // routine's call, so it crosses the C ABI as addrspace(0) — one boundary cast (D1). The
+        // spawn routine's env param and its returned result box stay addrspace(0) for the same
+        // reason (runtime-owned across the fiber boundary); M6's parked-fiber scan (D4) traces them.
         let envPtr = allocAndFillEnv(caps, envTy)
         let spawn = runtimeFn("fiber_spawn", ret: i8ptr, params: [i8ptr, i8ptr], varArg: false)
-        let fiber = buildCall(spawn.0, spawn.1, [fn, envPtr])!
+        let fiber = buildCall(spawn.0, spawn.1, [fn, toUnmanaged(envPtr)])!
         let handleSlot = LLVMBuildAlloca(b, spawnHandleTy, "\(name).h")!
         LLVMBuildStore(b, fiber, structGEP(spawnHandleTy, handleSlot, 0))
         let sl = SpawnLocal(handleSlot: handleSlot, resultTy: resultTy)
@@ -1584,16 +1633,15 @@ final class IRToLLVM {
             fail("8.2.4: unsupported call target", span)
             return nil
         }
-        guard let cval = lowerExpr(callee) else { return nil }
-        let fnPtr = LLVMBuildExtractValue(b, cval, 0, "clo.fn")
-        let envPtr = LLVMBuildExtractValue(b, cval, 1, "clo.env")
+        guard let cval = lowerExpr(callee) else { return nil }   // the closure object pointer (managed)
+        let fnPtr = LLVMBuildLoad2(b, i8ptr, structGEP(closureHdrTy, cval, 0), "clo.fn")!
         guard let retTy = llvmType(rty, span) else { return nil }
-        var paramTys: [LLVMTypeRef] = [i8ptr]
+        var paramTys: [LLVMTypeRef] = [p1]   // the closure object itself, passed as the impl's first arg
         for t in ptys {
             guard let lt = llvmType(t, span) else { return nil }
             paramTys.append(lt)
         }
-        return buildArgsAndCall(fnType(retTy, paramTys), fnPtr!, env: envPtr, args: args)
+        return buildArgsAndCall(fnType(retTy, paramTys), fnPtr, env: cval, args: args)
     }
 
     // Lower `args`, optionally prefixed by a closure `env`, and emit the call.
@@ -1754,15 +1802,37 @@ final class IRToLLVM {
     // The single seam through which every LLVM function is created. When `debug` is given it also
     // attaches a `DISubprogram` (recovered later via `LLVMGetSubprogram`), so 8.3's line-table/
     // debug-scope setup lands here instead of at each `LLVMAddFunction`.
+    //
+    // 8.4.1 — every function *we emit a body for* (free fns, methods, actor handlers, witness/
+    // property thunks, closures, spawn routines) is `gc "statepoint-example"`: any of them can be a
+    // frame at a safepoint, so the caller needs a stack map at each of its calls (m8.4-spec.md D2).
+    // Runtime C declarations pass `gc: false` (`runtimeFn`) and stay plain.
     private func emitFunction(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef],
-                              varArg: Bool = false,
+                              varArg: Bool = false, gc: Bool = true,
                               debug: (name: String, line: Int)? = nil) -> (fn: LLVMValueRef, ty: LLVMTypeRef) {
         let ty = fnType(ret, params, varArg: varArg)
         let fn = LLVMAddFunction(mod, name, ty)!
+        if gc { LLVMSetGC(fn, "statepoint-example") }
         if let debug = debug, let sp = makeSubprogram(debug.name, linkage: name, line: debug.line) {
             LLVMSetSubprogram(fn, sp)
         }
         return (fn, ty)
+    }
+
+    // Runtime C functions that never allocate on the GC heap and never park the fiber, so a GC can
+    // never run across them. Marking their declarations `"gc-leaf-function"` tells the rewrite pass
+    // to leave their calls as plain calls instead of statepoints — no root spill/reload around them
+    // (m8.4-spec.md D2, perf lever). Conservative: when unsure, a call stays non-leaf, since
+    // mislabeling a GC-triggering call as leaf is the unsound direction. `rt_str_*` are leaf only
+    // while `String` is runtime-owned (D1); M6 revisits if `String` becomes a GC object.
+    private static let gcLeafRuntimeFns: Set<String> = [
+        "printf", "rt_str_lit", "rt_str_concat", "rt_mutex_new", "rt_mutex_unlock",
+    ]
+
+    private func markGCLeaf(_ fn: LLVMValueRef) {
+        let name = "gc-leaf-function"
+        let attr = LLVMCreateStringAttribute(ctx, name, UInt32(name.utf8.count), "", 0)
+        LLVMAddAttributeAtIndex(fn, LLVMAttributeIndex(bitPattern: Int32(LLVMAttributeFunctionIndex)), attr)
     }
 
     private func buildCall(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?]) -> LLVMValueRef? {
@@ -1788,15 +1858,34 @@ final class IRToLLVM {
         }
     }
 
-    // `void* rt_alloc(size_t)` — the runtime allocator (bump-and-leak until the M6 GC).
-    private func rtAlloc() -> LLVMValueRef { runtimeFn("rt_alloc", ret: i8ptr, params: [i64], varArg: false).0 }
-    private func rtAllocTy() -> LLVMTypeRef { runtimeFn("rt_alloc", ret: i8ptr, params: [i64], varArg: false).1 }
+    // `void* rt_alloc(size_t)` — the runtime allocator (bump-and-leak until the M6 GC). We declare
+    // it as returning `ptr addrspace(1)`: the C ABI returns a plain 64-bit pointer, bit-identical to
+    // an addrspace(1) pointer on arm64 (addrspace 1 carries no codegen difference here), and this
+    // makes the allocation call itself a GC base the rewrite pass can track. An `addrspacecast
+    // (0 → 1)` at the call site would *not* work — `RewriteStatepointsForGC::findBaseDefiningValue`
+    // rejects a base introduced by a differing-addrspace cast (it strips pointer casts and asserts
+    // the address spaces match). So the managed address space enters at the allocator, not via a cast.
+    private func rtAlloc() -> LLVMValueRef { runtimeFn("rt_alloc", ret: p1, params: [i64], varArg: false).0 }
+    private func rtAllocTy() -> LLVMTypeRef { runtimeFn("rt_alloc", ret: p1, params: [i64], varArg: false).1 }
+
+    // Allocate a managed (GC-heap) object of `bytes` bytes — the allocator yields addrspace(1)
+    // directly (see `rtAlloc`), so this is the tracked managed reference the mutator holds (D1).
+    private func rtAllocManaged(_ bytes: LLVMValueRef) -> LLVMValueRef {
+        buildCall(rtAlloc(), rtAllocTy(), [bytes])!
+    }
+
+    // The C-ABI boundary cast (D1): a managed reference handed to a C function that takes a `void*`
+    // is cast (1 → 0) for the call. This direction is supported by the rewrite pass (the result is
+    // not a GC pointer, so it is never traced as a base). One explicit cast site per crossing keeps
+    // the boundary auditable.
+    private func toUnmanaged(_ v: LLVMValueRef) -> LLVMValueRef { LLVMBuildAddrSpaceCast(b, v, i8ptr, "to0")! }
 
     private func runtimeFn(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef], varArg: Bool)
         -> (LLVMValueRef, LLVMTypeRef)
     {
         if let cached = runtimeFns[name] { return cached }
-        let f = emitFunction(name, ret: ret, params: params, varArg: varArg)
+        let f = emitFunction(name, ret: ret, params: params, varArg: varArg, gc: false)
+        if IRToLLVM.gcLeafRuntimeFns.contains(name) { markGCLeaf(f.0) }
         runtimeFns[name] = f
         return f
     }

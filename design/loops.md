@@ -172,10 +172,11 @@ Performance-first shapes three choices:
   spilling the condition or IV to memory where an `alloca` would block the mem2reg the optimizer
   wants — reuse the existing alloca-per-local pattern and let mem2reg promote it.
 - **Cheap back-edge safepoint.** The per-iteration poll (8.4.2) is the loop's GC tax; keep it a
-  single protected-page load (D3 in `m8.4-spec.md`), and **elide it entirely for a body with no
-  call and no allocation** (nothing to scan, bounded latency to the exit safepoint) — the
-  performance/soundness tension (scheduler fairness for long counted loops) is settled by the
-  8.4.2 microbenchmark.
+  single protected-page load (D3 in `m8.4-spec.md`). Placement: a loop body that already **calls
+  or allocates** hits a statepoint each iteration, so its back-edge poll is redundant → elide it
+  there; a **call-and-alloc-free** loop reaches no statepoint on its own and **must keep** the poll
+  (else a moving GC can't scan it and time-to-safepoint is unbounded). Scheduler fairness for a hot
+  loop is handled separately by signal-based preemption, not this poll.
 - **Minimal cross-safepoint liveness.** A GC pointer held live across the back-edge poll costs a
   reload; the lowering should not extend a managed reference's live range across the latch beyond
   what the source requires.

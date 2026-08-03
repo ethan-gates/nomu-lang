@@ -1,16 +1,5 @@
 
 
-struct Base64Encoder {
-    var buffer: String
-
-    fun add(s: String) {
-        self.buffer = concat(self.buffer, s)
-    }
-
-    fun encode() -> {
-
-    }
-}
 
 
 

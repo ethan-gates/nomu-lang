@@ -153,6 +153,20 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String) -> String? 
     LLVMDisposeMessage(dlStr)
     LLVMDisposeTargetData(dl)
 
+    // 8.4.1 — GC substrate pass pipeline. `mem2reg`/`sroa` promote our alloca-per-local lowering
+    // to SSA so `RewriteStatepointsForGC` can see the `addrspace(1)` roots (a correctness
+    // prerequisite, m8.4-spec.md D2), then the rewrite turns every non-`gc-leaf` call in a
+    // `gc "statepoint-example"` function into a `gc.statepoint` with relocatable roots. Nothing
+    // moves in 8.4, so the relocations are identity — behavior is unchanged. The full `-O`
+    // pipeline lands in 8.5; this is the minimum ordering the rewrite needs.
+    let opts = LLVMCreatePassBuilderOptions()
+    defer { LLVMDisposePassBuilderOptions(opts) }
+    if let err = LLVMRunPasses(mod, "function(mem2reg,sroa),rewrite-statepoints-for-gc", tm, opts) {
+        let m = LLVMGetErrorMessage(err).map { String(cString: $0) } ?? "unknown"
+        LLVMConsumeError(err)
+        return "LLVM: GC pass pipeline failed: \(m)"
+    }
+
     var emitErr: UnsafeMutablePointer<CChar>? = nil
     let rc = path.withCString { cpath in
         LLVMTargetMachineEmitToFile(tm, mod, cpath, LLVMObjectFile, &emitErr)

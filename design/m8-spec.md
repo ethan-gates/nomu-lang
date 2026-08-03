@@ -110,18 +110,40 @@ depend on 8.2 and are independent of each other. 8.5 trails and is descopable.
   API lags (only on a deliberate version bump — we pin). Expected frequency low; C-API-primary
   should carry through M8 and likely M6.
 
-- **B · GC roots via LLVM statepoints; no bespoke MIR — Decided (2026-07-31).** Governed by
-  *what is fastest for MMTk*, not what is easiest. LLVM **statepoints** (`addrspace(1)` GC
-  pointers + `gc "statepoint-example"` + RewriteStatepointsForGC) emit return-address-keyed
-  **stack maps** — the state-of-the-art precise-root mechanism (HotSpot / .NET): GC pointers
-  stay in registers/stack in steady state and root cost is paid **only at collection**. The
-  **shadow-stack** alternative taxes *every call* with push/pop bookkeeping regardless of GC
-  and is rejected **on performance**, not merely as throwaway. Statepoints also handle
-  relocation natively (Immix/LXR). The mutator-performance battleground is *not* the root
-  mechanism but the **inlinable alloc/barrier/poll seams** (8.0.7). **No own MIR in M8:** LLVM
-  IR is itself CFG/SSA, so lower the **structured typed IR straight to LLVM**; a bespoke MIR
-  (≈ Rust MIR / Swift SIL — a low CFG/SSA form to host language-aware passes) is built only
-  when **escape analysis** needs language types LLVM has discarded (`compiler.md` §1).
+- **B · GC roots via LLVM statepoints; no bespoke MIR — Decided (2026-07-31), reconfirmed
+  (2026-08-03) against the conservative-stack alternative.** Governed by *what is fastest for
+  MMTk*, not what is easiest. LLVM **statepoints** (`addrspace(1)` GC pointers + `gc
+  "statepoint-example"` + RewriteStatepointsForGC) emit return-address-keyed **stack maps** — the
+  state-of-the-art precise-root mechanism (HotSpot / .NET): GC pointers stay in registers/stack in
+  steady state and root cost is paid **only at collection**. Statepoints handle relocation
+  natively (Immix/LXR).
+
+  **Alternatives evaluated and rejected.** The **shadow-stack** taxes *every call* with push/pop
+  bookkeeping regardless of GC — rejected on performance. The **conservative-stack / precise-heap
+  (pinning)** design — which would drop statepoints entirely, giving preempt-anywhere and a far
+  smaller backend (no `addrspace(1)`, no poll placement, no RewriteStatepointsForGC) — was
+  re-examined at length (2026-08-03) and rejected on **fiber-count scaling**. Its costs (whole-stack
+  conservative scan, **pinning** of stack-referenced objects, and false retention) all scale with
+  the number of fibers *and* with park duration, and they degrade exactly the moving-footprint
+  thesis (and LXR's evacuation-based advantage) that M6 exists to validate — on the massively
+  concurrent workloads a fast language is judged by. Statepoints' costs (mutator spill/reload,
+  time-to-safepoint) stay bounded by *running* fibers (≤ carriers), not by total fiber count. Since
+  Nomu's M:N runtime targets **10k+ fibers**, precise roots are the fiber-scaling-aligned choice.
+  It is the same tradeoff seen from both sides: conservative skips the mutator reload tax *by*
+  pinning (can't-move), precise pays the tax *to* move everything. Nomu wants the latter. (Precise
+  roots are also strictly upgradeable-from-nothing later if measured otherwise; MMTk supports both
+  root strategies — the door stays open, 8.0.8.)
+
+  **Preemption is separate from GC roots.** Signal-based async preemption (Go-style SIGURG) is
+  adopted for **scheduler fairness** — it stops a compute-bound fiber at any PC. It does **not**
+  carry GC root scanning: LLVM emits relocatable maps only at statepoints, so a signal-interrupted
+  fiber isn't scannable at an arbitrary PC. Fairness rides signals; GC rides statepoints.
+
+  The mutator-performance battleground is *not* the root mechanism but the **inlinable
+  alloc/barrier/poll seams** (8.0.7). **No own MIR in M8:** LLVM IR is itself CFG/SSA, so lower the
+  **structured typed IR straight to LLVM**; a bespoke MIR (≈ Rust MIR / Swift SIL — a low CFG/SSA
+  form to host language-aware passes) is built only when **escape analysis** needs language types
+  LLVM has discarded (`compiler.md` §1).
 
 - **C · Scope fence: LLVM-only, minimal-correct — Decided (2026-07-31).** No MLIR, no Cranelift
   second backend, no incremental compilation in M8; debug info Tier 0 only; perf items (8.5) to
