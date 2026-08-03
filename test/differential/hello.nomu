@@ -1,5 +1,0 @@
-fun main() {
-  let x = 2 + 3
-  print(x)
-  print(6 * 7)
-}

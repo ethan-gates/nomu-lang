@@ -1,6 +1,5 @@
 import Foundation
 import frontend
-import codegen
 import embedded
 import LLVMBridge
 
@@ -102,55 +101,9 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
         exit(1)
     }
 
-    // LLVM backend (M8): lower the typed IR via LLVM's C API → object → link with the runtime
-    // .a. The C backend stays the default and the differential oracle.
-    if options.backend == .llvm {
-        emitLLVMBinary(monoModule, stem: stem, outputDir: outputDir)
-        return
-    }
-
-    var gen = CodegenIR(monoModule)
-    let cCode = gen.emit()
-
-    if !gen.diagnostics.isEmpty {
-        for d in gen.diagnostics { fputs("\(d)\n", stderr) }
-        exit(1)
-    }
-
-    // Binary stage: the generated user code + the runtime sources, side by side; the
-    // header resolves via -I on this dir. The .c persists as an inspectable intermediate.
-    let userC = stem + ".c"
-    writeRuntimeSources(toDir: outputDir)
-    guard (try? cCode.write(toFile: userC, atomically: true, encoding: .utf8)) != nil else {
-        fputs("error: failed to write '\(userC)'\n", stderr)
-        exit(1)
-    }
-
-    // Additive: --emit-c reports the generated C path; the binary is still produced.
-    if options.c {
-        print(userC)
-    }
-
-    let binPath = stem
-    let cc = Process()
-    cc.executableURL = URL(fileURLWithPath: "/usr/bin/cc")
-    // Warnings on generated C are noise to the Nomu user (inspect via -c instead).
-    cc.arguments = ["-w", "-I", outputDir, "-o", binPath,
-                    userC, outputDir + "/runtime.c", outputDir + "/core.c"]
-    do {
-        try cc.run()
-        cc.waitUntilExit()
-    } catch {
-        fputs("error: failed to launch cc: \(error)\n", stderr)
-        exit(1)
-    }
-
-    guard cc.terminationStatus == 0 else {
-        fputs("error: cc failed\n", stderr)
-        exit(1)
-    }
-
-    print(binPath)
+    // Backend (M8): lower the typed IR via LLVM's C API → object → link with the runtime .a.
+    // (The C backend was the differential oracle through 8.2 and was retired at the 8.2 exit.)
+    emitLLVMBinary(monoModule, stem: stem, outputDir: outputDir)
 }
 
 // Write a text artifact to `path` (or exit) and report its path — the "emit" style,

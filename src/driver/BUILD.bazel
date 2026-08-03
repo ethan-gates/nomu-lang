@@ -9,6 +9,6 @@ swift_library(
         "-Xcc",
         "-std=c++17",
     ],
-    deps = ["//src/frontend", "//src/codegen", "//src/runtime:embedded", "//src/llvmgen:llvmswift"],
+    deps = ["//src/frontend", "//src/runtime:embedded", "//src/llvmgen:llvmswift"],
     visibility = ["//visibility:public"],
 )

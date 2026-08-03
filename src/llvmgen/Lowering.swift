@@ -1,6 +1,7 @@
-// M8.1 · 8.1.5 / M8 · 8.2.1 / 8.2.2 — lower the typed IR (frontend `IRModule`) to an LLVM module
-// via the C API. The LLVM sibling of `CodegenIR`; it mirrors that backend's per-node logic so the
-// two agree (the differential harness, test/differential).
+// M8 · 8.2 — lower the typed IR (frontend `IRModule`) to an LLVM module via the C API. This is the
+// backend. Through 8.2 it was developed as the LLVM sibling of the C backend (`CodegenIR`) and
+// differential-tested against it; at the 8.2 exit the C backend was retired, so per-node comments
+// that reference `CodegenIR` are design lineage, not a live counterpart.
 //
 //   8.2.1 — primitives + control flow + functions: Int/Bool/String literals, arithmetic/
 //           comparison, let/var, assignment + `+=`, if/else, return, user + builtin calls

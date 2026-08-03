@@ -355,3 +355,12 @@ follow-on. Deps: 8.2 (asm/mutex), 8.4 (opt↔statepoint ordering).
 
 **Exit:** measurable throughput/latency improvement over the 8.2 baseline on a benchmark (e.g.
 `examples/speed-nomu.nomu`); correctness unchanged (differential harness still green).
+
+
+### post m8 ideas
+- compiler architecture review for perf
+- llvm -O flag forwarding
+- cleanup llvm experiments
+- cleanup test
+- profile `time nomuc -h` taking 500ms
+- discuss module level interface as input

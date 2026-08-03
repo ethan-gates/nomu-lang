@@ -1,6 +1,0 @@
-fun main() {
-  let a = "foo"
-  let b = concat(a, "bar")
-  print(b)
-  print("done")
-}
