@@ -40,4 +40,11 @@ String  rt_read_line(int fd);
 Fiber*  fiber_spawn(void* (*fn)(void*), void* arg);
 void*   spawn_join(SpawnHandle* h);
 
+// ---- Actor mutex (opaque, heap-allocated) ----
+// The C backend inlines a `pthread_mutex_t` in the actor struct; the LLVM backend has no portable
+// `pthread_mutex_t` layout, so it holds an opaque `void*` to a runtime-allocated mutex instead.
+void* rt_mutex_new(void);
+void  rt_mutex_lock(void* m);
+void  rt_mutex_unlock(void* m);
+
 #endif

@@ -125,6 +125,17 @@ void* spawn_join(SpawnHandle* h) {
     return h->fiber->result;
 }
 
+// ---- Actor mutex (opaque, heap-allocated) ----
+// A `void*`-fronted `pthread_mutex_t` for the LLVM backend, which can't lay out the platform mutex
+// inline. Additive to the ABI; the C backend keeps inlining `pthread_mutex_t` directly.
+void* rt_mutex_new(void) {
+    pthread_mutex_t* m = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
+    pthread_mutex_init(m, NULL);
+    return m;
+}
+void rt_mutex_lock(void* m)   { pthread_mutex_lock((pthread_mutex_t*)m); }
+void rt_mutex_unlock(void* m) { pthread_mutex_unlock((pthread_mutex_t*)m); }
+
 // ---- Timer heap (M4.5) ----
 #define RT_MAX_TIMERS 256
 typedef struct { uint64_t expiry_ns; Fiber* fiber; } TimerEntry;

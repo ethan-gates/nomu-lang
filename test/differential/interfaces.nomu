@@ -1,0 +1,43 @@
+// 8.2.5 — interfaces + `any I` dynamic dispatch. Covers: a mandatory requirement satisfied by a
+// method, a stored-field property requirement, an overridable default (compiled into each
+// conformer), a computed property satisfying `{ get }` via an extension, and boxing at a call.
+
+interface Drawable {
+    fun draw() -> String
+    var name: String { get }
+    fun label() -> String {
+        return concat(self.name, self.draw())
+    }
+}
+
+struct Circle: Drawable {
+    var name: String
+    var radius: Int
+    fun draw() -> String { return "O" }
+}
+
+enum Suit {
+    case spade
+    case heart
+    var name: String { "suit" }
+}
+extension Suit: Drawable {
+    fun draw() -> String { return "card" }
+}
+
+fun render(d: any Drawable) -> String {
+    return d.label()
+}
+
+fun main() {
+    let c = Circle(name: "c", radius: 3)
+    print(c.draw())            // O
+    print(c.name)              // c
+
+    let d: any Drawable = c
+    print(d.draw())            // O   (through the witness)
+    print(d.name)              // c   (witness stored-field getter)
+    print(d.label())           // cO  (default via witness)
+    print(render(c))           // cO
+    print(render(Suit.heart))  // suitcard
+}

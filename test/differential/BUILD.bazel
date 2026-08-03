@@ -11,6 +11,13 @@ PROGRAMS = [
     "enums.nomu",
     "classes.nomu",
     "closures.nomu",
+    "interfaces.nomu",
+    "composition.nomu",
+    "opaque.nomu",
+    "upcast.nomu",
+    "generics.nomu",
+    "spawn.nomu",
+    "actor.nomu",
 ]
 
 sh_test(

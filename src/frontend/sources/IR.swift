@@ -75,6 +75,9 @@ public struct IRField {
     public let type: Type
     public let isMutable: Bool   // `var` vs `let` field; read by M5-C's deeply-immutable check
     public let span: Span
+    public init(name: String, type: Type, isMutable: Bool, span: Span) {
+        self.name = name; self.type = type; self.isMutable = isMutable; self.span = span
+    }
 }
 
 public struct IRStruct {

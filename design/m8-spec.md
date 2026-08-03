@@ -235,11 +235,55 @@ pre-pass proves cleaner (8.0.4-B). Differential-tested against the C backend thr
   params lower to `closureTy`). Differential-tested (`test/differential/{classes,closures}.nomu`):
   class methods + reference mutation across a call, String fields, capturing/no-arg/higher-order
   closures — all match the C backend.
-- **8.2.5 ⬜** — interfaces + generics + `Result`: witness-table emission, `any` boxing +
-  dynamic dispatch, `any A & B` composition, `some`/opaque static dispatch, monomorphized
-  generic instances, `Result<T, E>`.
-- **8.2.6 ⬜** — concurrency: `actor` layout (+ mutex/mailbox), `on`-handler dispatch,
-  `spawn let` + structured spawn/join, colorless blocking calls (`rt_sleep_ms`, `rt_read_line`).
+- **8.2.5 ✅ (2026-08-02)** — interfaces + generics + `Result`. **Witness tables** are built lazily
+  (per `type::iface`) as LLVM globals: a `witness.<I>` struct of `ptr` slots — one per method
+  requirement, `_get`/`_set` per property, a `base_<B>` per transitive base, then a reserved
+  `type_witness` — initialized with **uniform-signature thunks** `ret(ptr self, params…)` that
+  bridge the payload to the concrete impl's `self` ABI (by value for a read-only value method, by
+  pointer for a mutating/class method) and re-box a covariant-`Self` result. A property thunk is a
+  direct field load/store when stored-field-backed, else routes through the `prop.get`/`prop.set`
+  accessor. **`any I` is `AnyBox { ptr witness, ptr payload }`** (`anyBoxTy`, internal — never
+  crosses the runtime C ABI); `.box` wires witness + payload (reference type → the pointer; value
+  type → an `rt_alloc`'d copy). **Dynamic dispatch** (`.methodCall` on an `.existential`) loads the
+  slot fn ptr from the box's witness and calls `fn(payload, args…)` (call type taken from the
+  site). **`any A & B`** uses a `comp.<A&B>` composite witness (a sub-table ptr per interface);
+  dispatch loads the owning interface's sub-table, then its slot. **Existential upcast** (`any B` →
+  `any A`) re-boxes through the source witness's `base_<A>` pointer. **`some`/opaque** devirtualizes:
+  `concreteUnderlying` (via `IRModule.opaqueUnderlyings`) resolves the hidden type, so a requirement
+  call lowers to a direct concrete call (or stored-field load for a `prop.get`) with no box.
+  **Monomorphized generics + `Result<T,E>` need nothing new** — whole-program mono runs before
+  codegen (the LLVM path lowers `monoModule`), so a generic instance arrives as a concrete named
+  struct/enum (`Box<Int>`, `Result<Int,String>`) the 8.2.1–8.2.4 machinery already lowers; no
+  `.typeParam`/`.generic`/witness params survive. `lowerExpr`'s node switch is now exhaustive (no
+  `default`). Differential-tested (`test/differential/{interfaces,composition,opaque,upcast,
+  generics}.nomu`): `any`-dispatch + defaults + stored/computed property requirements, composition,
+  opaque devirt incl. `-> Self`, upcast + property-set through `any`, and generic func/type +
+  `Result`/`Option` — all match the C backend.
+- **8.2.6 ✅ (2026-08-02)** — concurrency. **Actors** are reference types laid out
+  `{ i64 header, fields…, i8* mu }` (`actor.<name>`, heap `rt_alloc`); like a class the value is
+  the object pointer and fields sit at index i+1. Construction initializes each field (a declared
+  `= expr` initializer, else the matching ctor arg) and installs a fresh mutex in the trailing slot.
+  Each **`on`-handler** is declared on demand (`declareActorHandler` synthesizes an `IRFunc`, `self`
+  by pointer) and **mutex-serialized**: `defineBody` brackets it with `rt_mutex_lock` at entry and
+  `rt_mutex_unlock` at every exit (each `return` and the fall-through). Fields are accessed directly
+  through `self` under the lock (no copy/write-back — simpler than `CodegenIR`, equivalently correct
+  since all access is serialized). **The mutex is an opaque runtime `void*`** (`rt_mutex_new/lock/
+  unlock`, added to the runtime) — the LLVM backend has no portable `pthread_mutex_t` layout, and
+  the actor layout is internal anyway; additive to the ABI, the C backend still inlines
+  `pthread_mutex_t`. **`spawn let`** closure-converts the value onto a fiber: a hoisted start
+  routine `void* nomu_spawnN(void* env)` loads captures (free vars of the value, by value into a
+  heap env, like a closure), computes the value, and returns an `rt_alloc`'d box of the result;
+  the site `fiber_spawn`s it and stores the `SpawnHandle` (`{ i8* fiber }`). Reading the binding
+  (`varRef`) `spawn_join`s and loads the box; every `return` and the function fall-through join all
+  the function's active spawns (`spawn_join` is idempotent) — the structured-concurrency guarantee.
+  **Colorless blocking calls**: `sleep` → `rt_sleep_ms`, `readLine` → `rt_read_line(0)`. Share
+  analysis stays a frontend/Sema safety check, not repeated in codegen. `lowerStmt`'s switch is now
+  exhaustive (no `default`). The `enterThunk`/`leaveThunk` helper now also saves/resets the
+  spawn/actor-mutex state, so a `return` inside a hoisted closure/spawn/thunk body can't join the
+  enclosing function's spawns (which would reference its allocas cross-function). Differential-tested
+  (`test/differential/{spawn,actor}.nomu`, deterministic outputs): concurrent spawn/join with a
+  captured value, and three concurrent workers bumping a mutex-serialized actor to an exact count —
+  both match the C backend (actor run 20× stays exact).
 
 **Exit:** a **differential harness** runs every `examples/*.nomu` plus the `src/codegen/tests`
 programs through both backends and asserts identical stdout + exit code — all pass. The

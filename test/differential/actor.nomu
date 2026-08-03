@@ -1,0 +1,23 @@
+// 8.2.6 — actors. Handlers are mutex-serialized, so concurrent spawns bumping a shared counter
+// never interleave; the final count is exact. Deterministic: both prints are 6.
+
+actor Counter {
+    var count: Int = 0
+    on bump(by: Int) { count += by }
+    on getCount() -> Int { return count }
+}
+
+fun doWork(c: Counter, amount: Int) -> Int {
+    let waited = sleep(50)
+    c.bump(by: amount)
+    return amount
+}
+
+fun main() {
+    let c = Counter()
+    spawn let a = doWork(c, 1)
+    spawn let b = doWork(c, 2)
+    spawn let d = doWork(c, 3)
+    print(a + b + d)     // 6  (spawn results)
+    print(c.getCount())  // 6  (actor state, mutex-exact)
+}
