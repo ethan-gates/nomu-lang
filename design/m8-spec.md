@@ -364,3 +364,8 @@ follow-on. Deps: 8.2 (asm/mutex), 8.4 (opt↔statepoint ordering).
 - cleanup test
 - profile `time nomuc -h` taking 500ms
 - discuss module level interface as input
+- start prioritizing stdlib via language benchmarks (post GC)
+  - lowest nomu primitives (string, collections, byte buffers, raw memory)
+  - swiss tables
+- dead code stripping
+- bazel usage

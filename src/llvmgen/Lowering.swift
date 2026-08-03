@@ -69,6 +69,7 @@ final class IRToLLVM {
     // per-conformance instances (LLVM globals) are built lazily on first box/upcast, keyed
     // `type::iface` (and `type::A&B` for composites).
     private var interfaceDefs: [String: IRInterface] = [:]
+    private var witnessSlotsCache: [String: [String]] = [:]
     private var opaqueUnderlyings: [String: Type] = [:]
     private var witnessTypes: [String: LLVMTypeRef] = [:]
     private var witnessGlobals: [String: LLVMValueRef] = [:]
@@ -173,14 +174,12 @@ final class IRToLLVM {
         guard let s = structMap[name] else { return nil }
         let st = LLVMStructCreateNamed(ctx, "struct.\(name)")!
         structTypes[name] = st   // cache before filling (value structs never self-nest, but be safe)
-        var elems: [LLVMTypeRef?] = []
+        var elems: [LLVMTypeRef] = []
         for f in s.fields {
             guard let ft = llvmType(f.type, f.span) else { return nil }
             elems.append(ft)
         }
-        elems.withUnsafeMutableBufferPointer {
-            LLVMStructSetBody(st, $0.baseAddress, UInt32(s.fields.count), 0)
-        }
+        setStructBody(st, elems)
         return st
     }
 
@@ -226,14 +225,12 @@ final class IRToLLVM {
         guard let c = classMap[name] else { return nil }
         let ct = LLVMStructCreateNamed(ctx, "class.\(name)")!
         classTypes[name] = ct
-        var elems: [LLVMTypeRef?] = [i64]   // ObjectHeader
+        var elems: [LLVMTypeRef] = [i64]   // ObjectHeader
         for f in c.fields {
             guard let ft = llvmType(f.type, f.span) else { return nil }
             elems.append(ft)
         }
-        elems.withUnsafeMutableBufferPointer {
-            LLVMStructSetBody(ct, $0.baseAddress, UInt32(c.fields.count + 1), 0)
-        }
+        setStructBody(ct, elems)
         return ct
     }
 
@@ -246,14 +243,13 @@ final class IRToLLVM {
         guard let a = actorMap[name] else { return nil }
         let at = LLVMStructCreateNamed(ctx, "actor.\(name)")!
         actorTypes[name] = at
-        var elems: [LLVMTypeRef?] = [i64]   // ObjectHeader
+        var elems: [LLVMTypeRef] = [i64]   // ObjectHeader
         for f in a.fields {
             guard let ft = llvmType(f.type, f.span) else { return nil }
             elems.append(ft)
         }
         elems.append(i8ptr)   // mu
-        let n = UInt32(a.fields.count + 2)
-        elems.withUnsafeMutableBufferPointer { LLVMStructSetBody(at, $0.baseAddress, n, 0) }
+        setStructBody(at, elems)
         return at
     }
 
@@ -282,21 +278,18 @@ final class IRToLLVM {
         let et = LLVMStructCreateNamed(ctx, "enum.\(name)")!
         enumTypes[name] = et
         let slots = e.cases.map { caseSlots($0) }.max() ?? 0
-        var elems: [LLVMTypeRef?] = [i64, LLVMArrayType2(i64, UInt64(slots))]
-        elems.withUnsafeMutableBufferPointer { LLVMStructSetBody(et, $0.baseAddress, 2, 0) }
+        setStructBody(et, [i64, LLVMArrayType2(i64, UInt64(slots))])
         return et
     }
 
     // The struct of a case's payload field types — GEP'd over the enum's payload region.
     private func caseStructType(_ enumName: String, _ c: IREnumCase) -> LLVMTypeRef? {
-        var elems: [LLVMTypeRef?] = []
+        var elems: [LLVMTypeRef] = []
         for f in c.fields {
             guard let t = llvmType(f.type, f.span) else { return nil }
             elems.append(t)
         }
-        return elems.withUnsafeMutableBufferPointer {
-            LLVMStructTypeInContext(ctx, $0.baseAddress, UInt32(c.fields.count), 0)
-        }
+        return structTy(elems)
     }
 
     private func caseSlots(_ c: IREnumCase) -> Int { c.fields.reduce(0) { $0 + slotCount($1.type) } }
@@ -373,7 +366,7 @@ final class IRToLLVM {
     private func declareCallable(key: String, llvmName: String, ir f: IRFunc,
                                  selfType: String?, selfByPointer: Bool, isActorHandler: Bool = false) {
         guard let retTy = llvmType(f.returnType, f.span) else { return }
-        var paramTys: [LLVMTypeRef?] = []
+        var paramTys: [LLVMTypeRef] = []
         if let selfType = selfType {
             guard let st = selfLLVMType(selfType) else { return }
             paramTys.append(selfByPointer ? LLVMPointerType(st, 0) : st)
@@ -382,11 +375,7 @@ final class IRToLLVM {
             guard let t = llvmType(p.type, p.span) else { return }
             paramTys.append(t)
         }
-        let pn = UInt32(paramTys.count)
-        let fnTy = paramTys.withUnsafeMutableBufferPointer {
-            LLVMFunctionType(retTy, $0.baseAddress, pn, 0)
-        }!
-        let fn = LLVMAddFunction(mod, llvmName, fnTy)!
+        let (fn, fnTy) = emitFunction(llvmName, ret: retTy, params: paramTys)
         callables[key] = Callable(fn: fn, ty: fnTy, ir: f, selfType: selfType,
                                   selfByPointer: selfByPointer, isActorHandler: isActorHandler)
         pending.append(key)
@@ -838,10 +827,7 @@ final class IRToLLVM {
             guard let v = lowerExpr(a) else { return nil }
             argVals.append(v)
         }
-        let n = UInt32(argVals.count)
-        return argVals.withUnsafeMutableBufferPointer {
-            LLVMBuildCall2(b, c.ty, c.fn, $0.baseAddress, n, "")
-        }
+        return buildCall(c.fn, c.ty, argVals)
     }
 
     // MARK: - Witness tables + `any`/`some` (8.2.5)
@@ -864,6 +850,7 @@ final class IRToLLVM {
     // reserved `type_witness`. Every slot is a pointer, so the witness struct is N pointers and a
     // slot is reached by its index here.
     private func witnessSlots(_ iface: String) -> [String] {
+        if let cached = witnessSlotsCache[iface] { return cached }
         guard let i = interfaceDefs[iface] else { return ["type_witness"] }
         var slots = i.methods.map(\.name)
         for p in i.properties {
@@ -872,6 +859,7 @@ final class IRToLLVM {
         }
         for b in i.bases { slots.append("base_\(b)") }
         slots.append("type_witness")
+        witnessSlotsCache[iface] = slots
         return slots
     }
 
@@ -884,8 +872,7 @@ final class IRToLLVM {
         if let t = witnessTypes[iface] { return t }
         let n = max(witnessSlots(iface).count, 1)
         let st = LLVMStructCreateNamed(ctx, "witness.\(iface)")!
-        var elems = [LLVMTypeRef?](repeating: i8ptr, count: n)
-        elems.withUnsafeMutableBufferPointer { LLVMStructSetBody(st, $0.baseAddress, UInt32(n), 0) }
+        setStructBody(st, [LLVMTypeRef](repeating: i8ptr, count: n))
         witnessTypes[iface] = st
         return st
     }
@@ -924,12 +911,16 @@ final class IRToLLVM {
             vals.append(bw)
         }
         vals.append(LLVMConstPointerNull(i8ptr))   // type_witness (reserved)
-        let count = UInt32(vals.count)
-        let initVal = vals.withUnsafeMutableBufferPointer {
-            LLVMConstNamedStruct(wt, $0.baseAddress, count)
-        }
-        LLVMSetInitializer(g, initVal)
+        LLVMSetInitializer(g, constStruct(wt, vals))
         return g
+    }
+
+    // Bridge a thunk's `payload` pointer to the impl's `self`: a by-pointer (mutating/class) method
+    // takes it directly; a by-value method loads the concrete value out of it.
+    private func bridgeThunkSelf(_ payload: LLVMValueRef, _ type: String, _ c: Callable) -> LLVMValueRef? {
+        if c.selfByPointer { return payload }
+        guard let st = selfLLVMType(type) else { return nil }
+        return LLVMBuildLoad2(b, st, payload, "self")
     }
 
     // A uniform-signature thunk `ret(ptr self, params…)` wrapping the concrete impl: it bridges
@@ -937,35 +928,23 @@ final class IRToLLVM {
     // pointer for a mutating / class method — and re-boxes a covariant-`Self` result as `any iface`.
     private func methodThunk(_ type: String, _ iface: String, _ m: IRMethodReq) -> LLVMValueRef? {
         guard let retTy = llvmType(m.ret, zeroSpan) else { return nil }
-        var paramTys: [LLVMTypeRef?] = [i8ptr]
+        var paramTys: [LLVMTypeRef] = [i8ptr]
         for pt in m.params {
             guard let t = llvmType(pt, zeroSpan) else { return nil }
             paramTys.append(t)
         }
-        let pn = UInt32(paramTys.count)
-        let fnTy = paramTys.withUnsafeMutableBufferPointer { LLVMFunctionType(retTy, $0.baseAddress, pn, 0) }!
         let sname = m.name.replacingOccurrences(of: ".", with: "_")
-        let fn = LLVMAddFunction(mod, "wt_\(type)_\(iface)_\(sname)", fnTy)!
+        let (fn, _) = emitFunction("wt_\(type)_\(iface)_\(sname)", ret: retTy, params: paramTys)
 
         let saved = enterThunk(fn)
         defer { leaveThunk(saved) }
 
         declareMethod(type, m.name)
         guard let c = callables["m:\(type):\(m.name)"] else { return nil }
-        let payload = LLVMGetParam(fn, 0)!
-        let selfArg: LLVMValueRef
-        if c.selfByPointer {
-            selfArg = payload
-        } else {
-            guard let st = selfLLVMType(type) else { return nil }
-            selfArg = LLVMBuildLoad2(b, st, payload, "self")
-        }
+        guard let selfArg = bridgeThunkSelf(LLVMGetParam(fn, 0)!, type, c) else { return nil }
         var callArgs: [LLVMValueRef?] = [selfArg]
         for i in 0..<m.params.count { callArgs.append(LLVMGetParam(fn, UInt32(i + 1))) }
-        let n = UInt32(callArgs.count)
-        let result = callArgs.withUnsafeMutableBufferPointer {
-            LLVMBuildCall2(b, c.ty, c.fn, $0.baseAddress, n, "")
-        }!
+        guard let result = buildCall(c.fn, c.ty, callArgs) else { return nil }
 
         if case .existential = m.ret {
             // Covariant `Self`: the impl returns the concrete conformer; re-box it as `any iface`.
@@ -984,14 +963,11 @@ final class IRToLLVM {
     // computed one routes through the concrete accessor method (`prop.get` / `prop.set`).
     private func propThunk(_ type: String, _ iface: String, _ p: IRPropReq, setter: Bool) -> LLVMValueRef? {
         guard let propTy = llvmType(p.type, zeroSpan) else { return nil }
-        var paramTys: [LLVMTypeRef?] = [i8ptr]
+        var paramTys: [LLVMTypeRef] = [i8ptr]
         if setter { paramTys.append(propTy) }
-        let pn = UInt32(paramTys.count)
-        let fnTy = paramTys.withUnsafeMutableBufferPointer {
-            LLVMFunctionType(setter ? voidTy : propTy, $0.baseAddress, pn, 0)
-        }!
         let slot = setter ? "\(p.name)_set" : "\(p.name)_get"
-        let fn = LLVMAddFunction(mod, "wt_\(type)_\(iface)_\(slot)", fnTy)!
+        let (fn, _) = emitFunction("wt_\(type)_\(iface)_\(slot)",
+                                   ret: setter ? voidTy : propTy, params: paramTys)
 
         let saved = enterThunk(fn)
         defer { leaveThunk(saved) }
@@ -1011,19 +987,10 @@ final class IRToLLVM {
         let accessor = "\(p.name).\(setter ? "set" : "get")"
         declareMethod(type, accessor)
         guard let c = callables["m:\(type):\(accessor)"] else { return nil }
-        let selfArg: LLVMValueRef
-        if c.selfByPointer {
-            selfArg = payload
-        } else {
-            guard let st = selfLLVMType(type) else { return nil }
-            selfArg = LLVMBuildLoad2(b, st, payload, "self")
-        }
+        guard let selfArg = bridgeThunkSelf(payload, type, c) else { return nil }
         var callArgs: [LLVMValueRef?] = [selfArg]
         if setter { callArgs.append(LLVMGetParam(fn, 1)) }
-        let n = UInt32(callArgs.count)
-        let result = callArgs.withUnsafeMutableBufferPointer {
-            LLVMBuildCall2(b, c.ty, c.fn, $0.baseAddress, n, "")
-        }
+        let result = buildCall(c.fn, c.ty, callArgs)
         if setter { LLVMBuildRetVoid(b) } else { LLVMBuildRet(b, result!) }
         return fn
     }
@@ -1033,8 +1000,7 @@ final class IRToLLVM {
         let key = ifaces.joined(separator: "&")
         if let t = compositeTypes[key] { return t }
         let st = LLVMStructCreateNamed(ctx, "comp.\(key)")!
-        var elems = [LLVMTypeRef?](repeating: i8ptr, count: max(ifaces.count, 1))
-        elems.withUnsafeMutableBufferPointer { LLVMStructSetBody(st, $0.baseAddress, UInt32(max(ifaces.count, 1)), 0) }
+        setStructBody(st, [LLVMTypeRef](repeating: i8ptr, count: max(ifaces.count, 1)))
         compositeTypes[key] = st
         return st
     }
@@ -1054,9 +1020,7 @@ final class IRToLLVM {
             guard let w = witnessInstance(type, i) else { return nil }
             vals.append(w)
         }
-        let count = UInt32(vals.count)
-        let initVal = vals.withUnsafeMutableBufferPointer { LLVMConstNamedStruct(ct, $0.baseAddress, count) }
-        LLVMSetInitializer(g, initVal)
+        LLVMSetInitializer(g, constStruct(ct, vals))
         return g
     }
 
@@ -1079,18 +1043,13 @@ final class IRToLLVM {
         let fnPtr = LLVMBuildLoad2(b, i8ptr, structGEP(witnessType(iface), witnessPtr, idx), "slot")!
 
         guard let retTy = llvmType(resultType, span) else { return nil }
-        var paramTys: [LLVMTypeRef?] = [i8ptr]
+        var paramTys: [LLVMTypeRef] = [i8ptr]
         var argVals: [LLVMValueRef?] = [payload]
         for a in args {
             guard let t = llvmType(a.type, span), let v = lowerExpr(a) else { return nil }
             paramTys.append(t); argVals.append(v)
         }
-        let pn = UInt32(paramTys.count)
-        let fnTy = paramTys.withUnsafeMutableBufferPointer { LLVMFunctionType(retTy, $0.baseAddress, pn, 0) }!
-        let n = UInt32(argVals.count)
-        return argVals.withUnsafeMutableBufferPointer {
-            LLVMBuildCall2(b, fnTy, fnPtr, $0.baseAddress, n, "")
-        }
+        return buildCall(fnPtr, fnType(retTy, paramTys), argVals)
     }
 
     // Wrap a concrete conformer as `any I` / `any A & B`, or upcast `any B` → `any A`.
@@ -1162,6 +1121,46 @@ final class IRToLLVM {
         if let block = saved.block { LLVMPositionBuilderAtEnd(b, block) }
     }
 
+    // A captured local: its name and the (addr, ty) slot it lives in in the enclosing scope. Shared
+    // by closures and `spawn let`, which both copy free variables by value into a heap env.
+    private typealias Capture = (name: String, local: (addr: LLVMValueRef, ty: LLVMTypeRef))
+
+    // The free variables of `used` that name enclosing locals, de-duplicated in first-use order.
+    private func resolveCaptures(_ used: [String]) -> [Capture] {
+        var seen = Set<String>()
+        return used.compactMap { name in
+            guard seen.insert(name).inserted, let l = locals[name] else { return nil }
+            return (name, l)
+        }
+    }
+
+    // The env struct type holding the captures in order; an i8 placeholder when empty so `rt_alloc`
+    // still has a nonzero size.
+    private func captureEnvType(_ caps: [Capture]) -> LLVMTypeRef {
+        structTy(caps.isEmpty ? [LLVMInt8TypeInContext(ctx)!] : caps.map { $0.local.ty })
+    }
+
+    // Inside a freshly entered thunk: copy each capture out of `env` into a fresh local slot.
+    private func loadCapturesIntoScope(_ caps: [Capture], _ envTy: LLVMTypeRef, _ env: LLVMValueRef) {
+        for (i, cap) in caps.enumerated() {
+            let slot = LLVMBuildAlloca(b, cap.local.ty, cap.name)!
+            let v = LLVMBuildLoad2(b, cap.local.ty, structGEP(envTy, env, i), cap.name)
+            LLVMBuildStore(b, v, slot)
+            locals[cap.name] = (slot, cap.local.ty)
+        }
+    }
+
+    // At the capture site: heap-allocate the env and copy each capture's current value into it.
+    private func allocAndFillEnv(_ caps: [Capture], _ envTy: LLVMTypeRef) -> LLVMValueRef {
+        let bytes = caps.reduce(0) { $0 + abiSlots($1.local.ty) } * 8
+        let envPtr = buildCall(rtAlloc(), rtAllocTy(), [LLVMConstInt(i64, UInt64(max(bytes, 8)), 0)])!
+        for (i, cap) in caps.enumerated() {
+            let v = LLVMBuildLoad2(b, cap.local.ty, cap.local.addr, cap.name)
+            LLVMBuildStore(b, v, structGEP(envTy, envPtr, i))
+        }
+        return envPtr
+    }
+
     // A closure lowers to a hoisted impl function `ret nomu_cloN(ptr env, params…)` plus a site
     // that heap-allocates the env (captures copied by value) and yields `{ fn, env }`. Captures
     // are the body's free variables that name enclosing locals (mirrors CodegenIR).
@@ -1169,44 +1168,24 @@ final class IRToLLVM {
         var bound = Set(params.map(\.name))
         var used: [String] = []
         collectUses(body, bound: &bound, used: &used)
-        var seen = Set<String>()
-        let caps = used.compactMap { name -> (name: String, local: (addr: LLVMValueRef, ty: LLVMTypeRef))? in
-            guard seen.insert(name).inserted, let l = locals[name] else { return nil }
-            return (name, l)
-        }
-
-        // Env struct type (captures, in order). Empty → an i8 placeholder so rt_alloc has a size.
-        var envElems: [LLVMTypeRef?] = caps.isEmpty ? [LLVMInt8TypeInContext(ctx)] : caps.map { $0.local.ty }
-        let envCount = UInt32(envElems.count)
-        let envTy = envElems.withUnsafeMutableBufferPointer {
-            LLVMStructTypeInContext(ctx, $0.baseAddress, envCount, 0)
-        }!
+        let caps = resolveCaptures(used)
+        let envTy = captureEnvType(caps)
 
         guard let retTy = llvmType(ret, span) else { return nil }
-        var paramTys: [LLVMTypeRef?] = [i8ptr]   // env
+        var paramTys: [LLVMTypeRef] = [i8ptr]   // env
         for p in params {
             guard let t = llvmType(p.type, p.span) else { return nil }
             paramTys.append(t)
         }
-        let pn = UInt32(paramTys.count)
-        let fnTy = paramTys.withUnsafeMutableBufferPointer {
-            LLVMFunctionType(retTy, $0.baseAddress, pn, 0)
-        }!
-        let name = "nomu_clo\(closureSeq)"; closureSeq += 1
-        let fn = LLVMAddFunction(mod, name, fnTy)!
+        let (fn, _) = emitFunction("nomu_clo\(closureSeq)", ret: retTy, params: paramTys)
+        closureSeq += 1
 
         // Define the impl body against a fresh scope (captures loaded from env + params), then
         // restore the enclosing builder position and lowering state.
         // A fresh scope, including spawn/actor state — the body's `return` must not join the
         // enclosing function's spawns (that would reference its allocas from another function).
         let saved = enterThunk(fn)
-        let env = LLVMGetParam(fn, 0)!
-        for (i, cap) in caps.enumerated() {
-            let slot = LLVMBuildAlloca(b, cap.local.ty, cap.name)!
-            let v = LLVMBuildLoad2(b, cap.local.ty, structGEP(envTy, env, i), cap.name)
-            LLVMBuildStore(b, v, slot)
-            locals[cap.name] = (slot, cap.local.ty)
-        }
+        loadCapturesIntoScope(caps, envTy, LLVMGetParam(fn, 0)!)
         for (i, p) in params.enumerated() {
             guard let t = llvmType(p.type, p.span) else { break }
             let slot = LLVMBuildAlloca(b, t, p.name)!
@@ -1221,12 +1200,7 @@ final class IRToLLVM {
         leaveThunk(saved)
 
         // Site: allocate + fill the env, then build the { fn, env } value.
-        let bytes = caps.reduce(0) { $0 + abiSlots($1.local.ty) } * 8
-        let envPtr = buildCall(rtAlloc(), rtAllocTy(), [LLVMConstInt(i64, UInt64(max(bytes, 8)), 0)])!
-        for (i, cap) in caps.enumerated() {
-            let v = LLVMBuildLoad2(b, cap.local.ty, cap.local.addr, cap.name)
-            LLVMBuildStore(b, v, structGEP(envTy, envPtr, i))
-        }
+        let envPtr = allocAndFillEnv(caps, envTy)
         var clo = LLVMGetUndef(closureTy)
         clo = LLVMBuildInsertValue(b, clo, fn, 0, "")
         clo = LLVMBuildInsertValue(b, clo, envPtr, 1, "")
@@ -1242,33 +1216,16 @@ final class IRToLLVM {
     private func lowerSpawnLet(name: String, value: IRExpr, resultType: Type, span: Span) {
         var used: [String] = []
         collectUsesExpr(value, bound: [], used: &used)
-        var seen = Set<String>()
-        let caps = used.compactMap { n -> (name: String, local: (addr: LLVMValueRef, ty: LLVMTypeRef))? in
-            guard seen.insert(n).inserted, let l = locals[n] else { return nil }
-            return (n, l)
-        }
-
-        var envElems: [LLVMTypeRef?] = caps.isEmpty ? [LLVMInt8TypeInContext(ctx)] : caps.map { $0.local.ty }
-        let envCount = UInt32(envElems.count)
-        let envTy = envElems.withUnsafeMutableBufferPointer {
-            LLVMStructTypeInContext(ctx, $0.baseAddress, envCount, 0)
-        }!
+        let caps = resolveCaptures(used)
+        let envTy = captureEnvType(caps)
 
         guard let resultTy = llvmType(resultType, span) else { return }
-        var startParams: [LLVMTypeRef?] = [i8ptr]
-        let startTy = startParams.withUnsafeMutableBufferPointer { LLVMFunctionType(i8ptr, $0.baseAddress, 1, 0) }!
-        let fn = LLVMAddFunction(mod, "nomu_spawn\(spawnSeq)", startTy)!
+        let (fn, _) = emitFunction("nomu_spawn\(spawnSeq)", ret: i8ptr, params: [i8ptr])
         spawnSeq += 1
 
         // The start routine: load captures from env, compute the value, box it, return the box.
         let saved = enterThunk(fn)
-        let env = LLVMGetParam(fn, 0)!
-        for (i, cap) in caps.enumerated() {
-            let slot = LLVMBuildAlloca(b, cap.local.ty, cap.name)!
-            let v = LLVMBuildLoad2(b, cap.local.ty, structGEP(envTy, env, i), cap.name)
-            LLVMBuildStore(b, v, slot)
-            locals[cap.name] = (slot, cap.local.ty)
-        }
+        loadCapturesIntoScope(caps, envTy, LLVMGetParam(fn, 0)!)
         if let rv = lowerExpr(value) {
             let bytes = max(slotCount(resultType) * 8, 8)
             let boxp = buildCall(rtAlloc(), rtAllocTy(), [LLVMConstInt(i64, UInt64(bytes), 0)])!
@@ -1280,12 +1237,7 @@ final class IRToLLVM {
         leaveThunk(saved)
 
         // Site: allocate + fill the env, start the fiber, keep its handle for joins.
-        let bytes = caps.reduce(0) { $0 + abiSlots($1.local.ty) } * 8
-        let envPtr = buildCall(rtAlloc(), rtAllocTy(), [LLVMConstInt(i64, UInt64(max(bytes, 8)), 0)])!
-        for (i, cap) in caps.enumerated() {
-            let v = LLVMBuildLoad2(b, cap.local.ty, cap.local.addr, cap.name)
-            LLVMBuildStore(b, v, structGEP(envTy, envPtr, i))
-        }
+        let envPtr = allocAndFillEnv(caps, envTy)
         let spawn = runtimeFn("fiber_spawn", ret: i8ptr, params: [i8ptr, i8ptr], varArg: false)
         let fiber = buildCall(spawn.0, spawn.1, [fn, envPtr])!
         let handleSlot = LLVMBuildAlloca(b, spawnHandleTy, "\(name).h")!
@@ -1344,16 +1296,12 @@ final class IRToLLVM {
         let fnPtr = LLVMBuildExtractValue(b, cval, 0, "clo.fn")
         let envPtr = LLVMBuildExtractValue(b, cval, 1, "clo.env")
         guard let retTy = llvmType(rty, span) else { return nil }
-        var paramTys: [LLVMTypeRef?] = [i8ptr]
+        var paramTys: [LLVMTypeRef] = [i8ptr]
         for t in ptys {
             guard let lt = llvmType(t, span) else { return nil }
             paramTys.append(lt)
         }
-        let pn = UInt32(paramTys.count)
-        let fnTy = paramTys.withUnsafeMutableBufferPointer {
-            LLVMFunctionType(retTy, $0.baseAddress, pn, 0)
-        }!
-        return buildArgsAndCall(fnTy, fnPtr!, env: envPtr, args: args)
+        return buildArgsAndCall(fnType(retTy, paramTys), fnPtr!, env: envPtr, args: args)
     }
 
     // Lower `args`, optionally prefixed by a closure `env`, and emit the call.
@@ -1476,6 +1424,44 @@ final class IRToLLVM {
         }!
     }
 
+    // Thin wrappers over the LLVM C API that own the `[LLVMTypeRef?]` buffer dance the raw calls
+    // require, so call sites read in terms of types/values, not pointers + counts.
+    private func fnType(_ ret: LLVMTypeRef, _ params: [LLVMTypeRef], varArg: Bool = false) -> LLVMTypeRef {
+        var ps: [LLVMTypeRef?] = params
+        return ps.withUnsafeMutableBufferPointer {
+            LLVMFunctionType(ret, $0.baseAddress, UInt32(params.count), varArg ? 1 : 0)
+        }!
+    }
+
+    private func structTy(_ elems: [LLVMTypeRef], packed: Bool = false) -> LLVMTypeRef {
+        var es: [LLVMTypeRef?] = elems
+        return es.withUnsafeMutableBufferPointer {
+            LLVMStructTypeInContext(ctx, $0.baseAddress, UInt32(elems.count), packed ? 1 : 0)
+        }!
+    }
+
+    private func setStructBody(_ st: LLVMTypeRef, _ elems: [LLVMTypeRef], packed: Bool = false) {
+        var es: [LLVMTypeRef?] = elems
+        es.withUnsafeMutableBufferPointer {
+            LLVMStructSetBody(st, $0.baseAddress, UInt32(elems.count), packed ? 1 : 0)
+        }
+    }
+
+    private func constStruct(_ ty: LLVMTypeRef, _ vals: [LLVMValueRef?]) -> LLVMValueRef {
+        var vs = vals
+        return vs.withUnsafeMutableBufferPointer {
+            LLVMConstNamedStruct(ty, $0.baseAddress, UInt32(vals.count))
+        }!
+    }
+
+    // The single seam through which every LLVM function is created. 8.3 attaches a `DISubprogram`
+    // here so line-table/debug-scope setup lands in one place instead of at each `LLVMAddFunction`.
+    private func emitFunction(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef],
+                              varArg: Bool = false) -> (fn: LLVMValueRef, ty: LLVMTypeRef) {
+        let ty = fnType(ret, params, varArg: varArg)
+        return (LLVMAddFunction(mod, name, ty)!, ty)
+    }
+
     private func buildCall(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?]) -> LLVMValueRef? {
         var a = args
         return a.withUnsafeMutableBufferPointer {
@@ -1507,13 +1493,9 @@ final class IRToLLVM {
         -> (LLVMValueRef, LLVMTypeRef)
     {
         if let cached = runtimeFns[name] { return cached }
-        var ps: [LLVMTypeRef?] = params.map { $0 }
-        let ty = ps.withUnsafeMutableBufferPointer {
-            LLVMFunctionType(ret, $0.baseAddress, UInt32(params.count), varArg ? 1 : 0)
-        }!
-        let fn = LLVMAddFunction(mod, name, ty)!
-        runtimeFns[name] = (fn, ty)
-        return (fn, ty)
+        let f = emitFunction(name, ret: ret, params: params, varArg: varArg)
+        runtimeFns[name] = f
+        return f
     }
 
     private func intFormat() -> LLVMValueRef {

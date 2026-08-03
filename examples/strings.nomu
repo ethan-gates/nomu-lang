@@ -1,3 +1,19 @@
+
+
+struct Base64Encoder {
+    var buffer: String
+
+    fun add(s: String) {
+        self.buffer = concat(self.buffer, s)
+    }
+
+    fun encode() -> {
+
+    }
+}
+
+
+
 fun main() {
     let hello: String = "hello"
     let world: String = "world"
