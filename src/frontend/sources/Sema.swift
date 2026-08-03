@@ -53,6 +53,7 @@ public struct Sema {
     // Declared return type of the body being lowered — the contextual type for a
     // `return .case(...)` leading-dot construction (M4.10).
     private var currentReturnType: Type = .void
+    private var loopDepth = 0   // >0 inside a `while` body; gates `break`/`continue`
 
     // Value-type method calls, recorded during lowering with their receiver's
     // mutability; checked against inferred mutating-ness after the mutation pass (M4.11).
@@ -1005,6 +1006,21 @@ public struct Sema {
             let els = s.elseBody.map { lowerBlock($0) }
             return IRStmt(kind: .ifStmt(cond: cond, then: then, else: els), span: s.span)
 
+        case .whileStmt(let s):
+            let cond = checkExpr(s.cond)
+            loopDepth += 1
+            let body = lowerBlock(s.body)
+            loopDepth -= 1
+            return IRStmt(kind: .whileStmt(cond: cond, body: body), span: s.span)
+
+        case .breakStmt(let span):
+            if loopDepth == 0 { diags.error("'break' outside a loop", at: span) }
+            return IRStmt(kind: .breakStmt, span: span)
+
+        case .continueStmt(let span):
+            if loopDepth == 0 { diags.error("'continue' outside a loop", at: span) }
+            return IRStmt(kind: .continueStmt, span: span)
+
         case .switchStmt(let sw):
             return IRStmt(kind: .switchStmt(lowerSwitch(sw)), span: sw.span)
 
@@ -1233,7 +1249,9 @@ public struct Sema {
             pushScope()
             for p in ps { declare(p.name, p.type) }
             let saved = currentReturnType; currentReturnType = retTy
+            let savedLoop = loopDepth; loopDepth = 0   // `break`/`continue` can't cross into a closure
             let irBody = lowerBlock(body)
+            loopDepth = savedLoop
             currentReturnType = saved
             popScope()
             let type = Type.function(params: ps.map(\.type), ret: retTy)

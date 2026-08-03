@@ -5,9 +5,10 @@
 and `runtime.md`. It pins the build sequence; the design lives in those docs. The big backend
 forks (8.0.4) are **Decided (2026-07-31)** and the phased build plan (8.1–8.5) is laid out with
 per-slice work and exit criteria; slice records fill in as they land. The IR-production
-mechanism (A) was refined in **`m8.1-spec.md`**: adopt **`swift-llvm-bindings`** (official
-Swift/C++-interop LLVM bindings) + a thin supplement, LLVM via the **`llvm/llvm-project` Bazel
-overlay** (`http_archive` at a pinned commit).
+mechanism (A) is refined in §8.0.4-A: drive LLVM via its **C API** (`import LLVM_C`) from Swift
+(cxx-interop over LLVM's C++ modules does not build), LLVM via the **`llvm/llvm-project` Bazel
+overlay** (`http_archive` at a pinned commit; the pins live in `bazel/llvm_extensions.bzl`). 8.1
+(toolchain bring-up) is **complete**.
 
 > Authoring conventions per `lang-project/milestone-doc-guide.md`.
 
@@ -60,11 +61,11 @@ oracle** for differential testing until M8 is green.
 ### 8.0.2 · Compiler surface touched
 
 Current: `… → typed IR → CodegenIR (emit C strings) → cc`. M8 replaces the last two stages.
-- **New backend** — typed IR → **LLVM IR** via **`swift-llvm-bindings`** (module / function /
+- **New backend** — typed IR → **LLVM IR** via the LLVM **C API** (module / function /
   basic-block construction, not string emission). The per-node lowering *logic* in `CodegenIR`
   carries over; the *string emitter* does not. `Mangle.swift` survives (symbol names are
-  backend-neutral). New build components: the `llvm-project` Bazel overlay, the vendored
-  bindings, an optional supplement (`m8.1-spec.md`).
+  backend-neutral). New build components: the `llvm-project` Bazel overlay and the `src/llvmgen`
+  `swift_library` driving `import LLVM_C` (§8.0.4-A).
 - **Debug info** — `DIBuilder` threaded from the IR's spans (carried on every node, §1).
 - **Runtime** — preamble carved into a compiled `.a`; codegen emits calls and links it.
 - **Closure conversion / share analysis** — "still in codegen" today (§1); either kept inline
@@ -84,15 +85,30 @@ depend on 8.2 and are independent of each other. 8.5 trails and is descopable.
 
 ### 8.0.4 · Big design decisions
 
-- **A · LLVM IR production: the LLVM **C API** from Swift — Decided (2026-08-01 in `m8.1-spec.md`
-  8.1.0.4; supersedes the earlier "C++ API via `swift-llvm-bindings`" pick).** Importing LLVM's
+- **A · LLVM IR production: the LLVM **C API** from Swift — Decided (2026-08-01; supersedes the
+  earlier "C++ API via `swift-llvm-bindings`" pick).** Importing LLVM's
   **C++** modules via Swift cxx-interop **does not build** (`Support/Format.h` `operator<<`
   ambiguity under interop — the first of many such incompatibilities). The LLVM **C API**
   (`import LLVM_C`) builds/links/runs end-to-end and covers the M8 backend needs (IR,
   `TargetMachine`, `DIBuilder`, pass pipeline incl. statepoints). C++ reach is preserved via a
-  **thin C++ shim** (normal C++, no interop) for the rare gap (`DIBuilder` variant parts,
-  custom passes) — see `m8.1-spec.md` 8.1.0.4-A/A′ for coverage + shim triggers. `swift-llvm-bindings`
-  not used (≈2 KB over LLVM's own module map).
+  **thin C++ shim** (normal C++, no interop) for the rare gap. `swift-llvm-bindings` not used
+  (≈2 KB over LLVM's own module map; the importable surface is LLVM's own `module.modulemap`,
+  shipped with `@llvm-project`). The Swift-facing surface must stay **flat and importable** — free
+  functions, opaque pointers, POD structs, scoped enums — since Swift cannot import LLVM's
+  templated / virtual-class C++ (the governing interop constraint). `import LLVM_C` still needs
+  `-cxx-interoperability-mode=default` (LLVM's C headers require the `cplusplus` module feature via
+  `LLVM_Config`), and that flag is **viral** — every target transitively importing it needs it.
+
+  **C-API coverage + shim triggers (A′).** Covered, no shim: IR (`Core.h`), object emission
+  (`TargetMachine.h`), debug info (`DebugInfo.h`, Tier 0), opt + statepoints
+  (`Transforms/PassBuilder.h` `LLVMRunPasses` incl. `rewrite-statepoints-for-gc`; `addrspace(1)`;
+  `LLVMSetGC`). Anticipated gaps → C++ shim, in likelihood order: (1) **`DIBuilder` variant parts**
+  (`DW_TAG_variant_part`, enums-as-active-case in DWARF — 8.3 Tier 1 / M10; the most likely first
+  shim; Tier 0 is fully covered); (2) **custom LLVM passes** (the C API runs *named* passes only —
+  none planned in M8, escape analysis is at our IR level); (3) **hand-emitted `gc.statepoint`
+  intrinsics** if the pass-driven route proves insufficient (8.4); (4) newest-LLVM features the C
+  API lags (only on a deliberate version bump — we pin). Expected frequency low; C-API-primary
+  should carry through M8 and likely M6.
 
 - **B · GC roots via LLVM statepoints; no bespoke MIR — Decided (2026-07-31).** Governed by
   *what is fastest for MMTk*, not what is easiest. LLVM **statepoints** (`addrspace(1)` GC
@@ -119,6 +135,12 @@ becomes a compiled `.a`. The alloc seam stays `rt_alloc` (routed to MMTk in M6).
 emits are **triple-purpose**: GC roots (M6), cancellation poll (M7), preemption (runtime). No
 new surface syntax; no language-semantics change — M8 is a backend swap.
 
+LLVM is a **compile-time** dependency of `nomuc` only (statically linked libLLVM); **compiled
+Nomu programs ship no LLVM** — a program is native code + the runtime `.a` + libc (LLVM produced
+it, as clang produces a C binary, but is not in it). So `nomuc` is a large binary (libLLVM is
+hundreds of MB — normal for a compiler); packaging it is an M8-tail concern, not a blocker.
+Programs stay small.
+
 ### 8.0.7 · Performance posture (the levers "down here")
 
 Max performance at the backend is a stated goal; the levers, in rough order of mutator impact:
@@ -141,10 +163,9 @@ function calls — that inlinability is what lets M6/LXR be fast.
 
 ### 8.0.8 · Risks / watch items
 
-- **Bindings + LLVM version pinning** — the vendored `swift-llvm-bindings` commit + the pinned
-  `llvm-project` overlay commit are the blast radius; the bazel integration of both (incl. the
-  overlay's from-source LLVM build) is real setup work and the riskiest early unknown
-  (`m8.1-spec.md`).
+- **LLVM version pinning** — the pinned `llvm-project` overlay commit (in
+  `bazel/llvm_extensions.bzl`) is the blast radius; the bazel integration (incl. the overlay's
+  from-source LLVM build) was the riskiest early unknown, now resolved (8.1 complete).
 - **Statepoint codegen quality** — statepoints add reload/spill overhead around safepoints and
   can inhibit opts; mitigated by late insertion + sparse safepoints + minimal cross-safepoint
   liveness (8.0.7). Keep the binding boundary clean enough to revisit the root mechanism if
@@ -161,20 +182,25 @@ function calls — that inlinability is what lets M6/LXR be fast.
 
 ---
 
-## 8.1 · Toolchain bring-up + native hello-world ⬜  → **expanded in `m8.1-spec.md`**
+## 8.1 · Toolchain bring-up + native hello-world ✅ (2026-08-01)
 
 Intent: stand up the whole LLVM path end to end on a trivial program — mostly build/interop
-plumbing, the riskiest unknown, so it goes first. Deps: none. Approach (8.0.4-A, refined):
-`swift-llvm-bindings` + the `llvm-project` Bazel overlay, called from Swift; the runtime compiled
-to a `.a` and linked.
+plumbing, the riskiest unknown, so it went first. Deps: none. Approach (8.0.4-A): the LLVM **C
+API** (`import LLVM_C`) + the `llvm-project` Bazel overlay, called from Swift; the runtime
+compiled to a `.a` and linked.
 
-This phase is large enough to carry its own spec — **`m8.1-spec.md`** (adopt
-`swift-llvm-bindings`, LLVM via the `llvm-project` overlay, object emission, link). Its phases
-8.1.1–8.1.5 supersede the slice sketch below.
+Built in five linear steps: (8.1.1) the `llvm-project` overlay as hermetic `cc_library` targets,
+proven from C++; (8.1.2) Swift drives the LLVM C API against `@llvm-project` — the pivot to the C
+API after LLVM's C++ modules failed to import under cxx-interop (§8.0.4-A); (8.1.3) a hand-built
+arithmetic-`main` + external `print`, verified; (8.1.4) host-triple `TargetMachine` object
+emission + runtime `.a` + link; (8.1.5) a real `main` lowered from the typed IR. The pins and
+bazel wiring live in `MODULE.bazel` + `bazel/llvm_extensions.bzl`; the lowering seam is
+`src/llvmgen/{LLVMBridge,Lowering}.swift`. (The differential-oracle C backend that guarded 8.1–8.2
+was retired at the 8.2 exit.)
 
-**Exit:** `fun main` with integer arithmetic and `print` compiles through the LLVM path to a
-native binary that runs and prints the correct value; `bazel build`/`test` green with the LLVM
-+ bindings targets; the C backend still builds (the differential oracle is preserved).
+**Exit — met.** `fun main() { print(2 + 3) }` (and arithmetic/`let`/multi-`print` variants)
+compiles through the LLVM path to a native binary that runs and prints the correct value; `bazel
+build`/`test` green with the LLVM targets.
 
 ## 8.2 · Full language lowering — C-backend parity ⬜
 

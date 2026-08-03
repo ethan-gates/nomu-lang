@@ -223,6 +223,9 @@ public enum Stmt {
     case compoundAssign(lhs: Expr, rhs: Expr, span: Span)  // +=
     case ret(Expr?, span: Span)
     case ifStmt(IfStmt)
+    case whileStmt(WhileStmt)
+    case breakStmt(span: Span)
+    case continueStmt(span: Span)
     case switchStmt(SwitchStmt)
     case expr(Expr)
 }
@@ -232,6 +235,13 @@ public struct IfStmt {
     public let cond: Expr
     public let thenBody: Block
     public let elseBody: Block?
+    public let span: Span
+}
+
+// A pre-tested loop: `while <cond> { body }` (`loops.md`).
+public struct WhileStmt {
+    public let cond: Expr
+    public let body: Block
     public let span: Span
 }
 

@@ -103,6 +103,11 @@ private final class MutationAnalyzer {
             scanExpr(cond, type: type, selfCalls: &selfCalls)
             scan(then, type: type, direct: &direct, selfCalls: &selfCalls)
             if let els { scan(els, type: type, direct: &direct, selfCalls: &selfCalls) }
+        case .whileStmt(let cond, let body):
+            scanExpr(cond, type: type, selfCalls: &selfCalls)
+            scan(body, type: type, direct: &direct, selfCalls: &selfCalls)
+        case .breakStmt, .continueStmt:
+            break
         case .switchStmt(let sw):
             scanExpr(sw.subject, type: type, selfCalls: &selfCalls)
             for arm in sw.arms { scan(arm.body, type: type, direct: &direct, selfCalls: &selfCalls) }

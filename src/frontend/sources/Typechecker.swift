@@ -140,6 +140,8 @@ public struct Typechecker {
         case .ifStmt(let s):
             checkBlock(s.thenBody, lets: lets)
             if let elseBody = s.elseBody { checkBlock(elseBody, lets: lets) }
+        case .whileStmt(let s):
+            checkBlock(s.body, lets: lets)
         case .switchStmt(let sw):
             for arm in sw.cases {
                 var innerLets = lets
@@ -148,7 +150,7 @@ public struct Typechecker {
                 }
                 checkBlock(arm.body, lets: innerLets)
             }
-        case .ret, .expr:
+        case .ret, .expr, .breakStmt, .continueStmt:
             break
         }
     }

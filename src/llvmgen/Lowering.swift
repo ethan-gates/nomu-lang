@@ -96,6 +96,16 @@ final class IRToLLVM {
     private var spawnLocals: [String: SpawnLocal] = [:]
     private var activeSpawns: [SpawnLocal] = []
     private var spawnSeq = 0
+
+    // While lowering a loop body: where `break`/`continue` branch, and the `activeSpawns` count on
+    // loop entry so each exiting edge joins only the spawns the body created (per-iteration join —
+    // `loops.md`). A stack so nested loops target the innermost.
+    private struct LoopCtx {
+        let header: LLVMBasicBlockRef   // `continue` and the back-edge branch here
+        let exit: LLVMBasicBlockRef     // `break` branches here
+        let spawnBase: Int              // activeSpawns.count at loop entry
+    }
+    private var loopStack: [LoopCtx] = []
     // While lowering an actor handler body: the (loaded) mutex to unlock at every exit.
     private var currentActorMu: LLVMValueRef?
 
@@ -655,9 +665,15 @@ final class IRToLLVM {
 
     // Join every fiber the current function spawned — the structured-concurrency guarantee that no
     // child outlives the scope. `spawn_join` is idempotent, so re-joining an already-read spawn is safe.
-    private func joinActiveSpawns() {
+    private func joinActiveSpawns() { joinSpawnsFrom(0) }
+
+    // Join the spawns created since index `base` (those `activeSpawns[base...]`). Used at function
+    // exit (base 0) and at each loop-body exit edge (base = the loop's entry count), so a `break` /
+    // `continue` / back-edge joins only what that path actually spawned. `spawn_join` is idempotent.
+    private func joinSpawnsFrom(_ base: Int) {
+        guard base < activeSpawns.count else { return }
         let sj = runtimeFn("spawn_join", ret: i8ptr, params: [i8ptr], varArg: false)
-        for s in activeSpawns { _ = buildCall(sj.0, sj.1, [s.handleSlot]) }
+        for s in activeSpawns[base...] { _ = buildCall(sj.0, sj.1, [s.handleSlot]) }
     }
 
     private func unlockActorIfNeeded() {
@@ -715,6 +731,19 @@ final class IRToLLVM {
         case .ifStmt(let cond, let then, let els):
             lowerIf(cond: cond, then: then, els: els)
 
+        case .whileStmt(let cond, let body):
+            lowerWhile(cond: cond, body: body)
+
+        case .breakStmt:
+            guard let loop = loopStack.last else { return }
+            joinSpawnsFrom(loop.spawnBase)
+            LLVMBuildBr(b, loop.exit)
+
+        case .continueStmt:
+            guard let loop = loopStack.last else { return }
+            joinSpawnsFrom(loop.spawnBase)
+            LLVMBuildBr(b, loop.header)
+
         case .switchStmt(let sw):
             lowerSwitch(sw)
 
@@ -742,6 +771,41 @@ final class IRToLLVM {
             if !blockTerminated() { LLVMBuildBr(b, mergeBB) }
         }
         LLVMPositionBuilderAtEnd(b, mergeBB)
+    }
+
+    // `while cond { body }` — header/body/exit blocks (`loops.md`). The header re-tests each
+    // iteration; the body branches back to the header (the back-edge, where 8.4.2 will place a
+    // safepoint poll). Body-scoped locals and spawns are saved on entry and restored on exit, and
+    // each exiting edge (normal fall-through, `continue`, `break`) joins the spawns the body made.
+    private func lowerWhile(cond: IRExpr, body: [IRStmt]) {
+        guard let fn = currentFn else { return }
+        let headerBB = LLVMAppendBasicBlockInContext(ctx, fn, "while.header")!
+        let bodyBB = LLVMAppendBasicBlockInContext(ctx, fn, "while.body")!
+        let exitBB = LLVMAppendBasicBlockInContext(ctx, fn, "while.exit")!
+
+        LLVMBuildBr(b, headerBB)
+        LLVMPositionBuilderAtEnd(b, headerBB)
+        setDebugLoc(cond.span)
+        guard let condV = lowerExpr(cond) else { return }
+        let condBit = LLVMBuildICmp(b, LLVMIntNE, condV, LLVMConstInt(i64, 0, 0), "while.cond")
+        LLVMBuildCondBr(b, condBit, bodyBB, exitBB)
+
+        LLVMPositionBuilderAtEnd(b, bodyBB)
+        let base = activeSpawns.count
+        let savedLocals = locals
+        let savedSpawnLocals = spawnLocals
+        loopStack.append(LoopCtx(header: headerBB, exit: exitBB, spawnBase: base))
+        lowerBlock(body)
+        if !blockTerminated() {
+            joinSpawnsFrom(base)                 // normal fall-through joins the iteration's spawns
+            LLVMBuildBr(b, headerBB)
+        }
+        loopStack.removeLast()
+        locals = savedLocals
+        spawnLocals = savedSpawnLocals
+        activeSpawns = Array(activeSpawns.prefix(base))   // body spawns don't outlive the loop
+
+        LLVMPositionBuilderAtEnd(b, exitBB)
     }
 
     // MARK: - Expressions
@@ -1322,14 +1386,16 @@ final class IRToLLVM {
         let actorMu: LLVMValueRef?
         let scope: LLVMMetadataRef?
         let debugLoc: LLVMMetadataRef?
+        let loops: [LoopCtx]
     }
 
     private func enterThunk(_ fn: LLVMValueRef, line: Int = 0) -> ThunkState {
         let saved = ThunkState(block: LLVMGetInsertBlock(b), locals: locals, self_: currentSelf, fn: currentFn,
                                spawnLocals: spawnLocals, activeSpawns: activeSpawns, actorMu: currentActorMu,
-                               scope: currentScope, debugLoc: di != nil ? LLVMGetCurrentDebugLocation2(b) : nil)
+                               scope: currentScope, debugLoc: di != nil ? LLVMGetCurrentDebugLocation2(b) : nil,
+                               loops: loopStack)
         currentFn = fn; currentSelf = nil; locals = [:]
-        spawnLocals = [:]; activeSpawns = []; currentActorMu = nil
+        spawnLocals = [:]; activeSpawns = []; currentActorMu = nil; loopStack = []
         LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, fn, "entry"))
         enterDebugScope(fn, line: line)
         return saved
@@ -1338,6 +1404,7 @@ final class IRToLLVM {
     private func leaveThunk(_ saved: ThunkState) {
         locals = saved.locals; currentSelf = saved.self_; currentFn = saved.fn
         spawnLocals = saved.spawnLocals; activeSpawns = saved.activeSpawns; currentActorMu = saved.actorMu
+        loopStack = saved.loops
         if let block = saved.block { LLVMPositionBuilderAtEnd(b, block) }
         currentScope = saved.scope
         if di != nil { LLVMSetCurrentDebugLocation2(b, saved.debugLoc) }
@@ -1563,6 +1630,11 @@ final class IRToLLVM {
             collectUsesExpr(cond, bound: bound, used: &used)
             var b1 = bound; collectUses(then, bound: &b1, used: &used)
             if let els = els { var b2 = bound; collectUses(els, bound: &b2, used: &used) }
+        case .whileStmt(let cond, let body):
+            collectUsesExpr(cond, bound: bound, used: &used)
+            var wb = bound; collectUses(body, bound: &wb, used: &used)
+        case .breakStmt, .continueStmt:
+            break
         case .switchStmt(let sw):
             collectUsesExpr(sw.subject, bound: bound, used: &used)
             for arm in sw.arms {

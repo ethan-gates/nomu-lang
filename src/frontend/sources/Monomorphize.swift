@@ -160,6 +160,9 @@ private final class Monomorphizer {
         case .compoundAssign(let t, let v):       kind = .compoundAssign(target: rewriteExpr(t, s), value: rewriteExpr(v, s))
         case .ret(let e):                         kind = .ret(e.map { rewriteExpr($0, s) })
         case .ifStmt(let c, let t, let e):        kind = .ifStmt(cond: rewriteExpr(c, s), then: t.map { rewriteStmt($0, s) }, else: e.map { $0.map { rewriteStmt($0, s) } })
+        case .whileStmt(let c, let body):         kind = .whileStmt(cond: rewriteExpr(c, s), body: body.map { rewriteStmt($0, s) })
+        case .breakStmt:                          kind = .breakStmt
+        case .continueStmt:                       kind = .continueStmt
         case .switchStmt(let sw):
             kind = .switchStmt(IRSwitch(subject: rewriteExpr(sw.subject, s),
                 arms: sw.arms.map { arm in IRCaseArm(caseName: arm.caseName,

@@ -232,7 +232,7 @@
   "moduleExtensions": {
     "//bazel:llvm_extensions.bzl%llvm_raw": {
       "general": {
-        "bzlTransitiveDigest": "FHxMGkP0zTuAPutzlMmafnzylQsYTmSHgk1uLRnipe4=",
+        "bzlTransitiveDigest": "7qR4MtMH3PnFq8WZGJXN0w3JliNBPooi3nL3hvextL8=",
         "usagesDigest": "AxTo4dc9KkpdcTiY/KVfOcKpOVvVnLzBexzXsDku57s=",
         "recordedInputs": [
           "REPO_MAPPING:,bazel_tools bazel_tools"

@@ -116,6 +116,13 @@ private func appendStmt(_ stmt: Stmt, ind: String, into lines: inout [String]) {
             lines.append("\(ind)else")
             appendBlock(elseBody, ind: ind + "  ", into: &lines)
         }
+    case .whileStmt(let s):
+        lines.append("\(ind)while \(describeExpr(s.cond))")
+        appendBlock(s.body, ind: ind + "  ", into: &lines)
+    case .breakStmt:
+        lines.append("\(ind)break")
+    case .continueStmt:
+        lines.append("\(ind)continue")
     case .switchStmt(let sw):
         lines.append("\(ind)switch \(describeExpr(sw.subject))")
         for arm in sw.cases {

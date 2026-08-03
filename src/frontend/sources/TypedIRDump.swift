@@ -102,6 +102,15 @@ private func appendStmt(_ stmt: IRStmt, ind: String, into lines: inout [String])
             lines.append("\(c)[else]")
             for s in els { appendStmt(s, ind: c + "  ", into: &lines) }
         }
+    case .whileStmt(let cond, let body):
+        lines.append("\(ind)while")
+        appendExpr(cond, slot: "cond", ind: c, into: &lines)
+        lines.append("\(c)[body]")
+        for s in body { appendStmt(s, ind: c + "  ", into: &lines) }
+    case .breakStmt:
+        lines.append("\(ind)break")
+    case .continueStmt:
+        lines.append("\(ind)continue")
     case .switchStmt(let sw):
         lines.append("\(ind)switch")
         appendExpr(sw.subject, slot: "subject", ind: c, into: &lines)

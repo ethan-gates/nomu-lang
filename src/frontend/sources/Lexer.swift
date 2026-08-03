@@ -18,6 +18,7 @@ public enum TokenKind: Hashable {
     case kwSwitch, kwCase, kwReturn
     case kwIf, kwElse
     case kwIn
+    case kwWhile, kwBreak, kwContinue
 
     // Punctuation
     case lBrace, rBrace       // { }
@@ -187,6 +188,9 @@ public struct Lexer {
         case "if":      return .kwIf
         case "else":    return .kwElse
         case "in":      return .kwIn
+        case "while":   return .kwWhile
+        case "break":   return .kwBreak
+        case "continue": return .kwContinue
         case "true":    return .boolLit(true)
         case "false":   return .boolLit(false)
         default:        return .ident(text)

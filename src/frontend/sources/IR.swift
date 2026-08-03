@@ -195,6 +195,9 @@ public indirect enum StmtKind {
     case compoundAssign(target: IRExpr, value: IRExpr)
     case ret(IRExpr?)
     case ifStmt(cond: IRExpr, then: [IRStmt], else: [IRStmt]?)
+    case whileStmt(cond: IRExpr, body: [IRStmt])
+    case breakStmt
+    case continueStmt
     case switchStmt(IRSwitch)
     case exprStmt(IRExpr)
 }

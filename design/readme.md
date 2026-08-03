@@ -17,8 +17,9 @@ Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease
 - [syntax.md](syntax.md) — surface-syntax principles (one canonical form per concept).
 - [macros.md](macros.md) — typed hygienic AST macros; extension-only role.
 - [compiler.md](compiler.md) — compiler architecture, mid-level IR, backend strategy, tooling, debugger.
-- [m8-spec.md](m8-spec.md) — **working draft**: M8 implementation spec for the LLVM backend — IR production (C++ shim), DWARF, the GC/cancellation/preemption safepoint substrate, runtime-as-library. The next build milestone (precedes M6). Forks decided in 8.0.4; phased plan 8.1–8.5.
-- [m8.1-spec.md](m8.1-spec.md) — **working draft (design-opening)**: M8 phase 8.1 expanded — LLVM toolchain bring-up (Swift↔C++ shim, LLVM-in-bazel, object emission, native hello-world). The riskiest M8 plumbing; binding-strategy + LLVM-acquisition forks open in 8.1.0.4.
+- [m8-spec.md](m8-spec.md) — **working draft**: M8 implementation spec for the LLVM backend — IR production (LLVM C API), DWARF, the GC/cancellation/preemption safepoint substrate, runtime-as-library. The next build milestone (precedes M6). Forks decided in 8.0.4; phased plan 8.1–8.5 (8.1–8.3 complete).
+- [m8.4-spec.md](m8.4-spec.md) — **draft for review**: M8 phase 8.4 expanded — the GC substrate (statepoints, `addrspace(1)` pointer model, stack maps, inline alloc/barrier/poll seams), inert until M6/M7. Co-designed with `m6-spec.md` §6.1.
+- [loops.md](loops.md) — **draft for review**: Nomu's iteration construct (`while`) — syntax, semantics, lowering. A prerequisite of 8.4 (the loop back-edge hosts the safepoint poll).
 - [m6-spec.md](m6-spec.md) — **working draft**: M6 implementation spec (build plan) for the real GC (MMTk) — binding, object model, precise roots, safepoints/barriers, moving GenImmix. Gated on M8 (LLVM). Follows `lang-project/milestone-doc-guide.md`.
 - [roadmap.md](roadmap.md) — milestones (provisional, post-pivot).
 - [deferred.md](deferred.md) — TODO backlog: feature work intentionally postponed, each with its un-park trigger.

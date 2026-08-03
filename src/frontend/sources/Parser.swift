@@ -568,10 +568,22 @@ public struct Parser {
         case .kwVar:    return parseBinding(isMutable: true)
         case .kwReturn: return parseReturn()
         case .kwIf:     return parseIfStmt()
+        case .kwWhile:  return parseWhileStmt()
+        case .kwBreak:  let s = currentSpan; advance(); return .breakStmt(span: s)
+        case .kwContinue: let s = currentSpan; advance(); return .continueStmt(span: s)
         case .kwSwitch: return parseSwitchStmt()
         case .kwSpawn where peek() == .kwLet: return parseSpawnLet()
         default:        return parseExprOrAssign()
         }
+    }
+
+    // while <cond> { body }  — the one canonical loop (`loops.md`).
+    private mutating func parseWhileStmt() -> Stmt {
+        let start = currentSpan
+        expect(.kwWhile)
+        let cond = parseExpr()
+        let body = parseBlock()
+        return .whileStmt(WhileStmt(cond: cond, body: body, span: spanFrom(start)))
     }
 
     // spawn let x [: T] = expr  — runs expr concurrently; reading x joins.

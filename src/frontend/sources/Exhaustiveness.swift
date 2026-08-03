@@ -52,6 +52,10 @@ private struct ExhaustivenessPass {
         case .ret(let e):                     if let e { walkExpr(e) }
         case .ifStmt(let cond, let then, let els):
             walkExpr(cond); walk(then); if let els { walk(els) }
+        case .whileStmt(let cond, let body):
+            walkExpr(cond); walk(body)
+        case .breakStmt, .continueStmt:
+            break
         case .switchStmt(let sw):
             checkSwitch(sw, at: stmt.span)
             walkExpr(sw.subject)

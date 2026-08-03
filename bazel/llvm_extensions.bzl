@@ -4,7 +4,7 @@ and pyyaml, so `llvm_configure` (loaded from `@llvm-raw`) can generate `@llvm-pr
 We can't `http_archive(@llvm-raw)` directly in MODULE.bazel and then load `configure.bzl` from
 it — a `use_repo_rule` repo isn't visible as a bzl source in the same module. Creating it inside
 an extension and exposing it via `use_repo` makes it loadable (this mirrors the overlay's own
-`utils/bazel/extensions.bzl`). Design: m8.1-spec.md 8.1.1.
+`utils/bazel/extensions.bzl`). Design: m8-spec.md §8.1.
 """
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")

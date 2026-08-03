@@ -37,3 +37,22 @@ Status vocabulary matches `readme.md` §"Reading the status tags".
   "inferred bottom-up" — a *Leaning* item) keeps `shared` unwritten for ordinary
   functions. Larger analysis; independent of the spelling above.
 - **Refs.** `generics.md` §2, §10; `concurrency.md` §5; `interfaces.md` §8.
+
+---
+
+## Docs reorganization: working design docs vs. a language spec
+
+- **What.** Split the doc set into two audiences: **working design docs** (the
+  `mN-spec.md` build plans, decision records, and per-feature design like `loops.md` —
+  how and why we build) and a **language specification** (what the language *guarantees
+  to the programmer*: syntax, semantics, and the contracts a Nomu author can rely on,
+  independent of implementation). Today both live intermixed across `design/`.
+- **Why deferred (raised 2026-08-03).** The design docs are still churning as M8 lands;
+  extracting a stable programmer-facing spec now would track a moving target. The split
+  pays off once the language surface settles.
+- **Trigger to build.** After M6 (post-GC), when the surface is stable enough that a
+  guarantees-oriented spec stops thrashing. Revisit as a post-M6 item.
+- **How to build then.** Decide the boundary (spec = observable behavior + syntax +
+  semantics; design docs = rationale + build plan + internals), then lift the
+  programmer-facing content out of `syntax.md`/`concurrency.md`/`types.md`/etc. into a
+  spec, leaving the working docs to cross-reference it. Discuss scope first.
