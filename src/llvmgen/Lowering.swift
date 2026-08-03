@@ -116,6 +116,16 @@ final class IRToLLVM {
     }
     private var currentSelf: SelfCtx?
 
+    // 8.3 — DWARF Tier 0. The DIBuilder, the compile-unit file, and the subprogram `!dbg` locations
+    // attach to. `currentScope` and the builder's current debug location are saved/restored across
+    // thunks (like the rest of the builder state) so each hoisted function keeps its own scope.
+    // Nil `di` ⇒ no debug info (the module named no source file); everything below is then inert.
+    private var di: LLVMDIBuilderRef?
+    private var diFile: LLVMMetadataRef?
+    private var diCU: LLVMMetadataRef?
+    private var currentScope: LLVMMetadataRef?
+    private var diTypeCache: [String: LLVMMetadataRef] = [:]   // 8.3.2 basic/composite DITypes
+
     private(set) var loweredMain = false
     private(set) var error: String?
 
@@ -159,12 +169,197 @@ final class IRToLLVM {
             case .actorDecl(let a):  actorMap[a.name] = a
             }
         }
-        guard funcMap["main"] != nil else { return }   // `loweredMain` stays false → caller errors
+        guard let mainFn = funcMap["main"] else { return }   // `loweredMain` stays false → caller errors
+        setupDebugInfo(sourceFile: mainFn.span.file)
         declareFree("main")
         while error == nil, !pending.isEmpty {
             defineBody(pending.removeFirst())
         }
+        if let dib = di {                       // resolve line tables/types before verify + emit
+            LLVMDIBuilderFinalize(dib)
+            LLVMDisposeDIBuilder(dib)
+            di = nil
+        }
         if error == nil { loweredMain = callables["f:main"] != nil }
+    }
+
+    // MARK: - Debug info (8.3, DWARF Tier 0)
+
+    // Create the DIBuilder, its file, and the compile unit from the source path (the `file` every
+    // span carries). Sets the two module flags the verifier requires for debug info. A blank path
+    // leaves `di` nil, so all later debug-info work is skipped.
+    private func setupDebugInfo(sourceFile path: String) {
+        guard !path.isEmpty else { return }
+        addModuleFlag("Debug Info Version", LLVMConstInt(i32, 3, 0))   // DEBUG_METADATA_VERSION
+        addModuleFlag("Dwarf Version", LLVMConstInt(i32, 4, 0))
+        let dib = LLVMCreateDIBuilder(mod)
+        di = dib
+        let (name, dir) = splitPath(path)
+        diFile = LLVMDIBuilderCreateFile(dib, name, name.utf8.count, dir, dir.utf8.count)
+        let producer = "nomu"
+        diCU = LLVMDIBuilderCreateCompileUnit(
+            dib, LLVMDWARFSourceLanguageC, diFile, producer, producer.utf8.count,
+            /*isOptimized=*/0, "", 0, /*RuntimeVer=*/0, "", 0,
+            LLVMDWARFEmissionFull, /*DWOId=*/0, /*SplitDebugInlining=*/1,
+            /*DebugInfoForProfiling=*/0, "", 0, "", 0)
+    }
+
+    private func addModuleFlag(_ key: String, _ value: LLVMValueRef) {
+        LLVMAddModuleFlag(mod, LLVMModuleFlagBehaviorWarning, key, key.utf8.count,
+                          LLVMValueAsMetadata(value))
+    }
+
+    private func splitPath(_ path: String) -> (name: String, dir: String) {
+        guard let slash = path.lastIndex(of: "/") else { return (path, ".") }
+        return (String(path[path.index(after: slash)...]), String(path[..<slash]))
+    }
+
+    // A `DISubprogram` for a source-backed function; nil for thunks (`debug` nil) so their
+    // synthetic instructions carry no `!dbg` and the inlinable-call verifier rule doesn't apply.
+    private func makeSubprogram(_ displayName: String, linkage: String, line: Int) -> LLVMMetadataRef? {
+        guard let dib = di else { return nil }
+        let subTy = LLVMDIBuilderCreateSubroutineType(dib, diFile, nil, 0, LLVMDIFlagZero)
+        let ln = UInt32(max(line, 1))
+        return LLVMDIBuilderCreateFunction(
+            dib, diCU, displayName, displayName.utf8.count, linkage, linkage.utf8.count,
+            diFile, ln, subTy, /*IsLocalToUnit=*/0, /*IsDefinition=*/1, /*ScopeLine=*/ln,
+            LLVMDIFlagZero, /*IsOptimized=*/0)
+    }
+
+    // Point the builder's current debug location at `span`, scoped to the active subprogram. All
+    // instructions built afterward inherit it until it's changed — enough for line-table stepping.
+    private func setDebugLoc(_ span: Span) {
+        guard di != nil, let scope = currentScope, span.begin.line > 0 else { return }
+        let loc = LLVMDIBuilderCreateDebugLocation(
+            ctx, UInt32(span.begin.line), UInt32(span.begin.col), scope, nil)
+        LLVMSetCurrentDebugLocation2(b, loc)
+    }
+
+    // Enter `fn`'s scope: adopt its subprogram (nil for thunks) and seed a live debug location at
+    // `line` so prologue instructions are covered; a nil scope clears the location instead.
+    private func enterDebugScope(_ fn: LLVMValueRef, line: Int) {
+        guard di != nil else { return }
+        currentScope = LLVMGetSubprogram(fn)
+        if let scope = currentScope, line > 0 {
+            LLVMSetCurrentDebugLocation2(b, LLVMDIBuilderCreateDebugLocation(ctx, UInt32(line), 0, scope, nil))
+        } else {
+            LLVMSetCurrentDebugLocation2(b, nil)
+        }
+    }
+
+    // 8.3.2 — the DWARF type for a Nomu type. Int/Bool are i64 basic types, String and structs are
+    // composites with member layout (offsets from the same 8-byte-slot accounting the ABI uses), a
+    // class is a pointer to its object composite. Types we don't yet model (enum/actor/closure/
+    // `any`/`some`) return nil, so their locals are simply left undeclared — never mis-described.
+    private let dwSigned: LLVMDWARFTypeEncoding = 5      // DW_ATE_signed
+    private let dwBoolean: LLVMDWARFTypeEncoding = 2     // DW_ATE_boolean
+    private let dwUnsignedChar: LLVMDWARFTypeEncoding = 8 // DW_ATE_unsigned_char
+
+    private func diType(_ t: Type) -> LLVMMetadataRef? {
+        guard di != nil else { return nil }
+        switch t {
+        case .int:    return diBasic("Int", dwSigned)
+        case .bool:   return diBasic("Bool", dwBoolean)   // stored as i64 (bool 0/1)
+        case .string: return diStringType()
+        case .named(let n, .struct_): return diStructType(n)
+        case .named(let n, .class_):  return diClassPointer(n)
+        case .opaque: return diType(concreteUnderlying(t))
+        default:      return nil                          // enum/actor/function/`any` — unmodeled (Tier 0)
+        }
+    }
+
+    private func diBasic(_ name: String, _ encoding: LLVMDWARFTypeEncoding) -> LLVMMetadataRef? {
+        if let c = diTypeCache["b:\(name)"] { return c }
+        let t = LLVMDIBuilderCreateBasicType(di, name, name.utf8.count, 64, encoding, LLVMDIFlagZero)
+        diTypeCache["b:\(name)"] = t
+        return t
+    }
+
+    // The runtime `String` is `{ i8* data, i64 len }` — a 16-byte composite of a char pointer and a
+    // length, laid out at slot offsets 0 and 1.
+    private func diStringType() -> LLVMMetadataRef? {
+        if let c = diTypeCache["b:String"] { return c }
+        let charTy = LLVMDIBuilderCreateBasicType(di, "UInt8", 5, 8, dwUnsignedChar, LLVMDIFlagZero)
+        let dataTy = LLVMDIBuilderCreatePointerType(di, charTy, 64, 0, 0, "", 0)
+        let members = [member("data", dataTy, sizeBits: 64, offsetBits: 0),
+                       member("len", diBasic("Int", dwSigned), sizeBits: 64, offsetBits: 64)]
+        let t = composite("String", sizeBits: 128, members: members)
+        diTypeCache["b:String"] = t
+        return t
+    }
+
+    private func diStructType(_ name: String) -> LLVMMetadataRef? {
+        if let c = diTypeCache["s:\(name)"] { return c }
+        guard let s = structMap[name] else { return nil }
+        var members: [LLVMMetadataRef?] = []
+        var offsetSlots = 0
+        for f in s.fields {
+            let fieldSlots = slotCount(f.type)
+            if let fty = diType(f.type) {
+                members.append(member(f.name, fty, sizeBits: UInt64(fieldSlots) * 64,
+                                      offsetBits: UInt64(offsetSlots) * 64))
+            }
+            offsetSlots += fieldSlots
+        }
+        let t = composite(name, sizeBits: UInt64(offsetSlots) * 64, members: members)
+        diTypeCache["s:\(name)"] = t
+        return t
+    }
+
+    // A class value is a pointer to `{ i64 header, fields… }`; model the object composite (with a
+    // header slot so field offsets match the +1 index) and return a pointer to it.
+    private func diClassPointer(_ name: String) -> LLVMMetadataRef? {
+        if let c = diTypeCache["c:\(name)"] { return c }
+        guard let cl = classMap[name] else { return nil }
+        var members: [LLVMMetadataRef?] = [member("__header", diBasic("Int", dwSigned), sizeBits: 64, offsetBits: 0)]
+        var offsetSlots = 1
+        for f in cl.fields {
+            let fieldSlots = slotCount(f.type)
+            if let fty = diType(f.type) {
+                members.append(member(f.name, fty, sizeBits: UInt64(fieldSlots) * 64,
+                                      offsetBits: UInt64(offsetSlots) * 64))
+            }
+            offsetSlots += fieldSlots
+        }
+        let obj = composite(name, sizeBits: UInt64(offsetSlots) * 64, members: members)
+        let ptr = LLVMDIBuilderCreatePointerType(di, obj, 64, 0, 0, "", 0)
+        diTypeCache["c:\(name)"] = ptr
+        return ptr
+    }
+
+    private func member(_ name: String, _ ty: LLVMMetadataRef?, sizeBits: UInt64, offsetBits: UInt64) -> LLVMMetadataRef? {
+        LLVMDIBuilderCreateMemberType(di, diCU, name, name.utf8.count, diFile, 0,
+                                      sizeBits, 0, offsetBits, LLVMDIFlagZero, ty)
+    }
+
+    private func composite(_ name: String, sizeBits: UInt64, members: [LLVMMetadataRef?]) -> LLVMMetadataRef? {
+        var elems = members
+        return elems.withUnsafeMutableBufferPointer {
+            LLVMDIBuilderCreateStructType(di, diCU, name, name.utf8.count, diFile, 0, sizeBits, 0,
+                                          LLVMDIFlagZero, nil, $0.baseAddress, UInt32(members.count),
+                                          0, nil, "", 0)
+        }
+    }
+
+    // Attach a `DILocalVariable` + `llvm.dbg.declare` to `addr` (the variable's storage), so a
+    // debugger can read it. `argNo` marks a parameter (1-based); nil is an ordinary local. No-op
+    // when there's no scope or the type is unmodeled.
+    private func declareLocal(_ name: String, type: Type, addr: LLVMValueRef, line: Int, argNo: Int? = nil) {
+        guard let dib = di, let scope = currentScope, let ty = diType(type) else { return }
+        let ln = UInt32(max(line, 1))
+        let varInfo: LLVMMetadataRef?
+        if let argNo = argNo {
+            varInfo = LLVMDIBuilderCreateParameterVariable(dib, scope, name, name.utf8.count,
+                        UInt32(argNo), diFile, ln, ty, /*AlwaysPreserve=*/1, LLVMDIFlagZero)
+        } else {
+            varInfo = LLVMDIBuilderCreateAutoVariable(dib, scope, name, name.utf8.count, diFile, ln, ty,
+                        /*AlwaysPreserve=*/1, LLVMDIFlagZero, /*AlignInBits=*/0)
+        }
+        guard let vi = varInfo else { return }
+        let expr = LLVMDIBuilderCreateExpression(dib, nil, 0)
+        let loc = LLVMGetCurrentDebugLocation2(b)
+            ?? LLVMDIBuilderCreateDebugLocation(ctx, ln, 0, scope, nil)
+        LLVMDIBuilderInsertDeclareRecordAtEnd(dib, addr, vi, expr, loc, LLVMGetInsertBlock(b))
     }
 
     // MARK: - Types
@@ -375,7 +570,8 @@ final class IRToLLVM {
             guard let t = llvmType(p.type, p.span) else { return }
             paramTys.append(t)
         }
-        let (fn, fnTy) = emitFunction(llvmName, ret: retTy, params: paramTys)
+        let (fn, fnTy) = emitFunction(llvmName, ret: retTy, params: paramTys,
+                                      debug: (f.name, f.span.begin.line))
         callables[key] = Callable(fn: fn, ty: fnTy, ir: f, selfType: selfType,
                                   selfByPointer: selfByPointer, isActorHandler: isActorHandler)
         pending.append(key)
@@ -390,7 +586,12 @@ final class IRToLLVM {
 
         let savedLocals = locals; let savedSelf = currentSelf
         let savedSpawns = spawnLocals; let savedActive = activeSpawns; let savedMu = currentActorMu
+        let savedScope = currentScope
+        let savedLoc = di != nil ? LLVMGetCurrentDebugLocation2(b) : nil
         locals = [:]; currentSelf = nil; spawnLocals = [:]; activeSpawns = []; currentActorMu = nil
+        // Adopt this function's subprogram + a live location before the prologue so its
+        // instructions (self setup, actor lock) are covered.
+        enterDebugScope(c.fn, line: f.span.begin.line)
 
         var paramBase: UInt32 = 0
         if let selfType = c.selfType, let st = selfLLVMType(selfType) {
@@ -414,6 +615,14 @@ final class IRToLLVM {
             }
             paramBase = 1
 
+            let selfKind: NamedKind = structMap[selfType] != nil ? .struct_
+                : classMap[selfType] != nil ? .class_
+                : enumMap[selfType] != nil ? .enum_ : .actor_
+            if let selfSlot = locals["self"]?.addr {
+                declareLocal("self", type: .named(selfType, selfKind), addr: selfSlot,
+                             line: f.span.begin.line, argNo: 1)
+            }
+
             // An actor handler runs under the actor's mutex — lock at entry, unlock at every exit.
             if c.isActorHandler {
                 let muAddr = structGEP(st, selfPtr, actorMuIndex(selfType))
@@ -429,6 +638,8 @@ final class IRToLLVM {
             let slot = LLVMBuildAlloca(b, t, p.name)!
             LLVMBuildStore(b, LLVMGetParam(c.fn, UInt32(i) + paramBase), slot)
             locals[p.name] = (slot, t)
+            declareLocal(p.name, type: p.type, addr: slot, line: p.span.begin.line,
+                         argNo: i + Int(paramBase) + 1)
         }
         lowerBlock(f.body)
         if !blockTerminated() {
@@ -438,6 +649,8 @@ final class IRToLLVM {
         }
         locals = savedLocals; currentSelf = savedSelf
         spawnLocals = savedSpawns; activeSpawns = savedActive; currentActorMu = savedMu
+        currentScope = savedScope
+        if di != nil { LLVMSetCurrentDebugLocation2(b, savedLoc) }
     }
 
     // Join every fiber the current function spawned — the structured-concurrency guarantee that no
@@ -467,12 +680,14 @@ final class IRToLLVM {
     }
 
     private func lowerStmt(_ stmt: IRStmt) {
+        setDebugLoc(stmt.span)   // 8.3: line-table entry; inherited by this statement's instructions
         switch stmt.kind {
         case .letBinding(let name, _, let value):
             guard let ty = llvmType(value.type, stmt.span), let v = lowerExpr(value) else { return }
             let slot = LLVMBuildAlloca(b, ty, name)!
             LLVMBuildStore(b, v, slot)
             locals[name] = (slot, ty)
+            declareLocal(name, type: value.type, addr: slot, line: stmt.span.begin.line)
 
         case .assign(let target, let value):
             guard let dst = lvalue(target) else { return }
@@ -741,6 +956,7 @@ final class IRToLLVM {
                     let bslot = LLVMBuildAlloca(b, bty, binding.name)!
                     LLVMBuildStore(b, val, bslot)
                     locals[binding.name] = (bslot, bty)
+                    declareLocal(binding.name, type: binding.type, addr: bslot, line: sw.subject.span.begin.line)
                 }
             }
             lowerBlock(arm.body)
@@ -1104,14 +1320,18 @@ final class IRToLLVM {
         let spawnLocals: [String: SpawnLocal]
         let activeSpawns: [SpawnLocal]
         let actorMu: LLVMValueRef?
+        let scope: LLVMMetadataRef?
+        let debugLoc: LLVMMetadataRef?
     }
 
-    private func enterThunk(_ fn: LLVMValueRef) -> ThunkState {
+    private func enterThunk(_ fn: LLVMValueRef, line: Int = 0) -> ThunkState {
         let saved = ThunkState(block: LLVMGetInsertBlock(b), locals: locals, self_: currentSelf, fn: currentFn,
-                               spawnLocals: spawnLocals, activeSpawns: activeSpawns, actorMu: currentActorMu)
+                               spawnLocals: spawnLocals, activeSpawns: activeSpawns, actorMu: currentActorMu,
+                               scope: currentScope, debugLoc: di != nil ? LLVMGetCurrentDebugLocation2(b) : nil)
         currentFn = fn; currentSelf = nil; locals = [:]
         spawnLocals = [:]; activeSpawns = []; currentActorMu = nil
         LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, fn, "entry"))
+        enterDebugScope(fn, line: line)
         return saved
     }
 
@@ -1119,6 +1339,8 @@ final class IRToLLVM {
         locals = saved.locals; currentSelf = saved.self_; currentFn = saved.fn
         spawnLocals = saved.spawnLocals; activeSpawns = saved.activeSpawns; currentActorMu = saved.actorMu
         if let block = saved.block { LLVMPositionBuilderAtEnd(b, block) }
+        currentScope = saved.scope
+        if di != nil { LLVMSetCurrentDebugLocation2(b, saved.debugLoc) }
     }
 
     // A captured local: its name and the (addr, ty) slot it lives in in the enclosing scope. Shared
@@ -1177,20 +1399,22 @@ final class IRToLLVM {
             guard let t = llvmType(p.type, p.span) else { return nil }
             paramTys.append(t)
         }
-        let (fn, _) = emitFunction("nomu_clo\(closureSeq)", ret: retTy, params: paramTys)
+        let (fn, _) = emitFunction("nomu_clo\(closureSeq)", ret: retTy, params: paramTys,
+                                   debug: ("closure", span.begin.line))
         closureSeq += 1
 
         // Define the impl body against a fresh scope (captures loaded from env + params), then
         // restore the enclosing builder position and lowering state.
         // A fresh scope, including spawn/actor state — the body's `return` must not join the
         // enclosing function's spawns (that would reference its allocas from another function).
-        let saved = enterThunk(fn)
+        let saved = enterThunk(fn, line: span.begin.line)
         loadCapturesIntoScope(caps, envTy, LLVMGetParam(fn, 0)!)
         for (i, p) in params.enumerated() {
             guard let t = llvmType(p.type, p.span) else { break }
             let slot = LLVMBuildAlloca(b, t, p.name)!
             LLVMBuildStore(b, LLVMGetParam(fn, UInt32(i) + 1), slot)
             locals[p.name] = (slot, t)
+            declareLocal(p.name, type: p.type, addr: slot, line: p.span.begin.line, argNo: i + 2)
         }
         lowerBlock(body)
         if !blockTerminated() {
@@ -1220,11 +1444,12 @@ final class IRToLLVM {
         let envTy = captureEnvType(caps)
 
         guard let resultTy = llvmType(resultType, span) else { return }
-        let (fn, _) = emitFunction("nomu_spawn\(spawnSeq)", ret: i8ptr, params: [i8ptr])
+        let (fn, _) = emitFunction("nomu_spawn\(spawnSeq)", ret: i8ptr, params: [i8ptr],
+                                   debug: ("spawn", span.begin.line))
         spawnSeq += 1
 
         // The start routine: load captures from env, compute the value, box it, return the box.
-        let saved = enterThunk(fn)
+        let saved = enterThunk(fn, line: span.begin.line)
         loadCapturesIntoScope(caps, envTy, LLVMGetParam(fn, 0)!)
         if let rv = lowerExpr(value) {
             let bytes = max(slotCount(resultType) * 8, 8)
@@ -1454,12 +1679,18 @@ final class IRToLLVM {
         }!
     }
 
-    // The single seam through which every LLVM function is created. 8.3 attaches a `DISubprogram`
-    // here so line-table/debug-scope setup lands in one place instead of at each `LLVMAddFunction`.
+    // The single seam through which every LLVM function is created. When `debug` is given it also
+    // attaches a `DISubprogram` (recovered later via `LLVMGetSubprogram`), so 8.3's line-table/
+    // debug-scope setup lands here instead of at each `LLVMAddFunction`.
     private func emitFunction(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef],
-                              varArg: Bool = false) -> (fn: LLVMValueRef, ty: LLVMTypeRef) {
+                              varArg: Bool = false,
+                              debug: (name: String, line: Int)? = nil) -> (fn: LLVMValueRef, ty: LLVMTypeRef) {
         let ty = fnType(ret, params, varArg: varArg)
-        return (LLVMAddFunction(mod, name, ty)!, ty)
+        let fn = LLVMAddFunction(mod, name, ty)!
+        if let debug = debug, let sp = makeSubprogram(debug.name, linkage: name, line: debug.line) {
+            LLVMSetSubprogram(fn, sp)
+        }
+        return (fn, ty)
     }
 
     private func buildCall(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?]) -> LLVMValueRef? {
