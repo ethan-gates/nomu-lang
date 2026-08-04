@@ -170,7 +170,9 @@ private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String,
     guard let archive = buildRuntimeArchive(inDir: outputDir) else { exit(1) }
 
     let binPath = stem
-    var linkArgs = ["-o", binPath, objPath, archive]
+    // `-dead_strip` drops code unreachable from the program's entry — most of MMTk's plan/scheduler
+    // machinery is never reached on the NoGC alloc path — and `-x` strips local symbols. (6.1.1 size.)
+    var linkArgs = ["-o", binPath, "-Wl,-dead_strip", "-Wl,-x", objPath, archive]
     // M6 · 6.1.1 — make the GC archive available to the emitted-program link. It rides inside nomuc
     // as an embedded Mach-O section (nomuc stays one atomic file) and is extracted to a cache file
     // here; a dev override via NOMU_GC_ARCHIVE wins if set. A static archive pulls in only the
