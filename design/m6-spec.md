@@ -5,18 +5,20 @@
 transition checklist, §7 GC binding), and the runtime facts in `runtime.md`. It pins the
 build sequence; the *design* lives in those docs and the two decisions stamped in 6.0.5 (the open
 forks are the 6.0.6 register).
-**Design is still opening** — several phase approaches are `Open`; this spec records the
-sequence and the question each phase must close, not a settled plan.
+**Design is settled** — all eight design forks are closed (the 6.0.6 register); the two locked
+cross-cutting decisions live in 6.0.5.
 
 > Authoring conventions per `lang-project/milestone-doc-guide.md` (numbering, status markers,
 > front matter, slice records, exit criteria).
 
-**Build status (2026-07-30):** **not started.** M6 is **hard-gated on M8** (LLVM backend +
-precise stack maps), reordered *before* M6 (`roadmap.md`; 6.0.5). Design-opening: the two
-cross-cutting decisions (LLVM-first; mainline-GenImmix sourcing) are locked (6.0.5); the open
-approaches — mutator mapping, runtime/binding boundary, safepoint poll form + density,
-parked-fiber scanning, actor teardown, `String`-as-GC, witness-table scanning — are tracked as a
-numbered register in 6.0.6.
+**Build status (2026-08-04):** **6.1 (MMTk NoGC bring-up) substantially built + green.** 6.1.0–6.1.3
+✅ (Rust `VMBinding` + MMTk NoGC linked via `crate_universe`; `rt_alloc` → per-carrier mutator; the
+type-id header replacing `refcount`; per-type pointer maps + `scan_object` for every currently-managed
+shape). 6.1.4 partial: the `gc-leaf` re-audit landed; **`String`-as-GC-object is blocked on
+heap-boxing** (the `{p1,i64}` value hits `RewriteStatepointsForGC`'s FCA limit) and is deferred to
+6.2. The M5 corpus (29 programs) compiles + runs green under NoGC. Design forks all closed (6.0.6);
+LXR is a scheduled successor gated on a benchmark-scale stdlib (`roadmap.md`, 6.0.5). Working tree is
+uncommitted across `nomu-lang/{src,design,.bazelrc,MODULE.bazel}` — you do the commits.
 
 **Framing correction:** the roadmap names M6 "real GC (MMTk)," but the bar is **not** "it
 collects" — it is **validating the performance thesis**: a *moving* collector at ~1.1–1.3×
@@ -209,9 +211,13 @@ Closed forks (the open ones live in 6.0.6):
     memcpy big pointer-free buffers on evacuation for no benefit; small strings live in the moving space.
   - **Literals → immortal space** (static bytes, never moved/collected) so `data` stays uniformly
     `addrspace(1)` with no per-use copy.
-  - **`rt_str_lit` / `rt_str_concat` re-audited off `gc-leaf`** — they now allocate GC objects, so they
-    are non-leaf (statepoints). The `String` value is a 16-byte ref+value aggregate, still register-
-    resident (D6 category A), so no root-slot spill seam is needed.
+  - **`String` must be heap-boxed — a `p1` to `{ header, len, bytes… }`, not a `{ p1, i64 }` value.**
+    ~~The D6 note claimed the String value stays register-resident (category A) with no spill.~~
+    **Corrected (2026-08-04, 6.1.4):** making `data` a `p1` was rejected by `RewriteStatepointsForGC`
+    ("FCA unimplemented") — a `{ p1, i64 }` value live across a statepoint is a first-class aggregate
+    carrying a GC pointer, the same limit that heap-boxed closures/any. So Q6 requires heap-boxing
+    `String`. `rt_str_concat` (allocates) is off `gc-leaf`; `rt_str_lit` (wraps a static pointer) stays
+    leaf. The heap-box + immortal/large-object routing lands with 6.2 (see 6.1.4).
   - Precedent: Go and the JVM both make strings GC objects (Go non-moving, JVM moving with large-object
     handling — the reason for the LOS refinement); Rust keeps strings off the GC only via ownership.
     Implemented at 6.1.3.
@@ -390,7 +396,7 @@ turns on collection, and reuses the root walk. Concrete facts M6 rests on:
 
 ---
 
-## 6.1 · MMTk binding + scannable object model (NoGC) ⬜
+## 6.1 · MMTk binding + scannable object model (NoGC) 🔨
 
 One-line intent: stand up the binding and a scannable object model with **zero collection** —
 prove allocation routes through MMTk and every heap shape is walkable before any GC runs.
@@ -427,7 +433,7 @@ MMTk calls back for `scan_object`.
     (`regex`/`sysinfo` are heavy MMTk deps; + `opt-level=z`/`panic=abort`/LTO/strip).
   - The probe symbol, `--gc-probe`, and the `NOMU_GC_ARCHIVE` override are throwaway — retired when
     6.1.1 swaps in the real MMTk archive.
-- **6.1.1 🔨 in progress** — grow `src/gcbinding` (6.1.0) into the **thin** Rust `VMBinding` crate (Q2 —
+- **6.1.1 ✅ built + green (2026-08-04)** — grow `src/gcbinding` (6.1.0) into the **thin** Rust `VMBinding` crate (Q2 —
   forwards to the C runtime, holds ~no state); MMTk NoGC linked; `rt_alloc` → mutator alloc; **one
   `Mutator` per carrier** bound at carrier init (Q1), every alloc reading the current carrier's
   cursor/limit fresh — the codegen fast-path load must not be cached across a safepoint (6.0.5).
@@ -462,30 +468,75 @@ MMTk calls back for `scan_object`.
     `nomu_gc_alloc`; MMTk returns raw memory, so `rt_alloc` `memset`s it to keep the old `calloc`
     zero-init contract (the vestigial `refcount` write stays until 6.1.2). **All 29 corpus programs
     compile + run correctly through MMTk NoGC** (`stdin`/`speed`/`gc_smoke` excluded); frontend tests
-    green. Two follow-ups: (a) a Nomu program now genuinely links MMTk's reachable subset — `hello`
-    **56 KB → 15.6 MB** (debug); the real GC'd floor, to be cut with `opt-level=z`/LTO/strip/
-    `panic=abort` + slimming `regex`/`sysinfo`. (b) MMTk prints an INFO init line to **stderr** each
-    run (stdout oracle unaffected) — suppress its logger for user programs.
-  - **Left in 6.1.1:** retire the 6.1.0/probe scaffolding (`nomu_gc_probe`, `--gc-probe`,
-    `--gc-alloc-probe`, `nomu_gc_alloc_probe`) once no longer needed for bring-up checks.
-- **6.1.2 ⬜** — GC **header** design (mark/log bits in side metadata; in-object **type-id**);
-  drop the vestigial `refcount` field. Co-design the log bit so a `write_barrier` interior-GEP
-  from `obj` reaches it in one step (6.0.10). Register finalizable objects in a **side table**,
-  not a header bit (leaves finalizer headroom, Q5 coexistence).
-- **6.1.3 ⬜** — codegen-emitted **per-type pointer maps** (static tables keyed by type-id),
-  `scan_object` dispatches through the map. Shapes:
-  - `class`/`actor` — scalar `p1` fields per the map (actor's trailing `mu` is `addr0`, skipped);
-  - `Closure` — heap-boxed `{ fn (addr0, skip), caps… }`: scan captures (6.0.10);
-  - `any` box — `{ witness, payload }`: **scan `payload` only, skip `witness`** (Q7 — witness
-    tables are static / non-scanned);
-  - `String` — the value is `{ data: p1, len: i64 }`; `data` points at a **GC pointer-free byte
-    array** (Q6, a leaf object scanning no fields); large buffers → large-object space, literals
-    → immortal space;
-  - generic instance — boxed field per its monomorphized map.
-- **6.1.4 ⬜** — replace the `rt_str_concat` header pointer-arithmetic hack with the GC
-  byte-array alloc/access API (Q6); re-audit `rt_str_lit`/`rt_str_concat` **off `gc-leaf`**
-  (they now allocate GC objects → non-leaf/statepoints, 6.0.5); normalize interior-pointer /
-  alignment to MMTk `ObjectReference`.
+    green. Two follow-ups: (a) **binary size — addressed.** A Nomu program now genuinely links MMTk's
+    reachable subset; `hello` was **15.6 MB**, cut to **2.78 MB** by `-Wl,-dead_strip -x` on the
+    emitted-program link (drops MMTk plan/scheduler code unreachable on the NoGC alloc path) + Rust
+    `-Copt-level=z` for the whole graph (persisted in `.bazelrc`, Rust-only so LLVM/Swift stay cached).
+    Tradeoff noted: `z` trades speed for size — revisit the collector hot-path opt-level at 6.3
+    (throughput). Further levers if needed: LTO, `panic=abort` (needs build-std), slim `regex`/
+    `sysinfo`. (b) **stderr log noise — fixed.** MMTk's default `builtin_env_logger` feature
+    auto-inits `env_logger` at INFO and printed a line per run; disabled via `default_features = False`
+    on the `crate.spec` (MODULE.bazel). Bonus: dropped `env_logger`+its `regex` → `hello` 2.78 → 2.73 MB.
+    (Lost the other default `log/release_max_level_off` — unusable from a downstream spec; revisit at
+    6.3.) Corpus + frontend green.
+  - **Scaffolding retired.** `nomu_gc_probe`/`nomu_gc_alloc_probe`/`dummy_tls` + the `--gc-probe`/
+    `--gc-alloc-probe` flags removed; `nomu_gc` stays a `nomuc` dep only to give `-sectcreate` the
+    archive path (no symbols linked). The kept mechanism: `nomu_gc_init`/`bind_mutator`/`alloc`, the
+    section embed + `gcembed` reader, `-dead_strip`, `.bazelrc` `opt-level=z`, and `NOMU_GC_ARCHIVE`
+    as a dev override.
+- **6.1.2 ✅ built + green (2026-08-04)** — GC **header** design. The in-object header is one 8-byte
+  word, `ObjectHeader { uint32_t type_id; uint32_t reserved; }` (runtime.h) — `type_id` (codegen-
+  assigned) keys the 6.1.3 pointer map; the word is 8 bytes only for field alignment, so 32 bits are
+  reserved for future in-object GC metadata (`scan_object` reads the low 32). The 8-byte slot is
+  unchanged so class/actor field offsets (index +1) and the String-buffer prefix are undisturbed.
+  (Footprint lever for 6.3: move the type-id to MMTk side metadata and drop the header entirely — 8
+  bytes/object — trading a header load for a side-metadata lookup.) **`refcount` dropped** (was written `=1` at `rt_alloc`, never
+  read — no retain/release path existed); `rt_alloc`'s `memset` zeroes the slot, and codegen populates
+  the real id at **6.1.3** (nothing reads it under NoGC). **Mark/log/forwarding bits are MMTk side
+  metadata** (the object model's `*_SPEC` are `side_first`/`side_after`), not in-object — so the log
+  bit the 6.3.1 write barrier tests lives in side metadata, reached without an in-object GEP.
+  Finalizable objects will register in a **side table** (Q5), not a header bit — nothing to build under
+  NoGC. Corpus + frontend green; output unchanged.
+- **6.1.3 ✅ built + green (2026-08-04)** — codegen-emitted **per-type pointer maps** (static tables keyed by type-id),
+  `scan_object` dispatches through the map. Covers every currently-managed heap shape (class/actor/
+  closure/any); `String` waits on Q6. Map-walk self-check (`NOMU_GC_TYPEMAPS`) passes.
+  - **Part A done (2026-08-04) — codegen foundation (class/actor).** Each class/actor heap type gets a
+    type-id (`Lowering.swift`), written into the object header at its alloc site (6.1.2 slot); the
+    per-type map = byte offsets of managed (`p1`) fields, computed by walking the layout (recurses into
+    inline value structs; skips String buffers (Q6) and enum payloads (none exist, D6)). Emitted as
+    flat tables `nomu_gc_typemap_data` (per-id `[count, off…]`), `_index[id]`, `_count` — confirmed
+    present in emitted objects; `-dead_strip` removes them from final binaries until part B references
+    them. Corpus 29/29 green (type-ids inert under NoGC — nothing reads them yet).
+  - **Part B done (2026-08-04) — accessor + self-check + `scan_object`.** `runtime.c` exposes
+    `nomu_gc_typemap(id, *count)` over the codegen tables; a `NOMU_GC_TYPEMAPS` self-check dumps every
+    type's map. Verified correct: a `{ Node{v:Int}, Pair{a:Node, b:Int} }` program yields `type 0: []`,
+    `type 1: [8]` (managed ref at byte 8, header slot 0 and `Int` skipped), and an actor yields no
+    `mu`. The binding's `scan_object` now reads the header type-id and reports each managed slot via
+    the accessor (compiles; inert under NoGC, exercised at 6.2). Corpus 29/29 + frontend green.
+  - **Part C done (2026-08-04) — headers on closures + any-boxes.** Both gained an `i64` header slot
+    at offset 0 (shifting `fn`/captures and `witness`/`payload` by one), so every managed heap object
+    now carries a type-id `scan_object` can read. **Closure** `{ header, fn, caps… }` gets a per-shape
+    map (managed captures scanned, `fn` skipped) — verified: a closure capturing a class ref yields
+    `[16]` (byte 16 = slot 2). **any-box** `{ header, witness, payload }` shares one map `[16]` (scan
+    `payload`, skip the static `witness`, Q7) — verified on `upcast`/`composition`. Corpus 29/29 +
+    frontend green; outputs unchanged. Shapes covered: `class`/`actor` (part A), `Closure`, `any`;
+    **generic instances** are monomorphized to concrete classes/structs, so the class path covers them.
+  - **Deferred to Q6/6.1.4 — `String`.** Its buffer is `addrspace(0)` (runtime-owned), never scanned
+    by MMTk, so it needs no type-id until Q6 makes `String` a GC byte-array (`data` → `p1`, buffer →
+    large-object/immortal space). No header needed under the current representation.
+- **6.1.4 🔨 partly done — String-as-GC-object blocked on heap-boxing (6.2).**
+  - **Done — `gc-leaf` re-audit.** `rt_str_concat` allocates, so it can trigger GC → moved **off
+    `gc-leaf`** (its call sites are now statepoints that record the caller's roots). `rt_str_lit` still
+    only wraps a static pointer (no alloc), so it stays leaf. Corpus + frontend green.
+  - **Finding — the naive Q6 fails; String must be heap-boxed.** Making `String.data` a managed `p1`
+    (so buffers are traced) was tried and **rejected by `RewriteStatepointsForGC`: "support for FCA
+    unimplemented"** — the `{ p1, i64 }` String value, live across the now-statepoint `rt_str_concat`,
+    is a first-class aggregate carrying a GC pointer, the exact limit that heap-boxed closures/any
+    (§6.0.10). So the D6 note's "String stays register-resident, no spill" is **wrong**: full Q6
+    needs `String` **heap-boxed** — a single `p1` to a `{ header, len, bytes… }` object — a
+    representational change (String becomes a reference in the value model). Deferred to **6.2**: under
+    NoGC nothing collects, so the current runtime-owned `addr0` buffer is correct until tracing turns
+    on; the immortal-space (literals) and large-object-space (big strings) routing also belong there.
 
 **Exit:** the full M5 suite compiles and runs under MMTk NoGC (allocates, never collects);
 every heap shape has a pointer map `scan_object` walks without error (a map-walk self-check

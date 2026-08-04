@@ -16,13 +16,9 @@ use mmtk::util::{Address, ObjectReference};
 use mmtk::vm::*;
 use mmtk::{memory_manager, AllocationSemantics, MMTKBuilder, Mutator, MMTK};
 
-// ---- 6.1.0 bring-up probe (throwaway; still force-resolved by the section-embed link) ----
-
-/// Fixed sentinel (`"NOMU_GC\0"`) proving the archive linked + executes. Retired with the rest of
-/// the 6.1.0 scaffolding once emitted programs call the real allocation seam.
-#[unsafe(no_mangle)]
-pub extern "C" fn nomu_gc_probe() -> u64 {
-    0x4E4F_4D55_5F47_4300
+// The runtime's pointer-map accessor (runtime.c, 6.1.3): managed-field byte offsets for a type-id.
+unsafe extern "C" {
+    fn nomu_gc_typemap(type_id: u64, out_count: *mut i32) -> *const i32;
 }
 
 // ---- VMBinding ----
@@ -176,12 +172,23 @@ impl Scanning<NomuVM> for VMScanning {
     fn scan_vm_specific_roots(_tls: VMWorkerThread, _factory: impl RootsWorkFactory<NomuVMSlot>) {
         unimplemented!()
     }
+    // 6.1.3: dispatch through the codegen-emitted pointer map. Read the type-id from the object
+    // header (slot 0), fetch its managed-field byte offsets, and report each as a slot. Inert under
+    // NoGC (never called); exercised at 6.2 when tracing turns on.
     fn scan_object<SV: SlotVisitor<NomuVMSlot>>(
         _tls: VMWorkerThread,
-        _object: ObjectReference,
-        _slot_visitor: &mut SV,
+        object: ObjectReference,
+        slot_visitor: &mut SV,
     ) {
-        unimplemented!()
+        let base = object.to_raw_address();
+        // The type-id is the low 32 bits of the header word (`reserved` is the high half, 6.1.2).
+        let type_id = unsafe { base.load::<u32>() } as u64;
+        let mut count: i32 = 0;
+        let offs = unsafe { nomu_gc_typemap(type_id, &mut count) };
+        for i in 0..count as isize {
+            let off = unsafe { *offs.offset(i) } as usize;
+            slot_visitor.visit_slot(mmtk::vm::slot::SimpleSlot::from_address(base + off));
+        }
     }
     fn notify_initial_thread_scan_complete(_partial_scan: bool, _tls: VMWorkerThread) {
         unimplemented!()
@@ -214,12 +221,6 @@ pub extern "C" fn nomu_gc_init(heap_bytes: usize) {
     let _ = SINGLETON.set(mmtk);
 }
 
-// A placeholder mutator TLS for bring-up (single-thread probe). Real per-carrier `VMMutatorThread`
-// wiring lands with the runtime side of 6.1.1 (Q1).
-fn dummy_tls() -> VMMutatorThread {
-    VMMutatorThread(VMThread(OpaquePointer::from_address(Address::ZERO)))
-}
-
 /// Bind one MMTk mutator for a carrier thread (Q1: one `Mutator` per carrier). `tls` is an opaque
 /// per-thread token (the runtime passes `pthread_self`); under NoGC its content is unused. Returns
 /// the boxed mutator as an opaque handle the runtime stores thread-locally and passes to `nomu_gc_alloc`.
@@ -238,15 +239,4 @@ pub extern "C" fn nomu_gc_alloc(mutator: *mut Mutator<NomuVM>, size: usize, alig
     let addr =
         memory_manager::alloc::<NomuVM>(unsafe { &mut *mutator }, size, align, 0, AllocationSemantics::Default);
     addr.to_mut_ptr()
-}
-
-/// 6.1.1 bring-up probe: init NoGC, bind a mutator, allocate `size` bytes through MMTk, and return
-/// the allocation address (0 on failure). Proves MMTk initializes and allocates under `NomuVM`
-/// before the runtime is wired to per-carrier mutators. Throwaway.
-#[unsafe(no_mangle)]
-pub extern "C" fn nomu_gc_alloc_probe(size: usize) -> u64 {
-    nomu_gc_init(1 << 24); // 16 MiB fixed heap
-    let mutator = Box::leak(memory_manager::bind_mutator(mmtk(), dummy_tls()));
-    let addr = memory_manager::alloc::<NomuVM>(mutator, size, 8, 0, AllocationSemantics::Default);
-    addr.as_usize() as u64
 }

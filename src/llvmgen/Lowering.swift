@@ -73,6 +73,13 @@ final class IRToLLVM {
     private var actorTypes: [String: LLVMTypeRef] = [:]
     private var funcMap: [String: IRFunc] = [:]
     private var closureSeq = 0
+    // M6 · 6.1.3 — GC pointer maps. Each heap type gets a type-id (written into the object header,
+    // 6.1.2) that keys `typeMaps[id]` = the byte offsets of its managed (`p1`) fields, which
+    // `scan_object` walks. Class/actor here; closures/any-boxes/String follow (they need a header
+    // slot added first). Emitted as flat tables at module finalization.
+    private var typeIds: [String: UInt64] = [:]
+    private var typeMaps: [[Int32]] = []
+    private var anyBoxMapId: UInt64?   // one shared map for every `any I` box (payload at byte 16)
 
     // 8.2.5 witness machinery. `interfaceDefs` gives a requirement surface to lay out a witness
     // struct; `opaqueUnderlyings` resolves `some I` to its hidden concrete type. Witness types and
@@ -163,13 +170,15 @@ final class IRToLLVM {
         strTy = fields.withUnsafeMutableBufferPointer {
             LLVMStructTypeInContext(ctx, $0.baseAddress, 2, /*packed=*/0)
         }
-        var clo: [LLVMTypeRef?] = [i8ptr]   // fn is a code pointer (addr0); captures follow, per closure
+        // { i64 header (6.1.3 type-id), i8ptr fn }; captures follow, per closure. fn is addr0.
+        var clo: [LLVMTypeRef?] = [i64, i8ptr]
         closureHdrTy = clo.withUnsafeMutableBufferPointer {
-            LLVMStructTypeInContext(ctx, $0.baseAddress, 1, 0)
-        }
-        var box: [LLVMTypeRef?] = [i8ptr, p1]   // witness is a static table (addr0); payload is managed (addr1)
-        anyBoxTy = box.withUnsafeMutableBufferPointer {
             LLVMStructTypeInContext(ctx, $0.baseAddress, 2, 0)
+        }
+        // { i64 header (6.1.3 type-id), i8ptr witness (static, addr0), p1 payload (managed) }
+        var box: [LLVMTypeRef?] = [i64, i8ptr, p1]
+        anyBoxTy = box.withUnsafeMutableBufferPointer {
+            LLVMStructTypeInContext(ctx, $0.baseAddress, 3, 0)
         }
         var sh: [LLVMTypeRef?] = [i8ptr]
         spawnHandleTy = sh.withUnsafeMutableBufferPointer {
@@ -197,6 +206,7 @@ final class IRToLLVM {
         while error == nil, !pending.isEmpty {
             defineBody(pending.removeFirst())
         }
+        emitTypeMaps()                          // M6 · 6.1.3 — all heap types now assigned type-ids
         if let dib = di {                       // resolve line tables/types before verify + emit
             LLVMDIBuilderFinalize(dib)
             LLVMDisposeDIBuilder(dib)
@@ -435,9 +445,9 @@ final class IRToLLVM {
         }
     }
 
-    // A class object is `{ i64 header /*ObjectHeader.refcount*/, fields… }`, heap-allocated. The
-    // header slot mirrors the runtime's `ObjectHeader`; under bump-and-leak it is unused (the M6
-    // GC will). Field index i is therefore at aggregate index i+1.
+    // A class object is `{ i64 header /*ObjectHeader.type_id, 6.1.2*/, fields… }`, heap-allocated. The
+    // header slot mirrors the runtime's `ObjectHeader`; codegen fills the type-id at 6.1.3 (zero until
+    // then). Field index i is therefore at aggregate index i+1.
     private func classType(_ name: String) -> LLVMTypeRef? {
         if let t = classTypes[name] { return t }
         guard let c = classMap[name] else { return nil }
@@ -987,6 +997,7 @@ final class IRToLLVM {
             // header. The class value is the returned pointer (reference semantics).
             let slots = 1 + c.fields.reduce(0) { $0 + slotCount($1.type) }
             let obj = rtAllocManaged(LLVMConstInt(i64, UInt64(slots * 8), 0))
+            writeTypeIdHeader(obj, typeName)   // M6 · 6.1.3 — stamp the type-id into the header
             for (idx, field) in c.fields.enumerated() {
                 guard let v = constructField(field, args, typeName, span) else { return nil }
                 storeField(obj, structGEP(ct, obj, fieldLLVMIndex(.classRef, idx)), v)
@@ -998,6 +1009,7 @@ final class IRToLLVM {
             // matching constructor argument), then install a fresh runtime mutex in the last slot.
             let slots = 2 + a.fields.reduce(0) { $0 + slotCount($1.type) }   // header + fields + mu
             let obj = rtAllocManaged(LLVMConstInt(i64, UInt64(slots * 8), 0))
+            writeTypeIdHeader(obj, typeName)   // M6 · 6.1.3 — stamp the type-id into the header
             for (idx, field) in a.fields.enumerated() {
                 let v: LLVMValueRef?
                 if let initE = field.initializer { v = lowerExpr(initE) }
@@ -1446,17 +1458,18 @@ final class IRToLLVM {
     // with a GC pointer nested inside (which the pass cannot relocate). The witness is a static
     // table (addrspace 0); the payload is the managed object / heap value-copy pointer (addrspace 1).
     private func makeAnyBox(_ witness: LLVMValueRef, _ payload: LLVMValueRef) -> LLVMValueRef {
-        let box = rtAllocManaged(LLVMConstInt(i64, 16, 0))
-        storeField(box, structGEP(anyBoxTy, box, 0), witness)   // witness (addrspace 0) → plain store
-        storeField(box, structGEP(anyBoxTy, box, 1), payload)   // payload (managed) → write barrier
+        let box = rtAllocManaged(LLVMConstInt(i64, 24, 0))   // header + witness + payload
+        LLVMBuildStore(b, LLVMConstInt(i64, anyBoxTypeId(), 0), structGEP(anyBoxTy, box, 0)) // header
+        storeField(box, structGEP(anyBoxTy, box, 1), witness)   // witness (addrspace 0) → plain store
+        storeField(box, structGEP(anyBoxTy, box, 2), payload)   // payload (managed) → write barrier
         return box
     }
 
     private func anyBoxWitness(_ box: LLVMValueRef) -> LLVMValueRef {
-        LLVMBuildLoad2(b, i8ptr, structGEP(anyBoxTy, box, 0), "wt")!
+        LLVMBuildLoad2(b, i8ptr, structGEP(anyBoxTy, box, 1), "wt")!
     }
     private func anyBoxPayload(_ box: LLVMValueRef) -> LLVMValueRef {
-        LLVMBuildLoad2(b, p1, structGEP(anyBoxTy, box, 1), "pl")!
+        LLVMBuildLoad2(b, p1, structGEP(anyBoxTy, box, 2), "pl")!
     }
 
     // Reposition the builder to a freshly built thunk, saving the enclosing lowering state; the
@@ -1551,7 +1564,7 @@ final class IRToLLVM {
         var used: [String] = []
         collectUses(body, bound: &bound, used: &used)
         let caps = resolveCaptures(used)
-        let objTy = structTy([i8ptr] + caps.map { $0.local.ty })   // { fn, cap0, cap1, … }
+        let objTy = structTy([i64, i8ptr] + caps.map { $0.local.ty })   // { header, fn, cap0, cap1, … }
 
         guard let retTy = llvmType(ret, span) else { return nil }
         var paramTys: [LLVMTypeRef] = [p1]   // the closure object itself (managed), captures read via GEP
@@ -1568,7 +1581,7 @@ final class IRToLLVM {
         // spawn/actor state — the body's `return` must not join the enclosing function's spawns
         // (that would reference its allocas from another function).
         let saved = enterThunk(fn, line: span.begin.line)
-        loadCapturesIntoScope(caps, objTy, LLVMGetParam(fn, 0)!, baseIndex: 1)
+        loadCapturesIntoScope(caps, objTy, LLVMGetParam(fn, 0)!, baseIndex: 2)
         for (i, p) in params.enumerated() {
             guard let t = llvmType(p.type, p.span) else { break }
             let slot = LLVMBuildAlloca(b, t, p.name)!
@@ -1585,12 +1598,13 @@ final class IRToLLVM {
 
         // Site: allocate the fused object, store the fn pointer then each capture by value, and
         // yield the managed pointer as the closure value.
-        let slots = 1 + caps.reduce(0) { $0 + abiSlots($1.local.ty) }
+        let slots = 2 + caps.reduce(0) { $0 + abiSlots($1.local.ty) }   // header + fn + captures
         let obj = rtAllocManaged(LLVMConstInt(i64, UInt64(slots * 8), 0))
-        LLVMBuildStore(b, fn, structGEP(objTy, obj, 0))
+        LLVMBuildStore(b, LLVMConstInt(i64, closureTypeId(caps), 0), structGEP(objTy, obj, 0)) // header
+        LLVMBuildStore(b, fn, structGEP(objTy, obj, 1))                                          // fn
         for (i, cap) in caps.enumerated() {
             let v = LLVMBuildLoad2(b, cap.local.ty, cap.local.addr, cap.name)
-            storeField(obj, structGEP(objTy, obj, i + 1), v)
+            storeField(obj, structGEP(objTy, obj, i + 2), v)
         }
         return obj
     }
@@ -1688,7 +1702,7 @@ final class IRToLLVM {
             return nil
         }
         guard let cval = lowerExpr(callee) else { return nil }   // the closure object pointer (managed)
-        let fnPtr = LLVMBuildLoad2(b, i8ptr, structGEP(closureHdrTy, cval, 0), "clo.fn")!
+        let fnPtr = LLVMBuildLoad2(b, i8ptr, structGEP(closureHdrTy, cval, 1), "clo.fn")!
         guard let retTy = llvmType(rty, span) else { return nil }
         var paramTys: [LLVMTypeRef] = [p1]   // the closure object itself, passed as the impl's first arg
         for t in ptys {
@@ -1880,10 +1894,13 @@ final class IRToLLVM {
     // never run across them. Marking their declarations `"gc-leaf-function"` tells the rewrite pass
     // to leave their calls as plain calls instead of statepoints — no root spill/reload around them
     // (m6-spec.md §6.0.8, perf lever). Conservative: when unsure, a call stays non-leaf, since
-    // mislabeling a GC-triggering call as leaf is the unsound direction. `rt_str_*` are leaf only
-    // while `String` is runtime-owned (D1); M6 revisits if `String` becomes a GC object.
+    // mislabeling a GC-triggering call as leaf is the unsound direction. 6.1.4: `rt_str_concat`
+    // allocates (→ can trigger GC), so it is non-leaf (a statepoint recording the caller's roots);
+    // `rt_str_lit` still only wraps a static pointer (no alloc), so it stays leaf. `String` staying a
+    // runtime-owned value (buffer `addr0`) is why its value never becomes a GC root here — the full
+    // GC-object form (Q6) needs `String` heap-boxed (the FCA limit), deferred with 6.2.
     private static let gcLeafRuntimeFns: Set<String> = [
-        "printf", "rt_str_lit", "rt_str_concat", "rt_mutex_new", "rt_mutex_unlock",
+        "printf", "rt_str_lit", "rt_mutex_new", "rt_mutex_unlock",
     ]
 
     private func markGCLeaf(_ fn: LLVMValueRef) {
@@ -2085,6 +2102,106 @@ final class IRToLLVM {
     private func rtAllocManaged(_ bytes: LLVMValueRef) -> LLVMValueRef {
         let g = nomuGcAlloc()
         return buildCall(g.0, g.1, [bytes])!
+    }
+
+    // ---- M6 · 6.1.3 — GC pointer maps ----
+
+    // Register a pointer map (managed-field byte offsets) and return its type-id.
+    private func registerMap(_ offsets: [Int32]) -> UInt64 {
+        let id = UInt64(typeMaps.count)
+        typeMaps.append(offsets)
+        return id
+    }
+
+    // Type-id for a class/actor heap type; assigns one (and computes its pointer map) on first use.
+    private func typeId(forHeapType name: String) -> UInt64 {
+        if let id = typeIds[name] { return id }
+        let fieldTypes: [Type] = classMap[name].map { $0.fields.map(\.type) }
+            ?? actorMap[name].map { $0.fields.map(\.type) } ?? []
+        var offsets: [Int32] = []
+        var slot = 1   // header occupies slot 0; fields (and the actor's trailing mu) follow
+        for ft in fieldTypes {
+            collectManagedOffsets(ft, baseSlot: slot, into: &offsets)
+            slot += slotCount(ft)
+        }
+        let id = registerMap(offsets)
+        typeIds[name] = id
+        return id
+    }
+
+    // Type-id for a fused closure object `{ header, fn, caps… }`: managed captures (scalar `p1`) are
+    // scanned, `fn` (addr0) is skipped. Each closure site is its own shape (captures vary), so a
+    // fresh map is registered per closure.
+    private func closureTypeId(_ caps: [Capture]) -> UInt64 {
+        var offsets: [Int32] = []
+        var slot = 2   // header(0) + fn(1); captures follow
+        for cap in caps {
+            if cap.local.ty == p1 { offsets.append(Int32(slot * 8)) }
+            slot += abiSlots(cap.local.ty)
+        }
+        return registerMap(offsets)
+    }
+
+    // Shared type-id for every `any I` box `{ header, witness, payload }`: scan `payload` only
+    // (byte 16, slot 2); the witness is a static table (Q7). Registered once.
+    private func anyBoxTypeId() -> UInt64 {
+        if let id = anyBoxMapId { return id }
+        let id = registerMap([16])
+        anyBoxMapId = id
+        return id
+    }
+
+    // Append the byte offsets of managed (`p1`) pointers within a field of type `t` laid out starting
+    // at `baseSlot`. Recurses into inline value structs; String's buffer is runtime-owned (`addr0`)
+    // today so it is skipped (Q6), and enum payloads carry no references in the language today (D6).
+    private func collectManagedOffsets(_ t: Type, baseSlot: Int, into offsets: inout [Int32]) {
+        switch t {
+        case .named(_, .class_), .named(_, .actor_), .function, .existential, .composition:
+            offsets.append(Int32(baseSlot * 8))
+        case .named(let n, .struct_):
+            var s = baseSlot
+            for sf in (structMap[n]?.fields ?? []) {
+                collectManagedOffsets(sf.type, baseSlot: s, into: &offsets)
+                s += slotCount(sf.type)
+            }
+        case .opaque:
+            collectManagedOffsets(concreteUnderlying(t), baseSlot: baseSlot, into: &offsets)
+        default:
+            break   // int, bool, string (buffer addr0 until Q6 heap-boxes String), enum payload
+        }
+    }
+
+    // Write the type-id into the object's header (slot 0 at the object base).
+    private func writeTypeIdHeader(_ obj: LLVMValueRef, _ name: String) {
+        LLVMBuildStore(b, LLVMConstInt(i64, typeId(forHeapType: name), 0), obj)
+    }
+
+    // Emit the flat pointer-map tables the runtime/binding reads (always emitted so runtime.c's
+    // externs resolve, even with no heap types): `_data` = per-id `[count, off…]` concatenated,
+    // `_index[id]` = that id's start in `_data`, `_count` = number of type-ids.
+    private func emitTypeMaps() {
+        var data: [Int32] = []
+        var index: [Int32] = []
+        for map in typeMaps {
+            index.append(Int32(data.count))
+            data.append(Int32(map.count))
+            data.append(contentsOf: map)
+        }
+        emitI32Array("nomu_gc_typemap_data", data.isEmpty ? [0] : data)
+        emitI32Array("nomu_gc_typemap_index", index.isEmpty ? [0] : index)
+        let g = LLVMAddGlobal(mod, i64, "nomu_gc_typemap_count")!
+        LLVMSetInitializer(g, LLVMConstInt(i64, UInt64(typeMaps.count), 0))
+        LLVMSetGlobalConstant(g, 1)
+    }
+
+    private func emitI32Array(_ name: String, _ vals: [Int32]) {
+        var consts: [LLVMValueRef?] = vals.map { LLVMConstInt(i32, UInt64(bitPattern: Int64($0)), 0) }
+        let g = LLVMAddGlobal(mod, LLVMArrayType2(i32, UInt64(vals.count)), name)!
+        let initv = consts.withUnsafeMutableBufferPointer {
+            LLVMConstArray2(i32, $0.baseAddress, UInt64(vals.count))
+        }
+        LLVMSetInitializer(g, initv)
+        LLVMSetGlobalConstant(g, 1)
     }
 
     // The C-ABI boundary cast (D1): a managed reference handed to a C function that takes a `void*`

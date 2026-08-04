@@ -33,15 +33,42 @@ static _Thread_local void* rt_mutator = NULL;
 
 // ---- Allocation seam ----
 // Routed through MMTk (NoGC): bump-allocate on the carrier's mutator. MMTk returns raw memory, so we
-// zero it to preserve the previous `calloc` contract (Nomu relies on zero-initialized fields). The
-// vestigial `refcount` header write stays until 6.1.2 drops the field.
+// zero it to preserve the previous `calloc` contract (Nomu relies on zero-initialized fields) — this
+// also zeroes the `ObjectHeader.type_id` (6.1.2), which codegen fills in at 6.1.3.
 void* rt_alloc(size_t size) {
     if (!rt_mutator) rt_mutator = nomu_gc_bind_mutator((void*)pthread_self());
     void* p = nomu_gc_alloc(rt_mutator, size, 8);
     if (!p) { fputs("out of memory\n", stderr); exit(1); }
     memset(p, 0, size);
-    ((ObjectHeader*)p)->refcount = 1;
     return p;
+}
+
+// ---- GC pointer maps (M6 · 6.1.3) ----
+// Codegen emits these per program: `_data` = each type-id's `[count, off…]` concatenated,
+// `_index[id]` = that id's start in `_data`, `_count` = number of type-ids (see Lowering.swift).
+extern const int32_t nomu_gc_typemap_data[];
+extern const int32_t nomu_gc_typemap_index[];
+extern const int64_t nomu_gc_typemap_count;
+
+// Managed-field byte offsets for a type-id (NULL if out of range); *out_count receives the count.
+// The binding's `scan_object` and the self-check below both walk objects through this.
+const int32_t* nomu_gc_typemap(uint64_t type_id, int32_t* out_count) {
+    if (type_id >= (uint64_t)nomu_gc_typemap_count) { *out_count = 0; return NULL; }
+    const int32_t* entry = &nomu_gc_typemap_data[nomu_gc_typemap_index[type_id]];
+    *out_count = entry[0];
+    return entry + 1;
+}
+
+// Map-walk self-check (6.1 exit): dump every type's pointer map. Gated by NOMU_GC_TYPEMAPS so it is
+// off for normal runs; a test compiles a program with known types and diffs this against expectation.
+static void nomu_gc_dump_typemaps(void) {
+    fprintf(stderr, "typemaps: %lld\n", (long long)nomu_gc_typemap_count);
+    for (int64_t id = 0; id < nomu_gc_typemap_count; id++) {
+        int32_t n; const int32_t* offs = nomu_gc_typemap((uint64_t)id, &n);
+        fprintf(stderr, "  type %lld: %d managed [", (long long)id, n);
+        for (int32_t i = 0; i < n; i++) fprintf(stderr, "%s%d", i ? " " : "", offs[i]);
+        fprintf(stderr, "]\n");
+    }
 }
 
 void rt_free(void* p) { free(p); }
@@ -395,6 +422,7 @@ extern void nomu_main(void);
 static void* __rt_main_entry(void* _) { nomu_main(); return NULL; }
 int main(void) {
     nomu_gc_init(1ULL << 30); // M6 · 6.1.1 — init MMTk (NoGC, 1 GiB reserved) before any allocation
+    if (getenv("NOMU_GC_TYPEMAPS")) nomu_gc_dump_typemaps();  // 6.1.3 map-walk self-check
     #ifdef __APPLE__
     rt_kq = kqueue();
     pthread_t __poller_t; pthread_create(&__poller_t, NULL, rt_poller_thread, NULL); pthread_detach(__poller_t);

@@ -16,7 +16,15 @@ rust.toolchain(
 # crates.io. The MMTk version is pinned deliberately (`m6-spec.md` §6.0.8: the binding is the
 # blast-radius boundary; MMTk API churn is a watch item).
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
-crate.spec(package = "mmtk", version = "=0.32.0")
+# Drop MMTk's default features — `builtin_env_logger` auto-inits env_logger at INFO and prints an
+# init line to stderr on every program run. (Its other default, `log/release_max_level_off`, can't be
+# re-enabled from here — Cargo disallows a transitive dep's slash-feature in a downstream spec — and
+# only compiles out log calls in release builds; revisit at 6.3 if it matters.)
+crate.spec(
+    package = "mmtk",
+    version = "=0.32.0",
+    default_features = False,
+)
 # MMTk's build script uses the `built` crate to embed build metadata; it `.expect()`s the full set
 # of descriptive CARGO_PKG_* vars, which crate_universe's build-script runner does not populate.
 # Inject them or the build panics one var at a time.

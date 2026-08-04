@@ -12,7 +12,12 @@
 #include <pthread.h>  // generated actor code uses pthread_mutex_t directly
 
 // ---- Shared object model ----
-typedef struct { size_t refcount; } ObjectHeader;
+// The in-object GC header (M6 · 6.1.2): one 8-byte word. `type_id` (codegen-assigned) keys the
+// per-type pointer map `scan_object` dispatches through (6.1.3); `reserved` is spare header space
+// (32 bits is plenty for the type-id — the word is 8 bytes only for field alignment, so the other
+// half is free for future in-object GC metadata / flags). Mark/log/forwarding bits live in MMTk side
+// metadata, not here. Replaces the vestigial `refcount` (was written =1, never read).
+typedef struct { uint32_t type_id; uint32_t reserved; } ObjectHeader;
 
 // A closure value: code pointer + captured environment (heap-allocated, bump-and-leak).
 typedef struct { void* fn; void* env; } Closure;
