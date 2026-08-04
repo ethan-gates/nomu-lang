@@ -1,8 +1,6 @@
-# M8.1 · 8.1.1 — LLVM toolchain bring-up. Smoke target proving @llvm-project links.
-load("@rules_cc//cc:defs.bzl", "cc_binary")
-load("@rules_swift//swift:swift.bzl", "swift_binary", "swift_library")
+# M8 — the LLVM backend: typed IR → LLVM IR (C API) → native object, driven from Swift.
+load("@rules_swift//swift:swift.bzl", "swift_library")
 
-# 8.1.2 — prove Swift drives LLVM's C API (LLVM_C module) against @llvm-project.
 swift_library(
     name = "llvmswift",
     srcs = ["LLVMBridge.swift", "Lowering.swift"],
@@ -15,7 +13,7 @@ swift_library(
         "-Xcc",
         "-std=c++17",
     ],
-    visibility = ["//visibility:public"],  # 8.1.4: the driver's --backend=llvm path deps on this
+    visibility = ["//visibility:public"],  # the driver deps on this for the backend
     deps = [
         "//src/frontend",  # 8.1.5: IRModule / the typed IR that IRToLLVM lowers
         "@llvm-project//llvm:Core",
@@ -31,26 +29,5 @@ swift_library(
         # RewriteStatepointsForGC (Scalar) and mem2reg/sroa (Utils/Scalar). The GC pass
         # pipeline (mem2reg/sroa → rewrite-statepoints-for-gc) is driven from here.
         "@llvm-project//llvm:Passes",
-    ],
-)
-
-swift_binary(
-    name = "llvmswift_smoke",
-    srcs = ["main.swift"],
-    # cxx-interop is viral: importing LLVMBridge re-resolves the LLVM_C Clang module here too.
-    copts = [
-        "-cxx-interoperability-mode=default",
-        "-Xcc",
-        "-std=c++17",
-    ],
-    deps = [":llvmswift"],
-)
-
-cc_binary(
-    name = "llvm_smoke",
-    srcs = ["llvm_smoke.cpp"],
-    deps = [
-        "@llvm-project//llvm:Core",
-        "@llvm-project//llvm:Support",
     ],
 )

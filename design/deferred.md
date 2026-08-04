@@ -70,9 +70,15 @@ a rough estimate to help sequencing, not a commitment.
 - **Clean up the LLVM experiments** `[small · anytime]` — remove the throwaway bring-up scaffolding
   now that 8.x is green: `src/llvmgen/llvm_smoke.cpp`, the `llvmswift_smoke` binary + its
   `main.swift`, and any dead 8.1 smoke targets. Low risk; shrinks the backend surface.
-- **`nomuc` startup latency** `[small · anytime]` — `time nomuc -h` ≈ 500 ms with no work done;
-  profile it (likely libLLVM static init / load). A symptom of the broader "compiler architecture
-  review for perf" below.
+- **`nomuc` startup latency** `[profiled 2026-08-04; fix = opt build]` — `nomuc -h` is ~0.8 s with
+  no compilation, **path-independent** and **99 % CPU** (0.81 s user / 0.01 s sys), i.e. it runs
+  *before* `main`: **LLVM global constructors** (registering `cl::opt` options + target/pass
+  registries across the linked Core/CodeGen/Passes libs). Only the host target (AArch64) is linked —
+  not target bloat. The dominant factor is that both `nomuc` and libLLVM are built **fastbuild
+  (unoptimized)** — 242 MB, 761 k debug entries — so that static-init code runs slow. **Fix:** ship /
+  develop with an optimized build (`bazel build -c opt`, which optimizes LLVM's static-init paths and
+  strips) — expected to cut startup several-fold; measure to confirm. No code change; a build-mode
+  choice. (Not a code fix; folds into "compiler architecture review for perf".)
 - **LLVM `-O` flag forwarding** `[small · partly done]` — the `-O`/`--release` toggle landed in
   8.5.3; remaining is finer control (explicit `-O0/1/2/3`, forwarding to the link step) if wanted.
 
