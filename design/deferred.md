@@ -56,3 +56,45 @@ Status vocabulary matches `readme.md` §"Reading the status tags".
   semantics; design docs = rationale + build plan + internals), then lift the
   programmer-facing content out of `syntax.md`/`concurrency.md`/`types.md`/etc. into a
   spec, leaving the working docs to cross-reference it. Discuss scope first.
+
+---
+
+## Post-M8 backlog (raw)
+
+Carried over from the retired `m8-spec.md` "post m8 ideas" list — things worth doing, not yet
+scheduled. **Raw and terse on purpose**: each is a pointer, not a decided build. Promote an item
+to a full entry above (What / Why / Trigger / How) when it's picked up. The `[size · when]` tag is
+a rough estimate to help sequencing, not a commitment.
+
+**Near-term cleanups (small; good between-milestone tasks, no gate):**
+- **Clean up the LLVM experiments** `[small · anytime]` — remove the throwaway bring-up scaffolding
+  now that 8.x is green: `src/llvmgen/llvm_smoke.cpp`, the `llvmswift_smoke` binary + its
+  `main.swift`, and any dead 8.1 smoke targets. Low risk; shrinks the backend surface.
+- **`nomuc` startup latency** `[small · anytime]` — `time nomuc -h` ≈ 500 ms with no work done;
+  profile it (likely libLLVM static init / load). A symptom of the broader "compiler architecture
+  review for perf" below.
+- **LLVM `-O` flag forwarding** `[small · partly done]` — the `-O`/`--release` toggle landed in
+  8.5.3; remaining is finer control (explicit `-O0/1/2/3`, forwarding to the link step) if wanted.
+
+**Compiler infra / pipeline (medium; opportunistic):**
+- **Dead-code stripping** `[medium]` — strip unreachable functions/symbols from the emitted binary
+  (LLVM `internalize` + `globaldce`, and/or `-dead_strip` at link). `-O` does some; a deliberate
+  pass would shrink binaries.
+- **Compiler perf diagnostics by default** `[medium]` — per-phase timing/allocation instrumentation
+  in `nomuc` (surfaced behind a flag or always-on summary).
+- **Compiler architecture review for perf** `[medium · ongoing]` — a pass over the compiler's own
+  hot paths (startup, monomorphization, lowering); the `nomuc -h` latency is one entry point.
+- **Emission options** `[medium]` — broaden `--emit-*` / `--stop=` (e.g. emit LLVM IR, asm, object
+  choices) beyond today's ast/typedir/binary.
+- **Intermediate-based iso(lated) regression** `[medium]` — regression tests keyed on intermediate
+  artifacts (typed IR / LLVM IR), not just stdout+exit, to localize where a change diverges.
+- **Bazel usage** `[small–medium]` — build-ergonomics cleanup (target layout, incremental build
+  friction).
+
+**Language features (large; later, some gated):**
+- **`comptime`** `[large]` — compile-time evaluation. A whole feature; design not started.
+- **Module-level interface as input** `[medium–large]` — accept a module's interface (signatures)
+  as compilation input; ties into the deferred incremental-compilation / module-boundary work.
+- **Stdlib via language benchmarks** `[large · gated on M6 / GC]` — once real GC lands, drive stdlib
+  priorities from benchmarks: the lowest Nomu primitives (`String`, collections, byte buffers, raw
+  memory) and e.g. swiss-table maps. Explicitly post-GC (collections need the collector).
