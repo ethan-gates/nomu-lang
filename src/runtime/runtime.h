@@ -47,4 +47,16 @@ void* rt_mutex_new(void);
 void  rt_mutex_lock(void* m);
 void  rt_mutex_unlock(void* m);
 
+// ---- GC root scanning (M8.4.3; m8.4-spec.md D4) ----
+// Parse the process's `__llvm_stackmaps` section into a return-address → live-GC-slot index.
+// Idempotent; called lazily by the walk. Inert until M6 turns on collection.
+void nomu_gc_stackmap_init(void);
+// Called once per distinct live GC root found while walking a stack: `slot` is the stack address
+// the pointer lives at, `value` is the pointer. (M6's collector updates `*slot` on relocation.)
+typedef void (*nomu_root_visitor)(void** slot, void* value, void* userdata);
+// Walk the current stack for GC roots, from the caller's frame up, invoking `visit` per root
+// (D4 single-stack walk). Shaped for M6 reuse: it drives a libunwind cursor, so a parked fiber's
+// saved context can be walked the same way (M6 passes the fiber's context instead of the current).
+void nomu_gc_walk_current(nomu_root_visitor visit, void* userdata);
+
 #endif

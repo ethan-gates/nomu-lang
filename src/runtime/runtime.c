@@ -12,8 +12,13 @@
 #include <time.h>
 #include <unistd.h>
 #include <ucontext.h>
+#include <stdint.h>
+#define UNW_LOCAL_ONLY
+#include <libunwind.h>
 #ifdef __APPLE__
 #include <sys/event.h>
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>   // _mh_execute_header (M8.4.3: locate __llvm_stackmaps)
 #endif
 
 // ---- Allocation seam ----
@@ -200,7 +205,12 @@ static void* rt_timer_thread(void* _) {
     return NULL;
 }
 
+static void nomu_gc_smoke(void);   // M8.4.3 — defined below (GC root-walk smoke)
+
 int64_t rt_sleep_ms(int64_t ms) {
+    // M8.4.3 smoke (env-gated, inert otherwise): `sleep` is a safepoint (this call is a statepoint),
+    // so at entry the caller's live GC roots are recorded. Walk them before parking the fiber.
+    if (getenv("NOMU_GC_SMOKE")) nomu_gc_smoke();
     uint64_t expiry = rt_now_ns() + (uint64_t)ms * 1000000ULL;
     pthread_mutex_lock(&rt_timer_mu);
     rt_timer_push(expiry, rt_current);
@@ -251,6 +261,119 @@ String rt_read_line(int fd) {
 // Non-macOS: readLine is not wired yet (epoll path unwritten, runtime.md §... poller).
 String rt_read_line(int fd) { (void)fd; return rt_str_lit("", 0); }
 #endif
+
+// ---- GC root scanning (M8.4.3; m8.4-spec.md D4) ----
+// Parse the `__llvm_stackmaps` section (stackmap v3) into a return-address → live-GC-slot index,
+// then walk a stack (libunwind) mapping each frame's return address to its record and reading the
+// live roots. Inert now — nothing calls this except the smoke path (M6 drives it from the
+// collector). The layout follows llvm/Object/StackMapParser.h.
+typedef struct { int reg; int32_t off; } gc_slot;   // Indirect [dwarf reg + off]; reg 31=SP, 29=FP
+typedef struct { uintptr_t addr; int nslots; gc_slot* slots; } gc_record;   // one statepoint
+static gc_record* gc_records = NULL;
+static int gc_nrecords = 0;
+static int gc_inited = 0;
+
+static uint16_t gc_rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t gc_rd32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint64_t gc_rd64(const uint8_t* p) { return (uint64_t)gc_rd32(p) | ((uint64_t)gc_rd32(p + 4) << 32); }
+
+void nomu_gc_stackmap_init(void) {
+    if (gc_inited) return;
+    gc_inited = 1;
+#ifdef __APPLE__
+    unsigned long size = 0;
+    const uint8_t* sm = getsectiondata(&_mh_execute_header, "__LLVM_STACKMAPS", "__llvm_stackmaps", &size);
+    if (!sm || size < 16 || sm[0] != 3) return;   // no section, or unsupported version
+    uint32_t nfuncs = gc_rd32(sm + 4), nconsts = gc_rd32(sm + 8), nrecs = gc_rd32(sm + 12);
+    const uint8_t* funcs = sm + 16;
+    const uint8_t* recs = funcs + (size_t)nfuncs * 24 + (size_t)nconsts * 8;   // records follow funcs+consts
+    gc_records = (gc_record*)calloc(nrecs ? nrecs : 1, sizeof(gc_record));
+    // Function records own their statepoint records in order (each says how many it has). The
+    // record's absolute address = function address + instruction offset = the call's return address.
+    const uint8_t* r = recs;
+    for (uint32_t fi = 0; fi < nfuncs; fi++) {
+        uint64_t faddr = gc_rd64(funcs + (size_t)fi * 24);
+        uint64_t frecs = gc_rd64(funcs + (size_t)fi * 24 + 16);
+        for (uint64_t k = 0; k < frecs; k++) {
+            uint32_t ioff = gc_rd32(r + 8);
+            uint16_t nloc = gc_rd16(r + 14);
+            const uint8_t* locs = r + 16;
+            gc_record* gr = &gc_records[gc_nrecords++];
+            gr->addr = (uintptr_t)(faddr + ioff);
+            gr->slots = (gc_slot*)calloc(nloc ? nloc : 1, sizeof(gc_slot));
+            gr->nslots = 0;
+            // Skip the 3 leading meta constants (calling conv, flags, #deopt); the rest are the live
+            // GC pointers, recorded as (base, derived) pairs — dedup to distinct slots.
+            for (int li = 3; li < nloc; li++) {
+                const uint8_t* L = locs + (size_t)li * 12;
+                uint8_t kind = L[0];
+                if (kind != 3 /*Indirect*/ && kind != 1 /*Register*/) continue;
+                int reg = gc_rd16(L + 4);
+                int32_t off = (int32_t)gc_rd32(L + 8);
+                int dup = 0;
+                for (int s = 0; s < gr->nslots; s++)
+                    if (gr->slots[s].reg == reg && gr->slots[s].off == off) { dup = 1; break; }
+                if (!dup) { gr->slots[gr->nslots].reg = reg; gr->slots[gr->nslots].off = off; gr->nslots++; }
+            }
+            // Advance to the next record: locations, align 8, then NumLiveOuts (u16) + live-outs.
+            size_t locend = (size_t)((locs + (size_t)nloc * 12) - r);
+            locend = (locend + 7) & ~(size_t)7;
+            uint16_t nlive = gc_rd16(r + locend);
+            size_t recsz = (locend + 2 + (size_t)nlive * 4 + 7) & ~(size_t)7;
+            r += recsz;
+        }
+    }
+#endif
+}
+
+static gc_record* gc_lookup(uintptr_t ip) {
+    for (int i = 0; i < gc_nrecords; i++) if (gc_records[i].addr == ip) return &gc_records[i];
+    return NULL;
+}
+
+void nomu_gc_walk_current(nomu_root_visitor visit, void* userdata) {
+    nomu_gc_stackmap_init();
+    unw_context_t ctx;
+    unw_cursor_t cur;
+    unw_getcontext(&ctx);
+    unw_init_local(&cur, &ctx);
+    // Step past this walker's own frame into its callers; for each frame whose return address has a
+    // stackmap record, read the live roots at (frame register + offset).
+    while (unw_step(&cur) > 0) {
+        unw_word_t ip = 0, sp = 0;
+        unw_get_reg(&cur, UNW_REG_IP, &ip);
+        unw_get_reg(&cur, UNW_REG_SP, &sp);
+        gc_record* rec = gc_lookup((uintptr_t)ip);
+        if (!rec) continue;
+        for (int s = 0; s < rec->nslots; s++) {
+            unw_word_t base = sp;
+            if (rec->slots[s].reg == UNW_ARM64_FP) unw_get_reg(&cur, UNW_ARM64_FP, &base);
+            void** slot = (void**)((char*)base + rec->slots[s].off);
+            visit(slot, *slot, userdata);
+        }
+    }
+}
+
+// GC-root-walk smoke (M8.4.3, env-gated). At a `sleep` safepoint the caller's live class objects
+// are recorded; the walk recovers them. The smoke fixture uses `class { var v: Int }`, whose object
+// layout is `{ i64 header, i64 v }`, so dereferencing a recovered root at offset 8 yields the known
+// field value — proving the root is the actual live object, not garbage. Reports to stderr, so a
+// normal run's stdout (the corpus oracle) is unaffected whether or not the walk fires.
+static void gc_smoke_visitor(void** slot, void* value, void* userdata) {
+    int* count = (int*)userdata;
+    long long v = value ? *(long long*)((char*)value + 8) : -1;
+    fprintf(stderr, "nomu-gc-smoke: root %d ptr=%p v=%lld\n", ++(*count), value, v);
+    (void)slot;
+}
+
+static void nomu_gc_smoke(void) {
+    int count = 0;
+    fprintf(stderr, "nomu-gc-smoke: walk begin\n");
+    nomu_gc_walk_current(gc_smoke_visitor, &count);
+    fprintf(stderr, "nomu-gc-smoke: %d roots\n", count);
+}
 
 // ---- Process entry ----
 extern void nomu_main(void);

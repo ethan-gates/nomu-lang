@@ -1,0 +1,35 @@
+// M8.4.3 — GC root-walk smoke fixture. Tests real *live*-root finding: multi-frame, multi-kind,
+// and — crucially — precision (a dead object on the stack must NOT be reported; only that makes it
+// live-root finding rather than conservative "scan every pointer-shaped slot").
+//
+// At the `sleep` safepoint, live GC roots span two Nomu frames:
+//   - inner's frame: `c` (class object 333), `x` (the class param, 111), `f` (a heap-boxed closure
+//     capturing 444). `dead` (999) is created and last-used BEFORE the sleep, so it is NOT live and
+//     must not appear.
+//   - main's frame:  `b` (class object 222), live across the call to `inner`.
+// Each object's known Int sits at offset 8 (a class is { i64 header, i64 v }; a closure box is
+// { fn, captures… } with the first capture at offset 8), so the walk dereferences offset 8 to prove
+// each root is the real live object. Live set (distinct): { 111, 222, 333, 444 } — 111 is the same
+// object seen in both frames (a in main, x in inner); 999 must be absent. Normal run prints 999,
+// 888, 222. Checked by tools/gc-smoke.sh.
+class Box {
+  var v: Int
+}
+
+fun inner(x: Box) -> Int {
+  let c = Box(v: 333)
+  let dead = Box(v: 999)              // used only below — dead at the sleep safepoint
+  print(dead.v)                       // 999 (dead's last use)
+  let k = 444
+  let f = {() -> Int in return k}     // heap-boxed closure capturing k=444
+  sleep(0)                            // safepoint: c, x, f live; dead NOT live; b live in main
+  return c.v + x.v + f()             // 333 + 111 + 444 = 888
+}
+
+fun main() {
+  let a = Box(v: 111)
+  let b = Box(v: 222)
+  let r = inner(a)                    // a passed in (→ x); b live across this call
+  print(r)                           // 888
+  print(b.v)                         // 222
+}
