@@ -14,4 +14,5 @@ fun fib(n: Int) -> Int {
 
 fun main() {
     let r = fib(n: 35)
+    print(r)              // 9227465 — observed so the benchmark isn't dead-code-eliminated under -O
 }

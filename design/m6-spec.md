@@ -27,7 +27,9 @@ moving-Immix target and the M8-first reorder.
 - **M8 — LLVM backend + statepoints (the hard gate).** A moving collector needs precise roots
   via compiler-emitted stack maps the C backend cannot produce (`compiler.md` §6). M8 lands
   the LLVM path, the lower CFG/SSA IR, and statepoint stack maps; M6 rests on them. Reordered
-  before M6 (decided 2026-07-30, `roadmap.md`).
+  before M6 (decided 2026-07-30, `roadmap.md`). **8.4 (the GC substrate) is done (2026-08-03):**
+  `addrspace(1)` roots, statepoint stack maps, the parser + single-stack root walk, and the three
+  inert alloc/barrier/poll seams all ship — see **6.0.8** for the concrete carry-over M6 builds on.
 - **Held invariants (through M5), no pre-slice needed** — single allocation seam (`rt_alloc`)
   and an explicit scannable object model (`compiler.md` §7). They already exist.
 
@@ -126,6 +128,72 @@ neither. **No new surface syntax.**
 - Barrier elision for deeply-immutable types (can't form new cross-generation pointers by
   mutation) — a perf pass (`memory-model.md` §4).
 - Escape analysis if it slips past M6 (6.5).
+
+### 6.0.8 · M8 / 8.4 carry-over — the substrate M6 builds on
+
+M8 · 8.4 (the GC substrate) is **implemented and green** (2026-08-03). The dedicated 8.4 spec was
+retired once it shipped; this section is its carry-over. The compiler now emits statepoint-based
+safepoints, parseable stack maps, and three
+inline-shaped mutator seams — all **inert** (corpus byte-identical to 8.2). M6 fills the seams,
+turns on collection, and reuses the root walk. Concrete facts M6 rests on:
+
+- **Three inert seams to fill** (all `internal alwaysinline`, in `Lowering.swift`; M6 replaces the
+  body and `alwaysinline` collapses the call sites):
+  - `__nomu_gc_alloc(i64 size) -> ptr addrspace(1)` — at every managed allocation. Inert body
+    tail-calls `rt_alloc`; **not** `gc-leaf` (it stays a statepoint). M6 fills the bump-pointer TLAB
+    fast path (load per-carrier cursor/limit, bump, branch to `rt_alloc` slow path). → **6.1.1 / 6.2**.
+  - `__nomu_write_barrier(ptr addrspace(1) obj, ptr addrspace(1) slot, ptr addrspace(1) val)` —
+    `gc-leaf`, at every managed-reference field write. Inert body is `store val, slot` (obj ignored).
+    M6 fills the barrier fast path: GEP the header from `obj`, test the logged/mark bit, log on first
+    mutation. `obj` is already passed for exactly this. → **6.3.1** (generational) / LXR later.
+  - `__nomu_poll()` — `gc-leaf`, no-op, emitted at the header of loops that reach no other safepoint
+    (loops with a non-leaf call or allocation are elided). M6 fills the poll; **form is still open**
+    (protected-page load vs. branch-on-flag — decide by microbenchmark + `SIGSEGV`/`ucontext`
+    viability). → **6.2.3** STW handshake.
+- **Address-space model.** `addrspace(1)` = a managed (GC-heap) reference; `addrspace(0)` = code /
+  static / C-owned memory. **`rt_alloc` is declared to return `ptr addrspace(1)` directly** — do
+  *not* reintroduce an `addrspacecast (0→1)` at alloc sites: `RewriteStatepointsForGC` rejects a GC
+  base introduced by a differing-addrspace cast. Only `1→0` casts exist, at C-ABI boundaries
+  (`fiber_spawn` env, spawn-box return, struct-mutating thunk `self`). Managed set: class/actor
+  objects, closure boxes, any-boxes, spawn boxes, and their interior GEPs. `String`'s char buffer is
+  still `addrspace(0)` (runtime-owned) — whether it becomes a GC object is an M6 object-model call.
+- **Existentials and closures are heap-boxed reference values** (forced by the pass's "no GC pointer
+  in a by-value first-class aggregate" limit). A closure value is a `p1` pointer to a **fused**
+  heap object `{ ptr fn (addr0), cap0, cap1, … }` (one allocation; captures inline after the fn
+  pointer; the impl takes the object as its first arg and reads captures from fields 1…N). An `any I`
+  value is a `p1` pointer to a heap `{ ptr witness (addr0, static), ptr addrspace(1) payload }`.
+  **6.1.3's pointer maps must cover these exact shapes** (closure: scan captures, skip `fn`; any-box:
+  scan `payload`, skip `witness`), not the old by-value `{fn,env}`/`{witness,payload}` layout.
+- **Object header** is still the vestigial `i64` (`ObjectHeader{refcount}`); class/actor objects are
+  `{ i64 header, fields… }`, actor adds a trailing `i8* mu`. **6.1.2** subdivides the header (mark /
+  log bits + type-id) and drops `refcount`; the write-barrier's logged bit must sit where an
+  `addrspace(1)`-interior GEP from `obj` reaches it in one step (header ↔ barrier co-designed).
+- **Stack-map parser + single-stack root walk already ship in `runtime.c`** (`runtime.h` API):
+  `nomu_gc_stackmap_init` parses `__llvm_stackmaps` (v3) via `getsectiondata(&_mh_execute_header,…)`
+  into a *return-address → distinct-GC-slot* index; `nomu_gc_walk_current(visitor)` drives a
+  **libunwind** cursor (our frames omit the FP but carry compact-unwind info) and reports each live
+  root at `frame-register + offset` (slots are **SP-relative**, DWARF reg 31; reg 29/FP handled).
+  It is **precise** (excludes dead-but-on-stack objects) — verified by `examples/gc_smoke.nomu` +
+  `tools/gc-smoke.sh` (env `NOMU_GC_SMOKE`), which recovers the exact live set across two frames and
+  two managed kinds. **6.2.1/6.2.2:** the walk takes a cursor, so a parked fiber's saved `ucontext`
+  is walked the same way — build a `unw_context_t` from the fiber's registers and pass it.
+- **`gc-leaf` runtime classification** (callers skip the statepoint): leaf = `printf`, `rt_str_lit`,
+  `rt_str_concat`, `rt_mutex_new`, `rt_mutex_unlock`; non-leaf (statepoint) = `rt_alloc`,
+  `fiber_spawn`, `spawn_join`, `rt_sleep_ms`, `rt_read_line`, `rt_mutex_lock`. **Re-audit in M6:**
+  `rt_str_*` are leaf only while `String` is runtime-owned; if M6 makes `String` a GC object they
+  become non-leaf. Every emitted function carries `gc "statepoint-example"`.
+- **Pass pipeline** (`LLVMBridge.swift`): `function(mem2reg,sroa),rewrite-statepoints-for-gc` before
+  codegen. `mem2reg`/`sroa` is a **correctness** prerequisite, not just perf — our lowering puts
+  every local in an alloca, and the rewrite tracks only SSA-value GC pointers, so promotion must run
+  first or almost no roots are found. M6's full `-O` pipeline slots before the rewrite (8.5).
+- **Roots-in-stack-memory (D6) — A covers the current surface; the B spill seam is deferred.**
+  Reference-carrying value aggregates are kept register-resident (A): small ones are passed by value
+  and promoted; closures/existentials are heap-boxed (their refs are heap-object fields, traced by
+  the object map, never stack roots); class/actor refs are scalar `p1`. An audit found **zero
+  category-3 sites** (no reference-carrying enum payload; no large ref-mixing struct) in the current
+  language, so no explicit per-frame root-slot spill seam is emitted. M6 adds the B spill seam +
+  its runtime root-slot scan when a *large* (>16-byte) value aggregate mixing values with references
+  first crosses a non-inlined call (or a non-hoistable mutating ref-receiver arises).
 
 ---
 

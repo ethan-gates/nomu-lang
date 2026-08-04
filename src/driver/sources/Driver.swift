@@ -103,7 +103,7 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
 
     // Backend (M8): lower the typed IR via LLVM's C API → object → link with the runtime .a.
     // (The C backend was the differential oracle through 8.2 and was retired at the 8.2 exit.)
-    emitLLVMBinary(monoModule, stem: stem, outputDir: outputDir)
+    emitLLVMBinary(monoModule, stem: stem, outputDir: outputDir, optimize: options.optimize)
 }
 
 // Write a text artifact to `path` (or exit) and report its path — the "emit" style,
@@ -160,9 +160,9 @@ private func prependPrelude(_ program: Program) -> Program {
 // static archive, and link them into a native executable. Reports the binary path (like the C
 // path). Everything LLVM stays behind `emitHelloWorldObject` in LLVMBridge — this only orchestrates
 // object → .a → link.
-private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String) {
+private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String, optimize: Bool) {
     let objPath = stem + ".o"
-    if let err = emitObject(module, to: objPath) {
+    if let err = emitObject(module, to: objPath, optimize: optimize) {
         fputs("error: \(err)\n", stderr)
         exit(1)
     }

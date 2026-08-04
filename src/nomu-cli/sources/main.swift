@@ -17,11 +17,13 @@ for arg in CommandLine.arguments.dropFirst() {
               --emit-ast         also emit the parsed AST (<name>.ast)
               --emit-typedir     also emit the typed IR (<name>.typedir)
               --stop=STAGE       halt after STAGE (ast | typedir | binary); default binary
+              -O, --release      optimize (LLVM -O2); default is a debug build
               -h, --help         show this help
             """)
         exit(0)
     case "--emit-ast":         options.ast = true
     case "--emit-typedir":     options.typedIR = true
+    case "-O", "--release":    options.optimize = true
     case let a where a.hasPrefix("--stop="):
         switch String(a.dropFirst("--stop=".count)) {
         case "ast":     options.stopAt = .ast

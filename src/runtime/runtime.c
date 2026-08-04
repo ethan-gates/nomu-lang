@@ -262,7 +262,7 @@ String rt_read_line(int fd) {
 String rt_read_line(int fd) { (void)fd; return rt_str_lit("", 0); }
 #endif
 
-// ---- GC root scanning (M8.4.3; m8.4-spec.md D4) ----
+// ---- GC root scanning (M8.4.3; m6-spec.md §6.0.8) ----
 // Parse the `__llvm_stackmaps` section (stackmap v3) into a return-address → live-GC-slot index,
 // then walk a stack (libunwind) mapping each frame's return address to its record and reading the
 // live roots. Inert now — nothing calls this except the smoke path (M6 drives it from the

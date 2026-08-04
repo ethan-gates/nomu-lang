@@ -47,7 +47,7 @@ void* rt_mutex_new(void);
 void  rt_mutex_lock(void* m);
 void  rt_mutex_unlock(void* m);
 
-// ---- GC root scanning (M8.4.3; m8.4-spec.md D4) ----
+// ---- GC root scanning (M8.4.3; m6-spec.md §6.0.8) ----
 // Parse the process's `__llvm_stackmaps` section into a return-address → live-GC-slot index.
 // Idempotent; called lazily by the walk. Inert until M6 turns on collection.
 void nomu_gc_stackmap_init(void);

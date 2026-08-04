@@ -19,6 +19,10 @@ public struct EmitOptions {
     public var ast = false       // --emit-ast: emit the parsed AST (<name>.ast)
     public var typedIR = false   // --emit-typedir: emit the typed IR (<name>.typedir)
     public var stopAt: Stage = .binary
+    // 8.5.3 — LLVM optimization level. Default (debug) runs the minimal `mem2reg`/`sroa` the
+    // statepoint rewrite needs and preserves Tier-0 debug info; `-O`/`--release` runs the full
+    // `default<O2>` pipeline (faster code, debug info degraded). Both precede statepoint rewriting.
+    public var optimize = false  // -O / --release
 
     public init() {}
 }

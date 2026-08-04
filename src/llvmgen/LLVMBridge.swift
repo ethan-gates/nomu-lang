@@ -99,7 +99,7 @@ public func buildHelloWorldModule() -> BuiltModule {
 /// the host triple. The first real Nomu-through-LLVM slice. Self-contained: all LLVM_C use stays
 /// inside this module, so the driver's LLVM path is a flat `IRModule → String?` surface (nil =
 /// success, else an error). Coverage is the 8.1.5 sliver (`IRToLLVM`); 8.2 broadens it.
-public func emitObject(_ module: IRModule, to path: String) -> String? {
+public func emitObject(_ module: IRModule, to path: String, optimize: Bool = false) -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
@@ -117,12 +117,12 @@ public func emitObject(_ module: IRModule, to path: String) -> String? {
     if LLVMVerifyModule(mod, LLVMReturnStatusAction, nil) != 0 {
         return "LLVM: module failed verification"
     }
-    return emitModuleObject(mod, to: path)
+    return emitModuleObject(mod, to: path, optimize: optimize)
 }
 
 /// Emit an already-built, verified module to a native object file for the host triple, via
 /// `llvm-c/TargetMachine.h`. Returns nil on success, else an error message.
-private func emitModuleObject(_ mod: LLVMModuleRef, to path: String) -> String? {
+private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: Bool) -> String? {
     let triple = LLVMGetDefaultTargetTriple()!
     defer { LLVMDisposeMessage(triple) }
     LLVMSetTarget(mod, triple)
@@ -155,13 +155,21 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String) -> String? 
 
     // 8.4.1 — GC substrate pass pipeline. `mem2reg`/`sroa` promote our alloca-per-local lowering
     // to SSA so `RewriteStatepointsForGC` can see the `addrspace(1)` roots (a correctness
-    // prerequisite, m8.4-spec.md D2), then the rewrite turns every non-`gc-leaf` call in a
+    // prerequisite, m6-spec.md §6.0.8), then the rewrite turns every non-`gc-leaf` call in a
     // `gc "statepoint-example"` function into a `gc.statepoint` with relocatable roots. Nothing
     // moves in 8.4, so the relocations are identity — behavior is unchanged. The full `-O`
     // pipeline lands in 8.5; this is the minimum ordering the rewrite needs.
+    // 8.5.3 — opt level chooses what runs before the statepoint rewrite: `-O` (release) runs the
+    // full `default<O2>` pipeline; the default (debug) runs just the `mem2reg`/`sroa` the rewrite
+    // needs to find SSA roots, keeping Tier-0 debug info intact. `rewrite-statepoints-for-gc` runs
+    // last either way (8.0.7), so opts see ordinary pointers and statepoint spill/reload noise is
+    // introduced only after optimization.
     let opts = LLVMCreatePassBuilderOptions()
     defer { LLVMDisposePassBuilderOptions(opts) }
-    if let err = LLVMRunPasses(mod, "function(mem2reg,sroa),rewrite-statepoints-for-gc", tm, opts) {
+    let pipeline = optimize
+        ? "default<O2>,rewrite-statepoints-for-gc"
+        : "function(mem2reg,sroa),rewrite-statepoints-for-gc"
+    if let err = LLVMRunPasses(mod, pipeline, tm, opts) {
         let m = LLVMGetErrorMessage(err).map { String(cString: $0) } ?? "unknown"
         LLVMConsumeError(err)
         return "LLVM: GC pass pipeline failed: \(m)"

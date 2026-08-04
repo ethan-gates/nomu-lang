@@ -387,19 +387,29 @@ of live GC roots on a known-answer program; the three seams are present, inline-
 provably inert (differential harness output unchanged vs. 8.2). Hands M6 a working precise-root
 + barrier substrate.
 
-## 8.5 · Perf tail (descopable) ⬜
+## 8.5 · Perf tail (descopable) — exit met (2026-08-03)
 
 Intent: recover backend performance once correctness is green; can trail M8 or spill to a
-follow-on. Deps: 8.2 (asm/mutex), 8.4 (opt↔statepoint ordering).
+follow-on. Deps: 8.2 (asm/mutex), 8.4 (opt↔statepoint ordering). **8.5.2 + 8.5.3 done; the exit is
+met by 8.5.3. 8.5.1 (asm fiber-switch) and 8.5.4 (fiber-aware mutex) are deferred descoped perf.**
 
-- **8.5.1 ⬜** — `ucontext` `swapcontext`/`makecontext` → ~20-line arm64 + x86-64 fiber-switch
-  asm (drops the macOS signal-mask syscall per switch).
-- **8.5.2 ⬜** — `Bool` → `i1`/`i8` (from `int64_t`); audit remaining C-ism artifacts
-  (`compiler.md` §6).
-- **8.5.3 ⬜** — LLVM opt pipeline: new pass manager, `-O` release vs. debug levels, ordered
-  **before** statepoint rewriting (8.0.7).
-- **8.5.4 ⬜** — fiber-aware mutex (park/unpark) replacing actor `pthread_mutex_t`, so a held
-  handler doesn't block a carrier (`compiler.md` §6).
+- **8.5.1 ⬜ (deferred)** — `ucontext` `swapcontext`/`makecontext` → ~20-line arm64 + x86-64
+  fiber-switch asm (drops the macOS signal-mask syscall per switch). Descoped perf (concurrency-
+  specific); the 8.5 exit is already met by 8.5.3.
+- **8.5.2 ✅ (2026-08-03)** — `Bool` is now LLVM-native **`i1`** (was `i64`): comparisons yield the
+  `icmp`'s i1 directly (no `zext`), `if`/`while` branch on it directly, `print(Bool)` widens to i64
+  for `printf`'s `%lld` (still 0/1). Bool never crosses the C ABI (internal only). Verified: corpus
+  byte-identical (debug **and** `-O`); smoke green.
+- **8.5.3 ✅ (2026-08-03)** — LLVM opt pipeline via the new pass manager, ordered **before**
+  statepoint rewriting (8.0.7). `-O`/`--release` runs `default<O2>`; the default (debug) keeps the
+  minimal `mem2reg`/`sroa` the rewrite needs and preserves Tier-0 debug info; both then
+  `rewrite-statepoints-for-gc`. Threaded through `EmitOptions.optimize` → driver → `LLVMBridge`.
+  Verified: default corpus byte-identical to 8.2; `-O` output identical to debug across the whole
+  corpus; `-O` builds still emit `__llvm_stackmaps` (statepoints survive O2). **~31 % faster** on
+  `fib(40)` (0.39 s → 0.27 s), correctness unchanged — meets the 8.5 exit.
+- **8.5.4 ⬜ (deferred)** — fiber-aware mutex (park/unpark) replacing actor `pthread_mutex_t`, so a
+  held handler doesn't block a carrier (`compiler.md` §6). Descoped perf (concurrency-specific);
+  the 8.5 exit is already met by 8.5.3.
 
 **Exit:** measurable throughput/latency improvement over the 8.2 baseline on a benchmark (e.g.
 `examples/speed-nomu.nomu`); correctness unchanged (differential harness still green).

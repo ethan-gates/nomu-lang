@@ -24,9 +24,9 @@
 //           safety check, not a codegen concern, so it is not repeated here.
 //
 // Nodes outside the covered set set `error` (a `file:line:col`-prefixed message, not a crash) —
-// the boundary later slices push. ABI parity with `CodegenIR.cType`: Int and Bool are both **i64**
-// (bool 0/1); String is the runtime `{ i8*, i64 }` struct; a `struct` is an LLVM struct in field
-// order, passed/returned by value (mutating `self` is a pointer to it). Nomu `main` → `nomu_main`.
+// the boundary later slices push. Types: Int is **i64**; Bool is **i1** (0/1, 8.5.2); String is the
+// runtime `{ i8*, i64 }` struct; a `struct` is an LLVM struct in field order, passed/returned by
+// value (mutating `self` is a pointer to it). Nomu `main` → `nomu_main`.
 import LLVM_C
 import frontend
 
@@ -37,6 +37,7 @@ final class IRToLLVM {
 
     private let i8ptr: LLVMTypeRef      // opaque `ptr` (addrspace 0) — code / static / C-owned memory
     private let p1: LLVMTypeRef         // opaque `ptr addrspace(1)` — a managed (GC-heap) reference (8.4.1 D1)
+    private let i1: LLVMTypeRef         // 8.5.2 — `Bool` (0/1); LLVM's natural boolean
     private let i32: LLVMTypeRef
     private let i64: LLVMTypeRef
     private let voidTy: LLVMTypeRef
@@ -52,7 +53,10 @@ final class IRToLLVM {
     private let zeroSpan = Span(file: "", begin: Pos(line: 0, col: 0), end: Pos(line: 0, col: 0))
 
     private var runtimeFns: [String: (fn: LLVMValueRef, ty: LLVMTypeRef)] = [:]
-    private var pollFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // 8.4.2 — the inert `__nomu_poll` seam
+    // 8.4.2/8.4.4 — the inert mutator seams (`__nomu_poll` / `__nomu_gc_alloc` / `__nomu_write_barrier`).
+    private var pollFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
+    private var gcAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
+    private var barrierFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     private var intFmt: LLVMValueRef?
     private var strFmt: LLVMValueRef?
 
@@ -151,6 +155,7 @@ final class IRToLLVM {
         b = LLVMCreateBuilderInContext(ctx)
         i8ptr = LLVMPointerType(LLVMInt8TypeInContext(ctx), 0)
         p1 = LLVMPointerType(LLVMInt8TypeInContext(ctx), 1)
+        i1 = LLVMInt1TypeInContext(ctx)
         i32 = LLVMInt32TypeInContext(ctx)
         i64 = LLVMInt64TypeInContext(ctx)
         voidTy = LLVMVoidTypeInContext(ctx)
@@ -275,8 +280,8 @@ final class IRToLLVM {
     private func diType(_ t: Type) -> LLVMMetadataRef? {
         guard di != nil else { return nil }
         switch t {
-        case .int:    return diBasic("Int", dwSigned)
-        case .bool:   return diBasic("Bool", dwBoolean)   // stored as i64 (bool 0/1)
+        case .int:    return diBasic("Int", dwSigned, bits: 64)
+        case .bool:   return diBasic("Bool", dwBoolean, bits: 8)   // i1, one byte in memory (8.5.2)
         case .string: return diStringType()
         case .named(let n, .struct_): return diStructType(n)
         case .named(let n, .class_):  return diClassPointer(n)
@@ -285,9 +290,9 @@ final class IRToLLVM {
         }
     }
 
-    private func diBasic(_ name: String, _ encoding: LLVMDWARFTypeEncoding) -> LLVMMetadataRef? {
+    private func diBasic(_ name: String, _ encoding: LLVMDWARFTypeEncoding, bits: UInt64 = 64) -> LLVMMetadataRef? {
         if let c = diTypeCache["b:\(name)"] { return c }
-        let t = LLVMDIBuilderCreateBasicType(di, name, name.utf8.count, 64, encoding, LLVMDIFlagZero)
+        let t = LLVMDIBuilderCreateBasicType(di, name, name.utf8.count, bits, encoding, LLVMDIFlagZero)
         diTypeCache["b:\(name)"] = t
         return t
     }
@@ -397,7 +402,8 @@ final class IRToLLVM {
 
     private func llvmType(_ t: Type, _ span: Span) -> LLVMTypeRef? {
         switch t {
-        case .int, .bool: return i64
+        case .int:        return i64
+        case .bool:       return i1    // 8.5.2 — Bool is LLVM's native i1 (was i64)
         case .string:     return strTy
         case .void:       return voidTy
         case .function:   return p1   // a closure value is a managed pointer to a heap { fn, caps… } object (8.4.1)
@@ -721,9 +727,7 @@ final class IRToLLVM {
             declareLocal(name, type: value.type, addr: slot, line: stmt.span.begin.line)
 
         case .assign(let target, let value):
-            guard let dst = lvalue(target) else { return }
-            guard let v = lowerExpr(value) else { return }
-            LLVMBuildStore(b, v, dst.addr)
+            assignTo(target, value)
 
         case .compoundAssign(let target, let value):
             // Nomu's only compound assignment is `+=`, on Int (CodegenIR emits `l += r`).
@@ -769,7 +773,7 @@ final class IRToLLVM {
 
     private func lowerIf(cond: IRExpr, then: [IRStmt], els: [IRStmt]?) {
         guard let fn = currentFn, let condV = lowerExpr(cond) else { return }
-        let condBit = LLVMBuildICmp(b, LLVMIntNE, condV, LLVMConstInt(i64, 0, 0), "cond")
+        let condBit = condV   // 8.5.2 — a Bool is already i1; branch on it directly
         let thenBB = LLVMAppendBasicBlockInContext(ctx, fn, "then")
         let elseBB = els != nil ? LLVMAppendBasicBlockInContext(ctx, fn, "else") : nil
         let mergeBB = LLVMAppendBasicBlockInContext(ctx, fn, "ifcont")
@@ -808,7 +812,7 @@ final class IRToLLVM {
         // back-edge (fall-through and `continue`) passes through it.
         if !loopBodyHasSafepoint(body) { emitSafepointPoll() }
         guard let condV = lowerExpr(cond) else { return }
-        let condBit = LLVMBuildICmp(b, LLVMIntNE, condV, LLVMConstInt(i64, 0, 0), "while.cond")
+        let condBit = condV   // 8.5.2 — a Bool is already i1; branch on it directly
         LLVMBuildCondBr(b, condBit, bodyBB, exitBB)
 
         LLVMPositionBuilderAtEnd(b, bodyBB)
@@ -836,7 +840,7 @@ final class IRToLLVM {
         case .intLit(let n):
             return LLVMConstInt(i64, UInt64(bitPattern: Int64(n)), /*SignExtend=*/1)
         case .boolLit(let v):
-            return LLVMConstInt(i64, v ? 1 : 0, 0)
+            return LLVMConstInt(i1, v ? 1 : 0, 0)
         case .stringLit(let s):
             return lowerStringLit(s)
         case .varRef(let name) where spawnLocals[name] != nil:
@@ -904,6 +908,49 @@ final class IRToLLVM {
         }
     }
 
+    // Lower an assignment `target = value`, routing a reference write into a managed object field
+    // through the write barrier (8.4.4). Mirrors `lvalue`'s assignable cases, but keeps the managed
+    // object base (so the barrier can log it) and lowers the field base exactly once — computing the
+    // target address before the value, as the plain-store path did (evaluation order preserved).
+    // A write to a stack local or a struct-value field (addrspace 0, not a GC object) is a plain store.
+    private func assignTo(_ target: IRExpr, _ valueExpr: IRExpr) {
+        switch target.kind {
+        case .varRef(let name):
+            if let l = locals[name] {
+                guard let v = lowerExpr(valueExpr) else { return }
+                LLVMBuildStore(b, v, l.addr)
+                return
+            }
+            if let cs = currentSelf, let pos = cs.fields.firstIndex(where: { $0.name == name }) {
+                let slot = structGEP(cs.llvmTy, cs.addr, fieldLLVMIndex(cs.kind, pos))
+                guard let v = lowerExpr(valueExpr) else { return }
+                if cs.kind == .classRef { storeField(cs.addr, slot, v) } else { LLVMBuildStore(b, v, slot) }
+                return
+            }
+            fail("8.2.4: unknown variable '\(name)'", target.span)
+        case .fieldAccess(let base, let field):
+            guard case .named(let typeName, _) = base.type, let info = aggInfo(typeName),
+                  let pos = info.fields.firstIndex(where: { $0.name == field }) else {
+                fail("8.2.4: field access on a non-aggregate", target.span)
+                return
+            }
+            let basePtr: LLVMValueRef
+            if info.kind == .classRef {
+                guard let bv = lowerExpr(base) else { return }   // the object pointer (managed)
+                basePtr = bv
+            } else {
+                guard let ba = lvalue(base) else { return }      // the struct's stack address
+                basePtr = ba.addr
+            }
+            let slot = structGEP(info.ty, basePtr, fieldLLVMIndex(info.kind, pos))
+            guard let v = lowerExpr(valueExpr) else { return }
+            if info.kind == .classRef { storeField(basePtr, slot, v) } else { LLVMBuildStore(b, v, slot) }
+        default:
+            guard let dst = lvalue(target), let v = lowerExpr(valueExpr) else { return }
+            LLVMBuildStore(b, v, dst.addr)
+        }
+    }
+
     private func lowerBinary(_ op: BinOp, _ l: IRExpr, _ r: IRExpr) -> LLVMValueRef? {
         guard let lv = lowerExpr(l), let rv = lowerExpr(r) else { return nil }
         switch op {
@@ -912,7 +959,7 @@ final class IRToLLVM {
         case .mul: return LLVMBuildMul(b, lv, rv, "mul")
         case .div: return LLVMBuildSDiv(b, lv, rv, "div")
         case .eq, .neq, .lt, .gt, .lte, .gte:
-            // Comparisons on Int yield Bool (i64 0/1): icmp → i1, then zext.
+            // Comparisons on Int yield Bool — now the `icmp`'s native i1 directly (8.5.2, no zext).
             let pred: LLVMIntPredicate
             switch op {
             case .eq:  pred = LLVMIntEQ
@@ -922,7 +969,7 @@ final class IRToLLVM {
             case .lte: pred = LLVMIntSLE
             default:   pred = LLVMIntSGE   // .gte
             }
-            return LLVMBuildZExt(b, LLVMBuildICmp(b, pred, lv, rv, "cmp"), i64, "cmpi")
+            return LLVMBuildICmp(b, pred, lv, rv, "cmp")
         }
     }
 
@@ -942,7 +989,7 @@ final class IRToLLVM {
             let obj = rtAllocManaged(LLVMConstInt(i64, UInt64(slots * 8), 0))
             for (idx, field) in c.fields.enumerated() {
                 guard let v = constructField(field, args, typeName, span) else { return nil }
-                LLVMBuildStore(b, v, structGEP(ct, obj, fieldLLVMIndex(.classRef, idx)))
+                storeField(obj, structGEP(ct, obj, fieldLLVMIndex(.classRef, idx)), v)
             }
             return obj
         }
@@ -956,7 +1003,7 @@ final class IRToLLVM {
                 if let initE = field.initializer { v = lowerExpr(initE) }
                 else { v = constructActorField(field, args, typeName, span) }
                 guard let fv = v else { return nil }
-                LLVMBuildStore(b, fv, structGEP(at, obj, fieldLLVMIndex(.classRef, idx)))
+                storeField(obj, structGEP(at, obj, fieldLLVMIndex(.classRef, idx)), fv)
             }
             let muNew = runtimeFn("rt_mutex_new", ret: i8ptr, params: [], varArg: false)
             let mu = buildCall(muNew.0, muNew.1, [])!
@@ -1282,7 +1329,7 @@ final class IRToLLVM {
         if let info = aggInfo(type), let pos = info.fields.firstIndex(where: { $0.name == p.name }) {
             let addr = structGEP(info.ty, payload, fieldLLVMIndex(info.kind, pos))
             if setter {
-                LLVMBuildStore(b, LLVMGetParam(fn, 1), addr)
+                storeField(payload, addr, LLVMGetParam(fn, 1)!)
                 LLVMBuildRetVoid(b)
             } else {
                 LLVMBuildRet(b, LLVMBuildLoad2(b, propTy, addr, "fld"))
@@ -1400,8 +1447,8 @@ final class IRToLLVM {
     // table (addrspace 0); the payload is the managed object / heap value-copy pointer (addrspace 1).
     private func makeAnyBox(_ witness: LLVMValueRef, _ payload: LLVMValueRef) -> LLVMValueRef {
         let box = rtAllocManaged(LLVMConstInt(i64, 16, 0))
-        LLVMBuildStore(b, witness, structGEP(anyBoxTy, box, 0))
-        LLVMBuildStore(b, payload, structGEP(anyBoxTy, box, 1))
+        storeField(box, structGEP(anyBoxTy, box, 0), witness)   // witness (addrspace 0) → plain store
+        storeField(box, structGEP(anyBoxTy, box, 1), payload)   // payload (managed) → write barrier
         return box
     }
 
@@ -1488,7 +1535,7 @@ final class IRToLLVM {
         let envPtr = rtAllocManaged(LLVMConstInt(i64, UInt64(max(bytes, 8)), 0))
         for (i, cap) in caps.enumerated() {
             let v = LLVMBuildLoad2(b, cap.local.ty, cap.local.addr, cap.name)
-            LLVMBuildStore(b, v, structGEP(envTy, envPtr, i))
+            storeField(envPtr, structGEP(envTy, envPtr, i), v)
         }
         return envPtr
     }
@@ -1543,7 +1590,7 @@ final class IRToLLVM {
         LLVMBuildStore(b, fn, structGEP(objTy, obj, 0))
         for (i, cap) in caps.enumerated() {
             let v = LLVMBuildLoad2(b, cap.local.ty, cap.local.addr, cap.name)
-            LLVMBuildStore(b, v, structGEP(objTy, obj, i + 1))
+            storeField(obj, structGEP(objTy, obj, i + 1), v)
         }
         return obj
     }
@@ -1571,7 +1618,7 @@ final class IRToLLVM {
         if let rv = lowerExpr(value) {
             let bytes = max(slotCount(resultType) * 8, 8)
             let boxp = rtAllocManaged(LLVMConstInt(i64, UInt64(bytes), 0))
-            LLVMBuildStore(b, rv, boxp)
+            storeField(boxp, boxp, rv)   // a reference result goes through the barrier; a value is a plain store
             // The routine returns the box to the runtime as a `void*` (addrspace 0); `spawn_join`
             // hands it back and `joinSpawn` reads the result out of it.
             LLVMBuildRet(b, toUnmanaged(boxp))
@@ -1737,8 +1784,11 @@ final class IRToLLVM {
         }
         let (fn, ty) = runtimeFn("printf", ret: i32, params: [i8ptr], varArg: true)
         switch arg.value.type {
-        case .int, .bool:
+        case .int:
             return buildCall(fn, ty, [intFormat(), value])
+        case .bool:
+            // Bool is i1; printf's `%lld` reads an i64, so widen to i64 (prints 0/1 as before). (8.5.2)
+            return buildCall(fn, ty, [intFormat(), LLVMBuildZExt(b, value, i64, "b2i")])
         case .string:
             let data = LLVMBuildExtractValue(b, value, 0, "data")
             let len = LLVMBuildExtractValue(b, value, 1, "len")
@@ -1812,7 +1862,7 @@ final class IRToLLVM {
     //
     // 8.4.1 — every function *we emit a body for* (free fns, methods, actor handlers, witness/
     // property thunks, closures, spawn routines) is `gc "statepoint-example"`: any of them can be a
-    // frame at a safepoint, so the caller needs a stack map at each of its calls (m8.4-spec.md D2).
+    // frame at a safepoint, so the caller needs a stack map at each of its calls (m6-spec.md §6.0.8).
     // Runtime C declarations pass `gc: false` (`runtimeFn`) and stay plain.
     private func emitFunction(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef],
                               varArg: Bool = false, gc: Bool = true,
@@ -1829,7 +1879,7 @@ final class IRToLLVM {
     // Runtime C functions that never allocate on the GC heap and never park the fiber, so a GC can
     // never run across them. Marking their declarations `"gc-leaf-function"` tells the rewrite pass
     // to leave their calls as plain calls instead of statepoints — no root spill/reload around them
-    // (m8.4-spec.md D2, perf lever). Conservative: when unsure, a call stays non-leaf, since
+    // (m6-spec.md §6.0.8, perf lever). Conservative: when unsure, a call stays non-leaf, since
     // mislabeling a GC-triggering call as leaf is the unsound direction. `rt_str_*` are leaf only
     // while `String` is runtime-owned (D1); M6 revisits if `String` becomes a GC object.
     private static let gcLeafRuntimeFns: Set<String> = [
@@ -1846,30 +1896,42 @@ final class IRToLLVM {
         LLVMAttributeIndex(bitPattern: Int32(LLVMAttributeFunctionIndex))
     }
 
-    // MARK: - Safepoint poll (8.4.2, D3)
+    private func addAlwaysInline(_ fn: LLVMValueRef) {
+        let k = LLVMGetEnumAttributeKindForName("alwaysinline", "alwaysinline".utf8.count)
+        LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, k, 0))
+    }
 
-    // The `__nomu_poll` seam: an `alwaysinline` stub with a trivial (no-op) body, emitted at loop
-    // back-edges that would otherwise be safepoint-free (D5's seam shape). It is `gc-leaf-function`
-    // so the rewrite pass leaves it a plain call (not a statepoint) — inert now (a call into an
-    // empty function; the poll page/flag is never armed). M6 fills the body with the real poll
-    // (protected-page load or branch-on-flag, D3) and its inline fast path replaces the call.
+    // Build a stub seam's body without disturbing the caller's builder position / debug location
+    // (a seam stub carries no subprogram, so a foreign `!dbg` would trip the verifier).
+    private func withStubBody(_ fn: LLVMValueRef, _ build: () -> Void) {
+        let savedBlock = LLVMGetInsertBlock(b)
+        let savedLoc = di != nil ? LLVMGetCurrentDebugLocation2(b) : nil
+        if di != nil { LLVMSetCurrentDebugLocation2(b, nil) }
+        LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, fn, "entry"))
+        build()
+        if let savedBlock = savedBlock { LLVMPositionBuilderAtEnd(b, savedBlock) }
+        if di != nil { LLVMSetCurrentDebugLocation2(b, savedLoc) }
+    }
+
+    // MARK: - Inline seams (8.4.4, D5)
+
+    // Each of the three mutator seams — alloc / write-barrier / poll — is emitted as a call to an
+    // `alwaysinline` stub with a trivial, provably-inert body (D5's "seam representation"). Keeping
+    // the inert phase as a call into a one-line stub (rather than open-coding the disabled fast path
+    // at every site) gives M6 a single body to fill; once filled, `alwaysinline` collapses the call
+    // sites into the inline fast path. All three are behavior-neutral now: alloc tail-calls
+    // `rt_alloc`, the barrier is a plain store, the poll is a no-op.
+
+    // The `__nomu_poll` seam (8.4.2): no-op now; `gc-leaf` so the rewrite leaves it a plain call.
+    // M6 fills it with the real poll (protected-page load / branch-on-flag, D3).
     private func nomuPoll() -> (LLVMValueRef, LLVMTypeRef) {
         if let p = pollFn { return p }
         let ty = fnType(voidTy, [])
         let fn = LLVMAddFunction(mod, "__nomu_poll", ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         markGCLeaf(fn)
-        let ai = LLVMGetEnumAttributeKindForName("alwaysinline", "alwaysinline".utf8.count)
-        LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, ai, 0))
-        // Build the no-op body without disturbing the caller's builder position / debug location
-        // (the stub carries no subprogram, so a foreign `!dbg` would trip the verifier).
-        let savedBlock = LLVMGetInsertBlock(b)
-        let savedLoc = di != nil ? LLVMGetCurrentDebugLocation2(b) : nil
-        if di != nil { LLVMSetCurrentDebugLocation2(b, nil) }
-        LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, fn, "entry"))
-        LLVMBuildRetVoid(b)
-        if let savedBlock = savedBlock { LLVMPositionBuilderAtEnd(b, savedBlock) }
-        if di != nil { LLVMSetCurrentDebugLocation2(b, savedLoc) }
+        addAlwaysInline(fn)
+        withStubBody(fn) { LLVMBuildRetVoid(b) }
         pollFn = (fn, ty)
         return pollFn!
     }
@@ -1877,6 +1939,58 @@ final class IRToLLVM {
     private func emitSafepointPoll() {
         let p = nomuPoll()
         _ = buildCall(p.0, p.1, [])
+    }
+
+    // The `__nomu_gc_alloc` seam: `ptr addrspace(1) (i64 size)`, emitted at every managed-object
+    // allocation. Inert body tail-calls `rt_alloc`, so it allocates exactly as before and stays a
+    // statepoint (it can trigger GC — *not* `gc-leaf`). M6 replaces the body with the inline
+    // bump-pointer TLAB fast path (load cursor/limit, bump, branch to `rt_alloc` slow path).
+    private func nomuGcAlloc() -> (LLVMValueRef, LLVMTypeRef) {
+        if let g = gcAllocFn { return g }
+        let ty = fnType(p1, [i64])
+        let fn = LLVMAddFunction(mod, "__nomu_gc_alloc", ty)!
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        LLVMSetGC(fn, "statepoint-example")   // its `rt_alloc` call is a statepoint
+        addAlwaysInline(fn)
+        withStubBody(fn) {
+            let p = buildCall(rtAlloc(), rtAllocTy(), [LLVMGetParam(fn, 0)])!
+            LLVMBuildRet(b, p)
+        }
+        gcAllocFn = (fn, ty)
+        return gcAllocFn!
+    }
+
+    // The `__nomu_write_barrier` seam: `void (ptr addrspace(1) obj, ptr addrspace(1) slot,
+    // ptr addrspace(1) val)`, emitted at every store of a managed reference into a managed object
+    // field (D5). Inert body is just the store — no header touch yet; `gc-leaf` (a plain store
+    // triggers no GC). M6 fills the LXR coalescing fast path (GEP the header from `obj`, test the
+    // logged bit, log on first mutation) — which is why `obj` is passed even though the inert stub
+    // ignores it. The object header stays the vestigial `i64` it is today; M6 subdivides it.
+    private func nomuWriteBarrier() -> (LLVMValueRef, LLVMTypeRef) {
+        if let g = barrierFn { return g }
+        let ty = fnType(voidTy, [p1, p1, p1])
+        let fn = LLVMAddFunction(mod, "__nomu_write_barrier", ty)!
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        markGCLeaf(fn)
+        addAlwaysInline(fn)
+        withStubBody(fn) {
+            LLVMBuildStore(b, LLVMGetParam(fn, 2), LLVMGetParam(fn, 1))   // *slot = val
+            LLVMBuildRetVoid(b)
+        }
+        barrierFn = (fn, ty)
+        return barrierFn!
+    }
+
+    // Store `val` into a field at `slot` of the managed object `objBase`. A managed reference
+    // (`addrspace(1)` value) goes through the write-barrier seam; everything else is a plain store
+    // (value-typed fields are not GC references, so they need no barrier).
+    private func storeField(_ objBase: LLVMValueRef!, _ slot: LLVMValueRef!, _ val: LLVMValueRef!) {
+        if LLVMTypeOf(val) == p1 {
+            let bar = nomuWriteBarrier()
+            _ = buildCall(bar.0, bar.1, [objBase, slot, val])
+        } else {
+            LLVMBuildStore(b, val, slot)
+        }
     }
 
     // Whether a loop body reaches a GC safepoint on its own each iteration — i.e. unconditionally
@@ -1965,10 +2079,12 @@ final class IRToLLVM {
     private func rtAlloc() -> LLVMValueRef { runtimeFn("rt_alloc", ret: p1, params: [i64], varArg: false).0 }
     private func rtAllocTy() -> LLVMTypeRef { runtimeFn("rt_alloc", ret: p1, params: [i64], varArg: false).1 }
 
-    // Allocate a managed (GC-heap) object of `bytes` bytes — the allocator yields addrspace(1)
-    // directly (see `rtAlloc`), so this is the tracked managed reference the mutator holds (D1).
+    // Allocate a managed (GC-heap) object of `bytes` bytes through the `__nomu_gc_alloc` seam
+    // (8.4.4, D5) — inert now (the seam tail-calls `rt_alloc`), the inline TLAB fast path in M6.
+    // The result is addrspace(1): the tracked managed reference the mutator holds (D1).
     private func rtAllocManaged(_ bytes: LLVMValueRef) -> LLVMValueRef {
-        buildCall(rtAlloc(), rtAllocTy(), [bytes])!
+        let g = nomuGcAlloc()
+        return buildCall(g.0, g.1, [bytes])!
     }
 
     // The C-ABI boundary cast (D1): a managed reference handed to a C function that takes a `void*`
