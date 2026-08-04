@@ -7,6 +7,11 @@ import driver
 @_silgen_name("nomu_gc_probe")
 func nomu_gc_probe() -> UInt64
 
+// M6 · 6.1.1 — init MMTk (NoGC) + allocate `size` bytes through the NomuVM binding; returns the
+// allocation address. Proves the collector initializes and allocates before the runtime is wired.
+@_silgen_name("nomu_gc_alloc_probe")
+func nomu_gc_alloc_probe(_ size: UInt) -> UInt64
+
 var options = EmitOptions()
 var file: String? = nil
 
@@ -30,6 +35,10 @@ for arg in CommandLine.arguments.dropFirst() {
     case "--gc-probe":
         print(String(format: "0x%016llX", nomu_gc_probe()))
         exit(0)
+    case "--gc-alloc-probe":
+        let addr = nomu_gc_alloc_probe(64)
+        print(addr != 0 ? String(format: "mmtk alloc ok: 0x%llX", addr) : "mmtk alloc FAILED")
+        exit(addr != 0 ? 0 : 1)
     case "--emit-ast":         options.ast = true
     case "--emit-typedir":     options.typedIR = true
     case "-O", "--release":    options.optimize = true

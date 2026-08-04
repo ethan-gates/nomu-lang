@@ -21,10 +21,25 @@
 #include <mach-o/ldsyms.h>   // _mh_execute_header (M8.4.3: locate __llvm_stackmaps)
 #endif
 
+// ---- GC binding (MMTk, M6 · 6.1.1) — implemented in Rust (src/gcbinding), NoGC to start ----
+extern void  nomu_gc_init(size_t heap_bytes);
+extern void* nomu_gc_bind_mutator(void* tls);
+extern void* nomu_gc_alloc(void* mutator, size_t size, size_t align);
+
+// One MMTk mutator per carrier thread (Q1). Bound lazily on the thread's first allocation; a fiber
+// migrating carriers allocates against whichever carrier it currently runs on (thread-local storage
+// gives the per-carrier split for free). MMTk mutators are not shared across threads.
+static _Thread_local void* rt_mutator = NULL;
+
 // ---- Allocation seam ----
+// Routed through MMTk (NoGC): bump-allocate on the carrier's mutator. MMTk returns raw memory, so we
+// zero it to preserve the previous `calloc` contract (Nomu relies on zero-initialized fields). The
+// vestigial `refcount` header write stays until 6.1.2 drops the field.
 void* rt_alloc(size_t size) {
-    void* p = calloc(1, size);
+    if (!rt_mutator) rt_mutator = nomu_gc_bind_mutator((void*)pthread_self());
+    void* p = nomu_gc_alloc(rt_mutator, size, 8);
     if (!p) { fputs("out of memory\n", stderr); exit(1); }
+    memset(p, 0, size);
     ((ObjectHeader*)p)->refcount = 1;
     return p;
 }
@@ -379,6 +394,7 @@ static void nomu_gc_smoke(void) {
 extern void nomu_main(void);
 static void* __rt_main_entry(void* _) { nomu_main(); return NULL; }
 int main(void) {
+    nomu_gc_init(1ULL << 30); // M6 · 6.1.1 — init MMTk (NoGC, 1 GiB reserved) before any allocation
     #ifdef __APPLE__
     rt_kq = kqueue();
     pthread_t __poller_t; pthread_create(&__poller_t, NULL, rt_poller_thread, NULL); pthread_detach(__poller_t);

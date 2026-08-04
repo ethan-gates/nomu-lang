@@ -415,11 +415,16 @@ MMTk calls back for `scan_object`.
     path. Verified: compiling with **no** `NOMU_GC_ARCHIVE` extracts from the embedded section and
     links. `NOMU_GC_ARCHIVE` stays a dev override. (Levers to shrink the payload later: `opt-level=z`,
     `panic=abort`, LTO, strip.)
-  - **Per-emitted-binary size is a non-issue.** A static archive links at member/function
-    granularity (+ `-dead_strip`), so only referenced code enters a program — linking the 17 MB
-    archive added **48 bytes** to `hello` (the probe references nothing else). The 17 MB is the
-    shelf, not the floor; a program that actually allocates will pull in MMTk's *reachable* subset
-    (measure at 6.1.1), and the runtime is linked into every program anyway (`compiler.md` §6).
+  - **Per-emitted-binary size — archive size is not the floor, but the force-link was a trap.** A
+    static archive pulls only members that resolve *referenced* symbols. But an early `-u
+    _nomu_gc_probe` (added to prove the emitted-program link) force-resolved the probe, whose Rust
+    codegen unit also holds the whole `VMBinding` + `mmtk_init`/`alloc` — so the linker dragged the
+    entire MMTk closure (mmtk core + `regex` + `aho-corasick` + `sysinfo` + `objc2`) into **every**
+    binary: `strings` ballooned 56 KB → **6.8 MB** while making zero GC calls. Force-link removed; the
+    archive is still handed to `cc` but pulls nothing until referenced, so binaries are back to 56 KB.
+    Real floor arrives when `rt_alloc` routes through MMTk (below): programs then pull MMTk's reachable
+    subset — a legitimate few-MB increase (a GC'd program carries its GC), to be measured and trimmed
+    (`regex`/`sysinfo` are heavy MMTk deps; + `opt-level=z`/`panic=abort`/LTO/strip).
   - The probe symbol, `--gc-probe`, and the `NOMU_GC_ARCHIVE` override are throwaway — retired when
     6.1.1 swaps in the real MMTk archive.
 - **6.1.1 🔨 in progress** — grow `src/gcbinding` (6.1.0) into the **thin** Rust `VMBinding` crate (Q2 —
@@ -438,9 +443,31 @@ MMTk calls back for `scan_object`.
     MMTk's build script uses the `built` crate, which `.expect()`s the descriptive `CARGO_PKG_*` env
     vars (AUTHORS/DESCRIPTION/HOMEPAGE/REPOSITORY/LICENSE) that `crate_universe` doesn't propagate —
     injected via `crate.annotation(build_script_env=…)` or the build panics one var at a time.
-  - **Next in 6.1.1:** the `VMBinding` impl (`ObjectModel`/`Scanning`/`Collection`/`ActivePlan`/
-    `ReferenceGlue` — mostly `unreachable!` under NoGC), MMTk init with the NoGC plan, `rt_alloc` →
-    per-carrier mutator alloc (Q1), then the M5 suite green under NoGC (allocates, never collects).
+  - **Done — `VMBinding` + MMTk NoGC init + allocation (green).** `src/gcbinding/lib.rs` implements
+    `NomuVM: VMBinding` (all five assoc traits) — adapted from mmtk-core's DummyVM binding at the
+    v0.32.0 tag; the collection-side callbacks and `ObjectModel` copy paths are `unimplemented!()`
+    (never hit under NoGC). `nomu_gc_init` builds MMTk with `PlanSelector::NoGC` + a fixed heap;
+    `nomu_gc_alloc_probe` binds a mutator and allocates. Verified in-process (`nomuc --gc-alloc-probe`
+    → `Initialized MMTk with NoGC` + a live address), and the MMTk-containing archive (now 34 MB)
+    rides the section embed into emitted programs, which link and run green across a corpus sample.
+    Two findings: (1) **MMTk 0.32's default plan is GenImmix** (our eventual target, §6.0.4) — NoGC is
+    set explicitly. (2) **MMTk's deps pull macOS frameworks:** `sysinfo` (host memory sizing) →
+    CoreFoundation/IOKit/`objc`; the emitted-program `cc` link now names `-framework CoreFoundation
+    -framework IOKit -lobjc` (nomuc gets them from the Swift toolchain; a plain link does not). A
+    later slim-deps pass could drop `sysinfo`.
+  - **Done — `rt_alloc` → per-carrier mutator; M5 corpus green under NoGC.** `runtime.c` calls
+    `nomu_gc_init(1 GiB)` at `main` entry; `rt_alloc` binds one MMTk mutator per carrier lazily
+    (`_Thread_local rt_mutator`, `pthread_self` as the opaque TLS — a migrating fiber allocates on its
+    current carrier, so thread-local storage gives the per-carrier split, Q1) and bump-allocates via
+    `nomu_gc_alloc`; MMTk returns raw memory, so `rt_alloc` `memset`s it to keep the old `calloc`
+    zero-init contract (the vestigial `refcount` write stays until 6.1.2). **All 29 corpus programs
+    compile + run correctly through MMTk NoGC** (`stdin`/`speed`/`gc_smoke` excluded); frontend tests
+    green. Two follow-ups: (a) a Nomu program now genuinely links MMTk's reachable subset — `hello`
+    **56 KB → 15.6 MB** (debug); the real GC'd floor, to be cut with `opt-level=z`/LTO/strip/
+    `panic=abort` + slimming `regex`/`sysinfo`. (b) MMTk prints an INFO init line to **stderr** each
+    run (stdout oracle unaffected) — suppress its logger for user programs.
+  - **Left in 6.1.1:** retire the 6.1.0/probe scaffolding (`nomu_gc_probe`, `--gc-probe`,
+    `--gc-alloc-probe`, `nomu_gc_alloc_probe`) once no longer needed for bring-up checks.
 - **6.1.2 ⬜** — GC **header** design (mark/log bits in side metadata; in-object **type-id**);
   drop the vestigial `refcount` field. Co-design the log bit so a `write_barrier` interior-GEP
   from `obj` reaches it in one step (6.0.10). Register finalizable objects in a **side table**,

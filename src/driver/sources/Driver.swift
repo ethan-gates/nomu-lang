@@ -171,12 +171,16 @@ private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String,
 
     let binPath = stem
     var linkArgs = ["-o", binPath, objPath, archive]
-    // M6 · 6.1.0 — link the GC archive into the emitted program. It rides inside nomuc as an
-    // embedded Mach-O section (nomuc stays one atomic file) and is extracted to a cache file here;
-    // a dev override via NOMU_GC_ARCHIVE wins if set. `-u _nomu_gc_probe` force-resolves the probe
-    // to prove the archive reaches the output link. Throwaway with the probe once 6.1.1 lands.
+    // M6 · 6.1.1 — make the GC archive available to the emitted-program link. It rides inside nomuc
+    // as an embedded Mach-O section (nomuc stays one atomic file) and is extracted to a cache file
+    // here; a dev override via NOMU_GC_ARCHIVE wins if set. A static archive pulls in only the
+    // members that resolve referenced symbols, so until `rt_alloc` routes through MMTk the archive
+    // contributes nothing to a binary. MMTk's deps (sysinfo → CoreFoundation/IOKit/objc) are named
+    // so those members can resolve once they are referenced. (No `-u` force-link — that dragged the
+    // whole MMTk closure into every binary regardless of use.)
     if let gcArchive = ProcessInfo.processInfo.environment["NOMU_GC_ARCHIVE"] ?? embeddedGCArchivePath() {
-        linkArgs += [gcArchive, "-u", "_nomu_gc_probe"]
+        linkArgs += [gcArchive,
+                     "-framework", "CoreFoundation", "-framework", "IOKit", "-lobjc"]
     }
     if runProcess("/usr/bin/cc", linkArgs) != 0 {
         fputs("error: link failed\n", stderr)
