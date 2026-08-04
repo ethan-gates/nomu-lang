@@ -17,9 +17,9 @@ Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease
 - [syntax.md](syntax.md) — surface-syntax principles (one canonical form per concept).
 - [macros.md](macros.md) — typed hygienic AST macros; extension-only role.
 - [compiler.md](compiler.md) — compiler architecture, mid-level IR, backend strategy, tooling, debugger.
-- **M8 (LLVM backend) — done (2026-08-03), spec retired.** 8.1–8.4 and the 8.5.2/8.5.3 perf items shipped; the implementation is the record. Design/rationale live in `compiler.md` (§2 backend); the GC-substrate carry-over for M6 is in `m6-spec.md` §6.0.8; forward-looking follow-ups are in `deferred.md` ("Post-M8 backlog"). 8.5.1/8.5.4 remain descoped perf.
+- **M8 (LLVM backend) — done (2026-08-03), spec retired.** 8.1–8.4 and the 8.5.2/8.5.3 perf items shipped; the implementation is the record. Design/rationale live in `compiler.md` (§2 backend); the GC-substrate carry-over for M6 is in `m6-spec.md` §6.0.10; forward-looking follow-ups are in `deferred.md` ("Post-M8 backlog"). 8.5.1/8.5.4 remain descoped perf.
 - [loops.md](loops.md) — **draft for review**: Nomu's iteration construct (`while`) — syntax, semantics, lowering. A prerequisite of 8.4 (the loop back-edge hosts the safepoint poll).
-- [m6-spec.md](m6-spec.md) — **working draft**: M6 implementation spec (build plan) for the real GC (MMTk) — binding, object model, precise roots, safepoints/barriers, moving GenImmix. Gated on M8 (LLVM); §6.0.8 records the delivered 8.4 substrate M6 builds on. Follows `lang-project/milestone-doc-guide.md`.
+- [m6-spec.md](m6-spec.md) — **working draft**: M6 implementation spec (build plan) for the real GC (MMTk) — binding, object model, precise roots, safepoints/barriers, moving GenImmix. Gated on M8 (LLVM); §6.0.10 records the delivered 8.4 substrate M6 builds on. Follows `lang-project/milestone-doc-guide.md`.
 - [roadmap.md](roadmap.md) — milestones (provisional, post-pivot).
 - [deferred.md](deferred.md) — TODO backlog: feature work intentionally postponed, each with its un-park trigger.
 

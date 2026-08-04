@@ -2,7 +2,7 @@
 
 **Status:** surface **Decided (2026-08-03)** — the home for Nomu's iteration construct
 (syntax, semantics, lowering). Prompted as a prerequisite of the M8 · 8.4 GC substrate (the loop
-back-edge is where 8.4.2's safepoint poll lives; carry-over in `m6-spec.md` §6.0.8), but designed
+back-edge is where 8.4.2's safepoint poll lives; carry-over in `m6-spec.md` §6.0.10), but designed
 on its own terms.
 
 **Decisions (2026-08-03).** One pre-tested `while` loop (no `loop`/`repeat` alternate form);
@@ -174,7 +174,7 @@ Performance-first shapes three choices:
   wants — reuse the existing alloca-per-local pattern and let mem2reg promote it.
 - **Cheap back-edge safepoint.** The per-iteration poll (8.4.2) is the loop's GC tax; it is the
   inert `__nomu_poll` seam at the loop header, which M6 fills with a cheap poll (form open —
-  protected-page load vs. branch-on-flag; `m6-spec.md` §6.0.8). Placement: a loop body that already **calls
+  protected-page load vs. branch-on-flag; `m6-spec.md` §6.0.10). Placement: a loop body that already **calls
   or allocates** hits a statepoint each iteration, so its back-edge poll is redundant → elide it
   there; a **call-and-alloc-free** loop reaches no statepoint on its own and **must keep** the poll
   (else a moving GC can't scan it and time-to-safepoint is unbounded). Scheduler fairness for a hot

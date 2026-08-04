@@ -37,7 +37,8 @@ Each milestone is meant to be small and independently meaningful.
 - **M9 — tooling:** query-based compiler server, LSP, formatter.
 - **M10 — debugger:** DWARF variant parts, data formatters, GC-aware stepping, runtime-aware plugin (DAP).
 - **M11 — macros:** typed hygienic AST macros.
-- **Ongoing:** LXR-style collector for footprint (`memory-model.md` §3), the shared-mutable primitive design (needs M5 generics), FFI (foreign-thread attach + pinning, `runtime.md` §5), MLIR consideration (`compiler.md`).
+- **LXR-style collector (footprint endgame)** — an *owned* RC-hybrid reimplementation behind the same `VMBinding` and reusing the `__nomu_write_barrier` seam, replacing/backing GenImmix (`memory-model.md` §3, `m6-spec.md` §6.0.5). **Intent (2026-08-04): scheduled, not open-ended** — targeted after M7 and the M10 debugger, but the **real gate is a benchmark-scale stdlib**: LXR is the footprint endgame, so validating it against Immix needs stdlib mature enough to build meaningfully large programs to measure footprint/throughput on. Sequenced by that prerequisite, not a fixed milestone number.
+- **Ongoing:** the shared-mutable primitive design (needs M5 generics), FFI (foreign-thread attach + pinning, `runtime.md` §5), MLIR consideration (`compiler.md`).
 
 **Cross-cutting** (thread through several milestones rather than sitting in one): error handling (`Result` + `?`, expressible once M2 has enums, finalized in M5), `defer` (scoped cleanup, wanted as soon as M3 does I/O), and linear types (first hard requirement at M7 for continuations and resource cleanup).
 
@@ -51,4 +52,4 @@ Build the part you doubt first; prototype the belief, not the surface. M1 is the
 
 ## Open questions
 
-- **Roadmap shape itself** — still provisional; the M4+ ordering (M:N, generics, GC, LLVM) can reshuffle as M3 teaches us what matters. The MVP framing (M1–M3) is the firm part. **Update (2026-07-30):** GC and LLVM swapped — **M8 (LLVM) now precedes M6 (GC)**, because validating the moving-collector performance thesis needs precise stack maps only the LLVM backend can emit (`m6-spec.md` 6.0.4).
+- **Roadmap shape itself** — still provisional; the M4+ ordering (M:N, generics, GC, LLVM) can reshuffle as M3 teaches us what matters. The MVP framing (M1–M3) is the firm part. **Update (2026-07-30):** GC and LLVM swapped — **M8 (LLVM) now precedes M6 (GC)**, because validating the moving-collector performance thesis needs precise stack maps only the LLVM backend can emit (`m6-spec.md` 6.0.5).
