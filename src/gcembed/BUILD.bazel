@@ -1,0 +1,10 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+# M6 · 6.1.0 — reads nomuc's own `__DATA,__nomu_gc` section (the embedded GC archive) so nomuc can
+# extract it to a cache file at link time and stay a single atomic binary. Linked into nomuc; the
+# driver calls `nomu_gc_embedded_section` via `@_silgen_name`.
+cc_library(
+    name = "gcembed",
+    srcs = ["gcembed.c"],
+    visibility = ["//visibility:public"],
+)

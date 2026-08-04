@@ -1,0 +1,13 @@
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
+
+# M6 · 6.1.0 — toolchain bring-up. The Rust GC binding crate (thin `VMBinding`, Q2) begins here.
+# For 6.1.0 it is a single throwaway probe symbol; 6.1.1 grows it into the real MMTk binding.
+# `rust_static_library` emits a self-contained, C-ABI static archive (crate-type staticlib) that
+# both the nomuc build and nomuc-emitted programs link against.
+rust_static_library(
+    name = "nomu_gc",
+    srcs = ["lib.rs"],
+    edition = "2024",
+    deps = ["@crates//:mmtk"],  # M6 · 6.1.1 — MMTk core (NoGC to start)
+    visibility = ["//visibility:public"],
+)

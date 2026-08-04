@@ -170,7 +170,15 @@ private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String,
     guard let archive = buildRuntimeArchive(inDir: outputDir) else { exit(1) }
 
     let binPath = stem
-    if runProcess("/usr/bin/cc", ["-o", binPath, objPath, archive]) != 0 {
+    var linkArgs = ["-o", binPath, objPath, archive]
+    // M6 · 6.1.0 — link the GC archive into the emitted program. It rides inside nomuc as an
+    // embedded Mach-O section (nomuc stays one atomic file) and is extracted to a cache file here;
+    // a dev override via NOMU_GC_ARCHIVE wins if set. `-u _nomu_gc_probe` force-resolves the probe
+    // to prove the archive reaches the output link. Throwaway with the probe once 6.1.1 lands.
+    if let gcArchive = ProcessInfo.processInfo.environment["NOMU_GC_ARCHIVE"] ?? embeddedGCArchivePath() {
+        linkArgs += [gcArchive, "-u", "_nomu_gc_probe"]
+    }
+    if runProcess("/usr/bin/cc", linkArgs) != 0 {
         fputs("error: link failed\n", stderr)
         exit(1)
     }
@@ -196,6 +204,30 @@ private func buildRuntimeArchive(inDir dir: String) -> String? {
         fputs("error: failed to archive runtime\n", stderr); return nil
     }
     return archive
+}
+
+// M6 · 6.1.0 — the embedded-section reader (src/gcembed): pointer to nomuc's `__DATA,__nomu_gc`
+// bytes (nil if absent), *size = length. Bound by symbol name to avoid a module import.
+@_silgen_name("nomu_gc_embedded_section")
+private func nomu_gc_embedded_section(_ size: UnsafeMutablePointer<UInt>) -> UnsafeRawPointer?
+
+// Materialize nomuc's embedded GC archive to a cache file (once) and return its path, or nil if
+// this nomuc carries no embedded archive. The external linker needs a file path, so the section
+// bytes are written to a temp cache and reused across invocations. (6.1.0; real binding at 6.1.1.)
+private func embeddedGCArchivePath() -> String? {
+    var size: UInt = 0
+    guard let base = nomu_gc_embedded_section(&size), size > 0 else { return nil }
+    let cache = NSTemporaryDirectory() + "nomu-gc-\(size).a"
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: cache),
+       (attrs[.size] as? Int) == Int(size) {
+        return cache  // already extracted at this size — reuse
+    }
+    let data = Data(bytes: base, count: Int(size))
+    guard (try? data.write(to: URL(fileURLWithPath: cache))) != nil else {
+        fputs("error: failed to extract embedded GC archive to \(cache)\n", stderr)
+        return nil
+    }
+    return cache
 }
 
 // Run `exe args`, wait, and return its exit status (or 1 if it could not be launched).

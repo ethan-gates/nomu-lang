@@ -397,18 +397,50 @@ prove allocation routes through MMTk and every heap shape is walkable before any
 Depends on M8. **Approach:** MMTk plan **NoGC**; a Rust `VMBinding` crate; C runtime calls in,
 MMTk calls back for `scan_object`.
 
-- **6.1.0 ⬜** — **toolchain bring-up (no MMTk, no binding logic).** A trivial Rust crate builds
-  under bazel (`rules_rust`) into a C-ABI static lib exposing one dummy symbol, and links three
-  ways on arm64/Mach-O: (a) the crate builds; (b) the symbol links into the **`nomuc` compiler
-  build** (the Swift/C/LLVM target); (c) the symbol links into a **`nomuc`-emitted program**.
-  Surfaces the embed-model wrinkle up front: the C runtime is embedded as *source* in `nomuc`
-  (`embed.sh` → `EmbeddedSources.swift`) and recompiled per program, but Rust can't ride that path
-  — it must be a **prebuilt static archive** `nomuc` passes to the output-program linker. Stand up
-  that archive-link path here, before any MMTk or binding code. (Throwaway dummy symbol.)
-- **6.1.1 ⬜** — **thin** Rust `VMBinding` crate (Q2 — forwards to the C runtime, holds ~no
-  state) + build integration (bazel); MMTk NoGC linked; `rt_alloc` → mutator alloc; **one
+- **6.1.0 ✅ built + green (2026-08-04)** — **toolchain bring-up (no MMTk, no binding logic).** A
+  trivial Rust crate (`src/gcbinding/`, `rust_static_library` → `libnomu_gc.a`, `rules_rust` 0.72,
+  edition 2024) exposing one throwaway C-ABI probe (`nomu_gc_probe` → sentinel `0x4E4F4D555F474300`).
+  All three link paths verified on arm64/Mach-O: **(a)** crate builds; **(b)** links into the
+  **`nomuc` build** (dep of `//src/nomu-cli:nomuc`, bound via `@_silgen_name`; `nomuc --gc-probe`
+  prints the sentinel); **(c)** links into a **`nomuc`-emitted program** — the driver appends a
+  provided GC archive + `-u _nomu_gc_probe` to the output link (`hello` binary carries defined
+  `T _nomu_gc_probe`, runs correctly, default no-archive path unaffected).
+  - **Distribution — solved, `nomuc` stays a single atomic file (proven, not proposed).** The
+    embed-as-*source* model does not extend to Rust (the staticlib is **17 MB** — bundled Rust std —
+    so a Swift string literal is impractical). Instead the archive is embedded as a **Mach-O
+    section**: `nomuc`'s link carries `-Wl,-sectcreate,__DATA,__nomu_gc,libnomu_gc.a` (`nomuc` grew
+    242→259 MB), and at emitted-program link time the driver reads its own section via
+    `getsectiondata` (`src/gcembed`, the same API `runtime.c` uses for `__llvm_stackmaps`) and
+    extracts it once to a temp cache (`$TMPDIR/nomu-gc-<size>.a`, reused thereafter) to hand `cc` a
+    path. Verified: compiling with **no** `NOMU_GC_ARCHIVE` extracts from the embedded section and
+    links. `NOMU_GC_ARCHIVE` stays a dev override. (Levers to shrink the payload later: `opt-level=z`,
+    `panic=abort`, LTO, strip.)
+  - **Per-emitted-binary size is a non-issue.** A static archive links at member/function
+    granularity (+ `-dead_strip`), so only referenced code enters a program — linking the 17 MB
+    archive added **48 bytes** to `hello` (the probe references nothing else). The 17 MB is the
+    shelf, not the floor; a program that actually allocates will pull in MMTk's *reachable* subset
+    (measure at 6.1.1), and the runtime is linked into every program anyway (`compiler.md` §6).
+  - The probe symbol, `--gc-probe`, and the `NOMU_GC_ARCHIVE` override are throwaway — retired when
+    6.1.1 swaps in the real MMTk archive.
+- **6.1.1 🔨 in progress** — grow `src/gcbinding` (6.1.0) into the **thin** Rust `VMBinding` crate (Q2 —
+  forwards to the C runtime, holds ~no state); MMTk NoGC linked; `rt_alloc` → mutator alloc; **one
   `Mutator` per carrier** bound at carrier init (Q1), every alloc reading the current carrier's
   cursor/limit fresh — the codegen fast-path load must not be cached across a safepoint (6.0.5).
+  Reuse the **section-embed distribution mechanism proven in 6.1.0** (`-sectcreate __DATA,__nomu_gc`
+  + `getsectiondata` extract-to-cache — `nomuc` stays atomic): swap the probe archive for the real
+  MMTk-linked archive, measure the emitted-binary size delta once allocation routes through MMTk, and
+  retire the `nomu_gc_probe` symbol, `--gc-probe` flag, and `NOMU_GC_ARCHIVE` override.
+  - **Done so far — MMTk dependency bring-up (green).** `mmtk = 0.32.0` (pinned, §6.0.8) fetched via
+    `crate_universe` (`crate` extension in `MODULE.bazel`); its full transitive graph (267 files +
+    deps) compiles under `rules_rust` and links into `libnomu_gc.a` (17 → 34 MB), which embeds in
+    `nomuc` (277 MB) and reaches emitted programs through the 6.1.0 section pipeline. `gcbinding`
+    references `mmtk::util::Address` to force the link (`nomu_gc_mmtk_probe`). **Gotcha recorded:**
+    MMTk's build script uses the `built` crate, which `.expect()`s the descriptive `CARGO_PKG_*` env
+    vars (AUTHORS/DESCRIPTION/HOMEPAGE/REPOSITORY/LICENSE) that `crate_universe` doesn't propagate —
+    injected via `crate.annotation(build_script_env=…)` or the build panics one var at a time.
+  - **Next in 6.1.1:** the `VMBinding` impl (`ObjectModel`/`Scanning`/`Collection`/`ActivePlan`/
+    `ReferenceGlue` — mostly `unreachable!` under NoGC), MMTk init with the NoGC plan, `rt_alloc` →
+    per-carrier mutator alloc (Q1), then the M5 suite green under NoGC (allocates, never collects).
 - **6.1.2 ⬜** — GC **header** design (mark/log bits in side metadata; in-object **type-id**);
   drop the vestigial `refcount` field. Co-design the log bit so a `write_barrier` interior-GEP
   from `obj` reaches it in one step (6.0.10). Register finalizable objects in a **side table**,

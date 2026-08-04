@@ -1,6 +1,12 @@
 import Foundation
 import driver
 
+// M6 · 6.1.0 — toolchain bring-up probe (temporary; removed once the real binding lands at 6.1.1).
+// Binds the Rust GC-binding symbol so it links into the nomuc build; `--gc-probe` prints its
+// sentinel to confirm the archive both linked and executes.
+@_silgen_name("nomu_gc_probe")
+func nomu_gc_probe() -> UInt64
+
 var options = EmitOptions()
 var file: String? = nil
 
@@ -20,6 +26,9 @@ for arg in CommandLine.arguments.dropFirst() {
               -O, --release      optimize (LLVM -O2); default is a debug build
               -h, --help         show this help
             """)
+        exit(0)
+    case "--gc-probe":
+        print(String(format: "0x%016llX", nomu_gc_probe()))
         exit(0)
     case "--emit-ast":         options.ast = true
     case "--emit-typedir":     options.typedIR = true

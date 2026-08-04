@@ -12,6 +12,27 @@ rust.toolchain(
     versions = [ "1.97.1" ],
 )
 
+# ---- Rust crates (M6 · 6.1.1) — MMTk + its transitive graph via crate_universe, fetched from
+# crates.io. The MMTk version is pinned deliberately (`m6-spec.md` §6.0.8: the binding is the
+# blast-radius boundary; MMTk API churn is a watch item).
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.spec(package = "mmtk", version = "=0.32.0")
+# MMTk's build script uses the `built` crate to embed build metadata; it `.expect()`s the full set
+# of descriptive CARGO_PKG_* vars, which crate_universe's build-script runner does not populate.
+# Inject them or the build panics one var at a time.
+crate.annotation(
+    crate = "mmtk",
+    build_script_env = {
+        "CARGO_PKG_AUTHORS": "The MMTk Developers",
+        "CARGO_PKG_DESCRIPTION": "MMTk core",
+        "CARGO_PKG_HOMEPAGE": "https://www.mmtk.io",
+        "CARGO_PKG_REPOSITORY": "https://github.com/mmtk/mmtk-core",
+        "CARGO_PKG_LICENSE": "MIT OR Apache-2.0",
+    },
+)
+crate.from_specs()
+use_repo(crate, "crates")
+
 # ---- LLVM (M8.1 · 8.1.1) ----
 # The official llvm/llvm-project Bazel overlay (utils/bazel), pinned to LLVM 23, built from
 # source. `llvm_configure` generates @llvm-project//llvm:Core, :Support, … cc_library targets
