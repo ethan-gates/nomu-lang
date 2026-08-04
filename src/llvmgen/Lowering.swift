@@ -52,6 +52,7 @@ final class IRToLLVM {
     private let zeroSpan = Span(file: "", begin: Pos(line: 0, col: 0), end: Pos(line: 0, col: 0))
 
     private var runtimeFns: [String: (fn: LLVMValueRef, ty: LLVMTypeRef)] = [:]
+    private var pollFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // 8.4.2 — the inert `__nomu_poll` seam
     private var intFmt: LLVMValueRef?
     private var strFmt: LLVMValueRef?
 
@@ -800,6 +801,12 @@ final class IRToLLVM {
         LLVMBuildBr(b, headerBB)
         LLVMPositionBuilderAtEnd(b, headerBB)
         setDebugLoc(cond.span)
+        // 8.4.2 (D3): a loop that reaches no safepoint on its own (no non-leaf call and no
+        // allocation in its body) gets an inert safepoint poll each iteration, so a moving GC (M6)
+        // can stop the fiber and bound time-to-safepoint. A loop that already hits a statepoint
+        // every iteration needs none — elide it there. Placed at the top of the header, so every
+        // back-edge (fall-through and `continue`) passes through it.
+        if !loopBodyHasSafepoint(body) { emitSafepointPoll() }
         guard let condV = lowerExpr(cond) else { return }
         let condBit = LLVMBuildICmp(b, LLVMIntNE, condV, LLVMConstInt(i64, 0, 0), "while.cond")
         LLVMBuildCondBr(b, condBit, bodyBB, exitBB)
@@ -1832,7 +1839,97 @@ final class IRToLLVM {
     private func markGCLeaf(_ fn: LLVMValueRef) {
         let name = "gc-leaf-function"
         let attr = LLVMCreateStringAttribute(ctx, name, UInt32(name.utf8.count), "", 0)
-        LLVMAddAttributeAtIndex(fn, LLVMAttributeIndex(bitPattern: Int32(LLVMAttributeFunctionIndex)), attr)
+        LLVMAddAttributeAtIndex(fn, funcAttrIndex, attr)
+    }
+
+    private var funcAttrIndex: LLVMAttributeIndex {
+        LLVMAttributeIndex(bitPattern: Int32(LLVMAttributeFunctionIndex))
+    }
+
+    // MARK: - Safepoint poll (8.4.2, D3)
+
+    // The `__nomu_poll` seam: an `alwaysinline` stub with a trivial (no-op) body, emitted at loop
+    // back-edges that would otherwise be safepoint-free (D5's seam shape). It is `gc-leaf-function`
+    // so the rewrite pass leaves it a plain call (not a statepoint) — inert now (a call into an
+    // empty function; the poll page/flag is never armed). M6 fills the body with the real poll
+    // (protected-page load or branch-on-flag, D3) and its inline fast path replaces the call.
+    private func nomuPoll() -> (LLVMValueRef, LLVMTypeRef) {
+        if let p = pollFn { return p }
+        let ty = fnType(voidTy, [])
+        let fn = LLVMAddFunction(mod, "__nomu_poll", ty)!
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        markGCLeaf(fn)
+        let ai = LLVMGetEnumAttributeKindForName("alwaysinline", "alwaysinline".utf8.count)
+        LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, ai, 0))
+        // Build the no-op body without disturbing the caller's builder position / debug location
+        // (the stub carries no subprogram, so a foreign `!dbg` would trip the verifier).
+        let savedBlock = LLVMGetInsertBlock(b)
+        let savedLoc = di != nil ? LLVMGetCurrentDebugLocation2(b) : nil
+        if di != nil { LLVMSetCurrentDebugLocation2(b, nil) }
+        LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, fn, "entry"))
+        LLVMBuildRetVoid(b)
+        if let savedBlock = savedBlock { LLVMPositionBuilderAtEnd(b, savedBlock) }
+        if di != nil { LLVMSetCurrentDebugLocation2(b, savedLoc) }
+        pollFn = (fn, ty)
+        return pollFn!
+    }
+
+    private func emitSafepointPoll() {
+        let p = nomuPoll()
+        _ = buildCall(p.0, p.1, [])
+    }
+
+    // Whether a loop body reaches a GC safepoint on its own each iteration — i.e. unconditionally
+    // performs a non-leaf call or a heap allocation (both become statepoints after the rewrite). If
+    // so, the loop needs no back-edge poll (D3 elision). Conservative in the safe direction: only
+    // the body's *top-level* statements count (a safepoint nested in an `if`/`while`/`switch` arm
+    // may not run every iteration), so when unsure we place the poll. This is the IR-level
+    // approximation of D3; M6 re-audits against precise codegen safepoints when the collector is live.
+    private func loopBodyHasSafepoint(_ stmts: [IRStmt]) -> Bool {
+        for s in stmts {
+            switch s.kind {
+            case .letBinding(_, _, let v): if exprHasSafepoint(v) { return true }
+            case .assign(let t, let v), .compoundAssign(let t, let v):
+                if exprHasSafepoint(t) || exprHasSafepoint(v) { return true }
+            case .ret(let e): if let e = e, exprHasSafepoint(e) { return true }
+            case .exprStmt(let e): if exprHasSafepoint(e) { return true }
+            case .spawnLet: return true   // fiber_spawn + rt_alloc — a safepoint
+            case .ifStmt, .whileStmt, .switchStmt, .breakStmt, .continueStmt: break
+            }
+        }
+        return false
+    }
+
+    // Whether evaluating `e` unconditionally hits a safepoint: a non-leaf call, a method/witness
+    // dispatch, or a heap allocation. Leaf builtins (`print`, `concat`, string literals) and pure
+    // value construction (struct/enum) are not safepoints, but their sub-expressions still execute.
+    private func exprHasSafepoint(_ e: IRExpr) -> Bool {
+        switch e.kind {
+        case .intLit, .boolLit, .stringLit, .varRef:
+            return false
+        case .fieldAccess(let base, _):
+            return exprHasSafepoint(base)
+        case .binary(_, let l, let r):
+            return exprHasSafepoint(l) || exprHasSafepoint(r)
+        case .construct(let name, let args):
+            if classMap[name] != nil || actorMap[name] != nil { return true }   // rt_alloc
+            return args.contains { exprHasSafepoint($0.value) }
+        case .enumInit(_, _, let args):
+            return args.contains { exprHasSafepoint($0.value) }
+        case .box, .closure:
+            return true   // rt_alloc (the any-box / the fused closure object)
+        case .methodCall:
+            return true   // dispatches to user / witness code (non-leaf)
+        case .call(let callee, let args, _):
+            if case .varRef(let n) = callee.kind {
+                switch n {
+                case "print", "concat": return args.contains { exprHasSafepoint($0.value) }   // leaf
+                case "sleep", "readLine": return true                                          // non-leaf runtime
+                default: return true                                                            // user function
+                }
+            }
+            return true   // indirect closure call
+        }
     }
 
     private func buildCall(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?]) -> LLVMValueRef? {

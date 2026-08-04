@@ -406,14 +406,19 @@ follow-on. Deps: 8.2 (asm/mutex), 8.4 (opt↔statepoint ordering).
 
 
 ### post m8 ideas
-- compiler architecture review for perf
-- llvm -O flag forwarding
-- cleanup llvm experiments
-- cleanup test
-- profile `time nomuc -h` taking 500ms
+- comptime
+  - compiler architecture review for perf
+  - compiler perf diagnostics by default
 - discuss module level interface as input
+- dead code stripping
+- runtime
+  - llvm -O flag forwarding
+  - profile `time nomuc -h` taking 500ms
+- cleanup llvm experiments
 - start prioritizing stdlib via language benchmarks (post GC)
   - lowest nomu primitives (string, collections, byte buffers, raw memory)
   - swiss tables
-- dead code stripping
-- bazel usage
+- pipeline
+  - emission options
+  - intermediate based iso regression
+  - bazel usage
