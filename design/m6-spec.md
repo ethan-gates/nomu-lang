@@ -537,31 +537,160 @@ MMTk calls back for `scan_object`.
     representational change (String becomes a reference in the value model). Deferred to **6.2**: under
     NoGC nothing collects, so the current runtime-owned `addr0` buffer is correct until tracing turns
     on; the immortal-space (literals) and large-object-space (big strings) routing also belong there.
+  - **Update (2026-08-05): heap-boxing deferred past the flip; the flip uses the immortal interim.**
+    Heap-boxing was implemented + reverted — it makes every struct/enum with a String field a
+    category-3 aggregate (FCA-across-statepoint), so full Q6 needs the D6 spill seam first. The Immix
+    flip instead keeps `String` as `{ addr0, i64 }` and routes its buffers to immortal space. See the
+    6.2.4 slice record for the finding and the sequencing.
 
 **Exit:** the full M5 suite compiles and runs under MMTk NoGC (allocates, never collects);
 every heap shape has a pointer map `scan_object` walks without error (a map-walk self-check
 passes); no `refcount` field remains.
 
-## 6.2 · Precise roots, safepoints & the moving collector (Immix) ⬜
+## 6.2 · Precise roots, safepoints & the moving collector (Immix) 🔨
 
 One-line intent: the correctness+moving core — objects relocate, roots are precise, collection
 reclaims memory including cycles. Depends on 6.1 + M8 statepoints. **Approach:** MMTk plain
 **Immix** (moving; no generational barrier yet — validates evacuation + maps barrier-free).
 
-- **6.2.1 ⬜** — consume LLVM **stack maps** at statepoints; MMTk `scan_roots` over live
-  carrier frames + globals.
-- **6.2.2 ⬜** — **global live-fiber registry** (Q8 — intrusive doubly-linked list, lock-guarded,
-  O(1) insert/remove at spawn/complete); scan **parked fiber stacks** by seeding the existing
-  `nomu_gc_walk_current` from the saved `ucontext` (build a `unw_context_t` from the fiber's saved
-  registers). Blocking-syscall fibers **checkpoint at the offload statepoint and present as parked**
-  (STW does not wait for the offload carrier). Invariants: all suspension via `park()` (statepoint);
-  STW quiesces before iterating the registry; the saved context carries callee-saved roots (x19–x28).
-  Validate via a parked-fiber `tools/gc-smoke.sh` case (6.0.5).
-- **6.2.3 ⬜** — **STW handshake**: per-carrier stop-requested flag; `__nomu_poll` lowered to
-  **branch-on-flag** → `__nomu_gc_poll_slow` statepoint call (Q3); density stays the 8.4 placement
-  with the **`-O` safepoint-coverage-preservation rule** (Q4); parked/blocked fibers already safe.
-- **6.2.4 ⬜** — evacuation correctness: references updated on relocation; no stale interior
-  pointers; pinning (if any) honored.
+- **6.2.1 🔨 pipeline wired (inert until the plan flips) — consume LLVM stack maps; MMTk `scan_roots`
+  over carrier frames + globals.**
+  - **Fixed a latent correctness bug first: `-dead_strip` was stripping `__llvm_stackmaps`.** The
+    6.1.1 emitted-program `-Wl,-dead_strip` (added for binary size) was discarding the whole stackmap
+    section — it carries no symbol reference (the runtime finds it by name via `getsectiondata` at
+    load), and its anchor `__LLVM_StackMaps` is a *local* symbol, so nothing pinned it. This silently
+    defeated the precise root walk from 6.1.1 onward; unnoticed because `gc_smoke` is env-gated and
+    off the corpus regression. Fix: codegen appends a module-level `.no_dead_strip __LLVM_StackMaps`
+    directive (`LLVMBridge.swift`) — marks that one atom non-strippable while dead-strip still drops
+    the unreachable MMTk closure (binary stays ~2.7 MB). Needed `LLVMInitializeNativeAsmParser` (the
+    object streamer assembles module inline asm) + the `AllTargetsAsmParsers` LLVM dep. A boundary
+    `section$start$…` symbol was tried first and rejected (keeps the section header, not the content
+    atom); `-Wl,-u` too (local symbol). *Watch item:* dead-strip and the by-name stackmap section
+    conflict — any change to the link or to how the section is anchored must preserve this.
+  - **Walk refactored to take a saved context.** `nomu_gc_walk_current` split into
+    `nomu_gc_walk_context(unw_context_t*, …)` (the shared core) + the current-stack wrapper, plus
+    `nomu_gc_walk_carrier(carrier_tls, …)` — the stopped-carrier walk the binding drives. The carrier
+    context source (`gc_carrier_context`) is the **6.2.3 STW seam** (returns NULL until the handshake
+    saves each carrier's context at its safepoint), so no carrier is walked yet.
+  - **Binding `scan_roots_in_mutator_thread` wired (`gcbinding/lib.rs`).** Extracts the carrier tls
+    from the MMTk `Mutator`, drives `nomu_gc_walk_carrier` with a C-ABI visitor that collects each
+    root **slot** (the stack location, updatable) as a `SimpleSlot`, and hands them to
+    `factory.create_process_roots_work` — precise, not conservative. `scan_vm_specific_roots` is empty
+    (no mutable globals today; parked-fiber stacks are 6.2.2). Inert under NoGC (`scan_roots` is never
+    called); exercised when the plan flips to Immix.
+  - **`gc_smoke` fixture/assertions updated** for the 6.1.3 closure-header shift (offset 8 is now
+    `fn`, not the captured 444) — the walk recovers the 5 live roots {111×2, 222, 333, closure} across
+    two frames, dead 999 excluded; `tools/gc-smoke.sh` green again.
+- **6.2.2 🔨 built + validated (inert until the plan flips) — global live-fiber registry + parked
+  fiber stack scanning.**
+  - **Registry (Q8).** `Fiber` gained `rt_prev/rt_next`; a global `rt_fiber_list` guarded by
+    `rt_queue_mu` (spawn/complete already hold it — off the hot path). O(1) insert at
+    `fiber_spawn`, O(1) remove at completion (`runtime.c`). A new `FIBER_RUNNING` status marks an
+    on-CPU fiber (set by the scheduler at schedule-in): it is scanned through its carrier (6.2.1) and
+    skipped by the registry scan, so its stale saved `ctx` is never walked.
+  - **Parked-stack walk.** `nomu_gc_walk_fiber` fabricates a `unw_context_t` from a fiber's saved
+    `ucontext` and drives the 6.2.1 `nomu_gc_walk_context`. On arm64 libunwind's register file is
+    x0–x28, fp, lr, sp, pc — same order as the saved `arm_thread_state64`, so they copy 1:1.
+    **Finding: Darwin `getcontext`/`swapcontext` saves no PC** (resume is via LR); seed the unwind
+    with LR (the return address just past the fiber's `swapcontext`, inside the gc-leaf park frame) so
+    it steps out to the Nomu frames. `nomu_gc_scan_parked_fibers` iterates the registry and walks only
+    PARKED fibers (a woken fiber stays PARKED until scheduled; RUNNABLE is the never-run state with no
+    roots; RUNNING goes via its carrier) — the binding's `scan_vm_specific_roots` reports the slots to MMTk
+    (`gcbinding/lib.rs`). Taking `rt_queue_mu` at STW is safe: a carrier stopped at a safepoint is
+    never inside a scheduler critical section (6.2.3 quiesce guarantees it).
+  - **Blocking-syscall fibers.** No separate offload carrier exists in the M4 runtime — all blocking
+    (`sleep`, `read`) goes through `park()` (swapcontext to the scheduler), so a blocked fiber is
+    already PARKED with a saved context the registry scan covers. The "checkpoint-and-present-as-
+    parked" handling applies if/when a true syscall-offload carrier is added.
+  - **Validation (the highest-risk item, done).** `examples/gc_smoke_parked.nomu` +
+    `tools/gc-smoke-parked.sh`: a `worker` fiber holds two class roots live across its `sleep(200)`
+    park while `main`'s safepoint waits for it to park, then walks its saved context via the registry
+    — recovers exactly {111, 222}, excludes the dead 999. Deterministic (10/10); concurrency corpus
+    race-free under repeat runs. The 6.2.1 current-stack smoke still passes.
+- **6.2.3 🔨 built + validated (runtime handshake done; MMTk `Collection` wrappers await the flip) —
+  STW handshake.**
+  - **Poll lowered (Q3 branch-on-flag).** `__nomu_poll` (`Lowering.swift`) now loads the process
+    stop-world flag `@__nomu_stop_world`; unset → fall through (bare volatile load + test + branch, no
+    statepoint); set → call `__nomu_gc_poll_slow`, which is **not** `gc-leaf`, so that call is a
+    statepoint whose stack map records the loop's live roots. Added `always-inline` to the debug pass
+    pipeline (`LLVMBridge.swift`) so the seam's fast path collapses into the loop and only the cold
+    slow path carries statepoint cost (Q4 cheap poll). `-O2` already inlines; the volatile load + the
+    external `__nomu_gc_poll_slow` call are non-removable / non-hoistable, so **O2 keeps the loop's
+    safepoint** (Q4 `-O` coverage rule — verified on a release build of the bare-loop fixture).
+  - **Runtime handshake (`runtime.c`).** `nomu_gc_stop_the_world` raises the flag, kicks idle carriers
+    out of their scheduler wait, and waits until every carrier has parked; `nomu_gc_resume_the_world`
+    clears it and wakes them. A running carrier parks in `__nomu_gc_poll_slow` (captures its context
+    via `unw_getcontext` — the walk unwinds through the poll frame to the loop roots, filling the
+    6.2.1 `gc_carrier_context` seam); an idle/dispatching carrier parks at the scheduler loop top with
+    no context (no roots). A per-carrier control block (`CarrierCB`, registered on scheduler entry)
+    holds the parked flag + saved context. **Flag granularity:** a single read-mostly global rather
+    than the Q3 per-carrier flag — identical correctness for a full STW; per-carrier is a deferred
+    perf refinement (noted in the code).
+  - **Validation.** `examples/gc_smoke_stw.nomu` + `tools/gc-smoke-stw.sh`: a background thread stops
+    the world while a compute fiber spins (root 777, held across its back-edge poll) and a fiber is
+    parked (root 888), scans both, and resumes. Recovers the running root via the carrier's saved poll
+    context (6.2.1) and the parked root via the registry (6.2.2), and the program runs to completion —
+    proving quiesce + resume. Deterministic 5/5 (debug) + green under `-O2`.
+  - **Deferred to the flip:** the MMTk `Collection` wrappers (`stop_all_mutators` → the runtime stop +
+    per-mutator visit, `resume_mutators`, `block_for_gc`, `spawn_gc_thread`) and `ActivePlan::mutators`
+    — they need MMTk mutator enumeration and a collecting plan to fire (`gcbinding/lib.rs`).
+- **6.2.4 ✅ — the NoGC→Immix flip (collection first runs) + evacuation correctness.** The convergence
+  step: it wired the currently-`unimplemented!()` MMTk callbacks and switched the plan, so tracing +
+  evacuation now run. Built (all in `gcbinding/lib.rs` unless noted):
+  - **Per-object size table** (`get_current_size` / `get_size_when_copied`). Codegen emits
+    `nomu_gc_typemap_sizes` parallel to the 6.1.3 pointer maps (`Lowering.swift` `registerMap` now
+    takes a byte size; class = `(1+Σslots)·8`, actor = `+1` for the mutex slot, closure =
+    `(2+Σcaptures)·8`, any-box = 24). The runtime exposes `nomu_gc_typesize(type_id)` (`runtime.c`);
+    `get_current_size` reads it via the header type-id. No header change. The `NOMU_GC_TYPEMAPS`
+    self-check dump now prints sizes too.
+  - **`ObjectModel` copy paths** — `copy` (evacuate: `alloc_copy` + flat byte move + `post_copy`),
+    `copy_to` (overlap-safe, for a future compacting plan), `get_reference_when_copied_to`, and a
+    constant 8-byte alignment. Size drives the byte move; the header rides along, managed fields are
+    updated separately by `scan_object`.
+  - **MMTk `Collection` + `ActivePlan`** — a **mutator registry** (`MUTATORS`, pushed at
+    `nomu_gc_bind_mutator`) backs `number_of_mutators`/`mutator`/`mutators`. `stop_all_mutators` wraps
+    `nomu_gc_stop_the_world` then visits each mutator; `resume_mutators` wraps the resume;
+    `spawn_gc_thread` runs a worker on its own OS thread via `start_worker`. `nomu_gc_init` sets
+    `threads=1` and calls `initialize_collection`. Also filled the reachable `Scanning` hooks
+    (`notify_initial_thread_scan_complete` no-op, `supports_return_barrier` false).
+  - **`block_for_gc` — new runtime coordination (`runtime.c`).** A carrier that triggers GC inside
+    `nomu_gc_alloc` (not at a Nomu poll) calls `nomu_gc_block_for_gc`: it `unw_getcontext`s itself,
+    marks its `CarrierCB` parked + saves the context (so its roots scan like any stopped carrier), sets
+    the new `rt_gc_wanted` flag, and blocks until `nomu_gc_resume_the_world` clears it. `rt_gc_wanted`
+    (not `__nomu_stop_world`, which the GC worker raises a moment later) is the wait predicate — that
+    closes the ordering race where the initiator parks before the stop flag is up. The alloc call is a
+    statepoint (`rt_alloc`/`nomu_gc_alloc` stay non-`gc-leaf`), so the walk from the saved context finds
+    the caller's roots.
+  - **`post_alloc` now called** (`alloc_semantic` helper) after every alloc — initializes the VO/log/mark
+    metadata a collecting plan needs; a no-op under NoGC, so this was latent-correct before the flip.
+  - **String → immortal space** (the interim below). New `nomu_gc_alloc_immortal` (semantics
+    `Immortal`, non-moving/non-collected) + `rt_alloc_immortal` (`runtime.c`); `rt_str_concat`
+    (`core.c`) and `rt_read_line` (`runtime.c`) route their buffers there so `{ addr0, i64 }` survives
+    moving GC. `rt_str_lit` already wraps rodata.
+  - **`PlanSelector` NoGC → Immix**, default. `NOMU_GC_PLAN=nogc` keeps the pre-flip plan for
+    differential debugging; `NOMU_GC_STRESS=<bytes>` sets `stress_factor` + `precise_stress` +
+    `immix_always_defrag` (a precise collect every N bytes that *evacuates* every cycle, so the copy
+    paths actually run — Immix only moves on defrag).
+  - **Validation.** Corpus green under Immix (default). Under `NOMU_GC_STRESS=1024` (collect + evacuate
+    constantly) all 34 corpus programs are **byte-identical** to their baseline output — covering
+    classes, actors, closures, any-boxes, enums, generics. `examples/gc_stress.nomu` (dedicated
+    evacuation fixture: live roots + managed interior refs relocated across ~hundreds of GCs, garbage
+    reclaimed) matches NoGC. All three 6.2.x smokes still pass under Immix. Deviation from the plan:
+    validated by the stress/differential corpus rather than a separate bounded-memory loop or an added
+    mutation-freeze counter — the byte-identical corpus under constant evacuation is the stronger test.
+
+  **String decision (2026-08-05): immortal interim, not heap-boxing (yet).** Heap-boxing `String` (Q6:
+  a `p1` to `{ header, len, bytes }`) was implemented and **reverted**. It works for scalar strings
+  (`hello`/`strings` green) but makes every **struct/enum with a String field** a *category-3* value
+  aggregate — values mixed with a GC pointer — which `RewriteStatepointsForGC` cannot relocate across a
+  statepoint ("FCA unimplemented"). The 6.0.10 audit found zero category-3 sites precisely because
+  String was not a reference; heap-boxing creates them everywhere (any `struct T: I` with a `String`
+  field, wherever it crosses a call — method `self` by value, struct params/returns, `boxPayload`). Full
+  Q6 therefore needs the **D6 category-3 spill seam first** (pass ref-carrying value aggregates by
+  memory + a runtime root-slot scan), a pervasive lowering change. To reach a running moving collector
+  without that slice, keep `String` as `{ addr0, i64 }` and route its buffers to immortal space (above):
+  no category-3, strings simply never move/collect (they leak) until heap-boxed later. **Follow-up:**
+  the D6 spill seam + real Q6 heap-boxing (making strings collectable) after the flip.
 
 **Exit:** allocate-in-a-loop runs in **bounded memory**; cycle-forming and graph-heavy
 programs are collected (tracing beats the retired RC); objects survive relocation intact; M5

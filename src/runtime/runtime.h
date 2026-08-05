@@ -33,6 +33,7 @@ typedef struct { Fiber* fiber; } SpawnHandle;
 
 // ---- Allocation seam (privileged; the heap alloc/free the generated code uses) ----
 void* rt_alloc(size_t size);
+void* rt_alloc_immortal(size_t size);   // M6 · 6.2.4 — non-moving String buffers (immortal interim)
 void  rt_free(void* p);
 
 // ---- Core floor: pure value primitives ----
@@ -63,5 +64,17 @@ typedef void (*nomu_root_visitor)(void** slot, void* value, void* userdata);
 // (D4 single-stack walk). Shaped for M6 reuse: it drives a libunwind cursor, so a parked fiber's
 // saved context can be walked the same way (M6 passes the fiber's context instead of the current).
 void nomu_gc_walk_current(nomu_root_visitor visit, void* userdata);
+// M6 · 6.2.1 — walk a stopped carrier's stack for GC roots. `carrier_tls` is the carrier's opaque
+// token (the `pthread_self` handed to `nomu_gc_bind_mutator`). At STW the carrier is parked at a
+// safepoint and its register context saved; this walks that context the same way as the current
+// stack. The MMTk binding calls this from `scan_roots_in_mutator_thread`. Until the STW handshake
+// saves contexts (6.2.3) no carrier is ever stopped for GC, so this reports no roots.
+void nomu_gc_walk_carrier(void* carrier_tls, nomu_root_visitor visit, void* userdata);
+// M6 · 6.2.2 — walk one parked fiber's stack (seeded from its saved `ucontext`), and over the whole
+// live-fiber registry, every parked fiber's stack (only PARKED has a root-bearing saved context; the
+// on-CPU fiber is scanned via its carrier, a never-run RUNNABLE fiber holds no roots). The MMTk
+// binding calls the latter from `scan_vm_specific_roots`. Inert until collection turns on.
+void nomu_gc_walk_fiber(Fiber* f, nomu_root_visitor visit, void* userdata);
+void nomu_gc_scan_parked_fibers(nomu_root_visitor visit, void* userdata);
 
 #endif

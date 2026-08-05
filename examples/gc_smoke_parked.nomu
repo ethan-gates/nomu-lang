@@ -1,0 +1,28 @@
+// M6 · 6.2.2 — parked-fiber GC root-walk smoke fixture. The highest-risk item (Q8): recover a
+// *parked* fiber's exact live set from its saved `ucontext`, not from the running stack.
+//
+// `worker` builds two live class objects and one dead one, then parks at `sleep(200)` holding the
+// live pair across the safepoint. While it is parked, `main`'s own `sleep(10)` safepoint fires the
+// env-gated parked scan (runtime.c, scoped to the `main` fiber): it waits until `worker` has parked,
+// then walks `worker`'s saved context via the live-fiber registry and reports each recovered root.
+// Live set: { 111, 222 } (both live across worker's park); the dead 999 (last used before the park)
+// must be absent. A class is { i64 header, i64 v }, so offset 8 is the known Int. Normal run prints
+// 999 then 333. Checked by tools/gc-smoke-parked.sh.
+class Box {
+  var v: Int
+}
+
+fun worker() -> Int {
+  let a = Box(v: 111)
+  let b = Box(v: 222)
+  let dead = Box(v: 999)              // used only below — dead at the park
+  print(dead.v)                       // 999 (dead's last use)
+  sleep(200)                          // park holding a, b live across the safepoint
+  return a.v + b.v                    // 333
+}
+
+fun main() {
+  spawn let r = worker()              // worker runs and parks at its sleep(200)
+  sleep(10)                           // main's safepoint: scan worker while it is parked (smoke)
+  print(r)                            // 333 — joins worker
+}

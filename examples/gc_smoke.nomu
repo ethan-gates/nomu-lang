@@ -7,11 +7,12 @@
 //     capturing 444). `dead` (999) is created and last-used BEFORE the sleep, so it is NOT live and
 //     must not appear.
 //   - main's frame:  `b` (class object 222), live across the call to `inner`.
-// Each object's known Int sits at offset 8 (a class is { i64 header, i64 v }; a closure box is
-// { fn, captures… } with the first capture at offset 8), so the walk dereferences offset 8 to prove
-// each root is the real live object. Live set (distinct): { 111, 222, 333, 444 } — 111 is the same
-// object seen in both frames (a in main, x in inner); 999 must be absent. Normal run prints 999,
-// 888, 222. Checked by tools/gc-smoke.sh.
+// A class is { i64 header, i64 v }, so its known Int sits at offset 8; the walk dereferences offset 8
+// to prove each class root is the real live object. The closure box is { i64 header, fn, captures… }
+// (6.1.3 added the header), so its offset 8 is `fn` (a code pointer), not the captured 444 — the
+// closure is checked as a recovered root, not by value. Live root set: the class objects 111 (seen in
+// both frames — a in main, x in inner), 222, 333, plus the heap-boxed closure = 5 roots; the dead
+// object 999 must be absent. Normal run prints 999, 888, 222. Checked by tools/gc-smoke.sh.
 class Box {
   var v: Int
 }

@@ -1,0 +1,32 @@
+// M6 · 6.2.4 — moving-GC evacuation stress. Under NOMU_GC_STRESS=<bytes> the collector runs (and,
+// with always-defrag, evacuates) repeatedly while this loop allocates garbage. The live objects must
+// be traced, moved, and have every reference to them updated:
+//   - `inner` / `pair` are live roots on the stack (their slots must be rewritten to the new address).
+//   - `pair.a` / `pair.b` are managed *interior* references (scanned via the 6.1.3 pointer map, then
+//     updated) — reading them at the end proves evacuation fixed the fields, not just the roots.
+//   - `g` is per-iteration garbage the collector reclaims.
+// Run: NOMU_GC_STRESS=2048 build/examples/gc_stress  → prints 42, 7, then 499500.
+class Box {
+  var v: Int
+}
+
+class Pair {
+  var a: Box
+  var b: Box
+}
+
+fun main() {
+  let inner = Box(v: 42)
+  let pair = Pair(a: inner, b: Box(v: 7))
+  var sum = 0
+  var i = 0
+  while i < 1000 {
+    let g = Box(v: i)          // garbage: dead after this iteration
+    sum = sum + g.v
+    i = i + 1
+  }
+  print(pair.a.v)              // 42 — interior ref relocated + field updated
+  print(pair.b.v)              // 7
+  print(inner.v)              // 42 — live root relocated
+  print(sum)                   // 0+1+...+999 = 499500
+}

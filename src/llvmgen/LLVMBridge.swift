@@ -14,6 +14,9 @@ public func emitObject(_ module: IRModule, to path: String, optimize: Bool = fal
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
     guard LLVMInitializeNativeAsmPrinter() == 0 else { return "LLVM: no native asm printer configured" }
+    // The object streamer assembles module-level inline asm (the `.no_dead_strip` stackmap keep, 6.2.1)
+    // through the target's asm parser, so it must be registered too.
+    guard LLVMInitializeNativeAsmParser() == 0 else { return "LLVM: no native asm parser configured" }
 
     let ctx = LLVMContextCreate()!
     defer { LLVMContextDispose(ctx) }
@@ -56,6 +59,16 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     else { return "LLVM: failed to create target machine" }
     defer { LLVMDisposeTargetMachine(tm) }
 
+    // M6 · 6.2.1 — keep the LLVM stackmaps alive under the emitted-program link's `-dead_strip`
+    // (6.1.1, for binary size). The stackmap section carries no symbol reference (the runtime finds
+    // it by name at load time via getsectiondata), and its anchor `__LLVM_StackMaps` is a *local*
+    // symbol in this object, so nothing in another object can pin it and global dead-strip would drop
+    // it — silently defeating precise root scanning. A module-level `.no_dead_strip` directive marks
+    // that one atom non-strippable while the rest of dead-strip's win (the unreachable MMTk closure)
+    // is unaffected. Harmless no-op for a statepoint-free program (the symbol is simply absent).
+    let keepStackmaps = ".no_dead_strip __LLVM_StackMaps\n"
+    keepStackmaps.withCString { LLVMAppendModuleInlineAsm(mod, $0, keepStackmaps.utf8.count) }
+
     // Stamp the target's data layout onto the module so it and the object agree.
     let dl = LLVMCreateTargetDataLayout(tm)
     let dlStr = LLVMCopyStringRepOfTargetData(dl)
@@ -76,9 +89,12 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     // introduced only after optimization.
     let opts = LLVMCreatePassBuilderOptions()
     defer { LLVMDisposePassBuilderOptions(opts) }
+    // `always-inline` (M6 · 6.2.3) collapses the mutator seams (poll / alloc / write-barrier) into
+    // their call sites before the statepoint rewrite, so the poll's fast path is a bare load+branch
+    // and only its cold slow-path call carries a statepoint. `default<O2>` already inlines.
     let pipeline = optimize
         ? "default<O2>,rewrite-statepoints-for-gc"
-        : "function(mem2reg,sroa),rewrite-statepoints-for-gc"
+        : "function(mem2reg,sroa),always-inline,rewrite-statepoints-for-gc"
     if let err = LLVMRunPasses(mod, pipeline, tm, opts) {
         let m = LLVMGetErrorMessage(err).map { String(cString: $0) } ?? "unknown"
         LLVMConsumeError(err)

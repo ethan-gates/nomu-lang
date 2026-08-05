@@ -1,0 +1,35 @@
+// M6 · 6.2.3 — stop-the-world handshake smoke fixture. Exercises the full STW cycle with no real
+// collection: while a compute fiber spins in a bare loop (reaching a safepoint only at its back-edge
+// poll) holding a live root, and another fiber is parked holding a root, a runtime background thread
+// stops the world, scans every root the collector would, and resumes.
+//
+// `spin` loops holding its Box param (777) live across the loop — a *running* root the STW captures
+// via the carrier's saved poll context (6.2.1). `parker` parks holding Box(888) — a *parked* root
+// found via the live-fiber registry (6.2.2). The env-gated driver (NOMU_GC_STW_SMOKE) reports the
+// recovered roots on stderr; the program must run to completion, proving resume releases cleanly.
+// Checked by tools/gc-smoke-stw.sh.
+class Box {
+  var v: Int
+}
+
+fun spin(x: Box) -> Int {
+  var i = 0
+  var acc = 0
+  while i < 2000000000 {        // long bare loop → a back-edge poll each iteration; x live across it
+    acc = acc + x.v
+    i = i + 1
+  }
+  return acc
+}
+
+fun parker() -> Int {
+  let p = Box(v: 888)
+  sleep(200)                    // park holding p live across the safepoint
+  return p.v
+}
+
+fun main() {
+  spawn let s = spin(Box(v: 777))   // a carrier runs this compute loop
+  spawn let q = parker()            // another fiber parks holding a root
+  print(s + q)                      // joins both
+}

@@ -25,6 +25,9 @@ swift_library(
         "@llvm-project//llvm:CodeGen",
         "@llvm-project//llvm:MC",
         "@llvm-project//llvm:AllTargetsCodeGens",
+        # 6.2.1: the host asm parser, which LLVMInitializeNativeAsmParser registers — the object
+        # streamer needs it to assemble the module-level `.no_dead_strip` inline asm (stackmap keep).
+        "@llvm-project//llvm:AllTargetsAsmParsers",
         # 8.4.1: the new-PM runner (LLVMRunPasses) + all transform libraries, incl.
         # RewriteStatepointsForGC (Scalar) and mem2reg/sroa (Utils/Scalar). The GC pass
         # pipeline (mem2reg/sroa → rewrite-statepoints-for-gc) is driven from here.

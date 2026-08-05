@@ -6,25 +6,26 @@
 #define _XOPEN_SOURCE 600
 #define _DARWIN_C_SOURCE
 #include "runtime.h"
+#include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #include <time.h>
-#include <unistd.h>
 #include <ucontext.h>
-#include <stdint.h>
+#include <unistd.h>
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
 #ifdef __APPLE__
-#include <sys/event.h>
 #include <mach-o/getsect.h>
-#include <mach-o/ldsyms.h>   // _mh_execute_header (M8.4.3: locate __llvm_stackmaps)
+#include <mach-o/ldsyms.h> // _mh_execute_header (M8.4.3: locate __llvm_stackmaps)
+#include <sys/event.h>
 #endif
 
 // ---- GC binding (MMTk, M6 · 6.1.1) — implemented in Rust (src/gcbinding), NoGC to start ----
-extern void  nomu_gc_init(size_t heap_bytes);
+extern void nomu_gc_init(size_t heap_bytes);
 extern void* nomu_gc_bind_mutator(void* tls);
 extern void* nomu_gc_alloc(void* mutator, size_t size, size_t align);
+extern void* nomu_gc_alloc_immortal(void* mutator, size_t size, size_t align);
 
 // One MMTk mutator per carrier thread (Q1). Bound lazily on the thread's first allocation; a fiber
 // migrating carriers allocates against whichever carrier it currently runs on (thread-local storage
@@ -36,9 +37,29 @@ static _Thread_local void* rt_mutator = NULL;
 // zero it to preserve the previous `calloc` contract (Nomu relies on zero-initialized fields) — this
 // also zeroes the `ObjectHeader.type_id` (6.1.2), which codegen fills in at 6.1.3.
 void* rt_alloc(size_t size) {
-    if (!rt_mutator) rt_mutator = nomu_gc_bind_mutator((void*)pthread_self());
+    if (!rt_mutator) {
+        rt_mutator = nomu_gc_bind_mutator((void*)pthread_self());
+    }
     void* p = nomu_gc_alloc(rt_mutator, size, 8);
-    if (!p) { fputs("out of memory\n", stderr); exit(1); }
+    if (!p) {
+        fputs("out of memory\n", stderr);
+        exit(1);
+    }
+    memset(p, 0, size);
+    return p;
+}
+
+// Immortal allocation seam (M6 · 6.2.4): non-moving, never-collected memory for String buffers under
+// the moving collector (the immortal interim, Q6). Same lazy-bind + zero contract as rt_alloc.
+void* rt_alloc_immortal(size_t size) {
+    if (!rt_mutator) {
+        rt_mutator = nomu_gc_bind_mutator((void*)pthread_self());
+    }
+    void* p = nomu_gc_alloc_immortal(rt_mutator, size, 8);
+    if (!p) {
+        fputs("out of memory\n", stderr);
+        exit(1);
+    }
     memset(p, 0, size);
     return p;
 }
@@ -49,14 +70,30 @@ void* rt_alloc(size_t size) {
 extern const int32_t nomu_gc_typemap_data[];
 extern const int32_t nomu_gc_typemap_index[];
 extern const int64_t nomu_gc_typemap_count;
+// Parallel per-type-id total object byte size (M6 · 6.2.4): `_sizes[id]` = the fixed size of every
+// object of that type (header included). Codegen emits it beside the pointer maps.
+extern const int32_t nomu_gc_typemap_sizes[];
 
 // Managed-field byte offsets for a type-id (NULL if out of range); *out_count receives the count.
 // The binding's `scan_object` and the self-check below both walk objects through this.
 const int32_t* nomu_gc_typemap(uint64_t type_id, int32_t* out_count) {
-    if (type_id >= (uint64_t)nomu_gc_typemap_count) { *out_count = 0; return NULL; }
+    if (type_id >= (uint64_t)nomu_gc_typemap_count) {
+        *out_count = 0;
+        return NULL;
+    }
     const int32_t* entry = &nomu_gc_typemap_data[nomu_gc_typemap_index[type_id]];
     *out_count = entry[0];
     return entry + 1;
+}
+
+// Total object byte size for a type-id (M6 · 6.2.4). The binding's `ObjectModel::get_current_size`
+// reads this to size an object for copying — every object of a given type-id is this fixed size.
+// Returns 0 for an out-of-range id (a bug: every live object carries a codegen-assigned id).
+uint64_t nomu_gc_typesize(uint64_t type_id) {
+    if (type_id >= (uint64_t)nomu_gc_typemap_count) {
+        return 0;
+    }
+    return (uint64_t)nomu_gc_typemap_sizes[type_id];
 }
 
 // Map-walk self-check (6.1 exit): dump every type's pointer map. Gated by NOMU_GC_TYPEMAPS so it is
@@ -64,9 +101,13 @@ const int32_t* nomu_gc_typemap(uint64_t type_id, int32_t* out_count) {
 static void nomu_gc_dump_typemaps(void) {
     fprintf(stderr, "typemaps: %lld\n", (long long)nomu_gc_typemap_count);
     for (int64_t id = 0; id < nomu_gc_typemap_count; id++) {
-        int32_t n; const int32_t* offs = nomu_gc_typemap((uint64_t)id, &n);
-        fprintf(stderr, "  type %lld: %d managed [", (long long)id, n);
-        for (int32_t i = 0; i < n; i++) fprintf(stderr, "%s%d", i ? " " : "", offs[i]);
+        int32_t n;
+        const int32_t* offs = nomu_gc_typemap((uint64_t)id, &n);
+        fprintf(stderr, "  type %lld: %llu bytes, %d managed [",
+                (long long)id, (unsigned long long)nomu_gc_typesize((uint64_t)id), n);
+        for (int32_t i = 0; i < n; i++) {
+            fprintf(stderr, "%s%d", i ? " " : "", offs[i]);
+        }
         fprintf(stderr, "]\n");
     }
 }
@@ -78,7 +119,17 @@ void rt_free(void* p) { free(p); }
 #define RT_MAX_CARRIERS 16
 #define RT_STACK_SIZE (128 * 1024)
 
-typedef enum { FIBER_RUNNABLE, FIBER_PARKED, FIBER_DONE } FiberStatus;
+// FIBER_RUNNING marks a fiber currently on-CPU on some carrier (M6 · 6.2.2). Its live registers are
+// on the carrier, not in `ctx`, so the GC scans it via that carrier's stack (6.2.1) and the
+// parked-fiber scan skips it; `ctx` is only a valid stack to walk once the fiber has swapped out
+// (PARKED, or RUNNABLE waiting to resume from its last park point).
+typedef enum {
+    FIBER_RUNNABLE,
+    FIBER_RUNNING,
+    FIBER_PARKED,
+    FIBER_DONE
+} FiberStatus;
+
 struct Fiber {
     ucontext_t ctx;
     char* stack;
@@ -87,6 +138,8 @@ struct Fiber {
     struct Fiber* joiner;
     void* (*fn)(void*);
     void* arg;
+    struct Fiber* rt_prev; // M6 · 6.2.2 — global live-fiber registry (intrusive doubly-linked list)
+    struct Fiber* rt_next;
 };
 
 static Fiber* rt_run_queue[RT_MAX_FIBERS];
@@ -96,6 +149,101 @@ static pthread_mutex_t rt_queue_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t rt_queue_cond = PTHREAD_COND_INITIALIZER;
 static _Thread_local Fiber* rt_current = NULL;
 static _Thread_local ucontext_t rt_sched_ctx;
+static Fiber* rt_main_fiber = NULL; // the Nomu `main` fiber (first spawn); scopes the 6.2.2 parked smoke
+
+// ---- Global live-fiber registry (M6 · 6.2.2, Q8) ----
+// The single source of truth for "every fiber that could hold GC roots." An intrusive doubly-linked
+// list guarded by rt_queue_mu (spawn/complete already hold it, so registry upkeep is off the hot
+// path): O(1) insert on spawn, O(1) remove on completion. At STW the collector iterates it to scan
+// every parked/runnable fiber's stack (a fiber is scannable wherever it waits — no per-wait-list
+// opt-in that a missed list could silently drop). A fiber currently on a carrier (FIBER_RUNNING) is
+// scanned through that carrier instead (6.2.1) and skipped here.
+static Fiber* rt_fiber_list = NULL;
+
+// Both callers hold rt_queue_mu.
+static void rt_registry_insert(Fiber* f) {
+    f->rt_prev = NULL;
+    f->rt_next = rt_fiber_list;
+    if (rt_fiber_list) {
+        rt_fiber_list->rt_prev = f;
+    }
+    rt_fiber_list = f;
+}
+
+static void rt_registry_remove(Fiber* f) {
+    if (f->rt_prev) {
+        f->rt_prev->rt_next = f->rt_next;
+    } else {
+        rt_fiber_list = f->rt_next;
+    }
+    if (f->rt_next) {
+        f->rt_next->rt_prev = f->rt_prev;
+    }
+    f->rt_prev = f->rt_next = NULL;
+}
+
+// ---- Stop-the-world handshake (M6 · 6.2.3, Q3/Q4) ----
+// Cooperative STW for the M:N scheduler. A carrier (an MMTk mutator, Q1) is either running Nomu code
+// — where it reaches a safepoint at every non-leaf call, allocation, and the back-edge poll — or
+// sitting in the scheduler between fibers (holding no roots). The initiator raises __nomu_stop_world;
+// a running carrier parks at its next poll (saving a scannable context), an idle carrier parks at the
+// scheduler dispatch. The initiator waits until every carrier has parked, the collector scans roots
+// (running carriers via their saved context, 6.2.1; parked fibers via the registry, 6.2.2), then
+// resume clears the flag and wakes them. The flag is a single read-mostly global (written twice per
+// GC) rather than the per-carrier flag of the Q3 decision — identical correctness for a full STW;
+// per-carrier is a deferred perf refinement (avoids the shared-line read traffic on many carriers).
+volatile int __nomu_stop_world = 0; // read by the inlined poll (Lowering.swift) and the scheduler
+
+typedef struct {
+    pthread_t tls; // carrier thread id (the nomu_gc_bind_mutator token)
+    int in_use;
+    volatile int parked; // reached a safepoint / dispatch and is waiting for resume
+    int has_ctx;         // ctx below is a running fiber's stack (scan it); else idle (no roots)
+    unw_context_t ctx;   // saved at the safepoint, for the carrier root walk (6.2.1)
+} CarrierCB;
+
+static CarrierCB rt_carriers[RT_MAX_CARRIERS];
+static int rt_ncarriers_reg = 0;
+static pthread_mutex_t rt_stw_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rt_stw_cond = PTHREAD_COND_INITIALIZER; // carrier ↔ initiator, both directions
+static _Thread_local CarrierCB* rt_self_cb = NULL;
+// M6 · 6.2.4 — set by a carrier that triggers a collection (in `nomu_gc_block_for_gc`), cleared by
+// `nomu_gc_resume_the_world` at the end of the cycle. Keeps the triggering carrier blocked across the
+// collection even before `__nomu_stop_world` is raised (the GC worker raises that a moment later).
+static volatile int rt_gc_wanted = 0;
+
+// Register the current carrier on scheduler entry (once per carrier thread), making it STW-visible.
+static void rt_carrier_register(void) {
+    pthread_mutex_lock(&rt_stw_mu);
+    CarrierCB* cb = &rt_carriers[rt_ncarriers_reg++];
+    cb->tls = pthread_self();
+    cb->in_use = 1;
+    cb->parked = 0;
+    cb->has_ctx = 0;
+    rt_self_cb = cb;
+    pthread_mutex_unlock(&rt_stw_mu);
+}
+
+// Park the current carrier for STW until the world resumes. `ctx` (or NULL for an idle carrier with no
+// roots) is the scannable context captured at the safepoint. Must NOT be called holding rt_queue_mu.
+static void rt_carrier_park_for_stw(const unw_context_t* ctx) {
+    CarrierCB* cb = rt_self_cb;
+    pthread_mutex_lock(&rt_stw_mu);
+    if (ctx) {
+        cb->ctx = *ctx;
+        cb->has_ctx = 1;
+    } else {
+        cb->has_ctx = 0;
+    }
+    cb->parked = 1;
+    pthread_cond_broadcast(&rt_stw_cond); // tell the initiator we reached the safepoint
+    while (__nomu_stop_world) {
+        pthread_cond_wait(&rt_stw_cond, &rt_stw_mu);
+    }
+    cb->parked = 0;
+    cb->has_ctx = 0;
+    pthread_mutex_unlock(&rt_stw_mu);
+}
 
 // Must be called with rt_queue_mu held. Signals a sleeping carrier.
 static void rt_rq_push(Fiber* f) {
@@ -103,9 +251,12 @@ static void rt_rq_push(Fiber* f) {
     rt_rq_tail++;
     pthread_cond_signal(&rt_queue_cond);
 }
+
 // Must be called with rt_queue_mu held.
 static Fiber* rt_rq_pop(void) {
-    if (rt_rq_head == rt_rq_tail) return NULL;
+    if (rt_rq_head == rt_rq_tail) {
+        return NULL;
+    }
     Fiber* f = rt_run_queue[rt_rq_head % RT_MAX_FIBERS];
     rt_rq_head++;
     return f;
@@ -116,8 +267,12 @@ static void rt_fiber_trampoline(void) {
     self->result = self->fn(self->arg);
     pthread_mutex_lock(&rt_queue_mu);
     self->status = FIBER_DONE;
+    rt_registry_remove(self); // M6 · 6.2.2 — done fibers hold no roots; drop from the registry
     rt_active--;
-    if (self->joiner) { rt_rq_push(self->joiner); self->joiner = NULL; }
+    if (self->joiner) {
+        rt_rq_push(self->joiner);
+        self->joiner = NULL;
+    }
     pthread_cond_broadcast(&rt_queue_cond); // wake all carriers to re-check rt_active == 0
     pthread_mutex_unlock(&rt_queue_mu);
     swapcontext(&self->ctx, &rt_sched_ctx);
@@ -126,7 +281,9 @@ static void rt_fiber_trampoline(void) {
 Fiber* fiber_spawn(void* (*fn)(void*), void* arg) {
     Fiber* f = (Fiber*)calloc(1, sizeof(Fiber));
     f->stack = (char*)malloc(RT_STACK_SIZE);
-    f->fn = fn; f->arg = arg; f->status = FIBER_RUNNABLE;
+    f->fn = fn;
+    f->arg = arg;
+    f->status = FIBER_RUNNABLE;
     getcontext(&f->ctx);
     f->ctx.uc_stack.ss_sp = f->stack;
     f->ctx.uc_stack.ss_size = RT_STACK_SIZE;
@@ -134,16 +291,27 @@ Fiber* fiber_spawn(void* (*fn)(void*), void* arg) {
     makecontext(&f->ctx, rt_fiber_trampoline, 0);
     pthread_mutex_lock(&rt_queue_mu);
     rt_active++;
+    rt_registry_insert(f); // M6 · 6.2.2 — track from spawn so the fiber is scannable wherever it waits
     rt_rq_push(f);
     pthread_mutex_unlock(&rt_queue_mu);
     return f;
 }
 
 static void rt_scheduler_run(void) {
+    rt_carrier_register(); // M6 · 6.2.3 — this carrier is now STW-visible
     pthread_mutex_lock(&rt_queue_mu);
     while (1) {
+        // 6.2.3 — an idle/dispatching carrier parks for STW here rather than picking up a fiber, so it
+        // holds no roots and starts no mutation while the world is stopped (no ctx: nothing to scan).
+        if (__nomu_stop_world) {
+            pthread_mutex_unlock(&rt_queue_mu);
+            rt_carrier_park_for_stw(NULL);
+            pthread_mutex_lock(&rt_queue_mu);
+            continue;
+        }
         Fiber* f = rt_rq_pop();
         if (f) {
+            f->status = FIBER_RUNNING; // M6 · 6.2.2 — on-CPU; scanned via this carrier, not the registry
             pthread_mutex_unlock(&rt_queue_mu);
             rt_current = f;
             swapcontext(&rt_sched_ctx, &f->ctx);
@@ -157,7 +325,10 @@ static void rt_scheduler_run(void) {
     pthread_mutex_unlock(&rt_queue_mu);
 }
 
-static void* rt_carrier_entry(void* _) { rt_scheduler_run(); return NULL; }
+static void* rt_carrier_entry(void* _) {
+    rt_scheduler_run();
+    return NULL;
+}
 
 void* spawn_join(SpawnHandle* h) {
     pthread_mutex_lock(&rt_queue_mu);
@@ -180,12 +351,19 @@ void* rt_mutex_new(void) {
     pthread_mutex_init(m, NULL);
     return m;
 }
-void rt_mutex_lock(void* m)   { pthread_mutex_lock((pthread_mutex_t*)m); }
+
+void rt_mutex_lock(void* m) { pthread_mutex_lock((pthread_mutex_t*)m); }
+
 void rt_mutex_unlock(void* m) { pthread_mutex_unlock((pthread_mutex_t*)m); }
 
 // ---- Timer heap (M4.5) ----
 #define RT_MAX_TIMERS 256
-typedef struct { uint64_t expiry_ns; Fiber* fiber; } TimerEntry;
+
+typedef struct {
+    uint64_t expiry_ns;
+    Fiber* fiber;
+} TimerEntry;
+
 static TimerEntry rt_timers[RT_MAX_TIMERS];
 static int rt_timer_count = 0;
 static pthread_mutex_t rt_timer_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -200,24 +378,37 @@ static uint64_t rt_now_ns(void) {
 // Min-heap helpers — must be called with rt_timer_mu held.
 static void rt_timer_push(uint64_t expiry, Fiber* f) {
     int i = rt_timer_count++;
-    rt_timers[i] = (TimerEntry){ expiry, f };
+    rt_timers[i] = (TimerEntry){expiry, f};
     while (i > 0) {
         int p = (i - 1) / 2;
-        if (rt_timers[p].expiry_ns <= rt_timers[i].expiry_ns) break;
-        TimerEntry tmp = rt_timers[p]; rt_timers[p] = rt_timers[i]; rt_timers[i] = tmp;
+        if (rt_timers[p].expiry_ns <= rt_timers[i].expiry_ns) {
+            break;
+        }
+        TimerEntry tmp = rt_timers[p];
+        rt_timers[p] = rt_timers[i];
+        rt_timers[i] = tmp;
         i = p;
     }
     pthread_cond_signal(&rt_timer_cond);
 }
+
 static void rt_timer_pop(void) {
     rt_timers[0] = rt_timers[--rt_timer_count];
     int i = 0;
     while (1) {
-        int l = 2*i+1, r = 2*i+2, s = i;
-        if (l < rt_timer_count && rt_timers[l].expiry_ns < rt_timers[s].expiry_ns) s = l;
-        if (r < rt_timer_count && rt_timers[r].expiry_ns < rt_timers[s].expiry_ns) s = r;
-        if (s == i) break;
-        TimerEntry tmp = rt_timers[s]; rt_timers[s] = rt_timers[i]; rt_timers[i] = tmp;
+        int l = 2 * i + 1, r = 2 * i + 2, s = i;
+        if (l < rt_timer_count && rt_timers[l].expiry_ns < rt_timers[s].expiry_ns) {
+            s = l;
+        }
+        if (r < rt_timer_count && rt_timers[r].expiry_ns < rt_timers[s].expiry_ns) {
+            s = r;
+        }
+        if (s == i) {
+            break;
+        }
+        TimerEntry tmp = rt_timers[s];
+        rt_timers[s] = rt_timers[i];
+        rt_timers[i] = tmp;
         i = s;
     }
 }
@@ -232,7 +423,7 @@ static void* rt_timer_thread(void* _) {
         uint64_t now = rt_now_ns();
         uint64_t next = rt_timers[0].expiry_ns;
         if (next > now) {
-            struct timespec ts = { (time_t)(next / 1000000000ULL), (long)(next % 1000000000ULL) };
+            struct timespec ts = {(time_t)(next / 1000000000ULL), (long)(next % 1000000000ULL)};
             pthread_cond_timedwait(&rt_timer_cond, &rt_timer_mu, &ts);
             continue;
         }
@@ -247,12 +438,21 @@ static void* rt_timer_thread(void* _) {
     return NULL;
 }
 
-static void nomu_gc_smoke(void);   // M8.4.3 — defined below (GC root-walk smoke)
+static void nomu_gc_smoke(void);        // M8.4.3 — defined below (current-stack root-walk smoke)
+static void nomu_gc_smoke_parked(void); // M6 · 6.2.2 — defined below (parked-fiber root-walk smoke)
 
 int64_t rt_sleep_ms(int64_t ms) {
     // M8.4.3 smoke (env-gated, inert otherwise): `sleep` is a safepoint (this call is a statepoint),
     // so at entry the caller's live GC roots are recorded. Walk them before parking the fiber.
-    if (getenv("NOMU_GC_SMOKE")) nomu_gc_smoke();
+    if (getenv("NOMU_GC_SMOKE")) {
+        nomu_gc_smoke();
+    }
+    // M6 · 6.2.2 parked-fiber smoke: from `main`'s safepoint, scan a peer fiber that is parked
+    // elsewhere (recovered from its saved ucontext, not the current stack). Scoped to `main` so the
+    // parked worker's own sleep does not re-enter the scan and stall waiting for a peer.
+    if (getenv("NOMU_GC_SMOKE_PARKED") && rt_current == rt_main_fiber) {
+        nomu_gc_smoke_parked();
+    }
     uint64_t expiry = rt_now_ns() + (uint64_t)ms * 1000000ULL;
     pthread_mutex_lock(&rt_timer_mu);
     rt_timer_push(expiry, rt_current);
@@ -292,16 +492,24 @@ String rt_read_line(int fd) {
     rt_wait_readable(fd);
     char buf[4096];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    if (n <= 0) return rt_str_lit("", 0);
-    if (buf[n - 1] == '\n') n--;
-    char* data = (char*)rt_alloc(sizeof(ObjectHeader) + (size_t)n + 1) + sizeof(ObjectHeader);
+    if (n <= 0) {
+        return rt_str_lit("", 0);
+    }
+    if (buf[n - 1] == '\n') {
+        n--;
+    }
+    // Immortal (non-moving) buffer — String's raw `data` pointer must survive a moving GC (6.2.4).
+    char* data = (char*)rt_alloc_immortal(sizeof(ObjectHeader) + (size_t)n + 1) + sizeof(ObjectHeader);
     memcpy(data, buf, (size_t)n);
     data[n] = '\0';
-    return (String){ .data = data, .len = (int64_t)n };
+    return (String){.data = data, .len = (int64_t)n};
 }
 #else
 // Non-macOS: readLine is not wired yet (epoll path unwritten, runtime.md §... poller).
-String rt_read_line(int fd) { (void)fd; return rt_str_lit("", 0); }
+String rt_read_line(int fd) {
+    (void)fd;
+    return rt_str_lit("", 0);
+}
 #endif
 
 // ---- GC root scanning (M8.4.3; m6-spec.md §6.0.8) ----
@@ -309,28 +517,43 @@ String rt_read_line(int fd) { (void)fd; return rt_str_lit("", 0); }
 // then walk a stack (libunwind) mapping each frame's return address to its record and reading the
 // live roots. Inert now — nothing calls this except the smoke path (M6 drives it from the
 // collector). The layout follows llvm/Object/StackMapParser.h.
-typedef struct { int reg; int32_t off; } gc_slot;   // Indirect [dwarf reg + off]; reg 31=SP, 29=FP
-typedef struct { uintptr_t addr; int nslots; gc_slot* slots; } gc_record;   // one statepoint
+typedef struct {
+    int reg;
+    int32_t off;
+} gc_slot; // Indirect [dwarf reg + off]; reg 31=SP, 29=FP
+
+typedef struct {
+    uintptr_t addr;
+    int nslots;
+    gc_slot* slots;
+} gc_record; // one statepoint
+
 static gc_record* gc_records = NULL;
 static int gc_nrecords = 0;
 static int gc_inited = 0;
 
 static uint16_t gc_rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+
 static uint32_t gc_rd32(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
+
 static uint64_t gc_rd64(const uint8_t* p) { return (uint64_t)gc_rd32(p) | ((uint64_t)gc_rd32(p + 4) << 32); }
 
 void nomu_gc_stackmap_init(void) {
-    if (gc_inited) return;
+    if (gc_inited) {
+        return;
+    }
     gc_inited = 1;
 #ifdef __APPLE__
     unsigned long size = 0;
     const uint8_t* sm = getsectiondata(&_mh_execute_header, "__LLVM_STACKMAPS", "__llvm_stackmaps", &size);
-    if (!sm || size < 16 || sm[0] != 3) return;   // no section, or unsupported version
+    if (!sm || size < 16 || sm[0] != 3) {
+        return; // no section, or unsupported version
+    }
     uint32_t nfuncs = gc_rd32(sm + 4), nconsts = gc_rd32(sm + 8), nrecs = gc_rd32(sm + 12);
     const uint8_t* funcs = sm + 16;
-    const uint8_t* recs = funcs + (size_t)nfuncs * 24 + (size_t)nconsts * 8;   // records follow funcs+consts
+    const uint8_t* recs = funcs + (size_t)nfuncs * 24 + (size_t)nconsts * 8; // records follow funcs+consts
     gc_records = (gc_record*)calloc(nrecs ? nrecs : 1, sizeof(gc_record));
     // Function records own their statepoint records in order (each says how many it has). The
     // record's absolute address = function address + instruction offset = the call's return address.
@@ -351,13 +574,23 @@ void nomu_gc_stackmap_init(void) {
             for (int li = 3; li < nloc; li++) {
                 const uint8_t* L = locs + (size_t)li * 12;
                 uint8_t kind = L[0];
-                if (kind != 3 /*Indirect*/ && kind != 1 /*Register*/) continue;
+                if (kind != 3 /*Indirect*/ && kind != 1 /*Register*/) {
+                    continue;
+                }
                 int reg = gc_rd16(L + 4);
                 int32_t off = (int32_t)gc_rd32(L + 8);
                 int dup = 0;
-                for (int s = 0; s < gr->nslots; s++)
-                    if (gr->slots[s].reg == reg && gr->slots[s].off == off) { dup = 1; break; }
-                if (!dup) { gr->slots[gr->nslots].reg = reg; gr->slots[gr->nslots].off = off; gr->nslots++; }
+                for (int s = 0; s < gr->nslots; s++) {
+                    if (gr->slots[s].reg == reg && gr->slots[s].off == off) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    gr->slots[gr->nslots].reg = reg;
+                    gr->slots[gr->nslots].off = off;
+                    gr->nslots++;
+                }
             }
             // Advance to the next record: locations, align 8, then NumLiveOuts (u16) + live-outs.
             size_t locend = (size_t)((locs + (size_t)nloc * 12) - r);
@@ -371,31 +604,192 @@ void nomu_gc_stackmap_init(void) {
 }
 
 static gc_record* gc_lookup(uintptr_t ip) {
-    for (int i = 0; i < gc_nrecords; i++) if (gc_records[i].addr == ip) return &gc_records[i];
+    for (int i = 0; i < gc_nrecords; i++) {
+        if (gc_records[i].addr == ip) {
+            return &gc_records[i];
+        }
+    }
     return NULL;
 }
 
-void nomu_gc_walk_current(nomu_root_visitor visit, void* userdata) {
+// Walk an arbitrary saved register context for GC roots (the shared core of the current-stack and
+// stopped-carrier/parked-fiber walks — M6 · 6.2.1). Steps past the context's innermost frame into
+// its callers; for each frame whose return address has a stackmap record, reads the live roots at
+// (frame register + offset). The innermost frame is always a gc-leaf runtime C frame (the walker
+// itself, or the `park`/`poll_slow`/`swapcontext` frame a stopped thread sits in), so skipping it
+// is correct — the roots live in the Nomu callers.
+static void nomu_gc_walk_context(unw_context_t* ctx, nomu_root_visitor visit, void* userdata) {
     nomu_gc_stackmap_init();
-    unw_context_t ctx;
     unw_cursor_t cur;
-    unw_getcontext(&ctx);
-    unw_init_local(&cur, &ctx);
-    // Step past this walker's own frame into its callers; for each frame whose return address has a
-    // stackmap record, read the live roots at (frame register + offset).
+    unw_init_local(&cur, ctx);
     while (unw_step(&cur) > 0) {
         unw_word_t ip = 0, sp = 0;
         unw_get_reg(&cur, UNW_REG_IP, &ip);
         unw_get_reg(&cur, UNW_REG_SP, &sp);
         gc_record* rec = gc_lookup((uintptr_t)ip);
-        if (!rec) continue;
+        if (!rec) {
+            continue;
+        }
         for (int s = 0; s < rec->nslots; s++) {
             unw_word_t base = sp;
-            if (rec->slots[s].reg == UNW_ARM64_FP) unw_get_reg(&cur, UNW_ARM64_FP, &base);
+            if (rec->slots[s].reg == UNW_ARM64_FP) {
+                unw_get_reg(&cur, UNW_ARM64_FP, &base);
+            }
             void** slot = (void**)((char*)base + rec->slots[s].off);
             visit(slot, *slot, userdata);
         }
     }
+}
+
+void nomu_gc_walk_current(nomu_root_visitor visit, void* userdata) {
+    unw_context_t ctx;
+    unw_getcontext(&ctx);
+    nomu_gc_walk_context(&ctx, visit, userdata);
+}
+
+// The saved register context for a carrier stopped at a GC safepoint (M6 · 6.2.3). Returns the
+// context captured when the carrier with this tls parked at its poll slow path, or NULL if that
+// carrier parked idle in the scheduler (holding no Nomu roots).
+static unw_context_t* gc_carrier_context(void* carrier_tls) {
+    pthread_t t = (pthread_t)carrier_tls;
+    for (int i = 0; i < rt_ncarriers_reg; i++) {
+        if (rt_carriers[i].in_use && pthread_equal(rt_carriers[i].tls, t) && rt_carriers[i].has_ctx) {
+            return &rt_carriers[i].ctx;
+        }
+    }
+    return NULL;
+}
+
+// The safepoint slow path (M6 · 6.2.3). The inlined poll (Lowering.swift) calls this when
+// __nomu_stop_world is set. This call is a statepoint, so the caller (loop) frame's live roots are
+// recorded at its return address; capturing the carrier's context here lets the collector unwind from
+// the poll frame to those roots. Then the carrier parks until the world resumes. Not `gc-leaf`.
+void __nomu_gc_poll_slow(void) {
+    unw_context_t ctx;
+    unw_getcontext(&ctx);
+    rt_carrier_park_for_stw(&ctx);
+}
+
+// Stop every carrier at a safepoint (M6 · 6.2.3) — MMTk's `stop_all_mutators` rests on this, and the
+// forced-STW smoke calls it directly. Raise the flag, wake idle carriers blocked in the scheduler so
+// they re-check and park, then wait until every registered carrier has parked. Returns with the world
+// stopped; the caller scans roots and then calls nomu_gc_resume_the_world.
+void nomu_gc_stop_the_world(void) {
+    __nomu_stop_world = 1;
+    pthread_mutex_lock(&rt_queue_mu);
+    pthread_cond_broadcast(&rt_queue_cond); // kick idle carriers out of their scheduler wait
+    pthread_mutex_unlock(&rt_queue_mu);
+    pthread_mutex_lock(&rt_stw_mu);
+    for (;;) {
+        int all_parked = 1;
+        for (int i = 0; i < rt_ncarriers_reg; i++) {
+            if (rt_carriers[i].in_use && !rt_carriers[i].parked && !pthread_equal(rt_carriers[i].tls, pthread_self())) {
+                all_parked = 0;
+            }
+        }
+        if (all_parked) {
+            break;
+        }
+        pthread_cond_wait(&rt_stw_cond, &rt_stw_mu);
+    }
+    pthread_mutex_unlock(&rt_stw_mu);
+}
+
+void nomu_gc_resume_the_world(void) {
+    pthread_mutex_lock(&rt_stw_mu);
+    __nomu_stop_world = 0;
+    rt_gc_wanted = 0;   // release the carrier blocked in nomu_gc_block_for_gc (6.2.4)
+    pthread_cond_broadcast(&rt_stw_cond);
+    pthread_mutex_unlock(&rt_stw_mu);
+}
+
+// The carrier that triggered a collection blocks here until the cycle finishes (M6 · 6.2.4). It is
+// deep inside `nomu_gc_alloc` (Rust), not at a Nomu poll, so it saves its own context and marks itself
+// parked — that makes its roots scannable (6.2.1) and lets `nomu_gc_stop_the_world`, raised a moment
+// later by the GC worker, count it as already stopped. `rt_gc_wanted` (not `__nomu_stop_world`, which
+// isn't set yet) is the wait predicate; `nomu_gc_resume_the_world` clears it.
+void nomu_gc_block_for_gc(void) {
+    unw_context_t ctx;
+    unw_getcontext(&ctx);
+    CarrierCB* cb = rt_self_cb;
+    pthread_mutex_lock(&rt_stw_mu);
+    rt_gc_wanted = 1;
+    if (cb) {
+        cb->ctx = ctx;
+        cb->has_ctx = 1;
+        cb->parked = 1;
+        pthread_cond_broadcast(&rt_stw_cond); // tell a waiting stop_the_world we are parked
+    }
+    while (rt_gc_wanted) {
+        pthread_cond_wait(&rt_stw_cond, &rt_stw_mu);
+    }
+    if (cb) {
+        cb->parked = 0;
+        cb->has_ctx = 0;
+    }
+    pthread_mutex_unlock(&rt_stw_mu);
+}
+
+void nomu_gc_walk_carrier(void* carrier_tls, nomu_root_visitor visit, void* userdata) {
+    unw_context_t* ctx = gc_carrier_context(carrier_tls);
+    if (ctx) {
+        nomu_gc_walk_context(ctx, visit, userdata);
+    }
+}
+
+#if defined(__APPLE__) && defined(__aarch64__)
+// Fabricate a libunwind context from a fiber's saved ucontext so its parked stack walks the same way
+// as a live one (M6 · 6.2.2, Q8). On arm64 libunwind's register file (unw_context_t) begins with the
+// GPRs x0–x28, then fp, lr, sp, pc — the same order as the saved arm_thread_state64 — so they copy
+// across 1:1. The accessor macros strip pointer authentication (arm64e). The saved pc sits inside the
+// gc-leaf park/swapcontext frame; the unwinder steps out through it to the Nomu frames above.
+static void nomu_gc_ucontext_to_unwctx(const ucontext_t* uc, unw_context_t* out) {
+    memset(out, 0, sizeof(*out));
+    const _STRUCT_ARM_THREAD_STATE64* ss = &uc->uc_mcontext->__ss;
+    uint64_t* d = (uint64_t*)out;
+    for (int i = 0; i < 29; i++) {
+        d[i] = ss->__x[i];
+    }
+    uint64_t lr = __darwin_arm_thread_state64_get_lr(*ss);
+    uint64_t pc = __darwin_arm_thread_state64_get_pc(*ss);
+    d[29] = __darwin_arm_thread_state64_get_fp(*ss);
+    d[30] = lr;
+    d[31] = __darwin_arm_thread_state64_get_sp(*ss);
+    // Darwin's getcontext/swapcontext saves no PC — a parked fiber resumes via LR (the return address
+    // just after its `swapcontext`, inside the gc-leaf park frame). Seed the unwind there so the walk
+    // steps out through the park frame to the Nomu frames above.
+    d[32] = pc ? pc : lr;
+}
+#endif
+
+// Walk one parked fiber's stack for GC roots, seeding the walk from its saved context (M6 · 6.2.2).
+void nomu_gc_walk_fiber(Fiber* f, nomu_root_visitor visit, void* userdata) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    unw_context_t ctx;
+    nomu_gc_ucontext_to_unwctx(&f->ctx, &ctx);
+    nomu_gc_walk_context(&ctx, visit, userdata);
+#else
+    (void)f;
+    (void)visit;
+    (void)userdata;
+#endif
+}
+
+// Scan every parked fiber's stack — the VM-specific roots the MMTk binding reports at STW (M6 ·
+// 6.2.2). Only FIBER_PARKED has a valid saved context that can hold roots: a woken fiber stays
+// PARKED until the scheduler makes it RUNNING, while FIBER_RUNNABLE is the freshly-spawned, never-run
+// state (its context is a bare `makecontext` entry with no Nomu frames / no roots). FIBER_RUNNING is
+// scanned through its carrier (6.2.1); FIBER_DONE holds nothing. Taking rt_queue_mu is safe here: a
+// carrier stopped at a safepoint is never inside a scheduler critical section, so it holds no
+// scheduler lock (the STW quiesce, 6.2.3, guarantees this).
+void nomu_gc_scan_parked_fibers(nomu_root_visitor visit, void* userdata) {
+    pthread_mutex_lock(&rt_queue_mu);
+    for (Fiber* f = rt_fiber_list; f; f = f->rt_next) {
+        if (f->status == FIBER_PARKED) {
+            nomu_gc_walk_fiber(f, visit, userdata);
+        }
+    }
+    pthread_mutex_unlock(&rt_queue_mu);
 }
 
 // GC-root-walk smoke (M8.4.3, env-gated). At a `sleep` safepoint the caller's live class objects
@@ -417,21 +811,91 @@ static void nomu_gc_smoke(void) {
     fprintf(stderr, "nomu-gc-smoke: %d roots\n", count);
 }
 
+// M6 · 6.2.2 parked-fiber smoke (env-gated). The highest-risk validation (Q8): recover a *parked*
+// fiber's exact live set from its saved ucontext — not the current stack. Called from `main`'s sleep
+// safepoint; spin-waits until a peer fiber has actually parked (bounded — the fixture's worker parks
+// in microseconds), then scans the whole registry. The worker holds two class roots live across its
+// own `park()` and a dead object that must be excluded.
+static void nomu_gc_smoke_parked(void) {
+    for (int spins = 0; spins < 100000; spins++) {
+        int peer_parked = 0;
+        pthread_mutex_lock(&rt_queue_mu);
+        for (Fiber* f = rt_fiber_list; f; f = f->rt_next) {
+            if (f != rt_current && f->status == FIBER_PARKED) {
+                peer_parked = 1;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&rt_queue_mu);
+        if (peer_parked) {
+            break;
+        }
+        usleep(50);
+    }
+    int count = 0;
+    fprintf(stderr, "nomu-gc-smoke-parked: walk begin\n");
+    nomu_gc_scan_parked_fibers(gc_smoke_visitor, &count);
+    fprintf(stderr, "nomu-gc-smoke-parked: %d roots\n", count);
+}
+
+// M6 · 6.2.3 stop-the-world smoke (env-gated). Exercises the full handshake with no real collection:
+// after a short delay (fibers get going — a compute fiber looping at its back-edge poll, a parked
+// fiber), stop the world, scan every root the collector would (running carriers via their saved
+// safepoint context, 6.2.1; parked fibers via the registry, 6.2.2), then resume. Proves the poll
+// flag + poll slow path quiesce all carriers, the saved context reaches a running fiber's roots, and
+// resume releases cleanly (the program runs to completion). Runs on a dedicated thread, not a carrier.
+static void* rt_stw_smoke_thread(void* _) {
+    (void)_;
+    usleep(40000); // let the compute fiber start looping and the parked fiber park
+    fprintf(stderr, "nomu-gc-stw: stopping the world\n");
+    nomu_gc_stop_the_world();
+    int count = 0;
+    for (int i = 0; i < rt_ncarriers_reg; i++) {
+        if (rt_carriers[i].in_use && rt_carriers[i].has_ctx) {
+            nomu_gc_walk_context(&rt_carriers[i].ctx, gc_smoke_visitor, &count);
+        }
+    }
+    int carrier_roots = count;
+    nomu_gc_scan_parked_fibers(gc_smoke_visitor, &count);
+    fprintf(stderr, "nomu-gc-stw: %d carrier roots, %d parked roots\n", carrier_roots, count - carrier_roots);
+    nomu_gc_resume_the_world();
+    fprintf(stderr, "nomu-gc-stw: resumed\n");
+    return NULL;
+}
+
 // ---- Process entry ----
 extern void nomu_main(void);
-static void* __rt_main_entry(void* _) { nomu_main(); return NULL; }
+
+static void* __rt_main_entry(void* _) {
+    nomu_main();
+    return NULL;
+}
+
 int main(void) {
     nomu_gc_init(1ULL << 30); // M6 · 6.1.1 — init MMTk (NoGC, 1 GiB reserved) before any allocation
-    if (getenv("NOMU_GC_TYPEMAPS")) nomu_gc_dump_typemaps();  // 6.1.3 map-walk self-check
-    #ifdef __APPLE__
+    if (getenv("NOMU_GC_TYPEMAPS")) {
+        nomu_gc_dump_typemaps(); // 6.1.3 map-walk self-check
+    }
+#ifdef __APPLE__
     rt_kq = kqueue();
-    pthread_t __poller_t; pthread_create(&__poller_t, NULL, rt_poller_thread, NULL); pthread_detach(__poller_t);
-    #endif
-    pthread_t __timer_t; pthread_create(&__timer_t, NULL, rt_timer_thread, NULL); pthread_detach(__timer_t);
-    int ncarriers = 4; // parallelism knob — will be configurable later
-    fiber_spawn(__rt_main_entry, NULL);
+    pthread_t __poller_t;
+    pthread_create(&__poller_t, NULL, rt_poller_thread, NULL);
+    pthread_detach(__poller_t);
+#endif
+    pthread_t __timer_t;
+    pthread_create(&__timer_t, NULL, rt_timer_thread, NULL);
+    pthread_detach(__timer_t);
+    int ncarriers = 4;                                  // parallelism knob — will be configurable later
+    rt_main_fiber = fiber_spawn(__rt_main_entry, NULL); // 6.2.2 — remember `main` for the parked smoke
     for (int i = 1; i < ncarriers; i++) {
-        pthread_t t; pthread_create(&t, NULL, rt_carrier_entry, NULL); pthread_detach(t);
+        pthread_t t;
+        pthread_create(&t, NULL, rt_carrier_entry, NULL);
+        pthread_detach(t);
+    }
+    if (getenv("NOMU_GC_STW_SMOKE")) { // 6.2.3 — forced stop-the-world handshake validation
+        pthread_t __stw_t;
+        pthread_create(&__stw_t, NULL, rt_stw_smoke_thread, NULL);
+        pthread_detach(__stw_t);
     }
     rt_scheduler_run();
     return 0;

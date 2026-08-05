@@ -11,7 +11,9 @@ String rt_str_lit(const char* data, int64_t len) {
 
 String rt_str_concat(String a, String b) {
     int64_t len = a.len + b.len;
-    char* data = (char*)rt_alloc(sizeof(ObjectHeader) + len + 1) + sizeof(ObjectHeader);
+    // Immortal (non-moving) buffer: String is `{ addr0 data, i64 len }` (Q6), so `data` is an
+    // untracked raw pointer a moving collector would leave dangling — pin the buffer (M6 · 6.2.4).
+    char* data = (char*)rt_alloc_immortal(sizeof(ObjectHeader) + len + 1) + sizeof(ObjectHeader);
     memcpy(data, a.data, (size_t)a.len);
     memcpy(data + a.len, b.data, (size_t)b.len);
     data[len] = '\0';

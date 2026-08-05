@@ -57,6 +57,7 @@ final class IRToLLVM {
     private var pollFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     private var gcAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     private var barrierFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
+    private var stopWorldGlobalCache: LLVMValueRef?   // 6.2.3 — external `@__nomu_stop_world` (i32)
     private var intFmt: LLVMValueRef?
     private var strFmt: LLVMValueRef?
 
@@ -79,6 +80,11 @@ final class IRToLLVM {
     // slot added first). Emitted as flat tables at module finalization.
     private var typeIds: [String: UInt64] = [:]
     private var typeMaps: [[Int32]] = []
+    // M6 · 6.2.4 — parallel to `typeMaps`: `typeSizes[id]` = the object's total byte size (header
+    // included). Every moving-space object is fixed-size per type-id (class/actor/closure/any-box are
+    // monomorphized), so the collector's `get_current_size`/`get_size_when_copied` read this table by
+    // type-id instead of parsing the object. No header change (§6.2.4).
+    private var typeSizes: [Int32] = []
     private var anyBoxMapId: UInt64?   // one shared map for every `any I` box (payload at byte 16)
 
     // 8.2.5 witness machinery. `interfaceDefs` gives a requirement surface to lay out a witness
@@ -1939,16 +1945,41 @@ final class IRToLLVM {
     // sites into the inline fast path. All three are behavior-neutral now: alloc tail-calls
     // `rt_alloc`, the barrier is a plain store, the poll is a no-op.
 
-    // The `__nomu_poll` seam (8.4.2): no-op now; `gc-leaf` so the rewrite leaves it a plain call.
-    // M6 fills it with the real poll (protected-page load / branch-on-flag, D3).
+    // The external stop-world flag (`volatile int __nomu_stop_world`, runtime.c) the poll tests.
+    private func stopWorldGlobal() -> LLVMValueRef {
+        if let g = stopWorldGlobalCache { return g }
+        let g = LLVMAddGlobal(mod, i32, "__nomu_stop_world")!   // no initializer → external declaration
+        stopWorldGlobalCache = g
+        return g
+    }
+
+    // The `__nomu_poll` seam (M6 · 6.2.3, Q3 branch-on-flag). Filled: load the per-process stop-world
+    // flag; if unset (the common case) fall through — a plain load + test + branch, no statepoint; if
+    // set, call `__nomu_gc_poll_slow`, which is **not** `gc-leaf`, so that call is a statepoint whose
+    // stack map records the loop's live roots, and the carrier parks there precisely scannable (6.2.1).
+    // `alwaysinline` + the pass pipeline's `always-inline` (LLVMBridge) collapse the fast path into the
+    // loop, so only the cold slow path carries statepoint cost (Q4: the poll stays cheap).
     private func nomuPoll() -> (LLVMValueRef, LLVMTypeRef) {
         if let p = pollFn { return p }
         let ty = fnType(voidTy, [])
         let fn = LLVMAddFunction(mod, "__nomu_poll", ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
-        markGCLeaf(fn)
-        addAlwaysInline(fn)
-        withStubBody(fn) { LLVMBuildRetVoid(b) }
+        addAlwaysInline(fn)   // not `gc-leaf`: the slow path calls a statepoint
+        let flag = stopWorldGlobal()
+        let slow = runtimeFn("__nomu_gc_poll_slow", ret: voidTy, params: [], varArg: false)
+        withStubBody(fn) {
+            let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.slow")
+            let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.cont")
+            let v = LLVMBuildLoad2(b, i32, flag, "stopreq")!
+            LLVMSetVolatile(v, 1)
+            let stop = LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstInt(i32, 0, 0), "stop")
+            LLVMBuildCondBr(b, stop, slowBB, contBB)
+            LLVMPositionBuilderAtEnd(b, slowBB)
+            _ = buildCall(slow.0, slow.1, [])
+            LLVMBuildBr(b, contBB)
+            LLVMPositionBuilderAtEnd(b, contBB)
+            LLVMBuildRetVoid(b)
+        }
         pollFn = (fn, ty)
         return pollFn!
     }
@@ -2106,10 +2137,12 @@ final class IRToLLVM {
 
     // ---- M6 · 6.1.3 — GC pointer maps ----
 
-    // Register a pointer map (managed-field byte offsets) and return its type-id.
-    private func registerMap(_ offsets: [Int32]) -> UInt64 {
+    // Register a pointer map (managed-field byte offsets) plus the object's total byte size, and
+    // return its type-id (the shared index into both `typeMaps` and `typeSizes`).
+    private func registerMap(_ offsets: [Int32], sizeBytes: Int32) -> UInt64 {
         let id = UInt64(typeMaps.count)
         typeMaps.append(offsets)
+        typeSizes.append(sizeBytes)
         return id
     }
 
@@ -2118,13 +2151,17 @@ final class IRToLLVM {
         if let id = typeIds[name] { return id }
         let fieldTypes: [Type] = classMap[name].map { $0.fields.map(\.type) }
             ?? actorMap[name].map { $0.fields.map(\.type) } ?? []
+        let isActor = actorMap[name] != nil
         var offsets: [Int32] = []
         var slot = 1   // header occupies slot 0; fields (and the actor's trailing mu) follow
         for ft in fieldTypes {
             collectManagedOffsets(ft, baseSlot: slot, into: &offsets)
             slot += slotCount(ft)
         }
-        let id = registerMap(offsets)
+        // slot is now 1 + Σ field slots (matching the class allocation site); an actor reserves one
+        // more slot for its trailing mutex pointer (the actor allocation site's `2 + Σ`).
+        let totalSlots = slot + (isActor ? 1 : 0)
+        let id = registerMap(offsets, sizeBytes: Int32(totalSlots * 8))
         typeIds[name] = id
         return id
     }
@@ -2139,14 +2176,14 @@ final class IRToLLVM {
             if cap.local.ty == p1 { offsets.append(Int32(slot * 8)) }
             slot += abiSlots(cap.local.ty)
         }
-        return registerMap(offsets)
+        return registerMap(offsets, sizeBytes: Int32(slot * 8))   // { header, fn, caps… }
     }
 
     // Shared type-id for every `any I` box `{ header, witness, payload }`: scan `payload` only
     // (byte 16, slot 2); the witness is a static table (Q7). Registered once.
     private func anyBoxTypeId() -> UInt64 {
         if let id = anyBoxMapId { return id }
-        let id = registerMap([16])
+        let id = registerMap([16], sizeBytes: 24)   // { header, witness, payload }
         anyBoxMapId = id
         return id
     }
@@ -2189,6 +2226,9 @@ final class IRToLLVM {
         }
         emitI32Array("nomu_gc_typemap_data", data.isEmpty ? [0] : data)
         emitI32Array("nomu_gc_typemap_index", index.isEmpty ? [0] : index)
+        // Parallel per-type-id byte sizes (6.2.4): `_sizes[id]` = total object size. Same fallback
+        // shape as the maps so the runtime externs resolve with no heap types.
+        emitI32Array("nomu_gc_typemap_sizes", typeSizes.isEmpty ? [0] : typeSizes)
         let g = LLVMAddGlobal(mod, i64, "nomu_gc_typemap_count")!
         LLVMSetInitializer(g, LLVMConstInt(i64, UInt64(typeMaps.count), 0))
         LLVMSetGlobalConstant(g, 1)
