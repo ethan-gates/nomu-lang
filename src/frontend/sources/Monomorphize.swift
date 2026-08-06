@@ -207,6 +207,10 @@ private final class Monomorphizer {
                             body: body.map { rewriteStmt($0, s) })
         case .box(let value, let interfaces):
             kind = .box(value: rewriteExpr(value, s), interfaces: interfaces)
+        case .arrayLit(let elements):
+            kind = .arrayLit(elements: elements.map { rewriteExpr($0, s) })
+        case .index(let base, let idx):
+            kind = .index(base: rewriteExpr(base, s), idx: rewriteExpr(idx, s))
         }
         return IRExpr(type: newType, span: e.span, kind: kind)
     }
@@ -230,6 +234,8 @@ private final class Monomorphizer {
             return .named(specName(base, rargs), baseKind[base] ?? .struct_)
         case .function(let ps, let r):
             return .function(params: ps.map { resolveType($0, s) }, ret: resolveType(r, s))
+        case .array(let e):
+            return .array(resolveType(e, s))
         default:
             return t
         }
@@ -265,6 +271,7 @@ private final class Monomorphizer {
         case .void: return "Void"
         case .named(let n, _): return n
         case .generic(let b, let a): return b + "<" + a.map(typeKey).joined(separator: ",") + ">"
+        case .array(let e): return "Array<" + typeKey(e) + ">"
         case .function(let p, let r): return "fn<" + (p.map(typeKey) + [typeKey(r)]).joined(separator: ",") + ">"
         case .existential(let i): return "any_" + i
         case .composition(let is_): return "any_" + is_.joined(separator: "_")

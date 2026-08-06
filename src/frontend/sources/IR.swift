@@ -240,6 +240,8 @@ public indirect enum ExprKind {
     case binary(BinOp, IRExpr, IRExpr)
     case closure(params: [IRParam], body: [IRStmt])
     case box(value: IRExpr, interfaces: [String])       // M5 A1.4/A1.5b: wrap a conformer as `any I` / `any A & B`
+    case arrayLit(elements: [IRExpr])                   // [a, b, c] — build an Array<T>; `type` is `.array(T)` (M6)
+    case index(base: IRExpr, idx: IRExpr)               // a[i] — array subscript read; `type` is the element T (M6)
 }
 
 public struct IRArg {

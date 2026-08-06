@@ -274,6 +274,15 @@ public struct Sema {
     // Resolve `Box<Int>` to `.generic` (M5 5.2.1): the base must be a declared generic type,
     // the argument count must match, and each argument resolves in the current scope.
     private func resolveGeneric(_ base: String, args: [TypeRef], selfAs: Type?, at span: Span) -> Type {
+        // `Array<T>` is a builtin generic reference type (M6 stdlib), not a user decl — resolve it to
+        // the dedicated `.array` type rather than routing through the user-generic-decl machinery.
+        if base == "Array" {
+            guard args.count == 1 else {
+                diags.error("generic type 'Array' expects 1 type argument, got \(args.count)", at: span)
+                return .error
+            }
+            return .array(resolve(args[0], selfAs: selfAs))
+        }
         guard let arity = genericArity(base) else {
             if kindOf(base) != nil {
                 diags.error("type '\(base)' is not generic — it takes no type arguments", at: span)
@@ -913,6 +922,25 @@ public struct Sema {
             return IRStmt(kind: .spawnLet(name: name, value: v, resultType: v.type), span: span)
 
         case .assign(let lhs, let rhs, let span):
+            // Array subscript write `a[i] = x` — reference semantics (mutates the shared buffer, so a
+            // `let`-bound array is fine, like a class field). Lowered to a builtin call codegen handles.
+            if case .index(let arr, let idxE, _) = lhs {
+                let a = checkExpr(arr)
+                guard case .array(let elem) = a.type else {
+                    if a.type != .error { diags.error("cannot subscript-assign a value of type '\(a.type)' — only 'Array<T>' supports '[ ] ='", at: span) }
+                    return IRStmt(kind: .exprStmt(checkExpr(rhs)), span: span)
+                }
+                let iIdx = checkExpr(idxE, expected: .int)
+                if iIdx.type != .int && iIdx.type != .error {
+                    diags.error("array index must be an 'Int', got '\(iIdx.type)'", at: iIdx.span)
+                }
+                let value = coerce(checkExpr(rhs, expected: elem), to: elem)
+                checkAssignable(value.type, to: elem, role: "assign", at: span)
+                let callee = IRExpr(type: .void, span: span, kind: .varRef("__arraySet"))
+                let call = IRExpr(type: .void, span: span, kind: .call(callee: callee,
+                    args: [IRArg(label: nil, value: a), IRArg(label: nil, value: iIdx), IRArg(label: nil, value: value)], typeArgs: []))
+                return IRStmt(kind: .exprStmt(call), span: span)
+            }
             // A write to a computed property lowers to a setter accessor call (M5 A1).
             if case .member(let base, let field, let mspan) = lhs {
                 let b = checkExpr(base)
@@ -1188,6 +1216,18 @@ public struct Sema {
                 return buildEnumInit(typeName, field, [], expected: expected, at: span)
             }
             let b = checkExpr(base)
+            // Array<T> builtin members (M6 stdlib). `count` is the element count; lowered to a builtin
+            // call codegen recognizes by name (element type comes from the receiver's `.array` type).
+            if case .array = b.type {
+                switch field {
+                case "count":
+                    let callee = IRExpr(type: .void, span: span, kind: .varRef("__arrayCount"))
+                    return IRExpr(type: .int, span: span, kind: .call(callee: callee, args: [IRArg(label: nil, value: b)], typeArgs: []))
+                default:
+                    diags.error("value of type '\(b.type)' has no member '\(field)'", at: span)
+                    return IRExpr(type: .error, span: span, kind: .intLit(0))
+                }
+            }
             // A property-requirement read through `any I` / `any A & B` — via the getter slot.
             if let iface = existentialInterfaces(b.type).first(where: { aggregatedProperties($0).contains { $0.name == field } }),
                let prop = aggregatedProperties(iface).first(where: { $0.name == field }) {
@@ -1257,6 +1297,37 @@ public struct Sema {
             let type = Type.function(params: ps.map(\.type), ret: retTy)
             return IRExpr(type: type, span: span, kind: .closure(params: ps, body: irBody))
 
+        case .arrayLit(let elems, let span):
+            // Element type: unify the elements' types, or take it from an `Array<T>` annotation on
+            // the left (needed for an empty literal, which has nothing to infer from).
+            var expectedElem: Type? = nil
+            if case .array(let e)? = expected { expectedElem = e }
+            let irElems = elems.map { checkExpr($0, expected: expectedElem) }
+            var elemTy = expectedElem ?? irElems.first?.type
+            if elemTy == nil {
+                diags.error("cannot infer the element type of an empty array literal — add an annotation like 'Array<Int>'", at: span)
+                elemTy = .error
+            }
+            // Every element must match the element type.
+            for ir in irElems where ir.type != .error && ir.type != elemTy! {
+                diags.error("array element has type '\(ir.type)', expected '\(elemTy!)'", at: ir.span)
+            }
+            return IRExpr(type: .array(elemTy!), span: span, kind: .arrayLit(elements: irElems))
+
+        case .index(let base, let idx, let span):
+            let irBase = checkExpr(base)
+            let irIdx = checkExpr(idx, expected: .int)
+            if irIdx.type != .int && irIdx.type != .error {
+                diags.error("array index must be an 'Int', got '\(irIdx.type)'", at: irIdx.span)
+            }
+            guard case .array(let elem) = irBase.type else {
+                if irBase.type != .error {
+                    diags.error("cannot subscript a value of type '\(irBase.type)' — only 'Array<T>' supports '[ ]'", at: span)
+                }
+                return IRExpr(type: .error, span: span, kind: .index(base: irBase, idx: irIdx))
+            }
+            return IRExpr(type: elem, span: span, kind: .index(base: irBase, idx: irIdx))
+
         case .error(let span):
             // A parser error-recovery placeholder. The driver stops before Sema when the
             // parse sink holds errors, so this is unreachable in the normal flow; type it
@@ -1322,6 +1393,9 @@ public struct Sema {
         case .generic(let pb, let pargs):
             guard case .generic(let ab, let aargs) = arg, pb == ab, pargs.count == aargs.count else { return mismatch(param, arg, at: span) }
             for (p, a) in zip(pargs, aargs) { unify(param: p, arg: a, into: &subst, at: span) }
+        case .array(let pe):
+            guard case .array(let ae) = arg else { return mismatch(param, arg, at: span) }
+            unify(param: pe, arg: ae, into: &subst, at: span)
         default:
             if param != arg { mismatch(param, arg, at: span) }
         }
@@ -1339,6 +1413,7 @@ public struct Sema {
     private func typeParamUnderGeneric(_ t: Type, _ tparams: Set<String>) -> Bool {
         switch t {
         case .generic(_, let a):      return a.contains { mentionsTypeParam($0, tparams) }
+        case .array(let e):           return mentionsTypeParam(e, tparams)
         case .function(let p, let r): return p.contains { typeParamUnderGeneric($0, tparams) } || typeParamUnderGeneric(r, tparams)
         default:                      return false
         }
@@ -1349,6 +1424,7 @@ public struct Sema {
         case .typeParam(let n):        return tparams.contains(n)
         case .function(let p, let r):  return p.contains { mentionsTypeParam($0, tparams) } || mentionsTypeParam(r, tparams)
         case .generic(_, let a):       return a.contains { mentionsTypeParam($0, tparams) }
+        case .array(let e):            return mentionsTypeParam(e, tparams)
         default:                       return false
         }
     }
@@ -1358,6 +1434,7 @@ public struct Sema {
         switch t {
         case .typeParam(let n):        return subst[n] ?? t
         case .generic(let b, let a):   return .generic(base: b, args: a.map { substitute($0, subst) })
+        case .array(let e):            return .array(substitute(e, subst))
         case .function(let p, let r):  return .function(params: p.map { substitute($0, subst) }, ret: substitute(r, subst))
         default:                        return t
         }
@@ -1452,6 +1529,25 @@ public struct Sema {
         // Member call: base.member(args) — an actor send or an instance method.
         if case .member(let base, let name, _) = callee {
             let recv = checkExpr(base)
+            // Array<T> builtin methods (M6 stdlib). `append(x)` grows the array; lowered to a builtin
+            // call codegen recognizes (element type from the receiver's `.array` type).
+            if case .array(let elem) = recv.type {
+                switch name {
+                case "append":
+                    guard args.count == 1 else {
+                        diags.error("Array.append expects 1 argument, got \(args.count)", at: span)
+                        return IRExpr(type: .error, span: span, kind: .intLit(0))
+                    }
+                    let value = coerce(checkExpr(args[0].value, expected: elem), to: elem)
+                    checkAssignable(value.type, to: elem, role: "argument", at: span)
+                    let ac = IRExpr(type: .void, span: span, kind: .varRef("__arrayAppend"))
+                    return IRExpr(type: .void, span: span, kind: .call(callee: ac,
+                        args: [IRArg(label: nil, value: recv), IRArg(label: nil, value: value)], typeArgs: []))
+                default:
+                    diags.error("value of type '\(recv.type)' has no method '\(name)'", at: span)
+                    return IRExpr(type: .error, span: span, kind: .intLit(0))
+                }
+            }
             // A method-requirement call through `any I` / `any A & B` — dispatched via the
             // witness slot (including requirements inherited by refinement, M5 A1.5).
             if let iface = existentialInterfaces(recv.type).first(where: { aggregatedMethods($0).contains { $0.name == name } }),

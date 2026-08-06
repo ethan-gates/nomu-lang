@@ -84,6 +84,10 @@ private struct ExhaustivenessPass {
             walk(body)
         case .box(let value, _):
             walkExpr(value)
+        case .arrayLit(let elements):
+            for el in elements { walkExpr(el) }
+        case .index(let base, let idx):
+            walkExpr(base); walkExpr(idx)
         }
     }
 

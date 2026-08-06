@@ -23,6 +23,7 @@ public enum TokenKind: Hashable {
     // Punctuation
     case lBrace, rBrace       // { }
     case lParen, rParen       // ( )
+    case lBracket, rBracket   // [ ] — array literals and subscripts
     case colon                // :
     case arrow                // ->
     case dot                  // .
@@ -112,6 +113,8 @@ public struct Lexer {
         case "}": return .rBrace
         case "(": return .lParen
         case ")": return .rParen
+        case "[": return .lBracket
+        case "]": return .rBracket
         case ":": return .colon
         case ".": return .dot
         case ",": return .comma

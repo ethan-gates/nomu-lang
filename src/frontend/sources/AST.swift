@@ -283,6 +283,8 @@ public indirect enum Expr {
     case call(Expr, [Arg], span: Span)
     case binary(BinOp, Expr, Expr, span: Span)
     case closure(params: [Param], ret: TypeRef?, body: Block, span: Span)
+    case arrayLit([Expr], span: Span)          // [a, b, c] — an Array<T> literal
+    case index(Expr, Expr, span: Span)         // a[i] — array subscript
 
     // A placeholder for an expression the parser could not build from broken input.
     // Only produced during error recovery — a diagnostic is always reported alongside

@@ -1,0 +1,31 @@
+fun main() {
+  // subscript write
+  var a = [0, 0, 0]
+  a[0] = 5
+  a[1] = 10
+  a[2] = 15
+  print(a[0] + a[1] + a[2])   // 30
+
+  // append + grow from empty (forces several reallocations)
+  let b: Array<Int> = []
+  var i = 0
+  while i < 10 {
+    b.append(i * i)
+    i = i + 1
+  }
+  print(b.count)              // 10
+  print(b[0])                 // 0
+  print(b[9])                 // 81
+  var sum = 0
+  var j = 0
+  while j < b.count {
+    sum = sum + b[j]
+    j = j + 1
+  }
+  print(sum)                  // 285
+
+  // reference semantics: aliasing sees mutation
+  let c = a
+  c[0] = 99
+  print(a[0])                 // 99 (shared)
+}

@@ -22,6 +22,11 @@ unsafe extern "C" {
     // 6.2.4 object sizing: the total byte size of every object of a type-id (header included), from
     // the codegen size table parallel to the pointer maps. `ObjectModel::get_current_size` reads it.
     fn nomu_gc_typesize(type_id: u64) -> u64;
+    // Slice 4 (arrays): object kind (0 fixed / 1 variable-size array buffer) + array element stride.
+    // A variable-size buffer is `{ header, cap, elems… }`: size/scan come from `cap` × stride, with
+    // the per-element managed-pointer map read from `nomu_gc_typemap`.
+    fn nomu_gc_typekind(type_id: u64) -> i32;
+    fn nomu_gc_typestride(type_id: u64) -> u64;
     // 6.2.1 root scanning: walk a stopped carrier's stack (from its STW-saved context), invoking
     // `visit(slot, value, userdata)` per live GC root — `slot` is the stack address holding the
     // pointer. Reports nothing until the STW handshake saves carrier contexts (6.2.3).
@@ -147,7 +152,15 @@ impl ObjectModel<NomuVM> for VMObjectModel {
     // bits of the header word at the object base, as `scan_object` reads it) — every object of a
     // type-id is fixed-size, so no object parsing. Fixed size means copied size equals current size.
     fn get_current_size(object: ObjectReference) -> usize {
-        let type_id = unsafe { object.to_raw_address().load::<u32>() } as u64;
+        let base = object.to_raw_address();
+        let type_id = unsafe { base.load::<u32>() } as u64;
+        if unsafe { nomu_gc_typekind(type_id) } != 0 {
+            // Variable-size array buffer `{ header, cap, elems… }`: size = header/cap prefix (16) +
+            // cap × element stride. `cap` is the *allocated* extent, so this accounts the whole object.
+            let cap = unsafe { (base + 8usize).load::<i64>() } as usize;
+            let stride = unsafe { nomu_gc_typestride(type_id) } as usize;
+            return 16 + cap * stride;
+        }
         unsafe { nomu_gc_typesize(type_id) as usize }
     }
     fn get_size_when_copied(object: ObjectReference) -> usize {
@@ -330,6 +343,21 @@ impl Scanning<NomuVM> for VMScanning {
         let type_id = unsafe { base.load::<u32>() } as u64;
         let mut count: i32 = 0;
         let offs = unsafe { nomu_gc_typemap(type_id, &mut count) };
+        if unsafe { nomu_gc_typekind(type_id) } != 0 {
+            // Array buffer: apply the per-element managed-pointer map at each of the `cap` element
+            // slots. Slots beyond `len` are zero-initialized (rt_alloc zeroing + copy-only-live on
+            // grow), so their managed offsets hold null and MMTk skips them — scanning `cap` is safe.
+            let cap = unsafe { (base + 8usize).load::<i64>() } as isize;
+            let stride = unsafe { nomu_gc_typestride(type_id) } as usize;
+            for i in 0..cap {
+                let elem_base = base + 16usize + (i as usize) * stride;
+                for j in 0..count as isize {
+                    let off = unsafe { *offs.offset(j) } as usize;
+                    slot_visitor.visit_slot(mmtk::vm::slot::SimpleSlot::from_address(elem_base + off));
+                }
+            }
+            return;
+        }
         for i in 0..count as isize {
             let off = unsafe { *offs.offset(i) } as usize;
             slot_visitor.visit_slot(mmtk::vm::slot::SimpleSlot::from_address(base + off));

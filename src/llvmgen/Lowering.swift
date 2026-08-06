@@ -85,7 +85,15 @@ final class IRToLLVM {
     // monomorphized), so the collector's `get_current_size`/`get_size_when_copied` read this table by
     // type-id instead of parsing the object. No header change (§6.2.4).
     private var typeSizes: [Int32] = []
+    // M6 stdlib · Slice 4 — parallel to `typeMaps`: `typeKinds[id]` = 0 for a fixed-size object, 1 for
+    // an array buffer (variable size). For an array buffer, `typeStrides[id]` = one element's byte
+    // stride and `typeMaps[id]` = the managed-pointer offsets *within one element* (applied per element
+    // by `scan_object`); `typeSizes[id]` is unused (size comes from the object's `cap`).
+    private var typeKinds: [Int32] = []
+    private var typeStrides: [Int32] = []
+    private var arrayBufMapIds: [String: UInt64] = [:]   // element-type description → array-buffer type-id
     private var anyBoxMapId: UInt64?   // one shared map for every `any I` box (payload at byte 16)
+    private var arrayHandleMapId: UInt64?   // M6 stdlib — one shared type-id for every Array handle (bufptr at byte 16)
 
     // 8.2.5 witness machinery. `interfaceDefs` gives a requirement surface to lay out a witness
     // struct; `opaqueUnderlyings` resolves `some I` to its hidden concrete type. Witness types and
@@ -439,6 +447,8 @@ final class IRToLLVM {
             if actorMap[n] != nil { return p1 }    // an actor handle is a managed pointer to its object (D1)
             fail("8.2.6: unknown actor '\(n)'", span)
             return nil
+        case .array:
+            return p1   // `Array<T>` is a reference type — a managed pointer to the heap handle (M6)
         case .existential, .composition:
             return p1   // `any I` / `any A & B` — a managed pointer to a heap { witness, payload } box (8.4.1)
         case .opaque:
@@ -859,6 +869,10 @@ final class IRToLLVM {
             return LLVMConstInt(i1, v ? 1 : 0, 0)
         case .stringLit(let s):
             return lowerStringLit(s)
+        case .arrayLit(let elements):
+            return lowerArrayLit(elements, e.type, e.span)
+        case .index(let base, let idx):
+            return lowerIndex(base, idx, e.type, e.span)
         case .varRef(let name) where spawnLocals[name] != nil:
             return joinSpawn(name)
         case .varRef, .fieldAccess:
@@ -1685,6 +1699,157 @@ final class IRToLLVM {
         return buildCall(fn.0, fn.1, [LLVMConstInt(i32, 0, 0)])
     }
 
+    // ---- Array<T> (M6 stdlib · Slice 3) ----
+    // A reference `Array<T>` value is a managed pointer to a fixed handle `{ i64 header, i64 len, p1
+    // bufptr }` (24 bytes). The buffer is a separate variable-size GC object `{ i64 header, i64 cap,
+    // elems… }`; element i is at byte 16 + i*stride, in T's natural representation. Reference semantics
+    // (the handle is shared). GC sizing/scanning of the variable-size buffer is Slice 4; under NoGC the
+    // buffer header is inert (small programs under Immix don't trigger a collection either).
+
+    // One element's byte stride in the buffer — 8-aligned slots, matching the GC pointer-map layout.
+    private func arrayElemStride(_ t: Type) -> Int { max(slotCount(t) * 8, 8) }
+
+    // GEP a managed pointer by a byte offset (`i8`-typed indexing), yielding a p1 to that byte.
+    private func gepByte(_ ptr: LLVMValueRef, _ off: LLVMValueRef) -> LLVMValueRef {
+        let i8 = LLVMInt8TypeInContext(ctx)
+        var idx: LLVMValueRef? = off
+        return withUnsafeMutablePointer(to: &idx) { LLVMBuildGEP2(b, i8, ptr, $0, 1, "aoff")! }
+    }
+
+    // The shared type-id for every Array handle — identical layout for all T (one managed field,
+    // bufptr at byte 16), so it is a fixed-size object using the ordinary 6.1.3 map.
+    private func arrayHandleTypeId() -> UInt64 {
+        if let id = arrayHandleMapId { return id }
+        let id = registerMap([16], sizeBytes: 24)
+        arrayHandleMapId = id
+        return id
+    }
+
+    // The array-buffer type-id for element type `elem` (M6 stdlib · Slice 4): a variable-size object
+    // whose per-element managed-pointer offsets are `elem`'s own managed offsets, repeated `cap` times
+    // by the collector. Registered once per element type.
+    private func arrayBufTypeId(_ elem: Type) -> UInt64 {
+        let key = elem.description
+        if let id = arrayBufMapIds[key] { return id }
+        var elemOffsets: [Int32] = []
+        collectManagedOffsets(elem, baseSlot: 0, into: &elemOffsets)
+        let id = registerArrayMap(elemOffsets, stride: Int32(arrayElemStride(elem)))
+        arrayBufMapIds[key] = id
+        return id
+    }
+
+    // [e0, e1, …] → allocate the handle + (for a non-empty literal) the buffer, stamp headers, store
+    // each element. Returns the handle (the Array value, a managed pointer).
+    private func lowerArrayLit(_ elements: [IRExpr], _ arrayType: Type, _ span: Span) -> LLVMValueRef? {
+        guard case .array(let elem) = arrayType else { fail("array literal has non-array type", span); return nil }
+        let stride = arrayElemStride(elem)
+        let n = elements.count
+        let handle = rtAllocManaged(LLVMConstInt(i64, 24, 0))
+        LLVMBuildStore(b, LLVMConstInt(i64, arrayHandleTypeId(), 0), handle)                            // header
+        LLVMBuildStore(b, LLVMConstInt(i64, UInt64(n), 0), gepByte(handle, LLVMConstInt(i64, 8, 0)))   // len
+        // Always allocate a buffer (cap = n, possibly 0), so `bufptr` is never null and append can
+        // read `cap` without a null guard. Buffer header carries the array-kind type-id (Slice 4).
+        let buf = rtAllocManaged(LLVMConstInt(i64, UInt64(16 + n * stride), 0))
+        LLVMBuildStore(b, LLVMConstInt(i64, arrayBufTypeId(elem), 0), buf)                             // header
+        LLVMBuildStore(b, LLVMConstInt(i64, UInt64(n), 0), gepByte(buf, LLVMConstInt(i64, 8, 0)))      // cap
+        for (i, el) in elements.enumerated() {
+            guard let v = lowerExpr(el) else { return nil }
+            LLVMBuildStore(b, v, gepByte(buf, LLVMConstInt(i64, UInt64(16 + i * stride), 0)))
+        }
+        LLVMBuildStore(b, buf, gepByte(handle, LLVMConstInt(i64, 16, 0)))                              // bufptr
+        return handle
+    }
+
+    // Bounds-checked p1 address of element `idxV` in `handle`. The unsigned compare `idx >= len`
+    // catches negative and too-large in one test; an out-of-range index traps in the runtime (never
+    // returns). On return the builder sits in the in-bounds block.
+    private func arrayElemAddr(_ handle: LLVMValueRef, _ idxV: LLVMValueRef, _ elemType: Type) -> LLVMValueRef? {
+        guard let fn = currentFn else { return nil }
+        let len = LLVMBuildLoad2(b, i64, gepByte(handle, LLVMConstInt(i64, 8, 0)), "arr.len")!
+        let oob = LLVMBuildICmp(b, LLVMIntUGE, idxV, len, "arr.oob")!
+        let trapBB = LLVMAppendBasicBlockInContext(ctx, fn, "arr.trap")!
+        let okBB = LLVMAppendBasicBlockInContext(ctx, fn, "arr.ok")!
+        LLVMBuildCondBr(b, oob, trapBB, okBB)
+        LLVMPositionBuilderAtEnd(b, trapBB)
+        let trap = runtimeFn("rt_bounds_trap", ret: LLVMVoidTypeInContext(ctx), params: [i64, i64], varArg: false)
+        _ = buildCall(trap.0, trap.1, [idxV, len])
+        LLVMBuildUnreachable(b)
+        LLVMPositionBuilderAtEnd(b, okBB)
+        let buf = LLVMBuildLoad2(b, p1, gepByte(handle, LLVMConstInt(i64, 16, 0)), "arr.buf")!
+        let stride = LLVMConstInt(i64, UInt64(arrayElemStride(elemType)), 0)
+        let off = LLVMBuildAdd(b, LLVMConstInt(i64, 16, 0), LLVMBuildMul(b, idxV, stride, "arr.mul"), "arr.off")!
+        return gepByte(buf, off)
+    }
+
+    // a[i] → bounds-checked element load.
+    private func lowerIndex(_ base: IRExpr, _ idx: IRExpr, _ elemType: Type, _ span: Span) -> LLVMValueRef? {
+        guard let handle = lowerExpr(base), let idxV = lowerExpr(idx), let elemLL = llvmType(elemType, span),
+              let addr = arrayElemAddr(handle, idxV, elemType) else { return nil }
+        return LLVMBuildLoad2(b, elemLL, addr, "arr.elem")
+    }
+
+    // a[i] = x → bounds-checked element store (args: handle, index, value). Result unused.
+    private func lowerArraySet(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+        guard args.count == 3 else { fail("__arraySet expects 3 args", span); return nil }
+        guard let handle = lowerExpr(args[0].value), let idxV = lowerExpr(args[1].value),
+              let val = lowerExpr(args[2].value),
+              let addr = arrayElemAddr(handle, idxV, args[2].value.type) else { return nil }
+        LLVMBuildStore(b, val, addr)
+        return LLVMConstInt(i64, 0, 0)
+    }
+
+    // a.append(x) → grow the buffer if full, store x at index len, bump len. Result unused. Grow is
+    // done here (not in C) so the buffer allocation is a statepoint: the rewrite pass relocates the
+    // handle/old-buffer/value across it, and we reload the current buffer from the (relocated) handle
+    // afterward — a raw C pointer could not survive a moving collection.
+    private func lowerArrayAppend(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+        guard args.count == 2 else { fail("__arrayAppend expects 2 args", span); return nil }
+        let elem = args[1].value.type
+        guard let handle = lowerExpr(args[0].value), let val = lowerExpr(args[1].value), let fn = currentFn else { return nil }
+        let stride = arrayElemStride(elem)
+        let strideV = LLVMConstInt(i64, UInt64(stride), 0)
+        let len = LLVMBuildLoad2(b, i64, gepByte(handle, LLVMConstInt(i64, 8, 0)), "app.len")!
+        let buf0 = LLVMBuildLoad2(b, p1, gepByte(handle, LLVMConstInt(i64, 16, 0)), "app.buf")!
+        let cap = LLVMBuildLoad2(b, i64, gepByte(buf0, LLVMConstInt(i64, 8, 0)), "app.cap")!
+        let full = LLVMBuildICmp(b, LLVMIntUGE, len, cap, "app.full")!
+        let growBB = LLVMAppendBasicBlockInContext(ctx, fn, "app.grow")!
+        let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "app.cont")!
+        LLVMBuildCondBr(b, full, growBB, contBB)
+
+        // Grow: newCap = cap==0 ? 4 : cap*2; allocate, stamp header + cap, copy the live elements,
+        // publish the new buffer into the handle. GEPs off `handle` after the alloc use the relocated
+        // handle (the rewrite pass rewrites the operand), so they never dangle.
+        LLVMPositionBuilderAtEnd(b, growBB)
+        let isZero = LLVMBuildICmp(b, LLVMIntEQ, cap, LLVMConstInt(i64, 0, 0), "app.cap0")!
+        let dbl = LLVMBuildMul(b, cap, LLVMConstInt(i64, 2, 0), "app.dbl")!
+        let newCap = LLVMBuildSelect(b, isZero, LLVMConstInt(i64, 4, 0), dbl, "app.newcap")!
+        let newBytes = LLVMBuildAdd(b, LLVMConstInt(i64, 16, 0), LLVMBuildMul(b, newCap, strideV, "app.nb"), "app.bytes")!
+        let newBuf = rtAllocManaged(newBytes)   // statepoint: handle/buf0/val relocated across this
+        LLVMBuildStore(b, LLVMConstInt(i64, arrayBufTypeId(elem), 0), newBuf)                       // header
+        LLVMBuildStore(b, newCap, gepByte(newBuf, LLVMConstInt(i64, 8, 0)))                         // cap
+        let copyBytes = LLVMBuildMul(b, len, strideV, "app.copy")!
+        let memcpy = runtimeFn("memcpy", ret: i8ptr, params: [i8ptr, i8ptr, i64], varArg: false)
+        _ = buildCall(memcpy.0, memcpy.1, [toUnmanaged(gepByte(newBuf, LLVMConstInt(i64, 16, 0))),
+                                           toUnmanaged(gepByte(buf0, LLVMConstInt(i64, 16, 0))), copyBytes])
+        LLVMBuildStore(b, newBuf, gepByte(handle, LLVMConstInt(i64, 16, 0)))   // publish
+        LLVMBuildBr(b, contBB)
+
+        // Store the element into the current buffer (reloaded from the handle so it is the grown one
+        // on the grow path) and bump len.
+        LLVMPositionBuilderAtEnd(b, contBB)
+        let buf = LLVMBuildLoad2(b, p1, gepByte(handle, LLVMConstInt(i64, 16, 0)), "app.buf2")!
+        let off = LLVMBuildAdd(b, LLVMConstInt(i64, 16, 0), LLVMBuildMul(b, len, strideV, "app.mul"), "app.off")!
+        LLVMBuildStore(b, val, gepByte(buf, off))
+        LLVMBuildStore(b, LLVMBuildAdd(b, len, LLVMConstInt(i64, 1, 0), "app.inc"), gepByte(handle, LLVMConstInt(i64, 8, 0)))
+        return LLVMConstInt(i64, 0, 0)
+    }
+
+    // `a.count` → load `len` from the handle (no allocation, no safepoint).
+    private func lowerArrayCount(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+        guard let a = args.first, let handle = lowerExpr(a.value) else { return nil }
+        return LLVMBuildLoad2(b, i64, gepByte(handle, LLVMConstInt(i64, 8, 0)), "arr.count")
+    }
+
     private func lowerCall(callee: IRExpr, args: [IRArg], span: Span) -> LLVMValueRef? {
         if case .varRef(let name) = callee.kind {
             switch name {
@@ -1692,6 +1857,9 @@ final class IRToLLVM {
             case "concat": return lowerConcat(args, span)
             case "sleep":  return lowerSleep(args, span)
             case "readLine": return lowerReadLine()
+            case "__arrayCount": return lowerArrayCount(args, span)
+            case "__arraySet": return lowerArraySet(args, span)
+            case "__arrayAppend": return lowerArrayAppend(args, span)
             default:       break
             }
             // A closure-typed local is an indirect call; a global function name is direct.
@@ -1793,6 +1961,11 @@ final class IRToLLVM {
             collectUses(cbody, bound: &nb, used: &used)
         case .box(let value, _):
             collectUsesExpr(value, bound: bound, used: &used)
+        case .arrayLit(let elements):
+            for el in elements { collectUsesExpr(el, bound: bound, used: &used) }
+        case .index(let base, let idx):
+            collectUsesExpr(base, bound: bound, used: &used)
+            collectUsesExpr(idx, bound: bound, used: &used)
         }
     }
 
@@ -1907,6 +2080,8 @@ final class IRToLLVM {
     // GC-object form (Q6) needs `String` heap-boxed (the FCA limit), deferred with 6.2.
     private static let gcLeafRuntimeFns: Set<String> = [
         "printf", "rt_str_lit", "rt_mutex_new", "rt_mutex_unlock",
+        "rt_bounds_trap",   // aborts, never allocates — no statepoint needed
+        "memcpy",           // libc block copy — never allocates (array grow)
     ]
 
     private func markGCLeaf(_ fn: LLVMValueRef) {
@@ -2086,11 +2261,17 @@ final class IRToLLVM {
             if case .varRef(let n) = callee.kind {
                 switch n {
                 case "print", "concat": return args.contains { exprHasSafepoint($0.value) }   // leaf
+                case "__arrayCount", "__arraySet": return args.contains { exprHasSafepoint($0.value) }   // load / store
+                case "__arrayAppend": return true                                              // rt_array_grow may rt_alloc
                 case "sleep", "readLine": return true                                          // non-leaf runtime
                 default: return true                                                            // user function
                 }
             }
             return true   // indirect closure call
+        case .arrayLit:
+            return true   // rt_alloc (the handle + the buffer)
+        case .index(let base, let idx):
+            return exprHasSafepoint(base) || exprHasSafepoint(idx)   // the load/bounds-trap is not a safepoint
         }
     }
 
@@ -2137,12 +2318,26 @@ final class IRToLLVM {
 
     // ---- M6 · 6.1.3 — GC pointer maps ----
 
-    // Register a pointer map (managed-field byte offsets) plus the object's total byte size, and
-    // return its type-id (the shared index into both `typeMaps` and `typeSizes`).
+    // Register a fixed-size object's pointer map (managed-field byte offsets) plus its total byte size,
+    // and return its type-id (the shared index into `typeMaps`/`typeSizes`/`typeKinds`/`typeStrides`).
     private func registerMap(_ offsets: [Int32], sizeBytes: Int32) -> UInt64 {
         let id = UInt64(typeMaps.count)
         typeMaps.append(offsets)
         typeSizes.append(sizeBytes)
+        typeKinds.append(0)      // fixed
+        typeStrides.append(0)
+        return id
+    }
+
+    // Register an array buffer type-id (M6 stdlib · Slice 4): `elementOffsets` are the managed-pointer
+    // byte offsets *within one element*, `stride` its byte size. The object's total size and live
+    // extent come from its `cap`/`len` at run time, so no fixed size is stored.
+    private func registerArrayMap(_ elementOffsets: [Int32], stride: Int32) -> UInt64 {
+        let id = UInt64(typeMaps.count)
+        typeMaps.append(elementOffsets)
+        typeSizes.append(0)
+        typeKinds.append(1)      // array
+        typeStrides.append(stride)
         return id
     }
 
@@ -2193,8 +2388,8 @@ final class IRToLLVM {
     // today so it is skipped (Q6), and enum payloads carry no references in the language today (D6).
     private func collectManagedOffsets(_ t: Type, baseSlot: Int, into offsets: inout [Int32]) {
         switch t {
-        case .named(_, .class_), .named(_, .actor_), .function, .existential, .composition:
-            offsets.append(Int32(baseSlot * 8))
+        case .named(_, .class_), .named(_, .actor_), .function, .existential, .composition, .array:
+            offsets.append(Int32(baseSlot * 8))   // an Array<T> field is a managed handle pointer (M6)
         case .named(let n, .struct_):
             var s = baseSlot
             for sf in (structMap[n]?.fields ?? []) {
@@ -2229,6 +2424,10 @@ final class IRToLLVM {
         // Parallel per-type-id byte sizes (6.2.4): `_sizes[id]` = total object size. Same fallback
         // shape as the maps so the runtime externs resolve with no heap types.
         emitI32Array("nomu_gc_typemap_sizes", typeSizes.isEmpty ? [0] : typeSizes)
+        // Slice 4 — per-type-id kind (0 fixed / 1 array) + array element stride. Lets the collector
+        // size/scan a variable-length array buffer from its `cap`/`len` and per-element map.
+        emitI32Array("nomu_gc_typemap_kind", typeKinds.isEmpty ? [0] : typeKinds)
+        emitI32Array("nomu_gc_typemap_stride", typeStrides.isEmpty ? [0] : typeStrides)
         let g = LLVMAddGlobal(mod, i64, "nomu_gc_typemap_count")!
         LLVMSetInitializer(g, LLVMConstInt(i64, UInt64(typeMaps.count), 0))
         LLVMSetGlobalConstant(g, 1)

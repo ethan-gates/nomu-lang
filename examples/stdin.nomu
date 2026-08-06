@@ -1,13 +1,13 @@
 fun ticker() -> Int {
-    sleep(300)
+    sleep(1)
     print("tick")
-    sleep(300)
+    sleep(1)
     print("tick")
-    sleep(300)
+    sleep(1)
     print("tick")
-    sleep(300)
+    sleep(1)
     print("tick")
-    sleep(300)
+    sleep(1)
     print("tick")
     return 0
 }

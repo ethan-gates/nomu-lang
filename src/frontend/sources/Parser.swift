@@ -736,6 +736,10 @@ public struct Parser {
                 expr = .member(expr, expectIdent(), span: spanFrom(start))
             } else if check(.lParen) {
                 expr = .call(expr, parseArgList(), span: spanFrom(start))
+            } else if eat(.lBracket) {
+                let idx = parseExpr()
+                expect(.rBracket)
+                expr = .index(expr, idx, span: spanFrom(start))
             } else {
                 break
             }
@@ -754,6 +758,8 @@ public struct Parser {
             advance(); return .stringLit(v, span: spanFrom(start))
         case .lBrace:
             return parseClosure()
+        case .lBracket:
+            return parseArrayLit()
         case .ident(let name):
             advance(); return .ident(name, span: spanFrom(start))
         case .dot:
@@ -767,6 +773,22 @@ public struct Parser {
             error("expected expression, got \(currentKind)")
             return .error(span: currentSpan)
         }
+    }
+
+    // [a, b, c]  — an array literal (empty `[]` allowed; element type inferred / annotated). A
+    // trailing subscript like `[1, 2][0]` is handled by parsePostfix off the literal.
+    private mutating func parseArrayLit() -> Expr {
+        let start = currentSpan
+        expect(.lBracket)
+        var elems: [Expr] = []
+        while !check(.rBracket) && !check(.eof) {
+            let before = pos
+            if !elems.isEmpty { expect(.comma) }
+            elems.append(parseExpr())
+            if pos == before { advance() }   // guarantee progress on unparseable input
+        }
+        expect(.rBracket)
+        return .arrayLit(elems, span: spanFrom(start))
     }
 
     // { (x: Int) -> Int in <stmts> }   — return type optional (void if omitted)

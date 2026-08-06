@@ -9,6 +9,7 @@ Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease
 - [vision.md](vision.md) — what Nomu is for: goals, performance profile, design principles, rejected directions, and the tiebreaker for future decisions.
 - [memory-model.md](memory-model.md) — the value/reference split, the GC (MMTk), immutability, escape analysis, the performance recipe, and every binding form's memory meaning.
 - [types.md](types.md) — type system apart from interfaces: generics + dispatch, sum types + exhaustive matching, error handling.
+- [c-types.md](c-types.md) — C-backed standard-library types (String, `Array<T>`, planned numeric primitives + spawn group): layout, the allocation/GC seam, and the runtime contract, before they migrate into a Nomu-written stdlib.
 - [generics.md](generics.md) — **authoritative as-built spec** for generics: parameters, inference, checking, witness-passing + monomorphization, generic types, the `shared` bound + conditional conformance, exhaustiveness, `Result`.
 - [interfaces.md](interfaces.md) — conformance, dispatch, extensions, and composition.
 - [modules.md](modules.md) — **stub**: modules / compilation units and access control (undesigned; reserved).

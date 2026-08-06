@@ -184,6 +184,10 @@ private func children(_ e: IRExpr) -> [(slot: String, expr: IRExpr)] {
         return [("lhs", l), ("rhs", r)]
     case .box(let value, _):
         return [("value", value)]
+    case .arrayLit(let elements):
+        return elements.map { ("elem", $0) }
+    case .index(let base, let idx):
+        return [("base", base), ("index", idx)]
     }
 }
 
@@ -203,6 +207,8 @@ private func head(_ e: IRExpr) -> String {
     case .binary(let op, _, _):    return "binary \(opSym(op))"
     case .closure:                 return "closure"
     case .box(_, let ifaces):      return "box any \(ifaces.joined(separator: " & "))"
+    case .arrayLit(let elements):  return "arrayLit [\(elements.count)]"
+    case .index:                   return "index"
     }
 }
 

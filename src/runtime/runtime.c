@@ -73,6 +73,11 @@ extern const int64_t nomu_gc_typemap_count;
 // Parallel per-type-id total object byte size (M6 · 6.2.4): `_sizes[id]` = the fixed size of every
 // object of that type (header included). Codegen emits it beside the pointer maps.
 extern const int32_t nomu_gc_typemap_sizes[];
+// Parallel per-type-id kind + array element stride (M6 stdlib · Slice 4): `_kind[id]` is 0 for a
+// fixed-size object, 1 for a variable-size array buffer; `_stride[id]` is one element's byte size for
+// an array buffer (0 otherwise). Lets the collector size/scan a buffer from its `cap`/`len`.
+extern const int32_t nomu_gc_typemap_kind[];
+extern const int32_t nomu_gc_typemap_stride[];
 
 // Managed-field byte offsets for a type-id (NULL if out of range); *out_count receives the count.
 // The binding's `scan_object` and the self-check below both walk objects through this.
@@ -96,6 +101,23 @@ uint64_t nomu_gc_typesize(uint64_t type_id) {
     return (uint64_t)nomu_gc_typemap_sizes[type_id];
 }
 
+// Object kind for a type-id (M6 stdlib · Slice 4): 0 = fixed-size, 1 = variable-size array buffer.
+// The binding's `get_current_size`/`scan_object` branch on this.
+int32_t nomu_gc_typekind(uint64_t type_id) {
+    if (type_id >= (uint64_t)nomu_gc_typemap_count) {
+        return 0;
+    }
+    return nomu_gc_typemap_kind[type_id];
+}
+
+// Array element byte stride for an array-buffer type-id (M6 stdlib · Slice 4). 0 for a fixed type.
+uint64_t nomu_gc_typestride(uint64_t type_id) {
+    if (type_id >= (uint64_t)nomu_gc_typemap_count) {
+        return 0;
+    }
+    return (uint64_t)nomu_gc_typemap_stride[type_id];
+}
+
 // Map-walk self-check (6.1 exit): dump every type's pointer map. Gated by NOMU_GC_TYPEMAPS so it is
 // off for normal runs; a test compiles a program with known types and diffs this against expectation.
 static void nomu_gc_dump_typemaps(void) {
@@ -113,6 +135,15 @@ static void nomu_gc_dump_typemaps(void) {
 }
 
 void rt_free(void* p) { free(p); }
+
+// Array bounds violation (M6 stdlib · Slice 3). Codegen emits a check on every subscript and calls
+// this on an out-of-range index; it prints and aborts (Swift-style trap). Never returns.
+void rt_bounds_trap(int64_t idx, int64_t len) {
+    fprintf(stderr, "fatal error: array index %lld out of range for length %lld\n",
+            (long long)idx, (long long)len);
+    abort();
+}
+
 
 // ---- Fiber scheduler (M4.5: multi-carrier, idle sleep, fiber-aware timer) ----
 #define RT_MAX_FIBERS 256

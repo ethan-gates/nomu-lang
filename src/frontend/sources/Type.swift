@@ -18,6 +18,7 @@ public indirect enum Type: Equatable {
     case opaque(interfaces: [String], owner: String)  // `some I` / `some A & B` — one hidden concrete underlying (M5 A3). `owner` gives per-function/binding identity (Swift-style); the underlying is looked up in IRModule.opaqueUnderlyings. Unboxed, statically dispatched.
     case typeParam(String)                          // a generic type parameter `T` in scope (M5 5.2.1)
     case generic(base: String, args: [Type])        // an applied generic type `Box<Int>` (M5 5.2.1)
+    case array(Type)                                // `Array<T>` — a builtin variable-size reference type (M6 stdlib). Reference semantics (a managed handle); the element `T` is monomorphized like any other generic argument.
     case function(params: [Type], ret: Type)       // closures and named functions share this
     case error                                     // unresolved / failed typing; suppresses cascades
 }
@@ -37,6 +38,7 @@ extension Type: CustomStringConvertible {
         case .opaque(let interfaces, _): return "some " + interfaces.joined(separator: " & ")
         case .typeParam(let n): return n
         case .generic(let base, let args): return base + "<" + args.map(\.description).joined(separator: ", ") + ">"
+        case .array(let elem): return "Array<\(elem)>"
         case .function(let params, let ret):
             return "(" + params.map(\.description).joined(separator: ", ") + ") -> \(ret)"
         }

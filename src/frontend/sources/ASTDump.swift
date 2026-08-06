@@ -152,6 +152,10 @@ private func describeExpr(_ e: Expr) -> String {
         let ps = params.map { "\($0.name): \($0.type.name)" }.joined(separator: ", ")
         let r = ret.map { " -> \($0.name)" } ?? ""
         return "{ (\(ps))\(r) in … }"
+    case .arrayLit(let elems, _):
+        return "[\(elems.map(describeExpr).joined(separator: ", "))]"
+    case .index(let base, let idx, _):
+        return "\(describeExpr(base))[\(describeExpr(idx))]"
     case .error:
         return "<error>"
     }

@@ -8,6 +8,11 @@
 // Run: NOMU_GC_STRESS=2048 build/examples/gc_stress  → prints 42, 7, then 499500.
 class Box {
   var v: Int
+  var a: Int
+  var b: Int
+  var c: Int
+  var d: Int
+  var e: Int
 }
 
 class Pair {
@@ -16,15 +21,16 @@ class Pair {
 }
 
 fun main() {
-  let inner = Box(v: 42)
-  let pair = Pair(a: inner, b: Box(v: 7))
+  let inner = Box(v: 42, a:0,b:0,c:0,d:0,e:0)
+  let pair = Pair(a: inner, b: Box(v: 7, a:0,b:0,c:0,d:0,e:0))
   var sum = 0
   var i = 0
   while i < 1000 {
-    let g = Box(v: i)          // garbage: dead after this iteration
+    let g = Box(v: i, a:0,b:0,c:0,d:0,e:0)          // garbage: dead after this iteration
     sum = sum + g.v
     i = i + 1
   }
+  sleep(10000)
   print(pair.a.v)              // 42 — interior ref relocated + field updated
   print(pair.b.v)              // 7
   print(inner.v)              // 42 — live root relocated
