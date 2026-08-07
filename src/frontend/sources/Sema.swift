@@ -48,7 +48,10 @@ public struct Sema {
 
     // Lexical scope stack for locals/params (name → type + mutability).
     private var scopes: [[String: Local]] = []
-    private struct Local { let type: Type; let isMutable: Bool }
+    private struct Local {
+        let type: Type
+        let isMutable: Bool
+    }
 
     // Declared return type of the body being lowered — the contextual type for a
     // `return .case(...)` leading-dot construction (M4.10).
@@ -211,6 +214,7 @@ public struct Sema {
         }
         switch ref.name {
         case "Int":    return .int
+        case "Double": return .double
         case "Bool":   return .bool
         case "String": return .string
         case "Void":   return .void
@@ -1190,6 +1194,7 @@ public struct Sema {
     private mutating func checkExpr(_ e: Expr, expected: Type? = nil) -> IRExpr {
         switch e {
         case .intLit(let v, let span):    return IRExpr(type: .int,    span: span, kind: .intLit(v))
+        case .doubleLit(let v, let span): return IRExpr(type: .double, span: span, kind: .doubleLit(v))
         case .boolLit(let v, let span):   return IRExpr(type: .bool,   span: span, kind: .boolLit(v))
         case .stringLit(let v, let span): return IRExpr(type: .string, span: span, kind: .stringLit(v))
 
@@ -1216,6 +1221,17 @@ public struct Sema {
                 return buildEnumInit(typeName, field, [], expected: expected, at: span)
             }
             let b = checkExpr(base)
+            // Numeric conversions (M6 stdlib), property-style: `i.double` widens Int→Double;
+            // `d.int` narrows Double→Int, rounding to nearest (ties away from zero). These are the
+            // only Int/Double conversions — arithmetic never converts implicitly.
+            if b.type == .int, field == "double" {
+                let callee = IRExpr(type: .void, span: span, kind: .varRef("__intToDouble"))
+                return IRExpr(type: .double, span: span, kind: .call(callee: callee, args: [IRArg(label: nil, value: b)], typeArgs: []))
+            }
+            if b.type == .double, field == "int" {
+                let callee = IRExpr(type: .void, span: span, kind: .varRef("__doubleToInt"))
+                return IRExpr(type: .int, span: span, kind: .call(callee: callee, args: [IRArg(label: nil, value: b)], typeArgs: []))
+            }
             // Array<T> builtin members (M6 stdlib). `count` is the element count; lowered to a builtin
             // call codegen recognizes by name (element type comes from the receiver's `.array` type).
             if case .array = b.type {
@@ -1710,14 +1726,20 @@ public struct Sema {
 
     private func binaryResult(_ op: BinOp, _ lhs: IRExpr, _ rhs: IRExpr, at span: Span) -> Type {
         switch op {
-        case .add, .sub, .mul, .div:
-            if lhs.type != .int && lhs.type != .error {
-                diags.error("arithmetic requires Int, got '\(lhs.type)'", at: lhs.span)
+        case .add, .sub, .mul, .div, .mod:
+            // Arithmetic is Int or Double, with no implicit conversion between them: both
+            // operands must be the same numeric type (use `.double`/`.int` to convert).
+            func numeric(_ t: Type, _ span: Span) -> Bool {
+                if t == .int || t == .double { return true }
+                if t != .error { diags.error("arithmetic requires Int or Double, got '\(t)'", at: span) }
+                return false
             }
-            if rhs.type != .int && rhs.type != .error {
-                diags.error("arithmetic requires Int, got '\(rhs.type)'", at: rhs.span)
+            let lok = numeric(lhs.type, lhs.span), rok = numeric(rhs.type, rhs.span)
+            if lok && rok && lhs.type != rhs.type {
+                diags.error("arithmetic operands must match: '\(lhs.type)' and '\(rhs.type)' (no implicit conversion)", at: lhs.span)
+                return .int
             }
-            return .int
+            return lok ? lhs.type : (rok ? rhs.type : .int)
         case .eq, .neq, .lt, .gt, .lte, .gte:
             return .bool
         }
@@ -1851,7 +1873,11 @@ public struct Sema {
     }
 
     private func lookup(_ name: String) -> Type? {
-        for scope in scopes.reversed() { if let l = scope[name] { return l.type } }
+        for scope in scopes.reversed() {
+            if let l = scope[name] {
+                return l.type
+            }
+        }
         return nil
     }
 

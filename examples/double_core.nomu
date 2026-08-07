@@ -1,0 +1,34 @@
+fun main() {
+    let a = 3.5
+    let b = 2.0
+    print(a + b)            // 5.5
+    print(a - b)            // 1.5
+    print(a * b)            // 7.0
+    print(a / b)            // 1.75
+    print(7.5 % 2.0)        // 1.5  — float remainder
+
+    // Int stays Int, including `%`.
+    print(17 % 5)           // 2
+    print(17 / 5)           // 3
+
+    // Conversions (the only Int<->Double bridge).
+    let n = 10
+    print(n.double / 4.0)   // 2.5   — widen then divide
+    print(2.7.int)          // 3     — round half away from zero
+    print(2.4.int)          // 2
+    let neg = 0 - 2
+    print(neg.double + 0.5) // -1.5
+
+    // Comparisons on Double.
+    print(a > b)            // true
+    print(a == 3.5)         // true
+
+    // += on Double.
+    var acc = 0.0
+    var i = 0
+    while i < 4 {
+        acc += 1.5
+        i = i + 1
+    }
+    print(acc)              // 6.0
+}

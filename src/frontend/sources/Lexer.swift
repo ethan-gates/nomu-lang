@@ -3,6 +3,7 @@ import Foundation
 public enum TokenKind: Hashable {
     // Literals
     case intLit(Int)
+    case doubleLit(Double)
     case boolLit(Bool)
     case stringLit(String)
 
@@ -32,7 +33,7 @@ public enum TokenKind: Hashable {
     // Operators
     case eq                   // =
     case plusEq               // +=
-    case plus, minus, star, slash
+    case plus, minus, star, slash, percent
     case eqEq, bangEq
     case lt, gt, ltEq, gtEq
     case amp                  // & — interface composition
@@ -103,7 +104,7 @@ public struct Lexer {
         guard pos < src.count else { return .eof }
 
         let c = src[pos]
-        if c.isNumber { return lexInt() }
+        if c.isNumber { return lexNumber() }
         if c.isLetter || c == "_" { return lexIdent() }
         if c == "\"" { return lexString() }
 
@@ -126,6 +127,7 @@ public struct Lexer {
             return .minus
         case "*": return .star
         case "/": return .slash
+        case "%": return .percent
         case "=":
             if peek() == "=" { pos += 1; return .eqEq }
             return .eq
@@ -158,13 +160,34 @@ public struct Lexer {
         }
     }
 
-    private mutating func lexInt() -> TokenKind {
-        var value = 0
+    // A run of digits is an `Int`. A following `.` is read by the char after it:
+    //   - a digit  → a `Double` literal (`3.14`, `0.5`);
+    //   - a letter or `_` → member access, so the dot is left for the parser (`3.foo`, `5.double`);
+    //   - anything else (EOF, space, operator, another `.`) → a bare `3.`, which is malformed: the
+    //     author meant either a `Double` (`3.0`) or a member access (`3.name`). Report and skip the dot.
+    private mutating func lexNumber() -> TokenKind {
+        var text = ""
         while pos < src.count && src[pos].isNumber {
-            value = value * 10 + src[pos].wholeNumberValue!
+            text.append(src[pos])
             pos += 1
         }
-        return .intLit(value)
+        if pos < src.count && src[pos] == "." {
+            let after = pos + 1 < src.count ? src[pos + 1] : nil
+            if let a = after, a.isNumber {
+                text.append("."); pos += 1                  // the '.'
+                while pos < src.count && src[pos].isNumber {
+                    text.append(src[pos])
+                    pos += 1
+                }
+                return .doubleLit(Double(text)!)
+            }
+            if after == nil || !(after!.isLetter || after! == "_") {
+                error("a bare '\(text).' is not a number: write '\(text).0' for a Double, or '\(text).<name>' for member access", at: pos)
+                pos += 1                                     // skip the stray '.' so it doesn't cascade
+            }
+            // else: a member name follows — leave the '.' for the parser (`3.foo`).
+        }
+        return .intLit(Int(text)!)
     }
 
     private mutating func lexIdent() -> TokenKind {

@@ -68,7 +68,7 @@ private struct ExhaustivenessPass {
 
     private func walkExpr(_ e: IRExpr) {
         switch e.kind {
-        case .intLit, .boolLit, .stringLit, .varRef:
+        case .intLit, .doubleLit, .boolLit, .stringLit, .varRef:
             break
         case .fieldAccess(let base, _):
             walkExpr(base)

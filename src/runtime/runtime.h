@@ -40,6 +40,7 @@ void  rt_bounds_trap(int64_t idx, int64_t len);   // M6 stdlib — array subscri
 // ---- Core floor: pure value primitives ----
 String rt_str_lit(const char* data, int64_t len);
 String rt_str_concat(String a, String b);
+void   rt_print_double(double x);   // M6 stdlib — print a Double: shortest round-tripping form, always with a decimal point, + newline
 
 // ---- Privileged: blocking primitives + structured concurrency ----
 int64_t rt_sleep_ms(int64_t ms);

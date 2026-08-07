@@ -170,7 +170,7 @@ private func flat(_ e: IRExpr) -> String? {
 
 private func children(_ e: IRExpr) -> [(slot: String, expr: IRExpr)] {
     switch e.kind {
-    case .intLit, .boolLit, .stringLit, .varRef, .closure:
+    case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .closure:
         return []
     case .fieldAccess(let base, _):
         return [("base", base)]
@@ -196,6 +196,7 @@ private func children(_ e: IRExpr) -> [(slot: String, expr: IRExpr)] {
 private func head(_ e: IRExpr) -> String {
     switch e.kind {
     case .intLit(let v):           return "intLit \(v)"
+    case .doubleLit(let v):        return "doubleLit \(v)"
     case .boolLit(let v):          return "boolLit \(v)"
     case .stringLit(let v):        return "stringLit \"\(v)\""
     case .varRef(let n):           return "varRef \(n)"
@@ -216,7 +217,7 @@ private func argSlot(_ a: IRArg) -> String { a.label ?? "arg" }
 
 private func opSym(_ op: BinOp) -> String {
     switch op {
-    case .add: return "+";  case .sub: return "-";  case .mul: return "*";  case .div: return "/"
+    case .add: return "+";  case .sub: return "-";  case .mul: return "*";  case .div: return "/";  case .mod: return "%"
     case .eq:  return "=="; case .neq: return "!="; case .lt:  return "<"
     case .gt:  return ">";  case .lte: return "<="; case .gte: return ">="
     }

@@ -139,6 +139,7 @@ private func appendStmt(_ stmt: Stmt, ind: String, into lines: inout [String]) {
 private func describeExpr(_ e: Expr) -> String {
     switch e {
     case .intLit(let v, _):    return "\(v)"
+    case .doubleLit(let v, _): return "\(v)"
     case .boolLit(let v, _):   return v ? "true" : "false"
     case .stringLit(let v, _): return "\"\(v)\""
     case .ident(let n, _):     return n
@@ -182,6 +183,7 @@ private func describeOp(_ op: BinOp) -> String {
     case .sub: return "-"
     case .mul: return "*"
     case .div: return "/"
+    case .mod: return "%"
     case .eq:  return "=="
     case .neq: return "!="
     case .lt:  return "<"

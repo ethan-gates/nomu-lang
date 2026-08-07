@@ -7,8 +7,9 @@ Nomu-written stdlib later, as the buffer/primitive substrate to express them app
 **Decided**, **Deferred**, **Open**.
 
 **API scope:** no concrete syntax or keyword here is committed. `[…]` / `a[i]` array spellings, `.count`
-/ `.append`, and the numeric type names are illustrative until agreed. What's pinned is the *layout and
-runtime contract*.
+/ `.append`, and the (other) numeric type names are illustrative until agreed. `Double`, its decimal
+literal, the `%` operator, and the `.double` / `.int` conversions are settled and built (§4). What's
+pinned otherwise is the *layout and runtime contract*.
 
 **Siblings:** the value/reference split and GC category semantics live in `memory-model.md`; the moving
 collector and its object model live in `m6-spec.md` (the size/scan tables these types plug into are
@@ -125,13 +126,31 @@ buffer are updated. Validated: `examples/arr_gc.nomu` + `tools/arr-gc.sh` (an `A
 
 ---
 
-## 4. Planned C-backed items — **Open**
+## 4. `Double` — **Decided** (built)
+
+A second numeric primitive, `Double`, lowered to LLVM `f64`. Landed as a whole-pipeline change (no C
+floor beyond print formatting):
+
+- **Literal syntax.** A decimal point with a digit on both sides: `3.14`, `0.5`, `42.0`. The char after
+  the dot decides: a digit makes a Double; a letter/`_` is member access (`3.foo`, `5.double`), so the
+  dot is left for the parser; anything else is a bare `3.`, a lexer error (the author meant `3.0` or
+  `3.<name>`). Leading dot (`.5`) and exponent (`1e9`) are not accepted. Lexer: `lexNumber`.
+- **Arithmetic.** `+ - * / %` on `Double` lower to the FP opcodes (`fadd`/…/`frem`); comparisons use
+  ordered `fcmp`. `%` was also added on `Int` (`srem`), same precedence as `* /`.
+- **No implicit conversion.** `Int` and `Double` never mix in arithmetic — `1.0 + 2` is a type error.
+  The only bridges are property-style: `i.double` widens `Int`→`Double` (`sitofp`), and `d.int` narrows
+  `Double`→`Int` rounding to nearest, ties away from zero (`llvm.round` then `fptosi`). Sema desugars
+  these to the `__intToDouble` / `__doubleToInt` builtins.
+- **Print.** `print` on a `Double` routes to the C floor's `rt_print_double`: the fewest significant
+  digits that round-trip back to the same value, always with a decimal point (`42.0`, never `42`).
+
+Still open on numerics: `Int32` and other sized/unsigned integers (deferred — not requested yet), and
+float-literal exponent syntax.
+
+## 5. Planned C-backed items — **Open**
 
 Not yet built; listed so the doc is the map when they land.
 
-- **Extra numeric primitives** (`Double`, `Int32`, …). The type model has only `Int` (i64) and `Bool`
-  today. These need type-system + codegen work (LLVM `f64`/`i32` arithmetic, conversions, float
-  literals in the lexer), not only a C floor; the C part is formatting/print and conversion helpers.
 - **Spawn group / structured wait.** `spawn let x = …` exists (single static binding, joined on read /
   scope exit via `spawn_join`). A group waiting on a dynamic number of spawned tasks is a library type
   over the existing fiber-join machinery (`runtime.c` `joiner`) — likely no new grammar.

@@ -274,6 +274,7 @@ public enum Pattern {
 
 public indirect enum Expr {
     case intLit(Int, span: Span)
+    case doubleLit(Double, span: Span)
     case boolLit(Bool, span: Span)
     case stringLit(String, span: Span)
     case ident(String, span: Span)
@@ -303,6 +304,6 @@ public struct Arg {
 }
 
 public enum BinOp {
-    case add, sub, mul, div
+    case add, sub, mul, div, mod
     case eq, neq, lt, gt, lte, gte
 }

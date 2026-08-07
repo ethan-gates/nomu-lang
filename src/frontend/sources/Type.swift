@@ -8,6 +8,7 @@ public enum NamedKind: Equatable {
 
 public indirect enum Type: Equatable {
     case int
+    case double
     case bool
     case string
     case void
@@ -27,6 +28,7 @@ extension Type: CustomStringConvertible {
     public var description: String {
         switch self {
         case .int:    return "Int"
+        case .double: return "Double"
         case .bool:   return "Bool"
         case .string: return "String"
         case .void:   return "Void"

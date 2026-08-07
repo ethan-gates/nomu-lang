@@ -159,7 +159,7 @@ private final class MutationAnalyzer {
         case .index(let base, let idx):
             scanExpr(base, type: type, selfCalls: &selfCalls)
             scanExpr(idx, type: type, selfCalls: &selfCalls)
-        case .intLit, .boolLit, .stringLit, .varRef, .closure:
+        case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .closure:
             break
         }
     }

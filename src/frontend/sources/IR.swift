@@ -229,6 +229,7 @@ public struct IRExpr {
 
 public indirect enum ExprKind {
     case intLit(Int)
+    case doubleLit(Double)
     case boolLit(Bool)
     case stringLit(String)
     case varRef(String)                                 // resolved local / param / global name

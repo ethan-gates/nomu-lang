@@ -720,8 +720,13 @@ public struct Parser {
     private mutating func parseMultiplicative() -> Expr {
         let start = currentSpan
         var lhs = parsePostfix()
-        while currentKind == .star || currentKind == .slash {
-            let op: BinOp = currentKind == .star ? .mul : .div
+        while currentKind == .star || currentKind == .slash || currentKind == .percent {
+            let op: BinOp
+            switch currentKind {
+            case .star:  op = .mul
+            case .slash: op = .div
+            default:     op = .mod   // .percent
+            }
             advance()
             lhs = .binary(op, lhs, parsePostfix(), span: spanFrom(start))
         }
@@ -752,6 +757,8 @@ public struct Parser {
         switch currentKind {
         case .intLit(let v):
             advance(); return .intLit(v, span: spanFrom(start))
+        case .doubleLit(let v):
+            advance(); return .doubleLit(v, span: spanFrom(start))
         case .boolLit(let v):
             advance(); return .boolLit(v, span: spanFrom(start))
         case .stringLit(let v):

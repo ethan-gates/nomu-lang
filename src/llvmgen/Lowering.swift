@@ -40,6 +40,7 @@ final class IRToLLVM {
     private let i1: LLVMTypeRef         // 8.5.2 — `Bool` (0/1); LLVM's natural boolean
     private let i32: LLVMTypeRef
     private let i64: LLVMTypeRef
+    private let f64: LLVMTypeRef         // `Double` — LLVM's native double
     private let voidTy: LLVMTypeRef
     private let strTy: LLVMTypeRef      // { i8* data, i64 len } — matches runtime.h `String`
     // Heap-box layouts (8.4.1). A closure / `any I` *value* is a managed `p1` pointer to one of
@@ -179,6 +180,7 @@ final class IRToLLVM {
         i1 = LLVMInt1TypeInContext(ctx)
         i32 = LLVMInt32TypeInContext(ctx)
         i64 = LLVMInt64TypeInContext(ctx)
+        f64 = LLVMDoubleTypeInContext(ctx)
         voidTy = LLVMVoidTypeInContext(ctx)
         var fields: [LLVMTypeRef?] = [i8ptr, i64]
         strTy = fields.withUnsafeMutableBufferPointer {
@@ -298,6 +300,7 @@ final class IRToLLVM {
     // class is a pointer to its object composite. Types we don't yet model (enum/actor/closure/
     // `any`/`some`) return nil, so their locals are simply left undeclared — never mis-described.
     private let dwSigned: LLVMDWARFTypeEncoding = 5      // DW_ATE_signed
+    private let dwFloat: LLVMDWARFTypeEncoding = 4       // DW_ATE_float
     private let dwBoolean: LLVMDWARFTypeEncoding = 2     // DW_ATE_boolean
     private let dwUnsignedChar: LLVMDWARFTypeEncoding = 8 // DW_ATE_unsigned_char
 
@@ -305,6 +308,7 @@ final class IRToLLVM {
         guard di != nil else { return nil }
         switch t {
         case .int:    return diBasic("Int", dwSigned, bits: 64)
+        case .double: return diBasic("Double", dwFloat, bits: 64)
         case .bool:   return diBasic("Bool", dwBoolean, bits: 8)   // i1, one byte in memory (8.5.2)
         case .string: return diStringType()
         case .named(let n, .struct_): return diStructType(n)
@@ -427,6 +431,7 @@ final class IRToLLVM {
     private func llvmType(_ t: Type, _ span: Span) -> LLVMTypeRef? {
         switch t {
         case .int:        return i64
+        case .double:     return f64
         case .bool:       return i1    // 8.5.2 — Bool is LLVM's native i1 (was i64)
         case .string:     return strTy
         case .void:       return voidTy
@@ -542,7 +547,7 @@ final class IRToLLVM {
     // struct/enum is just the sum/tag+max of its parts — no padding to account for.
     private func slotCount(_ t: Type) -> Int {
         switch t {
-        case .int, .bool: return 1
+        case .int, .double, .bool: return 1
         case .string:     return 2
         case .function:   return 1   // a managed pointer to a heap { fn, caps… } box (8.4.1)
         case .existential, .composition: return 1   // a managed pointer to a heap { witness, payload } box
@@ -756,11 +761,13 @@ final class IRToLLVM {
             assignTo(target, value)
 
         case .compoundAssign(let target, let value):
-            // Nomu's only compound assignment is `+=`, on Int (CodegenIR emits `l += r`).
+            // Nomu's only compound assignment is `+=`, on Int or Double (CodegenIR emits `l += r`).
             guard let dst = lvalue(target) else { return }
             guard let v = lowerExpr(value) else { return }
             let cur = LLVMBuildLoad2(b, dst.ty, dst.addr, "cur")
-            LLVMBuildStore(b, LLVMBuildAdd(b, cur, v, "add"), dst.addr)
+            let sum = value.type == .double ? LLVMBuildFAdd(b, cur, v, "fadd")
+                                            : LLVMBuildAdd(b, cur, v, "add")
+            LLVMBuildStore(b, sum, dst.addr)
 
         case .ret(let e):
             // A returned value is computed before joins/unlock so its own spawn reads happen first.
@@ -865,6 +872,8 @@ final class IRToLLVM {
         switch e.kind {
         case .intLit(let n):
             return LLVMConstInt(i64, UInt64(bitPattern: Int64(n)), /*SignExtend=*/1)
+        case .doubleLit(let x):
+            return LLVMConstReal(f64, x)
         case .boolLit(let v):
             return LLVMConstInt(i1, v ? 1 : 0, 0)
         case .stringLit(let s):
@@ -983,11 +992,35 @@ final class IRToLLVM {
 
     private func lowerBinary(_ op: BinOp, _ l: IRExpr, _ r: IRExpr) -> LLVMValueRef? {
         guard let lv = lowerExpr(l), let rv = lowerExpr(r) else { return nil }
+        // Double uses the floating-point opcodes; everything else is the i64 integer path. Sema
+        // guarantees both operands share the numeric type, so the left operand's type decides.
+        if l.type == .double {
+            switch op {
+            case .add: return LLVMBuildFAdd(b, lv, rv, "fadd")
+            case .sub: return LLVMBuildFSub(b, lv, rv, "fsub")
+            case .mul: return LLVMBuildFMul(b, lv, rv, "fmul")
+            case .div: return LLVMBuildFDiv(b, lv, rv, "fdiv")
+            case .mod: return LLVMBuildFRem(b, lv, rv, "frem")
+            case .eq, .neq, .lt, .gt, .lte, .gte:
+                // Ordered predicates (false when either operand is NaN).
+                let pred: LLVMRealPredicate
+                switch op {
+                case .eq:  pred = LLVMRealOEQ
+                case .neq: pred = LLVMRealONE
+                case .lt:  pred = LLVMRealOLT
+                case .gt:  pred = LLVMRealOGT
+                case .lte: pred = LLVMRealOLE
+                default:   pred = LLVMRealOGE   // .gte
+                }
+                return LLVMBuildFCmp(b, pred, lv, rv, "fcmp")
+            }
+        }
         switch op {
         case .add: return LLVMBuildAdd(b, lv, rv, "add")
         case .sub: return LLVMBuildSub(b, lv, rv, "sub")
         case .mul: return LLVMBuildMul(b, lv, rv, "mul")
         case .div: return LLVMBuildSDiv(b, lv, rv, "div")
+        case .mod: return LLVMBuildSRem(b, lv, rv, "rem")
         case .eq, .neq, .lt, .gt, .lte, .gte:
             // Comparisons on Int yield Bool — now the `icmp`'s native i1 directly (8.5.2, no zext).
             let pred: LLVMIntPredicate
@@ -1860,6 +1893,8 @@ final class IRToLLVM {
             case "__arrayCount": return lowerArrayCount(args, span)
             case "__arraySet": return lowerArraySet(args, span)
             case "__arrayAppend": return lowerArrayAppend(args, span)
+            case "__intToDouble": return lowerIntToDouble(args, span)
+            case "__doubleToInt": return lowerDoubleToInt(args, span)
             default:       break
             }
             // A closure-typed local is an indirect call; a global function name is direct.
@@ -1939,7 +1974,7 @@ final class IRToLLVM {
 
     private func collectUsesExpr(_ e: IRExpr, bound: Set<String>, used: inout [String]) {
         switch e.kind {
-        case .intLit, .boolLit, .stringLit:
+        case .intLit, .doubleLit, .boolLit, .stringLit:
             break
         case .varRef(let n):
             if !bound.contains(n) { used.append(n) }
@@ -1979,6 +2014,10 @@ final class IRToLLVM {
         switch arg.value.type {
         case .int:
             return buildCall(fn, ty, [intFormat(), value])
+        case .double:
+            // Formatting (shortest round-trip, always a decimal point) lives in the C floor.
+            let (pf, pty) = runtimeFn("rt_print_double", ret: voidTy, params: [f64], varArg: false)
+            return buildCall(pf, pty, [value])
         case .bool:
             // Bool is i1; printf's `%lld` reads an i64, so widen to i64 (prints 0/1 as before). (8.5.2)
             return buildCall(fn, ty, [intFormat(), LLVMBuildZExt(b, value, i64, "b2i")])
@@ -1988,9 +2027,28 @@ final class IRToLLVM {
             let len32 = LLVMBuildTrunc(b, len, i32, "len32")
             return buildCall(fn, ty, [strFormat(), len32, data])
         default:
-            fail("8.2.1: print supports Int, Bool, or String", arg.value.span)
+            fail("8.2.1: print supports Int, Double, Bool, or String", arg.value.span)
             return nil
         }
+    }
+
+    // `i.double` — widen Int (i64) to Double (f64), signed. Exact for values up to 2^53.
+    private func lowerIntToDouble(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+        guard let v = args.first.flatMap({ lowerExpr($0.value) }) else {
+            fail("__intToDouble expects one argument", span); return nil
+        }
+        return LLVMBuildSIToFP(b, v, f64, "i2d")
+    }
+
+    // `d.int` — narrow Double (f64) to Int (i64), rounding to nearest with ties away from zero
+    // (`llvm.round`), then a signed truncation to integer.
+    private func lowerDoubleToInt(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+        guard let v = args.first.flatMap({ lowerExpr($0.value) }) else {
+            fail("__doubleToInt expects one argument", span); return nil
+        }
+        let (fn, ty) = runtimeFn("llvm.round.f64", ret: f64, params: [f64], varArg: false)
+        let rounded = buildCall(fn, ty, [v])!
+        return LLVMBuildFPToSI(b, rounded, i64, "d2i")
     }
 
     private func lowerConcat(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
@@ -2242,7 +2300,7 @@ final class IRToLLVM {
     // value construction (struct/enum) are not safepoints, but their sub-expressions still execute.
     private func exprHasSafepoint(_ e: IRExpr) -> Bool {
         switch e.kind {
-        case .intLit, .boolLit, .stringLit, .varRef:
+        case .intLit, .doubleLit, .boolLit, .stringLit, .varRef:
             return false
         case .fieldAccess(let base, _):
             return exprHasSafepoint(base)
@@ -2263,6 +2321,8 @@ final class IRToLLVM {
                 case "print", "concat": return args.contains { exprHasSafepoint($0.value) }   // leaf
                 case "__arrayCount", "__arraySet": return args.contains { exprHasSafepoint($0.value) }   // load / store
                 case "__arrayAppend": return true                                              // rt_array_grow may rt_alloc
+                case "__intToDouble", "__doubleToInt": return args.contains { exprHasSafepoint($0.value) }   // pure sitofp / round+fptosi
+
                 case "sleep", "readLine": return true                                          // non-leaf runtime
                 default: return true                                                            // user function
                 }

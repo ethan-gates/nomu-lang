@@ -177,7 +177,7 @@ private final class Monomorphizer {
         let newType = resolveType(e.type, s)
         let kind: ExprKind
         switch e.kind {
-        case .intLit, .boolLit, .stringLit, .varRef:
+        case .intLit, .doubleLit, .boolLit, .stringLit, .varRef:
             kind = e.kind
         case .fieldAccess(let base, let field):
             kind = .fieldAccess(base: rewriteExpr(base, s), field: field)
@@ -266,6 +266,7 @@ private final class Monomorphizer {
     private func typeKey(_ t: Type) -> String {
         switch t {
         case .int: return "Int"
+        case .double: return "Double"
         case .bool: return "Bool"
         case .string: return "String"
         case .void: return "Void"

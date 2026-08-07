@@ -4,6 +4,26 @@
 // (Design: m4.13-spec.md §1, the standard-library C floor.)
 #include "runtime.h"
 #include <string.h>
+#include <stdlib.h>   // strtod — shortest round-trip Double formatting
+
+// Print a Double: the fewest significant digits that round-trip back to the same value, always
+// with a decimal point (so a whole-valued Double reads as `42.0`, never `42`), then a newline.
+void rt_print_double(double x) {
+    char buf[32];
+    // 17 significant digits round-trip any IEEE-754 double; stop at the first precision that does.
+    int prec = 17;
+    for (int p = 1; p < 17; p++) {
+        snprintf(buf, sizeof buf, "%.*g", p, x);
+        if (strtod(buf, NULL) == x) { prec = p; break; }
+    }
+    snprintf(buf, sizeof buf, "%.*g", prec, x);
+    // If %g emitted a plain integer (no '.', exponent, or inf/nan letters), append ".0".
+    if (!strpbrk(buf, ".eEnN")) {
+        size_t n = strlen(buf);
+        buf[n] = '.'; buf[n + 1] = '0'; buf[n + 2] = '\0';
+    }
+    printf("%s\n", buf);
+}
 
 String rt_str_lit(const char* data, int64_t len) {
     return (String){ .data = (char*)data, .len = len };
