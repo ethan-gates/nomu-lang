@@ -29,6 +29,12 @@ public final class DiagnosticSink {
     public var hasErrors: Bool { diagnostics.contains { $0.severity == .error } }
     public var isEmpty: Bool { diagnostics.isEmpty }
 
+    // Roll the sink back to an earlier length — used by the parser to discard diagnostics
+    // emitted during a speculative parse that it then abandons (e.g. `<` type-arg lookahead).
+    public func truncate(to count: Int) {
+        if count < diagnostics.count { diagnostics.removeLast(diagnostics.count - count) }
+    }
+
     // `file:line:col: error: message`, one per line, in source order.
     public func render() -> String {
         diagnostics.map { d in

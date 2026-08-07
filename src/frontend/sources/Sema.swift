@@ -1214,11 +1214,17 @@ public struct Sema {
             diags.error("undefined name '\(name)'", at: span)
             return IRExpr(type: .error, span: span, kind: .varRef(name))
 
+        case .genericIdent(let name, _, let span):
+            // Reached only when `Name<Args>` is used somewhere other than a construction or a
+            // qualified enum case (those are intercepted by checkCall / the `.member` branch).
+            diags.error("type arguments on '\(name)' are only valid when constructing it, e.g. '\(name)<...>(...)' or '\(name)<...>.case(...)'", at: span)
+            return IRExpr(type: .error, span: span, kind: .varRef(name))
+
         case .member(let base, let field, let span):
-            // Qualified no-payload enum construction: `EnumType.case`. (A payload case
-            // used bare falls through buildEnumInit as a wrong-arity error.)
-            if case .ident(let typeName, _) = base, lookup(typeName) == nil, enums[typeName] != nil {
-                return buildEnumInit(typeName, field, [], expected: expected, at: span)
+            // Qualified no-payload enum construction: `EnumType.case` / `EnumType<Args>.case`.
+            // (A payload case used bare falls through buildEnumInit as a wrong-arity error.)
+            if let (typeName, explicit) = typeNameAndArgs(base), lookup(typeName) == nil, enums[typeName] != nil {
+                return buildEnumInit(typeName, field, [], explicit: explicit, expected: expected, at: span)
             }
             let b = checkExpr(base)
             // Numeric conversions (M6 stdlib), property-style: `i.double` widens Int→Double;
@@ -1467,6 +1473,17 @@ public struct Sema {
 
     // MARK: - Generic types (M5 5.2.3)
 
+    // A construction base that is a plain type name (`Type`) or a name carrying explicit type
+    // arguments (`Type<Args>`, parsed as `.genericIdent`). The arguments are resolved in the
+    // current generic scope so a `T` at the site binds to the enclosing function's parameter.
+    private func typeNameAndArgs(_ e: Expr) -> (name: String, explicit: [Type]?)? {
+        switch e {
+        case .ident(let n, _):                   return (n, nil)
+        case .genericIdent(let n, let refs, _):  return (n, refs.map { resolve($0) })
+        default:                                 return nil
+        }
+    }
+
     // The type parameters and stored fields of a generic struct/class, or nil if `name` names
     // neither (a generic enum constructs through `buildEnumInit`).
     private func genericTypeShape(_ name: String) -> (generics: [GenericParam], fields: [VarField])? {
@@ -1477,13 +1494,22 @@ public struct Sema {
 
     // `Box(value: e)` — infer each type parameter by unifying the field's declared type
     // (a `T` resolves to `.typeParam`) against the argument, then bound-check (M5 5.2.3).
-    private mutating func checkGenericConstruct(_ name: String, _ args: [Arg], at span: Span) -> IRExpr {
+    private mutating func checkGenericConstruct(_ name: String, _ args: [Arg], explicit: [Type]? = nil, at span: Span) -> IRExpr {
         guard let shape = genericTypeShape(name) else {
             diags.error("generic enum '\(name)' is constructed through one of its cases, e.g. '\(name).case(...)'", at: span)
             return IRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
         }
         let saved = genericScope; genericScope = Set(shape.generics.map(\.name)); defer { genericScope = saved }
         var subst: [String: Type] = [:]
+        // Explicit type arguments (`Box<Int>(value: 3)`) seed inference; each field is then unified
+        // against them, so a mismatch is reported as a conflict.
+        if let explicit {
+            if explicit.count != shape.generics.count {
+                diags.error("generic type '\(name)' expects \(shape.generics.count) type argument(s), got \(explicit.count)", at: span)
+            } else {
+                for (p, a) in zip(shape.generics, explicit) { subst[p.name] = a }
+            }
+        }
         var irArgs: [IRArg] = []
         for f in shape.fields {
             let fieldTy = resolve(f.type)
@@ -1533,10 +1559,10 @@ public struct Sema {
     }
 
     private mutating func checkCall(callee: Expr, args: [Arg], span: Span, expected: Type? = nil) -> IRExpr {
-        // Qualified enum construction: `EnumType.case(args)`.
+        // Qualified enum construction: `EnumType.case(args)` or `EnumType<Args>.case(args)`.
         if case .member(let base, let caseName, _) = callee,
-           case .ident(let typeName, _) = base, lookup(typeName) == nil, enums[typeName] != nil {
-            return buildEnumInit(typeName, caseName, args, expected: expected, at: span)
+           let (typeName, explicit) = typeNameAndArgs(base), lookup(typeName) == nil, enums[typeName] != nil {
+            return buildEnumInit(typeName, caseName, args, explicit: explicit, expected: expected, at: span)
         }
         // Leading-dot enum construction: `.case(args)` — enum inferred from context.
         if case .implicitMember(let caseName, _) = callee {
@@ -1672,6 +1698,20 @@ public struct Sema {
             }
         }
 
+        // Generic construction with explicit type arguments: `Box<Int>(value: 3)`.
+        if case .genericIdent(let name, let refs, _) = callee {
+            let explicit = refs.map { resolve($0) }
+            if genericTypeShape(name) != nil {
+                return checkGenericConstruct(name, args, explicit: explicit, at: span)
+            }
+            if enums[name] != nil {
+                diags.error("generic enum '\(name)' is constructed through a case, e.g. '\(name)<...>.case(...)'", at: span)
+                return IRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
+            }
+            diags.error("'\(name)' is not a generic type; explicit type arguments are not allowed here", at: span)
+            return IRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
+        }
+
         // Fallback: type the callee; call it if it is a function value.
         let c = checkExpr(callee)
         let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
@@ -1787,14 +1827,17 @@ public struct Sema {
     // generic enum (`Option<T>`) the type argument is inferred from the payload — and, for a
     // no-payload case like `.none`, seeded from the expected type context (M5 5.2.3).
     private mutating func buildEnumInit(_ enumName: String, _ caseName: String, _ args: [Arg],
-                                        expected: Type? = nil, at span: Span) -> IRExpr {
+                                        explicit: [Type]? = nil, expected: Type? = nil, at span: Span) -> IRExpr {
         guard let caseDecl = enums[enumName]?.cases.first(where: { $0.name == caseName }) else {
             diags.error("enum '\(enumName)' has no case '\(caseName)'", at: span)
             let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
             return IRExpr(type: .named(enumName, .enum_), span: span, kind: .enumInit(typeName: enumName, caseName: caseName, args: irArgs))
         }
         if let generics = enums[enumName]?.generics, !generics.isEmpty {
-            return buildGenericEnumInit(enumName, generics, caseDecl, args, expected: expected, at: span)
+            return buildGenericEnumInit(enumName, generics, caseDecl, args, explicit: explicit, expected: expected, at: span)
+        }
+        if explicit != nil {
+            diags.error("enum '\(enumName)' is not generic; type arguments are not allowed", at: span)
         }
         let irArgs = matchEnumArgs(args, fields: caseDecl.fields, case: caseName, at: span)
         return IRExpr(type: .named(enumName, .enum_), span: span,
@@ -1806,10 +1849,18 @@ public struct Sema {
     // case carries no payload, then bound-check — yielding a `.generic(base, args)` (M5 5.2.3).
     private mutating func buildGenericEnumInit(_ enumName: String, _ generics: [GenericParam],
                                                _ caseDecl: EnumCaseDecl, _ args: [Arg],
-                                               expected: Type?, at span: Span) -> IRExpr {
+                                               explicit: [Type]? = nil, expected: Type?, at span: Span) -> IRExpr {
         let saved = genericScope; genericScope = Set(generics.map(\.name)); defer { genericScope = saved }
         var subst: [String: Type] = [:]
-        if case .generic(let b, let eargs)? = expected, b == enumName, eargs.count == generics.count {
+        // Explicit type arguments (`Option<Int>.some(...)`) seed inference; the payload is then
+        // unified against them, so a mismatch (`Option<Int>.some("hi")`) is a conflict error.
+        if let explicit {
+            if explicit.count != generics.count {
+                diags.error("generic enum '\(enumName)' expects \(generics.count) type argument(s), got \(explicit.count)", at: span)
+            } else {
+                for (p, a) in zip(generics, explicit) { subst[p.name] = a }
+            }
+        } else if case .generic(let b, let eargs)? = expected, b == enumName, eargs.count == generics.count {
             for (p, a) in zip(generics, eargs) { subst[p.name] = a }
         }
         if args.count != caseDecl.fields.count {

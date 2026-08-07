@@ -278,6 +278,7 @@ public indirect enum Expr {
     case boolLit(Bool, span: Span)
     case stringLit(String, span: Span)
     case ident(String, span: Span)
+    case genericIdent(String, [TypeRef], span: Span)   // `Name<T, U>` in expression position — explicit type args for generic construction (M5 5.2.3)
     case member(Expr, String, span: Span)
     case implicitMember(String, span: Span)   // leading-dot `.case` — enum type inferred from context
 

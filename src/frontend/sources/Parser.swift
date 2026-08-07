@@ -736,6 +736,13 @@ public struct Parser {
     private mutating func parsePostfix() -> Expr {
         let start = currentSpan
         var expr = parsePrimary()
+        // Explicit type arguments on a name: `Name<T, U>` before a construction or member access
+        // (`Box<Int>(...)`, `Option<Int>.some(...)`). Only a bare identifier can carry them, and
+        // only when the brackets parse as a type list closing before `(` or `.` — otherwise `<` is
+        // the comparison operator (resolved by parseComparison). See tryParseTypeArgs.
+        if case .ident(let name, _) = expr, check(.lt), let targs = tryParseTypeArgs() {
+            expr = .genericIdent(name, targs, span: spanFrom(start))
+        }
         while true {
             if eat(.dot) {
                 expr = .member(expr, expectIdent(), span: spanFrom(start))
@@ -750,6 +757,28 @@ public struct Parser {
             }
         }
         return expr
+    }
+
+    // Speculatively read `< T, U >` as explicit type arguments. Swift-style backtracking: commit
+    // only if the brackets form a well-formed type list whose closing `>` is immediately followed
+    // by `(` or `.` (a construction or member access) and no diagnostics were emitted. Otherwise
+    // the `<` is a comparison operator — restore the position, discard any speculative diagnostics,
+    // and return nil so parseComparison handles it. `>>` closes two lists as two `>` tokens.
+    private mutating func tryParseTypeArgs() -> [TypeRef]? {
+        let savedPos = pos
+        let savedDiagCount = diags.diagnostics.count
+        let savedPanicking = panicking
+        _ = eat(.lt)
+        var args: [TypeRef] = []
+        repeat { args.append(parseTypeRef()) } while eat(.comma)
+        let committed = eat(.gt)
+            && (check(.lParen) || check(.dot))
+            && diags.diagnostics.count == savedDiagCount
+        if committed { return args }
+        pos = savedPos
+        panicking = savedPanicking
+        diags.truncate(to: savedDiagCount)
+        return nil
     }
 
     private mutating func parsePrimary() -> Expr {

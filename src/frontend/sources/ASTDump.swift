@@ -143,6 +143,7 @@ private func describeExpr(_ e: Expr) -> String {
     case .boolLit(let v, _):   return v ? "true" : "false"
     case .stringLit(let v, _): return "\"\(v)\""
     case .ident(let n, _):     return n
+    case .genericIdent(let n, let targs, _): return "\(n)<\(targs.map(\.name).joined(separator: ", "))>"
     case .member(let b, let f, _): return "\(describeExpr(b)).\(f)"
     case .implicitMember(let name, _): return ".\(name)"
     case .binary(let op, let l, let r, _):

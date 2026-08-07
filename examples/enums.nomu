@@ -3,6 +3,11 @@
 enum Shape { case circle(radius: Int) case rect(w: Int, h: Int) }
 enum Color { case red case green case blue }
 
+enum Option<T> {
+    case some(value: T)
+    case none
+}
+
 struct Config {
     let scale: Int      // immutable field
     var offset: Int     // mutable field
@@ -28,6 +33,14 @@ fun makeCircle(r: Int) -> Shape {
 }
 
 fun main() {
+    // Generic enum construction: `T` is inferred, or given explicitly at the site. The explicit
+    // form `Option<Int>.some(...)` uses a speculative parse to tell the type-argument `<` apart
+    // from comparison (generics.md §2); `Option<Int>.none` pins a payload-less case's type.
+    let some = Option<Int>.some(value: 3)
+    let none = Option<Int>.none
+    switch some { case .some(let v): print(v) case .none: print(0) }   // 3
+    switch none { case .some(let v): print(v) case .none: print(0) }   // 0
+
     let c = Shape.circle(radius: 10)   // qualified, with payload
     print(area(c))                     // 300
     let r: Shape = .rect(w: 3, h: 4)   // leading-dot, inferred from the annotation
