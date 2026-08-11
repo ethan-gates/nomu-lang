@@ -1,0 +1,10 @@
+load("@rules_swift//swift:swift.bzl", "swift_binary")
+
+# Frontend throughput benchmark: times Lexer.tokenize() and Parser.parse() on a large synthetic
+# program, in isolation from codegen/GC. Run: `bazel run //src/bench:parsebench -- [units] [iters]`.
+swift_binary(
+    name = "parsebench",
+    srcs = glob(["sources/*.swift"]),
+    deps = ["//src/frontend"],
+    visibility = ["//visibility:public"],
+)

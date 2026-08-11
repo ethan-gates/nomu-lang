@@ -1,0 +1,170 @@
+// An open-addressing hash table (String -> Int), after the Crafting Interpreters `table.c`:
+// linear probing, FNV-1a hashing (String.hash), tombstone deletion, and grow-and-rehash at a
+// 0.75 load factor. Written in Nomu on top of `Array`, using the `String.hash` / `String.eq`
+// builtins. Value type is a concrete `Int` for now (a generic dictionary comes later).
+//
+// A slot's `state` is 0 empty, 1 live, 2 tombstone. Only live slots hold a real key/value; the
+// state field (not a key sentinel) marks occupancy, so an empty-string key is a normal key.
+// Elements are read field-wise (`entries[i].state`, `.key`, `.value`) and written whole
+// (`entries[i] = Entry(...)`), which is what the array element model supports today.
+
+struct Entry {
+    var state: Int
+    var key: String
+    var value: Int
+}
+
+class HashTable {
+    var entries: Array<Entry>
+    var count: Int          // live + tombstones (drives the load factor)
+    var capacity: Int
+
+    // The slot a key lives in, or the slot it should be inserted into: the first tombstone seen
+    // while probing (reused), else the terminating empty slot. A returned slot with state 1 is a
+    // match; any other state means the key is absent.
+    fun findSlot(key: String) -> Int {
+        var idx = key.hash % self.capacity
+        if idx < 0 {
+            idx = idx + self.capacity
+        }
+        var firstTomb = 0 - 1
+        var probes = 0
+        while probes < self.capacity {
+            let st = self.entries[idx].state
+            if st == 0 {
+                if firstTomb < 0 {
+                    return idx
+                }
+                return firstTomb
+            }
+            if st == 2 {
+                if firstTomb < 0 {
+                    firstTomb = idx
+                }
+            } else {
+                if self.entries[idx].key.eq(key) {
+                    return idx
+                }
+            }
+            idx = idx + 1
+            if idx == self.capacity {
+                idx = 0
+            }
+            probes = probes + 1
+        }
+        // The table is full of live + tombstone slots (the load factor keeps this from happening
+        // in practice). Fall back to a tombstone if one was seen.
+        if firstTomb < 0 {
+            return idx
+        }
+        return firstTomb
+    }
+
+    // Grow (or first-allocate) to `newCap` and rehash the live entries. Tombstones and empties are
+    // dropped; `count` becomes the live count.
+    fun resize(newCap: Int) {
+        let old = self.entries
+        let oldCap = self.capacity
+        var fresh: Array<Entry> = []
+        var j = 0
+        while j < newCap {
+            fresh.append(Entry(state: 0, key: "", value: 0))
+            j = j + 1
+        }
+        self.entries = fresh
+        self.capacity = newCap
+        self.count = 0
+        var i = 0
+        while i < oldCap {
+            if old[i].state == 1 {
+                self.insertLive(old[i].key, old[i].value)
+            }
+            i = i + 1
+        }
+    }
+
+    // Insert a known-absent key into a table with no matching key (used during rehash). Always
+    // lands on an empty slot, so it always adds to the live count.
+    fun insertLive(key: String, value: Int) {
+        let idx = self.findSlot(key)
+        self.entries[idx] = Entry(state: 1, key: key, value: value)
+        self.count = self.count + 1
+    }
+
+    fun set(key: String, value: Int) {
+        if self.count * 4 + 4 > self.capacity * 3 {   // (count + 1) / capacity > 0.75
+            self.resize(self.capacity * 2)
+        }
+        let idx = self.findSlot(key)
+        let st = self.entries[idx].state
+        self.entries[idx] = Entry(state: 1, key: key, value: value)
+        if st == 0 {
+            self.count = self.count + 1   // filled a fresh bucket; tombstone reuse / overwrite do not
+        }
+    }
+
+    fun get(key: String) -> Option<Int> {
+        let idx = self.findSlot(key)
+        if self.entries[idx].state == 1 {
+            return Option<Int>.some(value: self.entries[idx].value)
+        }
+        return Option<Int>.none
+    }
+
+    fun contains(key: String) -> Bool {
+        let idx = self.findSlot(key)
+        return self.entries[idx].state == 1
+    }
+
+    // Replace a live slot with a tombstone. `count` is unchanged: the tombstone still occupies the
+    // probe sequence (that is what tombstones are for).
+    fun delete(key: String) -> Bool {
+        let idx = self.findSlot(key)
+        if self.entries[idx].state == 1 {
+            self.entries[idx] = Entry(state: 2, key: "", value: 0)
+            return true
+        }
+        return false
+    }
+}
+
+fun makeTable() -> HashTable {
+    let empty: Array<Entry> = []
+    let t = HashTable(entries: empty, count: 0, capacity: 0)
+    t.resize(8)
+    return t
+}
+
+fun show(t: HashTable, key: String) {
+    switch t.get(key) {
+    case .some(let v): print(v)
+    case .none:        print(0)
+    }
+}
+
+fun main() {
+    let t = makeTable()
+    t.set("hello", 1)
+    t.set("hi", 2)
+    t.set("hay", 3)
+    t.set("hai", 4)
+    t.set("sup", 5)
+    t.set("gday", 6)
+    t.set("ay", 7)
+    t.set("yo", 8)
+    t.set("yaho", 9)
+
+    show(t, "hello")   // 1
+    show(t, "yaho")    // 9
+    show(t, "missing") // 0
+
+    t.set("hi", 20)    // overwrite
+    show(t, "hi")      // 20
+
+    print(t.contains("hai"))   // 1 (true)
+    print(t.delete("hai"))     // 1 (true)
+    print(t.contains("hai"))   // 0 (false, now a tombstone)
+    print(t.delete("hai"))     // 0 (already gone)
+
+    show(t, "gday")    // 6 — still reachable past the tombstone
+}

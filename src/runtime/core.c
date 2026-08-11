@@ -3,6 +3,7 @@
 // allocation seam. Shrinks as primitives migrate into the Nomu stdlib.
 // (Design: m4.13-spec.md §1, the standard-library C floor.)
 #include "runtime.h"
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>   // strtod — shortest round-trip Double formatting
 
@@ -25,6 +26,9 @@ void rt_print_double(double x) {
     printf("%s\n", buf);
 }
 
+// ===========================================================
+//                         Strings
+// ===========================================================
 String rt_str_lit(const char* data, int64_t len) {
     return (String){ .data = (char*)data, .len = len };
 }
@@ -38,4 +42,24 @@ String rt_str_concat(String a, String b) {
     memcpy(data + a.len, b.data, (size_t)b.len);
     data[len] = '\0';
     return (String){ .data = data, .len = len };
+}
+
+const uint64_t FNV_PRIME = 1099511628211ULL;
+const uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+int64_t __string_hash_int(String s) {
+    uint64_t hash = FNV_OFFSET_BASIS;
+    char* key = s.data;
+    while (*key) {
+        hash ^= (uint64_t)(unsigned char)(*key);
+        hash *= FNV_PRIME;
+        key++;
+    }
+    return hash;
+}
+
+// Byte equality. Returns 0/1 as int64_t; codegen truncates to the Bool i1 (a portable ABI, and
+// no dependency on a platform boolean type).
+int64_t __string_eq_bool_string(String l, String r) {
+    if (l.len != r.len) return 0;
+    return memcmp(l.data, r.data, (size_t)l.len) == 0;
 }

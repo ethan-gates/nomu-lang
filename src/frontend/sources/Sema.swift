@@ -1231,20 +1231,23 @@ public struct Sema {
             // `d.int` narrows Double→Int, rounding to nearest (ties away from zero). These are the
             // only Int/Double conversions — arithmetic never converts implicitly.
             if b.type == .int, field == "double" {
-                let callee = IRExpr(type: .void, span: span, kind: .varRef("__intToDouble"))
-                return IRExpr(type: .double, span: span, kind: .call(callee: callee, args: [IRArg(label: nil, value: b)], typeArgs: []))
+                return BuiltinsSema.member("__int_double_double", b, span)
             }
             if b.type == .double, field == "int" {
-                let callee = IRExpr(type: .void, span: span, kind: .varRef("__doubleToInt"))
-                return IRExpr(type: .int, span: span, kind: .call(callee: callee, args: [IRArg(label: nil, value: b)], typeArgs: []))
+                return BuiltinsSema.member("__double_int_int", b, span)
+            }
+
+            // String property builtins (`str.hash`). Method builtins with arguments (`str.eq(x)`)
+            // are handled in checkCall, since they parse with a call's argument list.
+            if b.type == .string, field == "hash" {
+                return BuiltinsSema.member("__string_hash_int", b, span)
             }
             // Array<T> builtin members (M6 stdlib). `count` is the element count; lowered to a builtin
             // call codegen recognizes by name (element type comes from the receiver's `.array` type).
             if case .array = b.type {
                 switch field {
                 case "count":
-                    let callee = IRExpr(type: .void, span: span, kind: .varRef("__arrayCount"))
-                    return IRExpr(type: .int, span: span, kind: .call(callee: callee, args: [IRArg(label: nil, value: b)], typeArgs: []))
+                    return BuiltinsSema.member("__array_count_int", b, span)
                 default:
                     diags.error("value of type '\(b.type)' has no member '\(field)'", at: span)
                     return IRExpr(type: .error, span: span, kind: .intLit(0))
@@ -1590,6 +1593,24 @@ public struct Sema {
                     return IRExpr(type: .error, span: span, kind: .intLit(0))
                 }
             }
+            // String method builtins. `eq(other)` is byte equality (there is no `==` on String yet).
+            if recv.type == .string {
+                switch name {
+                case "eq":
+                    guard args.count == 1 else {
+                        diags.error("String.eq expects 1 argument, got \(args.count)", at: span)
+                        return IRExpr(type: .error, span: span, kind: .boolLit(false))
+                    }
+                    let rhs = checkExpr(args[0].value)
+                    if rhs.type != .string && rhs.type != .error {
+                        diags.error("String.eq expects a String argument, got '\(rhs.type)'", at: rhs.span)
+                    }
+                    return BuiltinsSema.method("__string_eq_bool_string", recv, [rhs], span)
+                default:
+                    diags.error("value of type 'String' has no method '\(name)'", at: span)
+                    return IRExpr(type: .error, span: span, kind: .boolLit(false))
+                }
+            }
             // A method-requirement call through `any I` / `any A & B` — dispatched via the
             // witness slot (including requirements inherited by refinement, M5 A1.5).
             if let iface = existentialInterfaces(recv.type).first(where: { aggregatedMethods($0).contains { $0.name == name } }),
@@ -1780,8 +1801,32 @@ public struct Sema {
                 return .int
             }
             return lok ? lhs.type : (rok ? rhs.type : .int)
-        case .eq, .neq, .lt, .gt, .lte, .gte:
+        case .lt, .gt, .lte, .gte:
+            checkComparison(lhs, rhs, equality: false, at: span)
             return .bool
+        case .eq, .neq:
+            checkComparison(lhs, rhs, equality: true, at: span)
+            return .bool
+        }
+    }
+
+    // Comparison operators are numeric-only for now (a holistic operator design comes later).
+    // Relational (`< > <= >=`) allows Int/Double; equality (`== !=`) also allows Bool. Both sides
+    // must be the same type. Strings compare with `.eq`, not `==`; aggregates have no operator yet.
+    private func checkComparison(_ lhs: IRExpr, _ rhs: IRExpr, equality: Bool, at span: Span) {
+        if lhs.type == .error || rhs.type == .error { return }
+        let allowed: [Type] = equality ? [.int, .double, .bool] : [.int, .double]
+        if lhs.type != rhs.type {
+            diags.error("cannot compare '\(lhs.type)' and '\(rhs.type)'", at: span)
+            return
+        }
+        guard allowed.contains(lhs.type) else {
+            if lhs.type == .string && equality {
+                diags.error("String has no '==' / '!=' operator yet — use '.eq(...)'", at: span)
+            } else {
+                diags.error("type '\(lhs.type)' does not support comparison", at: span)
+            }
+            return
         }
     }
 

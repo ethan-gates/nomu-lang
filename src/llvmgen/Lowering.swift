@@ -1885,16 +1885,18 @@ final class IRToLLVM {
 
     private func lowerCall(callee: IRExpr, args: [IRArg], span: Span) -> LLVMValueRef? {
         if case .varRef(let name) = callee.kind {
+            // C-leaf builtins (same-named C symbol, signature encoded in the name) lower generically.
+            if Builtins.cLeaf.contains(name) { return lowerCLeafBuiltin(name, args, span) }
             switch name {
             case "print":  return lowerPrint(args, span)
             case "concat": return lowerConcat(args, span)
             case "sleep":  return lowerSleep(args, span)
             case "readLine": return lowerReadLine()
-            case "__arrayCount": return lowerArrayCount(args, span)
+            case "__array_count_int": return lowerArrayCount(args, span)
             case "__arraySet": return lowerArraySet(args, span)
             case "__arrayAppend": return lowerArrayAppend(args, span)
-            case "__intToDouble": return lowerIntToDouble(args, span)
-            case "__doubleToInt": return lowerDoubleToInt(args, span)
+            case "__int_double_double": return lowerIntToDouble(args, span)
+            case "__double_int_int": return lowerDoubleToInt(args, span)
             default:       break
             }
             // A closure-typed local is an indirect call; a global function name is direct.
@@ -2035,7 +2037,7 @@ final class IRToLLVM {
     // `i.double` — widen Int (i64) to Double (f64), signed. Exact for values up to 2^53.
     private func lowerIntToDouble(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
         guard let v = args.first.flatMap({ lowerExpr($0.value) }) else {
-            fail("__intToDouble expects one argument", span); return nil
+            fail("__int_double_double expects one argument", span); return nil
         }
         return LLVMBuildSIToFP(b, v, f64, "i2d")
     }
@@ -2044,11 +2046,40 @@ final class IRToLLVM {
     // (`llvm.round`), then a signed truncation to integer.
     private func lowerDoubleToInt(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
         guard let v = args.first.flatMap({ lowerExpr($0.value) }) else {
-            fail("__doubleToInt expects one argument", span); return nil
+            fail("__double_int_int expects one argument", span); return nil
         }
         let (fn, ty) = runtimeFn("llvm.round.f64", ret: f64, params: [f64], varArg: false)
         let rounded = buildCall(fn, ty, [v])!
         return LLVMBuildFPToSI(b, rounded, i64, "d2i")
+    }
+
+    // A C-leaf builtin: a call to the same-named C function, with parameter/return types read from
+    // the mangled name (`__<recv>_<name>_<ret>[_<arg>...]`). The receiver is the first argument. A
+    // `Bool` return arrives as the C `int` result and is truncated to i1.
+    private func lowerCLeafBuiltin(_ name: String, _ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+        let sig = Builtins.signature(name)
+        var vals: [LLVMValueRef] = []
+        for a in args {
+            guard let v = lowerExpr(a.value) else { return nil }
+            vals.append(v)
+        }
+        let paramTys = ([sig.receiver] + sig.params).map { cType($0) }
+        let retIsBool = sig.ret == .bool
+        let retTy = retIsBool ? i64 : cType(sig.ret)   // C returns int for Bool; narrow below
+        let (fn, ty) = runtimeFn(name, ret: retTy, params: paramTys, varArg: false)
+        guard let r = buildCall(fn, ty, vals) else { return nil }
+        return retIsBool ? LLVMBuildTrunc(b, r, i1, "b") : r
+    }
+
+    // The LLVM type a builtin value uses at the C boundary. Mirrors `llvmType` for the scalar/String
+    // cases builtins traffic in; `Bool` is handled at the return site (i64 in, truncated to i1).
+    private func cType(_ t: Type) -> LLVMTypeRef {
+        switch t {
+        case .string: return strTy
+        case .double: return f64
+        case .bool:   return i1
+        default:      return i64   // Int (and Void params never occur)
+        }
     }
 
     private func lowerConcat(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
@@ -2317,12 +2348,12 @@ final class IRToLLVM {
             return true   // dispatches to user / witness code (non-leaf)
         case .call(let callee, let args, _):
             if case .varRef(let n) = callee.kind {
+                if Builtins.cLeaf.contains(n) { return args.contains { exprHasSafepoint($0.value) } }   // pure C leaf
                 switch n {
                 case "print", "concat": return args.contains { exprHasSafepoint($0.value) }   // leaf
-                case "__arrayCount", "__arraySet": return args.contains { exprHasSafepoint($0.value) }   // load / store
+                case "__array_count_int", "__arraySet": return args.contains { exprHasSafepoint($0.value) }   // load / store
                 case "__arrayAppend": return true                                              // rt_array_grow may rt_alloc
-                case "__intToDouble", "__doubleToInt": return args.contains { exprHasSafepoint($0.value) }   // pure sitofp / round+fptosi
-
+                case "__int_double_double", "__double_int_int": return args.contains { exprHasSafepoint($0.value) }   // pure sitofp / round+fptosi
                 case "sleep", "readLine": return true                                          // non-leaf runtime
                 default: return true                                                            // user function
                 }

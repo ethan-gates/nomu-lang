@@ -9,4 +9,6 @@ fun main() {
     let greeting = concat(hello, concat(", ", world))
     print(greeting)
     print(concat("length test: ", "abc"))
+
+    print("world".hash)
 }

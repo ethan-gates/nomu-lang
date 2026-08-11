@@ -1,0 +1,92 @@
+// MARK: - Binary Tree Structure
+
+
+enum Option<T> {
+    case some(value: T)
+    case none
+}
+
+class TreeNode {
+    var left: Option<TreeNode>
+    var right: Option<TreeNode>
+
+    fun check() -> Int {
+        // Nested switch expressions, each evaluating exactly one single value
+        switch self.left {
+        case .some(let leftNode):
+            switch self.right {
+            case .some(let rightNode):
+                return 1 + leftNode.check() + rightNode.check()
+            case .none:
+                return 1
+            }
+        case .none:
+            return 1
+        }
+    }}
+
+// MARK: - Helper Functions
+fun bottomUpTree(depth: Int) -> TreeNode {
+    if depth > 0 {
+        let l = Option<TreeNode>.some(bottomUpTree(depth: depth - 1))
+        let r = Option<TreeNode>.some(bottomUpTree(depth: depth - 1))
+        return TreeNode(
+            left: l,
+            right: r
+        )
+    } else {
+        return TreeNode(left: Option<TreeNode>.none, right: Option<TreeNode>.none)
+    }
+}
+
+// MARK: - Benchmark Execution
+fun runBinaryTreeBenchmark(maxDepth: Int) {
+    let minDepth = 4
+    let stretchDepth = maxDepth + 1
+
+    // 1. Stretch Tree Allocation
+    let stretchTree = bottomUpTree(depth: stretchDepth)
+    print("stretch tree of depth")
+    print(stretchDepth)
+    print("\t check:")
+    print(stretchTree.check())
+
+    // 2. Long-Lived Tree Allocation
+    let longLivedTree = bottomUpTree(depth: maxDepth)
+
+    // 3. Iterative Deepening with While Loops & Standard Power Calculations
+    var depth = minDepth
+    while depth <= maxDepth {
+        var iterations = 1
+        var exponent = maxDepth - depth + minDepth
+        while exponent > 0 {
+            iterations = 2 * iterations
+            exponent = exponent - 1
+        }
+
+        var checkSum = 0
+        var i = 0
+        while i < iterations {
+            checkSum += bottomUpTree(depth: depth).check()
+            i += 1
+        }
+
+        print(iterations)
+        print("\t trees of depth")
+        print(depth)
+        print("\t check:")
+        print(checkSum)
+        depth += 2
+    }
+
+    // 4. Check Long-Lived Tree
+    print("long-lived tree of depth")
+    print(maxDepth)
+    print("check: ")
+    print(longLivedTree.check())
+}
+
+// MARK: - Run Program
+fun main() {
+    runBinaryTreeBenchmark(maxDepth: 18)
+}

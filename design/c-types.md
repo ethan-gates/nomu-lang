@@ -101,7 +101,7 @@ buffer are updated. Validated: `examples/arr_gc.nomu` + `tools/arr-gc.sh` (an `A
 ### 3.3 Operations (codegen-lowered)
 
 `[…]`, `a[i]`, `a.count`, `a[i] = x`, and `a.append(x)` desugar in Sema to dedicated IR (`arrayLit`,
-`index`) or builtin calls (`__arrayCount` / `__arraySet` / `__arrayAppend`), lowered in
+`index`) or builtin calls (`__array_count_int` / `__arraySet` / `__arrayAppend`), lowered in
 `Lowering.swift`:
 
 - **Literal** allocates the handle + buffer and stores elements.

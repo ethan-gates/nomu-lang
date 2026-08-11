@@ -61,7 +61,7 @@ if recv.type == .string {
 
 ## 3. Codegen — recognize the name, emit the C call
 
-In `lowerCall`'s name switch (`Lowering.swift`, alongside `concat` / `__intToDouble`):
+In `lowerCall`'s name switch (`Lowering.swift`, alongside `concat` / `__int_double_double`):
 
 ```swift
 case "__strByteAt": return lowerStrByteAt(args, span)

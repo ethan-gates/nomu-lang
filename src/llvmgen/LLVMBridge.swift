@@ -27,7 +27,10 @@ public func emitObject(_ module: IRModule, to path: String, optimize: Bool = fal
     if let err = lowerer.error { return err }
     guard lowerer.loweredMain else { return "LLVM: no `main` function to lower" }
 
-    if LLVMVerifyModule(mod, LLVMReturnStatusAction, nil) != 0 {
+    var errorMessage: UnsafeMutablePointer<CChar>! = nil
+    if LLVMVerifyModule(mod, LLVMReturnStatusAction, &errorMessage) != 0 {
+        let message = String(cString: errorMessage)
+        print("LLVM Module Verification Failed:\n\(message)")
         return "LLVM: module failed verification"
     }
     return emitModuleObject(mod, to: path, optimize: optimize)
