@@ -51,7 +51,7 @@ final class IRToLLVM {
     private let anyBoxTy: LLVMTypeRef      // { ptr witness (addr0), ptr addrspace(1) payload } — the `any I` heap box (D1)
     private let spawnHandleTy: LLVMTypeRef // { ptr fiber (addr0, runtime-owned) } — SpawnHandle (8.2.6)
 
-    private let zeroSpan = Span(file: "", begin: Pos(line: 0, col: 0), end: Pos(line: 0, col: 0))
+    private let zeroSpan = Span(startOffset: -1, endOffset: -1, map: nil)   // synthetic: resolves to line 0
 
     private var runtimeFns: [String: (fn: LLVMValueRef, ty: LLVMTypeRef)] = [:]
     // 8.4.2/8.4.4 — the inert mutator seams (`__nomu_poll` / `__nomu_gc_alloc` / `__nomu_write_barrier`).
@@ -572,7 +572,7 @@ final class IRToLLVM {
         let key = "m:\(typeName):\(method)"
         guard callables[key] == nil else { return }
         guard let f = typeMethods(typeName).first(where: { $0.name == method }) else {
-            fail("8.2.3: unknown method '\(typeName).\(method)'", Span(file: "", begin: Pos(line: 0, col: 0), end: Pos(line: 0, col: 0)))
+            fail("8.2.3: unknown method '\(typeName).\(method)'", Span(startOffset: -1, endOffset: -1, map: nil))
             return
         }
         let sanitized = method.replacingOccurrences(of: ".", with: "_")

@@ -77,10 +77,12 @@ final class LexerTests: XCTestCase {
         // Spans are half-open [begin, end): end col is one past the last char.
         var lexer = Lexer("ab\n  cd", file: "t.nomu")
         let toks = lexer.tokenize()
-        XCTAssertEqual(toks[0].span,
-                       Span(file: "t.nomu", begin: Pos(line: 1, col: 1), end: Pos(line: 1, col: 3)))
-        XCTAssertEqual(toks[1].span,
-                       Span(file: "t.nomu", begin: Pos(line: 2, col: 3), end: Pos(line: 2, col: 5)))
+        // Spans carry byte offsets; line/column/file resolve lazily through the SourceMap.
+        XCTAssertEqual(toks[0].span.file, "t.nomu")
+        XCTAssertEqual(toks[0].span.begin.line, 1); XCTAssertEqual(toks[0].span.begin.col, 1)
+        XCTAssertEqual(toks[0].span.end.line, 1);   XCTAssertEqual(toks[0].span.end.col, 3)
+        XCTAssertEqual(toks[1].span.begin.line, 2); XCTAssertEqual(toks[1].span.begin.col, 3)
+        XCTAssertEqual(toks[1].span.end.line, 2);   XCTAssertEqual(toks[1].span.end.col, 5)
         XCTAssertEqual(toks[2].kind, .eof)
     }
 

@@ -9,14 +9,25 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
         exit(1)
     }
 
+    // Per-stage timing; reported to stderr on the way out (success or error).
+    let timings = Timings()
+    timings.file = path
+    timings.optimize = options.optimize
+    timings.bytes = source.utf8.count
+
     // Lexer and parser share one sink and collect errors rather than exiting on the first
     // (the no-crash contract — frontend/README.md P0); the driver is the exit boundary.
     let parseDiags = DiagnosticSink()
-    var lexer = Lexer(source, file: path, diagnostics: parseDiags)
-    let tokens = lexer.tokenize()
+    let tokens = timings.measure("lex") { () -> [Token] in
+        var lexer = Lexer(source, file: path, diagnostics: parseDiags)
+        return lexer.tokenize()
+    }
+    timings.tokens = tokens.count
 
-    var parser = Parser(tokens, diagnostics: parseDiags)
-    var program = parser.parse()
+    var program = timings.measure("parse") { () -> Program in
+        var parser = Parser(tokens, diagnostics: parseDiags)
+        return parser.parse()
+    }
 
     // Resolve the output location up front — every artifact lands under
     // <project-root>/build/, mirroring the source's path relative to the root (the
@@ -45,36 +56,44 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     // later phases would report noise. Report the collected diagnostics and stop here.
     if parseDiags.hasErrors {
         fputs(parseDiags.render() + "\n", stderr)
+        timings.report()
         exit(1)
     }
 
     // Prepend the Nomu standard library, compiled with every program (M4.13). Under
     // the single compilation unit this is a decl concatenation; prelude symbols are
-    // then callable from user code with no import.
-    program = prependPrelude(program)
+    // then callable from user code with no import. (Times the prelude's own lex+parse.)
+    program = timings.measure("prelude") { prependPrelude(program) }
 
     // Fold plain extensions into their target types before any checking (M4.12);
     // downstream passes then see one type with all its methods.
     let mergeDiags = DiagnosticSink()
-    program = mergeExtensions(program, into: mergeDiags)
+    program = timings.measure("merge") { mergeExtensions(program, into: mergeDiags) }
     if mergeDiags.hasErrors {
         fputs(mergeDiags.render() + "\n", stderr)
+        timings.report()
         exit(1)
     }
 
     // Semantic pass → typed IR. POD + let/var checks (AST typechecker) run first (T2 §4).
     let typeDiags = DiagnosticSink()
-    var checker = Typechecker(program, diagnostics: typeDiags)
-    checker.check()
+    timings.measure("typecheck") {
+        var checker = Typechecker(program, diagnostics: typeDiags)
+        checker.check()
+    }
     if typeDiags.hasErrors {
         fputs(typeDiags.render() + "\n", stderr)
+        timings.report()
         exit(1)
     }
 
-    var sema = Sema(program)
-    let semaResult = sema.check()
-    // T4: exhaustiveness as an IR pass over the typed module, into the same sink.
-    checkExhaustiveness(semaResult.module, into: semaResult.diagnostics)
+    let semaResult = timings.measure("sema") { () -> SemaResult in
+        var sema = Sema(program)
+        let result = sema.check()
+        // T4: exhaustiveness as an IR pass over the typed module, into the same sink.
+        checkExhaustiveness(result.module, into: result.diagnostics)
+        return result
+    }
 
     // Typed-IR stage. --emit-typedir writes the typed IR to build/; --stop=typedir
     // writes it and halts (reporting diagnostics without failing — it is a debug view).
@@ -83,11 +102,13 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     }
     if options.stopAt == .typedIR {
         if !semaResult.diagnostics.isEmpty { fputs(semaResult.diagnostics.render() + "\n", stderr) }
+        timings.report()
         return
     }
     // Proceeding to codegen: semantic errors are now fatal.
     if !semaResult.diagnostics.isEmpty {
         fputs(semaResult.diagnostics.render() + "\n", stderr)
+        timings.report()
         exit(1)
     }
 
@@ -95,15 +116,17 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     // decls (whole-program mono under the single compilation unit). An IR→IR pass; `any I`
     // stays dynamic. Runs only on error-free IR.
     let monoDiags = DiagnosticSink()
-    let monoModule = monomorphize(semaResult.module, into: monoDiags)
+    let monoModule = timings.measure("mono") { monomorphize(semaResult.module, into: monoDiags) }
     if !monoDiags.isEmpty {
         fputs(monoDiags.render() + "\n", stderr)
+        timings.report()
         exit(1)
     }
 
     // Backend (M8): lower the typed IR via LLVM's C API → object → link with the runtime .a.
     // (The C backend was the differential oracle through 8.2 and was retired at the 8.2 exit.)
-    emitLLVMBinary(monoModule, stem: stem, outputDir: outputDir, optimize: options.optimize)
+    emitLLVMBinary(monoModule, stem: stem, outputDir: outputDir, optimize: options.optimize, timings: timings)
+    timings.report()
 }
 
 // Write a text artifact to `path` (or exit) and report its path — the "emit" style,
@@ -160,14 +183,21 @@ private func prependPrelude(_ program: Program) -> Program {
 // static archive, and link them into a native executable. Reports the binary path (like the C
 // path). Everything LLVM stays behind `emitHelloWorldObject` in LLVMBridge — this only orchestrates
 // object → .a → link.
-private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String, optimize: Bool) {
+private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String, optimize: Bool, timings: Timings) {
     let objPath = stem + ".o"
-    if let err = emitObject(module, to: objPath, optimize: optimize) {
+    // `codegen` is the whole LLVM path (IR lowering + transform passes + object emit) behind one
+    // bridge call; splitting it needs timing hooks inside LLVMBridge (a follow-up).
+    let err = timings.measure("codegen") { emitObject(module, to: objPath, optimize: optimize) }
+    if let err = err {
         fputs("error: \(err)\n", stderr)
+        timings.report()
         exit(1)
     }
-    writeRuntimeSources(toDir: outputDir)
-    guard let archive = buildRuntimeArchive(inDir: outputDir) else { exit(1) }
+    let archive = timings.measure("runtime") { () -> String? in
+        writeRuntimeSources(toDir: outputDir)
+        return buildRuntimeArchive(inDir: outputDir)
+    }
+    guard let archive = archive else { timings.report(); exit(1) }
 
     let binPath = stem
     // `-dead_strip` drops code unreachable from the program's entry — most of MMTk's plan/scheduler
@@ -184,8 +214,10 @@ private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String,
         linkArgs += [gcArchive,
                      "-framework", "CoreFoundation", "-framework", "IOKit", "-lobjc"]
     }
-    if runProcess("/usr/bin/cc", linkArgs) != 0 {
+    let linkStatus = timings.measure("link") { runProcess("/usr/bin/cc", linkArgs) }
+    if linkStatus != 0 {
         fputs("error: link failed\n", stderr)
+        timings.report()
         exit(1)
     }
     print(binPath)
