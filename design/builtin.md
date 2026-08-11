@@ -1,114 +1,122 @@
 # Adding a C-backed builtin
 
-How to add a builtin method, property, or free function whose implementation lives in the C runtime
-floor, and wire it through the compiler. This is the path `concat`, the numeric `.double` / `.int`
-conversions, and `Array.count` / `Array.append` already take.
+How to add a builtin method, property, or free function backed by the C runtime floor, and wire it
+through the compiler. There are two kinds:
 
-**The lexer and parser need no changes.** Method-call syntax `recv.name(args)`, property syntax
-`recv.name`, and free-call syntax `name(args)` already lex and parse into `.member` / `.call` AST nodes
-for any receiver. A builtin is added by intercepting in **Sema** (desugar to a named builtin call),
-lowering in **codegen** (emit the C call), and providing the **C function**. Three seams, plus a
-safepoint classification.
+- **C-leaf builtins** — a pure C function (no GC allocation, no blocking). These follow a naming
+  convention and are dispatched generically through the `Builtins` registry: adding one is a C
+  function, a one-line Sema branch, and one registry entry — no new codegen.
+- **Codegen-native builtins** — lowered to LLVM directly, not a C call: `Array.append` (grows in
+  codegen), `Array.count` (field load), `Int.double` / `Double.int` (`sitofp` / round). These keep an
+  explicit `lowerXxx` + a `case` in `lowerCall`.
 
-Worked example below: a method `str.byteAt(i) -> Int` on `String`.
+The lexer and parser need no change either way — `recv.name(args)`, `recv.name`, and `name(args)`
+already parse into `.member` / `.call` for any receiver.
+
+## The naming convention
+
+A C-leaf builtin's mangled name encodes its whole signature and **is** its C symbol name:
+
+    __<receiver>_<name>_<return>[_<arg>...]
+
+e.g. `__string_eq_bool_string` = receiver `String`, method `eq`, returns `Bool`, one `String` arg — and
+the C function is named `__string_eq_bool_string`. Because the name carries the signature, both Sema
+and codegen read the types off it (`Builtins.signature` in `Builtins.swift`), so no case is hand-written
+per builtin.
+
+Worked example below: `str.byteAt(i: Int) -> Int`, mangled `__string_byteAt_int_int`.
 
 ## 1. Runtime (C)
 
-Declare in `src/runtime/runtime.h`, define in `src/runtime/core.c` (the pure value floor) — or
-`runtime.c` for privileged/blocking primitives.
+Define the function under its mangled name in `core.c` (the pure floor) or `runtime.c`
+(privileged/blocking). A `Bool` return is an `int64_t` 0/1 — codegen truncates it to i1, which keeps a
+portable ABI (no platform boolean type).
 
 ```c
-// runtime.h
-int64_t rt_str_byte_at(String s, int64_t i);
-
 // core.c
-int64_t rt_str_byte_at(String s, int64_t i) {
+int64_t __string_byteAt_int_int(String s, int64_t i) {
     if (i < 0 || i >= s.len) rt_bounds_trap(i, s.len);
     return (int64_t)(unsigned char)s.data[i];
 }
 ```
 
-`String` is `{ char* data, int64_t len }` (runtime.h); it is passed by value.
+`String` is `{ char* data, int64_t len }`, passed by value. A `runtime.h` declaration is optional —
+codegen declares the extern itself.
 
-## 2. Sema — intercept by receiver type, desugar to a `__builtin` call
+## 2. Sema — intercept by receiver type, build the call from the registry
 
-Type-check the receiver, then, keyed on its type, emit a call to a reserved builtin name
-(`__strByteAt`) that codegen recognizes. The receiver is passed as the first argument.
+Type-check the receiver, then emit the builtin call through `BuiltinsSema`, which reads the return and
+argument types off the mangled name.
 
-**Method** (`str.byteAt(i)`) — in `checkCall`, after `let recv = checkExpr(base)`, next to the
-`Array` method branch (`case .array`):
+**Method** (`str.byteAt(i)`) — in `checkCall`, in the `String` branch next to `Array`'s, after
+`let recv = checkExpr(base)`:
 
 ```swift
 if recv.type == .string {
     switch name {
     case "byteAt":
         let idx = coerce(checkExpr(args[0].value, expected: .int), to: .int)
-        let callee = IRExpr(type: .void, span: span, kind: .varRef("__strByteAt"))
-        return IRExpr(type: .int, span: span, kind: .call(callee: callee,
-            args: [IRArg(label: nil, value: recv), IRArg(label: nil, value: idx)], typeArgs: []))
+        return BuiltinsSema.method("__string_byteAt_int_int", recv, [idx], span)
     default:
         diags.error("value of type 'String' has no method '\(name)'", at: span)
-        return IRExpr(type: .error, span: span, kind: .intLit(0))
+        return IRExpr(type: .error, span: span, kind: .boolLit(false))
     }
 }
 ```
 
-**Property** (`str.length`) — same shape, but in `checkExpr`'s `.member` case, next to the numeric
-`.double` / `.int` conversions. No argument list; the receiver is the sole builtin argument.
+`BuiltinsSema.method` builds `.call(.varRef(mangled), [recv, args…])`, typed by the name's return.
+Arg count/types are checked by the caller (which holds the diagnostic sink).
 
-**Free function** (`foo(a, b)`) — instead register a signature in the prelude and lower by name:
-`funcs["foo"] = FnSig(params: […], ret: …)` (see `concat`), then a `case "foo"` in codegen.
+**Property** (`str.hash`) — the same, in `checkExpr`'s `.member` case, via
+`BuiltinsSema.member(mangled, recv, span)` (no argument list).
 
-## 3. Codegen — recognize the name, emit the C call
+**Free function** (`foo(a, b)`) — register a prelude signature `funcs["foo"] = FnSig(…)` and lower by
+name (see `concat`); this is not part of the C-leaf registry.
 
-In `lowerCall`'s name switch (`Lowering.swift`, alongside `concat` / `__int_double_double`):
+## 3. Register it — one line, and that is the codegen wiring
 
-```swift
-case "__strByteAt": return lowerStrByteAt(args, span)
-```
-
-The helper, mirroring `lowerConcat`:
+Add the mangled name to `Builtins.cLeaf` in `Builtins.swift`:
 
 ```swift
-private func lowerStrByteAt(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
-    guard let s = lowerExpr(args[0].value), let i = lowerExpr(args[1].value) else { return nil }
-    let (fn, ty) = runtimeFn("rt_str_byte_at", ret: i64, params: [strTy, i64], varArg: false)
-    return buildCall(fn, ty, [s, i])
-}
+static let cLeaf: Set<String> = [
+    "__string_hash_int",
+    "__string_eq_bool_string",
+    "__string_byteAt_int_int",   // new
+]
 ```
 
-`runtimeFn` declares/caches the extern; `strTy` is the codegen `{ i8* data, i64 len }` matching the C
-`String`. Return `Int` → `i64`, `Bool` → `i1`, `Double` → `f64`, `String` → `strTy`.
+`lowerCall` routes any `cLeaf` name through the generic `lowerCLeafBuiltin`, which parses the signature,
+maps each type to its LLVM type (`String` → `strTy`, `Int` → `i64`, `Double` → `f64`, `Bool` → i1 via a
+truncated i64), and calls the same-named C symbol. No per-builtin codegen.
 
-## 4. Codegen — safepoint classification
+Codegen-native builtins that are **not** same-named C calls — `append`, `count`, the numeric
+conversions — stay out of `cLeaf` and keep an explicit `case` + `lowerXxx` in `lowerCall`.
 
-In `exprHasSafepoint` (`Lowering.swift`), classify the builtin. A pure C leaf that does not allocate
-GC memory or block is **not** a safepoint — recurse into its arguments only:
+## 4. Safepoint classification
 
-```swift
-case "__strByteAt": return args.contains { exprHasSafepoint($0.value) }
-```
-
-If the builtin instead **returns a heap `String`, allocates GC memory, or blocks**, it is not a leaf:
-return `true`, and a returned managed value must go through the immortal / managed-buffer path (the
-open String heap-boxing work, Q6 — see `c-types.md`). A raw heap pointer must never be held by C
-across an allocation under the moving collector.
+C-leaf builtins are pure leaves (no GC allocation, no blocking), and `exprHasSafepoint` already treats
+every `cLeaf` name as a leaf (recurses into arguments only) — nothing to add. A builtin that **allocates
+GC memory, returns a heap `String`, or blocks** is not a C-leaf: keep it out of `cLeaf`, give it an
+explicit lowering, and return `true` from `exprHasSafepoint`. A raw heap pointer must never be held by
+C across an allocation under the moving collector — this is why `Array.append` grows in codegen, and why
+heap-returning string ops wait on Q6 (`c-types.md`).
 
 ## Touch-point summary
 
-| Seam | File | What |
-| --- | --- | --- |
-| C function | `runtime.h` + `core.c` (or `runtime.c`) | declaration + definition |
-| Sema intercept | `Sema.swift` | method → `checkCall`; property → `checkExpr` `.member`; free fn → `funcs[…]` prelude |
-| Codegen lower | `Lowering.swift` | `case "__name"` in `lowerCall` + a helper using `runtimeFn` |
-| Safepoint | `Lowering.swift` | a `case` in `exprHasSafepoint` (leaf vs. allocating/blocking) |
+| Kind | C function | Sema | Codegen |
+| --- | --- | --- | --- |
+| **C-leaf** (pure C call) | mangled-name fn in `core.c` / `runtime.c` | one branch → `BuiltinsSema.member` / `.method` | one entry in `Builtins.cLeaf` — no code |
+| **Codegen-native** (not a C call) | — | one branch building the `.varRef` call | explicit `case` + `lowerXxx` + an `exprHasSafepoint` case |
 
 No lexer or parser change is needed.
 
 ## Existing examples to copy
 
-- **Free function:** `concat` (`Sema` prelude `funcs["concat"]`, `lowerConcat`, `rt_str_concat`).
-- **Property-style conversion:** `Int.double` / `Double.int` (`Sema` `.member` intercept,
-  `lowerIntToDouble` / `lowerDoubleToInt`, `llvm.round` + `rt_print_double` for the print seam).
-- **Method with args + GC:** `Array.append` (`Sema` `.array` branch, `lowerArrayAppend`) — note it is a
-  safepoint (`true`) because the buffer grow allocates.
+- **C-leaf property:** `String.hash` → `__string_hash_int` (in `Builtins.cLeaf`; C `__string_hash_int`
+  in `core.c`).
+- **C-leaf method:** `String.eq(other)` → `__string_eq_bool_string`.
+- **Codegen-native conversion:** `Int.double` / `Double.int` — `sitofp` / `llvm.round`+`fptosi`, explicit
+  `lowerIntToDouble` / `lowerDoubleToInt`.
+- **Codegen-native + GC:** `Array.append` — explicit, and a safepoint (`true`) because the buffer grow
+  allocates.
+- **Free function:** `concat` — prelude `funcs["concat"]`, `lowerConcat`, `rt_str_concat`.

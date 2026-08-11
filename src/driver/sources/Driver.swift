@@ -33,7 +33,9 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     // <project-root>/build/, mirroring the source's path relative to the root (the
     // nearest ancestor holding a `nomu.yaml` marker, else the source's own directory).
     let input = URL(fileURLWithPath: path).standardizedFileURL
-    let outputDir = outputDirectory(for: input, root: projectRoot(for: input))
+    let root = projectRoot(for: input)
+    let outputDir = outputDirectory(for: input, root: root)
+    let buildRoot = root.appendingPathComponent("build").path
     do {
         try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
     } catch {
@@ -125,7 +127,7 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
 
     // Backend (M8): lower the typed IR via LLVM's C API → object → link with the runtime .a.
     // (The C backend was the differential oracle through 8.2 and was retired at the 8.2 exit.)
-    emitLLVMBinary(monoModule, stem: stem, outputDir: outputDir, optimize: options.optimize, timings: timings)
+    emitLLVMBinary(monoModule, stem: stem, buildRoot: buildRoot, optimize: options.optimize, timings: timings)
     timings.report()
 }
 
@@ -183,7 +185,7 @@ private func prependPrelude(_ program: Program) -> Program {
 // static archive, and link them into a native executable. Reports the binary path (like the C
 // path). Everything LLVM stays behind `emitHelloWorldObject` in LLVMBridge — this only orchestrates
 // object → .a → link.
-private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String, optimize: Bool, timings: Timings) {
+private func emitLLVMBinary(_ module: IRModule, stem: String, buildRoot: String, optimize: Bool, timings: Timings) {
     let objPath = stem + ".o"
     // `codegen` is the whole LLVM path (IR lowering + transform passes + object emit) behind one
     // bridge call; splitting it needs timing hooks inside LLVMBridge (a follow-up).
@@ -193,10 +195,7 @@ private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String,
         timings.report()
         exit(1)
     }
-    let archive = timings.measure("runtime") { () -> String? in
-        writeRuntimeSources(toDir: outputDir)
-        return buildRuntimeArchive(inDir: outputDir)
-    }
+    let archive = timings.measure("runtime") { cachedRuntimeArchive(buildRoot: buildRoot) }
     guard let archive = archive else { timings.report(); exit(1) }
 
     let binPath = stem
@@ -226,6 +225,56 @@ private func emitLLVMBinary(_ module: IRModule, stem: String, outputDir: String,
 // Compile the runtime C sources to objects and archive them into `libnomuruntime.a` (the
 // `compiler.md` §6 "runtime library" item, real for the LLVM path). Replaces the C backend's
 // per-file `cc` co-compile. Returns the archive path, or nil on failure (message on stderr).
+// The runtime `.a` is identical across programs (the C floor is embedded in nomuc), so it is content-
+// addressed and cached under `build/runtime/`. The key hashes the embedded runtime sources + host
+// arch + a recipe version, so it invalidates automatically whenever any of those change — editing the
+// runtime rebuilds nomuc, which changes the embedded content and thus the key. Nobody clears the
+// cache; clearing `build/` is enough if ever needed. (Local `cc` version is deliberately not in the
+// key: a stale archive built by an older cc still links and runs — the C ABI is stable — so reuse is
+// correct; the C floor is transitional anyway.)
+private func cachedRuntimeArchive(buildRoot: String) -> String? {
+    let fm = FileManager.default
+    let dir = buildRoot + "/runtime"
+    let cached = dir + "/nomu-runtime-\(runtimeArchiveKey()).a"
+    if fm.fileExists(atPath: cached) { return cached }   // hit
+
+    // Miss: build in a pid-unique scratch dir, then publish atomically under the content key so a
+    // crash or a concurrent compile never leaves a partial archive at the shared path.
+    let scratch = dir + "/build-\(ProcessInfo.processInfo.processIdentifier)"
+    try? fm.createDirectory(atPath: scratch, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(atPath: scratch) }
+    writeRuntimeSources(toDir: scratch)
+    guard let built = buildRuntimeArchive(inDir: scratch) else { return nil }
+    try? fm.removeItem(atPath: cached)
+    do { try fm.moveItem(atPath: built, toPath: cached) } catch {
+        fputs("error: failed to publish runtime archive: \(error)\n", stderr)
+        return nil
+    }
+    return cached
+}
+
+// A stable (cross-run) FNV-1a key over everything that determines the archive's contents.
+private func runtimeArchiveKey() -> String {
+    var h: UInt64 = 0xcbf29ce484222325
+    func mix(_ s: String) { for b in s.utf8 { h ^= UInt64(b); h = h &* 0x00000100000001B3 } }
+    mix(EmbeddedSources.runtimeHeader)
+    mix(EmbeddedSources.runtimeC)
+    mix(EmbeddedSources.coreC)
+    mix(hostArch)
+    mix("recipe-1")   // bump when the compile/archive commands below change
+    return String(h, radix: 16)
+}
+
+private var hostArch: String {
+    #if arch(arm64)
+    return "arm64"
+    #elseif arch(x86_64)
+    return "x86_64"
+    #else
+    return "unknown"
+    #endif
+}
+
 private func buildRuntimeArchive(inDir dir: String) -> String? {
     let runtimeO = dir + "/runtime.o"
     let coreO = dir + "/core.o"

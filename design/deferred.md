@@ -8,9 +8,22 @@ in the owning `mN-spec.md`). Each entry records **what**, **why deferred**, the
 
 Status vocabulary matches `readme.md` §"Reading the status tags".
 
+## How entries are tagged
+
+Each entry carries a **Type** and a **Lifecycle** stage:
+
+- **Type** — `user-facing` (visible to a Nomu programmer), `language-feature` (new syntax/semantics),
+  `perf`, `refactor` (internal structure, no behavior change), or `observability` (compiler
+  introspection).
+- **Lifecycle** — `needs-design` (direction not yet specified), `needs-grounding` (direction clear,
+  needs code investigation/measurement before building), `ready-to-build` (designed + grounded, just
+  parked), or `blocked` (waiting on a named prerequisite).
+
 ---
 
 ## `shared` on function-type / existential spellings
+
+**Type / Lifecycle:** `language-feature · ready-to-build` (trigger-gated).
 
 - **What.** The explicit `shared (A) -> B` (shareable closure/function type) and
   `shared any I` (shareable existential) spellings (`generics.md` §2). The
@@ -42,6 +55,8 @@ Status vocabulary matches `readme.md` §"Reading the status tags".
 
 ## Docs reorganization: working design docs vs. a language spec
 
+**Type / Lifecycle:** `refactor · needs-design`.
+
 - **What.** Split the doc set into two audiences: **working design docs** (the
   `mN-spec.md` build plans, decision records, and per-feature design like `loops.md` —
   how and why we build) and a **language specification** (what the language *guarantees
@@ -56,6 +71,44 @@ Status vocabulary matches `readme.md` §"Reading the status tags".
   semantics; design docs = rationale + build plan + internals), then lift the
   programmer-facing content out of `syntax.md`/`concurrency.md`/`types.md`/etc. into a
   spec, leaving the working docs to cross-reference it. Discuss scope first.
+
+---
+
+## Language + compiler-perf work (2026-08 session)
+
+Terse pointers, each tagged `[Type · Lifecycle]`. Promote to a full What/Why/Trigger/How entry when
+picked up.
+
+- **Operator surface design** `[language-feature · needs-design]` — a holistic pass over operators
+  before extending any. Open pieces: equality/relational on non-numerics (`String` uses `.eq(...)`
+  today, aggregates have none); **logical-not `!`** (only `!=` exists); **unary minus** (`-x`; write
+  `0 - x` today). Comparison type-checking already rejects non-numeric `== != < >` with a clean error
+  (`Sema.binaryResult`). Decide the whole set + the overload/requirement story together. Ref:
+  `generics.md` §10 (operators-as-requirements).
+- **Grouping parentheses as a primary expression** `[user-facing · ready-to-build]` — `(a + b) * c`
+  does not parse; `(` only opens a call/param list. Add a parenthesized-expression case to
+  `parsePrimary`. Small, self-contained (worked around in `examples/benchmarks/hashmap.nomu`).
+- **Generic hash map `HashTable<V>` / whole-aggregate element reads** `[language-feature · blocked]` —
+  the hashmap is concrete `String → Int`; a generic value type, and reading a whole array element by
+  value (`let e = a[i]` mixing values + refs), both recreate the category-3 FCA case. Blocked on the
+  **D6 spill** (`c-types.md` §3.4; `m6-spec.md`).
+- **Identifier interning** `[perf · needs-grounding]` — intern identifiers to integer symbols at lex
+  time; downstream Sema comparisons/maps become int-keyed. Touches Sema's string-keyed tables and
+  interacts with macro **hygiene** (carry `(symbol, hygiene-ctx)`) and future parallel/incremental
+  compilation. Ground against Sema's map usage first. Deliberately deferred out of the parser-perf pass.
+- **Lexer allocation levers** `[perf · ready-to-build]` — after the byte-lexer + compact-spans work,
+  two small wins remain: parse `Int` literals directly from bytes (drop the per-number `String`), and
+  reuse one scratch `[UInt8]` across string literals (drop the per-literal array). Keywords/operators
+  are already allocation-free; identifiers still allocate their `String` (fundamental until interning).
+- **LLVM sub-stage timing split** `[observability · needs-grounding]` — the `codegen` timing bucket is
+  the whole `emitObject` call (IR→LLVM lowering + transform passes + object emit). Split it with timing
+  hooks inside `LLVMBridge`. Driver-level stages (lex → link) already report per-stage (`Timings`).
+- **Streaming / pull lexer** `[refactor · needs-design]` — a `pull_next_token()` model instead of
+  full up-front tokenization, to cut peak memory / allow lex+parse overlap. `Lexer.next()` is already
+  the pull primitive; a pull driver needs a rewindable lookahead buffer for the parser's backtracking.
+  Parked — the batch model is fine and this is not a throughput lever.
+- **Float-exponent literals** `[language-feature · needs-design]` — accept `1e9` / `2.5e-3`. Small
+  lexer change plus syntax agreement; today only the decimal-point form (`3.14`) lexes.
 
 ---
 
@@ -86,8 +139,10 @@ a rough estimate to help sequencing, not a commitment.
 - **Dead-code stripping** `[medium]` — strip unreachable functions/symbols from the emitted binary
   (LLVM `internalize` + `globaldce`, and/or `-dead_strip` at link). `-O` does some; a deliberate
   pass would shrink binaries.
-- **Compiler perf diagnostics by default** `[medium]` — per-phase timing/allocation instrumentation
-  in `nomuc` (surfaced behind a flag or always-on summary).
+- **Compiler perf diagnostics** `[per-stage timings landed 2026-08-11]` — per-stage timing prints on
+  every invocation to stderr (`Timings`; driver stages lex → parse → sema → mono → codegen → runtime →
+  link, with opt level + input size). Remaining: the LLVM sub-stage split (see "LLVM sub-stage timing
+  split" above) and optional allocation counts.
 - **Compiler architecture review for perf** `[medium · ongoing]` — a pass over the compiler's own
   hot paths (startup, monomorphization, lowering); the `nomuc -h` latency is one entry point.
 - **Emission options** `[medium]` — broaden `--emit-*` / `--stop=` (e.g. emit LLVM IR, asm, object
