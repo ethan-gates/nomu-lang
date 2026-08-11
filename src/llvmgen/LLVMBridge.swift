@@ -3,6 +3,7 @@
 // per-node lowering lives in `Lowering.swift` (`IRToLLVM`); this file drives target setup, the GC
 // pass pipeline (`mem2reg`/`sroa` → `rewrite-statepoints-for-gc`, or `-O2` in release), and object
 // emission via `llvm-c/TargetMachine.h`.
+import Foundation
 import LLVM_C
 import frontend
 
@@ -98,12 +99,18 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     let pipeline = optimize
         ? "default<O2>,rewrite-statepoints-for-gc"
         : "function(mem2reg,sroa),always-inline,rewrite-statepoints-for-gc"
+    if ProcessInfo.processInfo.environment["NOMU_DUMP_LLVM"] != nil {
+        (path + ".pre.ll").withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }
+    }
     if let err = LLVMRunPasses(mod, pipeline, tm, opts) {
         let m = LLVMGetErrorMessage(err).map { String(cString: $0) } ?? "unknown"
         LLVMConsumeError(err)
         return "LLVM: GC pass pipeline failed: \(m)"
     }
 
+    if ProcessInfo.processInfo.environment["NOMU_DUMP_LLVM"] != nil {
+        (path + ".post.ll").withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }
+    }
     var emitErr: UnsafeMutablePointer<CChar>? = nil
     let rc = path.withCString { cpath in
         LLVMTargetMachineEmitToFile(tm, mod, cpath, LLVMObjectFile, &emitErr)

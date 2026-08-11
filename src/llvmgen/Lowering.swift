@@ -747,12 +747,34 @@ final class IRToLLVM {
         }
     }
 
+    // A stack slot for a local/temporary, always created in the function's **entry block** — never at
+    // the current insertion point. LLVM only treats entry-block allocas as fixed frame slots; an
+    // alloca emitted inside a loop body is a *dynamic* stack allocation that grows the stack every
+    // iteration and overflows a fiber's fixed stack (128 KB) after enough iterations. `-O2` hoists
+    // these anyway, so this only shows up in the debug pipeline (mem2reg/sroa, no LICM/DCE). Reusing
+    // one slot across iterations is correct: locals are dead at the loop back-edge, and closures
+    // snapshot captures **by value** at creation (`allocAndFillEnv`), so per-iteration binding does not
+    // depend on a fresh slot. A scratch builder keeps the main builder's position untouched.
+    private func entryAlloca(_ ty: LLVMTypeRef, _ name: String) -> LLVMValueRef {
+        guard let fn = currentFn, let entry = LLVMGetEntryBasicBlock(fn) else {
+            return LLVMBuildAlloca(b, ty, name)!
+        }
+        let tmp = LLVMCreateBuilderInContext(ctx)!
+        defer { LLVMDisposeBuilder(tmp) }
+        if let first = LLVMGetFirstInstruction(entry) {
+            LLVMPositionBuilderBefore(tmp, first)
+        } else {
+            LLVMPositionBuilderAtEnd(tmp, entry)
+        }
+        return LLVMBuildAlloca(tmp, ty, name)!
+    }
+
     private func lowerStmt(_ stmt: IRStmt) {
         setDebugLoc(stmt.span)   // 8.3: line-table entry; inherited by this statement's instructions
         switch stmt.kind {
         case .letBinding(let name, _, let value):
             guard let ty = llvmType(value.type, stmt.span), let v = lowerExpr(value) else { return }
-            let slot = LLVMBuildAlloca(b, ty, name)!
+            let slot = entryAlloca(ty, name)
             LLVMBuildStore(b, v, slot)
             locals[name] = (slot, ty)
             declareLocal(name, type: value.type, addr: slot, line: stmt.span.begin.line)
@@ -941,7 +963,7 @@ final class IRToLLVM {
         default:
             // An rvalue (e.g. a call result): materialize it in a temp so it has an address.
             guard let ty = llvmType(e.type, e.span), let v = lowerExpr(e) else { return nil }
-            let slot = LLVMBuildAlloca(b, ty, "tmp")!
+            let slot = entryAlloca(ty, "tmp")
             LLVMBuildStore(b, v, slot)
             return (slot, ty)
         }
@@ -1104,7 +1126,7 @@ final class IRToLLVM {
             return nil
         }
         let c = e.cases[caseIdx]
-        let slot = LLVMBuildAlloca(b, et, "enum")!
+        let slot = entryAlloca(et, "enum")
         LLVMBuildStore(b, LLVMConstInt(i64, UInt64(caseIdx), 0), structGEP(et, slot, 0))
         if !c.fields.isEmpty {
             guard let cst = caseStructType(typeName, c) else { return nil }
@@ -1150,7 +1172,7 @@ final class IRToLLVM {
                 for (i, binding) in arm.bindings.enumerated() {
                     guard let bty = llvmType(binding.type, sw.subject.span) else { break }
                     let val = LLVMBuildLoad2(b, bty, structGEP(cst, payload, i), binding.name)
-                    let bslot = LLVMBuildAlloca(b, bty, binding.name)!
+                    let bslot = entryAlloca(bty, binding.name)
                     LLVMBuildStore(b, val, bslot)
                     locals[binding.name] = (bslot, bty)
                     declareLocal(binding.name, type: binding.type, addr: bslot, line: sw.subject.span.begin.line)
@@ -1702,7 +1724,7 @@ final class IRToLLVM {
         let envPtr = allocAndFillEnv(caps, envTy)
         let spawn = runtimeFn("fiber_spawn", ret: i8ptr, params: [i8ptr, i8ptr], varArg: false)
         let fiber = buildCall(spawn.0, spawn.1, [fn, toUnmanaged(envPtr)])!
-        let handleSlot = LLVMBuildAlloca(b, spawnHandleTy, "\(name).h")!
+        let handleSlot = entryAlloca(spawnHandleTy, "\(name).h")
         LLVMBuildStore(b, fiber, structGEP(spawnHandleTy, handleSlot, 0))
         let sl = SpawnLocal(handleSlot: handleSlot, resultTy: resultTy)
         spawnLocals[name] = sl
@@ -1787,16 +1809,20 @@ final class IRToLLVM {
         LLVMBuildStore(b, LLVMConstInt(i64, UInt64(n), 0), gepByte(buf, LLVMConstInt(i64, 8, 0)))      // cap
         for (i, el) in elements.enumerated() {
             guard let v = lowerExpr(el) else { return nil }
-            LLVMBuildStore(b, v, gepByte(buf, LLVMConstInt(i64, UInt64(16 + i * stride), 0)))
+            // Barriered: a preceding element's construction can allocate and (via a GC) promote `buf`
+            // to the mature space, so a later managed-element store into it needs remembering (6.3.1).
+            storeField(buf, gepByte(buf, LLVMConstInt(i64, UInt64(16 + i * stride), 0)), v)
         }
-        LLVMBuildStore(b, buf, gepByte(handle, LLVMConstInt(i64, 16, 0)))                              // bufptr
+        storeField(handle, gepByte(handle, LLVMConstInt(i64, 16, 0)), buf)                             // bufptr
         return handle
     }
 
     // Bounds-checked p1 address of element `idxV` in `handle`. The unsigned compare `idx >= len`
     // catches negative and too-large in one test; an out-of-range index traps in the runtime (never
-    // returns). On return the builder sits in the in-bounds block.
-    private func arrayElemAddr(_ handle: LLVMValueRef, _ idxV: LLVMValueRef, _ elemType: Type) -> LLVMValueRef? {
+    // returns). On return the builder sits in the in-bounds block. Returns both the buffer object base
+    // (`buf`, needed as the write-barrier source for a managed-element store) and the element address.
+    private func arrayElemAddr(_ handle: LLVMValueRef, _ idxV: LLVMValueRef, _ elemType: Type)
+        -> (buf: LLVMValueRef, addr: LLVMValueRef)? {
         guard let fn = currentFn else { return nil }
         let len = LLVMBuildLoad2(b, i64, gepByte(handle, LLVMConstInt(i64, 8, 0)), "arr.len")!
         let oob = LLVMBuildICmp(b, LLVMIntUGE, idxV, len, "arr.oob")!
@@ -1811,23 +1837,25 @@ final class IRToLLVM {
         let buf = LLVMBuildLoad2(b, p1, gepByte(handle, LLVMConstInt(i64, 16, 0)), "arr.buf")!
         let stride = LLVMConstInt(i64, UInt64(arrayElemStride(elemType)), 0)
         let off = LLVMBuildAdd(b, LLVMConstInt(i64, 16, 0), LLVMBuildMul(b, idxV, stride, "arr.mul"), "arr.off")!
-        return gepByte(buf, off)
+        return (buf, gepByte(buf, off))
     }
 
     // a[i] → bounds-checked element load.
     private func lowerIndex(_ base: IRExpr, _ idx: IRExpr, _ elemType: Type, _ span: Span) -> LLVMValueRef? {
         guard let handle = lowerExpr(base), let idxV = lowerExpr(idx), let elemLL = llvmType(elemType, span),
-              let addr = arrayElemAddr(handle, idxV, elemType) else { return nil }
-        return LLVMBuildLoad2(b, elemLL, addr, "arr.elem")
+              let e = arrayElemAddr(handle, idxV, elemType) else { return nil }
+        return LLVMBuildLoad2(b, elemLL, e.addr, "arr.elem")
     }
 
-    // a[i] = x → bounds-checked element store (args: handle, index, value). Result unused.
+    // a[i] = x → bounds-checked element store (args: handle, index, value). Result unused. A managed
+    // element goes through the write barrier (`storeField`) with the buffer as the source object, so a
+    // store into a mature buffer remembers it (6.3.1); a value element is a plain store.
     private func lowerArraySet(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
         guard args.count == 3 else { fail("__arraySet expects 3 args", span); return nil }
         guard let handle = lowerExpr(args[0].value), let idxV = lowerExpr(args[1].value),
               let val = lowerExpr(args[2].value),
-              let addr = arrayElemAddr(handle, idxV, args[2].value.type) else { return nil }
-        LLVMBuildStore(b, val, addr)
+              let e = arrayElemAddr(handle, idxV, args[2].value.type) else { return nil }
+        storeField(e.buf, e.addr, val)
         return LLVMConstInt(i64, 0, 0)
     }
 
@@ -1864,15 +1892,16 @@ final class IRToLLVM {
         let memcpy = runtimeFn("memcpy", ret: i8ptr, params: [i8ptr, i8ptr, i64], varArg: false)
         _ = buildCall(memcpy.0, memcpy.1, [toUnmanaged(gepByte(newBuf, LLVMConstInt(i64, 16, 0))),
                                            toUnmanaged(gepByte(buf0, LLVMConstInt(i64, 16, 0))), copyBytes])
-        LLVMBuildStore(b, newBuf, gepByte(handle, LLVMConstInt(i64, 16, 0)))   // publish
+        storeField(handle, gepByte(handle, LLVMConstInt(i64, 16, 0)), newBuf)   // publish (barriered: handle may be mature)
         LLVMBuildBr(b, contBB)
 
         // Store the element into the current buffer (reloaded from the handle so it is the grown one
-        // on the grow path) and bump len.
+        // on the grow path) and bump len. Barriered: a managed element into a possibly-mature buffer
+        // (the un-grown path) must remember it (6.3.1); a value element is a plain store.
         LLVMPositionBuilderAtEnd(b, contBB)
         let buf = LLVMBuildLoad2(b, p1, gepByte(handle, LLVMConstInt(i64, 16, 0)), "app.buf2")!
         let off = LLVMBuildAdd(b, LLVMConstInt(i64, 16, 0), LLVMBuildMul(b, len, strideV, "app.mul"), "app.off")!
-        LLVMBuildStore(b, val, gepByte(buf, off))
+        storeField(buf, gepByte(buf, off), val)
         LLVMBuildStore(b, LLVMBuildAdd(b, len, LLVMConstInt(i64, 1, 0), "app.inc"), gepByte(handle, LLVMConstInt(i64, 8, 0)))
         return LLVMConstInt(i64, 0, 0)
     }
@@ -2171,6 +2200,7 @@ final class IRToLLVM {
         "printf", "rt_str_lit", "rt_mutex_new", "rt_mutex_unlock",
         "rt_bounds_trap",   // aborts, never allocates — no statepoint needed
         "memcpy",           // libc block copy — never allocates (array grow)
+        "rt_gc_write_barrier",   // M6 · 6.3.1 — remembers the mutated object; never triggers GC
     ]
 
     private func markGCLeaf(_ fn: LLVMValueRef) {
@@ -2274,10 +2304,16 @@ final class IRToLLVM {
 
     // The `__nomu_write_barrier` seam: `void (ptr addrspace(1) obj, ptr addrspace(1) slot,
     // ptr addrspace(1) val)`, emitted at every store of a managed reference into a managed object
-    // field (D5). Inert body is just the store — no header touch yet; `gc-leaf` (a plain store
-    // triggers no GC). M6 fills the LXR coalescing fast path (GEP the header from `obj`, test the
-    // logged bit, log on first mutation) — which is why `obj` is passed even though the inert stub
-    // ignores it. The object header stays the vestigial `i64` it is today; M6 subdivides it.
+    // field (D5). Filled (M6 · 6.3.1): store `val` into `*slot`, then call the runtime post-barrier
+    // `rt_gc_write_barrier(obj, slot, val)` — an object-remembering *post* barrier (GenImmix's
+    // `ObjectBarrier`), so the store precedes the barrier. The barrier remembers `obj` on the first
+    // mutation of a mature object so a nursery collection sees the new cross-generation pointer; under
+    // NoGC/Immix it is a no-op (their mutator barrier is `NoBarrier`). Stays `gc-leaf`: the barrier
+    // never allocates on the GC heap or parks, so no statepoint — the seam is a plain store + leaf
+    // call, and `alwaysinline` collapses it at each store site. `obj/slot/val` cross the C-ABI as
+    // unmanaged pointers (`toUnmanaged`, the allowed 1→0 cast); the barrier reads the raw addresses.
+    // Fast-path inlining (test the log bit in side metadata, call a slow path only on first mutation)
+    // is a deferred perf follow-up, mirroring the still-out-of-line alloc TLAB fast path (6.0.10).
     private func nomuWriteBarrier() -> (LLVMValueRef, LLVMTypeRef) {
         if let g = barrierFn { return g }
         let ty = fnType(voidTy, [p1, p1, p1])
@@ -2285,8 +2321,11 @@ final class IRToLLVM {
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         markGCLeaf(fn)
         addAlwaysInline(fn)
+        let rtBarrier = runtimeFn("rt_gc_write_barrier", ret: voidTy, params: [i8ptr, i8ptr, i8ptr], varArg: false)
         withStubBody(fn) {
-            LLVMBuildStore(b, LLVMGetParam(fn, 2), LLVMGetParam(fn, 1))   // *slot = val
+            let obj = LLVMGetParam(fn, 0)!, slot = LLVMGetParam(fn, 1)!, val = LLVMGetParam(fn, 2)!
+            LLVMBuildStore(b, val, slot)   // *slot = val, before the post-barrier
+            _ = buildCall(rtBarrier.0, rtBarrier.1, [toUnmanaged(obj), toUnmanaged(slot), toUnmanaged(val)])
             LLVMBuildRetVoid(b)
         }
         barrierFn = (fn, ty)

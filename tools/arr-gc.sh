@@ -12,8 +12,10 @@ BIN=$ROOT/build/examples/arr_gc
 STRESS=${NOMU_GC_STRESS:-512}
 
 "$NOMUC" "$ROOT/examples/arr_gc.nomu" >/dev/null || { echo "FAIL: compile"; exit 1; }
+# Evacuation leg under Immix (NOMU_GC_STRESS = collect+defrag every $STRESS bytes; see gc-stress.sh
+# on why stress is an Immix, not GenImmix, tool). GenImmix's generational barrier is covered by gc-gen.sh.
 base=$(NOMU_GC_PLAN=nogc "$BIN" 2>/dev/null)
-evac=$(NOMU_GC_STRESS=$STRESS "$BIN" 2>/dev/null)
+evac=$(NOMU_GC_PLAN=immix NOMU_GC_STRESS=$STRESS "$BIN" 2>/dev/null)
 rc=$?
 
 fail() { echo "FAIL: $1"; echo "  baseline: $(echo $base)"; echo "  evac:     $(echo $evac)"; exit 1; }

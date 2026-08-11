@@ -36,6 +36,7 @@ void* rt_alloc(size_t size);
 void* rt_alloc_immortal(size_t size);   // M6 · 6.2.4 — non-moving String buffers (immortal interim)
 void  rt_free(void* p);
 void  rt_bounds_trap(int64_t idx, int64_t len);   // M6 stdlib — array subscript out-of-range trap
+void  rt_gc_write_barrier(void* obj, void* slot, void* val);   // M6 · 6.3.1 — generational write barrier
 
 // ---- Core floor: pure value primitives ----
 String rt_str_lit(const char* data, int64_t len);

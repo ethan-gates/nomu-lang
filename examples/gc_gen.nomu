@@ -1,0 +1,34 @@
+// M6 · 6.3.1 — generational write-barrier test. Under NOMU_GC_HEAP=<small> the collector runs many
+// real nursery GCs. `h` is allocated first, then a garbage loop forces nursery collections that
+// promote `h` to the mature space. Only *after* it is mature do we store a fresh (nursery) Box into
+// `h.item` — the exact cross-generation pointer the write barrier must remember. A second garbage loop
+// then forces more nursery GCs: without the barrier remembering `h`, the fresh Box (reachable only
+// from mature `h`) would be reclaimed or relocated without updating `h.item`, so the final read would
+// be wrong or crash. Prints 42 / 4242 iff the barrier kept and relocated the young objects.
+//
+// Run: NOMU_GC_HEAP=4000000 build/examples/gc_gen  → prints 42, then 4242.
+class Box {
+  var v: Int
+}
+
+class Holder {
+  var item: Box
+  var tag: Int
+}
+
+fun churn(n: Int) {
+  var i = 0
+  while i < n {
+    let g = Box(v: i)     // garbage: dead after this iteration, drives nursery GCs
+    i = i + 1
+  }
+}
+
+fun main() {
+  let h = Holder(item: Box(v: 0), tag: 4242)
+  churn(200000)           // under a modest heap, drives nursery GCs that promote `h` to the mature space
+  h.item = Box(v: 42)     // mature `h` now points at a fresh nursery Box — barrier remembers `h`
+  churn(5000)             // more nursery GCs: the young Box survives only if `h` was remembered
+  print(h.item.v)         // 42 — the post-promotion store was tracked and relocated
+  print(h.tag)            // 4242 — the mature object itself survived intact
+}

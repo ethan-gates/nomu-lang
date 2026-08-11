@@ -14,8 +14,12 @@ STRESS=${NOMU_GC_STRESS:-1024}   # bytes-between-collections; smaller = more GCs
 
 "$NOMUC" "$ROOT/examples/gc_stress.nomu" >/dev/null || { echo "FAIL: compile"; exit 1; }
 
+# The evacuation leg runs under Immix (the non-generational moving plan): NOMU_GC_STRESS drives a
+# collect+defrag every $STRESS bytes, so every live object relocates. GenImmix is validated separately
+# by gc-gen.sh — under an aggressive stress the generational collector's own evacuation allocations
+# re-trip the byte trigger (a nested GC the single worker can't service), so stress is an Immix tool.
 base=$(NOMU_GC_PLAN=nogc "$BIN" 2>/dev/null)
-evac=$(NOMU_GC_STRESS=$STRESS "$BIN" 2>/dev/null)
+evac=$(NOMU_GC_PLAN=immix NOMU_GC_STRESS=$STRESS "$BIN" 2>/dev/null)
 rc=$?
 
 fail() { echo "FAIL: $1"; echo "  baseline: $(echo $base)"; echo "  evac:     $(echo $evac)"; exit 1; }

@@ -26,6 +26,7 @@ extern void nomu_gc_init(size_t heap_bytes);
 extern void* nomu_gc_bind_mutator(void* tls);
 extern void* nomu_gc_alloc(void* mutator, size_t size, size_t align);
 extern void* nomu_gc_alloc_immortal(void* mutator, size_t size, size_t align);
+extern void nomu_gc_write_barrier_post(void* mutator, void* src, void* slot, void* target);
 
 // One MMTk mutator per carrier thread (Q1). Bound lazily on the thread's first allocation; a fiber
 // migrating carriers allocates against whichever carrier it currently runs on (thread-local storage
@@ -62,6 +63,23 @@ void* rt_alloc_immortal(size_t size) {
     }
     memset(p, 0, size);
     return p;
+}
+
+// ---- Generational write barrier seam (M6 · 6.3.1) ----
+// The codegen `__nomu_write_barrier` seam stores `val` into `*slot` (a managed reference field of the
+// managed object `obj`) and then calls this. It forwards to the MMTk object-remembering post-barrier
+// on the current carrier's mutator, which — under GenImmix — remembers `obj` the first time a mature
+// object is mutated so a nursery collection sees the new cross-generation pointer. Under NoGC/Immix
+// the mutator's barrier is `NoBarrier` and this is a no-op (the seam calls it unconditionally; the
+// plan decides — collector-agnostic, 6.0.5). Never triggers GC, so its call site stays `gc-leaf`.
+// `rt_mutator` is always bound here: a store into a managed object means that object was allocated on
+// this carrier's (or some carrier's) mutator, and any carrier that ran Nomu code has bound one — but
+// bind lazily anyway to be safe against a store before this thread's first allocation.
+void rt_gc_write_barrier(void* obj, void* slot, void* val) {
+    if (!rt_mutator) {
+        rt_mutator = nomu_gc_bind_mutator((void*)pthread_self());
+    }
+    nomu_gc_write_barrier_post(rt_mutator, obj, slot, val);
 }
 
 // ---- GC pointer maps (M6 · 6.1.3) ----
@@ -705,12 +723,17 @@ void __nomu_gc_poll_slow(void) {
 // forced-STW smoke calls it directly. Raise the flag, wake idle carriers blocked in the scheduler so
 // they re-check and park, then wait until every registered carrier has parked. Returns with the world
 // stopped; the caller scans roots and then calls nomu_gc_resume_the_world.
+static int rt_stw_dbg(void) { static int d = -1; if (d < 0) d = getenv("NOMU_GC_DEBUG_STW") != NULL; return d; }
 void nomu_gc_stop_the_world(void) {
+    if (rt_stw_dbg()) fprintf(stderr, "[stw] stop enter\n");
     __nomu_stop_world = 1;
     pthread_mutex_lock(&rt_queue_mu);
     pthread_cond_broadcast(&rt_queue_cond); // kick idle carriers out of their scheduler wait
     pthread_mutex_unlock(&rt_queue_mu);
     pthread_mutex_lock(&rt_stw_mu);
+    static int dbg = -1;
+    if (dbg < 0) { dbg = getenv("NOMU_GC_DEBUG_STW") != NULL; }
+    int spins = 0;
     for (;;) {
         int all_parked = 1;
         for (int i = 0; i < rt_ncarriers_reg; i++) {
@@ -721,12 +744,27 @@ void nomu_gc_stop_the_world(void) {
         if (all_parked) {
             break;
         }
-        pthread_cond_wait(&rt_stw_cond, &rt_stw_mu);
+        if (dbg) {
+            struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 1;
+            int rc = pthread_cond_timedwait(&rt_stw_cond, &rt_stw_mu, &dl);
+            if (rc != 0 && ++spins) {
+                fprintf(stderr, "[stw] waiting (%d carriers, gc_wanted=%d):", rt_ncarriers_reg, rt_gc_wanted);
+                for (int i = 0; i < rt_ncarriers_reg; i++) {
+                    fprintf(stderr, " c%d{use=%d,parked=%d,self=%d}", i, rt_carriers[i].in_use,
+                            rt_carriers[i].parked, (int)pthread_equal(rt_carriers[i].tls, pthread_self()));
+                }
+                fprintf(stderr, "\n");
+            }
+        } else {
+            pthread_cond_wait(&rt_stw_cond, &rt_stw_mu);
+        }
     }
     pthread_mutex_unlock(&rt_stw_mu);
+    if (rt_stw_dbg()) fprintf(stderr, "[stw] stop done (all parked)\n");
 }
 
 void nomu_gc_resume_the_world(void) {
+    if (rt_stw_dbg()) fprintf(stderr, "[stw] resume\n");
     pthread_mutex_lock(&rt_stw_mu);
     __nomu_stop_world = 0;
     rt_gc_wanted = 0;   // release the carrier blocked in nomu_gc_block_for_gc (6.2.4)
@@ -740,6 +778,16 @@ void nomu_gc_resume_the_world(void) {
 // later by the GC worker, count it as already stopped. `rt_gc_wanted` (not `__nomu_stop_world`, which
 // isn't set yet) is the wait predicate; `nomu_gc_resume_the_world` clears it.
 void nomu_gc_block_for_gc(void) {
+    // Only a registered mutator carrier waits for GC. A thread with no carrier CB — the MMTk GC worker
+    // — must never block here: under an aggressive `NOMU_GC_STRESS`, the collector's own evacuation
+    // (copy) allocations can re-trip the stress trigger and call `block_for_gc` on the worker, which
+    // with a single GC thread would wait for a collection only it can finish → deadlock. Returning lets
+    // the collector proceed (the nested stress-GC request is simply dropped). Real (heap-pressure) GC
+    // never calls this on the worker — copy space is reserved before the cycle. (M6 · 6.3.1.)
+    if (!rt_self_cb) {
+        return;
+    }
+    if (rt_stw_dbg()) fprintf(stderr, "[stw] block_for_gc enter\n");
     unw_context_t ctx;
     unw_getcontext(&ctx);
     CarrierCB* cb = rt_self_cb;
@@ -759,6 +807,7 @@ void nomu_gc_block_for_gc(void) {
         cb->has_ctx = 0;
     }
     pthread_mutex_unlock(&rt_stw_mu);
+    if (rt_stw_dbg()) fprintf(stderr, "[stw] block_for_gc exit\n");
 }
 
 void nomu_gc_walk_carrier(void* carrier_tls, nomu_root_visitor visit, void* userdata) {

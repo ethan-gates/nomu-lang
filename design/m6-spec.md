@@ -11,6 +11,11 @@ cross-cutting decisions live in 6.0.5.
 > Authoring conventions per `lang-project/milestone-doc-guide.md` (numbering, status markers,
 > front matter, slice records, exit criteria).
 
+**Build status (2026-08-11):** **6.2 complete (Immix flip + evacuation) and 6.3.1 built + green** — the
+generational write barrier fills the `__nomu_write_barrier` seam and the default plan is **GenImmix**
+(see 6.3). 6.3.2 (nursery/footprint tuning + inlined barrier fast path) and 6.4 (actor teardown) are
+next. Historical bring-up status below.
+
 **Build status (2026-08-04):** **6.1 (MMTk NoGC bring-up) substantially built + green.** 6.1.0–6.1.3
 ✅ (Rust `VMBinding` + MMTk NoGC linked via `crate_universe`; `rt_alloc` → per-carrier mutator; the
 type-id header replacing `refcount`; per-type pointer maps + `scan_object` for every currently-managed
@@ -316,6 +321,21 @@ neither. **No new surface syntax.**
 - **Runtime-instantiated witness tables (Q7 reopen trigger)** — witness tables are static/non-scanned
   today (the any-box map skips `witness`). A future move to runtime-built dictionaries would make the
   table a heap object needing tracing. Monomorphization keeps tables static; watch any retreat from it.
+- **Fixed (6.3.1): local slots were `alloca`'d in loop bodies -> fiber-stack overflow.** A `let`/temp/
+  `match`-binding/`enum`/`spawn`-handle slot was built with `LLVMBuildAlloca` at the *current*
+  insertion point, so a binding inside a loop became a **dynamic** stack allocation (`sub sp, sp, #N`
+  every iteration) instead of a fixed frame slot. Over enough iterations the stack grew past the
+  128 KB fiber stack and overflowed, corrupting whatever it hit (any live root read back garbage/`0`,
+  or a crash when a clobbered pointer field was dereferenced). It looked GC/root-related (a live class
+  value across an allocating loop) but was neither: it reproduced under **NoGC**, was triggered by the
+  *allocation* not the loop count (a no-alloc loop of the same size was fine), corrupted *every* live
+  root, and `-O2` hid it (LICM/DCE hoist the dead alloca -- only the debug pipeline's `mem2reg`/`sroa`
+  left it in the loop). **Fix:** `IRToLLVM.entryAlloca` builds every local/temporary slot in the
+  function **entry block** (the standard LLVM rule), reusing one slot across iterations -- safe because
+  locals are dead at the back-edge and closures snapshot captures by value (`allocAndFillEnv`).
+  Verified: the repro prints correctly through 500 K iterations, the loop body emits no `mov sp`, and
+  the 35-program corpus + GC scripts stay green. (Debug facility added alongside: `NOMU_DUMP_LLVM`
+  writes `<obj>.pre.ll`/`.post.ll` around the pass pipeline.)
 
 ### 6.0.9 · Deferred cleanups / feature work
 
@@ -696,21 +716,63 @@ reclaims memory including cycles. Depends on 6.1 + M8 statepoints. **Approach:**
 programs are collected (tracing beats the retired RC); objects survive relocation intact; M5
 suite green under Immix; a "collect on every allocation" stress mode passes.
 
-## 6.3 · Generational collection (GenImmix) + write barrier ⬜
+## 6.3 · Generational collection (GenImmix) + write barrier 🔨
 
 One-line intent: the footprint/throughput target plan. Depends on 6.2. **Approach:** MMTk
 **GenImmix** — nursery + generational barrier.
 
-- **6.3.1 ⬜** — LLVM-inlined **generational write barrier** (field-logging / remembered-set)
-  on every reference-field store, filling the inert `__nomu_write_barrier` seam. Keep the seam
-  shape **collector-agnostic** — GenImmix fills it as a logging barrier now; the planned LXR
-  RC-hybrid refills the *same* seam as its RC barrier later (6.0.5), so bake in no GenImmix-only
-  ABI assumption.
+- **6.3.1 ✅ built + green (2026-08-11)** — the **generational write barrier** filling the inert
+  `__nomu_write_barrier` seam, plan flipped Immix→**GenImmix**. As built:
+  - **Plan.** `nomu_gc_init` defaults to `PlanSelector::GenImmix` (a copying nursery over an Immix
+    mature space); `NOMU_GC_PLAN` selects `nogc` / `immix` / `genimmix` for differential debugging
+    (`gcbinding/lib.rs`). MMTk's `GLOBAL_LOG_BIT_SPEC` (already `side_first`) + `post_alloc` (6.2.4)
+    supply the object log bit the barrier tests.
+  - **Barrier = object-remembering post-write** (GenImmix's `ACTIVE_BARRIER = ObjectBarrier`). The
+    codegen seam (`Lowering.swift` `nomuWriteBarrier`) stores `val` into `*slot`, then calls the
+    runtime `rt_gc_write_barrier(obj, slot, val)` (`runtime.c`), which forwards to the binding
+    `nomu_gc_write_barrier_post` → `memory_manager::object_reference_write_post` on the current
+    carrier's mutator. Under GenImmix that remembers `obj` on the first mutation of a mature object;
+    under NoGC/Immix the mutator barrier is `NoBarrier`, so the same unconditional call is a no-op —
+    **collector-agnostic** (LXR refills the same seam later, 6.0.5). The seam stays `gc-leaf`
+    (remembering never triggers GC or moves objects), so no new statepoints — the corpus stays
+    structurally identical.
+  - **Array stores routed through the barrier.** `Array` element stores + the buffer-publish store
+    (`lowerArrayLit`/`lowerArraySet`/`lowerArrayAppend`, via `storeField` with the buffer/handle as
+    the source object) now barrier managed elements — the previously-unbarriered
+    `Array.append`-into-a-mature-buffer store (6.0.8 watch item) is closed. A value-typed element
+    stays a plain store.
+  - **Out-of-line first; inline fast path deferred.** The barrier is an out-of-line `gc-leaf` call
+    (like the still-out-of-line alloc TLAB fast path, 6.0.10). The inlined fast path — test the log
+    bit in side metadata, call a slow path only on first mutation — is a **deferred perf follow-up**
+    (6.3.2 / 6.0.9), not a correctness item.
+  - **Validation.** `examples/gc_gen.nomu` + `tools/gc-gen.sh` (new): a mature object is mutated to
+    point at a fresh nursery object, then nursery GCs run (small `NOMU_GC_HEAP`) — byte-identical to
+    NoGC across repeated runs proves the post-promotion cross-generation store is remembered and the
+    young objects relocate. The 35-program corpus is byte-identical under default GenImmix vs. NoGC;
+    the three 6.2 gc-smoke scripts and the (now Immix-pinned) gc-stress/arr-gc evacuation
+    differentials stay green.
 - **6.3.2 ⬜** — nursery sizing / promotion tuning; footprint measurement vs. the ~1.1–1.3×
-  target.
+  target. Fold in the **inlined barrier fast path** and revisit the collector hot-path `opt-level`
+  (currently `z` for size, 6.1.1).
+
+**Validation-harness notes (6.3.1).** Forcing heavy collection on the small fixtures runs into two
+resource-edge behaviors, neither a barrier bug (the barrier is correct under real GC + the corpus
+differential):
+- **`NOMU_GC_STRESS` is an Immix tool, not GenImmix.** Under an aggressive byte-trigger the
+  generational collector's own evacuation (copy) allocations re-trip the stress trigger → a *nested*
+  GC the single worker (`threads=1`) can't service. `nomu_gc_block_for_gc` now guards against a
+  non-carrier (GC-worker) thread blocking there (it would deadlock the collector); the residual is
+  that aggressive stress + GenImmix makes no useful progress, so the gc-stress/arr-gc evacuation
+  differentials pin `NOMU_GC_PLAN=immix` and GenImmix is validated by real heap-pressure GC
+  (`gc-gen.sh`, small `NOMU_GC_HEAP`).
+- **Sub-viable heaps livelock in MMTk.** A `NOMU_GC_HEAP` too small to hold GenImmix's
+  side-metadata + nursery + copy-reserve makes MMTk spin in `calculate_reserved_pages` instead of
+  cleanly OOMing (observed ~200–300 KB for `gc_gen`; ~150 KB completes via full collections). Use a
+  heap comfortably above that floor.
 
 **Exit:** GenImmix green on the M5 suite + stress tests; measured steady-state footprint near
-the live set on the bounded-memory benchmarks (the thesis metric).
+the live set on the bounded-memory benchmarks (the thesis metric). *(6.3.1 clears the suite +
+generational barrier; footprint measurement is 6.3.2.)*
 
 ## 6.4 · Actor teardown / finalization ⬜
 

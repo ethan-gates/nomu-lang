@@ -380,26 +380,43 @@ impl Scanning<NomuVM> for VMScanning {
 
 // ---- C-ABI entry points ----
 
-/// Initialize MMTk with a fixed heap (idempotent). Plan is **Immix** (the 6.2.4 NoGC→Immix flip):
-/// a moving mark-region collector that evacuates on defrag. `NOMU_GC_PLAN=nogc` falls back to the
-/// pre-flip allocate-never-collect plan for differential debugging. 6.3 moves on to GenImmix (§6.0.4).
+/// Initialize MMTk with a fixed heap (idempotent). Plan is **GenImmix** (6.3): a generational
+/// collector — a copying nursery over an Immix mature space — driven by the generational write
+/// barrier (the `__nomu_write_barrier` seam, filled at 6.3.1). `NOMU_GC_PLAN` selects a plan for
+/// differential debugging.
 ///
-/// Env knobs for validation (the flip's exit criteria):
+/// Env knobs for validation:
 ///   - `NOMU_GC_PLAN=nogc`         — pre-flip plan (no collection).
+///   - `NOMU_GC_PLAN=immix`        — the 6.2 non-generational moving plan (barrier is a no-op).
+///   - `NOMU_GC_PLAN=genimmix`     — default; generational (nursery + write barrier).
 ///   - `NOMU_GC_STRESS=<bytes>`    — precise collect every `<bytes>` allocated (collect-on-every-alloc
-///                                   stress); also forces Immix to defrag every GC so evacuation (the
-///                                   copy paths) actually runs, not just in-place marking.
+///                                   stress); also forces the mature Immix space to defrag every GC so
+///                                   evacuation (the copy paths) actually runs, not just in-place marking.
 #[unsafe(no_mangle)]
 pub extern "C" fn nomu_gc_init(heap_bytes: usize) {
     if SINGLETON.get().is_some() {
         return;
     }
-    let nogc = matches!(std::env::var("NOMU_GC_PLAN").as_deref(), Ok("nogc"));
+    // Default GenImmix (6.3): a generational plan whose mature space is Immix. `NOMU_GC_PLAN` picks
+    // a plan for differential debugging: `nogc` (allocate-never-collect, pre-flip), `immix` (the 6.2
+    // non-generational moving plan, no write barrier needed), or `genimmix` (default). NoGC skips
+    // collection init below; the generational write barrier is inert under NoGC/Immix (their mutator
+    // barrier is `NoBarrier`, so the post-barrier the codegen seam always calls is a no-op).
+    let plan = match std::env::var("NOMU_GC_PLAN").as_deref() {
+        Ok("nogc") => PlanSelector::NoGC,
+        Ok("immix") => PlanSelector::Immix,
+        _ => PlanSelector::GenImmix,
+    };
+    let nogc = matches!(plan, PlanSelector::NoGC);
+    // `NOMU_GC_HEAP=<bytes>` shrinks the fixed heap to force frequent *real* (heap-pressure) GCs — the
+    // generational-barrier validation path, distinct from `NOMU_GC_STRESS` (which drives GC off a byte
+    // counter and, under GenImmix, can re-trip during the collector's own evacuation allocations).
+    let heap_bytes = std::env::var("NOMU_GC_HEAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(heap_bytes);
     let mut builder = MMTKBuilder::new();
-    let _ = builder
-        .options
-        .plan
-        .set(if nogc { PlanSelector::NoGC } else { PlanSelector::Immix });
+    let _ = builder.options.plan.set(plan);
     let _ = builder
         .options
         .gc_trigger
@@ -441,6 +458,30 @@ pub extern "C" fn nomu_gc_bind_mutator(tls: *mut c_void) -> *mut Mutator<NomuVM>
 #[unsafe(no_mangle)]
 pub extern "C" fn nomu_gc_alloc(mutator: *mut Mutator<NomuVM>, size: usize, align: usize) -> *mut c_void {
     alloc_semantic(mutator, size, align, AllocationSemantics::Default)
+}
+
+/// Generational write barrier post-hook (M6 · 6.3.1). Called by the runtime `rt_gc_write_barrier`
+/// *after* the codegen `__nomu_write_barrier` seam stores `val` into `*slot` of the managed object
+/// `src`. Under GenImmix the mutator's barrier is the object-remembering `ObjectBarrier`: this checks
+/// `src`'s log bit and, on the first mature-object mutation, records `src` in the remembered set so a
+/// nursery collection treats the freshly-written cross-generation pointer as a root. Under NoGC/Immix
+/// the mutator barrier is `NoBarrier`, so this is a no-op — the seam calls it unconditionally and the
+/// plan decides whether it does anything, keeping the barrier collector-agnostic (6.0.5; LXR refills
+/// the same seam later). `target` is `None` when the stored value is null (no cross-gen pointer to
+/// remember); `slot` is the field address (an updatable `SimpleSlot`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomu_gc_write_barrier_post(
+    mutator: *mut Mutator<NomuVM>,
+    src: *mut c_void,
+    slot: *mut c_void,
+    target: *mut c_void,
+) {
+    let m = unsafe { &mut *mutator };
+    let src = ObjectReference::from_raw_address(Address::from_mut_ptr(src))
+        .expect("write barrier: null source object");
+    let slot = NomuVMSlot::from_address(Address::from_mut_ptr(slot));
+    let target = ObjectReference::from_raw_address(Address::from_mut_ptr(target));
+    memory_manager::object_reference_write_post::<NomuVM>(m, src, slot, target);
 }
 
 /// Allocate `size` bytes in **immortal** space (M6 · 6.2.4): non-moving, never reclaimed. The String
