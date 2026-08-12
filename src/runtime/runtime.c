@@ -27,6 +27,7 @@ extern void* nomu_gc_bind_mutator(void* tls);
 extern void* nomu_gc_alloc(void* mutator, size_t size, size_t align);
 extern void* nomu_gc_alloc_immortal(void* mutator, size_t size, size_t align);
 extern void nomu_gc_write_barrier_post(void* mutator, void* src, void* slot, void* target);
+extern void nomu_gc_report_stats(void);   // M6 · 6.3.2 — footprint report (NOMU_GC_STATS)
 
 // One MMTk mutator per carrier thread (Q1). Bound lazily on the thread's first allocation; a fiber
 // migrating carriers allocates against whichever carrier it currently runs on (thread-local storage
@@ -978,5 +979,8 @@ int main(void) {
         pthread_detach(__stw_t);
     }
     rt_scheduler_run();
+    if (getenv("NOMU_GC_STATS") || getenv("NOMU_GC_STATS_LIVE")) {   // M6 · 6.3.2 — footprint report
+        nomu_gc_report_stats();
+    }
     return 0;
 }

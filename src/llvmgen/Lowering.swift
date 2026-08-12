@@ -2303,29 +2303,56 @@ final class IRToLLVM {
     }
 
     // The `__nomu_write_barrier` seam: `void (ptr addrspace(1) obj, ptr addrspace(1) slot,
-    // ptr addrspace(1) val)`, emitted at every store of a managed reference into a managed object
-    // field (D5). Filled (M6 · 6.3.1): store `val` into `*slot`, then call the runtime post-barrier
-    // `rt_gc_write_barrier(obj, slot, val)` — an object-remembering *post* barrier (GenImmix's
-    // `ObjectBarrier`), so the store precedes the barrier. The barrier remembers `obj` on the first
-    // mutation of a mature object so a nursery collection sees the new cross-generation pointer; under
-    // NoGC/Immix it is a no-op (their mutator barrier is `NoBarrier`). Stays `gc-leaf`: the barrier
-    // never allocates on the GC heap or parks, so no statepoint — the seam is a plain store + leaf
-    // call, and `alwaysinline` collapses it at each store site. `obj/slot/val` cross the C-ABI as
-    // unmanaged pointers (`toUnmanaged`, the allowed 1→0 cast); the barrier reads the raw addresses.
-    // Fast-path inlining (test the log bit in side metadata, call a slow path only on first mutation)
-    // is a deferred perf follow-up, mirroring the still-out-of-line alloc TLAB fast path (6.0.10).
+    // ptr addrspace(1) val)`, emitted at every store of a managed reference into a managed object field.
+    // Object-remembering *post* barrier (GenImmix's `ObjectBarrier`): store `val` into `*slot`, then
+    // remember `obj` the first time it is mutated after promotion so a nursery collection sees the new
+    // cross-generation pointer. **Fast path inlined (M6 · 6.3.2):** the common case — barrier off
+    // (NoGC/Immix), or `obj` already remembered / young — is a couple of loads + a predicted branch,
+    // with no call. Only on an object's first mutation (unlog bit still 1) does it call the out-of-line
+    // slow path `rt_gc_write_barrier` (which does the atomic log + remembered-set append). The unlog-bit
+    // address is computed from the layout the binding publishes (`__nomu_logbit_base`/`_log_region`,
+    // 1 bit/region) rather than hardcoded MMTk constants; `__nomu_barrier_active` gates the whole check
+    // (0 under NoGC/Immix, where the log-bit metadata is unmapped). Stays `gc-leaf` (no statepoint);
+    // `alwaysinline` collapses it into each store site, and `-O2` LICM hoists the loop-invariant loads.
     private func nomuWriteBarrier() -> (LLVMValueRef, LLVMTypeRef) {
         if let g = barrierFn { return g }
+        let i8 = LLVMInt8TypeInContext(ctx)!
         let ty = fnType(voidTy, [p1, p1, p1])
         let fn = LLVMAddFunction(mod, "__nomu_write_barrier", ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         markGCLeaf(fn)
         addAlwaysInline(fn)
         let rtBarrier = runtimeFn("rt_gc_write_barrier", ret: voidTy, params: [i8ptr, i8ptr, i8ptr], varArg: false)
+        // External globals published by the GC binding (no initializer → declarations).
+        let gActive = LLVMAddGlobal(mod, i8, "__nomu_barrier_active")!
+        let gBase = LLVMAddGlobal(mod, i64, "__nomu_logbit_base")!
+        let gRegion = LLVMAddGlobal(mod, i8, "__nomu_logbit_log_region")!
         withStubBody(fn) {
             let obj = LLVMGetParam(fn, 0)!, slot = LLVMGetParam(fn, 1)!, val = LLVMGetParam(fn, 2)!
-            LLVMBuildStore(b, val, slot)   // *slot = val, before the post-barrier
+            LLVMBuildStore(b, val, slot)   // *slot = val (the field write; barrier is post-store)
+            let onBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.on")!
+            let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.slow")!
+            let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.done")!
+            // if (!__nomu_barrier_active) return;
+            let active = LLVMBuildLoad2(b, i8, gActive, "bar.active")
+            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, active, LLVMConstInt(i8, 0, 0), "bar.on?"), onBB, doneBB)
+            // on: region = addr(obj) >> log_region;  byte = *(base + (region >> 3));  bit = (byte >> (region & 7)) & 1
+            LLVMPositionBuilderAtEnd(b, onBB)
+            let objInt = LLVMBuildPtrToInt(b, obj, i64, "obj.int")
+            let logR = LLVMBuildZExt(b, LLVMBuildLoad2(b, i8, gRegion, "logR8"), i64, "logR")
+            let region = LLVMBuildLShr(b, objInt, logR, "region")
+            let baseV = LLVMBuildLoad2(b, i64, gBase, "logbit.base")
+            let byteOff = LLVMBuildLShr(b, region, LLVMConstInt(i64, 3, 0), "byteoff")
+            let metaPtr = LLVMBuildIntToPtr(b, LLVMBuildAdd(b, baseV, byteOff, "metaint"), i8ptr, "metaptr")
+            let byte = LLVMBuildLoad2(b, i8, metaPtr, "logbyte")
+            let bitpos = LLVMBuildTrunc(b, LLVMBuildAnd(b, region, LLVMConstInt(i64, 7, 0), "bp"), i8, "bitpos")
+            let bit = LLVMBuildAnd(b, LLVMBuildLShr(b, byte, bitpos, "sh"), LLVMConstInt(i8, 1, 0), "bit")
+            // unlogged (bit == 1) → slow path; else done.
+            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, bit, LLVMConstInt(i8, 0, 0), "unlogged"), slowBB, doneBB)
+            LLVMPositionBuilderAtEnd(b, slowBB)
             _ = buildCall(rtBarrier.0, rtBarrier.1, [toUnmanaged(obj), toUnmanaged(slot), toUnmanaged(val)])
+            LLVMBuildBr(b, doneBB)
+            LLVMPositionBuilderAtEnd(b, doneBB)
             LLVMBuildRetVoid(b)
         }
         barrierFn = (fn, ty)

@@ -7,6 +7,7 @@
 //! crate is the only Rust (Q2), linked into every emitted program via the 6.1.0 section embed.
 
 use core::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use mmtk::util::copy::{CopySemantics, GCWorkerCopyContext};
@@ -56,6 +57,91 @@ unsafe extern "C" {
 // STW quiesce. Stored as raw addresses (`*mut Mutator` isn't `Send`) and rematerialized as `&mut` on
 // iteration — sound because MMTk only enumerates mutators at STW, when every carrier is stopped.
 static MUTATORS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+// Nonzero iff the active plan uses the generational log bit (GenImmix). Set at init from the plan
+// constraints. The write-barrier fast path reads the log-bit side metadata directly — but that metadata
+// is only mapped when the plan needs it, so a NoGC/Immix run (NoBarrier) must short-circuit before the
+// read. `#[no_mangle]` so the codegen-inlined fast path (Step B) can load the same flag and skip the
+// whole barrier when it is off. `u8` (not `AtomicBool`) for a trivial C-ABI load from generated code.
+#[unsafe(no_mangle)]
+pub static __nomu_barrier_active: AtomicU8 = AtomicU8::new(0);
+
+// The generational unlog-bit side-metadata layout, exported for the codegen-inlined barrier fast path
+// so it computes the bit address without hardcoding MMTk's constants (they update here if MMTk's layout
+// changes). For object `o` (log_num_of_bits = 0, i.e. 1 bit/region):
+//   region = addr(o) >> LOGBIT_LOG_REGION;  byte = *(LOGBIT_BASE + (region >> 3));  bit = (byte >> (region & 7)) & 1
+// bit == 1 means *unlogged* → still needs remembering (slow path). Set at init from the plan's
+// `GLOBAL_LOG_BIT_SPEC`; stays 0 under NoGC/Immix, where `__nomu_barrier_active` gates the read.
+#[unsafe(no_mangle)]
+pub static __nomu_logbit_base: AtomicUsize = AtomicUsize::new(0);
+#[unsafe(no_mangle)]
+pub static __nomu_logbit_log_region: AtomicU8 = AtomicU8::new(0);
+
+// The largest object the moving default allocator can place (a GenImmix line/block bound,
+// `max_non_los_default_alloc_bytes`, ~16 KiB). Anything bigger MUST go to the non-moving large-object
+// space — the Immix copy allocator cannot evacuate an object larger than this, and routing it through
+// `Default` makes the collector grow the copy space without bound (→ crash). Read once from the plan
+// at init. A variable-size `Array` buffer is the object that crosses this (a class/closure/any is
+// small); it is a leaf-scanned or pointer-mapped GC object either way, so LOS placement is transparent.
+static MAX_NON_LOS: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+// Footprint sampling (M6 · 6.3.2), enabled by `NOMU_GC_STATS`. Sampled in `resume_mutators` (GC end),
+// where `used_bytes` = the heap pages the collector holds right after reclaiming — cheap (page counts,
+// no live-object walk). The **minimum** post-GC `used` over the run is the tightest footprint the
+// collector achieved for the program's live set; comparing it to the (analytically known) live set
+// gives the footprint ratio (the ~1.1–1.3× thesis, m6-spec.md §6.0.1). `NOMU_GC_STATS_LIVE` also turns
+// on MMTk's per-object live-byte counting for a precise per-space used/live breakdown at full GCs
+// (off by default — it walks every live object each GC).
+static STATS_ON: AtomicBool = AtomicBool::new(false);
+static STATS_LIVE: AtomicBool = AtomicBool::new(false);
+struct Footprint { min_used: usize, max_used: usize, max_live: usize, used_at_max_live: usize, gcs: u64 }
+static STATS: Mutex<Footprint> = Mutex::new(Footprint {
+    min_used: usize::MAX, max_used: 0, max_live: 0, used_at_max_live: 0, gcs: 0,
+});
+
+fn sample_footprint() {
+    let used = memory_manager::used_bytes(mmtk());
+    let mut g = STATS.lock().unwrap();
+    g.gcs += 1;
+    if used < g.min_used { g.min_used = used; }
+    if used > g.max_used { g.max_used = used; }
+    // Precise live bytes only when explicitly requested (expensive full-heap walk).
+    if STATS_LIVE.load(Ordering::Relaxed) {
+        let stats = memory_manager::live_bytes_in_last_gc(mmtk());
+        let live: usize = stats.values().map(|s| s.live_bytes).sum();
+        if live > g.max_live {
+            g.max_live = live;
+            g.used_at_max_live = used;
+        }
+    }
+}
+
+/// Print the footprint gathered over the run (M6 · 6.3.2). Called by the runtime at program exit under
+/// `NOMU_GC_STATS`. `min-footprint` is the tightest heap the collector settled the live set into;
+/// compare it to the program's known live set for the live-set-footprint ratio.
+#[unsafe(no_mangle)]
+pub extern "C" fn nomu_gc_report_stats() {
+    if !STATS_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let g = STATS.lock().unwrap();
+    if g.gcs == 0 {
+        eprintln!("[gc-stats] no GC ran (heap too large for this workload)");
+        return;
+    }
+    eprint!(
+        "[gc-stats] GCs={} min-footprint={} KiB max-footprint={} KiB",
+        g.gcs, g.min_used / 1024, g.max_used / 1024,
+    );
+    if g.max_live > 0 {
+        eprint!(
+            "  peak-live={} KiB used-at-peak={} KiB ratio={:.2}x",
+            g.max_live / 1024, g.used_at_max_live / 1024,
+            g.used_at_max_live as f64 / g.max_live as f64,
+        );
+    }
+    eprintln!();
+}
 
 // The C root visitor (matches `nomu_root_visitor`): record each reported root **slot** — the stack
 // location holding the pointer, not just the pointer — as an updatable `SimpleSlot`, so MMTk can
@@ -200,10 +286,19 @@ impl ActivePlan<NomuVM> for VMActivePlan {
     fn number_of_mutators() -> usize {
         MUTATORS.lock().unwrap().len()
     }
-    // Every Nomu thread that allocates is a carrier (an MMTk mutator); GC worker threads never call in
-    // here as mutators. A conservative `true` matches the NoGC stub and the single-role thread model.
-    fn is_mutator(_tls: VMThread) -> bool {
-        true
+    // True only for a registered mutator carrier — a GC worker's tls matches none. This is load-bearing
+    // for copying GC: `Space::acquire` gates `should_poll` on `is_mutator(tls)`, and only a *mutator*
+    // may poll/trigger a GC. A stub `true` (the NoGC-era value) makes the GC worker's evacuation
+    // copy-allocation poll the GC trigger during a collection — an infinite reserve→poll→fail retry
+    // (`calculate_reserved_pages`/`is_emergency_collection`) that livelocks the collector. Matching the
+    // carrier tls (as `mutator()` does) answers `false` for the worker, so it takes the copy-reserve
+    // path instead. O(#carriers) under the registry lock (held only briefly elsewhere).
+    fn is_mutator(tls: VMThread) -> bool {
+        let want = tls.0.to_address();
+        MUTATORS.lock().unwrap().iter().any(|&m| {
+            let mutator = unsafe { &*(m as *const Mutator<NomuVM>) };
+            mutator.mutator_tls.0 .0.to_address() == want
+        })
     }
     // Look up the mutator bound to a carrier by its tls token (the `pthread_self` passed at bind).
     fn mutator(tls: VMMutatorThread) -> &'static mut Mutator<NomuVM> {
@@ -247,6 +342,10 @@ impl Collection<NomuVM> for VMCollection {
         }
     }
     fn resume_mutators(_tls: VMWorkerThread) {
+        // Sample the footprint at GC end (live_bytes_in_last_gc is now updated) before resuming (6.3.2).
+        if STATS_ON.load(Ordering::Relaxed) {
+            sample_footprint();
+        }
         unsafe {
             nomu_gc_resume_the_world();
         }
@@ -417,6 +516,17 @@ pub extern "C" fn nomu_gc_init(heap_bytes: usize) {
         .unwrap_or(heap_bytes);
     let mut builder = MMTKBuilder::new();
     let _ = builder.options.plan.set(plan);
+    // Footprint measurement (6.3.2). `NOMU_GC_STATS` samples `used_bytes` each GC (cheap). The precise
+    // per-space live/used breakdown (`NOMU_GC_STATS_LIVE`) additionally enables MMTk's per-object
+    // live-byte counting — a full-heap walk each GC, so it's opt-in on top of the basic footprint.
+    if std::env::var("NOMU_GC_STATS").is_ok() {
+        STATS_ON.store(true, Ordering::Relaxed);
+    }
+    if std::env::var("NOMU_GC_STATS_LIVE").is_ok() {
+        STATS_ON.store(true, Ordering::Relaxed);
+        STATS_LIVE.store(true, Ordering::Relaxed);
+        let _ = builder.options.count_live_bytes_in_gc.set(true);
+    }
     let _ = builder
         .options
         .gc_trigger
@@ -431,6 +541,24 @@ pub extern "C" fn nomu_gc_init(heap_bytes: usize) {
     }
     let instance = memory_manager::mmtk_init::<NomuVM>(&builder);
     let _ = SINGLETON.set(instance);
+    // Cache the large-object threshold for size-based allocation routing (below).
+    MAX_NON_LOS.store(
+        mmtk().get_plan().constraints().max_non_los_default_alloc_bytes,
+        Ordering::Relaxed,
+    );
+    // The write barrier is live only when the plan maintains the log bit (GenImmix); NoGC/Immix use
+    // NoBarrier and must not touch the (unmapped) log-bit metadata.
+    __nomu_barrier_active.store(
+        mmtk().get_plan().constraints().needs_log_bit as u8,
+        Ordering::Relaxed,
+    );
+    // Publish the unlog-bit side-metadata layout for the inlined fast path (Step B).
+    if let mmtk::util::metadata::MetadataSpec::OnSide(spec) =
+        <VMObjectModel as ObjectModel<NomuVM>>::GLOBAL_LOG_BIT_SPEC.as_spec()
+    {
+        __nomu_logbit_base.store(spec.get_absolute_offset().as_usize(), Ordering::Relaxed);
+        __nomu_logbit_log_region.store(spec.log_bytes_in_region as u8, Ordering::Relaxed);
+    }
     // Enable collection: spawn GC workers (via `spawn_gc_thread`) and let the plan trigger GCs. Skip
     // under NoGC, which never collects. The tls is the initializing (main) thread's opaque token.
     if !nogc {
@@ -457,7 +585,14 @@ pub extern "C" fn nomu_gc_bind_mutator(tls: *mut c_void) -> *mut Mutator<NomuVM>
 /// for now the C `rt_alloc` calls it out-of-line.
 #[unsafe(no_mangle)]
 pub extern "C" fn nomu_gc_alloc(mutator: *mut Mutator<NomuVM>, size: usize, align: usize) -> *mut c_void {
-    alloc_semantic(mutator, size, align, AllocationSemantics::Default)
+    // Route objects larger than the moving allocator can evacuate to the large-object space. Without
+    // this a big `Array` buffer lands in the moving Immix space and evacuation grows the heap unbounded.
+    let semantics = if size > MAX_NON_LOS.load(Ordering::Relaxed) {
+        AllocationSemantics::Los
+    } else {
+        AllocationSemantics::Default
+    };
+    alloc_semantic(mutator, size, align, semantics)
 }
 
 /// Generational write barrier post-hook (M6 · 6.3.1). Called by the runtime `rt_gc_write_barrier`
@@ -476,9 +611,21 @@ pub extern "C" fn nomu_gc_write_barrier_post(
     slot: *mut c_void,
     target: *mut c_void,
 ) {
-    let m = unsafe { &mut *mutator };
+    if __nomu_barrier_active.load(Ordering::Relaxed) == 0 {
+        return; // NoGC/Immix: NoBarrier — nothing to do (and the log-bit metadata is unmapped).
+    }
     let src = ObjectReference::from_raw_address(Address::from_mut_ptr(src))
         .expect("write barrier: null source object");
+    // Fast path (monomorphized — no `dyn Barrier` dispatch): only a mature object whose unlog bit is
+    // still set needs remembering. Already-remembered mature objects and nursery objects (bit == 0)
+    // return here — the common case, so it stays off the virtual-call + `object_reference_write_post`
+    // path taken only on an object's first post-promotion mutation.
+    if !<VMObjectModel as ObjectModel<NomuVM>>::GLOBAL_LOG_BIT_SPEC
+        .is_unlogged::<NomuVM>(src, Ordering::Relaxed)
+    {
+        return;
+    }
+    let m = unsafe { &mut *mutator };
     let slot = NomuVMSlot::from_address(Address::from_mut_ptr(slot));
     let target = ObjectReference::from_raw_address(Address::from_mut_ptr(target));
     memory_manager::object_reference_write_post::<NomuVM>(m, src, slot, target);

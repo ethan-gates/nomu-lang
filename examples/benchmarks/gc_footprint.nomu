@@ -1,0 +1,33 @@
+// M6 · 6.3.2 — footprint benchmark. Builds a large, retained live set (an Array of N Boxes that stays
+// reachable to the end), then allocates a lot of garbage so the collector runs many times while the
+// live set is held. Every full GC therefore traces the whole live set; with NOMU_GC_STATS the binding
+// samples the fullest GC's live bytes vs. the heap pages it holds — the used/live ratio is the
+// steady-state footprint (the ~1.1–1.3× live-set thesis, m6-spec.md §6.0.1).
+//
+// Live set: N Boxes (16 B each) + the Array buffer (8 B/elem) + handle ≈ N * 24 B.
+// Run: NOMU_GC_STATS=1 NOMU_GC_HEAP=<bytes> build/examples/benchmarks/gc_footprint
+class Box {
+  var v: Int
+}
+
+fun main() {
+  var xs: Array<Box> = []
+  var i = 0
+  while i < 500000 {
+    xs.append(Box(v: i))         // retained: the live set the collector must keep and relocate
+    i = i + 1
+  }
+
+  // Churn garbage while `xs` stays reachable, so each GC sees the full live set.
+  var j = 0
+  var sum = 0
+  while j < 2000000 {
+    let g = Box(v: j)            // dead after this iteration
+    sum = sum + g.v
+    j = j + 1
+  }
+
+  print(xs.count)               // keeps `xs` live to the end
+  print(xs[0].v)                // touch a relocated element
+  print(sum)
+}

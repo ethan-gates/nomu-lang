@@ -13,8 +13,7 @@ cross-cutting decisions live in 6.0.5.
 
 **Build status (2026-08-11):** **6.2 complete (Immix flip + evacuation) and 6.3.1 built + green** — the
 generational write barrier fills the `__nomu_write_barrier` seam and the default plan is **GenImmix**
-(see 6.3). 6.3.2 (nursery/footprint tuning + inlined barrier fast path) and 6.4 (actor teardown) are
-next. Historical bring-up status below.
+(see 6.3). **6.3.2 done (2026-08-11):** the profiling blocker was root-caused to **two binding bugs** and fixed — GenImmix now collects a retained live set at tight heaps and the footprint thesis is met (**~1.05x** live-set footprint on the churn benchmark, see 6.3). Footprint tooling (`NOMU_GC_STATS`) is in place, and the **write barrier is now inlined** (GenImmix's barrier-saturated microbench 0.71 s → 0.047 s, ~15×; see 6.3). 6.3.2's remaining polish (nursery tuning, opt-level, a wider footprint sweep) and 6.4 (actor teardown) are next. Historical bring-up status below.
 
 **Build status (2026-08-04):** **6.1 (MMTk NoGC bring-up) substantially built + green.** 6.1.0–6.1.3
 ✅ (Rust `VMBinding` + MMTk NoGC linked via `crate_universe`; `rt_alloc` → per-carrier mutator; the
@@ -716,7 +715,7 @@ reclaims memory including cycles. Depends on 6.1 + M8 statepoints. **Approach:**
 programs are collected (tracing beats the retired RC); objects survive relocation intact; M5
 suite green under Immix; a "collect on every allocation" stress mode passes.
 
-## 6.3 · Generational collection (GenImmix) + write barrier 🔨
+## 6.3 · Generational collection (GenImmix) + write barrier ✅ (6.3.1 + 6.3.2; tuning polish remains)
 
 One-line intent: the footprint/throughput target plan. Depends on 6.2. **Approach:** MMTk
 **GenImmix** — nursery + generational barrier.
@@ -751,9 +750,57 @@ One-line intent: the footprint/throughput target plan. Depends on 6.2. **Approac
     young objects relocate. The 35-program corpus is byte-identical under default GenImmix vs. NoGC;
     the three 6.2 gc-smoke scripts and the (now Immix-pinned) gc-stress/arr-gc evacuation
     differentials stay green.
-- **6.3.2 ⬜** — nursery sizing / promotion tuning; footprint measurement vs. the ~1.1–1.3×
-  target. Fold in the **inlined barrier fast path** and revisit the collector hot-path `opt-level`
-  (currently `z` for size, 6.1.1).
+- **6.3.2 done + footprint measured (2026-08-11).**
+  - **Footprint tooling.** `NOMU_GC_STATS` samples `used_bytes` at each GC end (cheap page counts) and
+    reports min/max heap footprint; `NOMU_GC_STATS_LIVE` also enables MMTk's `count_live_bytes_in_gc`
+    for a precise per-space `used/live` breakdown (`gcbinding/lib.rs` `sample_footprint` /
+    `nomu_gc_report_stats`; runtime prints at exit). Bench: `examples/benchmarks/gc_footprint.nomu` (a
+    retained `Array<Box>` live set + garbage churn).
+  - **Two binding bugs found by disciplined profiling; both fixed.** The profiling blocker (GenImmix
+    livelocking/crashing whenever it had to evacuate a retained live set) was *not* the opt-level
+    (rebuilt at `-O3`, no change) and *not* the 6.3.1 non-carrier guard. lldb `thread backtrace all` on
+    the hung process (correcting an earlier sampled guess) showed the GC worker stuck **inside MMTk**,
+    not in `block_for_gc`, in the space-reservation path. Two root causes:
+    1. **`ActivePlan::is_mutator` was a stub returning `true` for every thread.** `Space::acquire` gates
+       `should_poll` on `is_mutator(tls)`; a collector must return `false`. With the stub, the GC
+       worker's evacuation copy-allocation polled the GC trigger during collection → the infinite
+       `calculate_reserved_pages`/`is_emergency_collection` reserve→poll loop. Fix: match the tls
+       against the registered mutator carriers (the worker matches none).
+    2. **All allocations used `AllocationSemantics::Default`; objects larger than
+       `max_non_los_default_alloc_bytes` (~16 KiB, `Block::BYTES>>1`) must use `Los`.** A variable-size
+       `Array` buffer over ~16 KiB landed in the moving Immix space, which cannot evacuate an object
+       that large, so the copy allocator grew the space without bound (→ stack-overflow crash). Fix:
+       `nomu_gc_alloc` routes `size > MAX_NON_LOS` to the large-object space. This is scale-triggered
+       (N=2000 buffer ~16 KiB survived; N=5000 ~64 KiB crashed) and plan-agnostic (Immix + always-defrag
+       hit it too). LOS objects stay ordinary GC objects (same header, pointer-map/leaf scan), so this
+       is transparent to tracing.
+  - **Result: healthy collection at tight heaps + the thesis met.** The `gc_footprint` bench (N=500 000,
+    live set ~11.9 MiB) now runs from a **24 MiB heap** (≈2x live) with 7 GCs, sub-second, correct.
+    Precise steady-state footprint: **peak-live 11 908 KiB, used 12 556 KiB → 1.05x** (consistent across
+    24/32/48 MiB heaps). Comfortably inside the ~1.1–1.3x thesis. *Caveat:* ~4 MiB of the live set is the
+    array buffer in exact-fit LOS, which dilutes the blended ratio; the Immix small-object portion alone
+    is ~1.08x — still within target. The same fix also resolved the **sub-viable-heap livelock** (gc_gen
+    now completes at 200–300 KiB) and the **`NOMU_GC_STRESS`+GenImmix** nested-GC (same `is_mutator`
+    cause), so those can be un-pinned from Immix later.
+  - **Inlined write-barrier fast path — done (2026-08-12).** The barrier was fully out-of-line (a
+    C→Rust FFI call + a `dyn Barrier` virtual dispatch + the log-bit load — ~20 ns/store). Two steps,
+    each measured on `examples/benchmarks/gc_barrier.nomu` (20M managed stores into a mature object, so
+    every store after the first hits the already-logged fast path; `-O2`):
+    - *Step A — monomorphize.* The binding checks the unlog bit directly (no virtual dispatch) and an
+      exported `__nomu_barrier_active` flag short-circuits NoGC/Immix (their log-bit metadata is
+      unmapped). GenImmix **0.71 s → 0.33 s**; NoGC/Immix 0.30 s → 0.10 s (the flag skips the old
+      no-op virtual call).
+    - *Step B — inline into codegen.* `Lowering.swift` emits the fast path in IR: load
+      `__nomu_barrier_active`; compute the unlog-bit address from the binding-published layout
+      (`__nomu_logbit_base` + `__nomu_logbit_log_region`, so no hardcoded MMTk constants — 1 bit/region:
+      `region = addr>>logR; byte = *(base+(region>>3)); bit = (byte>>(region&7))&1`); call the
+      out-of-line `rt_gc_write_barrier` slow path only when the bit is set (first mutation). GenImmix
+      **0.33 s → 0.047 s** (≈15× vs the original barrier), now within ~15 % of Immix's 0.040 s — a
+      ~0.35 ns/store log-bit-load tax. Correctness held throughout (gc-gen's cross-gen remembering,
+      arr_gc, gc_footprint's 1.05×, all gc-smokes, corpus 35/35). `gc-leaf` + `alwaysinline` unchanged;
+      `-O2` LICM hoists the loop-invariant flag/base/region loads.
+  - **Remaining 6.3.2 polish (not blockers):** nursery sizing / promotion tuning; a footprint sweep over
+    more workload shapes; and the collector hot-path `opt-level` (currently `z` for size, 6.1.1).
 
 **Validation-harness notes (6.3.1).** Forcing heavy collection on the small fixtures runs into two
 resource-edge behaviors, neither a barrier bug (the barrier is correct under real GC + the corpus
@@ -765,14 +812,13 @@ differential):
   that aggressive stress + GenImmix makes no useful progress, so the gc-stress/arr-gc evacuation
   differentials pin `NOMU_GC_PLAN=immix` and GenImmix is validated by real heap-pressure GC
   (`gc-gen.sh`, small `NOMU_GC_HEAP`).
-- **Sub-viable heaps livelock in MMTk.** A `NOMU_GC_HEAP` too small to hold GenImmix's
-  side-metadata + nursery + copy-reserve makes MMTk spin in `calculate_reserved_pages` instead of
-  cleanly OOMing (observed ~200–300 KB for `gc_gen`; ~150 KB completes via full collections). Use a
-  heap comfortably above that floor.
+- **Sub-viable heaps livelock — FIXED (6.3.2).** This was the same `is_mutator` bug as the evacuation livelock: a too-small `NOMU_GC_HEAP` spun in `calculate_reserved_pages`/`get_reserved_pages` instead of collecting. With `is_mutator` correct (and large `Array` buffers in LOS) it is gone — gc_gen completes at 200–300 KiB now. A genuinely-too-small heap should raise a clean OOM (MMTk's `not_acquiring` asserts the copy plan reserved headroom); verifying that clean-OOM path is a follow-up.
 
 **Exit:** GenImmix green on the M5 suite + stress tests; measured steady-state footprint near
-the live set on the bounded-memory benchmarks (the thesis metric). *(6.3.1 clears the suite +
-generational barrier; footprint measurement is 6.3.2.)*
+the live set on the bounded-memory benchmarks (the thesis metric). *(6.3.1 cleared the suite +
+generational barrier; **6.3.2 met the footprint thesis — ~1.05x live set on the churn benchmark,
+after the `is_mutator` + LOS-routing fixes.** Remaining: nursery/opt tuning, inlined barrier, wider
+workload sweep — polish, not exit blockers.)*
 
 ## 6.4 · Actor teardown / finalization ⬜
 

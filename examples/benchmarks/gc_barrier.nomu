@@ -1,0 +1,34 @@
+// M6 · 6.3.2 — barrier-cost microbenchmark. A mature `Holder` is overwritten with a managed reference
+// ~20M times in a tight loop (no allocation in the loop). After the first store `h` is logged, so every
+// later store hits the write barrier's *fast path* (log-bit load → already-logged → skip slow path) —
+// exactly what inlining the barrier optimizes. GenImmix runs the real barrier; Immix's NoBarrier makes
+// the same emitted call a no-op; NoGC likewise. Time delta ≈ the barrier fast-path cost per store.
+class Box {
+  var v: Int
+}
+class Holder {
+  var item: Box
+}
+
+fun main() {
+  var boxes: Array<Box> = []
+  var k = 0
+  while k < 8 {
+    boxes.append(Box(v: k))
+    k = k + 1
+  }
+  let h = Holder(item: boxes[0])
+  var c = 0
+  while c < 200000 {          // churn to promote h + boxes into the mature space
+    let g = Box(v: c)
+    c = c + 1
+  }
+  var i = 0
+  var sum = 0
+  while i < 20000000 {
+    h.item = boxes[i % 8]     // managed store into mature `h` → write barrier (fast path after 1st)
+    sum = sum + h.item.v
+    i = i + 1
+  }
+  print(sum)
+}
