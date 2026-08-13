@@ -7,7 +7,7 @@
 // generic instantiations — `.call` type arguments and `.generic` types — to a
 // worklist/fixpoint, and **clones each generic decl with its type parameters replaced
 // by concrete types**, dropping the `generics` list. The result is a fully-concrete
-// `IRModule`: no `.typeParam`, no `.generic`, no witness parameters in the specialized
+// `NOIRModule`: no `.typeParam`, no `.generic`, no witness parameters in the specialized
 // decls. Codegen then emits direct calls / inline fields / no boxing through its
 // existing concrete paths — a requirement call whose receiver is now concrete simply
 // isn't taken by codegen's `.typeParam` witness-dispatch branch, so it devirtualizes.
@@ -19,22 +19,22 @@
 // land it is rescoped to within-module (cross-module specialization opt-in), preserving
 // the stable-ABI default at module edges (generics.md §6).
 
-public func monomorphize(_ module: IRModule, into diags: DiagnosticSink) -> IRModule {
+public func monomorphize(_ module: NOIRModule, into diags: DiagnosticSink) -> NOIRModule {
     Monomorphizer(module: module, diags: diags).run()
 }
 
 private final class Monomorphizer {
-    let module: IRModule
+    let module: NOIRModule
     let diags: DiagnosticSink
 
     // Generic templates (never emitted directly; only their specializations are).
-    var genericFuncs:   [String: IRFunc]   = [:]
-    var genericStructs: [String: IRStruct] = [:]
-    var genericEnums:   [String: IREnum]   = [:]
-    var genericClasses: [String: IRClass]  = [:]
+    var genericFuncs:   [String: NOIRFunc]   = [:]
+    var genericStructs: [String: NOIRStruct] = [:]
+    var genericEnums:   [String: NOIREnum]   = [:]
+    var genericClasses: [String: NOIRClass]  = [:]
     var baseKind:       [String: NamedKind] = [:]   // generic type base → its kind
 
-    var out: [IRDecl] = []
+    var out: [NOIRDecl] = []
     // Specialized names already emitted (guards recursion) + requested (dedupes the worklist).
     var doneFuncs = Set<String>(), doneTypes = Set<String>()
     var reqFuncs  = Set<String>(), reqTypes  = Set<String>()
@@ -46,11 +46,11 @@ private final class Monomorphizer {
     // this we assume polymorphic recursion (`f<Box<T>>` → `f<Box<Box<T>>>` → …) and error.
     let depthCap = 64
 
-    init(module: IRModule, diags: DiagnosticSink) { self.module = module; self.diags = diags }
+    init(module: NOIRModule, diags: DiagnosticSink) { self.module = module; self.diags = diags }
 
-    func run() -> IRModule {
+    func run() -> NOIRModule {
         // Register every generic template first (a root may reference one declared later).
-        var roots: [IRDecl] = []
+        var roots: [NOIRDecl] = []
         for decl in module.decls {
             switch decl {
             case .funcDecl(let f)   where !f.generics.isEmpty: genericFuncs[f.name]   = f
@@ -65,7 +65,7 @@ private final class Monomorphizer {
             while let w = funcWork.popLast() { specializeFunc(w.base, w.args) }
             while let w = typeWork.popLast() { specializeType(w.base, w.args) }
         }
-        return IRModule(decls: out, interfaces: module.interfaces, conformances: module.conformances,
+        return NOIRModule(decls: out, interfaces: module.interfaces, conformances: module.conformances,
                         composites: module.composites, opaqueUnderlyings: module.opaqueUnderlyings)
     }
 
@@ -85,19 +85,19 @@ private final class Monomorphizer {
         if let s = genericStructs[base] {
             guard !overDepth(name, at: s.span) else { return }
             let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
-            out.append(.structDecl(IRStruct(name: name, generics: [],
+            out.append(.structDecl(NOIRStruct(name: name, generics: [],
                 fields: s.fields.map { rewriteField($0, subst) },
                 methods: s.methods.map { rewriteFunc($0, subst, name: $0.name) }, span: s.span)))
         } else if let e = genericEnums[base] {
             guard !overDepth(name, at: e.span) else { return }
             let subst = Dictionary(uniqueKeysWithValues: zip(e.generics.map(\.name), args))
-            out.append(.enumDecl(IREnum(name: name, generics: [],
-                cases: e.cases.map { c in IREnumCase(name: c.name, fields: c.fields.map { rewriteField($0, subst) }, span: c.span) },
+            out.append(.enumDecl(NOIREnum(name: name, generics: [],
+                cases: e.cases.map { c in NOIREnumCase(name: c.name, fields: c.fields.map { rewriteField($0, subst) }, span: c.span) },
                 methods: e.methods.map { rewriteFunc($0, subst, name: $0.name) }, span: e.span)))
         } else if let c = genericClasses[base] {
             guard !overDepth(name, at: c.span) else { return }
             let subst = Dictionary(uniqueKeysWithValues: zip(c.generics.map(\.name), args))
-            out.append(.classDecl(IRClass(name: name, generics: [],
+            out.append(.classDecl(NOIRClass(name: name, generics: [],
                 fields: c.fields.map { rewriteField($0, subst) },
                 methods: c.methods.map { rewriteFunc($0, subst, name: $0.name) }, span: c.span)))
         }
@@ -114,44 +114,44 @@ private final class Monomorphizer {
 
     // MARK: - Decl rewriting (roots use an empty subst; templates their instantiation's)
 
-    private func rewriteDecl(_ d: IRDecl, _ s: [String: Type]) -> IRDecl {
+    private func rewriteDecl(_ d: NOIRDecl, _ s: [String: Type]) -> NOIRDecl {
         switch d {
         case .funcDecl(let f):   return .funcDecl(rewriteFunc(f, s, name: f.name))
-        case .structDecl(let t): return .structDecl(IRStruct(name: t.name, generics: [],
+        case .structDecl(let t): return .structDecl(NOIRStruct(name: t.name, generics: [],
             fields: t.fields.map { rewriteField($0, s) }, methods: t.methods.map { rewriteFunc($0, s, name: $0.name) }, span: t.span))
-        case .enumDecl(let t):   return .enumDecl(IREnum(name: t.name, generics: [],
-            cases: t.cases.map { c in IREnumCase(name: c.name, fields: c.fields.map { rewriteField($0, s) }, span: c.span) },
+        case .enumDecl(let t):   return .enumDecl(NOIREnum(name: t.name, generics: [],
+            cases: t.cases.map { c in NOIREnumCase(name: c.name, fields: c.fields.map { rewriteField($0, s) }, span: c.span) },
             methods: t.methods.map { rewriteFunc($0, s, name: $0.name) }, span: t.span))
-        case .classDecl(let t):  return .classDecl(IRClass(name: t.name, generics: [],
+        case .classDecl(let t):  return .classDecl(NOIRClass(name: t.name, generics: [],
             fields: t.fields.map { rewriteField($0, s) }, methods: t.methods.map { rewriteFunc($0, s, name: $0.name) }, span: t.span))
         case .actorDecl(let a):  return .actorDecl(rewriteActor(a, s))
         }
     }
 
-    private func rewriteFunc(_ f: IRFunc, _ s: [String: Type], name: String) -> IRFunc {
-        IRFunc(name: name, generics: [],
-               params: f.params.map { IRParam(label: $0.label, name: $0.name, type: resolveType($0.type, s), span: $0.span) },
+    private func rewriteFunc(_ f: NOIRFunc, _ s: [String: Type], name: String) -> NOIRFunc {
+        NOIRFunc(name: name, generics: [],
+               params: f.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolveType($0.type, s), span: $0.span) },
                returnType: resolveType(f.returnType, s),
                body: f.body.map { rewriteStmt($0, s) }, isMutating: f.isMutating, span: f.span)
     }
 
-    private func rewriteField(_ f: IRField, _ s: [String: Type]) -> IRField {
-        IRField(name: f.name, type: resolveType(f.type, s), isMutable: f.isMutable, span: f.span)
+    private func rewriteField(_ f: NOIRField, _ s: [String: Type]) -> NOIRField {
+        NOIRField(name: f.name, type: resolveType(f.type, s), isMutable: f.isMutable, span: f.span)
     }
 
-    private func rewriteActor(_ a: IRActor, _ s: [String: Type]) -> IRActor {
-        IRActor(name: a.name,
-                fields: a.fields.map { IRActorField(name: $0.name, type: resolveType($0.type, s),
+    private func rewriteActor(_ a: NOIRActor, _ s: [String: Type]) -> NOIRActor {
+        NOIRActor(name: a.name,
+                fields: a.fields.map { NOIRActorField(name: $0.name, type: resolveType($0.type, s),
                                                     initializer: $0.initializer.map { rewriteExpr($0, s) }, span: $0.span) },
-                handlers: a.handlers.map { h in IRHandler(name: h.name,
-                    params: h.params.map { IRParam(label: $0.label, name: $0.name, type: resolveType($0.type, s), span: $0.span) },
+                handlers: a.handlers.map { h in NOIRHandler(name: h.name,
+                    params: h.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolveType($0.type, s), span: $0.span) },
                     returnType: resolveType(h.returnType, s), body: h.body.map { rewriteStmt($0, s) }, span: h.span) },
                 span: a.span)
     }
 
     // MARK: - Statement / expression rewriting
 
-    private func rewriteStmt(_ st: IRStmt, _ s: [String: Type]) -> IRStmt {
+    private func rewriteStmt(_ st: NOIRStmt, _ s: [String: Type]) -> NOIRStmt {
         let kind: StmtKind
         switch st.kind {
         case .letBinding(let n, let m, let v):    kind = .letBinding(name: n, isMutable: m, value: rewriteExpr(v, s))
@@ -164,16 +164,16 @@ private final class Monomorphizer {
         case .breakStmt:                          kind = .breakStmt
         case .continueStmt:                       kind = .continueStmt
         case .switchStmt(let sw):
-            kind = .switchStmt(IRSwitch(subject: rewriteExpr(sw.subject, s),
-                arms: sw.arms.map { arm in IRCaseArm(caseName: arm.caseName,
-                    bindings: arm.bindings.map { IRBinding(name: $0.name, type: resolveType($0.type, s)) },
+            kind = .switchStmt(NOIRSwitch(subject: rewriteExpr(sw.subject, s),
+                arms: sw.arms.map { arm in NOIRCaseArm(caseName: arm.caseName,
+                    bindings: arm.bindings.map { NOIRBinding(name: $0.name, type: resolveType($0.type, s)) },
                     body: arm.body.map { rewriteStmt($0, s) }, span: arm.span) }))
         case .exprStmt(let e):                    kind = .exprStmt(rewriteExpr(e, s))
         }
-        return IRStmt(kind: kind, span: st.span)
+        return NOIRStmt(kind: kind, span: st.span)
     }
 
-    private func rewriteExpr(_ e: IRExpr, _ s: [String: Type]) -> IRExpr {
+    private func rewriteExpr(_ e: NOIRExpr, _ s: [String: Type]) -> NOIRExpr {
         let newType = resolveType(e.type, s)
         let kind: ExprKind
         switch e.kind {
@@ -195,7 +195,7 @@ private final class Monomorphizer {
                 // Codegen resolves a global call by name (`funcs[sn]`), never the callee's
                 // type, so leave it a placeholder — resolving the generic function type here
                 // would recurse into its unbound `T`s and enqueue stray `Box<T>` specializations.
-                let newCallee = IRExpr(type: .void, span: callee.span, kind: .varRef(sn))
+                let newCallee = NOIRExpr(type: .void, span: callee.span, kind: .varRef(sn))
                 kind = .call(callee: newCallee, args: rewriteArgs(args, s), typeArgs: [])
             } else {
                 kind = .call(callee: rewriteExpr(callee, s), args: rewriteArgs(args, s), typeArgs: rArgs)
@@ -203,7 +203,7 @@ private final class Monomorphizer {
         case .binary(let op, let l, let r):
             kind = .binary(op, rewriteExpr(l, s), rewriteExpr(r, s))
         case .closure(let params, let body):
-            kind = .closure(params: params.map { IRParam(label: $0.label, name: $0.name, type: resolveType($0.type, s), span: $0.span) },
+            kind = .closure(params: params.map { NOIRParam(label: $0.label, name: $0.name, type: resolveType($0.type, s), span: $0.span) },
                             body: body.map { rewriteStmt($0, s) })
         case .box(let value, let interfaces):
             kind = .box(value: rewriteExpr(value, s), interfaces: interfaces)
@@ -212,11 +212,11 @@ private final class Monomorphizer {
         case .index(let base, let idx):
             kind = .index(base: rewriteExpr(base, s), idx: rewriteExpr(idx, s))
         }
-        return IRExpr(type: newType, span: e.span, kind: kind)
+        return NOIRExpr(type: newType, span: e.span, kind: kind)
     }
 
-    private func rewriteArgs(_ args: [IRArg], _ s: [String: Type]) -> [IRArg] {
-        args.map { IRArg(label: $0.label, value: rewriteExpr($0.value, s)) }
+    private func rewriteArgs(_ args: [NOIRArg], _ s: [String: Type]) -> [NOIRArg] {
+        args.map { NOIRArg(label: $0.label, value: rewriteExpr($0.value, s)) }
     }
 
     // MARK: - Types

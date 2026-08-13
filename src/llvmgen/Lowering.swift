@@ -1,4 +1,4 @@
-// M8 · 8.2 — lower the typed IR (frontend `IRModule`) to an LLVM module via the C API. This is the
+// M8 · 8.2 — lower the typed IR (frontend `NOIRModule`) to an LLVM module via the C API. This is the
 // backend. Through 8.2 it was developed as the LLVM sibling of the C backend (`CodegenIR`) and
 // differential-tested against it; at the 8.2 exit the C backend was retired, so per-node comments
 // that reference `CodegenIR` are design lineage, not a live counterpart.
@@ -30,7 +30,7 @@
 import LLVM_C
 import frontend
 
-final class IRToLLVM {
+final class NOIRToLLVM {
     private let ctx: LLVMContextRef
     private let mod: LLVMModuleRef
     private let b: LLVMBuilderRef
@@ -65,15 +65,15 @@ final class IRToLLVM {
     // Type + function registries. `structMap`/`structTypes`: Nomu structs and their (cached) LLVM
     // struct types. `funcMap`: top-level functions. `callables`: LLVM functions declared on demand
     // (free functions keyed `f:<name>`, methods `m:<type>:<method>`), with `pending` bodies.
-    private var structMap: [String: IRStruct] = [:]
+    private var structMap: [String: NOIRStruct] = [:]
     private var structTypes: [String: LLVMTypeRef] = [:]
-    private var enumMap: [String: IREnum] = [:]
+    private var enumMap: [String: NOIREnum] = [:]
     private var enumTypes: [String: LLVMTypeRef] = [:]
-    private var classMap: [String: IRClass] = [:]
+    private var classMap: [String: NOIRClass] = [:]
     private var classTypes: [String: LLVMTypeRef] = [:]
-    private var actorMap: [String: IRActor] = [:]
+    private var actorMap: [String: NOIRActor] = [:]
     private var actorTypes: [String: LLVMTypeRef] = [:]
-    private var funcMap: [String: IRFunc] = [:]
+    private var funcMap: [String: NOIRFunc] = [:]
     private var closureSeq = 0
     // M6 · 6.1.3 — GC pointer maps. Each heap type gets a type-id (written into the object header,
     // 6.1.2) that keys `typeMaps[id]` = the byte offsets of its managed (`p1`) fields, which
@@ -110,7 +110,7 @@ final class IRToLLVM {
     // struct; `opaqueUnderlyings` resolves `some I` to its hidden concrete type. Witness types and
     // per-conformance instances (LLVM globals) are built lazily on first box/upcast, keyed
     // `type::iface` (and `type::A&B` for composites).
-    private var interfaceDefs: [String: IRInterface] = [:]
+    private var interfaceDefs: [String: NOIRInterface] = [:]
     private var witnessSlotsCache: [String: [String]] = [:]
     private var opaqueUnderlyings: [String: Type] = [:]
     private var witnessTypes: [String: LLVMTypeRef] = [:]
@@ -121,7 +121,7 @@ final class IRToLLVM {
     private struct Callable {
         let fn: LLVMValueRef
         let ty: LLVMTypeRef
-        let ir: IRFunc
+        let ir: NOIRFunc
         let selfType: String?     // struct type name when this is a method
         let selfByPointer: Bool   // mutating method → self is `T*`
     }
@@ -159,7 +159,7 @@ final class IRToLLVM {
     private enum AggKind { case structVal, classRef }
 
     private struct SelfCtx {
-        let fields: [IRField]    // fields for bare-name access inside a method; [] for enums
+        let fields: [NOIRField]    // fields for bare-name access inside a method; [] for enums
         let kind: AggKind        // class fields sit after the object header (index +1)
         let llvmTy: LLVMTypeRef  // the struct/class aggregate type (the pointee for a class)
         let addr: LLVMValueRef   // pointer to the receiver's fields (struct value / object)
@@ -212,7 +212,7 @@ final class IRToLLVM {
 
     deinit { LLVMDisposeBuilder(b) }
 
-    func lower(_ module: IRModule) {
+    func lower(_ module: NOIRModule) {
         for i in module.interfaces { interfaceDefs[i.name] = i }
         opaqueUnderlyings = module.opaqueUnderlyings
         for decl in module.decls {
@@ -515,7 +515,7 @@ final class IRToLLVM {
     private func actorMailboxIndex(_ name: String) -> Int { (actorMap[name]?.fields.count ?? 0) + 1 }
 
     // The aggregate type, kind, and fields of a named struct/class.
-    private func aggInfo(_ typeName: String) -> (ty: LLVMTypeRef, kind: AggKind, fields: [IRField])? {
+    private func aggInfo(_ typeName: String) -> (ty: LLVMTypeRef, kind: AggKind, fields: [NOIRField])? {
         if let s = structMap[typeName], let t = structType(typeName) { return (t, .structVal, s.fields) }
         if let c = classMap[typeName], let t = classType(typeName) { return (t, .classRef, c.fields) }
         return nil
@@ -541,7 +541,7 @@ final class IRToLLVM {
     }
 
     // The struct of a case's payload field types — GEP'd over the enum's payload region.
-    private func caseStructType(_ enumName: String, _ c: IREnumCase) -> LLVMTypeRef? {
+    private func caseStructType(_ enumName: String, _ c: NOIREnumCase) -> LLVMTypeRef? {
         var elems: [LLVMTypeRef] = []
         for f in c.fields {
             guard let t = llvmType(f.type, f.span) else { return nil }
@@ -550,7 +550,7 @@ final class IRToLLVM {
         return structTy(elems)
     }
 
-    private func caseSlots(_ c: IREnumCase) -> Int { c.fields.reduce(0) { $0 + slotCount($1.type) } }
+    private func caseSlots(_ c: NOIREnumCase) -> Int { c.fields.reduce(0) { $0 + slotCount($1.type) } }
 
     // 8-byte slots a value occupies in an enum payload. Every supported leaf is 8-aligned, so a
     // struct/enum is just the sum/tag+max of its parts — no padding to account for.
@@ -592,7 +592,7 @@ final class IRToLLVM {
                         ir: f, selfType: typeName, selfByPointer: byPointer)
     }
 
-    private func typeMethods(_ typeName: String) -> [IRFunc] {
+    private func typeMethods(_ typeName: String) -> [NOIRFunc] {
         structMap[typeName]?.methods ?? enumMap[typeName]?.methods ?? classMap[typeName]?.methods ?? []
     }
 
@@ -615,13 +615,13 @@ final class IRToLLVM {
             fail("8.2.6: unknown handler '\(actorName).\(handler)'", zeroSpan)
             return
         }
-        let f = IRFunc(name: h.name, params: h.params, returnType: h.returnType,
+        let f = NOIRFunc(name: h.name, params: h.params, returnType: h.returnType,
                        body: h.body, isMutating: true, span: h.span)
         declareCallable(key: key, llvmName: "nomu_on_\(actorName)_\(handler)",
                         ir: f, selfType: actorName, selfByPointer: true)
     }
 
-    private func declareCallable(key: String, llvmName: String, ir f: IRFunc,
+    private func declareCallable(key: String, llvmName: String, ir f: NOIRFunc,
                                  selfType: String?, selfByPointer: Bool) {
         guard let retTy = llvmType(f.returnType, f.span) else { return }
         var paramTys: [LLVMTypeRef] = []
@@ -671,7 +671,7 @@ final class IRToLLVM {
                                           : { let s = LLVMBuildAlloca(b, st, "self")!
                                               LLVMBuildStore(b, LLVMGetParam(c.fn, 0), s); return s }()
             let fields = structMap[selfType]?.fields ?? classMap[selfType]?.fields
-                ?? actorMap[selfType]?.fields.map { IRField(name: $0.name, type: $0.type, isMutable: true, span: $0.span) }
+                ?? actorMap[selfType]?.fields.map { NOIRField(name: $0.name, type: $0.type, isMutable: true, span: $0.span) }
                 ?? []
             currentSelf = SelfCtx(fields: fields, kind: isReference ? .classRef : .structVal,
                                   llvmTy: st, addr: selfPtr)
@@ -736,7 +736,7 @@ final class IRToLLVM {
 
     // MARK: - Statements
 
-    private func lowerBlock(_ stmts: [IRStmt]) {
+    private func lowerBlock(_ stmts: [NOIRStmt]) {
         for s in stmts {
             if error != nil || blockTerminated() { return }
             lowerStmt(s)
@@ -765,7 +765,7 @@ final class IRToLLVM {
         return LLVMBuildAlloca(tmp, ty, name)!
     }
 
-    private func lowerStmt(_ stmt: IRStmt) {
+    private func lowerStmt(_ stmt: NOIRStmt) {
         setDebugLoc(stmt.span)   // 8.3: line-table entry; inherited by this statement's instructions
         switch stmt.kind {
         case .letBinding(let name, _, let value):
@@ -821,7 +821,7 @@ final class IRToLLVM {
         }
     }
 
-    private func lowerIf(cond: IRExpr, then: [IRStmt], els: [IRStmt]?) {
+    private func lowerIf(cond: NOIRExpr, then: [NOIRStmt], els: [NOIRStmt]?) {
         guard let fn = currentFn, let condV = lowerExpr(cond) else { return }
         let condBit = condV   // 8.5.2 — a Bool is already i1; branch on it directly
         let thenBB = LLVMAppendBasicBlockInContext(ctx, fn, "then")
@@ -846,7 +846,7 @@ final class IRToLLVM {
     // iteration; the body branches back to the header (the back-edge, where 8.4.2 will place a
     // safepoint poll). Body-scoped locals and spawns are saved on entry and restored on exit, and
     // each exiting edge (normal fall-through, `continue`, `break`) joins the spawns the body made.
-    private func lowerWhile(cond: IRExpr, body: [IRStmt]) {
+    private func lowerWhile(cond: NOIRExpr, body: [NOIRStmt]) {
         guard let fn = currentFn else { return }
         let headerBB = LLVMAppendBasicBlockInContext(ctx, fn, "while.header")!
         let bodyBB = LLVMAppendBasicBlockInContext(ctx, fn, "while.body")!
@@ -885,7 +885,7 @@ final class IRToLLVM {
 
     // MARK: - Expressions
 
-    private func lowerExpr(_ e: IRExpr) -> LLVMValueRef? {
+    private func lowerExpr(_ e: NOIRExpr) -> LLVMValueRef? {
         switch e.kind {
         case .intLit(let n):
             return LLVMConstInt(i64, UInt64(bitPattern: Int64(n)), /*SignExtend=*/1)
@@ -927,7 +927,7 @@ final class IRToLLVM {
     // The address of an assignable/aggregate expression. A local or self-field yields its slot; a
     // field access GEPs into its base's address; any other value is spilled to a temp alloca so a
     // field read off an rvalue (e.g. `makePoint().x`) still works.
-    private func lvalue(_ e: IRExpr) -> (addr: LLVMValueRef, ty: LLVMTypeRef)? {
+    private func lvalue(_ e: NOIRExpr) -> (addr: LLVMValueRef, ty: LLVMTypeRef)? {
         switch e.kind {
         case .varRef(let name):
             if let l = locals[name] { return l }
@@ -969,7 +969,7 @@ final class IRToLLVM {
     // object base (so the barrier can log it) and lowers the field base exactly once — computing the
     // target address before the value, as the plain-store path did (evaluation order preserved).
     // A write to a stack local or a struct-value field (addrspace 0, not a GC object) is a plain store.
-    private func assignTo(_ target: IRExpr, _ valueExpr: IRExpr) {
+    private func assignTo(_ target: NOIRExpr, _ valueExpr: NOIRExpr) {
         switch target.kind {
         case .varRef(let name):
             if let l = locals[name] {
@@ -1007,7 +1007,7 @@ final class IRToLLVM {
         }
     }
 
-    private func lowerBinary(_ op: BinOp, _ l: IRExpr, _ r: IRExpr) -> LLVMValueRef? {
+    private func lowerBinary(_ op: BinOp, _ l: NOIRExpr, _ r: NOIRExpr) -> LLVMValueRef? {
         guard let lv = lowerExpr(l), let rv = lowerExpr(r) else { return nil }
         // Double uses the floating-point opcodes; everything else is the i64 integer path. Sema
         // guarantees both operands share the numeric type, so the left operand's type decides.
@@ -1053,7 +1053,7 @@ final class IRToLLVM {
         }
     }
 
-    private func lowerConstruct(_ typeName: String, _ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerConstruct(_ typeName: String, _ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         if let s = structMap[typeName], let st = structType(typeName) {
             var agg = LLVMGetUndef(st)
             for (idx, field) in s.fields.enumerated() {
@@ -1099,7 +1099,7 @@ final class IRToLLVM {
         return nil
     }
 
-    private func constructActorField(_ field: IRActorField, _ args: [IRArg], _ typeName: String, _ span: Span) -> LLVMValueRef? {
+    private func constructActorField(_ field: NOIRActorField, _ args: [NOIRArg], _ typeName: String, _ span: Span) -> LLVMValueRef? {
         guard let arg = args.first(where: { $0.label == field.name }) else {
             fail("8.2.6: missing field '\(field.name)' in construction of '\(typeName)'", span)
             return nil
@@ -1107,7 +1107,7 @@ final class IRToLLVM {
         return lowerExpr(arg.value)
     }
 
-    private func constructField(_ field: IRField, _ args: [IRArg], _ typeName: String, _ span: Span) -> LLVMValueRef? {
+    private func constructField(_ field: NOIRField, _ args: [NOIRArg], _ typeName: String, _ span: Span) -> LLVMValueRef? {
         guard let arg = args.first(where: { $0.label == field.name }) else {
             fail("8.2.4: missing field '\(field.name)' in construction of '\(typeName)'", span)
             return nil
@@ -1117,7 +1117,7 @@ final class IRToLLVM {
 
     // Build an enum value in a temp: store the case index as the tag, then each payload field via
     // the case's struct type GEP'd over the payload region; return the loaded aggregate.
-    private func lowerEnumInit(_ typeName: String, _ caseName: String, _ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerEnumInit(_ typeName: String, _ caseName: String, _ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         guard let et = enumType(typeName), let e = enumMap[typeName],
               let caseIdx = e.cases.firstIndex(where: { $0.name == caseName }) else {
             fail("8.2.3: cannot construct '\(typeName).\(caseName)'", span)
@@ -1143,7 +1143,7 @@ final class IRToLLVM {
 
     // switch on the enum tag: an LLVM `switch` with one block per arm (exhaustive → default is
     // unreachable). Each arm binds its payload fields (as local copies) then lowers its body.
-    private func lowerSwitch(_ sw: IRSwitch) {
+    private func lowerSwitch(_ sw: NOIRSwitch) {
         guard let fn = currentFn else { return }
         guard case .named(let enumName, .enum_) = sw.subject.type,
               let e = enumMap[enumName], let et = enumType(enumName) else {
@@ -1186,7 +1186,7 @@ final class IRToLLVM {
         LLVMPositionBuilderAtEnd(b, mergeBB)
     }
 
-    private func lowerMethodCall(receiver: IRExpr, method: String, args: [IRExpr],
+    private func lowerMethodCall(receiver: NOIRExpr, method: String, args: [NOIRExpr],
                                  resultType: Type, span: Span) -> LLVMValueRef? {
         // Requirement call through `any I` — dispatch dynamically via the box's witness slot.
         if case .existential(let iface) = receiver.type {
@@ -1371,7 +1371,7 @@ final class IRToLLVM {
     // A uniform-signature thunk `ret(ptr self, params…)` wrapping the concrete impl: it bridges
     // `self` (the payload pointer) to the impl's ABI — by value for a read-only value method, by
     // pointer for a mutating / class method — and re-boxes a covariant-`Self` result as `any iface`.
-    private func methodThunk(_ type: String, _ iface: String, _ m: IRMethodReq) -> LLVMValueRef? {
+    private func methodThunk(_ type: String, _ iface: String, _ m: NOIRMethodReq) -> LLVMValueRef? {
         guard let retTy = llvmType(m.ret, zeroSpan) else { return nil }
         var paramTys: [LLVMTypeRef] = [p1]   // self/payload — the managed box pointer (addrspace 1)
         for pt in m.params {
@@ -1406,7 +1406,7 @@ final class IRToLLVM {
 
     // A property get/set thunk. A stored-field-backed requirement is a direct field load/store; a
     // computed one routes through the concrete accessor method (`prop.get` / `prop.set`).
-    private func propThunk(_ type: String, _ iface: String, _ p: IRPropReq, setter: Bool) -> LLVMValueRef? {
+    private func propThunk(_ type: String, _ iface: String, _ p: NOIRPropReq, setter: Bool) -> LLVMValueRef? {
         guard let propTy = llvmType(p.type, zeroSpan) else { return nil }
         var paramTys: [LLVMTypeRef] = [p1]   // self/payload — the managed box pointer (addrspace 1)
         if setter { paramTys.append(propTy) }
@@ -1480,7 +1480,7 @@ final class IRToLLVM {
     // first. The call type is taken from the site (result type + argument types) — consistent with
     // the thunk's signature, since both lower the same requirement types.
     private func witnessDispatch(witnessPtr: LLVMValueRef, iface: String, method: String,
-                                 payload: LLVMValueRef, args: [IRExpr], resultType: Type,
+                                 payload: LLVMValueRef, args: [NOIRExpr], resultType: Type,
                                  span: Span) -> LLVMValueRef? {
         let slot = method.replacingOccurrences(of: ".", with: "_")
         let idx = witnessSlotIndex(iface, slot)
@@ -1498,7 +1498,7 @@ final class IRToLLVM {
     }
 
     // Wrap a concrete conformer as `any I` / `any A & B`, or upcast `any B` → `any A`.
-    private func lowerBox(_ value: IRExpr, _ ifaces: [String], _ span: Span) -> LLVMValueRef? {
+    private func lowerBox(_ value: NOIRExpr, _ ifaces: [String], _ span: Span) -> LLVMValueRef? {
         // `any B` → `any A`: re-box through the source witness's base pointer, keeping the payload.
         if case .existential(let src) = value.type, ifaces.count == 1 {
             guard let box = lowerExpr(value) else { return nil }
@@ -1638,7 +1638,7 @@ final class IRToLLVM {
     // allocation, and the value is one scalar `p1` the rewrite pass tracks — no `{fn,env}` aggregate
     // rides across a safepoint (8.4.1). The impl receives the object as its first param and reads
     // its captures from fields 1…N. Captures are the body's free variables that name enclosing locals.
-    private func lowerClosure(params: [IRParam], body: [IRStmt], ret: Type, span: Span) -> LLVMValueRef? {
+    private func lowerClosure(params: [NOIRParam], body: [NOIRStmt], ret: Type, span: Span) -> LLVMValueRef? {
         var bound = Set(params.map(\.name))
         var used: [String] = []
         collectUses(body, bound: &bound, used: &used)
@@ -1694,7 +1694,7 @@ final class IRToLLVM {
     // are captured by value into a heap env; a hoisted start routine `void* nomu_spawnN(void* env)`
     // computes the value and returns a heap box of the result. The site starts the fiber and stores
     // its handle; reads of `name` (and scope/function exit) join it.
-    private func lowerSpawnLet(name: String, value: IRExpr, resultType: Type, span: Span) {
+    private func lowerSpawnLet(name: String, value: NOIRExpr, resultType: Type, span: Span) {
         var used: [String] = []
         collectUsesExpr(value, bound: [], used: &used)
         let caps = resolveCaptures(used)
@@ -1744,7 +1744,7 @@ final class IRToLLVM {
     }
 
     // `sleep(ms)` → `rt_sleep_ms(ms)` (Int); a colorless blocking call that parks the fiber.
-    private func lowerSleep(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerSleep(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         guard let arg = args.first, let ms = lowerExpr(arg.value) else {
             fail("8.2.6: sleep expects one Int argument", span); return nil
         }
@@ -1799,7 +1799,7 @@ final class IRToLLVM {
 
     // [e0, e1, …] → allocate the handle + (for a non-empty literal) the buffer, stamp headers, store
     // each element. Returns the handle (the Array value, a managed pointer).
-    private func lowerArrayLit(_ elements: [IRExpr], _ arrayType: Type, _ span: Span) -> LLVMValueRef? {
+    private func lowerArrayLit(_ elements: [NOIRExpr], _ arrayType: Type, _ span: Span) -> LLVMValueRef? {
         guard case .array(let elem) = arrayType else { fail("array literal has non-array type", span); return nil }
         let stride = arrayElemStride(elem)
         let n = elements.count
@@ -1845,7 +1845,7 @@ final class IRToLLVM {
     }
 
     // a[i] → bounds-checked element load.
-    private func lowerIndex(_ base: IRExpr, _ idx: IRExpr, _ elemType: Type, _ span: Span) -> LLVMValueRef? {
+    private func lowerIndex(_ base: NOIRExpr, _ idx: NOIRExpr, _ elemType: Type, _ span: Span) -> LLVMValueRef? {
         guard let handle = lowerExpr(base), let idxV = lowerExpr(idx), let elemLL = llvmType(elemType, span),
               let e = arrayElemAddr(handle, idxV, elemType) else { return nil }
         return LLVMBuildLoad2(b, elemLL, e.addr, "arr.elem")
@@ -1854,7 +1854,7 @@ final class IRToLLVM {
     // a[i] = x → bounds-checked element store (args: handle, index, value). Result unused. A managed
     // element goes through the write barrier (`storeField`) with the buffer as the source object, so a
     // store into a mature buffer remembers it (6.3.1); a value element is a plain store.
-    private func lowerArraySet(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerArraySet(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         guard args.count == 3 else { fail("__arraySet expects 3 args", span); return nil }
         guard let handle = lowerExpr(args[0].value), let idxV = lowerExpr(args[1].value),
               let val = lowerExpr(args[2].value),
@@ -1867,7 +1867,7 @@ final class IRToLLVM {
     // done here (not in C) so the buffer allocation is a statepoint: the rewrite pass relocates the
     // handle/old-buffer/value across it, and we reload the current buffer from the (relocated) handle
     // afterward — a raw C pointer could not survive a moving collection.
-    private func lowerArrayAppend(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerArrayAppend(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         guard args.count == 2 else { fail("__arrayAppend expects 2 args", span); return nil }
         let elem = args[1].value.type
         guard let handle = lowerExpr(args[0].value), let val = lowerExpr(args[1].value), let fn = currentFn else { return nil }
@@ -1911,12 +1911,12 @@ final class IRToLLVM {
     }
 
     // `a.count` → load `len` from the handle (no allocation, no safepoint).
-    private func lowerArrayCount(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerArrayCount(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         guard let a = args.first, let handle = lowerExpr(a.value) else { return nil }
         return LLVMBuildLoad2(b, i64, gepByte(handle, LLVMConstInt(i64, 8, 0)), "arr.count")
     }
 
-    private func lowerCall(callee: IRExpr, args: [IRArg], span: Span) -> LLVMValueRef? {
+    private func lowerCall(callee: NOIRExpr, args: [NOIRArg], span: Span) -> LLVMValueRef? {
         if case .varRef(let name) = callee.kind {
             // C-leaf builtins (same-named C symbol, signature encoded in the name) lower generically.
             if Builtins.cLeaf.contains(name) { return lowerCLeafBuiltin(name, args, span) }
@@ -1957,7 +1957,7 @@ final class IRToLLVM {
     }
 
     // Lower `args`, optionally prefixed by a closure `env`, and emit the call.
-    private func buildArgsAndCall(_ fnTy: LLVMTypeRef, _ fn: LLVMValueRef, env: LLVMValueRef?, args: [IRArg]) -> LLVMValueRef? {
+    private func buildArgsAndCall(_ fnTy: LLVMTypeRef, _ fn: LLVMValueRef, env: LLVMValueRef?, args: [NOIRArg]) -> LLVMValueRef? {
         var argVals: [LLVMValueRef?] = []
         if let env = env { argVals.append(env) }
         for a in args {
@@ -1972,11 +1972,11 @@ final class IRToLLVM {
 
     // MARK: - Free-variable collection (respects shadowing via `bound`)
 
-    private func collectUses(_ stmts: [IRStmt], bound: inout Set<String>, used: inout [String]) {
+    private func collectUses(_ stmts: [NOIRStmt], bound: inout Set<String>, used: inout [String]) {
         for s in stmts { collectUsesStmt(s, bound: &bound, used: &used) }
     }
 
-    private func collectUsesStmt(_ stmt: IRStmt, bound: inout Set<String>, used: inout [String]) {
+    private func collectUsesStmt(_ stmt: NOIRStmt, bound: inout Set<String>, used: inout [String]) {
         switch stmt.kind {
         case .letBinding(let name, _, let value):
             collectUsesExpr(value, bound: bound, used: &used); bound.insert(name)
@@ -2007,7 +2007,7 @@ final class IRToLLVM {
         }
     }
 
-    private func collectUsesExpr(_ e: IRExpr, bound: Set<String>, used: inout [String]) {
+    private func collectUsesExpr(_ e: NOIRExpr, bound: Set<String>, used: inout [String]) {
         switch e.kind {
         case .intLit, .doubleLit, .boolLit, .stringLit:
             break
@@ -2040,7 +2040,7 @@ final class IRToLLVM {
     }
 
     // print(Int|Bool) → printf("%lld\n", n);  print(String) → printf("%.*s\n", (int)len, data).
-    private func lowerPrint(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerPrint(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         guard let arg = args.first, let value = lowerExpr(arg.value) else {
             fail("8.2.1: print expects one argument", span)
             return nil
@@ -2068,7 +2068,7 @@ final class IRToLLVM {
     }
 
     // `i.double` — widen Int (i64) to Double (f64), signed. Exact for values up to 2^53.
-    private func lowerIntToDouble(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerIntToDouble(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         guard let v = args.first.flatMap({ lowerExpr($0.value) }) else {
             fail("__int_double_double expects one argument", span); return nil
         }
@@ -2077,7 +2077,7 @@ final class IRToLLVM {
 
     // `d.int` — narrow Double (f64) to Int (i64), rounding to nearest with ties away from zero
     // (`llvm.round`), then a signed truncation to integer.
-    private func lowerDoubleToInt(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerDoubleToInt(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         guard let v = args.first.flatMap({ lowerExpr($0.value) }) else {
             fail("__double_int_int expects one argument", span); return nil
         }
@@ -2089,7 +2089,7 @@ final class IRToLLVM {
     // A C-leaf builtin: a call to the same-named C function, with parameter/return types read from
     // the mangled name (`__<recv>_<name>_<ret>[_<arg>...]`). The receiver is the first argument. A
     // `Bool` return arrives as the C `int` result and is truncated to i1.
-    private func lowerCLeafBuiltin(_ name: String, _ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerCLeafBuiltin(_ name: String, _ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         let sig = Builtins.signature(name)
         var vals: [LLVMValueRef] = []
         for a in args {
@@ -2115,7 +2115,7 @@ final class IRToLLVM {
         }
     }
 
-    private func lowerConcat(_ args: [IRArg], _ span: Span) -> LLVMValueRef? {
+    private func lowerConcat(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         guard args.count == 2 else {
             fail("8.2.1: concat expects two String arguments", span)
             return nil
@@ -2381,7 +2381,7 @@ final class IRToLLVM {
     // the body's *top-level* statements count (a safepoint nested in an `if`/`while`/`switch` arm
     // may not run every iteration), so when unsure we place the poll. This is the IR-level
     // approximation of D3; M6 re-audits against precise codegen safepoints when the collector is live.
-    private func loopBodyHasSafepoint(_ stmts: [IRStmt]) -> Bool {
+    private func loopBodyHasSafepoint(_ stmts: [NOIRStmt]) -> Bool {
         for s in stmts {
             switch s.kind {
             case .letBinding(_, _, let v): if exprHasSafepoint(v) { return true }
@@ -2399,7 +2399,7 @@ final class IRToLLVM {
     // Whether evaluating `e` unconditionally hits a safepoint: a non-leaf call, a method/witness
     // dispatch, or a heap allocation. Leaf builtins (`print`, `concat`, string literals) and pure
     // value construction (struct/enum) are not safepoints, but their sub-expressions still execute.
-    private func exprHasSafepoint(_ e: IRExpr) -> Bool {
+    private func exprHasSafepoint(_ e: NOIRExpr) -> Bool {
         switch e.kind {
         case .intLit, .doubleLit, .boolLit, .stringLit, .varRef:
             return false
@@ -2602,7 +2602,7 @@ final class IRToLLVM {
 
     // The per-handler message struct `{ header, next, thunk, self, args… }`. Field indices past the
     // 4-slot prefix are 4 + argPos. Handlers are void (fire-and-forget), so there is no reply field.
-    private func messageType(_ actorName: String, _ h: IRHandler) -> LLVMTypeRef? {
+    private func messageType(_ actorName: String, _ h: NOIRHandler) -> LLVMTypeRef? {
         let key = "\(actorName):\(h.name)"
         if let t = messageTypes[key] { return t }
         var elems: [LLVMTypeRef] = [i64, p1, i8ptr, p1]   // header, next, thunk, self
@@ -2622,7 +2622,7 @@ final class IRToLLVM {
     // Total 8-byte slots a handler's message occupies: 4-slot prefix + args. Every leaf is 8-aligned
     // and an 8-multiple (the object-model invariant), so LLVM adds no padding and byte offsets equal
     // slot*8 — the same assumption the class/actor layout makes.
-    private func messageSlots(_ h: IRHandler) -> Int {
+    private func messageSlots(_ h: NOIRHandler) -> Int {
         var slots = 4
         for p in h.params { slots += slotCount(p.type) }
         return slots
@@ -2630,7 +2630,7 @@ final class IRToLLVM {
 
     // Type-id + pointer map for a handler's message. Managed offsets: next (8) and self (24) always,
     // plus any managed pointers inside the args. thunk (16, a code ptr) is never scanned.
-    private func messageTypeIdValue(_ actorName: String, _ h: IRHandler) -> UInt64 {
+    private func messageTypeIdValue(_ actorName: String, _ h: NOIRHandler) -> UInt64 {
         let key = "\(actorName):\(h.name)"
         if let id = messageTypeIds[key] { return id }
         var offsets: [Int32] = [8, 24]   // next, self
@@ -2648,7 +2648,7 @@ final class IRToLLVM {
     // args from the message and call the handler (void — no reply). Runs on a rented pool worker
     // inside the drain loop; `msg` is a tracked GC root here, so the handler's safepoints relocate it
     // and `self` correctly.
-    private func actorThunk(_ actorName: String, _ h: IRHandler) -> LLVMValueRef {
+    private func actorThunk(_ actorName: String, _ h: NOIRHandler) -> LLVMValueRef {
         let key = "\(actorName):\(h.name)"
         if let f = actorThunks[key] { return f }
         declareActorHandler(actorName, h.name)
@@ -2708,7 +2708,7 @@ final class IRToLLVM {
     // the message and hand it to `rt_actor_send`, which enqueues it and returns. The call is void —
     // fire-and-forget is the only actor operation (§9); there is no reply/ask of any kind.
     private func lowerActorCall(_ actorName: String, _ handler: String,
-                                _ recvValue: LLVMValueRef, _ args: [IRExpr], _ span: Span) -> LLVMValueRef? {
+                                _ recvValue: LLVMValueRef, _ args: [NOIRExpr], _ span: Span) -> LLVMValueRef? {
         guard let a = actorMap[actorName],
               let h = a.handlers.first(where: { $0.name == handler }) else {
             fail("8.2.6: unknown handler '\(actorName).\(handler)'", span); return nil
@@ -2780,7 +2780,7 @@ final class IRToLLVM {
     {
         if let cached = runtimeFns[name] { return cached }
         let f = emitFunction(name, ret: ret, params: params, varArg: varArg, gc: false)
-        if IRToLLVM.gcLeafRuntimeFns.contains(name) { markGCLeaf(f.0) }
+        if NOIRToLLVM.gcLeafRuntimeFns.contains(name) { markGCLeaf(f.0) }
         runtimeFns[name] = f
         return f
     }

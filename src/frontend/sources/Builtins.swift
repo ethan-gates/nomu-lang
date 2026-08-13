@@ -43,22 +43,22 @@ public enum Builtins {
 // A namespace for building NomuIR (NOIR) for builtins.
 struct BuiltinsSema {
     /// A zero-argument member builtin, e.g. `"str".hash` or `i.double`. `base` is the receiver.
-    static func member(_ mangled: String, _ base: IRExpr, _ span: Span) -> IRExpr {
+    static func member(_ mangled: String, _ base: NOIRExpr, _ span: Span) -> NOIRExpr {
         call(mangled, base, [], span)
     }
 
     /// A method builtin with arguments, e.g. `"a".eq("b")`. The receiver is passed as the first
     /// call argument, then `args`. The return type is read from the mangled name. Arg count/types
     /// are checked by the caller (which holds the diagnostic sink).
-    static func method(_ mangled: String, _ base: IRExpr, _ args: [IRExpr], _ span: Span) -> IRExpr {
+    static func method(_ mangled: String, _ base: NOIRExpr, _ args: [NOIRExpr], _ span: Span) -> NOIRExpr {
         call(mangled, base, args, span)
     }
 
-    private static func call(_ mangled: String, _ base: IRExpr, _ args: [IRExpr], _ span: Span) -> IRExpr {
+    private static func call(_ mangled: String, _ base: NOIRExpr, _ args: [NOIRExpr], _ span: Span) -> NOIRExpr {
         let sig = Builtins.signature(mangled)
-        let callee = IRExpr(type: .void, span: span, kind: .varRef(mangled))
-        let callArgs = ([base] + args).map { IRArg(label: nil, value: $0) }
-        return IRExpr(type: sig.ret, span: span, kind: .call(callee: callee, args: callArgs, typeArgs: []))
+        let callee = NOIRExpr(type: .void, span: span, kind: .varRef(mangled))
+        let callArgs = ([base] + args).map { NOIRArg(label: nil, value: $0) }
+        return NOIRExpr(type: sig.ret, span: span, kind: .call(callee: callee, args: callArgs, typeArgs: []))
     }
 }
 

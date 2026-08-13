@@ -3,7 +3,7 @@
 // only — interfaces/generics are M5; type methods are T3.
 
 public struct SemaResult {
-    public let module: IRModule
+    public let module: NOIRModule
     public let diagnostics: DiagnosticSink
 }
 
@@ -26,11 +26,11 @@ public struct Sema {
 
     // Conformance facts (M5 A1.4), filled by checkConformances before body lowering.
     private var conformsTo: [String: Set<String>] = [:]      // type name → interface names
-    private var conformanceList: [IRConformance] = []        // one per valid `T: I`
+    private var conformanceList: [NOIRConformance] = []        // one per valid `T: I`
     private var conformancePairs: Set<String> = []           // "T:I" seen, so witnesses aren't duplicated
     private var inheritedDefaults: [String: [InterfaceMethod]] = [:]   // defaulted reqs a type inherits
     private var interfaceBases: [String: [Conformance]] = [:]   // M5 A1.5: interface → direct base interfaces
-    private var compositeList: [IRComposite] = []               // M5 A1.5b: (type, any A & B) pairs boxed
+    private var compositeList: [NOIRComposite] = []               // M5 A1.5b: (type, any A & B) pairs boxed
     private var compositePairs: Set<String> = []
 
     // M5 A3: `some I` opaque types. `allConformsTo` records every checked conformance
@@ -84,7 +84,7 @@ public struct Sema {
         buildShareChecker()
         validateInterfaceGraph()
         checkConformances()
-        var decls: [IRDecl] = []
+        var decls: [NOIRDecl] = []
         for decl in program.decls {
             // Interfaces are abstract: validate them, but emit no IR (conformance in a
             // later slice generates the concrete witnesses that carry the defaults).
@@ -98,7 +98,7 @@ public struct Sema {
 
         // M4.11: infer method mutating-ness, validate `let`-field / `self` writes,
         // annotate the IR, then check that mutating value-type calls have a mutable receiver.
-        let module0 = IRModule(decls: decls, interfaces: buildIRInterfaces(),
+        let module0 = NOIRModule(decls: decls, interfaces: buildIRInterfaces(),
                                conformances: conformanceList, composites: compositeList,
                                opaqueUnderlyings: opaqueUnderlyings)
         let mutation = analyzeMutation(module0, into: diags)
@@ -349,26 +349,26 @@ public struct Sema {
 
     // MARK: - Declarations
 
-    private mutating func lowerDecl(_ decl: TopDecl) -> IRDecl {
+    private mutating func lowerDecl(_ decl: TopDecl) -> NOIRDecl {
         switch decl {
         case .structDecl(let s):
             let fields = s.fields.map(lowerField)
             var methods = lowerMethods(s.methods, selfType: .named(s.name, .struct_), fields: fields)
             methods += lowerAccessors(s.properties, selfType: .named(s.name, .struct_), fields: fields)
             methods += lowerInheritedDefaults(s.name, selfType: .named(s.name, .struct_), fields: fields)
-            return .structDecl(IRStruct(name: s.name, fields: fields, methods: methods, span: s.span))
+            return .structDecl(NOIRStruct(name: s.name, fields: fields, methods: methods, span: s.span))
         case .enumDecl(let e):
-            let cases = e.cases.map { IREnumCase(name: $0.name, fields: $0.fields.map(lowerField), span: $0.span) }
+            let cases = e.cases.map { NOIREnumCase(name: $0.name, fields: $0.fields.map(lowerField), span: $0.span) }
             var methods = lowerMethods(e.methods, selfType: .named(e.name, .enum_), fields: [])
             methods += lowerAccessors(e.properties, selfType: .named(e.name, .enum_), fields: [])
             methods += lowerInheritedDefaults(e.name, selfType: .named(e.name, .enum_), fields: [])
-            return .enumDecl(IREnum(name: e.name, cases: cases, methods: methods, span: e.span))
+            return .enumDecl(NOIREnum(name: e.name, cases: cases, methods: methods, span: e.span))
         case .classDecl(let c):
             let fields = c.fields.map(lowerField)
             var methods = lowerMethods(c.methods, selfType: .named(c.name, .class_), fields: fields)
             methods += lowerAccessors(c.properties, selfType: .named(c.name, .class_), fields: fields)
             methods += lowerInheritedDefaults(c.name, selfType: .named(c.name, .class_), fields: fields)
-            return .classDecl(IRClass(name: c.name, fields: fields, methods: methods, span: c.span))
+            return .classDecl(NOIRClass(name: c.name, fields: fields, methods: methods, span: c.span))
         case .actorDecl(let a):
             return .actorDecl(lowerActor(a))
         case .funcDecl(let f):
@@ -397,7 +397,7 @@ public struct Sema {
 
         for m in i.methods {
             guard let body = m.defaultBody else { continue }
-            let params = m.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type, selfAs: selfType), span: $0.span) }
+            let params = m.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolve($0.type, selfAs: selfType), span: $0.span) }
             let ret = resolve(m.returnType, selfAs: selfType)
             pushScope()
             declare("self", selfType)
@@ -437,7 +437,7 @@ public struct Sema {
     // scope while resolving fields (so a `T` field becomes `.typeParam("T")`), the bounds are
     // recorded, and the generic params ride onto the IR decl for codegen. Instance methods /
     // computed properties on a generic type are deferred — rejected with a clear message.
-    private mutating func lowerGenericDecl(_ decl: TopDecl) -> IRDecl {
+    private mutating func lowerGenericDecl(_ decl: TopDecl) -> NOIRDecl {
         let generics: [GenericParam]
         switch decl {
         case .structDecl(let s): generics = s.generics
@@ -450,20 +450,20 @@ public struct Sema {
         for g in generics { genericBounds[g.name] = g.bounds.map(\.name) }
         defer { genericScope = savedScope; genericBounds = savedBounds }
         validateBounds(generics)
-        let irGenerics = generics.map { IRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name), isShared: $0.isShared) }
+        let irGenerics = generics.map { NOIRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name), isShared: $0.isShared) }
         switch decl {
         case .structDecl(let s):
             rejectGenericMembers(s.methods, s.properties, at: s.span)
-            return .structDecl(IRStruct(name: s.name, generics: irGenerics,
+            return .structDecl(NOIRStruct(name: s.name, generics: irGenerics,
                                         fields: s.fields.map(lowerField), methods: [], span: s.span))
         case .classDecl(let c):
             rejectGenericMembers(c.methods, c.properties, at: c.span)
-            return .classDecl(IRClass(name: c.name, generics: irGenerics,
+            return .classDecl(NOIRClass(name: c.name, generics: irGenerics,
                                       fields: c.fields.map(lowerField), methods: [], span: c.span))
         case .enumDecl(let e):
             rejectGenericMembers(e.methods, e.properties, at: e.span)
-            let cases = e.cases.map { IREnumCase(name: $0.name, fields: $0.fields.map(lowerField), span: $0.span) }
-            return .enumDecl(IREnum(name: e.name, generics: irGenerics, cases: cases, methods: [], span: e.span))
+            let cases = e.cases.map { NOIREnumCase(name: $0.name, fields: $0.fields.map(lowerField), span: $0.span) }
+            return .enumDecl(NOIREnum(name: e.name, generics: irGenerics, cases: cases, methods: [], span: e.span))
         default: preconditionFailure("unreachable")
         }
     }
@@ -608,8 +608,8 @@ public struct Sema {
     }
 
     // The interfaces' requirement surface, resolved to types, for witness-table layout.
-    private func buildIRInterfaces() -> [IRInterface] {
-        var out: [IRInterface] = []
+    private func buildIRInterfaces() -> [NOIRInterface] {
+        var out: [NOIRInterface] = []
         for decl in program.decls {
             guard case .interfaceDecl(let i) = decl else { continue }
             // A non-covariant-`Self` (constraint-only) interface can't be `any I`, so it gets no
@@ -619,11 +619,11 @@ public struct Sema {
             if hasNonCovariantSelf(i.name) { continue }
             let selfErased = Type.existential(i.name)
             // Aggregated (flattened) surface: the witness table carries inherited slots too.
-            let methods = aggregatedMethods(i.name).map { IRMethodReq(name: $0.name, params: $0.params.map { resolve($0.type, selfAs: selfErased) }, ret: resolve($0.returnType, selfAs: selfErased)) }
-            let props = aggregatedProperties(i.name).map { IRPropReq(name: $0.name, type: resolve($0.type, selfAs: selfErased), isSettable: $0.isSettable) }
+            let methods = aggregatedMethods(i.name).map { NOIRMethodReq(name: $0.name, params: $0.params.map { resolve($0.type, selfAs: selfErased) }, ret: resolve($0.returnType, selfAs: selfErased)) }
+            let props = aggregatedProperties(i.name).map { NOIRPropReq(name: $0.name, type: resolve($0.type, selfAs: selfErased), isSettable: $0.isSettable) }
             // Only any-able bases carry a witness, so only they get a base pointer (M5 A1.4 upcast).
             let bases = transitiveBases(i.name).filter { !hasNonCovariantSelf($0) }.sorted()
-            out.append(IRInterface(name: i.name, methods: methods, properties: props, bases: bases))
+            out.append(NOIRInterface(name: i.name, methods: methods, properties: props, bases: bases))
         }
         return out
     }
@@ -633,13 +633,13 @@ public struct Sema {
     // to it (M5 A1.4). First cut: a default may reference directly-implemented requirements
     // (via `self.req()`) and stored-field state (bare name); default-calling-default and
     // computed-backed bare access are later work.
-    private mutating func lowerInheritedDefaults(_ typeName: String, selfType: Type, fields: [IRField]) -> [IRFunc] {
-        var out: [IRFunc] = []
+    private mutating func lowerInheritedDefaults(_ typeName: String, selfType: Type, fields: [NOIRField]) -> [NOIRFunc] {
+        var out: [NOIRFunc] = []
         for req in inheritedDefaults[typeName] ?? [] {
             guard let body = req.defaultBody else { continue }
             // A default is synthesized as a concrete method of the conformer, so `Self` binds
             // to the conformer's concrete type here (M5 A2).
-            let params = req.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type, selfAs: selfType), span: $0.span) }
+            let params = req.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolve($0.type, selfAs: selfType), span: $0.span) }
             let ret = resolve(req.returnType, selfAs: selfType)
             pushScope()
             declare("self", selfType)
@@ -649,7 +649,7 @@ public struct Sema {
             let irBody = lowerBlock(body)
             currentReturnType = saved
             popScope()
-            out.append(IRFunc(name: req.name, params: params, returnType: ret, body: irBody, isMutating: false, span: req.span))
+            out.append(NOIRFunc(name: req.name, params: params, returnType: ret, body: irBody, isMutating: false, span: req.span))
         }
         return out
     }
@@ -706,7 +706,7 @@ public struct Sema {
                 guard !hasNonCovariantSelf(iface) else { continue }
                 conformsTo[typeName, default: []].insert(iface)
                 if conformancePairs.insert("\(typeName):\(iface)").inserted {
-                    conformanceList.append(IRConformance(typeName: typeName, typeKind: kind, interfaceName: iface))
+                    conformanceList.append(NOIRConformance(typeName: typeName, typeKind: kind, interfaceName: iface))
                 }
             }
             // Check the full (aggregated) requirement set, so inherited requirements count.
@@ -768,17 +768,17 @@ public struct Sema {
         diags.error("type '\(typeName)' does not conform to '\(conf.name)': missing property '\(req.name)'", at: conf.span)
     }
 
-    private func lowerField(_ f: VarField) -> IRField {
-        IRField(name: f.name, type: resolve(f.type), isMutable: f.isMutable, span: f.span)
+    private func lowerField(_ f: VarField) -> NOIRField {
+        NOIRField(name: f.name, type: resolve(f.type), isMutable: f.isMutable, span: f.span)
     }
 
     // Lower each `fun` member with `self` (immutable) and the receiver's fields
     // declared by bare name, mirroring how actor handlers see their fields (T3).
-    private mutating func lowerMethods(_ methods: [FuncDecl], selfType: Type, fields: [IRField]) -> [IRFunc] {
-        var out: [IRFunc] = []
+    private mutating func lowerMethods(_ methods: [FuncDecl], selfType: Type, fields: [NOIRField]) -> [NOIRFunc] {
+        var out: [NOIRFunc] = []
         let ownerType: String? = { if case .named(let n, _) = selfType { return n }; return nil }()
         for m in methods {
-            let params = m.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+            let params = m.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
             // A `some I` method return keys its opaque identity by "m:Type.method" — the same
             // key the call site uses when it resolves the method's return type (M5 A3).
             let ret = resolve(m.returnType, opaqueOwner: ownerType.map { "m:\($0).\(m.name)" })
@@ -790,7 +790,7 @@ public struct Sema {
             let body = lowerBlock(m.body)
             currentReturnType = saved
             popScope()
-            out.append(IRFunc(name: m.name, params: params, returnType: ret, body: body, isMutating: false, span: m.span))
+            out.append(NOIRFunc(name: m.name, params: params, returnType: ret, body: body, isMutating: false, span: m.span))
         }
         return out
     }
@@ -807,19 +807,19 @@ public struct Sema {
     // their names out of any user method's namespace (Mangle 9-encodes it), and being
     // ordinary methods they reuse method codegen, self-passing, and mutation inference
     // (the setter is inferred mutating because it writes a field).
-    private mutating func lowerAccessors(_ props: [ComputedProperty], selfType: Type, fields: [IRField]) -> [IRFunc] {
-        var out: [IRFunc] = []
+    private mutating func lowerAccessors(_ props: [ComputedProperty], selfType: Type, fields: [NOIRField]) -> [NOIRFunc] {
+        var out: [NOIRFunc] = []
         for p in props {
             let propType = resolve(p.type)
             let getBody = accessorBody(p.getter, returnType: propType, selfType: selfType,
                                        fields: fields, params: [], span: p.span)
-            out.append(IRFunc(name: "\(p.name).get", params: [], returnType: propType,
+            out.append(NOIRFunc(name: "\(p.name).get", params: [], returnType: propType,
                               body: getBody, isMutating: false, span: p.span))
             if let setter = p.setter {
-                let param = IRParam(label: setter.paramName, name: setter.paramName, type: propType, span: p.span)
+                let param = NOIRParam(label: setter.paramName, name: setter.paramName, type: propType, span: p.span)
                 let setBody = accessorBody(setter.body, returnType: .void, selfType: selfType,
                                            fields: fields, params: [param], span: p.span)
-                out.append(IRFunc(name: "\(p.name).set", params: [param], returnType: .void,
+                out.append(NOIRFunc(name: "\(p.name).set", params: [param], returnType: .void,
                                   body: setBody, isMutating: false, span: p.span))
             }
         }
@@ -830,7 +830,7 @@ public struct Sema {
     // scope (mirroring `lowerMethods`). A single-expression getter body is an implicit
     // `return` of that expression (the bare-body shorthand, and the common `get` form).
     private mutating func accessorBody(_ block: Block, returnType: Type, selfType: Type,
-                                       fields: [IRField], params: [IRParam], span: Span) -> [IRStmt] {
+                                       fields: [NOIRField], params: [NOIRParam], span: Span) -> [NOIRStmt] {
         var block = block
         if returnType != .void, block.count == 1, case .expr(let e) = block[0] {
             block = [.ret(e, span: span)]
@@ -846,7 +846,7 @@ public struct Sema {
         return body
     }
 
-    private mutating func lowerFunc(_ f: FuncDecl) -> IRFunc {
+    private mutating func lowerFunc(_ f: FuncDecl) -> NOIRFunc {
         // A generic function's type parameters + bounds are in scope while lowering its body,
         // so `x: T` typechecks and `x.req()` dispatches through the bound's witness (M5 5.2.2).
         let savedScope = genericScope, savedBounds = genericBounds, savedShared = sharedParams
@@ -855,7 +855,7 @@ public struct Sema {
         sharedParams = Set(f.generics.filter(\.isShared).map(\.name))
         defer { genericScope = savedScope; genericBounds = savedBounds; sharedParams = savedShared }
         validateBounds(f.generics)
-        let params = f.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+        let params = f.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
         let ret = resolve(f.returnType, opaqueOwner: "fn:\(f.name)")
         pushScope()
         for p in params { declare(p.name, p.type) }
@@ -863,18 +863,18 @@ public struct Sema {
         let body = lowerBlock(f.body)
         currentReturnType = saved
         popScope()
-        let irGenerics = f.generics.map { IRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name), isShared: $0.isShared) }
-        return IRFunc(name: f.name, generics: irGenerics, params: params, returnType: ret, body: body, isMutating: false, span: f.span)
+        let irGenerics = f.generics.map { NOIRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name), isShared: $0.isShared) }
+        return NOIRFunc(name: f.name, generics: irGenerics, params: params, returnType: ret, body: body, isMutating: false, span: f.span)
     }
 
-    private mutating func lowerActor(_ a: ActorDecl) -> IRActor {
+    private mutating func lowerActor(_ a: ActorDecl) -> NOIRActor {
         let fields = a.fields.map { af in
-            IRActorField(name: af.name, type: resolve(af.type),
+            NOIRActorField(name: af.name, type: resolve(af.type),
                          initializer: af.initializer.map { checkExpr($0) }, span: af.span)
         }
-        var handlers: [IRHandler] = []
+        var handlers: [NOIRHandler] = []
         for h in a.handlers {
-            let params = h.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+            let params = h.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
             let ret = resolve(h.returnType)
             // Actors are fire-and-forget message-send only (§9): a handler is a one-way message
             // sink and cannot return a value to the sender. There is no reply/ask mechanism; a value
@@ -889,21 +889,21 @@ public struct Sema {
             let body = lowerBlock(h.body)
             currentReturnType = saved
             popScope()
-            handlers.append(IRHandler(name: h.name, params: params, returnType: ret, body: body, span: h.span))
+            handlers.append(NOIRHandler(name: h.name, params: params, returnType: ret, body: body, span: h.span))
         }
-        return IRActor(name: a.name, fields: fields, handlers: handlers, span: a.span)
+        return NOIRActor(name: a.name, fields: fields, handlers: handlers, span: a.span)
     }
 
     // MARK: - Statements
 
-    private mutating func lowerBlock(_ block: Block) -> [IRStmt] {
+    private mutating func lowerBlock(_ block: Block) -> [NOIRStmt] {
         pushScope()
         let stmts = block.map { lowerStmt($0) }
         popScope()
         return stmts
     }
 
-    private mutating func lowerStmt(_ stmt: Stmt) -> IRStmt {
+    private mutating func lowerStmt(_ stmt: Stmt) -> NOIRStmt {
         switch stmt {
         case .binding(let b):
             // `let x: some I = expr` — a fresh opaque binding whose hidden underlying is
@@ -917,19 +917,19 @@ public struct Sema {
                     recordOpaque(value, interfaces: ifaces, owner: owner, at: b.span)
                 }
                 declare(b.name, ann, isMutable: b.isMutable)
-                return IRStmt(kind: .letBinding(name: b.name, isMutable: b.isMutable, value: value), span: b.span)
+                return NOIRStmt(kind: .letBinding(name: b.name, isMutable: b.isMutable, value: value), span: b.span)
             }
             let annotated = b.type.map { resolve($0) }
             let value = coerce(checkExpr(b.value, expected: annotated), to: annotated)
             checkAssignable(value.type, to: annotated, role: "bind", at: b.span)
             let type = annotated ?? value.type
             declare(b.name, type, isMutable: b.isMutable)
-            return IRStmt(kind: .letBinding(name: b.name, isMutable: b.isMutable, value: value), span: b.span)
+            return NOIRStmt(kind: .letBinding(name: b.name, isMutable: b.isMutable, value: value), span: b.span)
 
         case .spawnLet(let name, _, let value, let span):
             let v = checkExpr(value)
             declare(name, v.type)   // reading a spawn binding yields its result value
-            return IRStmt(kind: .spawnLet(name: name, value: v, resultType: v.type), span: span)
+            return NOIRStmt(kind: .spawnLet(name: name, value: v, resultType: v.type), span: span)
 
         case .assign(let lhs, let rhs, let span):
             // Array subscript write `a[i] = x` — reference semantics (mutates the shared buffer, so a
@@ -938,7 +938,7 @@ public struct Sema {
                 let a = checkExpr(arr)
                 guard case .array(let elem) = a.type else {
                     if a.type != .error { diags.error("cannot subscript-assign a value of type '\(a.type)' — only 'Array<T>' supports '[ ] ='", at: span) }
-                    return IRStmt(kind: .exprStmt(checkExpr(rhs)), span: span)
+                    return NOIRStmt(kind: .exprStmt(checkExpr(rhs)), span: span)
                 }
                 let iIdx = checkExpr(idxE, expected: .int)
                 if iIdx.type != .int && iIdx.type != .error {
@@ -946,10 +946,10 @@ public struct Sema {
                 }
                 let value = coerce(checkExpr(rhs, expected: elem), to: elem)
                 checkAssignable(value.type, to: elem, role: "assign", at: span)
-                let callee = IRExpr(type: .void, span: span, kind: .varRef("__arraySet"))
-                let call = IRExpr(type: .void, span: span, kind: .call(callee: callee,
-                    args: [IRArg(label: nil, value: a), IRArg(label: nil, value: iIdx), IRArg(label: nil, value: value)], typeArgs: []))
-                return IRStmt(kind: .exprStmt(call), span: span)
+                let callee = NOIRExpr(type: .void, span: span, kind: .varRef("__arraySet"))
+                let call = NOIRExpr(type: .void, span: span, kind: .call(callee: callee,
+                    args: [NOIRArg(label: nil, value: a), NOIRArg(label: nil, value: iIdx), NOIRArg(label: nil, value: value)], typeArgs: []))
+                return NOIRStmt(kind: .exprStmt(call), span: span)
             }
             // A write to a computed property lowers to a setter accessor call (M5 A1).
             if case .member(let base, let field, let mspan) = lhs {
@@ -961,12 +961,12 @@ public struct Sema {
                     let propType = resolve(prop.type)
                     guard prop.isSettable else {
                         diags.error("cannot assign to read-only property '\(field)' of 'any \(iface)'", at: span)
-                        return IRStmt(kind: .exprStmt(checkExpr(rhs, expected: propType)), span: span)
+                        return NOIRStmt(kind: .exprStmt(checkExpr(rhs, expected: propType)), span: span)
                     }
                     let value = checkExpr(rhs, expected: propType)
-                    let call = IRExpr(type: .void, span: span,
+                    let call = NOIRExpr(type: .void, span: span,
                                       kind: .methodCall(receiver: b, method: "\(field).set", args: [value]))
-                    return IRStmt(kind: .exprStmt(call), span: span)
+                    return NOIRStmt(kind: .exprStmt(call), span: span)
                 }
                 // A property write inside an interface default (self: interface) — routes to the
                 // set slot; the concrete synthesized copy writes the real field/setter (M5).
@@ -975,17 +975,17 @@ public struct Sema {
                     let propType = resolve(prop.type)
                     guard prop.isSettable else {
                         diags.error("cannot assign to read-only property '\(field)' of '\(tn)'", at: span)
-                        return IRStmt(kind: .exprStmt(checkExpr(rhs, expected: propType)), span: span)
+                        return NOIRStmt(kind: .exprStmt(checkExpr(rhs, expected: propType)), span: span)
                     }
                     let value = checkExpr(rhs, expected: propType)
-                    let call = IRExpr(type: .void, span: span,
+                    let call = NOIRExpr(type: .void, span: span,
                                       kind: .methodCall(receiver: b, method: "\(field).set", args: [value]))
-                    return IRStmt(kind: .exprStmt(call), span: span)
+                    return NOIRStmt(kind: .exprStmt(call), span: span)
                 }
                 if case .named(let tn, let kind) = b.type, let info = computedProps[tn]?[field] {
                     guard info.hasSetter else {
                         diags.error("cannot assign to read-only computed property '\(field)'", at: span)
-                        return IRStmt(kind: .exprStmt(checkExpr(rhs, expected: info.type)), span: span)
+                        return NOIRStmt(kind: .exprStmt(checkExpr(rhs, expected: info.type)), span: span)
                     }
                     let value = checkExpr(rhs, expected: info.type)
                     // The setter mutates the value; on a value type it needs a mutable receiver.
@@ -993,38 +993,38 @@ public struct Sema {
                         methodCallSites.append(CallSite(callee: "\(tn).\(field).set",
                                                         receiverMutable: isMutableReceiver(base), span: span))
                     }
-                    let call = IRExpr(type: .void, span: span,
+                    let call = NOIRExpr(type: .void, span: span,
                                       kind: .methodCall(receiver: b, method: "\(field).set", args: [value]))
-                    return IRStmt(kind: .exprStmt(call), span: span)
+                    return NOIRStmt(kind: .exprStmt(call), span: span)
                 }
                 let ftype = fieldType(of: b.type, field: field, at: mspan)
-                let target = IRExpr(type: ftype, span: mspan, kind: .fieldAccess(base: b, field: field))
+                let target = NOIRExpr(type: ftype, span: mspan, kind: .fieldAccess(base: b, field: field))
                 rejectLetFieldTarget(target)
                 let value = coerce(checkExpr(rhs, expected: ftype), to: ftype)
                 checkAssignable(value.type, to: ftype, role: "assign", at: span)
-                return IRStmt(kind: .assign(target: target, value: value), span: span)
+                return NOIRStmt(kind: .assign(target: target, value: value), span: span)
             }
             let target = checkExpr(lhs)
             rejectLetFieldTarget(target)
             let value = coerce(checkExpr(rhs, expected: target.type), to: target.type)
             checkAssignable(value.type, to: target.type, role: "assign", at: span)
-            return IRStmt(kind: .assign(target: target, value: value), span: span)
+            return NOIRStmt(kind: .assign(target: target, value: value), span: span)
 
         case .compoundAssign(let lhs, let rhs, let span):
             if case .member(let base, let field, let mspan) = lhs {
                 let b = checkExpr(base)
                 if case .named(let tn, _) = b.type, computedProps[tn]?[field] != nil {
                     diags.error("compound assignment ('+=') to a computed property is not supported yet", at: span)
-                    return IRStmt(kind: .exprStmt(checkExpr(rhs)), span: span)
+                    return NOIRStmt(kind: .exprStmt(checkExpr(rhs)), span: span)
                 }
                 let ftype = fieldType(of: b.type, field: field, at: mspan)
-                let target = IRExpr(type: ftype, span: mspan, kind: .fieldAccess(base: b, field: field))
+                let target = NOIRExpr(type: ftype, span: mspan, kind: .fieldAccess(base: b, field: field))
                 rejectLetFieldTarget(target)
-                return IRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
+                return NOIRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
             }
             let target = checkExpr(lhs)
             rejectLetFieldTarget(target)
-            return IRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
+            return NOIRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
 
         case .ret(let e, let span):
             // A `some I` return is not a coercion target — it yields the concrete value
@@ -1032,43 +1032,43 @@ public struct Sema {
             if case .opaque(let ifaces, let owner) = currentReturnType {
                 let v = e.map { checkExpr($0) }
                 if let v { recordOpaque(v, interfaces: ifaces, owner: owner, at: span) }
-                return IRStmt(kind: .ret(v), span: span)
+                return NOIRStmt(kind: .ret(v), span: span)
             }
             let ret = e.map { coerce(checkExpr($0, expected: currentReturnType), to: currentReturnType) }
             if let ret { checkAssignable(ret.type, to: currentReturnType, role: "return", at: span) }
-            return IRStmt(kind: .ret(ret), span: span)
+            return NOIRStmt(kind: .ret(ret), span: span)
 
         case .ifStmt(let s):
             let cond = checkExpr(s.cond)
             let then = lowerBlock(s.thenBody)
             let els = s.elseBody.map { lowerBlock($0) }
-            return IRStmt(kind: .ifStmt(cond: cond, then: then, else: els), span: s.span)
+            return NOIRStmt(kind: .ifStmt(cond: cond, then: then, else: els), span: s.span)
 
         case .whileStmt(let s):
             let cond = checkExpr(s.cond)
             loopDepth += 1
             let body = lowerBlock(s.body)
             loopDepth -= 1
-            return IRStmt(kind: .whileStmt(cond: cond, body: body), span: s.span)
+            return NOIRStmt(kind: .whileStmt(cond: cond, body: body), span: s.span)
 
         case .breakStmt(let span):
             if loopDepth == 0 { diags.error("'break' outside a loop", at: span) }
-            return IRStmt(kind: .breakStmt, span: span)
+            return NOIRStmt(kind: .breakStmt, span: span)
 
         case .continueStmt(let span):
             if loopDepth == 0 { diags.error("'continue' outside a loop", at: span) }
-            return IRStmt(kind: .continueStmt, span: span)
+            return NOIRStmt(kind: .continueStmt, span: span)
 
         case .switchStmt(let sw):
-            return IRStmt(kind: .switchStmt(lowerSwitch(sw)), span: sw.span)
+            return NOIRStmt(kind: .switchStmt(lowerSwitch(sw)), span: sw.span)
 
         case .expr(let e):
             let ir = checkExpr(e)
-            return IRStmt(kind: .exprStmt(ir), span: ir.span)
+            return NOIRStmt(kind: .exprStmt(ir), span: ir.span)
         }
     }
 
-    private mutating func lowerSwitch(_ sw: SwitchStmt) -> IRSwitch {
+    private mutating func lowerSwitch(_ sw: SwitchStmt) -> NOIRSwitch {
         let subject = checkExpr(sw.subject)
         // The subject's enum, if any, gives payload binding types. An applied generic enum
         // (`Option<Int>`) substitutes its type arguments into each payload binding (M5 5.2.3).
@@ -1086,20 +1086,20 @@ public struct Sema {
         let savedScope = genericScope
         if let g = enumDecl?.generics, !g.isEmpty { genericScope = Set(g.map(\.name)) }
         defer { genericScope = savedScope }
-        var arms: [IRCaseArm] = []
+        var arms: [NOIRCaseArm] = []
         for arm in sw.cases {
             guard case .enumCase(let name, let names, _) = arm.pattern else { continue }
             let caseDecl = enumDecl?.cases.first { $0.name == name }
-            let bindings: [IRBinding] = zip(names, caseDecl?.fields ?? []).map {
-                IRBinding(name: $0.0, type: substitute(resolve($0.1.type), enumSubst))
+            let bindings: [NOIRBinding] = zip(names, caseDecl?.fields ?? []).map {
+                NOIRBinding(name: $0.0, type: substitute(resolve($0.1.type), enumSubst))
             }
             pushScope()
             for b in bindings { declare(b.name, b.type) }
             let body = lowerBlock(arm.body)
             popScope()
-            arms.append(IRCaseArm(caseName: name, bindings: bindings, body: body, span: arm.span))
+            arms.append(NOIRCaseArm(caseName: name, bindings: bindings, body: body, span: arm.span))
         }
-        return IRSwitch(subject: subject, arms: arms)
+        return NOIRSwitch(subject: subject, arms: arms)
     }
 
     // MARK: - Expressions
@@ -1119,7 +1119,7 @@ public struct Sema {
         }
     }
 
-    private mutating func coerce(_ e: IRExpr, to expected: Type?) -> IRExpr {
+    private mutating func coerce(_ e: NOIRExpr, to expected: Type?) -> NOIRExpr {
         let target: [String]
         switch expected {
         case .existential(let iface): target = [iface]
@@ -1133,7 +1133,7 @@ public struct Sema {
             let missing = target.filter { conformsTo[t]?.contains($0) != true }
             if missing.isEmpty {
                 if target.count > 1 { recordComposite(t, kind, target) }
-                return IRExpr(type: expected!, span: e.span, kind: .box(value: e, interfaces: target))
+                return NOIRExpr(type: expected!, span: e.span, kind: .box(value: e, interfaces: target))
             }
             diags.error("type '\(t)' does not conform to '\(missing.joined(separator: " & "))'", at: e.span)
             return e
@@ -1141,7 +1141,7 @@ public struct Sema {
             // `any B` → `any A` where B refines A: re-box through the source witness's base
             // pointer (M5 A1.4). Composition targets/sources stay unsupported for now.
             if target.count == 1, target[0] == src || transitiveBases(src).contains(target[0]) {
-                return IRExpr(type: expected!, span: e.span, kind: .box(value: e, interfaces: target))
+                return NOIRExpr(type: expected!, span: e.span, kind: .box(value: e, interfaces: target))
             }
             diags.error("cannot convert 'any \(src)' to 'any \(target.joined(separator: " & "))' — 'any B' only widens to a base interface of B", at: e.span)
             return e
@@ -1159,7 +1159,7 @@ public struct Sema {
     // Validate and record the hidden underlying of a `some I` site (M5 A3): the value must be
     // a concrete type conforming to every listed interface, and — across a function's returns —
     // must be the *same* concrete type each time (the one underlying).
-    private mutating func recordOpaque(_ v: IRExpr, interfaces: [String], owner: String, at span: Span) {
+    private mutating func recordOpaque(_ v: NOIRExpr, interfaces: [String], owner: String, at span: Span) {
         // Look through an opaque initializer/return to its concrete underlying (M5 A3): a
         // `some I` value can be produced by returning / binding another opaque of a known
         // underlying, not only a concrete literal.
@@ -1190,23 +1190,23 @@ public struct Sema {
     private mutating func recordComposite(_ typeName: String, _ kind: NamedKind, _ ifaces: [String]) {
         let key = "\(typeName):\(ifaces.joined(separator: "&"))"
         if compositePairs.insert(key).inserted {
-            compositeList.append(IRComposite(typeName: typeName, typeKind: kind, interfaces: ifaces))
+            compositeList.append(NOIRComposite(typeName: typeName, typeKind: kind, interfaces: ifaces))
         }
     }
 
     // `expected` carries a contextual type inward (binding annotation, return
     // position, call-argument slot) so leading-dot `.case` construction can infer
     // its enum (M4.10). nil elsewhere; most expressions ignore it.
-    private mutating func checkExpr(_ e: Expr, expected: Type? = nil) -> IRExpr {
+    private mutating func checkExpr(_ e: Expr, expected: Type? = nil) -> NOIRExpr {
         switch e {
-        case .intLit(let v, let span):    return IRExpr(type: .int,    span: span, kind: .intLit(v))
-        case .doubleLit(let v, let span): return IRExpr(type: .double, span: span, kind: .doubleLit(v))
-        case .boolLit(let v, let span):   return IRExpr(type: .bool,   span: span, kind: .boolLit(v))
-        case .stringLit(let v, let span): return IRExpr(type: .string, span: span, kind: .stringLit(v))
+        case .intLit(let v, let span):    return NOIRExpr(type: .int,    span: span, kind: .intLit(v))
+        case .doubleLit(let v, let span): return NOIRExpr(type: .double, span: span, kind: .doubleLit(v))
+        case .boolLit(let v, let span):   return NOIRExpr(type: .bool,   span: span, kind: .boolLit(v))
+        case .stringLit(let v, let span): return NOIRExpr(type: .string, span: span, kind: .stringLit(v))
 
         case .ident(let name, let span):
             if let t = lookup(name) {
-                return IRExpr(type: t, span: span, kind: .varRef(name))
+                return NOIRExpr(type: t, span: span, kind: .varRef(name))
             }
             // Bare access to a property member of `self` — `p` means `self.p` (M5). Fires for
             // an interface default (self: interface, a property requirement) and for a computed
@@ -1215,16 +1215,16 @@ public struct Sema {
                 return checkExpr(.member(.ident("self", span: span), name, span: span))
             }
             if let sig = funcs[name] {
-                return IRExpr(type: .function(params: sig.params, ret: sig.ret), span: span, kind: .varRef(name))
+                return NOIRExpr(type: .function(params: sig.params, ret: sig.ret), span: span, kind: .varRef(name))
             }
             diags.error("undefined name '\(name)'", at: span)
-            return IRExpr(type: .error, span: span, kind: .varRef(name))
+            return NOIRExpr(type: .error, span: span, kind: .varRef(name))
 
         case .genericIdent(let name, _, let span):
             // Reached only when `Name<Args>` is used somewhere other than a construction or a
             // qualified enum case (those are intercepted by checkCall / the `.member` branch).
             diags.error("type arguments on '\(name)' are only valid when constructing it, e.g. '\(name)<...>(...)' or '\(name)<...>.case(...)'", at: span)
-            return IRExpr(type: .error, span: span, kind: .varRef(name))
+            return NOIRExpr(type: .error, span: span, kind: .varRef(name))
 
         case .member(let base, let field, let span):
             // Qualified no-payload enum construction: `EnumType.case` / `EnumType<Args>.case`.
@@ -1256,13 +1256,13 @@ public struct Sema {
                     return BuiltinsSema.member("__array_count_int", b, span)
                 default:
                     diags.error("value of type '\(b.type)' has no member '\(field)'", at: span)
-                    return IRExpr(type: .error, span: span, kind: .intLit(0))
+                    return NOIRExpr(type: .error, span: span, kind: .intLit(0))
                 }
             }
             // A property-requirement read through `any I` / `any A & B` — via the getter slot.
             if let iface = existentialInterfaces(b.type).first(where: { aggregatedProperties($0).contains { $0.name == field } }),
                let prop = aggregatedProperties(iface).first(where: { $0.name == field }) {
-                return IRExpr(type: resolve(prop.type), span: span,
+                return NOIRExpr(type: resolve(prop.type), span: span,
                               kind: .methodCall(receiver: b, method: "\(field).get", args: []))
             }
             // A property-requirement read through `some I` — statically dispatched to the hidden
@@ -1274,34 +1274,34 @@ public struct Sema {
                let iface = ifaces.first(where: { aggregatedProperties($0).contains { $0.name == field } }),
                let prop = aggregatedProperties(iface).first(where: { $0.name == field }) {
                 let ty = resolve(prop.type, selfAs: opaqueUnderlyings[owner] ?? b.type)
-                return IRExpr(type: ty, span: span, kind: .methodCall(receiver: b, method: "\(field).get", args: []))
+                return NOIRExpr(type: ty, span: span, kind: .methodCall(receiver: b, method: "\(field).get", args: []))
             }
             // A property-requirement read through a bounded type parameter `T: I` — via the
             // bound's witness getter slot (M5 5.2.2).
             if case .typeParam(let t) = b.type,
                let iface = (genericBounds[t] ?? []).first(where: { aggregatedProperties($0).contains { $0.name == field } }),
                let prop = aggregatedProperties(iface).first(where: { $0.name == field }) {
-                return IRExpr(type: resolve(prop.type, selfAs: b.type), span: span,
+                return NOIRExpr(type: resolve(prop.type, selfAs: b.type), span: span,
                               kind: .methodCall(receiver: b, method: "\(field).get", args: []))
             }
             // A property-requirement read inside an interface default (self: interface).
             if case .named(let tn, .interface_) = b.type,
                let prop = aggregatedProperties(tn).first(where: { $0.name == field }) {
-                return IRExpr(type: resolve(prop.type), span: span, kind: .fieldAccess(base: b, field: field))
+                return NOIRExpr(type: resolve(prop.type), span: span, kind: .fieldAccess(base: b, field: field))
             }
             // A computed-property read lowers to a getter accessor call (M5 A1).
             if case .named(let tn, _) = b.type, let info = computedProps[tn]?[field] {
-                return IRExpr(type: info.type, span: span,
+                return NOIRExpr(type: info.type, span: span,
                               kind: .methodCall(receiver: b, method: "\(field).get", args: []))
             }
             // A field read on an applied generic type `Box<Int>` (M5 5.2.3): the field is stored
             // boxed; its declared `T` substitutes to the concrete argument for the result type.
             if case .generic(let gbase, let gargs) = b.type {
                 let type = genericMemberType(gbase, gargs, field, at: span)
-                return IRExpr(type: type, span: span, kind: .fieldAccess(base: b, field: field))
+                return NOIRExpr(type: type, span: span, kind: .fieldAccess(base: b, field: field))
             }
             let type = fieldType(of: b.type, field: field, at: span)
-            return IRExpr(type: type, span: span, kind: .fieldAccess(base: b, field: field))
+            return NOIRExpr(type: type, span: span, kind: .fieldAccess(base: b, field: field))
 
         case .implicitMember(let name, let span):
             return buildImplicitEnum(name, [], expected: expected, at: span)
@@ -1309,13 +1309,13 @@ public struct Sema {
         case .binary(let op, let l, let r, let span):
             let lhs = checkExpr(l), rhs = checkExpr(r)
             let type = binaryResult(op, lhs, rhs, at: span)
-            return IRExpr(type: type, span: span, kind: .binary(op, lhs, rhs))
+            return NOIRExpr(type: type, span: span, kind: .binary(op, lhs, rhs))
 
         case .call(let callee, let args, let span):
             return checkCall(callee: callee, args: args, span: span, expected: expected)
 
         case .closure(let params, let ret, let body, let span):
-            let ps = params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+            let ps = params.map { NOIRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
             let retTy = resolve(ret)
             pushScope()
             for p in ps { declare(p.name, p.type) }
@@ -1326,7 +1326,7 @@ public struct Sema {
             currentReturnType = saved
             popScope()
             let type = Type.function(params: ps.map(\.type), ret: retTy)
-            return IRExpr(type: type, span: span, kind: .closure(params: ps, body: irBody))
+            return NOIRExpr(type: type, span: span, kind: .closure(params: ps, body: irBody))
 
         case .arrayLit(let elems, let span):
             // Element type: unify the elements' types, or take it from an `Array<T>` annotation on
@@ -1343,7 +1343,7 @@ public struct Sema {
             for ir in irElems where ir.type != .error && ir.type != elemTy! {
                 diags.error("array element has type '\(ir.type)', expected '\(elemTy!)'", at: ir.span)
             }
-            return IRExpr(type: .array(elemTy!), span: span, kind: .arrayLit(elements: irElems))
+            return NOIRExpr(type: .array(elemTy!), span: span, kind: .arrayLit(elements: irElems))
 
         case .index(let base, let idx, let span):
             let irBase = checkExpr(base)
@@ -1355,22 +1355,22 @@ public struct Sema {
                 if irBase.type != .error {
                     diags.error("cannot subscript a value of type '\(irBase.type)' — only 'Array<T>' supports '[ ]'", at: span)
                 }
-                return IRExpr(type: .error, span: span, kind: .index(base: irBase, idx: irIdx))
+                return NOIRExpr(type: .error, span: span, kind: .index(base: irBase, idx: irIdx))
             }
-            return IRExpr(type: elem, span: span, kind: .index(base: irBase, idx: irIdx))
+            return NOIRExpr(type: elem, span: span, kind: .index(base: irBase, idx: irIdx))
 
         case .error(let span):
             // A parser error-recovery placeholder. The driver stops before Sema when the
             // parse sink holds errors, so this is unreachable in the normal flow; type it
             // `.error` (which suppresses further diagnostics) and emit no new diagnostic.
-            return IRExpr(type: .error, span: span, kind: .intLit(0))
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
         }
     }
 
     // A call to a generic function (M5 5.2.2): infer each type parameter from the arguments,
     // check every inferred type satisfies the parameter's bounds (a witness must exist), and
     // record the inferred type arguments so codegen can pass the witnesses.
-    private mutating func checkGenericCall(_ name: String, _ sig: FnSig, _ args: [IRArg], at span: Span) -> IRExpr {
+    private mutating func checkGenericCall(_ name: String, _ sig: FnSig, _ args: [NOIRArg], at span: Span) -> NOIRExpr {
         if args.count != sig.params.count {
             diags.error("function '\(name)' expects \(sig.params.count) argument(s), got \(args.count)", at: span)
         }
@@ -1398,7 +1398,7 @@ public struct Sema {
         }
         let typeArgs = sig.generics.map { subst[$0.name] ?? .error }
         let calleeType = Type.function(params: sig.params, ret: sig.ret)
-        return IRExpr(type: substitute(sig.ret, subst), span: span,
+        return NOIRExpr(type: substitute(sig.ret, subst), span: span,
                       kind: .call(callee: irVar(name, calleeType, span), args: args, typeArgs: typeArgs))
     }
 
@@ -1503,10 +1503,10 @@ public struct Sema {
 
     // `Box(value: e)` — infer each type parameter by unifying the field's declared type
     // (a `T` resolves to `.typeParam`) against the argument, then bound-check (M5 5.2.3).
-    private mutating func checkGenericConstruct(_ name: String, _ args: [Arg], explicit: [Type]? = nil, at span: Span) -> IRExpr {
+    private mutating func checkGenericConstruct(_ name: String, _ args: [Arg], explicit: [Type]? = nil, at span: Span) -> NOIRExpr {
         guard let shape = genericTypeShape(name) else {
             diags.error("generic enum '\(name)' is constructed through one of its cases, e.g. '\(name).case(...)'", at: span)
-            return IRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
+            return NOIRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
         }
         let saved = genericScope; genericScope = Set(shape.generics.map(\.name)); defer { genericScope = saved }
         var subst: [String: Type] = [:]
@@ -1519,7 +1519,7 @@ public struct Sema {
                 for (p, a) in zip(shape.generics, explicit) { subst[p.name] = a }
             }
         }
-        var irArgs: [IRArg] = []
+        var irArgs: [NOIRArg] = []
         for f in shape.fields {
             let fieldTy = resolve(f.type)
             let expected: Type? = { if case .typeParam = fieldTy { return nil }; return fieldTy }()
@@ -1528,10 +1528,10 @@ public struct Sema {
             }
             let v = checkExpr(arg.value, expected: expected)
             unify(param: fieldTy, arg: v.type, into: &subst, at: span)
-            irArgs.append(IRArg(label: f.name, value: v))
+            irArgs.append(NOIRArg(label: f.name, value: v))
         }
         let typeArgs = inferredTypeArgs(shape.generics, subst, owner: name, at: span)
-        return IRExpr(type: .generic(base: name, args: typeArgs), span: span,
+        return NOIRExpr(type: .generic(base: name, args: typeArgs), span: span,
                       kind: .construct(typeName: name, args: irArgs))
     }
 
@@ -1567,7 +1567,7 @@ public struct Sema {
         return substitute(resolve(f.type), subst)
     }
 
-    private mutating func checkCall(callee: Expr, args: [Arg], span: Span, expected: Type? = nil) -> IRExpr {
+    private mutating func checkCall(callee: Expr, args: [Arg], span: Span, expected: Type? = nil) -> NOIRExpr {
         // Qualified enum construction: `EnumType.case(args)` or `EnumType<Args>.case(args)`.
         if case .member(let base, let caseName, _) = callee,
            let (typeName, explicit) = typeNameAndArgs(base), lookup(typeName) == nil, enums[typeName] != nil {
@@ -1587,16 +1587,16 @@ public struct Sema {
                 case "append":
                     guard args.count == 1 else {
                         diags.error("Array.append expects 1 argument, got \(args.count)", at: span)
-                        return IRExpr(type: .error, span: span, kind: .intLit(0))
+                        return NOIRExpr(type: .error, span: span, kind: .intLit(0))
                     }
                     let value = coerce(checkExpr(args[0].value, expected: elem), to: elem)
                     checkAssignable(value.type, to: elem, role: "argument", at: span)
-                    let ac = IRExpr(type: .void, span: span, kind: .varRef("__arrayAppend"))
-                    return IRExpr(type: .void, span: span, kind: .call(callee: ac,
-                        args: [IRArg(label: nil, value: recv), IRArg(label: nil, value: value)], typeArgs: []))
+                    let ac = NOIRExpr(type: .void, span: span, kind: .varRef("__arrayAppend"))
+                    return NOIRExpr(type: .void, span: span, kind: .call(callee: ac,
+                        args: [NOIRArg(label: nil, value: recv), NOIRArg(label: nil, value: value)], typeArgs: []))
                 default:
                     diags.error("value of type '\(recv.type)' has no method '\(name)'", at: span)
-                    return IRExpr(type: .error, span: span, kind: .intLit(0))
+                    return NOIRExpr(type: .error, span: span, kind: .intLit(0))
                 }
             }
             // String method builtins. `eq(other)` is byte equality (there is no `==` on String yet).
@@ -1605,7 +1605,7 @@ public struct Sema {
                 case "eq":
                     guard args.count == 1 else {
                         diags.error("String.eq expects 1 argument, got \(args.count)", at: span)
-                        return IRExpr(type: .error, span: span, kind: .boolLit(false))
+                        return NOIRExpr(type: .error, span: span, kind: .boolLit(false))
                     }
                     let rhs = checkExpr(args[0].value)
                     if rhs.type != .string && rhs.type != .error {
@@ -1614,7 +1614,7 @@ public struct Sema {
                     return BuiltinsSema.method("__string_eq_bool_string", recv, [rhs], span)
                 default:
                     diags.error("value of type 'String' has no method '\(name)'", at: span)
-                    return IRExpr(type: .error, span: span, kind: .boolLit(false))
+                    return NOIRExpr(type: .error, span: span, kind: .boolLit(false))
                 }
             }
             // A method-requirement call through `any I` / `any A & B` — dispatched via the
@@ -1626,7 +1626,7 @@ public struct Sema {
                 // `any B` yields `any B` (M5 5.6). Params are `Self`-free here (a contravariant
                 // `Self` would have made the interface non-existential-legal).
                 checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: recv.type) }, at: span)
-                return IRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
+                return NOIRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
                               kind: .methodCall(receiver: recv, method: name, args: irArgs))
             }
             // A method-requirement call through `some I` — statically dispatched to the hidden
@@ -1639,7 +1639,7 @@ public struct Sema {
                 let irArgs = args.map { checkExpr($0.value) }
                 let selfBind = opaqueUnderlyings[owner] ?? recv.type
                 checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: selfBind) }, at: span)
-                return IRExpr(type: resolve(req.returnType, selfAs: selfBind), span: span,
+                return NOIRExpr(type: resolve(req.returnType, selfAs: selfBind), span: span,
                               kind: .methodCall(receiver: recv, method: name, args: irArgs))
             }
             // A requirement call through a bounded type parameter `T: I` — dispatched via the
@@ -1649,7 +1649,7 @@ public struct Sema {
                let req = aggregatedMethods(iface).first(where: { $0.name == name }) {
                 let irArgs = args.map { checkExpr($0.value) }
                 checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: recv.type) }, at: span)
-                return IRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
+                return NOIRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
                               kind: .methodCall(receiver: recv, method: name, args: irArgs))
             }
             if case .named(let typeName, let kind) = recv.type {
@@ -1657,7 +1657,7 @@ public struct Sema {
                 if kind == .actor_, let handler = actors[typeName]?.handlers.first(where: { $0.name == name }) {
                     let irArgs = args.map { checkExpr($0.value) }
                     checkArgTypes(irArgs, against: handler.params.map { resolve($0.type) }, at: span)
-                    return IRExpr(type: resolve(handler.returnType), span: span,
+                    return NOIRExpr(type: resolve(handler.returnType), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
                 // Requirement call inside an interface default (self: interface). `Self` in the
@@ -1665,7 +1665,7 @@ public struct Sema {
                 if kind == .interface_, let req = interfaceMethod(typeName, name) {
                     let irArgs = args.map { checkExpr($0.value) }
                     checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: recv.type) }, at: span)
-                    return IRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
+                    return NOIRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
                 // Instance method on a struct/enum/class value.
@@ -1678,7 +1678,7 @@ public struct Sema {
                         methodCallSites.append(CallSite(callee: "\(typeName).\(name)",
                                                         receiverMutable: isMutableReceiver(base), span: span))
                     }
-                    return IRExpr(type: resolve(method.returnType), span: span,
+                    return NOIRExpr(type: resolve(method.returnType), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
                 // A default requirement this type inherits (synthesized as a concrete method).
@@ -1686,22 +1686,22 @@ public struct Sema {
                 if let req = (inheritedDefaults[typeName] ?? []).first(where: { $0.name == name }) {
                     let irArgs = args.map { checkExpr($0.value) }
                     checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: recv.type) }, at: span)
-                    return IRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
+                    return NOIRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
             }
             if recv.type != .error {
                 diags.error("value of type '\(recv.type)' has no method '\(name)'", at: span)
             }
-            return IRExpr(type: .error, span: span, kind: .methodCall(receiver: recv, method: name,
+            return NOIRExpr(type: .error, span: span, kind: .methodCall(receiver: recv, method: name,
                                                                        args: args.map { checkExpr($0.value) }))
         }
 
         if case .ident(let name, _) = callee {
             // print — accepts zero or one arg of any printable type.
             if name == "print" {
-                let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
-                return IRExpr(type: .void, span: span, kind: .call(callee: irVar(name, .void, span), args: irArgs, typeArgs: []))
+                let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr($0.value)) }
+                return NOIRExpr(type: .void, span: span, kind: .call(callee: irVar(name, .void, span), args: irArgs, typeArgs: []))
             }
             // Construction of a generic type — infer the type arguments from the fields (M5 5.2.3).
             if genericArity(name) != nil {
@@ -1709,19 +1709,19 @@ public struct Sema {
             }
             // Construction: TypeName(...) for struct/class/actor.
             if let k = kindOf(name), k != .enum_ {
-                let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
-                return IRExpr(type: .named(name, k), span: span, kind: .construct(typeName: name, args: irArgs))
+                let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr($0.value)) }
+                return NOIRExpr(type: .named(name, k), span: span, kind: .construct(typeName: name, args: irArgs))
             }
             // Named function / non-print builtin.
             if let sig = funcs[name] {
                 if !sig.generics.isEmpty {
-                    let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
+                    let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr($0.value)) }
                     return checkGenericCall(name, sig, irArgs, at: span)
                 }
                 let irArgs = checkArgs(args, expectedParams: sig.params)
                 checkArgTypes(irArgs.map(\.value), against: sig.params, at: span)
                 let calleeType = Type.function(params: sig.params, ret: sig.ret)
-                return IRExpr(type: sig.ret, span: span, kind: .call(callee: irVar(name, calleeType, span), args: irArgs, typeArgs: []))
+                return NOIRExpr(type: sig.ret, span: span, kind: .call(callee: irVar(name, calleeType, span), args: irArgs, typeArgs: []))
             }
         }
 
@@ -1733,22 +1733,22 @@ public struct Sema {
             }
             if enums[name] != nil {
                 diags.error("generic enum '\(name)' is constructed through a case, e.g. '\(name)<...>.case(...)'", at: span)
-                return IRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
+                return NOIRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
             }
             diags.error("'\(name)' is not a generic type; explicit type arguments are not allowed here", at: span)
-            return IRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
+            return NOIRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
         }
 
         // Fallback: type the callee; call it if it is a function value.
         let c = checkExpr(callee)
-        let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
+        let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr($0.value)) }
         if case .function(_, let ret) = c.type {
-            return IRExpr(type: ret, span: span, kind: .call(callee: c, args: irArgs, typeArgs: []))
+            return NOIRExpr(type: ret, span: span, kind: .call(callee: c, args: irArgs, typeArgs: []))
         }
         if c.type != .error {
             diags.error("value of type '\(c.type)' is not callable", at: span)
         }
-        return IRExpr(type: .error, span: span, kind: .call(callee: c, args: irArgs, typeArgs: []))
+        return NOIRExpr(type: .error, span: span, kind: .call(callee: c, args: irArgs, typeArgs: []))
     }
 
     // MARK: - Type checks
@@ -1756,7 +1756,7 @@ public struct Sema {
     // Assigning to a `let` field is rejected (M4.10 field-level immutability). Bare
     // field writes inside methods are already caught by the AST Typechecker (self is
     // read-only); this covers `value.field = …` targets on struct/class values.
-    private func rejectLetFieldTarget(_ target: IRExpr) {
+    private func rejectLetFieldTarget(_ target: NOIRExpr) {
         guard case .fieldAccess(let base, let field) = target.kind else { return }
         let typeName: String
         switch base.type {
@@ -1791,7 +1791,7 @@ public struct Sema {
         return .error
     }
 
-    private func binaryResult(_ op: BinOp, _ lhs: IRExpr, _ rhs: IRExpr, at span: Span) -> Type {
+    private func binaryResult(_ op: BinOp, _ lhs: NOIRExpr, _ rhs: NOIRExpr, at span: Span) -> Type {
         switch op {
         case .add, .sub, .mul, .div, .mod:
             // Arithmetic is Int or Double, with no implicit conversion between them: both
@@ -1819,7 +1819,7 @@ public struct Sema {
     // Comparison operators are numeric-only for now (a holistic operator design comes later).
     // Relational (`< > <= >=`) allows Int/Double; equality (`== !=`) also allows Bool. Both sides
     // must be the same type. Strings compare with `.eq`, not `==`; aggregates have no operator yet.
-    private func checkComparison(_ lhs: IRExpr, _ rhs: IRExpr, equality: Bool, at span: Span) {
+    private func checkComparison(_ lhs: NOIRExpr, _ rhs: NOIRExpr, equality: Bool, at span: Span) {
         if lhs.type == .error || rhs.type == .error { return }
         let allowed: [Type] = equality ? [.int, .double, .bool] : [.int, .double]
         if lhs.type != rhs.type {
@@ -1836,7 +1836,7 @@ public struct Sema {
         }
     }
 
-    private func checkArgTypes(_ args: [IRExpr], against params: [Type], at span: Span) {
+    private func checkArgTypes(_ args: [NOIRExpr], against params: [Type], at span: Span) {
         if args.count != params.count {
             diags.error("expected \(params.count) argument(s), got \(args.count)", at: span)
             return
@@ -1848,18 +1848,18 @@ public struct Sema {
 
     // Check call args, threading a per-position expected type inward (for leading-dot
     // enum inference); `expectedParams` is nil where the slots aren't known.
-    private mutating func checkArgs(_ args: [Arg], expectedParams: [Type]?) -> [IRArg] {
-        var out: [IRArg] = []
+    private mutating func checkArgs(_ args: [Arg], expectedParams: [Type]?) -> [NOIRArg] {
+        var out: [NOIRArg] = []
         for (i, a) in args.enumerated() {
             let exp = expectedParams.flatMap { i < $0.count ? $0[i] : nil }
-            out.append(IRArg(label: a.label, value: coerce(checkExpr(a.value, expected: exp), to: exp)))
+            out.append(NOIRArg(label: a.label, value: coerce(checkExpr(a.value, expected: exp), to: exp)))
         }
         return out
     }
 
     // Leading-dot `.case(...)`: resolve the enum from the expected type, then build. The
     // context may name a concrete enum (`.named`) or an applied generic one (`.generic`, M5 5.2.3).
-    private mutating func buildImplicitEnum(_ caseName: String, _ args: [Arg], expected: Type?, at span: Span) -> IRExpr {
+    private mutating func buildImplicitEnum(_ caseName: String, _ args: [Arg], expected: Type?, at span: Span) -> NOIRExpr {
         let enumName: String?
         switch expected {
         case .named(let n, .enum_) where enums[n] != nil:    enumName = n
@@ -1868,8 +1868,8 @@ public struct Sema {
         }
         guard let enumName else {
             diags.error("cannot infer enum type for '.\(caseName)' here", at: span)
-            let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
-            return IRExpr(type: .error, span: span, kind: .enumInit(typeName: "", caseName: caseName, args: irArgs))
+            let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr($0.value)) }
+            return NOIRExpr(type: .error, span: span, kind: .enumInit(typeName: "", caseName: caseName, args: irArgs))
         }
         return buildEnumInit(enumName, caseName, args, expected: expected, at: span)
     }
@@ -1878,11 +1878,11 @@ public struct Sema {
     // generic enum (`Option<T>`) the type argument is inferred from the payload — and, for a
     // no-payload case like `.none`, seeded from the expected type context (M5 5.2.3).
     private mutating func buildEnumInit(_ enumName: String, _ caseName: String, _ args: [Arg],
-                                        explicit: [Type]? = nil, expected: Type? = nil, at span: Span) -> IRExpr {
+                                        explicit: [Type]? = nil, expected: Type? = nil, at span: Span) -> NOIRExpr {
         guard let caseDecl = enums[enumName]?.cases.first(where: { $0.name == caseName }) else {
             diags.error("enum '\(enumName)' has no case '\(caseName)'", at: span)
-            let irArgs = args.map { IRArg(label: $0.label, value: checkExpr($0.value)) }
-            return IRExpr(type: .named(enumName, .enum_), span: span, kind: .enumInit(typeName: enumName, caseName: caseName, args: irArgs))
+            let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr($0.value)) }
+            return NOIRExpr(type: .named(enumName, .enum_), span: span, kind: .enumInit(typeName: enumName, caseName: caseName, args: irArgs))
         }
         if let generics = enums[enumName]?.generics, !generics.isEmpty {
             return buildGenericEnumInit(enumName, generics, caseDecl, args, explicit: explicit, expected: expected, at: span)
@@ -1891,7 +1891,7 @@ public struct Sema {
             diags.error("enum '\(enumName)' is not generic; type arguments are not allowed", at: span)
         }
         let irArgs = matchEnumArgs(args, fields: caseDecl.fields, case: caseName, at: span)
-        return IRExpr(type: .named(enumName, .enum_), span: span,
+        return NOIRExpr(type: .named(enumName, .enum_), span: span,
                       kind: .enumInit(typeName: enumName, caseName: caseName, args: irArgs))
     }
 
@@ -1900,7 +1900,7 @@ public struct Sema {
     // case carries no payload, then bound-check — yielding a `.generic(base, args)` (M5 5.2.3).
     private mutating func buildGenericEnumInit(_ enumName: String, _ generics: [GenericParam],
                                                _ caseDecl: EnumCaseDecl, _ args: [Arg],
-                                               explicit: [Type]? = nil, expected: Type?, at span: Span) -> IRExpr {
+                                               explicit: [Type]? = nil, expected: Type?, at span: Span) -> NOIRExpr {
         let saved = genericScope; genericScope = Set(generics.map(\.name)); defer { genericScope = saved }
         var subst: [String: Type] = [:]
         // Explicit type arguments (`Option<Int>.some(...)`) seed inference; the payload is then
@@ -1917,7 +1917,7 @@ public struct Sema {
         if args.count != caseDecl.fields.count {
             diags.error("case '\(caseDecl.name)' expects \(caseDecl.fields.count) argument(s), got \(args.count)", at: span)
         }
-        var irArgs: [IRArg] = []
+        var irArgs: [NOIRArg] = []
         for (i, field) in caseDecl.fields.enumerated() {
             let fieldTy = resolve(field.type)
             let expArg = substitute(fieldTy, subst)
@@ -1925,20 +1925,20 @@ public struct Sema {
             guard let arg = args.first(where: { $0.label == field.name }) ?? (i < args.count ? args[i] : nil) else { continue }
             let v = checkExpr(arg.value, expected: hint)
             unify(param: fieldTy, arg: v.type, into: &subst, at: span)
-            irArgs.append(IRArg(label: field.name, value: v))
+            irArgs.append(NOIRArg(label: field.name, value: v))
         }
         let typeArgs = inferredTypeArgs(generics, subst, owner: enumName, at: span)
-        return IRExpr(type: .generic(base: enumName, args: typeArgs), span: span,
+        return NOIRExpr(type: .generic(base: enumName, args: typeArgs), span: span,
                       kind: .enumInit(typeName: enumName, caseName: caseDecl.name, args: irArgs))
     }
 
     // Pair payload args to the case's declared fields (by label, else by position),
     // type-checking each against its field; arity/type mismatches are diagnostics.
-    private mutating func matchEnumArgs(_ args: [Arg], fields: [VarField], case caseName: String, at span: Span) -> [IRArg] {
+    private mutating func matchEnumArgs(_ args: [Arg], fields: [VarField], case caseName: String, at span: Span) -> [NOIRArg] {
         if args.count != fields.count {
             diags.error("case '\(caseName)' expects \(fields.count) argument(s), got \(args.count)", at: span)
         }
-        var out: [IRArg] = []
+        var out: [NOIRArg] = []
         for (i, field) in fields.enumerated() {
             let fieldTy = resolve(field.type)
             guard let arg = args.first(where: { $0.label == field.name }) ?? (i < args.count ? args[i] : nil) else { continue }
@@ -1946,13 +1946,13 @@ public struct Sema {
             if v.type != fieldTy && v.type != .error && fieldTy != .error {
                 diags.error("argument of type '\(v.type)' does not match expected '\(fieldTy)'", at: v.span)
             }
-            out.append(IRArg(label: field.name, value: v))
+            out.append(NOIRArg(label: field.name, value: v))
         }
         return out
     }
 
-    private func irVar(_ name: String, _ type: Type, _ span: Span) -> IRExpr {
-        IRExpr(type: type, span: span, kind: .varRef(name))
+    private func irVar(_ name: String, _ type: Type, _ span: Span) -> NOIRExpr {
+        NOIRExpr(type: type, span: span, kind: .varRef(name))
     }
 
     // A mutable receiver for a mutating method call (M4.11, conservative first cut):

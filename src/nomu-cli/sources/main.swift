@@ -15,22 +15,22 @@ for arg in CommandLine.arguments.dropFirst() {
 
             options:
               --emit-ast         also emit the parsed AST (<name>.ast)
-              --emit-typedir     also emit the typed IR (<name>.typedir)
-              --stop=STAGE       halt after STAGE (ast | typedir | binary); default binary
+              --emit-noir        also emit NOIR, the Nomu typed IR (<name>.noir)
+              --stop=STAGE       halt after STAGE (ast | noir | binary); default binary
               -O, --release      optimize (LLVM -O2); default is a debug build
               -h, --help         show this help
             """)
         exit(0)
     case "--emit-ast":         options.ast = true
-    case "--emit-typedir":     options.typedIR = true
+    case "--emit-noir":        options.noir = true
     case "-O", "--release":    options.optimize = true
     case let a where a.hasPrefix("--stop="):
         switch String(a.dropFirst("--stop=".count)) {
         case "ast":     options.stopAt = .ast
-        case "typedir": options.stopAt = .typedIR
+        case "noir":    options.stopAt = .noir
         case "binary":  options.stopAt = .binary
         case let s:
-            fputs("error: unknown stage '\(s)' for --stop (expected ast, typedir, or binary)\n", stderr)
+            fputs("error: unknown stage '\(s)' for --stop (expected ast, noir, or binary)\n", stderr)
             exit(1)
         }
     default:

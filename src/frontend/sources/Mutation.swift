@@ -8,11 +8,11 @@
 // in `Sema`, where local `var`/`let` mutability is known.
 
 public struct MutationResult {
-    public let module: IRModule
+    public let module: NOIRModule
     public let mutating: Set<String>   // "TypeName.methodName" for each mutating method
 }
 
-public func analyzeMutation(_ module: IRModule, into diags: DiagnosticSink) -> MutationResult {
+public func analyzeMutation(_ module: NOIRModule, into diags: DiagnosticSink) -> MutationResult {
     let a = MutationAnalyzer(diags: diags)
     return a.run(module)
 }
@@ -25,7 +25,7 @@ private final class MutationAnalyzer {
 
     init(diags: DiagnosticSink) { self.diags = diags }
 
-    func run(_ module: IRModule) -> MutationResult {
+    func run(_ module: NOIRModule) -> MutationResult {
         for decl in module.decls {
             switch decl {
             case .structDecl(let s): fieldMut[s.name] = fieldDict(s.fields)
@@ -64,14 +64,14 @@ private final class MutationAnalyzer {
         return MutationResult(module: annotate(module, mutating: mutating), mutating: mutating)
     }
 
-    private func fieldDict(_ fs: [IRField]) -> [String: Bool] {
+    private func fieldDict(_ fs: [NOIRField]) -> [String: Bool] {
         var d: [String: Bool] = [:]
         for f in fs { d[f.name] = f.isMutable }
         return d
     }
 
-    private func allMethods(_ module: IRModule) -> [(String, IRFunc)] {
-        var out: [(String, IRFunc)] = []
+    private func allMethods(_ module: NOIRModule) -> [(String, NOIRFunc)] {
+        var out: [(String, NOIRFunc)] = []
         for decl in module.decls {
             switch decl {
             case .structDecl(let s): for m in s.methods { out.append((s.name, m)) }
@@ -85,11 +85,11 @@ private final class MutationAnalyzer {
 
     // MARK: - Scan a method body for field writes + self-method-calls
 
-    private func scan(_ stmts: [IRStmt], type: String, direct: inout Bool, selfCalls: inout Set<String>) {
+    private func scan(_ stmts: [NOIRStmt], type: String, direct: inout Bool, selfCalls: inout Set<String>) {
         for s in stmts { scanStmt(s, type: type, direct: &direct, selfCalls: &selfCalls) }
     }
 
-    private func scanStmt(_ stmt: IRStmt, type: String, direct: inout Bool, selfCalls: inout Set<String>) {
+    private func scanStmt(_ stmt: NOIRStmt, type: String, direct: inout Bool, selfCalls: inout Set<String>) {
         switch stmt.kind {
         case .letBinding(_, _, let v):   scanExpr(v, type: type, selfCalls: &selfCalls)
         case .spawnLet(_, let v, _):     scanExpr(v, type: type, selfCalls: &selfCalls)
@@ -116,7 +116,7 @@ private final class MutationAnalyzer {
 
     // A write whose target is a field of `self` (bare name or `self.field`) marks the
     // method mutating; writing a `let` field or reassigning `self` is a diagnostic.
-    private func checkWrite(_ target: IRExpr, type: String, direct: inout Bool) {
+    private func checkWrite(_ target: NOIRExpr, type: String, direct: inout Bool) {
         switch target.kind {
         case .varRef(let name):
             if name == "self" {
@@ -136,7 +136,7 @@ private final class MutationAnalyzer {
     }
 
     // Collect method names called on `self`; closures are treated as opaque.
-    private func scanExpr(_ e: IRExpr, type: String, selfCalls: inout Set<String>) {
+    private func scanExpr(_ e: NOIRExpr, type: String, selfCalls: inout Set<String>) {
         switch e.kind {
         case .methodCall(let recv, let method, let args):
             if case .varRef("self") = recv.kind { selfCalls.insert(method) }
@@ -166,26 +166,26 @@ private final class MutationAnalyzer {
 
     // MARK: - Rebuild the module with each method's isMutating set
 
-    private func annotate(_ module: IRModule, mutating: Set<String>) -> IRModule {
-        func ann(_ typeName: String, _ ms: [IRFunc]) -> [IRFunc] {
+    private func annotate(_ module: NOIRModule, mutating: Set<String>) -> NOIRModule {
+        func ann(_ typeName: String, _ ms: [NOIRFunc]) -> [NOIRFunc] {
             ms.map { m in
-                IRFunc(name: m.name, generics: m.generics, params: m.params, returnType: m.returnType, body: m.body,
+                NOIRFunc(name: m.name, generics: m.generics, params: m.params, returnType: m.returnType, body: m.body,
                        isMutating: mutating.contains(methodKey(typeName, m.name)), span: m.span)
             }
         }
-        let decls: [IRDecl] = module.decls.map { decl in
+        let decls: [NOIRDecl] = module.decls.map { decl in
             switch decl {
             case .structDecl(let s):
-                return .structDecl(IRStruct(name: s.name, generics: s.generics, fields: s.fields, methods: ann(s.name, s.methods), span: s.span))
+                return .structDecl(NOIRStruct(name: s.name, generics: s.generics, fields: s.fields, methods: ann(s.name, s.methods), span: s.span))
             case .classDecl(let c):
-                return .classDecl(IRClass(name: c.name, generics: c.generics, fields: c.fields, methods: ann(c.name, c.methods), span: c.span))
+                return .classDecl(NOIRClass(name: c.name, generics: c.generics, fields: c.fields, methods: ann(c.name, c.methods), span: c.span))
             case .enumDecl(let e):
-                return .enumDecl(IREnum(name: e.name, generics: e.generics, cases: e.cases, methods: ann(e.name, e.methods), span: e.span))
+                return .enumDecl(NOIREnum(name: e.name, generics: e.generics, cases: e.cases, methods: ann(e.name, e.methods), span: e.span))
             default:
                 return decl
             }
         }
-        return IRModule(decls: decls, interfaces: module.interfaces,
+        return NOIRModule(decls: decls, interfaces: module.interfaces,
                         conformances: module.conformances, composites: module.composites,
                         opaqueUnderlyings: module.opaqueUnderlyings)
     }

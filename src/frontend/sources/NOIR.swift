@@ -1,4 +1,4 @@
-// The typed mid-level IR (structured; design: compiler.md §1).
+// NOIR — the Nomu typed mid-level IR (structured; design: compiler.md §1).
 //
 // Produced by the semantic pass (Sema) from the AST; codegen consumes it (T2).
 // Structured — keeps `if`/`switch`/closures as nested nodes, not a CFG. Every
@@ -6,15 +6,15 @@
 // struct, variant data in a `kind` enum — so `expr.type`/`expr.span` are direct
 // while matching on `.kind` stays exhaustive.
 
-public struct IRModule {
-    public let decls: [IRDecl]
-    public let interfaces: [IRInterface]      // M5 A1.4: drives witness-table type emission
-    public let conformances: [IRConformance]  // M5 A1.4: drives witness-table instance emission
-    public let composites: [IRComposite]      // M5 A1.5b: composite (any A & B) witnesses to emit
+public struct NOIRModule {
+    public let decls: [NOIRDecl]
+    public let interfaces: [NOIRInterface]      // M5 A1.4: drives witness-table type emission
+    public let conformances: [NOIRConformance]  // M5 A1.4: drives witness-table instance emission
+    public let composites: [NOIRComposite]      // M5 A1.5b: composite (any A & B) witnesses to emit
     public let opaqueUnderlyings: [String: Type]   // M5 A3: opaque owner → hidden concrete underlying type
 
-    public init(decls: [IRDecl], interfaces: [IRInterface] = [], conformances: [IRConformance] = [],
-                composites: [IRComposite] = [], opaqueUnderlyings: [String: Type] = [:]) {
+    public init(decls: [NOIRDecl], interfaces: [NOIRInterface] = [], conformances: [NOIRConformance] = [],
+                composites: [NOIRComposite] = [], opaqueUnderlyings: [String: Type] = [:]) {
         self.decls = decls
         self.interfaces = interfaces
         self.conformances = conformances
@@ -25,7 +25,7 @@ public struct IRModule {
 
 // A concrete type boxed as `any A & B` — codegen emits a composite witness struct (one
 // witness-table pointer per interface) and an instance referencing the single witnesses.
-public struct IRComposite {
+public struct NOIRComposite {
     public let typeName: String
     public let typeKind: NamedKind
     public let interfaces: [String]   // canonical
@@ -34,43 +34,43 @@ public struct IRComposite {
 // The requirement surface of an interface, resolved to types — enough for codegen to
 // lay out a witness-table struct (a function-pointer slot per requirement, method then
 // property accessors, then the reserved type-witness slot).
-public struct IRInterface {
+public struct NOIRInterface {
     public let name: String
-    public let methods: [IRMethodReq]
-    public let properties: [IRPropReq]
+    public let methods: [NOIRMethodReq]
+    public let properties: [NOIRPropReq]
     public let bases: [String]   // M5 A1.4: transitive base interfaces — a witness carries a pointer to each, so `any B` upcasts to `any A`
 }
 
-public struct IRMethodReq {
+public struct NOIRMethodReq {
     public let name: String
     public let params: [Type]
     public let ret: Type
 }
 
-public struct IRPropReq {
+public struct NOIRPropReq {
     public let name: String
     public let type: Type
     public let isSettable: Bool
 }
 
 // A checked conformance `T: I` — codegen emits one witness-table instance per entry.
-public struct IRConformance {
+public struct NOIRConformance {
     public let typeName: String
     public let typeKind: NamedKind
     public let interfaceName: String
 }
 
-public enum IRDecl {
-    case structDecl(IRStruct)
-    case enumDecl(IREnum)
-    case classDecl(IRClass)
-    case actorDecl(IRActor)
-    case funcDecl(IRFunc)
+public enum NOIRDecl {
+    case structDecl(NOIRStruct)
+    case enumDecl(NOIREnum)
+    case classDecl(NOIRClass)
+    case actorDecl(NOIRActor)
+    case funcDecl(NOIRFunc)
 }
 
 // MARK: - Declarations
 
-public struct IRField {
+public struct NOIRField {
     public let name: String
     public let type: Type
     public let isMutable: Bool   // `var` vs `let` field; read by M5-C's deeply-immutable check
@@ -80,68 +80,68 @@ public struct IRField {
     }
 }
 
-public struct IRStruct {
+public struct NOIRStruct {
     public let name: String
-    public let generics: [IRGenericParam]   // M5 5.2.3: type parameters (empty for a non-generic type)
-    public let fields: [IRField]
-    public let methods: [IRFunc]   // T3: instance methods; each takes an implicit `self`
+    public let generics: [NOIRGenericParam]   // M5 5.2.3: type parameters (empty for a non-generic type)
+    public let fields: [NOIRField]
+    public let methods: [NOIRFunc]   // T3: instance methods; each takes an implicit `self`
     public let span: Span
-    public init(name: String, generics: [IRGenericParam] = [], fields: [IRField], methods: [IRFunc], span: Span) {
+    public init(name: String, generics: [NOIRGenericParam] = [], fields: [NOIRField], methods: [NOIRFunc], span: Span) {
         self.name = name; self.generics = generics; self.fields = fields; self.methods = methods; self.span = span
     }
 }
 
-public struct IREnumCase {
+public struct NOIREnumCase {
     public let name: String
-    public let fields: [IRField]
+    public let fields: [NOIRField]
     public let span: Span
 }
 
-public struct IREnum {
+public struct NOIREnum {
     public let name: String
-    public let generics: [IRGenericParam]   // M5 5.2.3
-    public let cases: [IREnumCase]
-    public let methods: [IRFunc]   // T3: instance methods; each takes an implicit `self`
+    public let generics: [NOIRGenericParam]   // M5 5.2.3
+    public let cases: [NOIREnumCase]
+    public let methods: [NOIRFunc]   // T3: instance methods; each takes an implicit `self`
     public let span: Span
-    public init(name: String, generics: [IRGenericParam] = [], cases: [IREnumCase], methods: [IRFunc], span: Span) {
+    public init(name: String, generics: [NOIRGenericParam] = [], cases: [NOIREnumCase], methods: [NOIRFunc], span: Span) {
         self.name = name; self.generics = generics; self.cases = cases; self.methods = methods; self.span = span
     }
 }
 
-public struct IRClass {
+public struct NOIRClass {
     public let name: String
-    public let generics: [IRGenericParam]   // M5 5.2.3
-    public let fields: [IRField]
-    public let methods: [IRFunc]   // T3: instance methods; each takes an implicit `self`
+    public let generics: [NOIRGenericParam]   // M5 5.2.3
+    public let fields: [NOIRField]
+    public let methods: [NOIRFunc]   // T3: instance methods; each takes an implicit `self`
     public let span: Span
-    public init(name: String, generics: [IRGenericParam] = [], fields: [IRField], methods: [IRFunc], span: Span) {
+    public init(name: String, generics: [NOIRGenericParam] = [], fields: [NOIRField], methods: [NOIRFunc], span: Span) {
         self.name = name; self.generics = generics; self.fields = fields; self.methods = methods; self.span = span
     }
 }
 
-public struct IRActorField {
+public struct NOIRActorField {
     public let name: String
     public let type: Type
-    public let initializer: IRExpr?
+    public let initializer: NOIRExpr?
     public let span: Span
 }
 
-public struct IRHandler {
+public struct NOIRHandler {
     public let name: String
-    public let params: [IRParam]
+    public let params: [NOIRParam]
     public let returnType: Type       // .void if none declared
-    public let body: [IRStmt]
+    public let body: [NOIRStmt]
     public let span: Span
 }
 
-public struct IRActor {
+public struct NOIRActor {
     public let name: String
-    public let fields: [IRActorField]
-    public let handlers: [IRHandler]
+    public let fields: [NOIRActorField]
+    public let handlers: [NOIRHandler]
     public let span: Span
 }
 
-public struct IRParam {
+public struct NOIRParam {
     public let label: String
     public let name: String
     public let type: Type
@@ -151,7 +151,7 @@ public struct IRParam {
 // A generic type parameter carried into codegen: its name and the interfaces it is bound to.
 // Codegen adds a witness-table parameter per (param, bound) and dispatches requirement calls
 // on a `.typeParam` receiver through it (M5 5.2.2).
-public struct IRGenericParam {
+public struct NOIRGenericParam {
     public let name: String
     public let bounds: [String]
     public let isShared: Bool   // `<shared T>` — codegen's spawn check treats such a T as shareable (M5 5.3.2)
@@ -160,17 +160,17 @@ public struct IRGenericParam {
     }
 }
 
-public struct IRFunc {
+public struct NOIRFunc {
     public let name: String
-    public let generics: [IRGenericParam]   // M5 5.2.2: type parameters (empty for a non-generic function)
-    public let params: [IRParam]
+    public let generics: [NOIRGenericParam]   // M5 5.2.2: type parameters (empty for a non-generic function)
+    public let params: [NOIRParam]
     public let returnType: Type       // .void if none declared
-    public let body: [IRStmt]
+    public let body: [NOIRStmt]
     public let isMutating: Bool       // inferred: a method that mutates `self` (M4.11); false for free functions
     public let span: Span
 
-    public init(name: String, generics: [IRGenericParam] = [], params: [IRParam], returnType: Type,
-                body: [IRStmt], isMutating: Bool, span: Span) {
+    public init(name: String, generics: [NOIRGenericParam] = [], params: [NOIRParam], returnType: Type,
+                body: [NOIRStmt], isMutating: Bool, span: Span) {
         self.name = name
         self.generics = generics
         self.params = params
@@ -183,45 +183,45 @@ public struct IRFunc {
 
 // MARK: - Statements
 
-public struct IRStmt {
+public struct NOIRStmt {
     public let kind: StmtKind
     public let span: Span
 }
 
 public indirect enum StmtKind {
-    case letBinding(name: String, isMutable: Bool, value: IRExpr)
-    case spawnLet(name: String, value: IRExpr, resultType: Type)
-    case assign(target: IRExpr, value: IRExpr)
-    case compoundAssign(target: IRExpr, value: IRExpr)
-    case ret(IRExpr?)
-    case ifStmt(cond: IRExpr, then: [IRStmt], else: [IRStmt]?)
-    case whileStmt(cond: IRExpr, body: [IRStmt])
+    case letBinding(name: String, isMutable: Bool, value: NOIRExpr)
+    case spawnLet(name: String, value: NOIRExpr, resultType: Type)
+    case assign(target: NOIRExpr, value: NOIRExpr)
+    case compoundAssign(target: NOIRExpr, value: NOIRExpr)
+    case ret(NOIRExpr?)
+    case ifStmt(cond: NOIRExpr, then: [NOIRStmt], else: [NOIRStmt]?)
+    case whileStmt(cond: NOIRExpr, body: [NOIRStmt])
     case breakStmt
     case continueStmt
-    case switchStmt(IRSwitch)
-    case exprStmt(IRExpr)
+    case switchStmt(NOIRSwitch)
+    case exprStmt(NOIRExpr)
 }
 
-public struct IRSwitch {
-    public let subject: IRExpr
-    public let arms: [IRCaseArm]
+public struct NOIRSwitch {
+    public let subject: NOIRExpr
+    public let arms: [NOIRCaseArm]
 }
 
-public struct IRCaseArm {
+public struct NOIRCaseArm {
     public let caseName: String
-    public let bindings: [IRBinding]   // payload bindings, each with its resolved type
-    public let body: [IRStmt]
+    public let bindings: [NOIRBinding]   // payload bindings, each with its resolved type
+    public let body: [NOIRStmt]
     public let span: Span
 }
 
-public struct IRBinding {
+public struct NOIRBinding {
     public let name: String
     public let type: Type
 }
 
 // MARK: - Expressions
 
-public struct IRExpr {
+public struct NOIRExpr {
     public let type: Type
     public let span: Span
     public let kind: ExprKind
@@ -233,19 +233,19 @@ public indirect enum ExprKind {
     case boolLit(Bool)
     case stringLit(String)
     case varRef(String)                                 // resolved local / param / global name
-    case fieldAccess(base: IRExpr, field: String)
-    case construct(typeName: String, args: [IRArg])     // struct / class / actor construction
-    case enumInit(typeName: String, caseName: String, args: [IRArg])    // enum value construction (M4.10)
-    case methodCall(receiver: IRExpr, method: String, args: [IRExpr])   // actor sends (T3: type methods)
-    case call(callee: IRExpr, args: [IRArg], typeArgs: [Type])   // function / builtin call; typeArgs non-empty for a generic call (M5 5.2.2)
-    case binary(BinOp, IRExpr, IRExpr)
-    case closure(params: [IRParam], body: [IRStmt])
-    case box(value: IRExpr, interfaces: [String])       // M5 A1.4/A1.5b: wrap a conformer as `any I` / `any A & B`
-    case arrayLit(elements: [IRExpr])                   // [a, b, c] — build an Array<T>; `type` is `.array(T)` (M6)
-    case index(base: IRExpr, idx: IRExpr)               // a[i] — array subscript read; `type` is the element T (M6)
+    case fieldAccess(base: NOIRExpr, field: String)
+    case construct(typeName: String, args: [NOIRArg])     // struct / class / actor construction
+    case enumInit(typeName: String, caseName: String, args: [NOIRArg])    // enum value construction (M4.10)
+    case methodCall(receiver: NOIRExpr, method: String, args: [NOIRExpr])   // actor sends (T3: type methods)
+    case call(callee: NOIRExpr, args: [NOIRArg], typeArgs: [Type])   // function / builtin call; typeArgs non-empty for a generic call (M5 5.2.2)
+    case binary(BinOp, NOIRExpr, NOIRExpr)
+    case closure(params: [NOIRParam], body: [NOIRStmt])
+    case box(value: NOIRExpr, interfaces: [String])       // M5 A1.4/A1.5b: wrap a conformer as `any I` / `any A & B`
+    case arrayLit(elements: [NOIRExpr])                   // [a, b, c] — build an Array<T>; `type` is `.array(T)` (M6)
+    case index(base: NOIRExpr, idx: NOIRExpr)               // a[i] — array subscript read; `type` is the element T (M6)
 }
 
-public struct IRArg {
+public struct NOIRArg {
     public let label: String?
-    public let value: IRExpr
+    public let value: NOIRExpr
 }

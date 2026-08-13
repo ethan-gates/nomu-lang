@@ -13,7 +13,8 @@ cross-cutting decisions live in 6.0.5.
 
 **Build status (2026-08-11):** **6.2 complete (Immix flip + evacuation) and 6.3.1 built + green** — the
 generational write barrier fills the `__nomu_write_barrier` seam and the default plan is **GenImmix**
-(see 6.3). **6.3.2 done (2026-08-11):** the profiling blocker was root-caused to **two binding bugs** and fixed — GenImmix now collects a retained live set at tight heaps and the footprint thesis is met (**~1.05x** live-set footprint on the churn benchmark, see 6.3). Footprint tooling (`NOMU_GC_STATS`) is in place, and the **write barrier is now inlined** (GenImmix's barrier-saturated microbench 0.71 s → 0.047 s, ~15×; see 6.3). 6.3.2's remaining polish (nursery tuning, opt-level, a wider footprint sweep) is deferred. **6.4 done (2026-08-12):** the async actor runtime (mailbox + message-send + pooled handler fibers) + structural teardown replaced the M3.4 mutex scaffold; see §6.4. Escape analysis (§6.5) remains the descopable perf tail. Historical bring-up status below.
+(see 6.3). **6.3.2 done (2026-08-11):** the profiling blocker was root-caused to **two binding bugs** and fixed — GenImmix now collects a retained live set at tight heaps and the footprint thesis is met (**~1.05x** live-set footprint on the churn benchmark, see 6.3). Footprint tooling (`NOMU_GC_STATS`) is in place, and the **write barrier is now inlined** (GenImmix's barrier-saturated microbench 0.71 s → 0.047 s, ~15×; see 6.3). 6.3.2's remaining polish (nursery tuning, opt-level, a wider footprint sweep) is deferred. **6.4 done (2026-08-12):** the async actor runtime (mailbox + message-send + pooled handler fibers) + structural teardown replaced the M3.4 mutex scaffold; see §6.4. Escape analysis (§6.5) is the open M6 item: a conservative pass on the structured NOIR (the
+precise CFG/SSA form is deferred to M8). Historical bring-up status below.
 
 **Build status (2026-08-04):** **6.1 (MMTk NoGC bring-up) substantially built + green.** 6.1.0–6.1.3
 ✅ (Rust `VMBinding` + MMTk NoGC linked via `crate_universe`; `rt_alloc` → per-carrier mutator; the
@@ -52,8 +53,8 @@ moving-Immix target and the M8-first reorder.
 - **LXR-style RC-hybrid collector** — the footprint endgame; a later *owned* reimplementation
   behind the same binding, never a dependency on the stalled upstream branch
   (`memory-model.md` §3; 6.0.5).
-- **Escape analysis** — a perf pass (stack allocation / scalar replacement); descopable to the
-  M6 tail or a follow-on (`memory-model.md` §6.1; phase 6.5).
+- **Escape analysis** — a perf pass (stack allocation / scalar replacement); conservative form in the
+  M6 tail, precise form in M8 (`memory-model.md` §6.1; phase 6.5).
 - **User-visible finalizers** — none planned; internal actor teardown only (phase 6.4).
 
 ### 6.0.2 · Prerequisites
@@ -79,7 +80,8 @@ M6 touches:
   fast path.
 - **Runtime (C + Rust binding)** — the MMTk `VMBinding` (`scan_object`, `scan_roots`,
   `block_for_gc`, resume); a **live-fiber registry**; the STW handshake; per-carrier `Mutator`.
-- **IR / Sema** — the escape-analysis pass on the CFG/SSA level (6.5).
+- **IR / Sema** — the escape-analysis pass (6.5): conservative on the structured NOIR in M6, precise
+  on the CFG/SSA NOIR tier in M8.
 
 ### 6.0.4 · Dependencies
 
@@ -89,10 +91,11 @@ M8 (LLVM backend + statepoints)              [hard prerequisite]
    └─ 6.2 (precise roots + safepoints + moving Immix)
       ├─ 6.3 (GenImmix + write barrier)
       └─ 6.4 (actor runtime + teardown)
-6.5 (escape analysis)   [perf tail; needs M8 IR; descopable]
+6.5 (escape analysis)   [perf tail; conservative in M6, precise deferred to M8 IR]
 ```
 6.1 gates all collection. 6.2 is the correctness+moving core. 6.3 and 6.4 are independent of
-each other. 6.5 is sequenced last and descopable.
+each other. 6.5 is sequenced last: a conservative pass on the structured NOIR ships in M6, the
+precise pass waits for the M8 CFG/SSA NOIR tier (§6.5).
 
 ### 6.0.5 · Cross-cutting decisions
 
@@ -339,7 +342,8 @@ neither. **No new surface syntax.**
 - LXR-style RC-hybrid (owned reimplementation) — footprint endgame.
 - Barrier elision for deeply-immutable types (can't form new cross-generation pointers by
   mutation) — a perf pass (`memory-model.md` §4).
-- Escape analysis if it slips past M6 (6.5).
+- Precise (CFG/SSA) escape analysis — deferred to the M8 NOIR optimizer tier (6.5); the conservative
+  form ships in M6.
 - Profile-guided perf follow-ups from the closed design questions (6.0.5): Q3-B faulting-page poll,
   Q4 counted-loop poll elision, Q1-C fiber-pinned TLAB locality, and Q8 live-fiber-registry data
   structure (profile insert/remove + STW iteration under fiber churn vs. the lock-guarded intrusive
@@ -872,15 +876,51 @@ churns 200k short-lived actors and completes under GenImmix at a 4 MB heap where
 memory — the dead actors + mailboxes are actually reclaimed, not merely plausibly-so, and the capped
 mailbox-fiber pool + scheduled-queue rooting hold under the churn. No per-actor non-GC resource remains.
 
-## 6.5 · Escape analysis (perf tail; descopable) ⬜
+## 6.5 · Escape analysis (perf tail) ⬜
 
-One-line intent: recover the stack-allocation win — keep provably-non-escaping objects off the
-GC heap (`memory-model.md` §6.1). Depends on M8's CFG/SSA IR; independent of 6.2–6.4;
-**descopable** to a follow-on. **Approach:** best-effort analysis on the lower IR; fallback is
-always "heap-allocate," so precision affects speed only, never correctness.
+One-line intent: recover the stack-allocation win — keep provably-non-escaping reference
+allocations off the GC heap (`memory-model.md` §6.1). Best-effort: the fallback is always
+heap-allocate, so precision affects speed only, correctness always holds.
 
-- **6.5.1 ⬜** — escape-analysis pass on the CFG/SSA IR; annotate non-escaping allocations.
-- **6.5.2 ⬜** — stack allocation / scalar replacement in codegen for annotated sites.
+**Sequencing (decided 2026-08-13).** Escape analysis ships in two phases. A **conservative pass on
+the structured NOIR** (the current typed IR; artifact extension `.noir`, `--emit-noir`) lands in M6 —
+it captures the deep case (a reference allocation in a hot loop, used locally, discarded each
+iteration) with no new IR. The **precise pass** waits for the M8 CFG/SSA optimizer tier of NOIR,
+where def-use chains and a CFG let it follow pointers across control flow; that tier is shared with
+devirtualization, bounds-check elimination, inlining, and specialization, and is designed against all
+of them at once (roadmap M8). The conservative analysis front-end is replaced when the precise one
+lands; the 6.5.2 codegen half is reused unchanged.
 
-**Exit:** a set of known-non-escaping allocations (microbenchmarks) touch neither the collector
-nor the heap; correctness unchanged when the pass is disabled.
+Reference allocations targeted (the `__nomu_gc_alloc` sites): class instances, `any`-boxes, closure
+environments, array buffers. Structs and enums are already value types on the stack, so they are out
+of scope. The conservative pass targets **class instances and closure environments** first; `any`-boxes
+usually escape and array buffers have dynamic size (stack-eligible only when statically bounded), so
+both are deferred to the precise phase.
+
+**Design — conservative pass.**
+
+- **Result carrier.** The analysis writes non-escaping allocation sites to a **side table** keyed by
+  allocation-site identity, consumed by codegen. NOIR node types stay unchanged, so the table is
+  additive and the M8 tier can ignore or replace it — the optimization adds no coupling to the IR.
+- **Escape predicate (conservative, intra-procedural).** An allocation escapes if its value is:
+  returned from the function; stored into a heap object's field or a global; captured by a closure
+  that itself escapes; passed as a call argument; or bound to a variable that is reassigned or
+  address-taken. Every remaining allocation is stack-eligible. Any call argument is treated as
+  escaping (no interprocedural summary in this phase).
+- **Codegen + GC interaction (the part that earns the doc).** An annotated site lowers to an `alloca`
+  (or scalar-replaced fields) in place of `__nomu_gc_alloc`. A stack-allocated object whose fields
+  hold `addrspace(1)` pointers stays part of the GC's world: those fields are scanned as roots through
+  the frame's stack map, so stack allocation changes only where the collector finds the object, and
+  its contents still trace. Stores into a stack slot elide the generational write barrier (a stack
+  slot is a location the barrier has no reason to track). The lowering stays collector-agnostic — it
+  assumes neither a moving nor a non-moving collector.
+
+- **6.5.1 ⬜** — conservative escape-analysis pass on the structured NOIR; side table of non-escaping
+  class-instance and closure-environment sites.
+- **6.5.2 ⬜** — stack allocation / scalar replacement in codegen for annotated sites, with correct GC
+  root scanning of the stack slots and write-barrier elision.
+- **6.5.3 (M8) ⬜** — precise pass on the CFG/SSA NOIR tier; replaces 6.5.1, reuses 6.5.2.
+
+**Exit (conservative phase):** a microbenchmark with a known non-escaping allocation in a hot loop
+shows zero collector activity under `NOMU_GC_STATS` with the pass on; byte-identical results with the
+pass disabled; a flag disables the pass.

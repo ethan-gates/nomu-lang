@@ -1,6 +1,6 @@
 // M8 — the LLVM backend seam. All LLVM C-API use stays inside this module, so the driver sees a
-// flat surface: a typed `IRModule` in, a native object out (`emitObject`), or nil/error. The
-// per-node lowering lives in `Lowering.swift` (`IRToLLVM`); this file drives target setup, the GC
+// flat surface: a typed `NOIRModule` in, a native object out (`emitObject`), or nil/error. The
+// per-node lowering lives in `Lowering.swift` (`NOIRToLLVM`); this file drives target setup, the GC
 // pass pipeline (`mem2reg`/`sroa` → `rewrite-statepoints-for-gc`, or `-O2` in release), and object
 // emission via `llvm-c/TargetMachine.h`.
 import Foundation
@@ -10,7 +10,7 @@ import frontend
 /// Lower a whole typed IR module to a native object file for the host triple (the driver then links
 /// it with the runtime `.a`). Returns nil on success, else a `file:line:col`-prefixed error.
 /// `optimize` selects the release (`default<O2>`) pipeline over the debug default (8.5.3).
-public func emitObject(_ module: IRModule, to path: String, optimize: Bool = false) -> String? {
+public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = false) -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
@@ -23,7 +23,7 @@ public func emitObject(_ module: IRModule, to path: String, optimize: Bool = fal
     defer { LLVMContextDispose(ctx) }
     let mod = LLVMModuleCreateWithNameInContext("nomu", ctx)!
 
-    let lowerer = IRToLLVM(ctx: ctx, mod: mod)
+    let lowerer = NOIRToLLVM(ctx: ctx, mod: mod)
     lowerer.lower(module)
     if let err = lowerer.error { return err }
     guard lowerer.loweredMain else { return "LLVM: no `main` function to lower" }

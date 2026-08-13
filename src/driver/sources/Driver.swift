@@ -97,12 +97,12 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
         return result
     }
 
-    // Typed-IR stage. --emit-typedir writes the typed IR to build/; --stop=typedir
+    // NOIR stage. --emit-noir writes NOIR to build/; --stop=noir
     // writes it and halts (reporting diagnostics without failing — it is a debug view).
-    if options.typedIR || options.stopAt == .typedIR {
-        writeArtifact(dumpTypedIR(semaResult.module), toFile: stem + ".typedir")
+    if options.noir || options.stopAt == .noir {
+        writeArtifact(dumpNOIR(semaResult.module), toFile: stem + ".noir")
     }
-    if options.stopAt == .typedIR {
+    if options.stopAt == .noir {
         if !semaResult.diagnostics.isEmpty { fputs(semaResult.diagnostics.render() + "\n", stderr) }
         timings.report()
         return
@@ -185,7 +185,7 @@ private func prependPrelude(_ program: Program) -> Program {
 // static archive, and link them into a native executable. Reports the binary path (like the C
 // path). Everything LLVM stays behind `emitHelloWorldObject` in LLVMBridge — this only orchestrates
 // object → .a → link.
-private func emitLLVMBinary(_ module: IRModule, stem: String, buildRoot: String, optimize: Bool, timings: Timings) {
+private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: String, optimize: Bool, timings: Timings) {
     let objPath = stem + ".o"
     // `codegen` is the whole LLVM path (IR lowering + transform passes + object emit) behind one
     // bridge call; splitting it needs timing hooks inside LLVMBridge (a follow-up).

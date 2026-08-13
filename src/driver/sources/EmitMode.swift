@@ -7,17 +7,17 @@
 
 public enum Stage {
     case ast       // after parse
-    case typedIR   // after the semantic pass
+    case noir      // after the semantic pass (NOIR — the Nomu typed IR)
     case binary    // full pipeline → native binary (default)
 }
 
-// The typed IR is lowered to a native binary through the LLVM backend (M8) — LLVM's C API →
+// NOIR is lowered to a native binary through the LLVM backend (M8) — LLVM's C API →
 // object → link. The C backend was the differential oracle through 8.2 and was retired at the
 // 8.2 exit, so there is no longer a backend to select.
 
 public struct EmitOptions {
     public var ast = false       // --emit-ast: emit the parsed AST (<name>.ast)
-    public var typedIR = false   // --emit-typedir: emit the typed IR (<name>.typedir)
+    public var noir = false      // --emit-noir: emit NOIR (<name>.noir)
     public var stopAt: Stage = .binary
     // 8.5.3 — LLVM optimization level. Default (debug) runs the minimal `mem2reg`/`sroa` the
     // statepoint rewrite needs and preserves Tier-0 debug info; `-O`/`--release` runs the full

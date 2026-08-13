@@ -5,7 +5,7 @@
 // typed IR (Rust runs it on THIR, the same altitude) and reports into the shared
 // DiagnosticSink, collect-and-continue. Non-enum subjects are out of scope here.
 
-public func checkExhaustiveness(_ module: IRModule, into diags: DiagnosticSink) {
+public func checkExhaustiveness(_ module: NOIRModule, into diags: DiagnosticSink) {
     // Enum name → its full set of case names, gathered from the module's decls.
     var enumCases: [String: [String]] = [:]
     for decl in module.decls {
@@ -19,13 +19,13 @@ private struct ExhaustivenessPass {
     let enumCases: [String: [String]]
     let diags: DiagnosticSink
 
-    func run(_ module: IRModule) {
+    func run(_ module: NOIRModule) {
         for decl in module.decls { walkDecl(decl) }
     }
 
     // MARK: - Declarations (walk every body that can hold a switch)
 
-    private func walkDecl(_ decl: IRDecl) {
+    private func walkDecl(_ decl: NOIRDecl) {
         switch decl {
         case .funcDecl(let f):   walk(f.body)
         case .structDecl(let s): for m in s.methods { walk(m.body) }
@@ -39,11 +39,11 @@ private struct ExhaustivenessPass {
 
     // MARK: - Statements
 
-    private func walk(_ stmts: [IRStmt]) {
+    private func walk(_ stmts: [NOIRStmt]) {
         for s in stmts { walkStmt(s) }
     }
 
-    private func walkStmt(_ stmt: IRStmt) {
+    private func walkStmt(_ stmt: NOIRStmt) {
         switch stmt.kind {
         case .letBinding(_, _, let value):    walkExpr(value)
         case .spawnLet(_, let value, _):      walkExpr(value)
@@ -66,7 +66,7 @@ private struct ExhaustivenessPass {
 
     // MARK: - Expressions (descend only to reach nested statement bodies)
 
-    private func walkExpr(_ e: IRExpr) {
+    private func walkExpr(_ e: NOIRExpr) {
         switch e.kind {
         case .intLit, .doubleLit, .boolLit, .stringLit, .varRef:
             break
@@ -93,7 +93,7 @@ private struct ExhaustivenessPass {
 
     // MARK: - The check
 
-    private func checkSwitch(_ sw: IRSwitch, at span: Span) {
+    private func checkSwitch(_ sw: NOIRSwitch, at span: Span) {
         // A concrete enum (`.named`) or an applied generic one (`.generic`, M5 5.2.3): the case
         // set is the generic definition's — instantiation adds no cases.
         let enumName: String

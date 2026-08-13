@@ -18,7 +18,7 @@ final class ExtensionTests: XCTestCase {
         return (s.check(), mergeDiags)
     }
 
-    private func methods(of decl: IRDecl?) -> [IRFunc] {
+    private func methods(of decl: NOIRDecl?) -> [NOIRFunc] {
         switch decl {
         case .structDecl(let s): return s.methods
         case .enumDecl(let e):   return e.methods

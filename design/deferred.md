@@ -146,9 +146,9 @@ a rough estimate to help sequencing, not a commitment.
 - **Compiler architecture review for perf** `[medium · ongoing]` — a pass over the compiler's own
   hot paths (startup, monomorphization, lowering); the `nomuc -h` latency is one entry point.
 - **Emission options** `[medium]` — broaden `--emit-*` / `--stop=` (e.g. emit LLVM IR, asm, object
-  choices) beyond today's ast/typedir/binary.
+  choices) beyond today's ast/noir/binary.
 - **Intermediate-based iso(lated) regression** `[medium]` — regression tests keyed on intermediate
-  artifacts (typed IR / LLVM IR), not just stdout+exit, to localize where a change diverges.
+  artifacts (NOIR / LLVM IR), not just stdout+exit, to localize where a change diverges.
 - **Bazel usage** `[small–medium]` — build-ergonomics cleanup (target layout, incremental build
   friction).
 

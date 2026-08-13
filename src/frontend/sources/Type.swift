@@ -16,7 +16,7 @@ public indirect enum Type: Equatable {
     case existential(String)                       // `any I` — a boxed value conforming to interface I (M5 A1.4)
     case composition([String])                     // `any A & B` — conforms to several interfaces (canonical, M5 A1.5b)
     case selfType                                  // `Self` in an interface requirement (M5 A2); constraint-only, never reaches codegen
-    case opaque(interfaces: [String], owner: String)  // `some I` / `some A & B` — one hidden concrete underlying (M5 A3). `owner` gives per-function/binding identity (Swift-style); the underlying is looked up in IRModule.opaqueUnderlyings. Unboxed, statically dispatched.
+    case opaque(interfaces: [String], owner: String)  // `some I` / `some A & B` — one hidden concrete underlying (M5 A3). `owner` gives per-function/binding identity (Swift-style); the underlying is looked up in NOIRModule.opaqueUnderlyings. Unboxed, statically dispatched.
     case typeParam(String)                          // a generic type parameter `T` in scope (M5 5.2.1)
     case generic(base: String, args: [Type])        // an applied generic type `Box<Int>` (M5 5.2.1)
     case array(Type)                                // `Array<T>` — a builtin variable-size reference type (M6 stdlib). Reference semantics (a managed handle); the element `T` is monomorphized like any other generic argument.
