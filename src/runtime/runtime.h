@@ -61,9 +61,9 @@ void  rt_mutex_unlock(void* m);
 // The decided actor model (`concurrency.md` §9, fire-and-forget revision 2026-08-12): a send enqueues
 // a message on the actor's mailbox and RETURNS immediately (the sender never waits, gets no reply).
 // Handlers run on fibers rented from a program-global pool, one drain per actor at a time (serial,
-// non-reentrant). Request-reply, when needed, is an explicit `ask` over the continuation (§3), not a
-// handler return — not part of this ABI. Teardown is structural — actor + mailbox are ordinary GC
-// objects, so the runtime allocates nothing per-actor and frees nothing here.
+// non-reentrant). There is no reply/ask of any kind — fire-and-forget is the only actor operation
+// (§9). Teardown is structural — actor + mailbox are ordinary GC objects, so the runtime allocates
+// nothing per-actor and frees nothing here.
 //
 // ABI contract with codegen (`Lowering.swift`). The mailbox and message are GC-allocated objects
 // with fixed layouts this C code reaches without knowing the actor's fields / the handler's args.
@@ -71,12 +71,13 @@ void  rt_mutex_unlock(void* m);
 // codegen loads that at the call site, so this code never parses the actor. Codegen supplies the GC
 // pointer maps.
 //
-//   mailbox object { i64 header; Msg* mb_head; Msg* mb_tail; i64 scheduled; }
+//   mailbox object { i64 header; Msg* mb_head; Msg* mb_tail; i64 scheduled; Mailbox* sched_next; }
 //   message object { i64 header; Msg* next; void(*thunk)(void* msg); void* self; args… }
 //
-// `mb_head`/`mb_tail`/`next`/`self` are GC-scanned (they chain live queued messages, kept live with
-// the receiver); `thunk` (a code ptr) is not. `rt_actor_send` enqueues `msg` on `mailbox` and returns
-// after scheduling a drain if none is running.
+// `mb_head`/`mb_tail`/`next`/`self`/`sched_next` are GC-scanned (they chain live queued messages and
+// the scheduled-mailbox queue, kept live with the receiver); `thunk` (a code ptr) is not.
+// `rt_actor_send` enqueues `msg` on `mailbox` and returns after appending the mailbox to the global
+// scheduled queue (and dispatching a mailbox fiber) if it wasn't already scheduled.
 //
 // The drain LOOP is codegen-emitted (`nomu_actor_drain`), not here: it must hold the mailbox and
 // message as tracked addrspace(1) roots across each handler call, which C can't. It loops over

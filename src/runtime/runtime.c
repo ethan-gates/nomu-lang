@@ -190,8 +190,7 @@ struct Fiber {
     void* arg;
     struct Fiber* rt_prev; // M6 · 6.2.2 — global live-fiber registry (intrusive doubly-linked list)
     struct Fiber* rt_next;
-    void* drain_target;    // M6 · 6.4 — pool worker: the mailbox this rental is draining (NomuMailbox*)
-    struct Fiber* pool_next; // M6 · 6.4 — pool worker free-list link (guarded by rt_queue_mu)
+    struct Fiber* pool_next; // M6 · 6.4 — mailbox-fiber free-list link (guarded by rt_queue_mu)
 };
 
 static Fiber* rt_run_queue[RT_MAX_FIBERS];
@@ -404,14 +403,14 @@ void* spawn_join(SpawnHandle* h) {
     return h->fiber->result;
 }
 
-// ---- Actor mailbox + drain-fiber pool (M6 · 6.4 · fire-and-forget message-send) ----
+// ---- Actor mailbox + mailbox-fiber pool (M6 · 6.4 · fire-and-forget message-send) ----
 // The decided actor model (`concurrency.md` §9, fire-and-forget revision 2026-08-12), backing the
 // LLVM backend. An actor is an ordinary GC object whose fixed prefix carries a mailbox (a FIFO of
 // GC-allocated messages); a send enqueues a message and RETURNS immediately (the sender never waits).
-// Handlers run on fibers **rented from a program-global pool** — an idle actor holds no fiber, and at
-// most one drain runs per actor at a time (the `scheduled` flag), giving serial, non-reentrant,
-// per-sender-FIFO handling. Teardown is structural: nothing here is allocated per actor, so nothing is
-// freed per actor. Layout is the ABI contract in runtime.h; only the fixed prefixes are touched here.
+// A mailbox with pending messages joins a **global scheduled-mailbox queue**; a **capped pool of
+// mailbox fibers** pulls mailboxes off that queue and drains them (at most one drain per mailbox at a
+// time — the `scheduled` flag — so handling is serial, non-reentrant, per-sender FIFO). Teardown is
+// structural: nothing here is allocated per actor. Layout is the ABI contract in runtime.h.
 typedef struct NomuMsg {
     uint64_t header;
     struct NomuMsg* next;                // FIFO link (GC-scanned)
@@ -421,55 +420,81 @@ typedef struct NomuMsg {
 
 typedef struct NomuMailbox {
     uint64_t header;
-    NomuMsg* mb_head;      // GC-scanned
-    NomuMsg* mb_tail;      // GC-scanned
-    int64_t scheduled;     // 1 while a rented worker is (or is about to be) draining this mailbox
+    NomuMsg* mb_head;                // GC-scanned
+    NomuMsg* mb_tail;                // GC-scanned
+    int64_t scheduled;              // 1 while queued for / undergoing draining
+    struct NomuMailbox* sched_next; // GC-scanned — intrusive link in the global scheduled-mailbox queue
 } NomuMailbox;
 
-// Program-global pool of reusable worker fibers. `rt_pool_free` is a free-list of parked idle
-// workers; guarded by rt_queue_mu (every mailbox op already holds it). Workers do not count toward
-// rt_active — they are infrastructure.
-static Fiber* rt_pool_free = NULL;
+// The global scheduled-mailbox queue: an intrusive FIFO through `sched_next` of every mailbox with
+// pending messages awaiting a mailbox fiber. `rt_sched_head` is a **GC root** (reported by
+// nomu_gc_scan_parked_fibers); since `sched_next` is a scanned field, rooting the head keeps the whole
+// chain — and each queued mailbox's pending messages and receiver actor — alive even when the actor is
+// otherwise unreferenced. This is what makes fire-and-forget outstanding work survive GC. Guarded by
+// rt_queue_mu; non-static so the root scan can read it.
+NomuMailbox* rt_sched_head = NULL;
+static NomuMailbox* rt_sched_tail = NULL;
+
+// The mailbox-fiber pool: a CAPPED set of reusable fibers that pull mailboxes off the scheduled queue
+// and drain them. `rt_mbfiber_free` is a free-list of idle (parked) mailbox fibers; `rt_mbfiber_count`
+// is how many exist (≤ the cap). Capping is what stops a churn of many concurrently-busy actors from
+// spawning a fiber (a 128 KiB stack) each and overrunning the run queue — excess mailboxes wait in the
+// scheduled queue and a busy fiber picks them up when it finishes its current one. Guarded by
+// rt_queue_mu; mailbox fibers do not count toward rt_active (they are infrastructure).
+#define RT_MAX_MAILBOX_FIBERS 64
+static Fiber* rt_mbfiber_free = NULL;
+static int rt_mbfiber_count = 0;
 
 // `rt_active_drains` (declared with the scheduler globals) counts mailboxes currently `scheduled`:
 // fire-and-forget sends create no user fiber, so `rt_active` alone would let the program exit with
-// actor work still queued (silently dropped). It is ++'d on the 0→1 edge (rt_dispatch_drain) and
-// --'d on the 1→0 edge (a drain emptying its mailbox, rt_mailbox_pop); the scheduler exits only when
-// rt_active == 0 AND it is 0 — drain-to-quiescence (§9 drain-then-collect). A self-sustaining actor
-// keeps it > 0, so the program stays alive (a live server — the programmer's infinite loop, §9).
+// actor work still queued (silently dropped). It is ++'d on the 0→1 edge (rt_actor_send appends to the
+// scheduled queue) and --'d on the 1→0 edge (a drain emptying its mailbox, rt_mailbox_pop); the
+// scheduler exits only when rt_active == 0 AND it is 0 — drain-to-quiescence (§9 drain-then-collect).
+// A self-sustaining actor keeps it > 0, so the program stays alive (a live server, §9).
 
 // The drain LOOP is emitted by codegen, not written here: it must hold the mailbox + message as
 // tracked addrspace(1) roots across each handler call (a moving GC can relocate them at a safepoint
 // inside the handler), which C code can't. Codegen's `nomu_actor_drain(mailbox)` loops over
-// rt_mailbox_pop → `msg->thunk(msg)` until the mailbox is empty. The C side here only rents/returns
-// workers and provides the non-safepoint-spanning `rt_mailbox_pop` primitive below.
+// rt_mailbox_pop → `msg->thunk(msg)` until the mailbox is empty. The C side here manages the pool and
+// provides the non-safepoint-spanning `rt_mailbox_pop` primitive below.
 extern void nomu_actor_drain(void* mailbox);
 
-// A worker fiber's top level: rent → drain the assigned mailbox → park back on the free-list →
-// repeat. It never returns; re-rental resumes it right after the swapcontext with a fresh target.
-static void rt_pool_worker_main(void) {
+// Remove and return the head of the scheduled-mailbox queue (FIFO), or NULL if empty. Caller holds
+// rt_queue_mu. The returned mailbox stays `scheduled` — the caller is now its drainer.
+static NomuMailbox* rt_sched_pop(void) {
+    NomuMailbox* mb = rt_sched_head;
+    if (!mb) return NULL;
+    rt_sched_head = mb->sched_next;
+    if (!rt_sched_head) rt_sched_tail = NULL;
+    mb->sched_next = NULL;
+    return mb;
+}
+
+// A mailbox fiber's top level: pull a scheduled mailbox and drain it; when none remain, park on the
+// free-list; repeat. Never returns. Handoff protocol: rt_queue_mu is held at every loop top and across
+// every park, so a mailbox popped here is handed to nomu_actor_drain (which makes it a tracked root)
+// with no GC window between.
+static void rt_mailbox_fiber_main(void) {
     Fiber* self = rt_current;
+    // Entered (first) / resumed (later) with the lock HELD by the scheduler — the loop-top invariant.
     while (1) {
-        // Entered (first rental) / resumed (later rentals) with the lock HELD by the scheduler; the
-        // dispatcher set drain_target under that lock. Read it, then release before draining.
-        void* mb = self->drain_target;
-        self->drain_target = NULL;
+        NomuMailbox* mb = rt_sched_pop();
+        if (!mb) {
+            self->pool_next = rt_mbfiber_free;   // no work — park on the free-list
+            rt_mbfiber_free = self;
+            self->status = FIBER_PARKED;
+            swapcontext(&self->ctx, &rt_sched_ctx);   // hand lock to scheduler; resumes with lock HELD
+            continue;                                 // lock held → loop-top invariant restored
+        }
         pthread_mutex_unlock(&rt_queue_mu);
-        nomu_actor_drain(mb);
+        nomu_actor_drain(mb);   // drains all of mb's messages; clears mb->scheduled when empty
         pthread_mutex_lock(&rt_queue_mu);
-        self->pool_next = rt_pool_free;   // return this warm fiber to the pool
-        rt_pool_free = self;
-        self->status = FIBER_PARKED;
-        // Park with the lock HELD (handoff): wakeable only after the context is saved. A rental
-        // (rt_dispatch_drain) pops us off the free-list, sets drain_target, and rq_pushes us.
-        swapcontext(&self->ctx, &rt_sched_ctx);
     }
 }
 
-// Create a fresh pool worker. Caller holds rt_queue_mu (registry insert needs it). Registered so a
-// worker parked inside an inline-blocking handler is scanned for roots like any fiber (6.2.2); an
-// idle worker on the free-list holds no live roots.
-static Fiber* rt_worker_new(void) {
+// Create a fresh mailbox fiber. Caller holds rt_queue_mu. Registered so one parked inside an
+// inline-blocking handler is scanned for roots like any fiber (6.2.2); an idle one holds no live roots.
+static Fiber* rt_mailbox_fiber_new(void) {
     Fiber* f = (Fiber*)calloc(1, sizeof(Fiber));
     f->stack = (char*)malloc(RT_STACK_SIZE);
     f->status = FIBER_RUNNABLE;
@@ -477,22 +502,26 @@ static Fiber* rt_worker_new(void) {
     f->ctx.uc_stack.ss_sp = f->stack;
     f->ctx.uc_stack.ss_size = RT_STACK_SIZE;
     f->ctx.uc_link = NULL;
-    makecontext(&f->ctx, rt_pool_worker_main, 0);
+    makecontext(&f->ctx, rt_mailbox_fiber_main, 0);
     rt_registry_insert(f);
     return f;
 }
 
-// Rent a worker to drain `mb` and make it runnable. Caller holds rt_queue_mu; called on the
-// scheduled 0→1 edge so exactly one worker is ever assigned to a mailbox at a time (the pool
-// parallelizes across actors, never within one). Grows the pool on demand.
-static void rt_dispatch_drain(NomuMailbox* mb) {
-    Fiber* w = rt_pool_free;
-    if (w) { rt_pool_free = w->pool_next; w->pool_next = NULL; }
-    else   { w = rt_worker_new(); }
-    w->drain_target = mb;
-    w->status = FIBER_RUNNABLE;
-    rt_active_drains++;   // outstanding drain (0→1 edge); cleared when this mailbox empties
-    rt_rq_push(w);
+// Ensure a mailbox fiber will service the scheduled queue: wake a parked one, else create one up to
+// the cap. If all fibers are busy and at the cap, the newly-queued mailbox simply waits — a busy fiber
+// pops it when it finishes its current mailbox. Caller holds rt_queue_mu; called on the 0→1 edge.
+static void rt_mailbox_dispatch(void) {
+    Fiber* f = rt_mbfiber_free;
+    if (f) {
+        rt_mbfiber_free = f->pool_next; f->pool_next = NULL;
+        f->status = FIBER_RUNNABLE;
+        rt_rq_push(f);
+    } else if (rt_mbfiber_count < RT_MAX_MAILBOX_FIBERS) {
+        f = rt_mailbox_fiber_new();
+        rt_mbfiber_count++;
+        rt_rq_push(f);
+    }
+    // else: all mailbox fibers busy and at the cap — the mailbox waits in the scheduled queue.
 }
 
 // Pop the next message from `mailbox` in FIFO order, or return NULL when empty. On empty it clears
@@ -519,11 +548,11 @@ void* rt_mailbox_pop(void* mailbox) {
     return msg;
 }
 
-// Enqueue `msg` on `mailbox` and return immediately — fire-and-forget (§9). The handler runs later on
-// a rented pool worker; the sender does not wait and gets no reply. Schedules a drain on the 0→1 edge.
-// The message stays reachable via the mailbox chain (mb_head/tail/next are all GC-scanned), so it
-// survives GC without the sender holding a root; the write barrier keeps the mailbox slots valid
-// across a move.
+// Enqueue `msg` on `mailbox` and return immediately — fire-and-forget (§9). On the 0→1 schedule edge,
+// append the mailbox to the global scheduled queue (rooting its pending work for GC) and ensure a
+// mailbox fiber will service it. The sender does not wait and gets no reply. The message stays
+// reachable via the mailbox chain (mb_head/tail/next all GC-scanned); the barriers keep the moving
+// GC's remembered set honest across the stores.
 void rt_actor_send(void* mailbox_, void* msg_) {
     NomuMailbox* mb = (NomuMailbox*)mailbox_;
     NomuMsg* msg = (NomuMsg*)msg_;
@@ -538,7 +567,20 @@ void rt_actor_send(void* mailbox_, void* msg_) {
     }
     mb->mb_tail = msg;
     rt_gc_write_barrier(mb, &mb->mb_tail, msg);
-    if (!mb->scheduled) { mb->scheduled = 1; rt_dispatch_drain(mb); }
+    if (!mb->scheduled) {
+        mb->scheduled = 1;
+        mb->sched_next = NULL;
+        if (rt_sched_tail) {
+            rt_sched_tail->sched_next = mb;
+            rt_gc_write_barrier(rt_sched_tail, &rt_sched_tail->sched_next, mb);
+            rt_sched_tail = mb;
+        } else {
+            rt_sched_head = mb;
+            rt_sched_tail = mb;
+        }
+        rt_active_drains++;      // outstanding scheduled mailbox (0→1); cleared when it empties
+        rt_mailbox_dispatch();
+    }
     pthread_mutex_unlock(&rt_queue_mu);
 }
 
@@ -1029,6 +1071,13 @@ void nomu_gc_scan_parked_fibers(nomu_root_visitor visit, void* userdata) {
         if (f->status == FIBER_PARKED) {
             nomu_gc_walk_fiber(f, visit, userdata);
         }
+    }
+    // M6 · 6.4 — the scheduled-mailbox queue head is a GC root: reporting it keeps the whole
+    // `sched_next` chain (each queued mailbox + its pending messages + receiver actor) live, so
+    // fire-and-forget outstanding work isn't collected while an actor is otherwise unreferenced. The
+    // chain past the head is reached through the mailbox pointer map (sched_next is a scanned field).
+    if (rt_sched_head) {
+        visit((void**)&rt_sched_head, rt_sched_head, userdata);
     }
     pthread_mutex_unlock(&rt_queue_mu);
 }

@@ -1087,9 +1087,10 @@ final class IRToLLVM {
                 guard let fv = v else { return nil }
                 storeField(obj, structGEP(at, obj, fieldLLVMIndex(.classRef, idx)), fv)
             }
-            // The mailbox is its own GC object `{ header, mb_head, mb_tail, scheduled }` (zeroed by the
-            // allocator → empty + unscheduled). Stored into the actor's last slot through the barrier.
-            let mailbox = rtAllocManaged(LLVMConstInt(i64, 32, 0))
+            // The mailbox is its own GC object `{ header, mb_head, mb_tail, scheduled, sched_next }`
+            // (zeroed by the allocator → empty + unscheduled). Stored into the actor's last slot
+            // through the barrier.
+            let mailbox = rtAllocManaged(LLVMConstInt(i64, 40, 0))
             writeTypeIdHeaderRaw(mailbox, mailboxTypeIdValue())
             storeField(obj, structGEP(at, obj, actorMailboxIndex(typeName)), mailbox)
             return obj
@@ -2578,12 +2579,13 @@ final class IRToLLVM {
 
     // MARK: - M6 · 6.4 actor mailbox codegen
 
-    // The shared type-id for every mailbox object `{ i64 header, mb_head, mb_tail, i64 scheduled }`:
-    // mb_head (byte 8) and mb_tail (byte 16) are managed message pointers (scanned); scheduled is a
-    // plain int. 32 bytes.
+    // The shared type-id for every mailbox object
+    // `{ i64 header, mb_head, mb_tail, i64 scheduled, sched_next }`: mb_head (8), mb_tail (16), and
+    // sched_next (32, the scheduled-mailbox-queue link) are managed pointers (scanned); scheduled (24)
+    // is a plain int. 40 bytes.
     private func mailboxTypeIdValue() -> UInt64 {
         if let id = mailboxTypeId { return id }
-        let id = registerMap([8, 16], sizeBytes: 32)
+        let id = registerMap([8, 16, 32], sizeBytes: 40)
         mailboxTypeId = id
         return id
     }
@@ -2703,8 +2705,8 @@ final class IRToLLVM {
     }
 
     // Lower an actor handler call `recv.h(args…)` to a fire-and-forget message-send (M6 · 6.4): build
-    // the message and hand it to `rt_actor_send`, which enqueues it and returns. No reply — the call
-    // is void (§9). Request-reply is a separate explicit `ask` over the continuation (§3), not here.
+    // the message and hand it to `rt_actor_send`, which enqueues it and returns. The call is void —
+    // fire-and-forget is the only actor operation (§9); there is no reply/ask of any kind.
     private func lowerActorCall(_ actorName: String, _ handler: String,
                                 _ recvValue: LLVMValueRef, _ args: [IRExpr], _ span: Span) -> LLVMValueRef? {
         guard let a = actorMap[actorName],

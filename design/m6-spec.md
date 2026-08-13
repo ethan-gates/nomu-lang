@@ -829,19 +829,29 @@ same observable behavior for a plain blocking call, but no mailbox, no handler f
 mutex.) LLVM backend only; the C backend keeps the scaffold.
 
 - **6.4.1 ✅ — async actor runtime.** Each actor object carries a **mailbox** (a GC object,
-  `{ header, mb_head, mb_tail, scheduled }`); an `on`-handler call lowers to a **fire-and-forget
-  message-send** — build a GC message `{ header, next, thunk, self, args… }`, `rt_actor_send` enqueues
-  it and returns (the sender never waits, §9 revised 2026-08-12). Handlers run on fibers **rented from
-  a program-global retained pool** (warm reuse, elastic, no dedicated per-actor fiber); the `scheduled`
-  flag gives the single-drain invariant → serial, non-reentrant, per-sender FIFO. The drain *loop* is
-  codegen (`nomu_actor_drain`) so the mailbox/message stay tracked `addrspace(1)` roots across handler
-  safepoints; the C runtime provides `rt_mailbox_pop`. The mutex is gone.
-  - *Fire-and-forget simplification (pending code pass — decided 2026-08-12):* the first build (2026-08-12)
-    had blocking value handlers — the message carried `sender`/`reply` and `rt_actor_call` parked the
-    caller until the handler wrote the reply. **Actors are now send-only** (`concurrency.md` §9): no
-    value handlers, no caller parking, no reply slot, no `rt_mailbox_wake`. Request-reply becomes an
-    explicit `ask` over the continuation (§3), not a handler return. This *shrinks* the runtime (drop
-    the reply/park/wake path); the message and `rt_actor_send` above are the post-simplification shape.
+  `{ header, mb_head, mb_tail, scheduled, sched_next }`); an `on`-handler call lowers to a
+  **fire-and-forget message-send** — build a GC message `{ header, next, thunk, self, args… }`,
+  `rt_actor_send` enqueues it and returns (the sender never waits, §9 revised 2026-08-12). A scheduled
+  mailbox joins a **global scheduled-mailbox queue** (intrusive via `sched_next`); a **capped pool of
+  mailbox fibers** pulls mailboxes off it and drains each to completion. The `scheduled` flag gives the
+  single-drain invariant → serial, non-reentrant, per-sender FIFO. The drain *loop* is codegen
+  (`nomu_actor_drain`) so the mailbox/message stay tracked `addrspace(1)` roots across handler
+  safepoints; the C runtime provides `rt_mailbox_pop`. **The scheduled-queue head is a GC root**
+  (reported by `nomu_gc_scan_parked_fibers`, `sched_next` traced through the pointer map), so a
+  scheduled mailbox whose actor is otherwise unreferenced — fire-and-forget outstanding work — stays
+  live until drained. The pool cap (`RT_MAX_MAILBOX_FIBERS`) bounds fiber-stack growth under a churn of
+  many concurrently-busy actors (excess mailboxes wait in the queue); this is the "grows to a cap" the
+  pool always specified — the first build was uncapped and overran the run queue at ~1,900 fibers under
+  the teardown churn, root-caused and fixed 2026-08-13. The mutex is gone.
+  - *Fire-and-forget simplification (done 2026-08-12):* the first build had blocking value handlers —
+    the message carried `sender`/`reply` and `rt_actor_call` parked the caller until the handler wrote
+    the reply. **Actors are now send-only** (`concurrency.md` §9): no value handlers (sema rejects a
+    non-void `on` handler), no caller parking, no reply slot, no `rt_mailbox_wake`; `rt_actor_call` →
+    `rt_actor_send`. There is no reply/ask/request-reply of any kind — fire-and-forget is the only
+    actor operation (§9); values come from `spawn let` results or channels, not actors. Also added
+    **drain-to-quiescence** at program exit (`rt_active_drains`): the
+    scheduler exits only when no user fibers *and* no outstanding actor drains remain, so fire-and-forget
+    work isn't dropped at exit (a self-sustaining actor keeps the program alive — a live server).
 - **6.4.2 ✅ — structural teardown.** Actor state + mailbox are ordinary GC objects; pending messages
   root the actor (drain-then-collect). An unreferenced idle actor owns **no non-GC resource** — no
   fiber (returned to the pool), no mutex — so it is reclaimed structurally with the cycle it dies in;
@@ -857,8 +867,10 @@ mutex.) LLVM backend only; the C backend keeps the scaffold.
 
 **Exit (met):** `examples/actor.nomu` (6/6) and `examples/actor_relay.nomu` (actor↔actor, 400/400/400)
 run on the model; byte-identical under NoGC and GenImmix; stable under tight-heap GC over hundreds of
-runs; the corpus differential and GC tools stay green. An unreferenced idle actor is reclaimed
-structurally; no per-actor non-GC resource remains.
+runs; the corpus differential and GC tools stay green. **Teardown proven:** `tools/gc-actor-teardown.sh`
+churns 200k short-lived actors and completes under GenImmix at a 4 MB heap where NoGC runs out of
+memory — the dead actors + mailboxes are actually reclaimed, not merely plausibly-so, and the capped
+mailbox-fiber pool + scheduled-queue rooting hold under the churn. No per-actor non-GC resource remains.
 
 ## 6.5 · Escape analysis (perf tail; descopable) ⬜
 

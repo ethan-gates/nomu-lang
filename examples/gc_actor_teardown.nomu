@@ -1,0 +1,20 @@
+// M6 · 6.4 — actor teardown / reclamation test. Churns many short-lived actors: each iteration
+// creates a Counter, sends it one fire-and-forget message, then drops the reference. Once its
+// mailbox drains, the actor + mailbox + processed message form an unreferenced cycle the moving GC
+// reclaims (nothing per-actor is non-GC). N actors' worth of state far exceeds the test heap, so:
+// under a moving collector the run completes at a tight heap (the dead actors are collected); under
+// NoGC (bump-and-leak) the same tight heap runs out of memory. That contrast is the proof that an
+// unreferenced idle actor's memory is actually reclaimed, not merely plausibly-so.
+actor Counter {
+    var count: Int = 0
+    on bump(by: Int) { count += by }
+}
+fun main() {
+    var i = 0
+    while i < 200000 {
+        let a = Counter()
+        a.bump(by: 1)
+        i = i + 1
+    }
+    print(i)   // 200000 — reached the end at a heap far too small to hold N live actors
+}
