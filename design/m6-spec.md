@@ -13,7 +13,7 @@ cross-cutting decisions live in 6.0.5.
 
 **Build status (2026-08-11):** **6.2 complete (Immix flip + evacuation) and 6.3.1 built + green** — the
 generational write barrier fills the `__nomu_write_barrier` seam and the default plan is **GenImmix**
-(see 6.3). **6.3.2 done (2026-08-11):** the profiling blocker was root-caused to **two binding bugs** and fixed — GenImmix now collects a retained live set at tight heaps and the footprint thesis is met (**~1.05x** live-set footprint on the churn benchmark, see 6.3). Footprint tooling (`NOMU_GC_STATS`) is in place, and the **write barrier is now inlined** (GenImmix's barrier-saturated microbench 0.71 s → 0.047 s, ~15×; see 6.3). 6.3.2's remaining polish (nursery tuning, opt-level, a wider footprint sweep) and 6.4 (actor teardown) are next. Historical bring-up status below.
+(see 6.3). **6.3.2 done (2026-08-11):** the profiling blocker was root-caused to **two binding bugs** and fixed — GenImmix now collects a retained live set at tight heaps and the footprint thesis is met (**~1.05x** live-set footprint on the churn benchmark, see 6.3). Footprint tooling (`NOMU_GC_STATS`) is in place, and the **write barrier is now inlined** (GenImmix's barrier-saturated microbench 0.71 s → 0.047 s, ~15×; see 6.3). 6.3.2's remaining polish (nursery tuning, opt-level, a wider footprint sweep) is deferred. **6.4 done (2026-08-12):** the async actor runtime (mailbox + message-send + pooled handler fibers) + structural teardown replaced the M3.4 mutex scaffold; see §6.4. Escape analysis (§6.5) remains the descopable perf tail. Historical bring-up status below.
 
 **Build status (2026-08-04):** **6.1 (MMTk NoGC bring-up) substantially built + green.** 6.1.0–6.1.3
 ✅ (Rust `VMBinding` + MMTk NoGC linked via `crate_universe`; `rt_alloc` → per-carrier mutator; the
@@ -88,7 +88,7 @@ M8 (LLVM backend + statepoints)              [hard prerequisite]
 └─ 6.1 (MMTk binding + object model, NoGC)
    └─ 6.2 (precise roots + safepoints + moving Immix)
       ├─ 6.3 (GenImmix + write barrier)
-      └─ 6.4 (actor teardown / finalization)
+      └─ 6.4 (actor runtime + teardown)
 6.5 (escape analysis)   [perf tail; needs M8 IR; descopable]
 ```
 6.1 gates all collection. 6.2 is the correctness+moving core. 6.3 and 6.4 are independent of
@@ -183,27 +183,25 @@ Closed forks (the open ones live in 6.0.6):
   - *Skipped — **denser (bound basic-block size / poll in long straight-line regions).*** Only a
     pathological giant call/alloc-free straight-line block motivates it; time-to-safepoint there is
     already finite. Revisit only if such a block appears in real code.
-- **Actor teardown: structural collection + weak-handle resource release — Decided (2026-08-04, was
-  Q5).** Actor fields + mailbox are ordinary GC objects, reclaimed structurally with the cycle in the
-  same GC cycle they die. The one non-GC resource — the fiber stack (`RT_STACK_SIZE` `mmap`) + the
-  live-fiber-registry slot — is held through a **weak reference** (MMTk `ReferenceGlue`); reference
-  processing clears it on death and enqueues the raw stack pointer onto a runtime free-queue that
-  `munmap`s it. No per-actor finalizer, no resurrection, no extra-cycle retention, no moving-GC
-  pinning of a finalizable object. Rests on invariants that leave nothing imperative to do at
-  collection: an unreferenced-and-idle actor's handler fiber is parked on its own mailbox (off every
-  run queue / external wait-list, a self-cycle tracing handles), and its structured-scope children
-  have already drained (a live child holds a back-reference, so the actor isn't garbage until they
-  finish). Explicit `shutdown` (drain-then-collect) is a separate surface path (`concurrency.md` §9).
-  Both correctness (actor↔actor cycle collection with no finalizer ordering hazard) and performance
-  (same-cycle reclamation vs. B's ≥1 extra cycle holding the whole reachable subgraph) point here.
-  Implemented at 6.4 (6.4.1 structural; 6.4.2 weak-handle release + invariant assertions).
-  - *Scoped fallback — **internal finalizer for a specific stubborn resource.*** If some actor runtime
-    resource ever needs ordered imperative teardown a weak-cleared free-queue can't express, give that
-    resource an internal GC finalizer — without making the whole actor finalizable. Internal only;
-    stays consistent with "no user-visible finalizers" (`memory-model.md` §2). Cheaper to reach if the
-    finalizer machinery already exists for other reasons (see the open user-finalizer question).
-  - *Object-model requirement:* A's weak-reference (`ReferenceGlue`) path and any general finalizer
-    queue must coexist cleanly in the binding — relevant if user-visible finalizers are later adopted.
+- **Actor teardown: purely structural collection — Revised (2026-08-12; was "structural + weak-handle",
+  2026-08-04, Q5).** The 2026-08-04 decision assumed a **dedicated per-actor handler fiber** whose stack
+  (`RT_STACK_SIZE` `mmap`) + live-fiber-registry slot was the one non-GC resource, released through a
+  weak reference (MMTk `ReferenceGlue`) + a runtime `munmap` free-queue. The actor implementation model
+  settled 2026-08-12 (`concurrency.md` §9) **removes that resource**: handler fibers are **pooled and
+  borrowed on demand**, so an idle actor holds no fiber and no mutex. Actor state and mailbox are
+  ordinary GC objects; pending messages root the actor (drain-then-collect); an unreferenced idle actor
+  therefore has **nothing non-GC to release** and is reclaimed structurally like any object — no weak
+  handle, no `ReferenceGlue`, no per-actor finalizer, no free-queue, no moving-GC pinning. Actor↔actor
+  cycles with drained mailboxes collect together in one cycle. Explicit `shutdown` (drain-then-collect)
+  is a separate surface path (`concurrency.md` §9). The pool's fiber stacks are runtime-lifetime, not
+  per-actor. **Built at §6.4 (2026-08-12):** the async actor runtime (mailbox + pooled handler fibers +
+  message-send lowering) replaced the M3.4 mutex scaffold, and teardown is purely structural as above.
+  - *Scoped fallback — **internal finalizer for a specific stubborn resource.*** Structural collection
+    covers actors now that they own no non-GC resource. If some future actor runtime resource ever needs
+    ordered imperative teardown, give that resource an internal GC finalizer (or a weak-cleared
+    free-queue via `ReferenceGlue`) — without making the whole actor finalizable. Internal only; stays
+    consistent with "no user-visible finalizers" (`memory-model.md` §2). `ReferenceGlue` in the binding
+    stays `unimplemented!()` until such a resource or user-visible finalizers appear.
 - **`String` is a GC object — Decided (2026-08-04, was Q6).** The `String` value stays two words
   `{ data, i64 len }`, but `data` becomes `addrspace(1)`, pointing at a GC-managed **pointer-free
   byte array** (a leaf object; its pointer map scans no fields). Strings are collected like all heap
@@ -820,24 +818,41 @@ generational barrier; **6.3.2 met the footprint thesis — ~1.05x live set on th
 after the `is_mutator` + LOS-routing fixes.** Remaining: nursery/opt tuning, inlined barrier, wider
 workload sweep — polish, not exit blockers.)*
 
-## 6.4 · Actor teardown / finalization ⬜
+## 6.4 · Actor runtime + teardown ✅ (built 2026-08-12)
 
-One-line intent: GC-driven actor lifetime, replacing the retired refcount actor-release path.
-Depends on 6.2. **Approach (Q5 — decided):** structural collection of actor fields + mailbox
-(ordinary GC objects), with the one non-GC resource released via a **weak handle**, not a
-per-actor finalizer.
+One-line intent: the decided async actor model (`concurrency.md` §9) on the real runtime, with
+GC-driven lifetime. Doing 6.4 required building the runtime the shipped M3.4 mutex scaffold never
+had — a mailbox, message-send, and pooled handler fibers — so this phase is the actor runtime *and*
+its teardown, which turned out to be one body of work. (The scaffold was an object
+`{ header, fields…, mu }` whose handlers locked a `pthread_mutex_t` and ran on the caller's fiber:
+same observable behavior for a plain blocking call, but no mailbox, no handler fiber, and a leaked
+mutex.) LLVM backend only; the C backend keeps the scaffold.
 
-- **6.4.1 ⬜** — remove the vestigial refcount actor-release path; drive actor collection from
-  GC liveness ("unreferenced-and-idle," `memory-model.md` §2); actor fields + mailbox are
-  structurally reclaimed with the cycle.
-- **6.4.2 ⬜** — hold the fiber stack (`RT_STACK_SIZE` `mmap`) + live-fiber-registry slot through
-  a **weak reference** (`ReferenceGlue`); reference processing clears it on death → runtime
-  free-queue `munmap`s the stack. Assert the enabling invariants (fiber parked on its own mailbox;
-  structured-scope children already drained). No user-visible finalizers; the scoped internal-
-  finalizer fallback stays unused unless a resource needs ordered imperative teardown (6.0.5).
+- **6.4.1 ✅ — async actor runtime.** Each actor object carries a **mailbox** (a GC object,
+  `{ header, mb_head, mb_tail, scheduled }`); an `on`-handler call lowers to a **message-send** —
+  build a GC message `{ header, next, thunk, sender, self, args…, reply }`, `rt_actor_call` enqueues
+  it and blocks the caller until the handler runs and writes the reply (one semantics for void and
+  returning calls, §9). Handlers run on fibers **rented from a program-global retained pool** (warm
+  reuse, elastic, no dedicated per-actor fiber); the `scheduled` flag gives the single-drain
+  invariant → serial, non-reentrant, per-sender FIFO. The drain *loop* is codegen (`nomu_actor_drain`)
+  so the mailbox/message stay tracked `addrspace(1)` roots across handler safepoints; the C runtime
+  provides `rt_mailbox_pop`/`rt_mailbox_wake`. The mutex is gone.
+- **6.4.2 ✅ — structural teardown.** Actor state + mailbox are ordinary GC objects; pending messages
+  root the actor (drain-then-collect). An unreferenced idle actor owns **no non-GC resource** — no
+  fiber (returned to the pool), no mutex — so it is reclaimed structurally with the cycle it dies in;
+  actor↔actor cycles collect together. No weak handle, no `ReferenceGlue`, no free-queue (the
+  2026-08-04 fiber-stack weak-handle plan is retired — §6.0.5). The vestigial refcount actor-release
+  path was already gone (`ObjectHeader` replaced it). Pool fiber stacks are runtime-lifetime.
+- **Park-protocol hardening (built alongside).** Actor↔actor message-send parks fibers on each other
+  heavily, surfacing a latent M:N race (a fiber re-queued before `swapcontext` finished saving its
+  context → SIGBUS / lost-wakeup deadlock). Fixed with a lock-handoff park protocol: the single
+  scheduler lock is held across every fiber↔scheduler switch, applied to spawn/join, timer sleep, I/O
+  poller, actor call, and pool rental — hardening the pre-existing park sites too.
 
-**Exit:** an unreferenced idle actor's memory *and* runtime state are reclaimed; actor↔actor
-cycles collected; no dangling handle; the refcount path is gone.
+**Exit (met):** `examples/actor.nomu` (6/6) and `examples/actor_relay.nomu` (actor↔actor, 400/400/400)
+run on the model; byte-identical under NoGC and GenImmix; stable under tight-heap GC over hundreds of
+runs; the corpus differential and GC tools stay green. An unreferenced idle actor is reclaimed
+structurally; no per-actor non-GC resource remains.
 
 ## 6.5 · Escape analysis (perf tail; descopable) ⬜
 

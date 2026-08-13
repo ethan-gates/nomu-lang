@@ -1,7 +1,9 @@
-// Actor model (M3.4): method-call syntax, mutex-serialized, actor handles are shareable.
+// Actor model (M6.5 · async mailbox): method-call syntax over message-send, actor handles are
+// shareable. A call enqueues a message and blocks until the handler runs on a pool-rented fiber;
+// the mailbox serializes handlers (one drain per actor), so concurrent senders never interleave.
 //
-// Key property: multiple concurrent spawns call the same actor safely because the
-// actor's mutex serializes every handler. The caller blocks until the handler returns.
+// Key property: multiple concurrent spawns call the same actor safely because the mailbox
+// serializes every handler. The caller blocks until the handler returns.
 //
 // Run with `time ./a.out` — should print in ~200ms, not ~600ms, proving the three
 // workers ran concurrently even though they share one Counter.

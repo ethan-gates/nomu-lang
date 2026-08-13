@@ -190,6 +190,8 @@ struct Fiber {
     void* arg;
     struct Fiber* rt_prev; // M6 · 6.2.2 — global live-fiber registry (intrusive doubly-linked list)
     struct Fiber* rt_next;
+    void* drain_target;    // M6 · 6.4 — pool worker: the mailbox this rental is draining (NomuMailbox*)
+    struct Fiber* pool_next; // M6 · 6.4 — pool worker free-list link (guarded by rt_queue_mu)
 };
 
 static Fiber* rt_run_queue[RT_MAX_FIBERS];
@@ -312,8 +314,17 @@ static Fiber* rt_rq_pop(void) {
     return f;
 }
 
+// Lock-handoff park protocol (M6 · 6.4). rt_queue_mu is held across every fiber↔scheduler context
+// switch: the scheduler switches INTO a fiber with the lock held, and a fiber switches BACK to the
+// scheduler with the lock held. A fiber releases the lock right after it is switched in (before
+// running any Nomu code) and re-acquires it to park or finish. This closes the window where a
+// waker could re-queue a fiber whose context is not yet fully saved by swapcontext — the bug that
+// showed up as a lost-wakeup deadlock / SIGBUS under heavy actor↔actor parking. A fiber is only
+// ever eligible for wakeup once the scheduler has regained control (context fully saved) and later
+// released the lock (by switching into the next fiber, or via cond_wait).
 static void rt_fiber_trampoline(void) {
     Fiber* self = rt_current;
+    pthread_mutex_unlock(&rt_queue_mu); // release the lock handed over by the scheduler on switch-in
     self->result = self->fn(self->arg);
     pthread_mutex_lock(&rt_queue_mu);
     self->status = FIBER_DONE;
@@ -324,8 +335,7 @@ static void rt_fiber_trampoline(void) {
         self->joiner = NULL;
     }
     pthread_cond_broadcast(&rt_queue_cond); // wake all carriers to re-check rt_active == 0
-    pthread_mutex_unlock(&rt_queue_mu);
-    swapcontext(&self->ctx, &rt_sched_ctx);
+    swapcontext(&self->ctx, &rt_sched_ctx); // hand the lock back to the scheduler (held across)
 }
 
 Fiber* fiber_spawn(void* (*fn)(void*), void* arg) {
@@ -362,10 +372,10 @@ static void rt_scheduler_run(void) {
         Fiber* f = rt_rq_pop();
         if (f) {
             f->status = FIBER_RUNNING; // M6 · 6.2.2 — on-CPU; scanned via this carrier, not the registry
-            pthread_mutex_unlock(&rt_queue_mu);
             rt_current = f;
+            // Switch in with the lock HELD (handoff protocol); f releases it before running Nomu
+            // code and hands it back here when it parks/finishes. No unlock/relock around the switch.
             swapcontext(&rt_sched_ctx, &f->ctx);
-            pthread_mutex_lock(&rt_queue_mu);
         } else if (rt_active == 0) {
             break;
         } else {
@@ -385,12 +395,152 @@ void* spawn_join(SpawnHandle* h) {
     if (h->fiber->status != FIBER_DONE) {
         h->fiber->joiner = rt_current;
         rt_current->status = FIBER_PARKED;
-        pthread_mutex_unlock(&rt_queue_mu);
+        // Park with the lock HELD (handoff protocol): the scheduler receives it, and this fiber
+        // becomes wakeable only after its context is fully saved. Resumes here with the lock held.
         swapcontext(&rt_current->ctx, &rt_sched_ctx);
-    } else {
-        pthread_mutex_unlock(&rt_queue_mu);
     }
+    pthread_mutex_unlock(&rt_queue_mu);
     return h->fiber->result;
+}
+
+// ---- Actor mailbox + drain-fiber pool (M6 · 6.4 · async message-send) ----
+// The decided actor model (`concurrency.md` §9), backing the LLVM backend. An actor is an ordinary
+// GC object whose fixed prefix carries a mailbox (a FIFO of GC-allocated messages); a call enqueues
+// a message and blocks until its handler runs. Handlers run on fibers **rented from a program-global
+// pool** — an idle actor holds no fiber, and at most one drain runs per actor at a time (the
+// `scheduled` flag), giving serial, non-reentrant, per-sender-FIFO handling. Teardown is structural:
+// nothing here is allocated per actor, so nothing is freed per actor. Layout is the ABI contract in
+// runtime.h; only the fixed prefixes are touched here.
+typedef struct NomuMsg {
+    uint64_t header;
+    struct NomuMsg* next;                // FIFO link (GC-scanned)
+    void (*thunk)(void* msg);            // codegen per-handler thunk: reads self+args, runs handler, writes reply
+    Fiber* sender;                       // caller to wake once the reply is written (a runtime Fiber*)
+    void* self;                          // the receiver actor (GC-scanned); the rest is args…, reply
+} NomuMsg;
+
+typedef struct NomuMailbox {
+    uint64_t header;
+    NomuMsg* mb_head;      // GC-scanned
+    NomuMsg* mb_tail;      // GC-scanned
+    int64_t scheduled;     // 1 while a rented worker is (or is about to be) draining this mailbox
+} NomuMailbox;
+
+// Program-global pool of reusable worker fibers. `rt_pool_free` is a free-list of parked idle
+// workers; guarded by rt_queue_mu (every mailbox op already holds it). Workers do not count toward
+// rt_active — they are infrastructure, kept alive by a parked (counted) caller during any call.
+static Fiber* rt_pool_free = NULL;
+
+// The drain LOOP is emitted by codegen, not written here: it must hold the mailbox + message as
+// tracked addrspace(1) roots across each handler call (a moving GC can relocate them at a safepoint
+// inside the handler), which C code can't. Codegen's `nomu_actor_drain(mailbox)` loops over
+// rt_mailbox_pop → `msg->thunk(msg)` → rt_mailbox_wake until the mailbox is empty. The C side here
+// only rents/returns workers and provides the two non-safepoint-spanning primitives below.
+extern void nomu_actor_drain(void* mailbox);
+
+// A worker fiber's top level: rent → drain the assigned mailbox → park back on the free-list →
+// repeat. It never returns; re-rental resumes it right after the swapcontext with a fresh target.
+static void rt_pool_worker_main(void) {
+    Fiber* self = rt_current;
+    while (1) {
+        // Entered (first rental) / resumed (later rentals) with the lock HELD by the scheduler; the
+        // dispatcher set drain_target under that lock. Read it, then release before draining.
+        void* mb = self->drain_target;
+        self->drain_target = NULL;
+        pthread_mutex_unlock(&rt_queue_mu);
+        nomu_actor_drain(mb);
+        pthread_mutex_lock(&rt_queue_mu);
+        self->pool_next = rt_pool_free;   // return this warm fiber to the pool
+        rt_pool_free = self;
+        self->status = FIBER_PARKED;
+        // Park with the lock HELD (handoff): wakeable only after the context is saved. A rental
+        // (rt_dispatch_drain) pops us off the free-list, sets drain_target, and rq_pushes us.
+        swapcontext(&self->ctx, &rt_sched_ctx);
+    }
+}
+
+// Create a fresh pool worker. Caller holds rt_queue_mu (registry insert needs it). Registered so a
+// worker parked inside an inline-blocking handler is scanned for roots like any fiber (6.2.2); an
+// idle worker on the free-list holds no live roots.
+static Fiber* rt_worker_new(void) {
+    Fiber* f = (Fiber*)calloc(1, sizeof(Fiber));
+    f->stack = (char*)malloc(RT_STACK_SIZE);
+    f->status = FIBER_RUNNABLE;
+    getcontext(&f->ctx);
+    f->ctx.uc_stack.ss_sp = f->stack;
+    f->ctx.uc_stack.ss_size = RT_STACK_SIZE;
+    f->ctx.uc_link = NULL;
+    makecontext(&f->ctx, rt_pool_worker_main, 0);
+    rt_registry_insert(f);
+    return f;
+}
+
+// Rent a worker to drain `mb` and make it runnable. Caller holds rt_queue_mu; called on the
+// scheduled 0→1 edge so exactly one worker is ever assigned to a mailbox at a time (the pool
+// parallelizes across actors, never within one). Grows the pool on demand.
+static void rt_dispatch_drain(NomuMailbox* mb) {
+    Fiber* w = rt_pool_free;
+    if (w) { rt_pool_free = w->pool_next; w->pool_next = NULL; }
+    else   { w = rt_worker_new(); }
+    w->drain_target = mb;
+    w->status = FIBER_RUNNABLE;
+    rt_rq_push(w);
+}
+
+// Pop the next message from `mailbox` in FIFO order, or return NULL when empty. On empty it clears
+// `scheduled` under the same lock hold a concurrent enqueue takes, so no message is lost: an enqueue
+// either linked before we looked (this returns it) or arrives after the clear and redispatches a
+// fresh drain. No safepoint/allocation inside → GC cannot move `mailbox` across this call, so
+// codegen's tracked mailbox pointer stays valid. Called from codegen's `nomu_actor_drain`.
+void* rt_mailbox_pop(void* mailbox) {
+    NomuMailbox* mb = (NomuMailbox*)mailbox;
+    pthread_mutex_lock(&rt_queue_mu);
+    NomuMsg* msg = mb->mb_head;
+    if (!msg) { mb->scheduled = 0; pthread_mutex_unlock(&rt_queue_mu); return NULL; }
+    mb->mb_head = msg->next;
+    if (!mb->mb_head) mb->mb_tail = NULL;
+    rt_gc_write_barrier(mb, &mb->mb_head, mb->mb_head);   // slot mutated; keep the moving GC's remset honest
+    pthread_mutex_unlock(&rt_queue_mu);
+    return msg;
+}
+
+// Wake a returning call's parked sender (a runtime Fiber*, not a GC object — stable across GC).
+// Called from codegen's `nomu_actor_drain` after a handler has run and written its reply.
+void rt_mailbox_wake(void* sender) {
+    Fiber* s = (Fiber*)sender;
+    if (!s) return;
+    pthread_mutex_lock(&rt_queue_mu);
+    s->status = FIBER_RUNNABLE;
+    rt_rq_push(s);
+    pthread_mutex_unlock(&rt_queue_mu);
+}
+
+// Enqueue `msg` on `mailbox` and block the caller until its handler has run and written the reply
+// (one semantics for void and returning calls, §9). Codegen reads the reply out of `msg` after this
+// returns. The parked caller keeps `msg` reachable on its stack throughout, so the mailbox link is
+// backed by a real root; the write barrier keeps the mailbox's slots valid across a move.
+void rt_actor_call(void* mailbox_, void* msg_) {
+    NomuMailbox* mb = (NomuMailbox*)mailbox_;
+    NomuMsg* msg = (NomuMsg*)msg_;
+    pthread_mutex_lock(&rt_queue_mu);
+    msg->next = NULL;
+    msg->sender = rt_current;
+    if (mb->mb_tail) {
+        mb->mb_tail->next = msg;
+        rt_gc_write_barrier(mb->mb_tail, &mb->mb_tail->next, msg);
+    } else {
+        mb->mb_head = msg;
+        rt_gc_write_barrier(mb, &mb->mb_head, msg);
+    }
+    mb->mb_tail = msg;
+    rt_gc_write_barrier(mb, &mb->mb_tail, msg);
+    if (!mb->scheduled) { mb->scheduled = 1; rt_dispatch_drain(mb); }
+    rt_current->status = FIBER_PARKED;
+    // Park with the lock HELD (handoff protocol): the drain wakes us (rt_mailbox_wake) only after the
+    // handler has run, and we become wakeable only once our context is fully saved. Resumes here with
+    // the lock held; the reply lives in msg (codegen reads it after this returns).
+    swapcontext(&rt_current->ctx, &rt_sched_ctx);
+    pthread_mutex_unlock(&rt_queue_mu);
 }
 
 // ---- Actor mutex (opaque, heap-allocated) ----
@@ -504,11 +654,17 @@ int64_t rt_sleep_ms(int64_t ms) {
         nomu_gc_smoke_parked();
     }
     uint64_t expiry = rt_now_ns() + (uint64_t)ms * 1000000ULL;
+    // Handoff protocol (M6 · 6.4): hold rt_queue_mu across the park so the timer thread's wake (which
+    // takes rt_queue_mu to rq_push) can't run until this fiber's context is fully saved. Registering
+    // on the timer heap under both locks is deadlock-free — the timer thread releases rt_timer_mu
+    // before it ever reaches for rt_queue_mu.
+    pthread_mutex_lock(&rt_queue_mu);
     pthread_mutex_lock(&rt_timer_mu);
     rt_timer_push(expiry, rt_current);
     pthread_mutex_unlock(&rt_timer_mu);
     rt_current->status = FIBER_PARKED;
     swapcontext(&rt_current->ctx, &rt_sched_ctx);
+    pthread_mutex_unlock(&rt_queue_mu);
     return ms;
 }
 
@@ -517,11 +673,16 @@ int64_t rt_sleep_ms(int64_t ms) {
 static int rt_kq = -1;
 
 static void rt_wait_readable(int fd) {
+    // Handoff protocol (M6 · 6.4): hold rt_queue_mu across the park so the poller thread's wake (which
+    // takes rt_queue_mu to rq_push) can't run until this fiber's context is fully saved. Registering
+    // the kevent under rt_queue_mu is safe — the poller blocks in kevent() without that lock.
     struct kevent ev;
     EV_SET(&ev, fd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, rt_current);
+    pthread_mutex_lock(&rt_queue_mu);
     kevent(rt_kq, &ev, 1, NULL, 0, NULL);
     rt_current->status = FIBER_PARKED;
     swapcontext(&rt_current->ctx, &rt_sched_ctx);
+    pthread_mutex_unlock(&rt_queue_mu);
 }
 
 static void* rt_poller_thread(void* _) {

@@ -49,12 +49,43 @@ String  rt_read_line(int fd);
 Fiber*  fiber_spawn(void* (*fn)(void*), void* arg);
 void*   spawn_join(SpawnHandle* h);
 
-// ---- Actor mutex (opaque, heap-allocated) ----
-// The C backend inlines a `pthread_mutex_t` in the actor struct; the LLVM backend has no portable
-// `pthread_mutex_t` layout, so it holds an opaque `void*` to a runtime-allocated mutex instead.
+// ---- Actor mutex (opaque, heap-allocated) — C backend only ----
+// The C backend inlines a `pthread_mutex_t` in the actor struct; it has no portable layout for the
+// LLVM backend. The LLVM backend does NOT use this: it drives actors through the mailbox ABI below
+// (M6 · 6.4). Kept for the C backend's mutex-serialized actor.
 void* rt_mutex_new(void);
 void  rt_mutex_lock(void* m);
 void  rt_mutex_unlock(void* m);
+
+// ---- Actor mailbox (M6 · 6.4 · async message-send, LLVM backend) ----
+// The decided actor model (`concurrency.md` §9): a call enqueues a message on the actor's mailbox
+// and blocks until its handler runs; handlers run on fibers rented from a program-global pool, one
+// drain per actor at a time (serial, non-reentrant). Teardown is structural — actor + mailbox are
+// ordinary GC objects, so the runtime allocates nothing per-actor and frees nothing here.
+//
+// ABI contract with codegen (`Lowering.swift`). The mailbox and message are GC-allocated objects
+// with fixed layouts this C code reaches without knowing the actor's fields / the handler's args.
+// The actor object is unchanged (class-shaped) except its last slot holds a pointer to its mailbox;
+// codegen loads that at the call site, so this code never parses the actor. Codegen supplies the GC
+// pointer maps.
+//
+//   mailbox object { i64 header; Msg* mb_head; Msg* mb_tail; i64 scheduled; }
+//   message object { i64 header; Msg* next; void(*thunk)(void* msg); Fiber* sender; void* self;
+//                    args…; reply }
+//
+// `mb_head`/`mb_tail`/`next`/`self` are GC-scanned (they chain live messages and keep the receiver
+// live); `thunk` (code ptr) and `sender` (a runtime Fiber*, not GC) are not. `rt_actor_call`
+// enqueues `msg` on `mailbox`, schedules a drain if none is running, and parks the caller until the
+// handler has run and written the reply; codegen reads the reply out of `msg` after it returns.
+// One semantics for void and returning calls (§9): the call blocks until the handler returns.
+//
+// The drain LOOP is codegen-emitted (`nomu_actor_drain`), not here: it must hold the mailbox and
+// message as tracked addrspace(1) roots across each handler call, which C can't. It loops over
+// these two primitives — `rt_mailbox_pop` (FIFO pop, NULL on empty + clears the drain flag) and
+// `rt_mailbox_wake` (wake the parked sender) — running `msg->thunk(msg)` between them.
+void  rt_actor_call(void* mailbox, void* msg);
+void* rt_mailbox_pop(void* mailbox);
+void  rt_mailbox_wake(void* sender);
 
 // ---- GC root scanning (M8.4.3; m6-spec.md §6.0.8) ----
 // Parse the process's `__llvm_stackmaps` section into a return-address → live-GC-slot index.
