@@ -494,7 +494,7 @@ final class IRToLLVM {
     // An actor object is `{ i64 header, fields…, mailbox }`, heap-allocated (M6 · 6.4). Fields sit at
     // index i+1 (past the header, like a class); the trailing slot holds a managed pointer to the
     // actor's mailbox object (a GC object — so it is scanned, unlike the old runtime mutex). Codegen
-    // loads this at the call site and hands the mailbox to `rt_actor_call`, so the actor object never
+    // loads this at the call site and hands the mailbox to `rt_actor_send`, so the actor object never
     // crosses the runtime C ABI.
     private func actorType(_ name: String) -> LLVMTypeRef? {
         if let t = actorTypes[name] { return t }
@@ -1237,9 +1237,9 @@ final class IRToLLVM {
             }
         }
 
-        // An actor handler call is a message-send, not a direct call (M6 · 6.4): build a message and
-        // block on `rt_actor_call` (the handler runs on a rented pool worker). `self` is the actor
-        // object pointer.
+        // An actor handler call is a fire-and-forget message-send, not a direct call (M6 · 6.4): build
+        // a message and `rt_actor_send` it (the handler runs later on a rented pool worker; the call
+        // returns immediately with no value). `self` is the actor object pointer.
         if kind == .actor_ {
             guard let recvValue = lowerExpr(receiver) else { return nil }
             return lowerActorCall(typeName, method, recvValue, args, span)
@@ -2588,30 +2588,25 @@ final class IRToLLVM {
         return id
     }
 
-    // The generic message prefix `{ i64 header, p1 next, i8ptr thunk, i8ptr sender, p1 self }` —
-    // enough for the shared drain loop to reach `thunk` (idx 2) and `sender` (idx 3). Per-handler
-    // message types extend it with args + reply, but share these offsets.
+    // The generic message prefix `{ i64 header, p1 next, i8ptr thunk, p1 self }` — enough for the
+    // shared drain loop to reach `thunk` (idx 2). Per-handler message types extend it with args, but
+    // share these offsets. (Fire-and-forget: no sender, no reply — §9.)
     private func msgPrefixType() -> LLVMTypeRef {
         if let t = msgPrefixTypeRef { return t }
-        let t = structTy([i64, p1, i8ptr, i8ptr, p1])
+        let t = structTy([i64, p1, i8ptr, p1])
         msgPrefixTypeRef = t
         return t
     }
 
-    // The per-handler message struct `{ header, next, thunk, sender, self, args…, reply? }`. Field
-    // indices past the 5-slot prefix are 5 + argPos; reply is the last field when the handler returns
-    // a value.
+    // The per-handler message struct `{ header, next, thunk, self, args… }`. Field indices past the
+    // 4-slot prefix are 4 + argPos. Handlers are void (fire-and-forget), so there is no reply field.
     private func messageType(_ actorName: String, _ h: IRHandler) -> LLVMTypeRef? {
         let key = "\(actorName):\(h.name)"
         if let t = messageTypes[key] { return t }
-        var elems: [LLVMTypeRef] = [i64, p1, i8ptr, i8ptr, p1]   // header, next, thunk, sender, self
+        var elems: [LLVMTypeRef] = [i64, p1, i8ptr, p1]   // header, next, thunk, self
         for p in h.params {
             guard let t = llvmType(p.type, p.span) else { return nil }
             elems.append(t)
-        }
-        if h.returnType != .void {
-            guard let rt = llvmType(h.returnType, h.span) else { return nil }
-            elems.append(rt)
         }
         let mt = LLVMStructCreateNamed(ctx, "msg.\(actorName).\(h.name)")!
         setStructBody(mt, elems)
@@ -2619,35 +2614,28 @@ final class IRToLLVM {
         return mt
     }
 
-    // Field index of a handler's i-th arg / its reply within the message struct.
-    private func msgArgIndex(_ i: Int) -> Int { 5 + i }
-    private func msgReplyIndex(_ h: IRHandler) -> Int { 5 + h.params.count }
+    // Field index of a handler's i-th arg within the message struct (past the 4-slot prefix).
+    private func msgArgIndex(_ i: Int) -> Int { 4 + i }
 
-    // Total 8-byte slots a handler's message occupies: 5-slot prefix + args + reply. Every leaf is
-    // 8-aligned and an 8-multiple (the object-model invariant), so LLVM adds no padding and byte
-    // offsets equal slot*8 — the same assumption the class/actor layout makes.
+    // Total 8-byte slots a handler's message occupies: 4-slot prefix + args. Every leaf is 8-aligned
+    // and an 8-multiple (the object-model invariant), so LLVM adds no padding and byte offsets equal
+    // slot*8 — the same assumption the class/actor layout makes.
     private func messageSlots(_ h: IRHandler) -> Int {
-        var slots = 5
+        var slots = 4
         for p in h.params { slots += slotCount(p.type) }
-        if h.returnType != .void { slots += slotCount(h.returnType) }
         return slots
     }
 
-    // Type-id + pointer map for a handler's message. Managed offsets: next (8) and self (32) always,
-    // plus any managed pointers inside the args and the reply. thunk (16) and sender (24, a runtime
-    // Fiber*) are never scanned.
+    // Type-id + pointer map for a handler's message. Managed offsets: next (8) and self (24) always,
+    // plus any managed pointers inside the args. thunk (16, a code ptr) is never scanned.
     private func messageTypeIdValue(_ actorName: String, _ h: IRHandler) -> UInt64 {
         let key = "\(actorName):\(h.name)"
         if let id = messageTypeIds[key] { return id }
-        var offsets: [Int32] = [8, 32]   // next, self
-        var slot = 5                     // args start past the 5-slot prefix
+        var offsets: [Int32] = [8, 24]   // next, self
+        var slot = 4                     // args start past the 4-slot prefix
         for p in h.params {
             collectManagedOffsets(p.type, baseSlot: slot, into: &offsets)
             slot += slotCount(p.type)
-        }
-        if h.returnType != .void {
-            collectManagedOffsets(h.returnType, baseSlot: slot, into: &offsets)
-            slot += slotCount(h.returnType)
         }
         let id = registerMap(offsets, sizeBytes: Int32(slot * 8))
         messageTypeIds[key] = id
@@ -2655,9 +2643,9 @@ final class IRToLLVM {
     }
 
     // The per-handler drain thunk `void @nomu_onthunk_<A>_<h>(ptr addrspace(1) msg)`: unpack self +
-    // args from the message, call the handler, store its result into the reply slot. Runs on a rented
-    // pool worker inside the drain loop; `msg` is a tracked GC root here, so the handler's safepoints
-    // relocate it and `self` correctly.
+    // args from the message and call the handler (void — no reply). Runs on a rented pool worker
+    // inside the drain loop; `msg` is a tracked GC root here, so the handler's safepoints relocate it
+    // and `self` correctly.
     private func actorThunk(_ actorName: String, _ h: IRHandler) -> LLVMValueRef {
         let key = "\(actorName):\(h.name)"
         if let f = actorThunks[key] { return f }
@@ -2668,29 +2656,25 @@ final class IRToLLVM {
         actorThunks[key] = fn
         withStubBody(fn) {
             let msg = LLVMGetParam(fn, 0)!
-            let selfV = LLVMBuildLoad2(b, p1, structGEP(mt, msg, 4), "self")!
+            let selfV = LLVMBuildLoad2(b, p1, structGEP(mt, msg, 3), "self")!
             var argVals: [LLVMValueRef?] = [selfV]
             for (i, p) in h.params.enumerated() {
                 guard let t = llvmType(p.type, p.span) else { continue }
                 argVals.append(LLVMBuildLoad2(b, t, structGEP(mt, msg, msgArgIndex(i)), p.name))
             }
-            let result = buildCall(handler.fn, handler.ty, argVals)
-            if h.returnType != .void, let result = result {
-                storeField(msg, structGEP(mt, msg, msgReplyIndex(h)), result)
-            }
+            _ = buildCall(handler.fn, handler.ty, argVals)   // void handler; any return is dropped
             LLVMBuildRetVoid(b)
         }
         return fn
     }
 
     // The one shared drain loop `void @nomu_actor_drain(ptr addrspace(1) mb)` the pool worker calls
-    // (runtime.c `rt_pool_worker_main`): pop a message, run its thunk, wake its sender, repeat until
-    // the mailbox is empty. `mb` and each `msg` are tracked GC roots across the thunk call — the whole
-    // reason this loop is codegen (not C): a moving GC may relocate them at a handler safepoint.
+    // (runtime.c `rt_pool_worker_main`): pop a message, run its thunk, repeat until the mailbox is
+    // empty. `mb` and each `msg` are tracked GC roots across the thunk call — the whole reason this
+    // loop is codegen (not C): a moving GC may relocate them at a handler safepoint.
     private func actorDrain() -> (LLVMValueRef, LLVMTypeRef) {
         if let f = actorDrainFn { return f }
         let pop = runtimeFn("rt_mailbox_pop", ret: p1, params: [p1], varArg: false)
-        let wake = runtimeFn("rt_mailbox_wake", ret: voidTy, params: [i8ptr], varArg: false)
         let thunkTy = fnType(voidTy, [p1])
         let pre = msgPrefixType()
         let (fn, fnTy) = emitFunction("nomu_actor_drain", ret: voidTy, params: [p1])
@@ -2711,8 +2695,6 @@ final class IRToLLVM {
             _ = callArgs.withUnsafeMutableBufferPointer {
                 LLVMBuildCall2(b, thunkTy, thunk, $0.baseAddress, 1, "")
             }
-            let sender = LLVMBuildLoad2(b, i8ptr, structGEP(pre, msg, 3), "sender")!
-            _ = buildCall(wake.0, wake.1, [sender])
             LLVMBuildBr(b, loopBB)
             LLVMPositionBuilderAtEnd(b, exitBB)
             LLVMBuildRetVoid(b)
@@ -2720,9 +2702,9 @@ final class IRToLLVM {
         return actorDrainFn!
     }
 
-    // Lower an actor handler call `recv.h(args…)` to a message-send (M6 · 6.4): build the message, hand
-    // it to `rt_actor_call` (which enqueues + parks the caller until the handler runs), then read the
-    // reply back out. One semantics for void and returning calls (§9): the call blocks.
+    // Lower an actor handler call `recv.h(args…)` to a fire-and-forget message-send (M6 · 6.4): build
+    // the message and hand it to `rt_actor_send`, which enqueues it and returns. No reply — the call
+    // is void (§9). Request-reply is a separate explicit `ask` over the continuation (§3), not here.
     private func lowerActorCall(_ actorName: String, _ handler: String,
                                 _ recvValue: LLVMValueRef, _ args: [IRExpr], _ span: Span) -> LLVMValueRef? {
         guard let a = actorMap[actorName],
@@ -2733,23 +2715,21 @@ final class IRToLLVM {
         let thunk = actorThunk(actorName, h)   // per-handler thunk (+ handler + message type)
         guard let mt = messageType(actorName, h), let at = actorType(actorName) else { return nil }
 
-        // Allocate + populate the message. header, thunk, self, args are set here; next/sender are
-        // filled by the runtime. Reply is left undefined until the handler writes it.
+        // Allocate + populate the message. header, thunk, self, args are set here; `next` is filled by
+        // the runtime. The message stays reachable via the mailbox chain once enqueued (no sender root).
         let bytes = messageSlots(h) * 8
         let msg = rtAllocManaged(LLVMConstInt(i64, UInt64(bytes), 0))
         writeTypeIdHeaderRaw(msg, messageTypeIdValue(actorName, h))
         LLVMBuildStore(b, thunk, structGEP(mt, msg, 2))         // thunk (code ptr, not managed)
-        storeField(msg, structGEP(mt, msg, 4), recvValue)       // self (managed)
+        storeField(msg, structGEP(mt, msg, 3), recvValue)       // self (managed)
         for (i, argE) in args.enumerated() {
             guard let v = lowerExpr(argE) else { return nil }
             storeField(msg, structGEP(mt, msg, msgArgIndex(i)), v)
         }
         let mailbox = LLVMBuildLoad2(b, p1, structGEP(at, recvValue, actorMailboxIndex(actorName)), "mailbox")!
-        let call = runtimeFn("rt_actor_call", ret: voidTy, params: [p1, p1], varArg: false)
-        _ = buildCall(call.0, call.1, [mailbox, msg])
-        if h.returnType == .void { return LLVMConstNull(p1) }
-        guard let rt = llvmType(h.returnType, h.span) else { return nil }
-        return LLVMBuildLoad2(b, rt, structGEP(mt, msg, msgReplyIndex(h)), "reply")
+        let send = runtimeFn("rt_actor_send", ret: voidTy, params: [p1, p1], varArg: false)
+        _ = buildCall(send.0, send.1, [mailbox, msg])
+        return LLVMConstNull(p1)   // fire-and-forget: no value
     }
 
     // Emit the flat pointer-map tables the runtime/binding reads (always emitted so runtime.c's

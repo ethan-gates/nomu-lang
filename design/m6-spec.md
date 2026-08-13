@@ -829,25 +829,31 @@ same observable behavior for a plain blocking call, but no mailbox, no handler f
 mutex.) LLVM backend only; the C backend keeps the scaffold.
 
 - **6.4.1 ✅ — async actor runtime.** Each actor object carries a **mailbox** (a GC object,
-  `{ header, mb_head, mb_tail, scheduled }`); an `on`-handler call lowers to a **message-send** —
-  build a GC message `{ header, next, thunk, sender, self, args…, reply }`, `rt_actor_call` enqueues
-  it and blocks the caller until the handler runs and writes the reply (one semantics for void and
-  returning calls, §9). Handlers run on fibers **rented from a program-global retained pool** (warm
-  reuse, elastic, no dedicated per-actor fiber); the `scheduled` flag gives the single-drain
-  invariant → serial, non-reentrant, per-sender FIFO. The drain *loop* is codegen (`nomu_actor_drain`)
-  so the mailbox/message stay tracked `addrspace(1)` roots across handler safepoints; the C runtime
-  provides `rt_mailbox_pop`/`rt_mailbox_wake`. The mutex is gone.
+  `{ header, mb_head, mb_tail, scheduled }`); an `on`-handler call lowers to a **fire-and-forget
+  message-send** — build a GC message `{ header, next, thunk, self, args… }`, `rt_actor_send` enqueues
+  it and returns (the sender never waits, §9 revised 2026-08-12). Handlers run on fibers **rented from
+  a program-global retained pool** (warm reuse, elastic, no dedicated per-actor fiber); the `scheduled`
+  flag gives the single-drain invariant → serial, non-reentrant, per-sender FIFO. The drain *loop* is
+  codegen (`nomu_actor_drain`) so the mailbox/message stay tracked `addrspace(1)` roots across handler
+  safepoints; the C runtime provides `rt_mailbox_pop`. The mutex is gone.
+  - *Fire-and-forget simplification (pending code pass — decided 2026-08-12):* the first build (2026-08-12)
+    had blocking value handlers — the message carried `sender`/`reply` and `rt_actor_call` parked the
+    caller until the handler wrote the reply. **Actors are now send-only** (`concurrency.md` §9): no
+    value handlers, no caller parking, no reply slot, no `rt_mailbox_wake`. Request-reply becomes an
+    explicit `ask` over the continuation (§3), not a handler return. This *shrinks* the runtime (drop
+    the reply/park/wake path); the message and `rt_actor_send` above are the post-simplification shape.
 - **6.4.2 ✅ — structural teardown.** Actor state + mailbox are ordinary GC objects; pending messages
   root the actor (drain-then-collect). An unreferenced idle actor owns **no non-GC resource** — no
   fiber (returned to the pool), no mutex — so it is reclaimed structurally with the cycle it dies in;
   actor↔actor cycles collect together. No weak handle, no `ReferenceGlue`, no free-queue (the
   2026-08-04 fiber-stack weak-handle plan is retired — §6.0.5). The vestigial refcount actor-release
   path was already gone (`ObjectHeader` replaced it). Pool fiber stacks are runtime-lifetime.
-- **Park-protocol hardening (built alongside).** Actor↔actor message-send parks fibers on each other
-  heavily, surfacing a latent M:N race (a fiber re-queued before `swapcontext` finished saving its
-  context → SIGBUS / lost-wakeup deadlock). Fixed with a lock-handoff park protocol: the single
-  scheduler lock is held across every fiber↔scheduler switch, applied to spawn/join, timer sleep, I/O
-  poller, actor call, and pool rental — hardening the pre-existing park sites too.
+- **Park-protocol hardening (built alongside).** Heavy fiber parking surfaced a latent M:N race (a
+  fiber re-queued before `swapcontext` finished saving its context → SIGBUS / lost-wakeup deadlock).
+  Fixed with a lock-handoff park protocol: the single scheduler lock is held across every
+  fiber↔scheduler switch, applied to spawn/join, timer sleep, I/O poller, and pool rental — hardening
+  the pre-existing park sites too. (Found via the blocking actor↔actor calls of the first build; the
+  fix stands regardless of the fire-and-forget simplification.)
 
 **Exit (met):** `examples/actor.nomu` (6/6) and `examples/actor_relay.nomu` (actor↔actor, 400/400/400)
 run on the model; byte-identical under NoGC and GenImmix; stable under tight-heap GC over hundreds of

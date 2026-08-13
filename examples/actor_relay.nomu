@@ -1,27 +1,29 @@
-// Actor regression (M6.5 · async mailbox model). Exercises the parts the M3.4 mutex scaffold could
-// not, and doubles as a stress reproducer for the M:N park protocol:
+// Actor regression (M6 · 6.4 · fire-and-forget mailbox). Exercises the paths a single-actor demo
+// doesn't, and doubles as a stress reproducer for the M:N park protocol:
 //   - many concurrent senders serialized through one mailbox — the total is exact regardless of
 //     interleaving (single-drain + FIFO),
-//   - a returning handler (the reply path: a call blocks until the handler runs and replies),
-//   - actor -> actor message-send: a Relay handler calls into a Sum actor, so the pool worker
-//     draining Relay parks on Sum's mailbox while another worker drains Sum. That mutual parking is
-//     what surfaced the park race the lock-handoff protocol fixes.
+//   - actor -> actor message-send: a Relay handler forwards into a Sum actor, so a pool worker
+//     draining Relay sends to Sum's mailbox. That inter-actor traffic is what surfaced the park race
+//     the lock-handoff protocol fixes.
 //
-// Output must be byte-identical under NoGC and the default GenImmix, and stable across many runs.
+// Determinism without request-reply: the final `report` is routed *through* the relay. The workers
+// are joined before `finish` is sent, so Relay's mailbox holds 400 `forward`s then `finish` (FIFO);
+// Relay drains them in order, sending `add` x400 then `report` to Sum — and since Relay is the sole
+// sender to Sum, per-sender FIFO means Sum applies all 400 adds before it reports. Prints 400 under
+// both NoGC and GenImmix, stable across runs. Drain-to-quiescence keeps the program alive until done.
 
 actor Sum {
     var total: Int = 0
     on add(n: Int) { total += n }
-    on get() -> Int { return total }
+    on report() { print(total) }
 }
 
 actor Relay {
     var sink: Sum
     on forward(n: Int) { sink.add(n: n) }   // actor -> actor: forwards into the shared Sum
-    on tally() -> Int { return sink.get() }
+    on finish() { sink.report() }            // ordered after all forwards this Relay has drained
 }
 
-// Each worker forwards `1` a hundred times through the relay into the shared Sum.
 fun worker(r: Relay) -> Int {
     var i = 0
     while i < 100 {
@@ -31,19 +33,16 @@ fun worker(r: Relay) -> Int {
     return i
 }
 
-fun main() {
-    let s = Sum()
-    let r = Relay(sink: s)
-
-    // Four workers hammer the relay concurrently — 400 forwards total, serialized by the mailboxes.
+fun runWorkers(r: Relay) {
     spawn let a = worker(r)
     spawn let b = worker(r)
     spawn let c = worker(r)
     spawn let d = worker(r)
+}
 
-    // Three independent witnesses to the same 400 units of work: the spawn results, the relay's
-    // view of its sink, and the sink's own state.
-    print(a + b + c + d)   // 400
-    print(r.tally())       // 400
-    print(s.get())         // 400
+fun main() {
+    let s = Sum()
+    let r = Relay(sink: s)
+    runWorkers(r)   // 400 forwards enqueued on Relay (workers joined)
+    r.finish()      // FIFO after them → Relay sends report to Sum after all 400 adds → prints 400
 }

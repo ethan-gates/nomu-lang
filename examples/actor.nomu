@@ -1,38 +1,38 @@
-// Actor model (M6.5 · async mailbox): method-call syntax over message-send, actor handles are
-// shareable. A call enqueues a message and blocks until the handler runs on a pool-rented fiber;
-// the mailbox serializes handlers (one drain per actor), so concurrent senders never interleave.
+// Actor model (M6 · 6.4 · fire-and-forget mailbox): method-call syntax over message-send, actor
+// handles are shareable. A call enqueues a message and returns immediately; the handler runs later on
+// a pool-rented fiber, and the mailbox serializes handlers (one drain per actor) so concurrent
+// senders never interleave. Handlers are fire-and-forget — they don't return values to the sender
+// (request-reply is a separate explicit `ask`, arriving with the continuation; `concurrency.md` §9).
 //
-// Key property: multiple concurrent spawns call the same actor safely because the mailbox
-// serializes every handler. The caller blocks until the handler returns.
+// Key property: three workers run concurrently (each sleeps 200ms), then each bumps the shared
+// Counter. Because the workers are joined before `report` is sent, all three bumps are enqueued
+// first; the single FIFO mailbox then drains them before `report`, so the count is always exact.
+// The program stays alive until the mailbox drains (drain-to-quiescence), so `report` always runs.
 //
-// Run with `time ./a.out` — should print in ~200ms, not ~600ms, proving the three
-// workers ran concurrently even though they share one Counter.
+// Run with `time ./a.out` — should print in ~200ms, not ~600ms, proving the workers ran concurrently.
 
 actor Counter {
     var count: Int = 0
     on bump(by: Int) { count += by }
-    on getCount() -> Int { return count }
+    on report() { print(count) }   // fire-and-forget: prints, does not return to the sender
 }
 
-// Simulates work (sleep 200ms), then records the result in the shared counter.
-// Actor handle is shareable — safe to pass across task boundaries.
 fun doWork(c: Counter, amount: Int) -> Int {
     let waited = sleep(200)
     c.bump(by: amount)
     return amount
 }
 
-fun main() {
-    let c = Counter()
-
-    // Three workers run concurrently. Each sleeps 200ms, then bumps the counter.
-    // The mutex ensures no two bumps interleave — the final count is always exact.
+// Spawns the three workers and joins them at return (structured concurrency — no work escapes the
+// scope), so every bump has been enqueued on the Counter by the time this returns.
+fun runWorkers(c: Counter) {
     spawn let a = doWork(c, 1)
     spawn let b = doWork(c, 2)
     spawn let d = doWork(c, 3)
+}
 
-    // Spawn results and actor state both sum to 6 — two independent witnesses
-    // to the same six units of work.
-    print(a + b + d)      // 6
-    print(c.getCount())   // 6
+fun main() {
+    let c = Counter()
+    runWorkers(c)     // all three bumps enqueued (1 + 2 + 3)
+    c.report()        // FIFO after the bumps → prints 6
 }

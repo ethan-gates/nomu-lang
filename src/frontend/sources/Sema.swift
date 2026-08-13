@@ -876,6 +876,12 @@ public struct Sema {
         for h in a.handlers {
             let params = h.params.map { IRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
             let ret = resolve(h.returnType)
+            // Actors are fire-and-forget message-send (§9): a handler is a message sink, not a
+            // request-reply — it cannot return a value to the sender. Request a reply explicitly
+            // (an `ask` over the continuation, §3), not as a handler return type.
+            if ret != .void {
+                diags.error("an actor 'on' handler cannot return a value — actor messages are fire-and-forget; to get a reply, ask the actor explicitly (a continuation-based request-reply), not via a handler return type", at: h.span)
+            }
             pushScope()
             for f in fields { declare(f.name, f.type) }   // handler body sees actor fields by name
             for p in params { declare(p.name, p.type) }
