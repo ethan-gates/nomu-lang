@@ -1,7 +1,7 @@
 # Loops
 
 **Status:** surface **Decided (2026-08-03)** — the home for Nomu's iteration construct
-(syntax, semantics, lowering). Prompted as a prerequisite of the M8 · 8.4 GC substrate (the loop
+(syntax, semantics, lowering). Prompted as a prerequisite of the M9 · 8.4 GC substrate (the loop
 back-edge is where 8.4.2's safepoint poll lives; carry-over in `m6-spec.md` §6.0.10), but designed
 on its own terms.
 

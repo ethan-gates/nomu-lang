@@ -11,6 +11,8 @@
 # exercises the capped mailbox-fiber pool + the scheduled-mailbox queue rooting (a scheduled mailbox
 # whose actor is otherwise unreferenced stays live via the queue root, not collected mid-flight).
 set -u
+# 6.5.2: pin escape analysis off so leaf heap roots this collector test relies on are not stack-promoted.
+export NOMU_NO_ESCAPE=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NOMUC=$ROOT/bazel-bin/src/nomu-cli/nomuc
 BIN=$ROOT/build/examples/gc_actor_teardown

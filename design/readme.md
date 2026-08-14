@@ -19,9 +19,9 @@ Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease
 - [macros.md](macros.md) — typed hygienic AST macros; extension-only role.
 - [compiler.md](compiler.md) — compiler architecture, mid-level IR, backend strategy, tooling, debugger.
 - [builtin.md](builtin.md) — how-to: adding a C-backed builtin method / property / free function and wiring it through Sema, codegen, and the safepoint pass (no lexer/parser change).
-- **M8 (LLVM backend) — done (2026-08-03), spec retired.** 8.1–8.4 and the 8.5.2/8.5.3 perf items shipped; the implementation is the record. Design/rationale live in `compiler.md` (§2 backend); the GC-substrate carry-over for M6 is in `m6-spec.md` §6.0.10; forward-looking follow-ups are in `deferred.md` ("Post-M8 backlog"). 8.5.1/8.5.4 remain descoped perf.
+- **M9 (LLVM backend) — done (2026-08-03), spec retired.** 8.1–8.4 and the 8.5.2/8.5.3 perf items shipped; the implementation is the record. Design/rationale live in `compiler.md` (§2 backend); the GC-substrate carry-over for M6 is in `m6-spec.md` §6.0.10; forward-looking follow-ups are in `deferred.md` ("Post-M9 backlog"). 8.5.1/8.5.4 remain descoped perf.
 - [loops.md](loops.md) — **draft for review**: Nomu's iteration construct (`while`) — syntax, semantics, lowering. A prerequisite of 8.4 (the loop back-edge hosts the safepoint poll).
-- [m6-spec.md](m6-spec.md) — **working draft**: M6 implementation spec (build plan) for the real GC (MMTk) — binding, object model, precise roots, safepoints/barriers, moving GenImmix. Gated on M8 (LLVM); §6.0.10 records the delivered 8.4 substrate M6 builds on. Follows `lang-project/milestone-doc-guide.md`.
+- [m6-spec.md](m6-spec.md) — **working draft**: M6 implementation spec (build plan) for the real GC (MMTk) — binding, object model, precise roots, safepoints/barriers, moving GenImmix. Gated on M9 (LLVM); §6.0.10 records the delivered 8.4 substrate M6 builds on. Follows `lang-project/milestone-doc-guide.md`.
 - [roadmap.md](roadmap.md) — milestones (provisional, post-pivot).
 - [deferred.md](deferred.md) — TODO backlog: feature work intentionally postponed, each with its un-park trigger.
 
@@ -45,7 +45,7 @@ Each doc owns its own rollup; the cross-cutting highlights:
 - **Generics** — **built through M5** and specified as-built in `generics.md` (parameters, inference, checking, witness-passing + monomorphization, generic types, `shared` bound, exhaustiveness, `Result`). Remaining open items are the deferred surface listed there (§10): operators-as-requirements, associated types, `?`/typed-throws, the newtype mechanism.
 - **Concurrency** — the model is essentially complete (`concurrency.md`): the shareability rule (§1), suspension core (§2), continuations (§3, §6), channels as a deferred library (§4), share analysis (§5), the **cancellation model** (§7), the **scope surface** (§8), and the **actor surface** (§9) are all decided. The **shared-mutable primitive** is decided-deferred (§10 — reserved fourth shareable category). Remaining: the **spelling batch** and the shared-mutable design when generics land.
 - **Runtime/scheduler** — work-stealing internals, stack growth, task-locals, remote-wake primitive, platform/syscall (no-libc) strategy, and deferred FFI attach/pinning (`runtime.md` §7).
-- **Deterministic resource cleanup** — `defer` is Decided; linear / non-copyable types deferred to M7 (`memory-model.md` §6.2).
+- **Deterministic resource cleanup** — `defer` is Decided; linear / non-copyable types deferred to M8 (`memory-model.md` §6.2).
 - **Error handling** — errors-as-values (no exceptions) Decided; the *form* (`Result`/tuple/other carrier, `?` operator, typed throws) is open (`types.md` §4).
 - **Modules & access control** — undesigned; a stub reserves the topic (`modules.md`).
 - **Keyword spellings** — `shareable`, `extension` (`syntax.md`, and their home docs).

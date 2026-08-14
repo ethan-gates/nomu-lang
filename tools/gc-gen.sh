@@ -8,6 +8,8 @@
 #
 # Expected (both runs): 42 then 4242.
 set -u
+# 6.5.2: pin escape analysis off so leaf heap roots this collector test relies on are not stack-promoted.
+export NOMU_NO_ESCAPE=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NOMUC=$ROOT/bazel-bin/src/nomu-cli/nomuc
 BIN=$ROOT/build/examples/gc_gen

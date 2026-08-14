@@ -9,6 +9,8 @@
 # plus the heap-boxed closure, whose offset 8 is its `fn` code pointer (6.1.3 header shift) so it is
 # checked as a recovered root, not by value. The dead object 999 must NOT appear.
 set -u
+# 6.5.2: pin escape analysis off so leaf heap roots this collector test relies on are not stack-promoted.
+export NOMU_NO_ESCAPE=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NOMUC=$ROOT/bazel-bin/src/nomu-cli/nomuc
 "$NOMUC" "$ROOT/examples/gc_smoke.nomu" >/dev/null || { echo "FAIL: compile"; exit 1; }

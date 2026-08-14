@@ -32,7 +32,9 @@ extern void nomu_gc_report_stats(void);   // M6 · 6.3.2 — footprint report (N
 // One MMTk mutator per carrier thread (Q1). Bound lazily on the thread's first allocation; a fiber
 // migrating carriers allocates against whichever carrier it currently runs on (thread-local storage
 // gives the per-carrier split for free). MMTk mutators are not shared across threads.
-static _Thread_local void* rt_mutator = NULL;
+// Exported (not `static`) so the §6.6 codegen-inlined alloc fast path can read the current carrier's
+// mutator as a thread-local global; null until the carrier's first allocation binds it (→ slow path).
+_Thread_local void* rt_mutator = NULL;
 
 // ---- Allocation seam ----
 // Routed through MMTk (NoGC): bump-allocate on the carrier's mutator. MMTk returns raw memory, so we

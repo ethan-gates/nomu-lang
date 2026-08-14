@@ -77,6 +77,16 @@ pub static __nomu_logbit_base: AtomicUsize = AtomicUsize::new(0);
 #[unsafe(no_mangle)]
 pub static __nomu_logbit_log_region: AtomicU8 = AtomicU8::new(0);
 
+// §6.6.1 — the bump-pointer fast-path layout for the codegen-inlined `__nomu_gc_alloc`. The
+// per-carrier mutator holds a `{ cursor, limit }` `BumpPointer` at `__nomu_bump_offset` bytes for the
+// Default semantics (same shape across NoGC/Immix/GenImmix; MMTk `AllocatorInfo::BumpPointer`).
+// `usize::MAX` = "no inline fast path published" → the seam slow-paths. `__nomu_max_non_los` is the
+// largest object the moving default allocator can place; a larger allocation must slow-path to LOS.
+#[unsafe(no_mangle)]
+pub static __nomu_bump_offset: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[unsafe(no_mangle)]
+pub static __nomu_max_non_los: AtomicUsize = AtomicUsize::new(0);
+
 // The largest object the moving default allocator can place (a GenImmix line/block bound,
 // `max_non_los_default_alloc_bytes`, ~16 KiB). Anything bigger MUST go to the non-moving large-object
 // space — the Immix copy allocator cannot evacuate an object larger than this, and routing it through
@@ -546,6 +556,22 @@ pub extern "C" fn nomu_gc_init(heap_bytes: usize) {
         mmtk().get_plan().constraints().max_non_los_default_alloc_bytes,
         Ordering::Relaxed,
     );
+    // §6.6.1 — publish the bump-pointer offset + LOS threshold for the codegen-inlined alloc fast path
+    // (§6.6). The offset is per-plan (chosen at runtime here), so codegen reads it rather than baking a
+    // constant. Every plan we ship (NoGC/Immix/GenImmix) reports a `BumpPointer` fast path.
+    __nomu_max_non_los.store(
+        mmtk().get_plan().constraints().max_non_los_default_alloc_bytes,
+        Ordering::Relaxed,
+    );
+    {
+        use mmtk::util::alloc::AllocatorInfo;
+        let selector = memory_manager::get_allocator_mapping(mmtk(), AllocationSemantics::Default);
+        if let AllocatorInfo::BumpPointer { bump_pointer_offset } =
+            AllocatorInfo::new::<NomuVM>(selector)
+        {
+            __nomu_bump_offset.store(bump_pointer_offset, Ordering::Relaxed);
+        }
+    }
     // The write barrier is live only when the plan maintains the log bit (GenImmix); NoGC/Immix use
     // NoBarrier and must not touch the (unmapped) log-bit metadata.
     __nomu_barrier_active.store(

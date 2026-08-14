@@ -117,7 +117,7 @@ Deterministic release of **non-memory resources** (files, sockets, locks, DB con
 
 **`defer` — Decided (2026-07-16).** Swift-style scoped cleanup: `defer { … }` runs at scope exit, in reverse order, on **every** exit path — normal return, error return, or cancellation unwind (`concurrency.md` §7). The baseline resource-cleanup tool.
 
-**Linear / non-copyable types — Open (design deferred to roadmap M7).** A type-checked "must be consumed exactly once" (Swift `~Copyable`, Rust move-only), for resources where scoped `defer` is insufficient (a handle passed *between* scopes that must still be closed exactly once) and for the continuation token (below). Still to design:
+**Linear / non-copyable types — Open (design deferred to roadmap M8).** A type-checked "must be consumed exactly once" (Swift `~Copyable`, Rust move-only), for resources where scoped `defer` is insufficient (a handle passed *between* scopes that must still be closed exactly once) and for the continuation token (below). Still to design:
 - **Declaration** — a `~Copyable`-style negative marker vs. a positive keyword.
 - **Consume + move semantics** — what consumes a linear value (a consuming parameter, last use, an explicit `consume`); assignment moves rather than copies.
 - **The must-consume analysis** — tracking exactly-once consumption on every path, including early returns and cancellation-unwind (a light ownership pass — the real work).
@@ -152,7 +152,7 @@ The target is **Swift-class performance**. The recipe: value types with inline l
 
 ## 9. Open questions
 
-- **Deterministic resource cleanup** — `defer` is Decided (§6.2); linear / non-copyable resource types are deferred to roadmap M7.
+- **Deterministic resource cleanup** — `defer` is Decided (§6.2); linear / non-copyable resource types are deferred to roadmap M8.
 - **Collector choice over time** — when to move from generational Immix to the LXR-style RC collector for footprint (§3).
 - **Concurrency safety details** — spelling ("shareable" vs "sendable"), the shared-mutable primitive, shareable-closure syntax (§7; full list in `concurrency.md`).
 - **Access control × binding forms** — what changes under `public`/`internal`; publicly-immutable/privately-mutable fields. Homed in `modules.md` (stub).

@@ -27,6 +27,7 @@
 // the boundary later slices push. Types: Int is **i64**; Bool is **i1** (0/1, 8.5.2); String is the
 // runtime `{ i8*, i64 }` struct; a `struct` is an LLVM struct in field order, passed/returned by
 // value (mutating `self` is a pointer to it). Nomu `main` → `nomu_main`.
+import Foundation
 import LLVM_C
 import frontend
 
@@ -75,6 +76,11 @@ final class NOIRToLLVM {
     private var actorTypes: [String: LLVMTypeRef] = [:]
     private var funcMap: [String: NOIRFunc] = [:]
     private var closureSeq = 0
+    // 6.5.2 — non-escaping allocation sites from escape analysis; empty when the pass is disabled.
+    private let escapes: EscapeResult
+    // §6.6 — inline the allocation bump fast path; `NOMU_NO_INLINE_ALLOC` reverts to the out-of-line
+    // `rt_alloc` tail-call (the pre-6.6 body) for A/B measurement.
+    private let inlineAlloc = ProcessInfo.processInfo.environment["NOMU_NO_INLINE_ALLOC"] == nil
     // M6 · 6.1.3 — GC pointer maps. Each heap type gets a type-id (written into the object header,
     // 6.1.2) that keys `typeMaps[id]` = the byte offsets of its managed (`p1`) fields, which
     // `scan_object` walks. Class/actor here; closures/any-boxes/String follow (they need a header
@@ -179,9 +185,10 @@ final class NOIRToLLVM {
     private(set) var loweredMain = false
     private(set) var error: String?
 
-    init(ctx: LLVMContextRef, mod: LLVMModuleRef) {
+    init(ctx: LLVMContextRef, mod: LLVMModuleRef, escapes: EscapeResult = EscapeResult(nonEscaping: [])) {
         self.ctx = ctx
         self.mod = mod
+        self.escapes = escapes
         b = LLVMCreateBuilderInContext(ctx)
         i8ptr = LLVMPointerType(LLVMInt8TypeInContext(ctx), 0)
         p1 = LLVMPointerType(LLVMInt8TypeInContext(ctx), 1)
@@ -552,6 +559,12 @@ final class NOIRToLLVM {
 
     private func caseSlots(_ c: NOIREnumCase) -> Int { c.fields.reduce(0) { $0 + slotCount($1.type) } }
 
+    // 6.5.2 — a captured value whose LLVM type carries no managed pointer, so a stack-allocated
+    // closure env holding only such captures needs no barrier and no stack-map scanning. The scalar
+    // leaves (`Int`/`Double`/`Bool`) are the safe set; a `p1` capture, a String, or an aggregate that
+    // could embed a pointer keeps the closure on the heap for now.
+    private func isScalarLeaf(_ ty: LLVMTypeRef) -> Bool { ty == i64 || ty == f64 || ty == i1 }
+
     // 8-byte slots a value occupies in an enum payload. Every supported leaf is 8-aligned, so a
     // struct/enum is just the sum/tag+max of its parts — no padding to account for.
     private func slotCount(_ t: Type) -> Int {
@@ -769,7 +782,10 @@ final class NOIRToLLVM {
         setDebugLoc(stmt.span)   // 8.3: line-table entry; inherited by this statement's instructions
         switch stmt.kind {
         case .letBinding(let name, _, let value):
-            guard let ty = llvmType(value.type, stmt.span), let v = lowerExpr(value) else { return }
+            guard llvmType(value.type, stmt.span) != nil, let v = lowerExpr(value) else { return }
+            // Slot type follows the produced value, not the nominal type: usually identical, but a
+            // 6.5.2 stack-allocated class flows as an addrspace(0) pointer rather than the managed p1.
+            let ty = LLVMTypeOf(v)!
             let slot = entryAlloca(ty, name)
             LLVMBuildStore(b, v, slot)
             locals[name] = (slot, ty)
@@ -1063,6 +1079,23 @@ final class NOIRToLLVM {
             return agg
         }
         if let c = classMap[typeName], let ct = classType(typeName) {
+            // A non-escaping class instance is stack-allocated: one `alloca` (addrspace 0, hoisted to
+            // the entry block) in place of `rt_alloc`, so it never heaps. Escape analysis proved the
+            // object pointer only ever feeds field access, so SROA scalar-replaces the alloca and each
+            // field becomes an SSA value: a managed field becomes an addrspace(1) SSA root that the
+            // statepoint rewriter relocates like any other class-typed local (the same mechanism the
+            // whole GC substrate rests on), so no interior stack-map scanning is needed. Field stores
+            // are plain (a stack slot is not a heap location the write barrier tracks). Same struct
+            // layout as the heap object, so field GEPs are unchanged.
+            if escapes.isNonEscaping(span, .classInstance) {
+                let obj = entryAlloca(ct, typeName)
+                writeTypeIdHeader(obj, typeName)   // kept for layout uniformity; unread on the stack
+                for (idx, field) in c.fields.enumerated() {
+                    guard let v = constructField(field, args, typeName, span) else { return nil }
+                    LLVMBuildStore(b, v, structGEP(ct, obj, fieldLLVMIndex(.classRef, idx)))
+                }
+                return obj
+            }
             // Heap-allocate the object (rt_alloc, bump-and-leak), then store each field past the
             // header. The class value is the returned pointer (reference semantics).
             let slots = 1 + c.fields.reduce(0) { $0 + slotCount($1.type) }
@@ -1645,8 +1678,15 @@ final class NOIRToLLVM {
         let caps = resolveCaptures(used)
         let objTy = structTy([i64, i8ptr] + caps.map { $0.local.ty })   // { header, fn, cap0, cap1, … }
 
+        // 6.5.2 — a non-escaping closure whose captures are all scalar leaves gets a stack env: the
+        // impl takes its env as an addrspace(0) pointer and the site `alloca`s it, so the fused object
+        // never heaps. The env holds no managed pointers, so it needs no scanning; escape analysis
+        // proved the closure is only invoked locally, never stored/passed/returned.
+        let stackEnv = escapes.isNonEscaping(span, .closure) && caps.allSatisfy { isScalarLeaf($0.local.ty) }
+        let envTy: LLVMTypeRef = stackEnv ? i8ptr : p1
+
         guard let retTy = llvmType(ret, span) else { return nil }
-        var paramTys: [LLVMTypeRef] = [p1]   // the closure object itself (managed), captures read via GEP
+        var paramTys: [LLVMTypeRef] = [envTy]   // the closure object itself, captures read via GEP
         for p in params {
             guard let t = llvmType(p.type, p.span) else { return nil }
             paramTys.append(t)
@@ -1678,7 +1718,8 @@ final class NOIRToLLVM {
         // Site: allocate the fused object, store the fn pointer then each capture by value, and
         // yield the managed pointer as the closure value.
         let slots = 2 + caps.reduce(0) { $0 + abiSlots($1.local.ty) }   // header + fn + captures
-        let obj = rtAllocManaged(LLVMConstInt(i64, UInt64(slots * 8), 0))
+        let obj = stackEnv ? entryAlloca(objTy, "clo.env")
+                           : rtAllocManaged(LLVMConstInt(i64, UInt64(slots * 8), 0))
         LLVMBuildStore(b, LLVMConstInt(i64, closureTypeId(caps), 0), structGEP(objTy, obj, 0)) // header
         LLVMBuildStore(b, fn, structGEP(objTy, obj, 1))                                          // fn
         for (i, cap) in caps.enumerated() {
@@ -1945,10 +1986,12 @@ final class NOIRToLLVM {
             fail("8.2.4: unsupported call target", span)
             return nil
         }
-        guard let cval = lowerExpr(callee) else { return nil }   // the closure object pointer (managed)
+        guard let cval = lowerExpr(callee) else { return nil }   // the closure object pointer
         let fnPtr = LLVMBuildLoad2(b, i8ptr, structGEP(closureHdrTy, cval, 1), "clo.fn")!
         guard let retTy = llvmType(rty, span) else { return nil }
-        var paramTys: [LLVMTypeRef] = [p1]   // the closure object itself, passed as the impl's first arg
+        // The env param takes the closure value's actual address space: p1 for a heap closure, addr0
+        // for a 6.5.2 stack-allocated one — matching the impl generated in `lowerClosure`.
+        var paramTys: [LLVMTypeRef] = [LLVMTypeOf(cval)!]
         for t in ptys {
             guard let lt = llvmType(t, span) else { return nil }
             paramTys.append(lt)
@@ -2204,6 +2247,7 @@ final class NOIRToLLVM {
         "printf", "rt_str_lit", "rt_mutex_new", "rt_mutex_unlock",
         "rt_bounds_trap",   // aborts, never allocates — no statepoint needed
         "memcpy",           // libc block copy — never allocates (array grow)
+        "memset",           // libc fill — zeroes the inline-allocated object; never allocates
         "rt_gc_write_barrier",   // M6 · 6.3.1 — remembers the mutated object; never triggers GC
     ]
 
@@ -2288,19 +2332,81 @@ final class NOIRToLLVM {
     }
 
     // The `__nomu_gc_alloc` seam: `ptr addrspace(1) (i64 size)`, emitted at every managed-object
-    // allocation. Inert body tail-calls `rt_alloc`, so it allocates exactly as before and stays a
-    // statepoint (it can trigger GC — *not* `gc-leaf`). M6 replaces the body with the inline
-    // bump-pointer TLAB fast path (load cursor/limit, bump, branch to `rt_alloc` slow path).
+    // allocation. §6.6.2 — the inline bump-pointer fast path. Read the per-carrier mutator (a thread-
+    // local, §6.6.1) and the published `{cursor, limit}` `BumpPointer` at `__nomu_bump_offset`; bump the
+    // cursor and return it when the object fits and is not LOS-sized; else tail-call `rt_alloc` (the
+    // slow path — a statepoint, so this function is **not** `gc-leaf`). The returned memory is zeroed
+    // (Nomu's zero-init-fields contract; the actor mailbox and array buffers rely on it), matching
+    // `rt_alloc`'s `memset`. The bump loads/stores sit in a call-free block, so nothing hoists across a
+    // safepoint (the only safepoint is the slow-path `rt_alloc` call, which clobbers the mutator memory).
     private func nomuGcAlloc() -> (LLVMValueRef, LLVMTypeRef) {
         if let g = gcAllocFn { return g }
         let ty = fnType(p1, [i64])
         let fn = LLVMAddFunction(mod, "__nomu_gc_alloc", ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
-        LLVMSetGC(fn, "statepoint-example")   // its `rt_alloc` call is a statepoint
+        LLVMSetGC(fn, "statepoint-example")   // its slow-path `rt_alloc` call is a statepoint
         addAlwaysInline(fn)
+        // A/B: revert to the pre-6.6 out-of-line body when the inline path is disabled.
+        guard inlineAlloc else {
+            withStubBody(fn) { LLVMBuildRet(b, buildCall(rtAlloc(), rtAllocTy(), [LLVMGetParam(fn, 0)])!) }
+            gcAllocFn = (fn, ty)
+            return gcAllocFn!
+        }
+        // External state published by the GC binding (§6.6.1): the Default-semantics bump offset, the
+        // LOS threshold, and the per-carrier mutator (thread-local). No initializer → declarations.
+        let gOff = LLVMAddGlobal(mod, i64, "__nomu_bump_offset")!
+        let gMax = LLVMAddGlobal(mod, i64, "__nomu_max_non_los")!
+        let gMut = LLVMAddGlobal(mod, i8ptr, "rt_mutator")!
+        LLVMSetThreadLocal(gMut, 1)
+        let memset = runtimeFn("memset", ret: i8ptr, params: [i8ptr, i32, i64], varArg: false)
         withStubBody(fn) {
-            let p = buildCall(rtAlloc(), rtAllocTy(), [LLVMGetParam(fn, 0)])!
-            LLVMBuildRet(b, p)
+            let size = LLVMGetParam(fn, 0)!
+            let fastBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.fast")!
+            let bumpBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.bump")!
+            let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.slow")!
+            let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.done")!
+            // entry guards: fast path only if the offset is published (!= usize::MAX), the mutator is
+            // bound (!= null — else lazy-bind happens in `rt_alloc`), and the size is not LOS-routed.
+            let off = LLVMBuildLoad2(b, i64, gOff, "bump.off")!
+            let offOk = LLVMBuildICmp(b, LLVMIntNE, off, LLVMConstInt(i64, .max, 0), "off.ok")!
+            let mut = LLVMBuildLoad2(b, i8ptr, gMut, "mutator")!
+            let mutOk = LLVMBuildICmp(b, LLVMIntNE, mut, LLVMConstPointerNull(i8ptr), "mut.ok")!
+            let maxlos = LLVMBuildLoad2(b, i64, gMax, "maxlos")!
+            let sizeOk = LLVMBuildICmp(b, LLVMIntULE, size, maxlos, "size.ok")!
+            let canFast = LLVMBuildAnd(b, LLVMBuildAnd(b, offOk, mutOk, "g1"), sizeOk, "canfast")!
+            LLVMBuildCondBr(b, canFast, fastBB, slowBB)
+            // fast: load cursor/limit; align the cursor to 8 (a no-op for our 8-aligned sizes, kept to
+            // match MMTk's `align_allocation`); bump; take it if it fits.
+            LLVMPositionBuilderAtEnd(b, fastBB)
+            let cursorPtr = gepByte(mut, off)
+            let cursor = LLVMBuildLoad2(b, i64, cursorPtr, "cursor")!
+            let aligned = LLVMBuildAnd(b, LLVMBuildAdd(b, cursor, LLVMConstInt(i64, 7, 0), "c+7"),
+                                       LLVMConstInt(i64, ~UInt64(7), 0), "aligned")!
+            let off8 = LLVMBuildAdd(b, off, LLVMConstInt(i64, 8, 0), "off+8")!
+            let limit = LLVMBuildLoad2(b, i64, gepByte(mut, off8), "limit")!
+            let newCursor = LLVMBuildAdd(b, aligned, size, "newcursor")!
+            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntULE, newCursor, limit, "fits"), bumpBB, slowBB)
+            // bump: publish the new cursor, form the object at the aligned address, zero it.
+            LLVMPositionBuilderAtEnd(b, bumpBB)
+            LLVMBuildStore(b, newCursor, cursorPtr)
+            let obj = LLVMBuildIntToPtr(b, aligned, p1, "obj")!
+            _ = buildCall(memset.0, memset.1, [toUnmanaged(obj), LLVMConstInt(i32, 0, 0), size])
+            LLVMBuildBr(b, doneBB)
+            // slow: out-of-line allocate (handles lazy bind, TLAB refill, and LOS). A statepoint.
+            LLVMPositionBuilderAtEnd(b, slowBB)
+            let slowP = buildCall(rtAlloc(), rtAllocTy(), [size])!
+            LLVMBuildBr(b, doneBB)
+            // done: the object from whichever path taken.
+            LLVMPositionBuilderAtEnd(b, doneBB)
+            let phi = LLVMBuildPhi(b, p1, "obj")!
+            var vals: [LLVMValueRef?] = [obj, slowP]
+            var blks: [LLVMBasicBlockRef?] = [bumpBB, slowBB]
+            vals.withUnsafeMutableBufferPointer { vp in
+                blks.withUnsafeMutableBufferPointer { bp in
+                    LLVMAddIncoming(phi, vp.baseAddress, bp.baseAddress, 2)
+                }
+            }
+            LLVMBuildRet(b, phi)
         }
         gcAllocFn = (fn, ty)
         return gcAllocFn!
@@ -2363,11 +2469,13 @@ final class NOIRToLLVM {
         return barrierFn!
     }
 
-    // Store `val` into a field at `slot` of the managed object `objBase`. A managed reference
-    // (`addrspace(1)` value) goes through the write-barrier seam; everything else is a plain store
-    // (value-typed fields are not GC references, so they need no barrier).
+    // Store `val` into a field at `slot` of the object `objBase`. A managed reference (`addrspace(1)`
+    // value) stored into a *heap* object goes through the write-barrier seam; everything else is a
+    // plain store — value-typed fields are not GC references, and a store into a stack-allocated object
+    // (6.5.2/6.5.3, an addrspace(0) base) needs no barrier: the stack slot is a root scanned every GC,
+    // not a remembered-set entry, and the barrier's ABI expects an addrspace(1) object regardless.
     private func storeField(_ objBase: LLVMValueRef!, _ slot: LLVMValueRef!, _ val: LLVMValueRef!) {
-        if LLVMTypeOf(val) == p1 {
+        if LLVMTypeOf(val) == p1, LLVMGetPointerAddressSpace(LLVMTypeOf(objBase)) == 1 {
             let bar = nomuWriteBarrier()
             _ = buildCall(bar.0, bar.1, [objBase, slot, val])
         } else {

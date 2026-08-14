@@ -9,6 +9,8 @@
 # saved poll context (6.2.1); the parked fiber's root 888 via the registry (6.2.2); the program runs
 # to completion (exit 0) — proving resume released every carrier.
 set -u
+# 6.5.2: pin escape analysis off so leaf heap roots this collector test relies on are not stack-promoted.
+export NOMU_NO_ESCAPE=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NOMUC=$ROOT/bazel-bin/src/nomu-cli/nomuc
 "$NOMUC" "$ROOT/examples/gc_smoke_stw.nomu" >/dev/null || { echo "FAIL: compile"; exit 1; }

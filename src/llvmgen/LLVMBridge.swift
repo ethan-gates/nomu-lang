@@ -23,7 +23,12 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
     defer { LLVMContextDispose(ctx) }
     let mod = LLVMModuleCreateWithNameInContext("nomu", ctx)!
 
-    let lowerer = NOIRToLLVM(ctx: ctx, mod: mod)
+    // 6.5.2 — escape analysis feeds codegen a side table of non-escaping allocation sites to
+    // stack-allocate. Best-effort: `NOMU_NO_ESCAPE` disables it (empty table → every site heaps as
+    // before), which is the correctness fallback and the exit-criterion off switch.
+    let escapes = ProcessInfo.processInfo.environment["NOMU_NO_ESCAPE"] == nil
+        ? analyzeEscapes(module) : EscapeResult(nonEscaping: [])
+    let lowerer = NOIRToLLVM(ctx: ctx, mod: mod, escapes: escapes)
     lowerer.lower(module)
     if let err = lowerer.error { return err }
     guard lowerer.loweredMain else { return "LLVM: no `main` function to lower" }

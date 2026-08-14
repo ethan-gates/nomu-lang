@@ -8,6 +8,8 @@
 # Expected: exactly 2 roots — the class objects 111 and 222, both live across worker's park. The dead
 # object 999 (last used before the park) must NOT appear. Normal run prints 999 then 333.
 set -u
+# 6.5.2: pin escape analysis off so leaf heap roots this collector test relies on are not stack-promoted.
+export NOMU_NO_ESCAPE=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NOMUC=$ROOT/bazel-bin/src/nomu-cli/nomuc
 "$NOMUC" "$ROOT/examples/gc_smoke_parked.nomu" >/dev/null || { echo "FAIL: compile"; exit 1; }

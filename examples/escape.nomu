@@ -1,0 +1,24 @@
+// 6.5.2 — escape analysis stack-allocates a non-escaping, managed-free class.
+//
+// `p` is the only heap candidate in this program: a leaf `Point` (all-`Int` fields) that is used
+// solely through field reads and never returned, stored, passed to a call, or captured. Escape
+// analysis proves it does not escape its frame, so codegen allocates it on the stack (one entry-block
+// slot reused across the loop) instead of the GC heap — the emitted object references no `rt_alloc`.
+// `NOMU_NO_ESCAPE=1` restores the heap allocation. The result is identical either way: the analysis
+// affects speed only, never correctness. (tools/escape.sh checks both.)
+
+class Point {
+    var x: Int
+    var y: Int
+}
+
+fun main() {
+    var sum = 0
+    var i = 0
+    while i < 100 {
+        let p = Point(x: i, y: i + 1)
+        sum = sum + p.x + p.y
+        i = i + 1
+    }
+    print(sum)   // 10000
+}

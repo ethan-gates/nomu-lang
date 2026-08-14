@@ -14,7 +14,7 @@ cross-cutting decisions live in 6.0.5.
 **Build status (2026-08-11):** **6.2 complete (Immix flip + evacuation) and 6.3.1 built + green** — the
 generational write barrier fills the `__nomu_write_barrier` seam and the default plan is **GenImmix**
 (see 6.3). **6.3.2 done (2026-08-11):** the profiling blocker was root-caused to **two binding bugs** and fixed — GenImmix now collects a retained live set at tight heaps and the footprint thesis is met (**~1.05x** live-set footprint on the churn benchmark, see 6.3). Footprint tooling (`NOMU_GC_STATS`) is in place, and the **write barrier is now inlined** (GenImmix's barrier-saturated microbench 0.71 s → 0.047 s, ~15×; see 6.3). 6.3.2's remaining polish (nursery tuning, opt-level, a wider footprint sweep) is deferred. **6.4 done (2026-08-12):** the async actor runtime (mailbox + message-send + pooled handler fibers) + structural teardown replaced the M3.4 mutex scaffold; see §6.4. Escape analysis (§6.5) is the open M6 item: a conservative pass on the structured NOIR (the
-precise CFG/SSA form is deferred to M8). Historical bring-up status below.
+precise CFG/SSA form is deferred to M7, the optimizer tier). Historical bring-up status below.
 
 **Build status (2026-08-04):** **6.1 (MMTk NoGC bring-up) substantially built + green.** 6.1.0–6.1.3
 ✅ (Rust `VMBinding` + MMTk NoGC linked via `crate_universe`; `rt_alloc` → per-carrier mutator; the
@@ -29,7 +29,7 @@ uncommitted across `nomu-lang/{src,design,.bazelrc,MODULE.bazel}` — you do the
 collects" — it is **validating the performance thesis**: a *moving* collector at ~1.1–1.3×
 live-set footprint with competitive throughput (`memory-model.md` §8). A non-moving mark-sweep
 prototype would clear "it collects" while validating none of the doubted bet — hence the
-moving-Immix target and the M8-first reorder.
+moving-Immix target and the M9-first reorder.
 
 ---
 
@@ -54,16 +54,17 @@ moving-Immix target and the M8-first reorder.
   behind the same binding, never a dependency on the stalled upstream branch
   (`memory-model.md` §3; 6.0.5).
 - **Escape analysis** — a perf pass (stack allocation / scalar replacement); conservative form in the
-  M6 tail, precise form in M8 (`memory-model.md` §6.1; phase 6.5).
+  M6 tail, precise form needs the M7 optimizer tier (CFG/SSA NOIR) (`memory-model.md` §6.1; phase 6.5).
 - **User-visible finalizers** — none planned; internal actor teardown only (phase 6.4).
 
 ### 6.0.2 · Prerequisites
 
 Grounding M6 against the current compiler (M5; C backend; bump-and-leak `rt_alloc`; vestigial
 `ObjectHeader { refcount }`; M:N `ucontext` fiber scheduler):
-- **M8 — LLVM backend + statepoints (the hard gate).** A moving collector needs precise roots
-  via compiler-emitted stack maps the C backend cannot produce (`compiler.md` §6). M8 lands
-  the LLVM path, the lower CFG/SSA IR, and statepoint stack maps; M6 rests on them. Reordered
+- **M9 — LLVM backend + statepoints (the hard gate).** A moving collector needs precise roots
+  via compiler-emitted stack maps the C backend cannot produce (`compiler.md` §6). M9 lands
+  the LLVM path and statepoint stack maps; M6 rests on them. (Structured NOIR lowers straight to LLVM —
+  there is no separate lower IR; the CFG/SSA optimizer tier is the later M7.) Reordered
   before M6 (decided 2026-07-30, `roadmap.md`). **8.4 (the GC substrate) is done (2026-08-03):**
   `addrspace(1)` roots, statepoint stack maps, the parser + single-stack root walk, and the three
   inert alloc/barrier/poll seams all ship — see **6.0.10** for the concrete carry-over M6 builds on.
@@ -72,7 +73,8 @@ Grounding M6 against the current compiler (M5; C backend; bump-and-leak `rt_allo
 
 ### 6.0.3 · Compiler surface touched
 
-Post-M8 pipeline: `… → typed IR → lower CFG/SSA IR → LLVM (statepoints, barriers) → native`.
+Post-M9 pipeline: `… → typed IR (NOIR, structured) → LLVM (statepoints, barriers) → native`. (The
+lower CFG/SSA optimizer tier is the later M7; not yet inserted.)
 M6 touches:
 - **Codegen (LLVM)** — GC header on every heap object; per-type **pointer maps** as static
   tables keyed by a header type-id; **statepoint** safepoints (maps at calls / loop back-edges
@@ -81,21 +83,21 @@ M6 touches:
 - **Runtime (C + Rust binding)** — the MMTk `VMBinding` (`scan_object`, `scan_roots`,
   `block_for_gc`, resume); a **live-fiber registry**; the STW handshake; per-carrier `Mutator`.
 - **IR / Sema** — the escape-analysis pass (6.5): conservative on the structured NOIR in M6, precise
-  on the CFG/SSA NOIR tier in M8.
+  on the M7 optimizer tier (CFG/SSA NOIR).
 
 ### 6.0.4 · Dependencies
 
 ```
-M8 (LLVM backend + statepoints)              [hard prerequisite]
+M9 (LLVM backend + statepoints)              [hard prerequisite]
 └─ 6.1 (MMTk binding + object model, NoGC)
    └─ 6.2 (precise roots + safepoints + moving Immix)
       ├─ 6.3 (GenImmix + write barrier)
       └─ 6.4 (actor runtime + teardown)
-6.5 (escape analysis)   [perf tail; conservative in M6, precise deferred to M8 IR]
+6.5 (escape analysis)   [perf tail; conservative in M6, precise is M7 (optimizer tier)]
 ```
 6.1 gates all collection. 6.2 is the correctness+moving core. 6.3 and 6.4 are independent of
 each other. 6.5 is sequenced last: a conservative pass on the structured NOIR ships in M6, the
-precise pass waits for the M8 CFG/SSA NOIR tier (§6.5).
+precise pass waits on the M7 optimizer tier, the CFG/SSA NOIR IR (the LLVM backend, now M9, is already done; §6.5).
 
 ### 6.0.5 · Cross-cutting decisions
 
@@ -103,13 +105,13 @@ Closed forks (the open ones live in 6.0.6):
 - **LLVM before GC — Decided (2026-07-30).** M6 validates the moving-collector performance
   thesis, which needs precise roots. The C-path bridges were rejected: conservative-pinned
   scanning degrades the footprint metric under test; a codegen shadow stack is precise but
-  throwaway. So M8 lands first and the collector rests on statepoint stack maps
+  throwaway. So M9 lands first and the collector rests on statepoint stack maps
   (`roadmap.md`; `compiler.md` §7). Corollary: **precise roots, never conservative.**
 - **Collector sourcing: mainline GenImmix; LXR planned & owned — Decided (2026-07-30; sequenced
   2026-08-04).** MMTk's value is a live borrow; mainline GenImmix is that. The LXR branch is stalled,
   so the RC-hybrid endgame is a clean *owned* reimplementation behind the same interface — nothing in
   M6 assumes LXR (`memory-model.md` §3). **Sequencing intent (2026-08-04):** LXR is a scheduled
-  successor, not open-ended — targeted after M7 + the M10 debugger, gated on a **benchmark-scale
+  successor, not open-ended — targeted after M8 + the M11 debugger, gated on a **benchmark-scale
   stdlib** (LXR is the footprint endgame; validating it against Immix needs large real programs to
   measure). This raises the payoff of the Q2 swappable-binding discipline (the swap is exercised on a
   real timeline) and of keeping `__nomu_write_barrier`'s shape collector-agnostic (GenImmix fills it as
@@ -138,7 +140,7 @@ Closed forks (the open ones live in 6.0.6):
   shim whose trait methods FFI back into the existing C runtime (`nomu_gc_walk_current` for roots, C
   accessors for the object model, C hooks for STW stop/resume); Rust holds ~no state. This leaves the
   built, verified M4 M:N scheduler and the C stack-map walk untouched and keeps the blast radius to
-  one crate. Settled context, not reopened here: codegen emits LLVM IR (M8); the two held invariants
+  one crate. Settled context, not reopened here: codegen emits LLVM IR (M9); the two held invariants
   (single alloc seam; explicit scannable object model, `compiler.md` §7) keep the boundary movable.
   Cost accepted: `scan_object` and per-frame root reporting cross Rust→C on the trace hot path, and
   the header + pointer-map layout is a two-language contract. Stood up in 6.1.1.
@@ -315,7 +317,7 @@ neither. **No new surface syntax.**
   on-CPU roots). Interacts with `runtime.md`'s syscall offload.
 - **Safepoint density vs. cost** — enough for prompt STW, few enough to stay cheap.
 - **Footprint target** — GenImmix must reach the thesis footprint (~1.1–1.3× live set). The
-  owned LXR-hybrid is a **scheduled successor** regardless (post-M7 + M10 debugger, gated on a
+  owned LXR-hybrid is a **scheduled successor** regardless (post-M8 + M11 debugger, gated on a
   benchmark-scale stdlib; `roadmap.md`, 6.0.5); a GenImmix footprint miss only pulls it earlier.
 - **MMTk API churn** — pin a version; the binding is the blast-radius boundary.
 - **Runtime-instantiated witness tables (Q7 reopen trigger)** — witness tables are static/non-scanned
@@ -342,16 +344,16 @@ neither. **No new surface syntax.**
 - LXR-style RC-hybrid (owned reimplementation) — footprint endgame.
 - Barrier elision for deeply-immutable types (can't form new cross-generation pointers by
   mutation) — a perf pass (`memory-model.md` §4).
-- Precise (CFG/SSA) escape analysis — deferred to the M8 NOIR optimizer tier (6.5); the conservative
-  form ships in M6.
+- Precise (CFG/SSA) escape analysis — needs the M7 optimizer tier, the CFG/SSA NOIR IR (6.5); the
+  conservative form ships in M6. (The LLVM backend, now M9, is done; NOIR lowers straight to LLVM.)
 - Profile-guided perf follow-ups from the closed design questions (6.0.5): Q3-B faulting-page poll,
   Q4 counted-loop poll elision, Q1-C fiber-pinned TLAB locality, and Q8 live-fiber-registry data
   structure (profile insert/remove + STW iteration under fiber churn vs. the lock-guarded intrusive
   DLL baseline; explore sharded / lock-free / epoch alternatives, change only on a measured win).
 
-### 6.0.10 · M8 / 8.4 carry-over — the substrate M6 builds on
+### 6.0.10 · M9 / 8.4 carry-over — the substrate M6 builds on
 
-M8 · 8.4 (the GC substrate) is **implemented and green** (2026-08-03). The dedicated 8.4 spec was
+M9 · 8.4 (the GC substrate) is **implemented and green** (2026-08-03). The dedicated 8.4 spec was
 retired once it shipped; this section is its carry-over. The compiler now emits statepoint-based
 safepoints, parseable stack maps, and three
 inline-shaped mutator seams — all **inert** (corpus byte-identical to 8.2). M6 fills the seams,
@@ -421,7 +423,7 @@ turns on collection, and reuses the root walk. Concrete facts M6 rests on:
 
 One-line intent: stand up the binding and a scannable object model with **zero collection** —
 prove allocation routes through MMTk and every heap shape is walkable before any GC runs.
-Depends on M8. **Approach:** MMTk plan **NoGC**; a Rust `VMBinding` crate; C runtime calls in,
+Depends on M9. **Approach:** MMTk plan **NoGC**; a Rust `VMBinding` crate; C runtime calls in,
 MMTk calls back for `scan_object`.
 
 - **6.1.0 ✅ built + green (2026-08-04)** — **toolchain bring-up (no MMTk, no binding logic).** A
@@ -571,7 +573,7 @@ passes); no `refcount` field remains.
 ## 6.2 · Precise roots, safepoints & the moving collector (Immix) 🔨
 
 One-line intent: the correctness+moving core — objects relocate, roots are precise, collection
-reclaims memory including cycles. Depends on 6.1 + M8 statepoints. **Approach:** MMTk plain
+reclaims memory including cycles. Depends on 6.1 + M9 statepoints. **Approach:** MMTk plain
 **Immix** (moving; no generational barrier yet — validates evacuation + maps barrier-free).
 
 - **6.2.1 🔨 pipeline wired (inert until the plan flips) — consume LLVM stack maps; MMTk `scan_roots`
@@ -876,7 +878,7 @@ churns 200k short-lived actors and completes under GenImmix at a 4 MB heap where
 memory — the dead actors + mailboxes are actually reclaimed, not merely plausibly-so, and the capped
 mailbox-fiber pool + scheduled-queue rooting hold under the churn. No per-actor non-GC resource remains.
 
-## 6.5 · Escape analysis (perf tail) ⬜
+## 6.5 · Escape analysis (perf tail) — conservative phase ✅ (2026-08-13); precise pass is M7
 
 One-line intent: recover the stack-allocation win — keep provably-non-escaping reference
 allocations off the GC heap (`memory-model.md` §6.1). Best-effort: the fallback is always
@@ -885,23 +887,26 @@ heap-allocate, so precision affects speed only, correctness always holds.
 **Sequencing (decided 2026-08-13).** Escape analysis ships in two phases. A **conservative pass on
 the structured NOIR** (the current typed IR; artifact extension `.noir`, `--emit-noir`) lands in M6 —
 it captures the deep case (a reference allocation in a hot loop, used locally, discarded each
-iteration) with no new IR. The **precise pass** waits for the M8 CFG/SSA optimizer tier of NOIR,
-where def-use chains and a CFG let it follow pointers across control flow; that tier is shared with
-devirtualization, bounds-check elimination, inlining, and specialization, and is designed against all
-of them at once (roadmap M8). The conservative analysis front-end is replaced when the precise one
-lands; the 6.5.2 codegen half is reused unchanged.
+iteration) with no new IR. The **precise pass** needs def-use chains and a CFG to follow pointers
+across control flow, which the structured NOIR does not have. NOIR lowers straight to LLVM (the LLVM
+backend, now M9, is done — there is no separate Nomu-level CFG/SSA tier, and the "CFG/SSA IR" in that
+roadmap line turned out to *be* LLVM IR). Precise analysis is therefore blocked on the **M7 optimizer
+tier** — the CFG/SSA NOIR IR (scheduled 2026-08-13) — built alongside its other tenants
+(devirtualization, bounds-check elimination, inlining, specialization), not for escape analysis alone.
+The conservative analysis front-end is replaced when the precise one lands; the 6.5.2 codegen half is
+reused unchanged.
 
 Reference allocations targeted (the `__nomu_gc_alloc` sites): class instances, `any`-boxes, closure
 environments, array buffers. Structs and enums are already value types on the stack, so they are out
 of scope. The conservative pass targets **class instances and closure environments** first; `any`-boxes
 usually escape and array buffers have dynamic size (stack-eligible only when statically bounded), so
-both are deferred to the precise phase.
+both are deferred to 6.5.3 (doable now on the structured NOIR, not gated on new IR).
 
 **Design — conservative pass.**
 
 - **Result carrier.** The analysis writes non-escaping allocation sites to a **side table** keyed by
   allocation-site identity, consumed by codegen. NOIR node types stay unchanged, so the table is
-  additive and the M8 tier can ignore or replace it — the optimization adds no coupling to the IR.
+  additive and a future CFG/SSA tier can ignore or replace it — the optimization adds no coupling to the IR.
 - **Escape predicate (conservative, intra-procedural).** An allocation escapes if its value is:
   returned from the function; stored into a heap object's field or a global; captured by a closure
   that itself escapes; passed as a call argument; or bound to a variable that is reassigned or
@@ -915,12 +920,119 @@ both are deferred to the precise phase.
   slot is a location the barrier has no reason to track). The lowering stays collector-agnostic — it
   assumes neither a moving nor a non-moving collector.
 
-- **6.5.1 ⬜** — conservative escape-analysis pass on the structured NOIR; side table of non-escaping
-  class-instance and closure-environment sites.
-- **6.5.2 ⬜** — stack allocation / scalar replacement in codegen for annotated sites, with correct GC
-  root scanning of the stack slots and write-barrier elision.
-- **6.5.3 (M8) ⬜** — precise pass on the CFG/SSA NOIR tier; replaces 6.5.1, reuses 6.5.2.
+- **6.5.1 ✅ (built 2026-08-13)** — conservative escape-analysis pass on the structured NOIR
+  (`src/frontend/sources/EscapeAnalysis.swift`); `analyzeEscapes(module) -> EscapeResult`, a side
+  table of non-escaping `AllocSite`s (class-instance and closure, keyed by span+kind). Intra-procedural
+  single-walk analyzer: a local `let` bound to an allocation stays non-escaping while it is only read
+  (field access, or invoked as a call target) and never returned, stored, passed to a call, spawned,
+  reassigned, or captured by a closure. Not yet wired into the pipeline — 6.5.2 is its first consumer.
+  Verified by `EscapeAnalysisTests` (8 cases, incl. the gc_smoke shape); full frontend suite green.
+- **6.5.2 ✅ (built 2026-08-13, classes + closures)** — codegen consumes the side table:
+  - A non-escaping **class instance** lowers to an entry-block `alloca` (addrspace 0) in place of
+    `__nomu_gc_alloc`; the value flows as an addrspace(0) pointer that escape analysis proved feeds only
+    field access, so the layout is unchanged (field GEPs untouched) and field stores are plain (a stack
+    slot is not a heap location the write barrier tracks). The first cut restricted this to leaf
+    (managed-free) classes; **6.5.3 lifted that**. `Lowering.swift`: `lowerConstruct` class branch.
+  - A non-escaping **closure** whose captures are all scalar leaves (`Int`/`Double`/`Bool`) gets a stack
+    env: `lowerClosure` `alloca`s the fused `{header, fn, caps…}` object and generates the impl's env
+    param as addrspace(0); the call site (`lowerCall`) types the env argument from the closure value's
+    actual address space, so the two match. A non-escaping closure is only ever invoked locally, so the
+    addrspace(0) env never crosses a boundary that expects the managed form. `isScalarLeaf` gates it.
+  - Shared: the `let`-binding slot types from the produced value (so a stack object/closure flows as an
+    addrspace(0) pointer); wired in `emitObject` (`analyzeEscapes` on the post-mono module), gated by
+    `NOMU_NO_ESCAPE` (the disable flag). Non-leaf objects, non-scalar-capture closures, `any`-boxes, and
+    arrays stay on the heap — see 6.5.3/6.5.4 for why each waits.
+- **6.5.3 (partly built 2026-08-13 — codegen coverage, no new IR)** — extend the stack-allocation
+  action to more site kinds on the *current* structured NOIR:
+  - **Non-leaf classes ✅** — the leaf restriction is lifted: any non-escaping class stack-allocates,
+    including fields that hold managed pointers. The object pointer only feeds local field GEPs (escape
+    analysis guarantees no escape), so SROA scalar-replaces the alloca and each managed field becomes an
+    addrspace(1) SSA value the statepoint rewriter roots and relocates — the same mechanism every
+    class-typed local uses, so no interior stack-map scanning. A managed store into a stack object skips
+    the write barrier (`storeField` gates on an addrspace(1) base — a stack slot is a root, not a
+    remembered-set entry). Soundness rests on SROA fully promoting the object, which holds for this
+    pattern (single-def, address never taken past field GEPs; the debug pipeline runs `sroa`). Verified
+    under the moving collector: `examples/escape_nonleaf.nomu` + `tools/escape-nonleaf.sh` — a stack
+    `Holder`'s interior heap pointer survives and relocates across Immix evacuation, byte-identical to
+    NoGC. (Surfaced + fixed the barrier-on-stack-object ABI mismatch that broke `gc_gen` under escape-on.)
+  The three items below are **Deferred** (direction understood, work intentionally postponed — they
+  don't clear the current-phase perf triage in `deferred.md`). Tracked here for now; to be moved to
+  `deferred.md` later.
+  - **Non-scalar closure captures — Deferred.** The whole-object-alloca path is unsound here: the env's
+    address is passed to the impl function, defeating SROA, so a managed capture would sit unscanned in
+    the stack env. Needs the stack-map scanning path (or closure inlining). Closures stay scalar-leaf
+    (`isScalarLeaf`) until then.
+  - **`any`-boxes — Deferred.** Same SROA-root mechanism as non-leaf classes (a box has a p1 payload); a
+    non-escaping box could stack-allocate. Cheap to add, but rarely fires (boxing usually escapes), so
+    parked until a workload wants it.
+  - **Arrays — Deferred.** A dynamic-size buffer can't stack-allocate in general (only a
+    statically-bounded literal), and the handle+buffer split needs its own handling.
+- **6.5.4 ⬜ (blocked on M7)** — precise, flow-sensitive analysis (pointers through
+  conditionals/aliasing). Needs def-use chains + a CFG, i.e. the **M7 optimizer tier** (CFG/SSA NOIR);
+  the structured NOIR can't express it. (The LLVM backend, now M9, is done; it lowers structured NOIR
+  straight to LLVM.) Replaces 6.5.1, reuses 6.5.2/6.5.3. Lands with M7's co-tenants (devirt, BCE,
+  inlining, specialization), not for escape analysis alone.
 
-**Exit (conservative phase):** a microbenchmark with a known non-escaping allocation in a hot loop
-shows zero collector activity under `NOMU_GC_STATS` with the pass on; byte-identical results with the
-pass disabled; a flag disables the pass.
+**Exit (conservative phase, classes + closures — met):** `examples/escape.nomu` + `tools/escape.sh`
+— a leaf class in a hot loop is stack-allocated: the emitted object references no `rt_alloc` with the
+pass on, references it with `NOMU_NO_ESCAPE=1`, and prints identically either way (a scalar-capture
+closure behaves the same). Corpus differential byte-identical on vs off across all examples (1 stdin
+skip); the seven GC tools stay green (they pin `NOMU_NO_ESCAPE=1` internally, since escape analysis
+legitimately removes leaf heap roots the collector tests assert on); frontend suite green incl.
+`EscapeAnalysisTests`.
+
+## 6.6 · Inline allocation fast path ✅ (built 2026-08-13; the deferred alloc-seam inlining, 6.0.10)
+
+One-line intent: replace the `__nomu_gc_alloc` seam's out-of-line `rt_alloc` tail-call with the inline
+bump-pointer TLAB fast path — the matching half of the mutator-seam inlining (the write barrier was
+inlined in 6.3.2). Originally assigned to 6.1.1 / 6.2, deferred, picked up 2026-08-13.
+
+**Research findings (MMTk 0.32, verified against its source).**
+- **One uniform fast path across all our plans.** MMTk's own `mock_test_allocator_info` confirms NoGC,
+  Immix, and GenImmix all use a bump-pointer fast path. `memory_manager::get_allocator_mapping(mmtk,
+  AllocationSemantics::Default)` → a selector; `AllocatorInfo::new::<NomuVM>(selector)` →
+  `BumpPointer { bump_pointer_offset }`. The `BumpPointer` is `{ cursor: Address, limit: Address }`
+  (cursor at +0, limit at +8) sitting at `mutator + bump_pointer_offset`.
+- **The offset is runtime, not compile-time.** The plan is chosen at runtime (`NOMU_GC_PLAN`), so
+  codegen can't bake the offset; the binding publishes it at init (like `MAX_NON_LOS`) and the inline
+  path reads mutator memory at `mutator + offset`.
+- **`post_alloc` is a no-op** for our config. `post_alloc` → `space.initialize_object_metadata`, which
+  is empty for Immix and (for the GenImmix nursery CopySpace) only does work under the `vo_bit`
+  feature, which we do not enable. The generational unlog bit is set at *promotion* during GC, not at
+  alloc. So the inline path skips `post_alloc` entirely.
+- **Alignment is free** — sizes are multiples of 8 and align is 8, so the cursor stays 8-aligned; no
+  alignment arithmetic in the inline path.
+- **Zeroing must be preserved** — MMTk returns raw memory; `rt_alloc` memsets to keep Nomu's
+  zero-initialized-fields contract. The inline path emits the zero-fill.
+- **Hoist contract (6.0.3).** The cursor/limit loads and the cursor store must not be hoisted or
+  cached across a safepoint (a GC resets the TLAB). The fast path is call-free, so it is safe
+  internally; the risk is a loop with a back-edge poll caching the cursor. Statepoints clobber memory,
+  which should block the hoist — verify in the emitted IR, and make the accesses opaque if needed.
+
+**Plan.**
+- **6.6.1 ✅ (2026-08-13) — binding publishes the offset.** `nomu_gc_init` computes the Default-semantics
+  `bump_pointer_offset` (`get_allocator_mapping` → `AllocatorInfo::new`) and the LOS threshold, and
+  stores them in the exported globals `__nomu_bump_offset` / `__nomu_max_non_los` (`usize::MAX` = no
+  fast path). `rt_mutator` is now exported (non-`static`) so the inline path can read the per-carrier
+  mutator as a thread-local. Verified: both globals present in a linked binary; corpus still runs.
+- **6.6.2 ✅ (2026-08-13) — codegen inline fast path.** `nomuGcAlloc` now emits: read the thread-local
+  `rt_mutator` and `__nomu_bump_offset`/`__nomu_max_non_los`; fast path only when the offset is
+  published, the mutator is bound, and the size is not LOS (else `rt_alloc`); load `{cursor, limit}`,
+  align the cursor to 8, `new = aligned + size`; if `new <= limit` → store the cursor, zero via `memset`
+  (now `gc-leaf`), return the object; else → tail-call `rt_alloc` (the statepoint). `alwaysinline`
+  collapses it into each site. Cross-module TLS access to `rt_mutator` works on LLVM 23 / macOS (a
+  `_tlv_get_addr` call on Darwin — the fast path is not fully call-free here, but drops the statepoint +
+  MMTk overhead).
+
+**Exit (met):** compiles/verifies/links and runs correctly under NoGC / Immix / GenImmix; the seven GC
+tools stay green (they exercise the inline path under real + moving GC, including 200k-actor churn and
+evacuate-every-cycle stress — byte-identical, which also proves the cursor load is not hoisted across a
+safepoint); the emitted IR shows the bump inlined into `main` with `rt_alloc` only on the cold path;
+`escape-diff` byte-identical on vs off; frontend suite green.
+
+**Measured win (2026-08-13).** A/B on an alloc-dominated loop (10M heap `Box`es, NoGC, macOS arm64;
+inline path toggled off with `NOMU_NO_INLINE_ALLOC`, identical output both ways): **~4.8× at debug
+(0.24s → 0.05s), ~7× at -O2 (0.25s → 0.03s).** Confirms the win holds on Darwin despite the tlv call —
+the fiber-pinned mutator cache (`deferred.md`) would push it further by removing the `_tlv_get_addr`
+read. This is the alloc-path speedup in isolation; whole-program wins scale with allocation density.
+`NOMU_NO_INLINE_ALLOC` is retained as the A/B knob and a correctness fallback.

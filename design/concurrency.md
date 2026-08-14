@@ -205,7 +205,7 @@ Why two constructs rather than one: static fan-out (fixed, heterogeneous, combin
 
 **Residual (§10):** all spellings (the binding form, the scope/group, spawn), the exact join points (implicit at block exit vs. explicit), how collected results are typed/ordered, and how the error mode is selected. Some of this rides on generics (`types.md`).
 
-**Sequencing (decided 2026-08-10).** Static fan-out (`spawn let`) ships. The **dynamic fan-out group is built in M7, after cancellation** (`roadmap.md`) — its fail-fast mode rides the structured-cancellation model (§7), and its motivating use (benchmarking highly concurrent workloads) can wait. Confirm the surface (handle-based vs. scoped; join point; error-mode selection) before building.
+**Sequencing (decided 2026-08-10).** Static fan-out (`spawn let`) ships. The **dynamic fan-out group is built in M8, after cancellation** (`roadmap.md`) — its fail-fast mode rides the structured-cancellation model (§7), and its motivating use (benchmarking highly concurrent workloads) can wait. Confirm the surface (handle-based vs. scoped; join point; error-mode selection) before building.
 
 ---
 

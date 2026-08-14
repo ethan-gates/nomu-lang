@@ -8,6 +8,21 @@ in the owning `mN-spec.md`). Each entry records **what**, **why deferred**, the
 
 Status vocabulary matches `readme.md` §"Reading the status tags".
 
+## Current-phase perf triage (2026-08)
+
+A guideline, not a rule — applied case by case. In the current phase, perf work worth picking up now
+usually falls into one of two buckets:
+
+1. **Large architectural directions** that steer the whole system — the actor message model, GC plan
+   direction, the M7 optimizer tier.
+2. **Work already in flight or awaited** — the C-compilation cache, the parallel differential,
+   allocation inlining.
+
+A local, self-contained perf win with unmeasured value is usually better parked here until a workload
+asks for it. **Caveat:** a "small" decision or feature that combines with other small ones into an
+architectural direction is category 1 in disguise; surface it and decide it explicitly rather than
+letting a direction accrete unremarked.
+
 ## How entries are tagged
 
 Each entry carries a **Type** and a **Lifecycle** stage:
@@ -62,7 +77,7 @@ Each entry carries a **Type** and a **Lifecycle** stage:
   how and why we build) and a **language specification** (what the language *guarantees
   to the programmer*: syntax, semantics, and the contracts a Nomu author can rely on,
   independent of implementation). Today both live intermixed across `design/`.
-- **Why deferred (raised 2026-08-03).** The design docs are still churning as M8 lands;
+- **Why deferred (raised 2026-08-03).** The design docs are still churning as M9 lands;
   extracting a stable programmer-facing spec now would track a moving target. The split
   pays off once the language surface settles.
 - **Trigger to build.** After M6 (post-GC), when the surface is stable enough that a
@@ -109,10 +124,16 @@ picked up.
   Parked — the batch model is fine and this is not a throughput lever.
 - **Float-exponent literals** `[language-feature · needs-design]` — accept `1e9` / `2.5e-3`. Small
   lexer change plus syntax agreement; today only the decimal-point form (`3.14`) lexes.
+- **Fiber-pinned mutator cache** `[perf · needs-grounding]` — the §6.6 inline alloc fast path reads the
+  per-carrier MMTk mutator via the thread-local `rt_mutator`; on macOS a thread-local read compiles to a
+  `_tlv_get_addr` call, so the fast path is not fully call-free on Darwin. Cache the mutator where
+  codegen can reach it without a tlv call (a fiber/carrier-pinned slot or a reserved register), removing
+  the per-alloc tlv cost. Ground against a profile first — confirm the tlv read actually dominates the
+  alloc fast path before building. Ref: `m6-spec.md` §6.6.
 
 ---
 
-## Post-M8 backlog (raw)
+## Post-M9 backlog (raw)
 
 Carried over from the retired `m8-spec.md` "post m8 ideas" list — things worth doing, not yet
 scheduled. **Raw and terse on purpose**: each is a pointer, not a decided build. Promote an item

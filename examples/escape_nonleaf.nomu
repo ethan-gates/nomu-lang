@@ -1,0 +1,41 @@
+// 6.5.3 — a NON-LEAF non-escaping class is stack-allocated (escape analysis on).
+//
+// `Holder` has a field that holds a managed pointer (`inner: Inner`), so stack-allocating it is only
+// sound if that interior pointer is a real GC root. It is: escape analysis proves `h` never escapes
+// (only its fields are read), so SROA scalar-replaces the stack object and `h.inner` becomes an
+// addrspace(1) SSA value the statepoint rewriter relocates like any other class-typed local — the
+// same mechanism the whole GC substrate rests on. `h` is live across `churn`, which allocates enough
+// heap garbage to drive collections; the heap `Inner(12345)` it points at must survive and relocate.
+// tools/escape-nonleaf.sh runs this under the moving collector and checks the output is unchanged.
+
+class Inner {
+    var v: Int
+}
+
+class Holder {
+    var inner: Inner
+    var tag: Int
+}
+
+fun sink(x: Inner) -> Int {
+    return x.v
+}
+
+fun churn(n: Int) -> Int {
+    var acc = 0
+    var i = 0
+    while i < n {
+        let g = Inner(v: i)   // escapes into `sink` → heap garbage that drives collections
+        acc = acc + sink(g)
+        i = i + 1
+    }
+    return acc
+}
+
+fun main() {
+    let h = Holder(inner: Inner(v: 12345), tag: 7)   // Holder non-escaping → stack; Inner → heap
+    let c = churn(100000)                             // force many collections while `h` is live
+    print(h.inner.v)   // 12345 — the interior pointer survived + relocated
+    print(h.tag)       // 7
+    print(c)           // 4999950000
+}
