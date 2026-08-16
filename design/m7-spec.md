@@ -1,0 +1,190 @@
+# M7 — Implementation Spec (Optimizer tier — SSAIR)
+
+**Status:** working draft — the ordered work plan for **M7**, derived from `compiler.md` §1 (mid-level IR), `memory-model.md` §6.1 (escape analysis), and the M6 escape-analysis groundwork (conservative pass, now the record in the compiler). It pins the build sequence; the design/rationale lives in `compiler.md` §1a and is cited here.
+
+**Build status (2026-08-14):** spec-first. Nothing built. Next slice is **7.1** — modularization (split the frontend monolith into per-stage `swift_library` modules and split `lowering.swift`), so 7.2's SSAIR + passes land in a granular structure. IR named **SSAIR** (2026-08-14) — a separate IR from NOIR.
+
+**Framing correction.** The roadmap names M7 "optimizer tier," which understates it: M7 is a from-scratch second IR level plus a pass framework plus four first-tenant passes, preceded by a modularization slice. The IR is designed against all four tenants at once (roadmap M7, Decided 2026-08-13), so the SSAIR shape is validated before it freezes.
+
+**Prerequisites (grounded against current code):** monomorphization (M5, done — the tier runs post-mono on concrete types); the structured-NOIR→LLVM path (M9, done — SSAIR→LLVM will replace it, §7.0.4); LLVM statepoints + precise roots (M6/M9, done — the tier preserves GC precision info so late statepoint insertion still sees precise roots); the conservative escape pass's side-table codegen consumer (shipped in M6, done — reused unchanged by the precise pass).
+
+---
+
+## 7.0 · Front matter
+
+### 7.0.1 · Scope
+
+Ships this milestone:
+
+- **Modularization** — the frontend monolith split into per-stage modules; `lowering.swift` split into files.
+- **SSAIR** — a lower control-flow-explicit, SSA IR (a separate IR from NOIR), lowered from structured NOIR after monomorphization and lowered onward to LLVM.
+- A small **pass manager** (analyses + transforms, explicit invalidation).
+- Four **first-tenant passes**: precise flow-sensitive escape analysis, devirtualization, bounds-check elimination, inlining/specialization.
+
+**Deferred:**
+
+- **Heavy alias/effect modelling** — added only when a tenant's precision demands it (§7.0.6 open question).
+- **MLIR** — out of scope, unchanged from M9 (`compiler.md` §2).
+
+### 7.0.2 · Compiler surface touched
+
+Pipeline today: `AST → Sema → NOIR (structured) → monomorphization → LLVM`. M7 inserts a stage:
+
+`… → monomorphization → LOWER TO SSAIR → optimizer passes → lower to LLVM → statepoint rewrite → object code`
+
+- **Sema / NOIR** — unchanged; structured NOIR stays the front-end IR.
+- **New tier** — the SSAIR types + the lowering in (structured NOIR → SSAIR) and out (SSAIR → LLVM).
+- **Codegen (LLVM lowering)** — the SSAIR→LLVM egress is built *beside* the intact NOIR→LLVM path (flag-selectable, sharing the GC-ABI emission factored out in 7.1.2); both run over the corpus for the 7.2 differential, then the NOIR→LLVM path is deleted — netting a replacement (both debug and release run through SSAIR, §7.0.4).
+- **Escape analysis** — the conservative front-end (`EscapeAnalysis.swift`) is retired when the precise pass lands (7.3); its side-table codegen consumer is reused unchanged.
+- **Closure conversion** — moves out of codegen into the lowering to SSAIR (closures become explicit env structs here).
+- **Module structure** — the frontend `swift_library` is split (7.1); SSAIR + passes land as new modules.
+
+### 7.0.3 · Dependencies
+
+```
+7.1 (modularization: frontend per-stage modules + lowering.swift split)
+ └─ 7.2 (SSAIR + inert lowering, identity stage)   ← the gate; no pass runs until inert-verified
+     └─ 7.3 (pass manager + precise escape analysis)   ← largest single-pass impact; reuses the M6 conservative pass's codegen consumer
+         └─ 7.4 (devirtualization)
+             └─ 7.5 (inlining/specialization + BCE)     ← devirt unlocks inline; inline then widens EA's interprocedural reach
+```
+
+7.1 clears the ground so new code lands modular. 7.2 is the gate for every pass (nothing runs until the tier is proven inert). **Pass build order is EA-first (Decided 2026-08-14), by impact:** allocation/GC is the dominant runtime cost and the language's own performance thesis, and whole-program monomorphization (M5) already resolves most generic dispatch to direct calls — so devirt's residual target is the narrower `any`-existential slice, and its bigger value is as an inlining enabler (7.5). EA runs standalone at 7.3 (it needs only the IR + pass manager, no dependence on devirt); devirt (7.4) precedes inlining (7.5) because a `witness`→`direct` rewrite is what makes a call an inlining candidate, and inlining then widens EA's interprocedural reach. The **runtime pass-pipeline order stays devirt → inline → EA/BCE** (§7.0.4) regardless of the build order, so once all passes exist EA benefits from a post-inline re-run.
+
+### 7.0.4 · Cross-cutting decisions
+
+- **A separate Nomu-level tier, above LLVM.** — **Decided (2026-08-13).** LLVM optimizes at the wrong altitude for four language-aware wins: it will not un-heap a `__nomu_gc_alloc` (opaque runtime call), devirtualize a witness-table dispatch (indirect call through a loaded pointer), eliminate a bounds check (a Nomu semantic guarantee it can't see redundant), or specialize on Nomu type info (erased by codegen). Structured NOIR can't host them either — they need a CFG + def-use chains the nested tree lacks. The tier is Nomu's **MIR/SIL** analog.
+- **Design against the whole tenant set at once.** — **Decided (2026-08-13, roadmap M7).** SSAIR's shape serves EA, devirt, BCE, and inline/specialize together; shaping it for one pass would bake in a form the others fight.
+- **SSA with block arguments, not φ-nodes.** — **Decided (2026-08-14).** The Swift/MLIR style — merge blocks take parameters, each branch passes its value on the jump — is cleaner to construct from a tree-walk and to rewrite in transforms (the value flows with the edge, so CFG edits don't require fixing up predecessor-named phi lists).
+- **SSA construction: build it directly during lowering-in (Braun et al.), not alloca-then-promote.** — **Decided (2026-08-14).** As the structured tree lowers to SSAIR, track the current value per variable and insert block args at joins; emit SSA straight out, with no slot/load/store layer at the tier level. Rejected the alloca-everything + mem2reg approach: the tier is above LLVM, so there is no LLVM mem2reg to lean on — that option would mean writing our own promotion pass (the same phi-insertion machinery as direct construction) *plus* carrying and then deleting a slot layer, and it would re-import the mem2reg-before-statepoint coupling into the tier (GC pointers would stay invisible to escape analysis until promotion runs). Direct construction does the SSA reasoning once and gives escape analysis SSA-valued GC pointers immediately. Nomu's lack of an address-of operator makes the SSA-candidate set trivially "every local," so construction never falls back to keeping a variable in memory. **Cost owned:** loop back-edge correctness (block sealing) — 7.2.2 carries a targeted test set (nested loops, `break`/`continue`, a value live across a back-edge).
+- **Single path (net) — build the SSAIR egress beside the intact NOIR→LLVM path, compare, then delete the old.** — **Decided (2026-08-14).** The end state is one egress (`NOIR → SSAIR → LLVM`, both debug and release; debug runs SSAIR with zero/few passes), reached by build-beside-then-delete: during 7.2 both egresses live in the tree, **flag-selectable**, so both run over the corpus and are compared directly. The comparison is **correct-over-corpus, not byte-identical** (SSA/φ vs alloca/load/store). The **oracle is the in-tree NOIR→LLVM path** (flag-selected) — same build, only the egress differs, so a discrepancy isolates to the new path. The GC-ABI emission factored out in 7.1.2 is **shared by both egresses** during the coexistence (only the traversal differs — NOIR-tree walk vs SSAIR-CFG walk), so the transitional two-path state duplicates no GC ABI. Once the corpus differential is green, the NOIR→LLVM path and its tree-traversal are **deleted**, netting a replacement. Rejected keeping both permanently — a duplicated GC ABI is a silent-miscompile surface. This resolves the debug-routing question (debug routes through SSAIR). Each pass sits behind an A/B disable flag (the EA/inline-alloc-knob precedent), so the tier is switchable and a regression is bisectable.
+- **Late statepoint insertion, unchanged.** — **Decided (inherited, `compiler.md` §2).** Statepoints are inserted at the LLVM level post-opt, so the tier's passes see ordinary managed pointers and never the spill/reload noise.
+
+### 7.0.5 · Runtime / GC posture
+
+The tier preserves **GC precision info** (address spaces; which values are managed roots) on every value, so the downstream statepoint rewrite still finds precise roots. Precise EA rewrites an `alloc` to a stack slot and drops the write barriers that fed it; the barrier is an **explicit op** in this IR so elision is a pass. A stack object whose fields hold managed pointers stays in the GC's world — its fields are scanned as roots via the frame's stack map (the M6 escape-analysis mechanism, reused). No moving/non-moving assumption is baked in.
+
+**Unmanaged-memory forward-compatibility.** Nomu source has no way to allocate unmanaged heap memory today, but it likely will (arenas, FFI buffers, off-heap data). The substrate already models the split — `addrspace(1)` managed vs `addrspace(0)` unmanaged/C-owned — so the door stays open **as long as the tier keeps managed-ness a per-value property and scopes every GC-specific transform explicitly to `addrspace(1)`**, never to "pointer" or "heap allocation" generically:
+- The tier's **`alloc` op means *managed* GC allocation** (the EA + barrier target). Unmanaged allocation is an ordinary `call` returning `addrspace(0)` — no dedicated op needed, and it must **never be an EA stack-promotion candidate** (the user owns its lifetime; promoting it would be a correctness bug).
+- Root tracking (`addrspace(1)` only), barrier insertion (`addrspace(1)` base only), and the EA target set (managed `alloc` sites only) already key off the address space, so unmanaged pointers flow through as opaque non-roots for free.
+- **Future language rule to leave room for (not foreclosed here):** storing a managed ref *into* unmanaged memory needs a root-registration/pinning rule, since the collector scans managed pointers only in stack frames, registers, and GC-heap objects — unmanaged memory is a fourth, unscanned location. The address-space model is additive, so adding a scanned location later is a new rule, not a rework. Hold "all managed-pointer-holding memory is GC-scanned" as a current invariant, never as an unremovable assumption in a pass.
+
+**GC-precision-survival invariants + test obligation.** EA (7.3) is the first transform to rewrite a managed allocation into a stack slot and to drop write barriers, so the tier's soundness under the moving collector rests on the invariants below. Bugs here are **silent** — relocation corruption, non-deterministic — so each invariant carries a forcing test with a ground-truth oracle: *running without a crash is not a pass.*
+
+*Master property (falsifiable).* For every program, with the tier ON the root set recovered at each safepoint and the set of executed write barriers is a **justified refinement** of the tier-OFF program — every removal is individually licensed by an invariant below (a stack-promoted object's slot; a barrier elided on a store into a root), and nothing otherwise-needed is dropped or added. T5 checks this at corpus scale; T4 checks it pointwise.
+
+*Address space / root identity.*
+- **I1.** Every value's address space is preserved by every transform. `addrspace(1)` (managed) stays managed unless a transform soundly re-provenances it (only EA stack promotion, I4). No transform silently reinterprets managed↔unmanaged.
+- **I2.** No transform introduces an `addrspace(0)→(1)` reinterpretation (the statepoint rewrite rejects a GC base from a differing-addrspace cast; an unmanaged pointer must never be scanned or relocated). Only sound `1→0` narrowing at C-ABI boundaries, as today.
+- **I3.** A value is a GC root at a safepoint iff it is a managed value live across it. The root set the statepoint rewrite recovers after the tier equals the un-optimized root set, modulo values the tier legitimately made dead or stack-local.
+
+*Escape analysis / stack promotion.*
+- **I4.** Stack promotion applies only to an allocation proven non-escaping; when unsure, the object escapes (the fallback is always heap-allocate — a false "non-escaping" is the one unsound direction).
+- **I5.** A stack-promoted object's managed fields stay precisely scannable: each `addrspace(1)` field is SROA-promoted to a statepoint-tracked SSA root (or covered by a frame root slot). The tier must never produce a stack object holding a managed pointer that no root map describes — e.g., by blocking SROA through an address-taken use.
+- **I6.** Stack promotion never extends lifetime past the frame (corollary of I4): no managed pointer to a promoted object survives the return.
+
+*Write barrier.*
+- **I7.** A barrier is elided only where the store cannot create an untracked old→young reference: a store into a stack slot (a root scanned every GC) or an initializing store into a freshly-allocated nursery object may skip it; a store into a mature heap object keeps it.
+- **I8.** A transform that moves or copies a store carries its barrier obligation with it — inlining a callee that stores a managed ref into a heap field preserves that store's barrier.
+
+*Safepoint / statepoint.*
+- **I9.** Safepoint coverage is preserved: no tier transform (inline, unroll, block-merge) deletes the last safepoint from a loop or creates an unbounded safepoint-free region (the M6 pass-pipeline rule, now binding on tier transforms).
+- **I10.** A managed value live across a safepoint stays a first-class SSA `addrspace(1)` value; no transform sinks it into a by-value aggregate that embeds a GC pointer live across a statepoint (the FCA limitation).
+
+*Test plan (each forces the hazard + checks an oracle).*
+- **T1 — A/B × collector differential.** {tier off, tier on} × {NoGC, GenImmix} byte-identical on the corpus. Extends `escape-diff.sh`.
+- **T2 — forced evacuation of a promoted object's pointer (I5).** A stack-promoted non-leaf object holds a heap pointer, live across a **forced** collection (small-heap / stress knobs, `gc-stress.sh`/`gc-gen.sh`) that relocates the referent; assert the value survives and the pointer is updated. Extends `escape-nonleaf.sh`.
+- **T3 — barrier obligations (I7, I8).** A mature object storing a young reference across a minor GC keeps the young object live (elision would drop it); an inlined barriered store still fires. Differential under a minor-GC-forcing config.
+- **T4 — root-set introspection (I3, master property, pointwise).** Extend `gc-smoke.sh` (`NOMU_GC_SMOKE`) so a test asserts the **exact** root set the walker recovers with the tier ON matches an expected set — turning a dropped root from silent corruption into a failed assertion. The strongest oracle: checks the invariant directly rather than waiting for corruption to surface.
+- **T5 — corpus root/barrier differential at scale.** The example corpus under {tier off, tier on} × {NoGC, GenImmix, GenImmix-stress}, outputs diffed; catches regressions broadly.
+- **T6 — safepoint coverage after transforms (I9).** A call/alloc-free loop the tier inlines/unrolls; assert STW still stops it (the `gc-smoke-stw.sh` pattern) — no unbounded safepoint-free region.
+- **T7 — randomized differential (seed now, systematize in M12).** Generated programs (allocate / store / branch / hold-across-call / drop) compiled tier-on vs off, differenced under forced GC — the systematic version of T1–T3; lightweight seed now, full harness with M12 concurrency hardening.
+
+### 7.0.6 · Open questions
+
+- **Block arguments vs φ-nodes** — resolved (§7.0.4): block args.
+- **Debug-build routing** — resolved (§7.0.4): debug routes through SSAIR with zero/few passes; the direct path is deleted after 7.2.
+- **Interprocedural EA summary** — how much survives without whole-program fixpoint iteration; whether monomorphization's whole-program view makes a cheap summary enough.
+- **Artifact/dump format** — reuse the NOIR dumper or a dedicated CFG dump (`--emit-*` extension TBD).
+- **Alias/effect model** — how much aliasing precision the passes need before cost outweighs win.
+- **Inlining cost model** — what drives the heuristic (callee size, call-site hotness, specialization).
+- **Debug info through inlining** — inline-site DWARF records, or defer.
+
+---
+
+## 7.1 · Modularization ⬜ (Decided 2026-08-14)
+
+**Intent:** the frontend is one `swift_library` (~5,900 LoC of sources, one compile unit that rebuilds wholesale on any edit) and `lowering.swift` is ~2,900 LoC. Split before adding SSAIR + passes, for build parallelism, coarse inter-module incremental, and enforced layering (aligned with `compiler.md` §3/§8 and `src/frontend/README.md`). Pure refactor, no behavior change. **Two granularities:** Bazel module boundaries (the compile unit) and files within a module.
+
+**Interface/implementation module split (Decided 2026-08-16).** Each IR gets its own **interface module** (the format: types + dump), separate from the **implementation modules** that produce or consume it. An IR is a stable dependency surface — producers/consumers depend on the format, not on each other — which is the structural home for the §8 phase-output-format / format-stability goals and keeps the §3 query architecture's IR-keyed memoization clean (`compiler.md` §8). A stage that introduces no new IR (e.g. the mid passes on NOIR) is implementation-only, depending on the upstream format module.
+
+Pipeline decomposition (interface | implementation), grouped by phase into parent dirs (2026-08-16). Modules keep their `module_name`, so `import`s are unchanged; only Bazel labels carry the dir:
+- shared leaf, top-level: `//src/support` (Span, Diagnostic, Type) — no deps
+- **`//src/frontend/`** (source → NOIR): `frontend/ast` (Token, AST, ASTDump) | `frontend/parse` (Lexer, Parser); `frontend/noir` (NOIR, NOIRDump) | `frontend/sema` (Sema, Typechecker, Builtins, Exhaustiveness, Mutation, Shareability, ExtensionMerge)
+- **`//src/midend/`** (mid-level tier): `midend` (Monomorphize, EscapeAnalysis — NOIR→NOIR) + the M7 SSAIR tier `midend/ssair` (SSAIR + dump) | `midend/ssairbuild` (NOIR→SSAIR), `midend/ssairpasses` (manager + passes)
+- **`//src/llvmgen/`** (backend): `llvmgen` (SSAIR→LLVM)
+
+Placement calls: **Token** → `ast` (extract from `Lexer.swift` if clean, else keep in `parse` and expose). **Type** → `support` (both NOIR and SSAIR carry it); could become its own `types` interface module later.
+
+**Slices:**
+- **7.1.1 ✅ (2026-08-16)** — **frontend → the interface/impl modules above** (`support`, `ast`, `parse`, `noir`, `sema`, `midend`). The old `frontend` `swift_library` is dissolved; each stage is its own module with a `support` leaf. As built: interface modules (`ast`, `noir`) needed **explicit `public init`s** on their structs (synthesized memberwise inits are `internal` — ~22 on AST, ~16 on NOIR). Findings: (1) stdlib now has a generic `Span<T>` — an unqualified `Span` binds to it unless the file `import`s `support`, which Swift then prefers, so no rename needed; (2) `noir` depends on `ast` for `BinOp` (NOIR reuses it); (3) `llvmgen` depends on `sema` only for `Builtins` (the shared builtin table) — a layering wrinkle to revisit. Full build (`//src/...`) + `frontend_tests` green. Backlog relocated to `src/sema/README.md`; overview `src/README.md` refreshed.
+- **7.1.2 ✅ (2026-08-16)** — **`lowering.swift` (~2,900 LoC) → 7 files within `llvmgen`** (one module), the `NOIRToLLVM` class split across `extension` files by concern: `Lowering.swift` (core — class decl, all stored properties, init, debug info), `LoweringTypesDecls.swift` (type/layout + callable decl), **`LoweringStmtExpr.swift` (the NOIR tree-walk — the part 7.2.3's SSAIR CFG-walk replaces)**, `LoweringWitness.swift`, `LoweringConcurrency.swift`, `LoweringHelpers.swift`, and `LoweringGC.swift` (the inline alloc/barrier/poll GC-ABI + actor mailbox — reused by the SSAIR egress). As built: Swift's `private` is file-scoped, so ~222 class members were relaxed `private`→internal (and 2 `private(set)` → `var`) to be reachable across the split files; BUILD `srcs` → `glob`. Verified behavior-preserving: full build + tests green, and the built compiler compiles+runs a sample of examples correctly (`actor_relay`→400, `gc_smoke`→999, `escape_nonleaf`→12345, actor/generics/interfaces).
+- **New M7 code lands as new modules from the start**, under `//src/midend/` — `ssair` (types + dump), `ssairbuild` (NOIR→SSAIR), `ssairpasses` (pass manager + the four passes) — so the monolith stops growing. Scaffolded at 7.2.1, filled in 7.2+.
+- **Directory grouping (2026-08-16):** modules are grouped by phase into `//src/frontend/` (ast, parse, noir, sema), `//src/midend/` (midend passes + the SSAIR tier), and `//src/llvmgen/` (backend); `support` stays top-level. Since `module_name`s are unchanged, this was a BUILD-labels-only move with no source edits.
+
+**Exit:** `bazel build //src/nomu-cli:nomuc` + `bazel test //src/frontend/...` green after the split; per-stage modules build in parallel; corpus output unchanged (pure refactor).
+
+---
+
+## 7.2 · SSAIR + lowering, no passes (identity stage) ⬜
+
+**Intent:** define the SSAIR types and lower structured NOIR → SSAIR → LLVM with the optimizer empty, proven inert before any pass runs.
+
+**Representation (Proposed).**
+- Functions are a **CFG of basic blocks**; each block is straight-line instructions ending in one **terminator** (`br`, `condBr`, `switch`, `ret`, `unreachable`). Structured `if`/`switch`/`while` + `break`/`continue` flatten to blocks + terminators here — the one place the structured tree is flattened.
+- **SSA values with block arguments**; each value typed (carries the NOIR `Type`, concrete post-mono); dominance explicit.
+- **Explicit memory + allocation ops:** `alloc` (the EA site, lowering to `__nomu_gc_alloc` by default), `load`/`store` carrying the **GC address space** (1 = managed, 0 = stack), field GEPs, and the **write barrier as an explicit op**.
+- **Explicit dispatch ops:** a call carries its kind — `direct` (known target), `witness` (through a witness slot, the devirt target), `indirect` (closure/fn-pointer).
+- **Closures → explicit environments** (closure conversion moves here): an env struct + a direct/indirect call, so the capture set is ordinary values.
+- **Pattern matches → decision trees / switch terminators** (exhaustiveness already checked upstream).
+
+**Invariants every pass must hold:** types on every value; **source spans** on every instruction (debug info threaded from the front, `compiler.md` §1/§4 — dropping a span is a bug); GC precision info.
+
+**Slices:**
+- **7.2.1 ⬜** — the SSAIR data types (in the `ssair` module, 7.1).
+- **7.2.2 ⬜** — lowering in: structured NOIR → SSAIR (control-flow flattening, **direct SSA construction** per §7.0.4 — track current value per variable, insert block args at joins, seal loop back-edges; every local is an SSA candidate since Nomu has no address-of — closure conversion, match lowering). Carries the block-sealing test set: nested loops, `break`/`continue`, a value live across a back-edge.
+- **7.2.3 ⬜** — lowering out: SSAIR → LLVM. Build the egress **reusing the GC-ABI emission factored out in 7.1.2** (alloc/store/barrier/dispatch, address spaces, object layout, `gc` attr) with an SSAIR CFG-walk traversal in place of the NOIR tree-walk (no control-flow flattening, no alloca-per-scalar-local — SSAIR already supplies both). Keep the NOIR→LLVM path **intact and flag-selectable** alongside it for the differential. Block args → LLVM φ at the boundary.
+- **7.2.4 ⬜** — a `--emit-*` artifact for SSAIR (per-phase debuggability, `compiler.md` §1).
+
+**Exit:** a corpus of programs compiles through `NOIR → SSAIR → LLVM` with the optimizer empty and runs **correct over the corpus vs the in-tree NOIR→LLVM path** (flag-selected — program output + GC behavior across the corpus + GC tools), not byte-identical LLVM IR (the new IR legitimately differs: SSA/φ vs alloca/load/store). Once the differential is green, the NOIR→LLVM path is deleted, netting a replacement. The tier is proven inert before any pass runs.
+
+---
+
+## 7.3 · Pass manager + precise flow-sensitive escape analysis ⬜
+
+**Intent:** stand up the analysis/transform/invalidation contract, and complete escape analysis (`memory-model.md` §6.1; the precise pass blocked on this tier) — the largest single-pass impact (§7.0.3).
+
+- **Two pass kinds:** *analyses* (side tables keyed by value/site identity, mutate nothing — escape result, dominator tree, alias facts) and *transforms* (rewrite the IR, invalidating analyses). Side tables match the M6 conservative-EA shape, so the codegen consumer contract is unchanged.
+- **Pass manager** with explicit analysis dependencies + invalidation; hand-rolled, small.
+- **Precise EA:** def-use + CFG follow a pointer across branches and through the now-explicit closure envs, lifting the conservative pass's "any call argument escapes." Clears the M6 conservative pass's deferred tail (non-scalar closure captures, `any`-boxes, statically-bounded array buffers). **Replaces** the conservative front-end (`EscapeAnalysis.swift`); the codegen consumer is **reused unchanged**. Interprocedural reach starts intra-procedural + flow-sensitive at 7.3; inlining (7.5) later widens it (a post-inline re-run in the pipeline).
+
+**Exit:** the deferred-tail shapes stack-allocate where non-escaping, and the GC-precision-survival gate (§7.0.5) holds — **T1, T2, T4 green** (A/B × collector differential; forced evacuation of a promoted object's pointer; root-set introspection asserting the exact recovered root set), with T3 covering any barrier elision this phase performs. Gated by the escape A/B flag.
+
+---
+
+## 7.4 · Devirtualization ⬜
+
+**Intent:** rewrite `witness`/`any` calls to `direct` where the concrete conformer is known — a `some`/opaque underlying, a monomorphized instance, or a locally-constructed box. The narrower residual after monomorphization (§7.0.3), and the unlocker for inlining (7.5).
+
+**Exit:** a witness/`any` call with a statically-known conformer lowers to a direct call; verified by IR-dump diff + a runtime differential against devirt-off.
+
+---
+
+## 7.5 · Inlining/specialization + bounds-check elimination ⬜
+
+**Intent:** the throughput passes on the now-concrete, devirtualized, inlined bodies.
+
+- **Inlining + specialization** on top of monomorphization (M5), driven by Nomu type/cost info; inlining widens the reach of intra-procedural EA and BCE across the old call boundary.
+- **Bounds-check elimination** on `index`: redundant-with-a-dominating-check, and provable-in-range-of-a-loop-bound.
+
+**Exit:** microbenchmarks show the expected wins (inlined hot calls, eliminated redundant bounds checks); each behind an A/B flag so a regression is bisectable.

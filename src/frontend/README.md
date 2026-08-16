@@ -1,9 +1,21 @@
-# frontend/
+# frontend/ — source → NOIR
 
-Lexer, parser, AST, typechecker, semantic pass (typed IR), and the IR passes
-(exhaustiveness, mutation, share analysis). The frontend is **kept across the
-C→LLVM backend transition** (`design/compiler.md` §6), so architectural gaps here
-are real — unlike C-backend-only limitations, which are throwaway scaffolding.
+The Nomu frontend — lexer, parser, AST, and the semantic pass (typed IR = NOIR). As of M7
+§7.1 the old single `frontend` module is **split into per-stage modules** grouped under this
+directory, with an interface/implementation separation (`design/m7-spec.md` §7.1, `compiler.md`
+§8):
+
+- `frontend/ast` (Token, AST, ASTDump) — syntactic interface · `frontend/parse` (Lexer, Parser) — impl
+- `frontend/noir` (NOIR, NOIRDump) — typed-IR interface · `frontend/sema` (Sema, Typechecker,
+  Builtins, Exhaustiveness, Mutation, Shareability, ExtensionMerge) — impl
+
+Siblings outside this directory: `support` (Span, Diagnostic, Type — the shared leaf, top-level)
+and `midend` (Monomorphize, EscapeAnalysis — NOIR→NOIR passes, grouped with the M7 SSAIR tier).
+
+The frontend is **kept across the C→LLVM backend transition** (`design/compiler.md` §6), so
+architectural gaps here are real — unlike C-backend-only limitations, which are throwaway
+scaffolding. This backlog covers the frontend stages as a whole; most remaining items (modular
+checking, the query engine, monomorphization) are Sema-centric.
 
 ## Architecture TODO
 
@@ -38,6 +50,19 @@ typechecker `error/fail -> Never`). Now:
   needs `Expr.error` threaded through Sema's checker (it has a compile-time case today
   that returns an `.error`-typed placeholder, but the path is untested end-to-end).
 
+### P1 — split the frontend monolith into per-stage modules — **done (M7 §7.1, 2026-08-16)**
+The single `frontend` `swift_library` (~5,900 LoC, one compile unit) is now the six
+per-stage modules above, each its own `swift_library` with a shared `support` leaf.
+Interface modules (`ast`, `noir`) hold each IR's types + dump; implementation modules
+(`parse`, `sema`, `midend`) hold the code. This gives build parallelism, coarse
+inter-module incremental (Bazel rebuilds only changed modules + dependents), and enforced
+layering. Complements — does not replace — the P2 per-decl query engine (that is
+intra-module fine-grained; this is inter-module coarse). Cross-module construction of AST
+and NOIR values required explicit `public init`s on their structs (the synthesized
+memberwise inits are `internal`). One layering wrinkle to revisit: `llvmgen` depends on
+`sema` only for `Builtins` (the builtin-function table codegen shares) — a candidate to
+move to a shared module later.
+
 ### P1 — structured diagnostics
 Today a `Diagnostic` is `severity + message + span`. LSP quality (and stable tests)
 wants more, and retrofitting messages→codes later is miserable:
@@ -50,7 +75,7 @@ driver is single-file and the prelude is concatenated into one `Program`.
 - Accept **N source files → one module**: parse each independently, build the shared
   module **signature environment** from all files, then check each file's bodies
   against it.
-- Keep the **signatures-first / bodies-second** seam clean (already latent in
+- Keep the **signatures-first / bodies-second** boundary clean (already latent in
   `Sema.collectGlobals` → `check()`): a body is checked only against referenced
   **signatures**, never another decl's body. This modular-checking property is what
   makes "recompile only what changed" *sound* — protect it as new checks are added.

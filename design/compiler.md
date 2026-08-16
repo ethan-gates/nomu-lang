@@ -33,6 +33,86 @@ The backend (LLVM) does not understand the language's semantics, so running thes
 
 ---
 
+## 1a. The optimizer tier — SSAIR (M7)
+
+**Status:** working draft, spec-first. The tier itself is **Open** (design in progress); the pieces below are marked **Proposed** unless a prior decision pins them. This section is the **design home** (the *why* + the shape); the **ordered build plan** (phases 7.1–7.5, exit criteria) lives in `m7-spec.md`.
+
+**One-line intent.** **SSAIR** is a lower, control-flow-explicit, SSA intermediate representation — a separate IR from NOIR (its own types, dumper, files), the level where the language-aware optimizations that carry the "faster than Swift/Go" thesis run. Structured NOIR (§1) lowers into SSAIR; SSAIR lowers to LLVM. It is Nomu's analog of **Rust's MIR / Swift's SIL**, sitting below THIR-altitude NOIR and above LLVM IR. (Named 2026-08-14; the sibling to NOIR, both ending in IR.)
+
+### Why a separate tier (the altitude argument)
+
+LLVM optimizes at the wrong altitude for four wins Nomu needs, because by the time code is LLVM IR the language facts are erased:
+
+- **Precise escape analysis** — LLVM will not un-heap a `__nomu_gc_alloc` call; it sees an opaque runtime call, not an allocation whose lifetime we can prove local (`memory-model.md` §6.1).
+- **Devirtualization of witness-table calls** — an `any I` / generic dispatch is an indirect call through a loaded function pointer at the LLVM level; the fact that the concrete conformer is knowable is a Nomu-level fact, gone by codegen.
+- **Bounds-check elimination** — the check is a Nomu semantic guarantee on `index`; LLVM sees a compare-and-branch with no knowledge that it is redundant with a prior check or a loop bound.
+- **Inlining + specialization on our type info** — on top of the existing whole-program monomorphization (M5), driven by Nomu-level cost and type knowledge rather than LLVM's post-lowering heuristics.
+
+Structured NOIR can't host these either: they need **def-use chains and a CFG to follow values across control flow**, which the nested `if`/`switch`/`while` tree lacks. The conservative escape pass shipped in M6 (`EscapeAnalysis.swift`; `memory-model.md` §6.1) is exactly what you can do without them — intra-procedural, single-walk, no flow sensitivity — and its ceiling is why the precise pass waits for this tier.
+
+**Design against the whole tenant set at once (Decided 2026-08-13, roadmap M7).** SSAIR is shaped to serve precise EA, devirtualization, BCE, and inlining/specialization together, so its form is validated against all four before it freezes. Building it for one pass would bake in a shape the others fight.
+
+### Position in the pipeline
+
+```
+source → lexer → parser (AST) → semantic pass → NOIR (structured, §1)
+       → monomorphization (M5)
+       → LOWER TO SSAIR  ← the M7 tier
+       → optimizer passes (EA, devirt, BCE, inline/specialize)
+       → lower to LLVM IR → statepoint rewrite → object code
+```
+
+The tier lands **after monomorphization** (passes see concrete types, no type parameters) and **before LLVM lowering**. **Single path (Decided 2026-08-14):** SSAIR does not sit beside the old lowering — the SSAIR→LLVM step *replaces* today's direct NOIR→LLVM (`lowering.swift`). Both debug and release run `NOIR → SSAIR → LLVM`; debug runs SSAIR with zero (or few) passes, release runs the full set. Two paths exist only transiently during 7.1 — the pre-M7 compiler is the differential oracle — and the old direct path is deleted once the new path is verified. This resolves the earlier debug-routing question: debug routes through SSAIR, it does not skip it.
+
+### IR shape (Proposed)
+
+- **Functions are a CFG of basic blocks.** Each block is a straight-line list of instructions ending in one **terminator** (`br`, `condBr`, `switch`, `ret`, `unreachable`). Structured control flow from NOIR (`if`/`switch`/`while`, `break`/`continue`) lowers to blocks + terminators here — the one place the structured tree is flattened.
+- **SSA values with block arguments** (the Swift/MLIR style) rather than φ-nodes — cleaner to construct from a tree-walk and to manipulate in transforms. Each value is typed (carry the NOIR `Type`) and dominance is explicit.
+- **Explicit memory + allocation ops.** `alloc` (the site EA reasons about, still lowering to `__nomu_gc_alloc` by default), `load`/`store` with the **GC address space** attached (addrspace 1 = managed, 0 = stack), field GEPs, and the **write-barrier** as an explicit op so barrier elision is a pass over this IR. This is what lets precise EA rewrite an `alloc` to a stack slot and drop the barriers that fed it.
+- **Explicit dispatch ops.** A call carries its dispatch kind — `direct` (known target), `witness` (through a witness-table slot, the devirt target), or `indirect` (closure/fn-pointer). Devirtualization is a rewrite from `witness` to `direct`, which then unlocks inlining.
+- **Closures lowered to explicit environments.** Closure conversion (still in codegen today, §1 pass list) moves here: a closure becomes an explicit env struct + a direct/indirect call, so the optimizer sees the capture set as ordinary values (feeds scalar-capture EA, §6.5.3).
+- **Pattern matches lowered to decision trees / switch terminators** — exhaustiveness already checked upstream (§1), so this tier sees only the lowered branch form.
+
+**Preserved by construction (the invariants every pass must hold):**
+- **Types** on every value (concrete post-mono).
+- **Source spans** on every instruction — debug info is threaded from the front and **must survive every pass** (§1, §4); the DWARF quality the debugger rests on depends on it. A transform that drops a span is a bug.
+- **GC precision info** — address spaces and which values are managed roots, so the statepoint rewrite downstream still sees precise roots.
+
+### Pass framework (Proposed)
+
+- **Two pass kinds:** *analyses* (produce side tables keyed by value/site identity, mutate nothing — e.g. the escape result, dominator tree, alias facts) and *transforms* (rewrite the IR, invalidating analyses). The M6 conservative EA already uses the side-table shape, so its precise replacement slots into the same consumer contract in codegen — the codegen half is **reused unchanged** (`memory-model.md` §6.1).
+- **A pass manager** with explicit analysis dependencies + invalidation. Small and hand-rolled first; no need to mirror LLVM's.
+- **Ordering (Proposed):** devirtualize → inline/specialize → (EA, BCE) on the now-concrete, inlined bodies. Devirt-before-inline matters: turning a `witness` call into a `direct` call is what makes it an inlining candidate, and inlining is what makes intra-procedural EA and BCE see across the old call boundary. Precise EA benefits most after inlining exposes local allocation lifetimes.
+
+### First tenants
+
+1. **Precise flow-sensitive escape analysis** (completes the escape-analysis direction, `memory-model.md` §6.1). Def-use + CFG let a pointer be followed across branches and through the now-explicit closure envs; lifts the conservative pass's "any call argument escapes" to an interprocedural summary after inlining. Replaces the EA front-end; the codegen consumer is unchanged. Also clears the M6 conservative pass's deferred tail (non-scalar closure captures, `any`-boxes, statically-bounded arrays) that the structured pass couldn't reach.
+2. **Devirtualization** of `witness`/`any` calls where the concrete conformer is known (a `some`/opaque underlying, a monomorphized instance, or a locally-constructed box). Rewrites `witness` → `direct`.
+3. **Bounds-check elimination** on `index` — redundant-with-dominating-check and provable-in-range-of-loop-bound cases.
+4. **Inlining + specialization** on top of monomorphization, driven by Nomu type/cost info.
+
+The IR is designed so all four compose (see ordering above), rather than as four independent bolt-ons.
+
+### Lowering out to LLVM (rebased `lowering.swift`)
+
+The SSAIR→LLVM step is today's `lowering.swift` with its **input rebased** from the structured tree to SSAIR — the GC-ABI emission (address spaces, the `__nomu_gc_alloc`/`__nomu_write_barrier`/`__nomu_poll` hooks, object/witness/any-box layout, the `gc "statepoint-example"` attribute, calls) is preserved in one place, and the traversal changes from tree-walk to CFG-walk. The rebase also *simplifies* it: control-flow flattening moves into the lowering-in step (SSAIR already has explicit blocks + terminators), and alloca-per-scalar-local goes away (SSAIR values are direct), which removes the mem2reg-before-statepoint dependency for scalars — LLVM receives already-in-SSA values, so the statepoint rewrite sees SSA-valued GC pointers directly. The mapping is close to mechanical: blocks → LLVM basic blocks, SSA values → LLVM values, block args → LLVM φ, the `alloc`/`store`/barrier/dispatch ops → the existing emitted forms. Statepoint insertion stays **late** (post-opt, at the LLVM level, §2). GC precision preservation through the tier's transforms is a stated invariant with a test obligation (`m7-spec.md` §7.0.5).
+
+### Build phases
+
+The ordered build plan is `m7-spec.md`: **7.1** modularization (split the frontend monolith into per-stage modules + split `lowering.swift`, so SSAIR + passes land granular), **7.2** SSAIR + inert lowering (differential-tested behaviorally identical to the pre-M7 compiler before any pass runs, then the old direct path is deleted), **7.3** pass manager + precise escape analysis (the largest single-pass impact), **7.4** devirtualization, **7.5** inlining/specialization + BCE. Each pass phase is independently microbenchmarkable and gated behind an A/B disable flag (the escape / inline-alloc precedent), so a regression is bisectable and the tier is switchable wholesale.
+
+### Open questions
+
+- **Inlining cost model** — what drives the heuristic (callee size, call-site hotness, specialization).
+- **Debug info through inlining** — inline-site DWARF records, or defer.
+- **Interprocedural EA summary depth** — how much survives without whole-program fixpoint; monomorphization's whole-program view may make a cheap summary enough.
+- **Artifact/dump format** and **alias/effect model** (§7.0.6 in the spec).
+- **Interprocedural EA summary** — how much survives without whole-program iteration to fixpoint; whether monomorphization's whole-program view makes a cheap summary enough.
+- **Artifact/dump format** for the tier and whether it reuses the NOIR dumper or needs its own.
+- **Alias/effect model** — how much aliasing precision the passes need before the cost outweighs the win.
+
+---
+
 ## 2. Backend strategy
 
 - **Prototype: emit C or bind a simple backend** — throwaway scaffolding to get native execution fast and validate the surface + type system + runtime integration without building production codegen. — **Decided (direction).**
@@ -40,7 +120,18 @@ The backend (LLVM) does not understand the language's semantics, so running thes
 - **Debug/dev builds: consider Cranelift** for fast compiles. — **Deferred** (past M9 — a later fast-compile play once LLVM iteration pain bites).
 - **MLIR** if heavy language-specific optimization is wanted. — **Not pursued for M9 (2026-07-31)**; plain LLVM. Reconsidered only if heavy custom optimization is later wanted.
 
-**M9 mechanism — Decided; M9 built (2026-08-03).** (M9 is done — 8.1–8.4 and the 8.5.2/8.5.3 perf items; its dedicated build-plan spec was retired once it shipped. The runtime GC-substrate carry-over lives in `m6-spec.md` §6.0.10.) Drive LLVM via its **C API** (`import LLVM_C`) from Swift (Decided 2026-08-01): importing LLVM's **C++** modules via Swift cxx-interop does not build (`Format.h` `operator<<` ambiguity under interop), whereas the C API builds/links/runs and covers IR + `TargetMachine` + `DIBuilder` + pass pipeline (incl. `rewrite-statepoints-for-gc`). Full C++ reach stays available through a **thin C++ shim** (ordinary C++, no interop) for rare C-API gaps (`DIBuilder` variant parts, custom passes). LLVM is brought in via the **`llvm/llvm-project` Bazel overlay** (`http_archive` at a pinned commit → `@llvm-project//llvm` `cc_library` targets), built from source and hermetic. `swift-llvm-bindings` evaluated and not used. (The earlier "hand-written C++ shim" is the fallback for gaps, not the primary path.) **GC roots via LLVM statepoints** (`addrspace(1)` + `statepoint-example` + RewriteStatepointsForGC → stack maps the MMTk binding reads as precise roots) — chosen as the *most performant* precise-root mechanism for a moving collector (return-address-keyed stack maps, as HotSpot/.NET; the shadow-stack alternative taxes every call and is rejected on performance). The mutator-performance levers are the **inlinable alloc/barrier/poll seams** — the alloc bump-pointer fast path, the write barrier (the dominant cost under LXR's RC), and the safepoint poll are emitted **inline** at the LLVM level, only slow paths as calls; statepoints inserted **late** so opts run first (the seams shipped inert in 8.4 — `m6-spec.md` §6.0.10). Lower the **structured typed IR straight to LLVM** (no bespoke MIR until escape analysis needs it, §1). Scope is **LLVM-only, minimal-correct** — no MLIR, no Cranelift, no incremental in M9.
+**M9 mechanism — Decided; M9 built (2026-08-03).** (M9 is done — 8.1–8.4 and the 8.5.2/8.5.3 perf items; its dedicated build-plan spec was retired once it shipped, as was the M6 GC spec — the GC-substrate facts M6 rests on are folded into the "GC backend substrate" note below.) Drive LLVM via its **C API** (`import LLVM_C`) from Swift (Decided 2026-08-01): importing LLVM's **C++** modules via Swift cxx-interop does not build (`Format.h` `operator<<` ambiguity under interop), whereas the C API builds/links/runs and covers IR + `TargetMachine` + `DIBuilder` + pass pipeline (incl. `rewrite-statepoints-for-gc`). Full C++ reach stays available through a **thin C++ shim** (ordinary C++, no interop) for rare C-API gaps (`DIBuilder` variant parts, custom passes). LLVM is brought in via the **`llvm/llvm-project` Bazel overlay** (`http_archive` at a pinned commit → `@llvm-project//llvm` `cc_library` targets), built from source and hermetic. `swift-llvm-bindings` evaluated and not used. (The earlier "hand-written C++ shim" is the fallback for gaps, not the primary path.) **GC roots via LLVM statepoints** (`addrspace(1)` + `statepoint-example` + RewriteStatepointsForGC → stack maps the MMTk binding reads as precise roots) — chosen as the *most performant* precise-root mechanism for a moving collector (return-address-keyed stack maps, as HotSpot/.NET; the shadow-stack alternative taxes every call and is rejected on performance). The mutator-performance levers are the **inlinable alloc/barrier/poll seams** — the alloc bump-pointer fast path, the write barrier (the dominant cost under LXR's RC), and the safepoint poll are emitted **inline** at the LLVM level, only slow paths as calls; statepoints inserted **late** so opts run first. Lower the **structured typed IR straight to LLVM** (no bespoke MIR until escape analysis needs it, §1). Scope is **LLVM-only, minimal-correct** — no MLIR, no Cranelift, no incremental in M9.
+
+**GC backend substrate (as built, M6 · 2026-08-12).** The facts the moving GC rests on, folded here when the M6 spec retired (the shipped compiler + runtime are the record):
+
+- **Three inline seams** (`internal alwaysinline`, `Lowering.swift`), shipped inert in M9 · 8.4 and filled by M6:
+  - `__nomu_gc_alloc(i64 size) -> ptr addrspace(1)` at every managed allocation — a statepoint (not `gc-leaf`); M6 filled the per-carrier bump-pointer TLAB fast path (load cursor/limit, bump, branch to `rt_alloc` slow path).
+  - `__nomu_write_barrier(obj, slot, val)` — `gc-leaf`, at every managed-reference field write; M6 filled the generational logging barrier (GEP the header from `obj`, test the logged bit, log on first mutation). The header and barrier are co-designed so the logged bit sits where an interior GEP from `obj` reaches it in one step.
+  - `__nomu_poll()` — `gc-leaf`, at the header of loops reaching no other safepoint; M6 filled the branch-on-flag form (`runtime.md` §6).
+- **`mem2reg`/`sroa` before the statepoint rewrite is a correctness prerequisite**, not just perf: the lowering puts every local in an `alloca`, and `RewriteStatepointsForGC` tracks only SSA-value GC pointers, so promotion must run first or almost no roots are found. Pipeline: `function(mem2reg,sroa),…,rewrite-statepoints-for-gc` (debug) / `default<O2>,rewrite-statepoints-for-gc` (release); the rewrite runs **last** either way. Every emitted function carries `gc "statepoint-example"`.
+- **`gc-leaf` classification** (callers skip the statepoint): leaf = `printf`, `rt_str_lit`, `rt_mutex_new/unlock`; non-leaf/statepoint = `rt_alloc`, `fiber_spawn`, `spawn_join`, `rt_sleep_ms`, `rt_read_line`, `rt_mutex_lock`, and (once `String` became a GC object) the allocating `rt_str_concat`.
+- **Stack-map parser + root walk** ship in `runtime.c`: `nomu_gc_stackmap_init` parses `__llvm_stackmaps` (v3) into a return-address → GC-slot index; `nomu_gc_walk_current` drives a libunwind cursor reporting each live root (SP-relative slots, callee-saved registers recovered per frame). Precise (excludes dead-on-stack objects). A parked fiber's saved `ucontext` is walked the same way (`runtime.md` §6).
+- **Object header** is a subdivided `i64` (mark/log bits + type-id; the vestigial `refcount` dropped). Class/actor objects are `{ header, fields… }`; the object model's size/scan tables are in `c-types.md`.
 
 LLVM is right eventually but is a big time sink that obscures the early questions, so the prototype gets native execution by a cheaper route first. The **GC integration (via MMTk)** is the real, new backend work:
 
@@ -121,7 +212,7 @@ Things to revisit when the C codegen is replaced by the LLVM backend (M9). The C
 ## 7. Open questions
 
 - **Runtime language + MMTk binding (M6).** — MMTk is Rust and exposes a C ABI; the irreducible Rust is a `VMBinding` binding crate, while callers can stay C. Open: keep the runtime (scheduler/allocator) in C with a thin Rust binding and codegen-inlined alloc fast path + barriers, vs. move the runtime to Rust for cleaner MMTk integration (rewrites the M4 scheduler). Codegen target stays C either way (emitting Rust rejected — `unsafe`-everywhere, throwaway before LLVM). Decided (2026-07-21) to **defer to M6** and proceed under two invariants (held through M5) so every M6 option stays open: (1) **single allocation seam** — every heap allocation goes through one codegen-controlled call (`rt_alloc` today), so the allocator can be swapped for MMTk's with a localized change; (2) **explicit, scannable object model** — the M5 object shapes (`any` boxes, witness tables, generic instances) carry a clear header and discoverable pointer layout, so a C or Rust binding (and later LLVM-emitted barriers/maps) can scan them precisely — no representation tricks that assume conservative-only scanning, and the `rt_alloc` header pointer-arithmetic hack (§6) is to be dropped with the M6 object-model work.
-- **GC precision vs. backend (M6 ↔ M9 coupling).** — **Resolved (2026-07-30): M9 (LLVM) precedes M6.** A moving collector (Immix) needs **precise stack maps**, which the C backend can't emit (§6). The C-path bridges — a **shadow stack** (portable, throwaway) or **conservative scanning** (pins, fights moving and muddies the footprint numbers under test) — were rejected because M6's purpose is to validate the *performance* thesis, which those degrade. So LLVM statepoints supply precise roots first, then the moving collector rests on them (`roadmap.md`, `m6-spec.md` 6.0.5). Parked fiber stacks are scanned precisely via per-fiber saved SP/PC + frame maps (`m6-spec.md` 6.2.2).
+- **GC precision vs. backend (M6 ↔ M9 coupling).** — **Resolved (2026-07-30): M9 (LLVM) precedes M6.** A moving collector (Immix) needs **precise stack maps**, which the C backend can't emit (§6). The C-path bridges — a **shadow stack** (portable, throwaway) or **conservative scanning** (pins, fights moving and muddies the footprint numbers under test) — were rejected because M6's purpose is to validate the *performance* thesis, which those degrade. So LLVM statepoints supply precise roots first, then the moving collector rests on them (`roadmap.md`; the GC backend substrate is in §2 above). Parked fiber stacks are scanned precisely via per-fiber saved SP/PC + frame maps (`runtime.md` §6).
 - ~~**MLIR vs. plain LLVM** for the release backend~~ — Resolved: plain LLVM, MLIR not pursued for M9 (§2).
 - **Cranelift** for fast debug builds — deferred past M9; when it earns its place (§2).
 - **Incremental compilation + cached monomorphizations** — the shape that keeps LLVM iteration bearable.
@@ -139,7 +230,8 @@ The M4.9 pipeline (parse → semantic pass → typed IR → passes → codegen) 
 - **Parallelism** — where phases, or per-decl/per-function work within a phase, can run concurrently.
 - **Incremental compilation** — recompute only what changed; ties to the query-based architecture (§3) and cached monomorphizations (§7).
 - **Per-phase debuggability** — inspect/dump each phase's output in isolation. `ASTDump` exists for the AST; M4.9 added a **typed-IR dump** (`--dump-typed-ast`); dumps for later phases remain to extend.
+- **Interface/implementation module split** (M7 §7.1, Decided 2026-08-16) — each IR is its own **interface module** (format: types + dump), separate from the **implementation modules** that produce/consume it (`support` | `ast`/`parse` | `noir`/`sema` | `midend` | `ssair`/`ssairbuild`/`ssairpasses` | `llvmgen`). The interface module is the structural home for the phase-output-format and format-stability items above, and the dependency-surface the query architecture (§3) memoizes against. Landing as the first M7 slice (`m7-spec.md` §7.1).
 
-Hooks already in place that keep the door open: the IR carries debug info/spans from the start (§1), `ASTDump` gives a dump pattern to extend, and §3 commits to the query/incremental direction. The hardening itself is deferred until the minimal pipeline works end to end. — **Deferred (noted 2026-07-21).**
+Hooks already in place that keep the door open: the IR carries debug info/spans from the start (§1), `ASTDump` gives a dump pattern to extend, and §3 commits to the query/incremental direction. The hardening itself is deferred until the minimal pipeline works end to end. — **Deferred (noted 2026-07-21); the module split lands in M7 §7.1.**
 
 **Architecture evaluation (2026-07-30).** Checked whether the code is quietly foreclosing the three committed capabilities (debug info §1/§4, fine-grained incremental §8, query server §3), under the rule that C-backend-only limits are throwaway and only frontend/IR/LLVM-path gaps count. Findings: **debug info** is safe (the span invariant is held; the missing `#line` is C-backend-only). **Fine-grained incremental** (intra-module, per-file — "20 files, edit 2, rebuild 2") and the **query server** are the *same* engine (memoized per-decl queries + fingerprint invalidation); its prerequisites (multi-file input, per-unit codegen, dependency/fingerprint layer) are unbuilt but not foreclosed, and the soundness property that makes it work — **modular checking** (bodies depend only on referenced signatures) — is held. The **one live blocker** is in the frontend, which survives to LLVM: the lexer/parser/typechecker **`exit(1)` on first error** with no recovery, contra the §3 server commitment. Actionable frontend backlog: `src/frontend/README.md`.

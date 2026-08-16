@@ -1,3 +1,6 @@
+import parse
+import ast
+import support
 // Frontend throughput benchmark.
 //
 // Generates a large synthetic Nomu program and times `Lexer.tokenize()` and `Parser.parse()`
@@ -9,7 +12,6 @@
 // `units` scales the program size (default 3000); `iters` is the timed-run count (default 7, best
 // reported to cut noise). A warm-up run precedes timing.
 
-import frontend
 
 // One unit exercises a representative token mix: a struct with fields, an enum with cases, and a
 // function with params, a loop, a branch, arithmetic, comparison, assignment, and a return.

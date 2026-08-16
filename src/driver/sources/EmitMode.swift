@@ -1,3 +1,6 @@
+import noir
+import ast
+import support
 // How far the compiler runs, and which intermediate artifacts it emits.
 //
 // Emit flags are **additive** — each requests an extra dump/report and never

@@ -3,7 +3,7 @@ load("@rules_swift//swift:swift.bzl", "swift_library")
 
 swift_library(
     name = "llvmswift",
-    srcs = ["LLVMBridge.swift", "Lowering.swift"],
+    srcs = glob(["*.swift"]),
     module_name = "LLVMBridge",
     # C++ mode required even for LLVM's C API: LLVM_C transitively pulls LLVM_Config, whose
     # Clang module `requires cplusplus`. The C headers don't hit the C++ template pitfalls
@@ -15,7 +15,11 @@ swift_library(
     ],
     visibility = ["//visibility:public"],  # the driver deps on this for the backend
     deps = [
-        "//src/frontend",  # 8.1.5: IRModule / the typed IR that IRToLLVM lowers
+        "//src/support",  # Span/Type/Diagnostic (interface leaf)
+        "//src/frontend/ast",  # BinOp (NOIR reuses the AST binary-op enum)
+        "//src/frontend/noir",  # NOIRModule / the typed IR that NOIRToLLVM lowers
+        "//src/midend",  # analyzeEscapes / EscapeResult (escape analysis side table)
+        "//src/frontend/sema",  # Builtins (the builtin-function table codegen shares)
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Analysis",  # LLVMVerifyModule
         # 8.1.4 object emission (llvm-c/TargetMachine.h): the TargetMachine C API lives in

@@ -24,7 +24,7 @@ The doc set follows this vocabulary (pass done 2026-07-16): **fiber** for the ru
 - **M:N stackful fibers** — many fibers multiplexed over few OS carrier threads; a fiber has a real stack and can suspend anywhere. — **Locked** (`concurrency.md` §1).
 - **Work-stealing** across carriers, with per-carrier run queues and a shared overflow queue (Go/Tokio shape). — **Leaning.**
 - **A parallelism knob** (`GOMAXPROCS`-equivalent) caps carrier count. — **Leaning.**
-- **Stack growth** — growable/segmented or copy-on-grow stacks so a fiber starts small. Strategy open. — **Open.**
+- **Stack growth** — growable **contiguous** stacks (copy-on-grow, Go's post-2014 model) so a fiber starts small and grows by copying to a larger buffer; segmented ("hot split") rejected. A copy relocates the stack, so every interior/frame-relative pointer and saved SP must be found and rewritten — this reuses the precise parked-fiber stack walk the moving GC already emits (statepoint stack maps + §6), extended from *scan* to *relocate*. Infrastructure is in place; **gated on the M8 dynamic spawn group** (`roadmap.md` M8) so the payoff (massive fan-out shrinking the fixed-128 KiB footprint) is measurable on that milestone's own concurrency benchmark the day it lands. — **Decided (contiguous copy-on-grow); scheduled at M8.**
 - **Task-locals** — per-task storage analogous to goroutine-locals / thread-locals. Shape open. — **Open.**
 
 The abstract suspension primitive these rest on — `park`/`unpark(t)`/`current` with permit semantics — is Locked and specified in `concurrency.md` §2; this doc does not restate it.
@@ -86,13 +86,21 @@ FFI (calling C, and C calling back) is **not planned near-term**, and beyond `li
 
 ## 6. GC integration touchpoints
 
-The scheduler and the collector are co-designed at a few seams (details in `compiler.md` §1–2, `memory-model.md` §3):
+The scheduler and the collector are co-designed at a few seams (object-model + backend detail in `compiler.md` §1–2, `memory-model.md` §3). Built as M6 (real GC via MMTk GenImmix); the decisions below are as-built.
 
-- **Safepoints & precise stack maps** — a moving collector (Immix/LXR) needs fibers to reach safepoints and needs to scan fiber stacks precisely.
-- **Write barriers** — inserted by codegen; the runtime honors them.
-- **Root scanning across fibers** — every parked fiber's stack is a root set; the runtime exposes them to the collector.
+- **Safepoints & precise stack maps** — a moving collector needs fibers to reach safepoints and their stacks scanned precisely. Roots come from LLVM statepoints (`compiler.md` §2), never conservative scanning.
+- **Write barriers** — inserted by codegen (the `__nomu_write_barrier` seam); the runtime honors them. GenImmix fills it as a generational logging barrier; LXR refills the same seam as the RC barrier.
+- **Root scanning across fibers** — every parked fiber's stack is a root set.
 
-These are gating runtime engineering, tracked with the backend work, not restated here.
+As-built decisions (all **Decided 2026-08-04**, built M6; the design forks and their rejected alternatives were retired with the M6 spec — this is the surviving record):
+
+- **Mutator granularity: per-carrier thread.** One MMTk `Mutator` (TLAB + allocators) per carrier, bound at carrier init; every allocation reads the *current* carrier's cursor/limit fresh. Bounds TLAB count to carrier count (~4–16) rather than one-per-fiber, protecting the ~1.1–1.3× footprint thesis. Codegen contract: the fast-path cursor/limit load is not hoisted or cached across a safepoint/suspend. *(Deferred locality optimization: pin a fiber to its carrier while it holds allocation state — revisit only on a measured allocate-then-traverse cost.)*
+- **Runtime/binding boundary: thin Rust binding, runtime stays C.** MMTk's `VMBinding` is the only Rust — a shim whose trait methods FFI back into the C runtime (root walk, object-model accessors, STW hooks). Keeps the built M4 scheduler and C stack-map walk untouched; blast radius is one crate. *(Escape hatch on a measured FFI cost: move only the GC-facing hot callbacks — `scan_object` reading static pointer maps, the libunwind root walk — into Rust; scheduler stays C.)*
+- **Safepoint poll form: branch-on-flag.** `__nomu_poll` (emitted only at the header of call-and-alloc-free loops) loads a per-carrier stop-requested flag, tests, branches past a slow-path call that parks. The slow-path call is a statepoint, so the poll frame is precisely scannable through the existing call-keyed walker. *(Deferred, profile-guided: protected-page faulting load, the JVM model — needs poll-PC stackmaps our call-keyed pipeline doesn't emit.)*
+- **Safepoint density: the placement is the invariant.** Safepoints sit at non-leaf call returns + call-and-alloc-free loop back-edges + the alloc slow path. Every loop iteration reaches one, so time-to-safepoint is bounded by one loop body. The real rule is a **pass-pipeline constraint: `-O` transforms must not delete the last safepoint from a loop or create an unbounded safepoint-free region.** Scheduler preemption is a separate signal mechanism (`loops.md`), so there is no fairness motive to go denser.
+- **Parked-fiber stack scanning: global live-fiber registry + present-as-parked syscalls.** Every suspension goes through `park()` (a non-leaf call → statepoint), so a parked fiber's top Nomu frame has a stackmap and its stack is walkable from the saved `ucontext` (build a `unw_context_t` from saved registers; libunwind unwinds out through the gc-leaf C frames). Fiber enumeration is an intrusive lock-guarded doubly-linked registry (O(1) insert/remove, off the hot path; STW iterates it) — one source of truth, chosen over gathering from wait-lists (a missed list = missed roots). A blocking-syscall fiber checkpoints its scannable context at the offload handoff and is marked parked-in-syscall; STW scans from that context and does not wait for the offload carrier (it holds no Nomu roots). Invariants: all suspension via `park()`; STW quiesces before iterating the registry; the saved `ucontext` captures the full callee-saved set (arm64 x19–x28). *(Deferred, profile-guided: alternative registry structures — sharded/lock-free/epoch — only on a measured win over the intrusive-DLL baseline.)*
+
+These were gating runtime engineering; the shipped runtime (`src/runtime/`, `src/gcbinding/`) is the implementation record.
 
 ---
 
@@ -174,7 +182,7 @@ Transitions:
 
 ### Deferred from M4
 
-- **Stack growth** — fixed 128KB stacks; growable/segmented stacks deferred.
+- **Stack growth** — fixed 128KB stacks; growable **contiguous** (copy-on-grow) stacks scheduled at M8 (see the §1 stack-growth item and `roadmap.md` M8).
 - **Parallelism knob** — carrier count hardcoded at 4; `GOMAXPROCS`-equivalent not yet wired.
 - **Work stealing** — M4.3c; single shared queue used instead.
 - **Blocking-syscall offload** — M4.6; `nanosleep` / file reads block the carrier.

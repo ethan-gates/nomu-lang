@@ -106,7 +106,7 @@ picked up.
 - **Generic hash map `HashTable<V>` / whole-aggregate element reads** `[language-feature · blocked]` —
   the hashmap is concrete `String → Int`; a generic value type, and reading a whole array element by
   value (`let e = a[i]` mixing values + refs), both recreate the category-3 FCA case. Blocked on the
-  **D6 spill** (`c-types.md` §3.4; `m6-spec.md`).
+  **D6 spill** (`c-types.md` §3.4).
 - **Identifier interning** `[perf · needs-grounding]` — intern identifiers to integer symbols at lex
   time; downstream Sema comparisons/maps become int-keyed. Touches Sema's string-keyed tables and
   interacts with macro **hygiene** (carry `(symbol, hygiene-ctx)`) and future parallel/incremental
@@ -129,7 +129,7 @@ picked up.
   `_tlv_get_addr` call, so the fast path is not fully call-free on Darwin. Cache the mutator where
   codegen can reach it without a tlv call (a fiber/carrier-pinned slot or a reserved register), removing
   the per-alloc tlv cost. Ground against a profile first — confirm the tlv read actually dominates the
-  alloc fast path before building. Ref: `m6-spec.md` §6.6.
+  alloc fast path before building. Ref: the inline alloc seam, `compiler.md` §2 (GC backend substrate).
 
 ---
 

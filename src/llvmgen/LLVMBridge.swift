@@ -1,3 +1,7 @@
+import midend
+import noir
+import ast
+import support
 // M8 — the LLVM backend seam. All LLVM C-API use stays inside this module, so the driver sees a
 // flat surface: a typed `NOIRModule` in, a native object out (`emitObject`), or nil/error. The
 // per-node lowering lives in `Lowering.swift` (`NOIRToLLVM`); this file drives target setup, the GC
@@ -5,7 +9,6 @@
 // emission via `llvm-c/TargetMachine.h`.
 import Foundation
 import LLVM_C
-import frontend
 
 /// Lower a whole typed IR module to a native object file for the host triple (the driver then links
 /// it with the runtime `.a`). Returns nil on success, else a `file:line:col`-prefixed error.
@@ -87,7 +90,7 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
 
     // 8.4.1 — GC substrate pass pipeline. `mem2reg`/`sroa` promote our alloca-per-local lowering
     // to SSA so `RewriteStatepointsForGC` can see the `addrspace(1)` roots (a correctness
-    // prerequisite, m6-spec.md §6.0.8), then the rewrite turns every non-`gc-leaf` call in a
+    // prerequisite, compiler.md §2 GC backend substrate), then the rewrite turns every non-`gc-leaf` call in a
     // `gc "statepoint-example"` function into a `gc.statepoint` with relocatable roots. Nothing
     // moves in 8.4, so the relocations are identity — behavior is unchanged. The full `-O`
     // pipeline lands in 8.5; this is the minimum ordering the rewrite needs.

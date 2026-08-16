@@ -1,0 +1,19 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# Implementation module: the semantic pass (name/type/member resolution) that turns the
+# AST into NOIR, plus the AST/NOIR checking passes (exhaustiveness, mutation, shareability,
+# extension merge) and builtins. Consumes `ast`, produces `noir`.
+swift_library(
+    name = "sema",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "sema",
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/noir"],
+    visibility = ["//visibility:public"],
+)
+
+# Frontend test suite — spans lexer/parser/sema/exhaustiveness/escape, so it deps every stage.
+swift_test(
+    name = "frontend_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir", "//src/midend", "//src/frontend/sema"],
+)

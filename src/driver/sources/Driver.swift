@@ -1,5 +1,10 @@
+import midend
+import parse
+import noir
+import ast
+import support
 import Foundation
-import frontend
+import sema
 import embedded
 import LLVMBridge
 

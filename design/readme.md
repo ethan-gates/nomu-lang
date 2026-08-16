@@ -19,9 +19,10 @@ Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease
 - [macros.md](macros.md) — typed hygienic AST macros; extension-only role.
 - [compiler.md](compiler.md) — compiler architecture, mid-level IR, backend strategy, tooling, debugger.
 - [builtin.md](builtin.md) — how-to: adding a C-backed builtin method / property / free function and wiring it through Sema, codegen, and the safepoint pass (no lexer/parser change).
-- **M9 (LLVM backend) — done (2026-08-03), spec retired.** 8.1–8.4 and the 8.5.2/8.5.3 perf items shipped; the implementation is the record. Design/rationale live in `compiler.md` (§2 backend); the GC-substrate carry-over for M6 is in `m6-spec.md` §6.0.10; forward-looking follow-ups are in `deferred.md` ("Post-M9 backlog"). 8.5.1/8.5.4 remain descoped perf.
-- [loops.md](loops.md) — **draft for review**: Nomu's iteration construct (`while`) — syntax, semantics, lowering. A prerequisite of 8.4 (the loop back-edge hosts the safepoint poll).
-- [m6-spec.md](m6-spec.md) — **working draft**: M6 implementation spec (build plan) for the real GC (MMTk) — binding, object model, precise roots, safepoints/barriers, moving GenImmix. Gated on M9 (LLVM); §6.0.10 records the delivered 8.4 substrate M6 builds on. Follows `lang-project/milestone-doc-guide.md`.
+- **M9 (LLVM backend) — done (2026-08-03), spec retired.** 8.1–8.4 and the 8.5.2/8.5.3 perf items shipped; the implementation is the record. Design/rationale live in `compiler.md` (§2 backend, incl. the GC backend substrate); forward-looking follow-ups are in `deferred.md` ("Post-M9 backlog"). 8.5.1/8.5.4 remain descoped perf.
+- **M6 (real GC via MMTk) — done (2026-08-13), spec retired.** The moving GenImmix collector, object model, precise roots/safepoints/barriers, async actor runtime, conservative escape analysis, inline allocation. The code is the record; durable design folded to `memory-model.md` §3 (object model), `runtime.md` §6 (safepoints, parked-fiber scan, mutator granularity), `compiler.md` §2 (GC backend substrate), `concurrency.md` §9 (actor runtime).
+- [loops.md](loops.md) — **draft for review**: Nomu's iteration construct (`while`) — syntax, semantics, lowering. The loop back-edge hosts the safepoint poll.
+- [m7-spec.md](m7-spec.md) — **working draft**: M7 implementation spec (build plan) for the optimizer tier — **SSAIR** (a lower CFG/SSA IR, separate from NOIR) + the pass framework + precise escape analysis, devirtualization, BCE, inlining. Design/why in `compiler.md` §1a. Follows `lang-project/milestone-doc-guide.md`.
 - [roadmap.md](roadmap.md) — milestones (provisional, post-pivot).
 - [deferred.md](deferred.md) — TODO backlog: feature work intentionally postponed, each with its un-park trigger.
 

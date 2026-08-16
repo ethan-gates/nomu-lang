@@ -1,0 +1,11 @@
+load("@rules_swift//swift:swift.bzl", "swift_library")
+
+# Implementation module: the NOIR→NOIR mid-level passes (monomorphization) and the
+# conservative escape analysis. Runs after Sema, before codegen; consumes/produces `noir`.
+swift_library(
+    name = "midend",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "midend",
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/noir"],
+    visibility = ["//visibility:public"],
+)

@@ -15,7 +15,7 @@ NOMUC=$ROOT/bazel-bin/src/nomu-cli/nomuc
 BIN=$ROOT/build/examples/gc_gen
 # A modest fixed heap: the fixture allocates ~6 MB of Boxes over its two churn loops, so a 2 MB heap
 # forces several real nursery GCs (promotion + the barriered store + relocation) — comfortably above
-# MMTk's viable-heap floor (sub-megabyte heaps livelock in page accounting; see m6-spec.md 6.3).
+# MMTk's viable-heap floor (sub-megabyte heaps livelock in page accounting; see memory-model.md §3).
 HEAP=${NOMU_GC_HEAP:-2000000}
 
 "$NOMUC" "$ROOT/examples/gc_gen.nomu" >/dev/null || { echo "FAIL: compile"; exit 1; }

@@ -1,0 +1,11 @@
+load("@rules_swift//swift:swift.bzl", "swift_library")
+
+# Implementation module: the lexer and parser. Consumes `support` (Span, DiagnosticSink)
+# and produces `ast` (Token, AST) — depends on the formats, not on downstream stages.
+swift_library(
+    name = "parse",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "parse",
+    deps = ["//src/support", "//src/frontend/ast"],
+    visibility = ["//visibility:public"],
+)

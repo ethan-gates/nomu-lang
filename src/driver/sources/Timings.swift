@@ -1,3 +1,6 @@
+import noir
+import ast
+import support
 import Foundation
 
 // Per-stage compiler timing. Every invocation records how long each pipeline stage takes and prints

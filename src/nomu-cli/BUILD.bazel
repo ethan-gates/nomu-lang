@@ -9,14 +9,14 @@ swift_binary(
         "-std=c++17",
     ],
     # M6 · 6.1.1 — embed the Rust GC archive into nomuc as a Mach-O section so nomuc stays a single
-    # atomic file; the driver extracts it (via //src/gcembed) to a cache file at link time. nomu_gc is
+    # atomic file; the driver extracts it (via //src/runtime/gcembed) to a cache file at link time. nomu_gc is
     # a dep only so `$(location)` can resolve the archive path for -sectcreate — nomuc references none
     # of its symbols, so nothing from it links into the compiler.
-    linkopts = ["-Wl,-sectcreate,__DATA,__nomu_gc,$(location //src/gcbinding:nomu_gc)"],
+    linkopts = ["-Wl,-sectcreate,__DATA,__nomu_gc,$(location //src/runtime/gcbinding:nomu_gc)"],
     deps = [
         "//src/driver",
-        "//src/gcbinding:nomu_gc",  # provides the embedded archive path (not linked for symbols)
-        "//src/gcembed",            # reads nomuc's embedded __nomu_gc section at link time
+        "//src/runtime/gcbinding:nomu_gc",  # provides the embedded archive path (not linked for symbols)
+        "//src/runtime/gcembed",            # reads nomuc's embedded __nomu_gc section at link time
     ],
     visibility = ["//visibility:public"]
 )

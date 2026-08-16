@@ -1,0 +1,12 @@
+load("@rules_swift//swift:swift.bzl", "swift_library")
+
+# Shared leaf module: source positions (Span/SourceMap/Pos), diagnostics
+# (Diagnostic/DiagnosticSink), and the semantic Type model. Depended on by every
+# pipeline stage; depends on nothing. Interface/impl module split — see
+# design/m7-spec.md §7.1 and compiler.md §8.
+swift_library(
+    name = "support",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "support",
+    visibility = ["//visibility:public"],
+)

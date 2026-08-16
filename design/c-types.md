@@ -12,10 +12,10 @@ literal, the `%` operator, and the `.double` / `.int` conversions are settled an
 pinned otherwise is the *layout and runtime contract*.
 
 **Siblings:** the value/reference split and GC category semantics live in `memory-model.md`; the moving
-collector and its object model live in `m6-spec.md` (the size/scan tables these types plug into are
-§6.2.4 + the Slice-4 array extension); the C runtime floor's origin is the M4.13 split
-(`compiler.md`). Codegen lives in `src/llvmgen/Lowering.swift`; the runtime in `src/runtime/`
-(`runtime.c`, `core.c`, `runtime.h`); the GC binding in `src/gcbinding/lib.rs`.
+collector's object model lives in `memory-model.md` §3 (address spaces, box shapes) and `compiler.md` §2
+(GC backend substrate); the size/scan tables these types plug into are described in §1 below. The C
+runtime floor's origin is the M4.13 split (`compiler.md`). Codegen lives in `src/llvmgen/Lowering.swift`;
+the runtime in `src/runtime/` (`runtime.c`, `core.c`, `runtime.h`); the GC binding in `src/gcbinding/lib.rs`.
 
 ---
 
@@ -30,8 +30,8 @@ zero-initialized memory:
   must not relocate (the String interim, §2).
 
 An object placed in the moving heap must be describable to the collector by its **header type-id** (low
-32 bits of the 8-byte object header). Codegen emits per-type-id side tables the binding reads
-(`m6-spec.md` §6.2.4): the managed-pointer map (`nomu_gc_typemap`), the fixed size
+32 bits of the 8-byte object header). Codegen emits per-type-id side tables the binding reads:
+the managed-pointer map (`nomu_gc_typemap`), the fixed size
 (`nomu_gc_typesize`), and — for variable-size objects — a kind + element stride (`nomu_gc_typekind` /
 `nomu_gc_typestride`, §3.2). A C-backed type is GC-correct exactly when its heap objects carry a
 stamped type-id whose tables describe their layout. — **Decided.**
@@ -52,8 +52,9 @@ A `String` value is `{ ptr data (addrspace 0), i64 len }` — two words, passed 
 **Deferred — the collectable form (Q6).** Making `String` a managed `{ header, len, bytes }` box was
 implemented and reverted: it turns every struct/enum with a String field into a category-3 value
 aggregate (values mixed with a GC pointer), which `RewriteStatepointsForGC` cannot relocate across a
-statepoint ("FCA unimplemented"). Full Q6 needs the **D6 category-3 spill seam** first
-(`m6-spec.md` §6.2.4 String decision). Until then, strings use the immortal interim above. The
+statepoint ("FCA unimplemented"). The collectable String form needs the **D6 category-3 spill seam**
+first (§3.4; the intended GC-object form is `memory-model.md` §3). Until then, strings use the immortal
+interim above. The
 variable-size buffer machinery arrays now have (§3) is the same shape a heap-boxed String buffer will
 reuse.
 
