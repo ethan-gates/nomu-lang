@@ -13,7 +13,7 @@ interface modules hold each IR's format, implementation modules hold the code;
 
 **midend/** — the mid-level tier (NOIR→NOIR and, from M7, the SSAIR optimizer tier)
 - **midend** — Monomorphize, EscapeAnalysis (NOIR→NOIR passes); the SSAIR modules
-  (`ssair`, `ssairbuild`, `ssairpasses`) land here in M7 §7.2
+  (`ssair`, `ssairgen`, `ssairpasses`) land here in M7 §7.2
 
 **Backend & driver**
 - **llvmgen** — NOIR → LLVM IR (C API) → native object; the GC pass pipeline

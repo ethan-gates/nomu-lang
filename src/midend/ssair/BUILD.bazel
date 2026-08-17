@@ -1,0 +1,21 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# SSAIR interface module: the low-level, control-flow-explicit, SSA optimizer IR (the format) plus
+# its dump. Producers (`ssairgen`) and consumers (`ssairpasses`, `llvmgen`) depend on this format,
+# not on each other — see design/m7-spec.md §7.1 (interface/impl split) and §7.2 (SSAIR).
+# Depends on `ast` for BinOp and `noir` for the witness-table metadata (interfaces/conformances/
+# composites) SSAIR carries through unchanged for the backend.
+swift_library(
+    name = "ssair",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "ssair",
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/noir"],
+    visibility = ["//visibility:public"],
+)
+
+# Unit tests for the SSAIR types + dump (a hand-built module → golden `dumpSSAIR` output).
+swift_test(
+    name = "ssair_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/noir", ":ssair"],
+)

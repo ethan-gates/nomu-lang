@@ -162,51 +162,20 @@ extension NOIRToLLVM {
         return buildCall(fn, ty, [a, c])
     }
 
-    func lowerStringLit(_ s: String) -> LLVMValueRef {
-        let data = LLVMBuildGlobalStringPtr(b, s, "str")!
-        let len = LLVMConstInt(i64, UInt64(s.utf8.count), 0)
-        let (fn, ty) = runtimeFn("rt_str_lit", ret: strTy, params: [i8ptr, i64], varArg: false)
-        return buildCall(fn, ty, [data, len])!
-    }
+    func lowerStringLit(_ s: String) -> LLVMValueRef { e.lowerStringLit(s) }
 
     // MARK: - Helpers
 
-    func structGEP(_ structTy: LLVMTypeRef, _ addr: LLVMValueRef, _ idx: Int) -> LLVMValueRef {
-        var idxs: [LLVMValueRef?] = [LLVMConstInt(i32, 0, 0), LLVMConstInt(i32, UInt64(idx), 0)]
-        return idxs.withUnsafeMutableBufferPointer {
-            LLVMBuildGEP2(b, structTy, addr, $0.baseAddress, 2, "fld")
-        }!
-    }
+    func structGEP(_ structTy: LLVMTypeRef, _ addr: LLVMValueRef, _ idx: Int) -> LLVMValueRef { e.structGEP(structTy, addr, idx) }
 
     // Thin wrappers over the LLVM C API that own the `[LLVMTypeRef?]` buffer dance the raw calls
     // require, so call sites read in terms of types/values, not pointers + counts.
-    func fnType(_ ret: LLVMTypeRef, _ params: [LLVMTypeRef], varArg: Bool = false) -> LLVMTypeRef {
-        var ps: [LLVMTypeRef?] = params
-        return ps.withUnsafeMutableBufferPointer {
-            LLVMFunctionType(ret, $0.baseAddress, UInt32(params.count), varArg ? 1 : 0)
-        }!
-    }
-
-    func structTy(_ elems: [LLVMTypeRef], packed: Bool = false) -> LLVMTypeRef {
-        var es: [LLVMTypeRef?] = elems
-        return es.withUnsafeMutableBufferPointer {
-            LLVMStructTypeInContext(ctx, $0.baseAddress, UInt32(elems.count), packed ? 1 : 0)
-        }!
-    }
-
-    func setStructBody(_ st: LLVMTypeRef, _ elems: [LLVMTypeRef], packed: Bool = false) {
-        var es: [LLVMTypeRef?] = elems
-        es.withUnsafeMutableBufferPointer {
-            LLVMStructSetBody(st, $0.baseAddress, UInt32(elems.count), packed ? 1 : 0)
-        }
-    }
-
-    func constStruct(_ ty: LLVMTypeRef, _ vals: [LLVMValueRef?]) -> LLVMValueRef {
-        var vs = vals
-        return vs.withUnsafeMutableBufferPointer {
-            LLVMConstNamedStruct(ty, $0.baseAddress, UInt32(vals.count))
-        }!
-    }
+    // These four LLVM builders + `fail`/`concreteUnderlying` moved to `LLVMGen` (shared by both
+    // egresses); forwarded below so the tree-walk here is unchanged. (m7-spec.md §7.2.3)
+    func fnType(_ ret: LLVMTypeRef, _ params: [LLVMTypeRef], varArg: Bool = false) -> LLVMTypeRef { e.fnType(ret, params, varArg: varArg) }
+    func structTy(_ elems: [LLVMTypeRef], packed: Bool = false) -> LLVMTypeRef { e.structTy(elems, packed: packed) }
+    func setStructBody(_ st: LLVMTypeRef, _ elems: [LLVMTypeRef], packed: Bool = false) { e.setStructBody(st, elems, packed: packed) }
+    func constStruct(_ ty: LLVMTypeRef, _ vals: [LLVMValueRef?]) -> LLVMValueRef { e.constStruct(ty, vals) }
 
     // The single seam through which every LLVM function is created. When `debug` is given it also
     // attaches a `DISubprogram` (recovered later via `LLVMGetSubprogram`), so 8.3's line-table/
@@ -216,60 +185,12 @@ extension NOIRToLLVM {
     // property thunks, closures, spawn routines) is `gc "statepoint-example"`: any of them can be a
     // frame at a safepoint, so the caller needs a stack map at each of its calls (compiler.md §2 GC backend substrate).
     // Runtime C declarations pass `gc: false` (`runtimeFn`) and stay plain.
+    // `emitFunction` (+ `gcLeafRuntimeFns`/`markGCLeaf`/`addAlwaysInline`/`withStubBody`) moved to
+    // LLVMGen (LLVMGenRuntime.swift); `emitFunction` forwarded for the tree-walk's declare sites.
     func emitFunction(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef],
-                              varArg: Bool = false, gc: Bool = true,
-                              debug: (name: String, line: Int)? = nil) -> (fn: LLVMValueRef, ty: LLVMTypeRef) {
-        let ty = fnType(ret, params, varArg: varArg)
-        let fn = LLVMAddFunction(mod, name, ty)!
-        if gc { LLVMSetGC(fn, "statepoint-example") }
-        if let debug = debug, let sp = makeSubprogram(debug.name, linkage: name, line: debug.line) {
-            LLVMSetSubprogram(fn, sp)
-        }
-        return (fn, ty)
+                      varArg: Bool = false, gc: Bool = true,
+                      debug: (name: String, line: Int)? = nil) -> (fn: LLVMValueRef, ty: LLVMTypeRef) {
+        e.emitFunction(name, ret: ret, params: params, varArg: varArg, gc: gc, debug: debug)
     }
-
-    // Runtime C functions that never allocate on the GC heap and never park the fiber, so a GC can
-    // never run across them. Marking their declarations `"gc-leaf-function"` tells the rewrite pass
-    // to leave their calls as plain calls instead of statepoints — no root spill/reload around them
-    // (compiler.md §2 GC backend substrate, perf lever). Conservative: when unsure, a call stays non-leaf, since
-    // mislabeling a GC-triggering call as leaf is the unsound direction. 6.1.4: `rt_str_concat`
-    // allocates (→ can trigger GC), so it is non-leaf (a statepoint recording the caller's roots);
-    // `rt_str_lit` still only wraps a static pointer (no alloc), so it stays leaf. `String` staying a
-    // runtime-owned value (buffer `addr0`) is why its value never becomes a GC root here — the full
-    // GC-object form (Q6) needs `String` heap-boxed (the FCA limit), deferred with 6.2.
-    static let gcLeafRuntimeFns: Set<String> = [
-        "printf", "rt_str_lit", "rt_mutex_new", "rt_mutex_unlock",
-        "rt_bounds_trap",   // aborts, never allocates — no statepoint needed
-        "memcpy",           // libc block copy — never allocates (array grow)
-        "memset",           // libc fill — zeroes the inline-allocated object; never allocates
-        "rt_gc_write_barrier",   // M6 · 6.3.1 — remembers the mutated object; never triggers GC
-    ]
-
-    func markGCLeaf(_ fn: LLVMValueRef) {
-        let name = "gc-leaf-function"
-        let attr = LLVMCreateStringAttribute(ctx, name, UInt32(name.utf8.count), "", 0)
-        LLVMAddAttributeAtIndex(fn, funcAttrIndex, attr)
-    }
-
-    var funcAttrIndex: LLVMAttributeIndex {
-        LLVMAttributeIndex(bitPattern: Int32(LLVMAttributeFunctionIndex))
-    }
-
-    func addAlwaysInline(_ fn: LLVMValueRef) {
-        let k = LLVMGetEnumAttributeKindForName("alwaysinline", "alwaysinline".utf8.count)
-        LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, k, 0))
-    }
-
-    // Build a stub seam's body without disturbing the caller's builder position / debug location
-    // (a seam stub carries no subprogram, so a foreign `!dbg` would trip the verifier).
-    func withStubBody(_ fn: LLVMValueRef, _ build: () -> Void) {
-        let savedBlock = LLVMGetInsertBlock(b)
-        let savedLoc = di != nil ? LLVMGetCurrentDebugLocation2(b) : nil
-        if di != nil { LLVMSetCurrentDebugLocation2(b, nil) }
-        LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, fn, "entry"))
-        build()
-        if let savedBlock = savedBlock { LLVMPositionBuilderAtEnd(b, savedBlock) }
-        if di != nil { LLVMSetCurrentDebugLocation2(b, savedLoc) }
-    }
-
+    func withStubBody(_ fn: LLVMValueRef, _ build: () -> Void) { e.withStubBody(fn, build) }
 }

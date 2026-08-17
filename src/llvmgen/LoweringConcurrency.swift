@@ -85,36 +85,18 @@ extension NOIRToLLVM {
     // buffer header is inert (small programs under Immix don't trigger a collection either).
 
     // One element's byte stride in the buffer — 8-aligned slots, matching the GC pointer-map layout.
-    func arrayElemStride(_ t: Type) -> Int { max(slotCount(t) * 8, 8) }
+    func arrayElemStride(_ t: Type) -> Int { e.arrayElemStride(t) }
 
-    // GEP a managed pointer by a byte offset (`i8`-typed indexing), yielding a p1 to that byte.
-    func gepByte(_ ptr: LLVMValueRef, _ off: LLVMValueRef) -> LLVMValueRef {
-        let i8 = LLVMInt8TypeInContext(ctx)
-        var idx: LLVMValueRef? = off
-        return withUnsafeMutablePointer(to: &idx) { LLVMBuildGEP2(b, i8, ptr, $0, 1, "aoff")! }
-    }
+    func gepByte(_ ptr: LLVMValueRef, _ off: LLVMValueRef) -> LLVMValueRef { e.gepByte(ptr, off) }   // → LLVMGen
 
     // The shared type-id for every Array handle — identical layout for all T (one managed field,
     // bufptr at byte 16), so it is a fixed-size object using the ordinary 6.1.3 map.
-    func arrayHandleTypeId() -> UInt64 {
-        if let id = arrayHandleMapId { return id }
-        let id = registerMap([16], sizeBytes: 24)
-        arrayHandleMapId = id
-        return id
-    }
+    func arrayHandleTypeId() -> UInt64 { e.arrayHandleTypeId() }
 
     // The array-buffer type-id for element type `elem` (M6 stdlib · Slice 4): a variable-size object
     // whose per-element managed-pointer offsets are `elem`'s own managed offsets, repeated `cap` times
     // by the collector. Registered once per element type.
-    func arrayBufTypeId(_ elem: Type) -> UInt64 {
-        let key = elem.description
-        if let id = arrayBufMapIds[key] { return id }
-        var elemOffsets: [Int32] = []
-        collectManagedOffsets(elem, baseSlot: 0, into: &elemOffsets)
-        let id = registerArrayMap(elemOffsets, stride: Int32(arrayElemStride(elem)))
-        arrayBufMapIds[key] = id
-        return id
-    }
+    func arrayBufTypeId(_ elem: Type) -> UInt64 { e.arrayBufTypeId(elem) }
 
     // [e0, e1, …] → allocate the handle + (for a non-empty literal) the buffer, stamp headers, store
     // each element. Returns the handle (the Array value, a managed pointer).

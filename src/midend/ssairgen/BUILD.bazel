@@ -1,0 +1,20 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# Implementation module: lowering-in, structured NOIR → SSAIR (direct SSA construction). Scaffolded
+# at 7.2.1, filled at 7.2.2 (m7-spec.md §7.2). Consumes `noir`, produces `ssair`.
+swift_library(
+    name = "ssairgen",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "ssairgen",
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/noir", "//src/midend/ssair"],
+    visibility = ["//visibility:public"],
+)
+
+# Block-sealing / SSA-construction tests: source → parse → Sema → NOIR → SSAIR → dump, asserting on
+# the CFG shape (nested loops, break/continue, a value live across a back-edge).
+swift_test(
+    name = "ssairgen_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir",
+            "//src/frontend/sema", "//src/midend/ssair", ":ssairgen"],
+)

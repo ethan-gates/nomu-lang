@@ -1,0 +1,12 @@
+load("@rules_swift//swift:swift.bzl", "swift_library")
+
+# Implementation module: the pass manager + the four M7 passes (precise escape analysis, devirt,
+# bounds-check elimination, inlining/specialization). Scaffolded at 7.2.1, filled from 7.3 on
+# (m7-spec.md §7.3–§7.5). Analyses/transforms over `ssair`.
+swift_library(
+    name = "ssairpasses",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "ssairpasses",
+    deps = ["//src/support", "//src/midend/ssair"],
+    visibility = ["//visibility:public"],
+)
