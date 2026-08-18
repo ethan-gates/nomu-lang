@@ -40,6 +40,22 @@ final class SSAIRToLLVM {
     var b: LLVMBuilderRef { e.b }
     var ctx: LLVMContextRef { e.ctx }
     func ty(_ t: Type, _ span: Span) -> LLVMTypeRef? { e.llvmType(t, span) }
+
+    // The LLVM storage type for a `stackAlloc` slot. For a value aggregate `llvmType` is already the
+    // storage (the struct/enum value); for a **stack-promoted** class/actor the slot must hold the
+    // object struct `{ header, fields… }`, not the `p1` `llvmType` gives a reference — the slot is an
+    // addrspace(0) pointer to that struct, and `fieldAddr` GEPs past the header like a heap object.
+    func storageType(_ t: Type, _ span: Span) -> LLVMTypeRef? {
+        if case .named(let n, let k) = t {
+            switch k {
+            case .class_: return e.classType(n)
+            case .actor_: return e.actorType(n)
+            default: break
+            }
+        }
+        return ty(t, span)
+    }
+
     var curFnName = ""
     // Every SSA value is defined before use (SSA dominance) and every def maps here, so a miss is an
     // egress bug, not user error — report it as a compile error (a null placeholder keeps lowering from
@@ -284,7 +300,7 @@ final class SSAIRToLLVM {
         case .alloc(let t):
             define(inst, lowerAlloc(t, span))
         case .stackAlloc(let t):
-            guard let lt = ty(t, span) else { return }
+            guard let lt = storageType(t, span) else { return }
             define(inst, e.entryAlloca(lt, "slot"))
         case .load(let addr):
             guard let rt = inst.result.flatMap({ ty($0.type, span) }) else { return }

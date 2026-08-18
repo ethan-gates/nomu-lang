@@ -21,6 +21,7 @@ swift_library(
         "//src/midend",  # analyzeEscapes / EscapeResult (escape analysis side table)
         "//src/midend/ssair",  # SSAModule / the SSAIR the SSAIRToLLVM egress lowers (7.2.3)
         "//src/midend/ssairgen",  # lowerToSSAIR — NOIR→SSAIR, driven when NOMU_EGRESS=ssair
+        "//src/midend/ssairpasses",  # the optimizer pipeline + GC-precision verifier (M7.3)
         "//src/frontend/sema",  # Builtins (the builtin-function table codegen shares)
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Analysis",  # LLVMVerifyModule

@@ -1,4 +1,4 @@
-load("@rules_swift//swift:swift.bzl", "swift_library")
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
 
 # Implementation module: the pass manager + the four M7 passes (precise escape analysis, devirt,
 # bounds-check elimination, inlining/specialization). Scaffolded at 7.2.1, filled from 7.3 on
@@ -9,4 +9,12 @@ swift_library(
     module_name = "ssairpasses",
     deps = ["//src/support", "//src/midend/ssair"],
     visibility = ["//visibility:public"],
+)
+
+# Verifier tests: each builds a module that breaks one GC-precision invariant (I1–I3) and asserts the
+# verifier reports it, plus a well-formed module that passes clean (§7.0.5 "no crash is not a pass").
+swift_test(
+    name = "ssairpasses_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = ["//src/support", "//src/frontend/ast", "//src/midend/ssair", ":ssairpasses"],
 )

@@ -254,7 +254,7 @@ public struct SSAEnumCase {
 // witness metadata carry through from NOIR unchanged (the witness structs are reused directly, since
 // they hold no executable bodies).
 public struct SSAModule {
-    public let functions: [SSAFunction]
+    public var functions: [SSAFunction]   // `var`: transform passes rewrite bodies in place (M7.3)
     public let aggregates: [SSAAggregate]           // struct / class / actor storage layout
     public let enums: [SSAEnum]                      // enum case layout
     public let interfaces: [NOIRInterface]           // drives witness-table type emission

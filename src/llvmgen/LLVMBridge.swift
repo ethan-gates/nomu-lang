@@ -1,6 +1,7 @@
 import midend
 import ssair
 import ssairgen
+import ssairpasses
 import noir
 import ast
 import support
@@ -49,8 +50,16 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
     if ProcessInfo.processInfo.environment["NOMU_EGRESS"] == "ssair" {
         let ssa = cgStage("noir→ssair") { lowerToSSAIR(module) }
         if ssa.diagnostics.hasErrors { return "SSAIR: " + ssa.diagnostics.render() }
+        // M7.3 — run the optimizer pipeline in place, verifying the GC-precision invariants (§7.0.5)
+        // after each pass. Stack promotion (escape analysis) is gated by `NOMU_NO_ESCAPE`, the same A/B
+        // switch the NOIR path uses, so the tier-off baseline stays available.
+        var ssaModule = ssa.module
+        let passes: [SSAPass] = ProcessInfo.processInfo.environment["NOMU_NO_ESCAPE"] == nil ? [StackPromotion()] : []
+        let pipeline = PassPipeline(passes)
+        let violations = cgStage("ssair passes") { pipeline.run(&ssaModule, stem: path) }
+        if let first = violations.first { return "SSAIR verify: \(first)" }
         let egress = SSAIRToLLVM(ctx: ctx, mod: mod)
-        cgStage("ssair→llvm") { egress.lower(ssa.module, from: module) }
+        cgStage("ssair→llvm") { egress.lower(ssaModule, from: module) }
         if let err = egress.error { return err }
         guard egress.loweredMain else { return "LLVM: no `main` function to lower" }
     } else {
