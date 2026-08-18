@@ -1,3 +1,6 @@
+// This file is named .nomu.txt because claude can't remember to not run it
+// during validation tests.  Then tests hang forever because it's waiting for
+// input.  This code is valid and runs.
 fun ticker() -> Int {
     sleep(1)
     print("tick")

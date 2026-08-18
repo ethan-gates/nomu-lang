@@ -5,6 +5,8 @@ import ast
 import support
 import Foundation
 import sema
+import ssair
+import ssairgen
 import embedded
 import LLVMBridge
 
@@ -128,6 +130,19 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
         fputs(monoDiags.render() + "\n", stderr)
         timings.report()
         exit(1)
+    }
+
+    // SSAIR stage (M7 · 7.2.4). --emit-ssair writes the optimizer IR (post-mono NOIR → SSAIR) to
+    // build/; --stop=ssair writes it and halts. A debug view, so ssairgen diagnostics report without
+    // failing. The egress lowers SSAIR itself when NOMU_EGRESS=ssair; this is the inspectable dump.
+    if options.ssair || options.stopAt == .ssair {
+        let ssa = timings.measure("ssairgen") { lowerToSSAIR(monoModule) }
+        writeArtifact(dumpSSAIR(ssa.module), toFile: stem + ".ssair")
+        if options.stopAt == .ssair {
+            if !ssa.diagnostics.isEmpty { fputs(ssa.diagnostics.render() + "\n", stderr) }
+            timings.report()
+            return
+        }
     }
 
     // Backend (M8): lower the typed IR via LLVM's C API → object → link with the runtime .a.

@@ -19,6 +19,8 @@ swift_library(
         "//src/frontend/ast",  # BinOp (NOIR reuses the AST binary-op enum)
         "//src/frontend/noir",  # NOIRModule / the typed IR that NOIRToLLVM lowers
         "//src/midend",  # analyzeEscapes / EscapeResult (escape analysis side table)
+        "//src/midend/ssair",  # SSAModule / the SSAIR the SSAIRToLLVM egress lowers (7.2.3)
+        "//src/midend/ssairgen",  # lowerToSSAIR — NOIR→SSAIR, driven when NOMU_EGRESS=ssair
         "//src/frontend/sema",  # Builtins (the builtin-function table codegen shares)
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Analysis",  # LLVMVerifyModule

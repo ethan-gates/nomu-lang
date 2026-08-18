@@ -88,6 +88,9 @@ extension LLVMGen {
 
     // The C-ABI boundary cast (D1): a managed reference handed to a C `void*` is cast (1 → 0).
     func toUnmanaged(_ v: LLVMValueRef) -> LLVMValueRef { LLVMBuildAddrSpaceCast(b, v, i8ptr, "to0")! }
+    // The reverse boundary cast: a runtime-held `void*` (addrspace 0) back to a managed `p1` — used
+    // where a fiber's `env` re-enters managed code (the SSAIR spawn thunk, D1/D4).
+    func toManaged(_ v: LLVMValueRef) -> LLVMValueRef { LLVMBuildAddrSpaceCast(b, v, p1, "to1")! }
 
     func rtAlloc() -> LLVMValueRef { runtimeFn("rt_alloc", ret: p1, params: [i64], varArg: false).0 }
     func rtAllocTy() -> LLVMTypeRef { runtimeFn("rt_alloc", ret: p1, params: [i64], varArg: false).1 }
@@ -96,6 +99,24 @@ extension LLVMGen {
     func rtAllocManaged(_ bytes: LLVMValueRef) -> LLVMValueRef {
         let g = nomuGcAlloc()
         return buildCall(g.0, g.1, [bytes])!
+    }
+
+    // A stack slot placed in `currentFn`'s **entry block** (never the current insertion point): LLVM
+    // only treats entry-block allocas as fixed frame slots, so an alloca in a loop body would grow the
+    // stack every iteration. A scratch builder keeps the main builder's position untouched. Shared by
+    // both egresses (the NOIR walker keeps its own copy while it lives).
+    func entryAlloca(_ ty: LLVMTypeRef, _ name: String) -> LLVMValueRef {
+        guard let fn = currentFn, let entry = LLVMGetEntryBasicBlock(fn) else {
+            return LLVMBuildAlloca(b, ty, name)!
+        }
+        let tmp = LLVMCreateBuilderInContext(ctx)!
+        defer { LLVMDisposeBuilder(tmp) }
+        if let first = LLVMGetFirstInstruction(entry) {
+            LLVMPositionBuilderBefore(tmp, first)
+        } else {
+            LLVMPositionBuilderAtEnd(tmp, entry)
+        }
+        return LLVMBuildAlloca(tmp, ty, name)!
     }
 
     func intFormat() -> LLVMValueRef {

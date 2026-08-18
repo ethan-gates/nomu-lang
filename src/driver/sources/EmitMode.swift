@@ -11,6 +11,7 @@ import support
 public enum Stage {
     case ast       // after parse
     case noir      // after the semantic pass (NOIR — the Nomu typed IR)
+    case ssair     // after NOIR→SSAIR lowering (the optimizer IR, post-mono)
     case binary    // full pipeline → native binary (default)
 }
 
@@ -21,6 +22,7 @@ public enum Stage {
 public struct EmitOptions {
     public var ast = false       // --emit-ast: emit the parsed AST (<name>.ast)
     public var noir = false      // --emit-noir: emit NOIR (<name>.noir)
+    public var ssair = false     // --emit-ssair: emit SSAIR, the optimizer IR (<name>.ssair)
     public var stopAt: Stage = .binary
     // 8.5.3 — LLVM optimization level. Default (debug) runs the minimal `mem2reg`/`sroa` the
     // statepoint rewrite needs and preserves Tier-0 debug info; `-O`/`--release` runs the full
