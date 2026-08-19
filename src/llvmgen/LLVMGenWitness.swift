@@ -228,11 +228,15 @@ extension LLVMGen {
     // calls is a single scalar GC reference the rewrite pass tracks, never a first-class aggregate
     // with a GC pointer nested inside (which the pass cannot relocate). The witness is a static
     // table (addrspace 0); the payload is the managed object / heap value-copy pointer (addrspace 1).
-    func makeAnyBox(_ witness: LLVMValueRef, _ payload: LLVMValueRef) -> LLVMValueRef {
-        let box = rtAllocManaged(LLVMConstInt(i64, 24, 0))   // header + witness + payload
+    // `onStack` (SSAIR EA, 7.3): a non-escaping box's witness struct is an entry alloca in place of the
+    // managed heap object (same `{header, witness, payload}` layout, so witness-dispatch GEPs are
+    // unchanged; the payload field stays `p1`, SROA scalar-replaces the slot so it becomes a tracked
+    // root). Default `false` — the NOIR oracle + covariant-Self thunk keep the heap box.
+    func makeAnyBox(_ witness: LLVMValueRef, _ payload: LLVMValueRef, onStack: Bool = false) -> LLVMValueRef {
+        let box: LLVMValueRef = onStack ? entryAlloca(anyBoxTy, "box") : rtAllocManaged(LLVMConstInt(i64, 24, 0))
         LLVMBuildStore(b, LLVMConstInt(i64, anyBoxTypeId(), 0), structGEP(anyBoxTy, box, 0)) // header
         storeField(box, structGEP(anyBoxTy, box, 1), witness)   // witness (addrspace 0) → plain store
-        storeField(box, structGEP(anyBoxTy, box, 2), payload)   // payload (managed) → write barrier
+        storeField(box, structGEP(anyBoxTy, box, 2), payload)   // payload (managed) → write barrier (heap box only)
         return box
     }
 

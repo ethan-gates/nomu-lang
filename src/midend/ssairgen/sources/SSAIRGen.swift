@@ -633,7 +633,7 @@ final class FunctionLowerer {
 
         case .box(let value, let interfaces):
             guard let v = lowerExpr(value) else { return nil }
-            return emit(.box(value: v, interfaces: interfaces), e.type, e.span)
+            return emit(.box(value: v, interfaces: interfaces, onStack: false), e.type, e.span)
 
         case .closure(let params, let body):
             return lowerClosure(params: params, body: body, type: e.type, span: e.span)
@@ -686,7 +686,7 @@ final class FunctionLowerer {
                                                params: params, body: body, ret: ret, span: span) {
             sink.lifted.append(lifted)
         }
-        return emit(.makeClosure(funcName: liftedName, env: env), type, span)
+        return emit(.makeClosure(funcName: liftedName, env: env, onStack: false), type, span)
     }
 
     // Lower a lifted closure body: env is parameter 0, captures are loaded from it into scope, then the

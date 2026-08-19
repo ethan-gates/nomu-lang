@@ -344,12 +344,12 @@ final class SSAIRToLLVM {
         case .extractPayload(let base, let caseIndex, let fieldIndex):
             define(inst, extractPayload(base, caseIndex, fieldIndex, inst.result!.type, span))
 
-        case .box(let value, let interfaces):
-            define(inst, lowerBox(value, interfaces, span))
+        case .box(let value, let interfaces, let onStack):
+            define(inst, lowerBox(value, interfaces, onStack, span))
         case .arrayLit(let elements, let elem):
             define(inst, lowerArrayLit(elements, elem, span))
-        case .makeClosure(let funcName, let env):
-            define(inst, makeClosure(funcName, env, span))
+        case .makeClosure(let funcName, let env, let onStack):
+            define(inst, makeClosure(funcName, env, onStack, span))
         }
     }
 
@@ -519,7 +519,7 @@ final class SSAIRToLLVM {
 
     // Wrap a conformer as `any I` / `any A & B`, or upcast `any B` → `any A` — the SSA `box` op's value
     // is already lowered, so this is `lowerBox` over an operand.
-    private func lowerBox(_ value: SSAValue, _ interfaces: [String], _ span: Span) -> LLVMValueRef? {
+    private func lowerBox(_ value: SSAValue, _ interfaces: [String], _ onStack: Bool, _ span: Span) -> LLVMValueRef? {
         if case .existential(let src) = value.type, interfaces.count == 1 {
             let box = val(value)
             let witnessPtr = e.anyBoxWitness(box)
@@ -527,12 +527,12 @@ final class SSAIRToLLVM {
             let idx = e.witnessSlotIndex(src, "base_\(interfaces[0])")
             guard idx >= 0 else { e.fail("7.2.3: '\(src)' has no base '\(interfaces[0])'", span); return nil }
             let base = LLVMBuildLoad2(b, e.i8ptr, e.structGEP(e.witnessType(src), witnessPtr, idx), "base")!
-            return e.makeAnyBox(base, payload)
+            return e.makeAnyBox(base, payload, onStack: onStack)
         }
         guard case .named(let t, _) = value.type else { e.fail("7.2.3: cannot box non-nominal value", span); return nil }
         let witness = interfaces.count == 1 ? e.witnessInstance(t, interfaces[0]) : e.compositeInstance(t, interfaces)
         guard let w = witness, let pl = e.boxPayload(val(value), value.type) else { return nil }
-        return e.makeAnyBox(w, pl)
+        return e.makeAnyBox(w, pl, onStack: onStack)
     }
 
     // MARK: - Calls
@@ -805,10 +805,15 @@ final class SSAIRToLLVM {
     // A closure value is a managed `{ i64 header, i8ptr fn, p1 env }` object (the env carries the
     // captures, built separately as a class object). Same shape as an `any` box (one managed field at
     // byte 16), so it reuses the any-box type-id for GC scanning.
-    private func makeClosure(_ funcName: String, _ env: SSAValue?, _ span: Span) -> LLVMValueRef? {
+    private func makeClosure(_ funcName: String, _ env: SSAValue?, _ onStack: Bool, _ span: Span) -> LLVMValueRef? {
         guard let c = e.callables["f:\(funcName)"] else { e.fail("7.2.3: unknown closure body '\(funcName)'", span); return nil }
         let cloTy = e.structTy([e.i64, e.i8ptr, e.p1])
-        let obj = e.rtAllocManaged(LLVMConstInt(e.i64, 24, 0))
+        // A non-escaping closure object lives on the stack (EA 7.3): an entry alloca in place of the
+        // managed heap object. Same `{header, fn, env}` layout, so the indirect-call GEPs are unchanged;
+        // the env field stays `p1` (the env object itself is still heap this slice). `storeField` sees
+        // an addrspace(0) base and emits a plain store (no barrier, I7); SROA then scalar-replaces the
+        // slot so its managed env field becomes a statepoint-tracked root (I5).
+        let obj: LLVMValueRef = onStack ? e.entryAlloca(cloTy, "clo") : e.rtAllocManaged(LLVMConstInt(e.i64, 24, 0))
         LLVMBuildStore(b, LLVMConstInt(e.i64, e.anyBoxTypeId(), 0), e.structGEP(cloTy, obj, 0))
         LLVMBuildStore(b, c.fn, e.structGEP(cloTy, obj, 1))
         let envVal = env != nil ? val(env!) : LLVMConstNull(e.p1)

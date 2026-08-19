@@ -50,11 +50,15 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
     if ProcessInfo.processInfo.environment["NOMU_EGRESS"] == "ssair" {
         let ssa = cgStage("noir→ssair") { lowerToSSAIR(module) }
         if ssa.diagnostics.hasErrors { return "SSAIR: " + ssa.diagnostics.render() }
-        // M7.3 — run the optimizer pipeline in place, verifying the GC-precision invariants (§7.0.5)
-        // after each pass. Stack promotion (escape analysis) is gated by `NOMU_NO_ESCAPE`, the same A/B
-        // switch the NOIR path uses, so the tier-off baseline stays available.
+        // M7.3/7.4 — run the optimizer pipeline in place, verifying the GC-precision invariants
+        // (§7.0.5) after each pass. Pipeline order is devirt → EA (§7.0.4): devirt un-uses a
+        // locally-dispatched box so stack promotion then falls out. Each pass has an A/B env gate
+        // (`NOMU_NO_DEVIRT`, `NOMU_NO_ESCAPE`) so a tier-off baseline stays available.
         var ssaModule = ssa.module
-        let passes: [SSAPass] = ProcessInfo.processInfo.environment["NOMU_NO_ESCAPE"] == nil ? [StackPromotion()] : []
+        let env = ProcessInfo.processInfo.environment
+        var passes: [SSAPass] = []
+        if env["NOMU_NO_DEVIRT"] == nil { passes.append(Devirtualize()) }
+        if env["NOMU_NO_ESCAPE"] == nil { passes.append(StackPromotion()) }
         let pipeline = PassPipeline(passes)
         let violations = cgStage("ssair passes") { pipeline.run(&ssaModule, stem: path) }
         if let first = violations.first { return "SSAIR verify: \(first)" }

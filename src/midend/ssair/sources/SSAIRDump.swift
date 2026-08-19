@@ -103,10 +103,11 @@ private func renderKind(_ kind: SSAInstKind) -> String {
     case .enumTag(let a):                       return "enumTag \(val(a))"
     case .extractPayload(let base, let ci, let fi): return "extractPayload \(val(base)), #\(ci).\(fi)"
 
-    case .box(let v, let ifaces):              return "box \(val(v)) as any \(ifaces.joined(separator: " & "))"
+    case .box(let v, let ifaces, let onStack): return "\(onStack ? "stackbox" : "box") \(val(v)) as any \(ifaces.joined(separator: " & "))"
     case .arrayLit(let elems, _):              return "arrayLit [\(list(elems))]"   // element type shows in the result type
-    case .makeClosure(let name, let env):
-        return env.map { "closure \(name) env \(val($0))" } ?? "closure \(name)"
+    case .makeClosure(let name, let env, let onStack):
+        let kw = onStack ? "stackclosure" : "closure"
+        return env.map { "\(kw) \(name) env \(val($0))" } ?? "\(kw) \(name)"
     }
 }
 

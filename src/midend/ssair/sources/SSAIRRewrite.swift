@@ -45,12 +45,12 @@ public func remapOperands(_ kind: SSAInstKind, _ f: (SSAValue) -> SSAValue) -> S
         return .enumTag(f(a))
     case .extractPayload(let base, let ci, let fi):
         return .extractPayload(base: f(base), caseIndex: ci, fieldIndex: fi)
-    case .box(let v, let ifaces):
-        return .box(value: f(v), interfaces: ifaces)
+    case .box(let v, let ifaces, let onStack):
+        return .box(value: f(v), interfaces: ifaces, onStack: onStack)
     case .arrayLit(let elems, let elem):
         return .arrayLit(elements: elems.map(f), elem: elem)
-    case .makeClosure(let name, let env):
-        return .makeClosure(funcName: name, env: env.map(f))
+    case .makeClosure(let name, let env, let onStack):
+        return .makeClosure(funcName: name, env: env.map(f), onStack: onStack)
     }
 }
 

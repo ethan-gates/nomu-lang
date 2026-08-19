@@ -106,12 +106,19 @@ public indirect enum SSAInstKind {
     // Existential boxing and array literals — runtime-coupled composites the egress lowers via the
     // existing witness / array-buffer helpers (`box` allocates a witness struct; `arrayLit`
     // allocates a buffer). Array-buffer escape is a 7.3 deferred-tail item.
-    case box(value: SSAValue, interfaces: [String])   // wrap a conformer as `any I` / `any A & B`
+    // `onStack` (7.3, EA output) stack-allocates a non-escaping box's witness struct; the payload
+    // object stays heap (a class payload / a value-type payload boxed by `boxPayload`), stored into the
+    // box's `p1` field either way — so no addrspace wall (unlike a closure env). Set only by
+    // `StackPromotion`; ssairgen always emits `false`.
+    case box(value: SSAValue, interfaces: [String], onStack: Bool)   // wrap a conformer as `any I` / `any A & B`
     case arrayLit(elements: [SSAValue], elem: Type)   // build an `Array<T>` from a literal
 
     // A closure value: a code pointer plus an explicit environment (closure conversion, 7.2.2, moves
-    // the capture set into `env`). `env` is nil for a bare function reference.
-    case makeClosure(funcName: String, env: SSAValue?)
+    // the capture set into `env`). `env` is nil for a bare function reference. `onStack` is an EA
+    // output (7.3): a non-escaping closure *object* is stack-allocated by the egress (the `env` object
+    // itself stays heap this slice — a stack-promoted env hits the `p1` env-param addrspace wall, a
+    // scoped follow-up like `spawn:N`). Set only by `StackPromotion`; ssairgen always emits `false`.
+    case makeClosure(funcName: String, env: SSAValue?, onStack: Bool)
 }
 
 // A call site. `typeArgs` is non-empty only for a residual generic call the mono pass left dynamic.

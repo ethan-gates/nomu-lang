@@ -79,13 +79,17 @@ private func verifyFunction(_ f: SSAFunction, _ errs: inout [String]) {
     for blk in f.blocks {
         for inst in blk.insts {
             guard let r = inst.result else { continue }
+            // A heap allocation defines a managed value; an `onStack` closure/box is instead a stack
+            // allocation (like a promoted `stackAlloc`), checked for non-escape in I4 below.
+            var onStack = false
             switch inst.kind {
-            case .alloc, .box, .arrayLit, .makeClosure:
-                if !isManaged(r.type) {
-                    errs.append("[\(f.name)] I2: %\(r.id) is a heap allocation of non-managed type \(r.type)")
-                }
-            default:
-                break
+            case .alloc, .arrayLit:                 break
+            case .makeClosure(_, _, let s):         onStack = s
+            case .box(_, _, let s):                 onStack = s
+            default:                                continue
+            }
+            if !onStack && !isManaged(r.type) {
+                errs.append("[\(f.name)] I2: %\(r.id) is a heap allocation of non-managed type \(r.type)")
             }
         }
     }
@@ -140,6 +144,14 @@ private func verifyFunction(_ f: SSAFunction, _ errs: inout [String]) {
         for inst in blk.insts {
             if case .stackAlloc(let t) = inst.kind, let r = inst.result, isManaged(t), escaping.contains(r.id) {
                 errs.append("[\(f.name)] I4: stack-promoted %\(r.id) of \(t) escapes its frame")
+            }
+            // A stack-promoted closure object (`makeClosure`) or box (`box`) with `onStack` must likewise
+            // be non-escaping — StackPromotion only sets the flag for a non-escaping result.
+            if case .makeClosure(_, _, true) = inst.kind, let r = inst.result, escaping.contains(r.id) {
+                errs.append("[\(f.name)] I4: stack-promoted closure %\(r.id) escapes its frame")
+            }
+            if case .box(_, _, true) = inst.kind, let r = inst.result, escaping.contains(r.id) {
+                errs.append("[\(f.name)] I4: stack-promoted box %\(r.id) escapes its frame")
             }
         }
     }

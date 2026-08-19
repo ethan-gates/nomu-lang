@@ -50,21 +50,24 @@ private func escapingUses(_ kind: SSAInstKind) -> [SSAValue] {
     switch kind {
     case .store(_, let value):            return [value]
     case .writeBarrier(_, let value):     return [value]
-    case .box(let v, _):                  return [v]
+    // The boxed value is published into the box (reachable through it); the payload object stays heap
+    // this slice, so keep it escaping. Only the box *object* is promoted (the `onStack` flag).
+    case .box(let v, _, _):               return [v]
     case .arrayLit(let elems, _):         return elems
-    case .makeClosure(_, let env):        return env.map { [$0] } ?? []
+    // The env is published into the closure object (the captures become reachable through it). The env
+    // *object* still escapes here — only the closure *object* is promoted this slice; a stack-promoted
+    // env hits the `p1` env-param addrspace wall (a scoped follow-up, like `spawn:N`).
+    case .makeClosure(_, let env, _):     return env.map { [$0] } ?? []
     case .makeStruct(_, let fields):      return fields
     case .makeEnum(_, _, let fields):     return fields
     case .actorSend(let recv, _, let args): return [recv] + args
     case .spawn(_, _, let env, _):        return env.map { [$0] } ?? []
     case .call(let c):
-        var xs = c.args
-        switch c.kind {
-        case .witness(let recv, _, _): xs.append(recv)
-        case .indirect(let callee):    xs.append(callee)
-        case .direct:                  break
-        }
-        return xs
+        // Only the call arguments escape. Calling *through* a value reads it — a witness receiver has
+        // its witness+payload extracted, a closure/fn value has its fn+env loaded — none of which
+        // publishes the value itself, so neither the witness receiver nor the indirect callee is an
+        // escaping use (that is what lets a locally-dispatched box / locally-called closure promote).
+        return c.args
     default:
         return []
     }
@@ -93,23 +96,31 @@ public struct StackPromotion: SSAPass {
     public func run(_ module: inout SSAModule) {
         for fi in module.functions.indices {
             let escaping = escapingValues(module.functions[fi])
-            var promoted = Set<Int>()
+            var promoted = Set<Int>()        // `alloc` sites → `stackAlloc`
+            var stackObjects = Set<Int>()    // `makeClosure`/`box` results → the object stack-allocated
             for blk in module.functions[fi].blocks {
                 for inst in blk.insts {
-                    if case .alloc(let t) = inst.kind, let r = inst.result,
-                       !escaping.contains(r.id), isPromotable(t) {
-                        promoted.insert(r.id)
+                    guard let r = inst.result, !escaping.contains(r.id) else { continue }
+                    switch inst.kind {
+                    case .alloc(let t) where isPromotable(t): promoted.insert(r.id)
+                    case .makeClosure, .box:                  stackObjects.insert(r.id)
+                    default:                                  break
                     }
                 }
             }
-            if promoted.isEmpty { continue }
+            if promoted.isEmpty && stackObjects.isEmpty { continue }
             for bi in module.functions[fi].blocks.indices {
                 var insts: [SSAInst] = []
                 insts.reserveCapacity(module.functions[fi].blocks[bi].insts.count)
                 for inst in module.functions[fi].blocks[bi].insts {
+                    let onStack = inst.result.map { stackObjects.contains($0.id) } ?? false
                     switch inst.kind {
                     case .alloc(let t) where inst.result.map({ promoted.contains($0.id) }) ?? false:
                         insts.append(SSAInst(result: inst.result, kind: .stackAlloc(t), span: inst.span))
+                    case .makeClosure(let fn, let env, _) where onStack:
+                        insts.append(SSAInst(result: inst.result, kind: .makeClosure(funcName: fn, env: env, onStack: true), span: inst.span))
+                    case .box(let v, let ifaces, _) where onStack:
+                        insts.append(SSAInst(result: inst.result, kind: .box(value: v, interfaces: ifaces, onStack: true), span: inst.span))
                     case .writeBarrier(let object, _) where promoted.contains(object.id):
                         continue   // barrier into a stack slot — drop (the following store remains)
                     default:
@@ -121,9 +132,11 @@ public struct StackPromotion: SSAPass {
         }
     }
 
-    // Only class instances promote. Actors keep their shared-heap semantics; struct/enum values are
-    // already `stackAlloc`; other `alloc` shapes (closure/spawn envs) escape via capture until the
-    // analysis tracks closure-object escape.
+    // Which `alloc` types promote to a `stackAlloc` slot. Only class instances. Actors keep their
+    // shared-heap semantics; struct/enum values are already `stackAlloc`. A non-escaping closure
+    // *object* promotes separately (the `makeClosure` `onStack` flag), but its `env` object still
+    // allocates here as a heap class — env stack-promotion is a scoped follow-up (the `p1` env-param
+    // addrspace wall); a spawn env is likewise never promoted (it crosses the fiber boundary).
     private func isPromotable(_ t: Type) -> Bool {
         if case .named(_, .class_) = t { return true }
         return false

@@ -2,6 +2,8 @@
 
 **Status:** working draft — **provisional**. Restaged 2026-07-16 after the concurrency model was designed; the order is a working plan, not fixed. Status tags: **Provisional**.
 
+**Planned rewrite (2026-08-18):** this roadmap is slated for a **full rewrite once M7 completes**. Its scope has shifted substantially and much of what it lists is already done (M4.x–M6, the M9 LLVM backend). The rewrite will restate the remaining milestones and fold in the roadmap-candidate items captured in `deferred.md` (the 2026-08-18 batch — modules, stdlib track, self-hosting, fiber-stack strategy, unsafe raw memory, CoW, deinit, pattern matching, tuples, and the one-liner pointers), including the five **► Decide-early** flags. Until then it stays as-is — execute against it, do not retrofit the backlog into it.
+
 ---
 
 ## MVP strategy

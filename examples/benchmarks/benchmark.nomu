@@ -1,0 +1,103 @@
+class Node {
+    var val: Int
+    var next: Option<Node>
+}
+
+fun testCompute(size: Int) {
+    // Manual 2D array initialization
+    var A: Array<Array<Double>> = []
+    var i = 0
+    while i < size {
+        var row = [Double]()
+        var j = 0
+        while j < size {
+            row.append(Double(i + j))
+            j += 1
+        }
+        A.append(row)
+        i += 1
+    }
+
+    var B = [[Double]]()
+    i = 0
+    while i < size {
+        var row = [Double]()
+        var j = 0
+        while j < size {
+            row.append(Double(i - j))
+            j += 1
+        }
+        B.append(row)
+        i += 1
+    }
+
+    var C = [[Double]]()
+    i = 0
+    while i < size {
+        var row = [Double]()
+        var j = 0
+        while j < size {
+            row.append(0.0)
+            j += 1
+        }
+        C.append(row)
+        i += 1
+    }
+
+    // Matrix Multiplication
+    i = 0
+    while i < size {
+        var j = 0
+        while j < size {
+            var s = 0.0
+            var k = 0
+            while k < size {
+                s += A[i][k] * B[k][j]
+                k += 1
+            }
+            C[i][j] = s
+            j += 1
+        }
+        i += 1
+    }
+}
+
+fun testAllocationsAndARC(count: Int) {
+    // Linear allocation churn
+    var i = 0
+    while i < count {
+        _ = Node(i)
+        i += 1
+    }
+
+    // Cyclic references
+    var cycles: Option<Array<Node>> = []
+    let limit = count / 10
+    i = 0
+    while i < limit {
+        let n1 = Node(i)
+        let n2 = Node(i)
+        n1.next = n2
+        n2.next = n1
+        cycles.append(n1)
+        i += 1
+    }
+
+    // Manual breaking of cycles to trigger immediate ARC release
+    if .some(elements) = cycles {
+        var index = 0
+        let elementCount = elements.count
+        while index < elementCount {
+            let node = elements[index]
+            node.next = nil
+            index += 1
+        }
+    }
+    cycles = nil
+}
+
+// Run workload
+fun main() {
+    testCompute(size: 150)
+    testAllocationsAndARC(count: 1000000)
+}
