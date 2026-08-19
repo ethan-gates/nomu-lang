@@ -219,11 +219,15 @@ Placement calls: **Token** → `ast` (extract from `Lexer.swift` if clean, else 
 
 ---
 
-## 7.5 · Inlining/specialization + bounds-check elimination ⬜
+## 7.5 · Inlining/specialization + bounds-check elimination ◐ (inlining single-block slice ✅ 2026-08-19)
 
 **Intent:** the throughput passes on the now-concrete, devirtualized, inlined bodies.
 
-- **Inlining + specialization** on top of monomorphization (M5), driven by Nomu type/cost info; inlining widens the reach of intra-procedural EA and BCE across the old call boundary.
+**Inlining as built (single-block slice)** — `ssairpasses/Inlining.swift`, the `Inline` pass (pipeline **devirt → inline → EA**, §7.0.4; A/B-gated by `NOMU_NO_INLINE`). A callee that is one block ending in `ret` and ≤ 12 insts splices its instructions straight into the caller: params → the call args, each callee result → a fresh caller value, the returned value substituted for the call result. No CFG surgery / no return φ (that is the multi-block follow-up), so the deferred **I9/I10** verifier work isn't needed yet (single-block inlining adds no blocks or loops; the egress still inserts loop-header polls on the final CFG). Non-recursive (skips a direct self-call), single-level per run. Compounds with 7.3/7.4: a devirtualized `m:T:m` body inlines, and the box it dispatched on goes dead → promoted/DCE'd — e.g. `let d: any Drawable = Circle(…); d.draw()` collapses end-to-end to `const "O"`. **Fires on 54 calls across 18/43 corpus programs.** Differential 43/43 + GC tools green; inline-off A/B byte-identical. Tests: `ssairpasses/tests/InliningTests.swift`. **Deferred:** multi-block callees (block splicing + return φ, then the I9/I10 checks), a fixpoint for deep chains, a real cost model + specialization, and dead-callee DCE.
+
+- **Inlining + specialization** on top of monomorphization (M5), driven by Nomu type/cost info; inlining widens the reach of intra-procedural EA, devirt, and BCE across the old call boundary.
 - **Bounds-check elimination** on `index`: redundant-with-a-dominating-check, and provable-in-range-of-a-loop-bound.
 
-**Exit:** microbenchmarks show the expected wins (inlined hot calls, eliminated redundant bounds checks); each behind an A/B flag so a regression is bisectable.
+**BCE scope decision (2026-08-19):** the **provable-in-range-of-a-loop-bound** case is **descoped**. It reasons about an implicit `while i < arr.count` guard, but the blessed path for check-free iteration is **`for … in` (+ ranges), bounds-check-free *by construction*** (safe-by-construction, Rust-iterator style) — so proving hand-written index loops safe is proving something idiomatic code won't write. The BCE residual — **dominating-redundant** (RMW / repeated same-`(array, index)` access) and **constant-fold** (`a[k]`, `k` and length both statically known, e.g. `a[0]` on a literal) — is minor and self-contained; **deferred** as a small later cleanup (a dominator tree + light value-numbering, no loop reasoning). The `for … in` bounds-check-free contract is recorded against the deferred `for-in`/iteration frontend item. So 7.5's active work is **inlining/specialization**.
+
+**Exit:** microbenchmarks show the inlining wins (inlined hot calls; widened EA/devirt/BCE reach), behind an A/B flag so a regression is bisectable.

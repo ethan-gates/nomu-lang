@@ -740,8 +740,11 @@ midend/backend changes. Each is still a real feature; the shared thread is limit
 - **`for … in` + iteration protocol + ranges** `[language-feature · needs-design]` — `for x in xs`,
   range syntax (`0..<n`), and the iterator / sequence interface they lower to. The **iteration
   protocol** is the one non-frontend piece (a stdlib interface + how iteration borrows/owns); the loop
-  lowering is frontend (to the existing `while`). **Roadmap: one-liner pointer** — core surface, and
-  the iterator interface is a small design contract.
+  lowering is frontend (to the existing `while`). **Perf contract (decided 2026-08-19):** `for … in`
+  is the **bounds-check-free-by-construction** iteration path (safe-by-construction, Rust-iterator
+  style) — so array iteration needs no bounds-check-elimination pass; the M7 BCE loop-bound case was
+  descoped in favor of this (`m7-spec.md` §7.5). **Roadmap: one-liner pointer** — core surface, the
+  iterator interface is a small design contract, and it carries this perf-envelope commitment.
 - **Associated types + where-clauses on generics** `[language-feature · needs-design]` — associated
   types on interfaces (`associatedtype`) and `where` clauses on generic bounds. The heaviest of this
   group. Relatively frontend/sema-focused (type-checking + witness layout), though associated types

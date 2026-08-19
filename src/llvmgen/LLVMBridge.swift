@@ -58,6 +58,7 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
         let env = ProcessInfo.processInfo.environment
         var passes: [SSAPass] = []
         if env["NOMU_NO_DEVIRT"] == nil { passes.append(Devirtualize()) }
+        if env["NOMU_NO_INLINE"] == nil { passes.append(Inline()) }
         if env["NOMU_NO_ESCAPE"] == nil { passes.append(StackPromotion()) }
         let pipeline = PassPipeline(passes)
         let violations = cgStage("ssair passes") { pipeline.run(&ssaModule, stem: path) }
