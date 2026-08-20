@@ -13,23 +13,27 @@ import support
 import Foundation
 import LLVM_C
 
-// Optional codegen sub-stage timing (the `codegen` bucket split the driver can't see behind this
-// bridge call). Enabled by `NOMU_TIME_CODEGEN`; prints ms per sub-stage to stderr.
+// Codegen sub-stage timing. When the driver passes a `StageSink` (`onStage`), each sub-stage reports
+// up into the phase-categorized `Timings` table (so the `ssair`/`llvm` phases break down rather than
+// showing one opaque `codegen` bucket). With no sink but `NOMU_TIME_CODEGEN` set, it prints to stderr
+// standalone; otherwise it is a plain call with no timing overhead.
 private let cgTimed = ProcessInfo.processInfo.environment["NOMU_TIME_CODEGEN"] != nil
 @discardableResult
-private func cgStage<T>(_ label: String, _ body: () -> T) -> T {
-    guard cgTimed else { return body() }
+private func cgStage<T>(_ phase: String, _ name: String, _ onStage: StageSink?, _ body: () -> T) -> T {
+    if onStage == nil && !cgTimed { return body() }
     let t0 = Date()
     let r = body()
-    let ms = Date().timeIntervalSince(t0) * 1000
-    FileHandle.standardError.write(Data("  [codegen] \(label): \(String(format: "%.2f", ms)) ms\n".utf8))
+    let secs = Date().timeIntervalSince(t0)
+    if let onStage { onStage(phase, name, secs) }
+    else { FileHandle.standardError.write(Data("  [codegen] \(phase):\(name): \(String(format: "%.2f", secs * 1000)) ms\n".utf8)) }
     return r
 }
 
 /// Lower a whole typed IR module to a native object file for the host triple (the driver then links
 /// it with the runtime `.a`). Returns nil on success, else a `file:line:col`-prefixed error.
 /// `optimize` selects the release (`default<O2>`) pipeline over the debug default (8.5.3).
-public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = false) -> String? {
+public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = false,
+                       onStage: StageSink? = nil) -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
@@ -48,7 +52,7 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
     // 7.2.3 — `NOMU_EGRESS=ssair` selects the SSAIR CFG-walk egress (NOIR→SSAIR→LLVM) over the default
     // NOIR tree-walk, for the corpus differential. Both share `LLVMGen`, so the GC ABI is identical.
     if ProcessInfo.processInfo.environment["NOMU_EGRESS"] == "ssair" {
-        let ssa = cgStage("noir→ssair") { lowerToSSAIR(module) }
+        let ssa = cgStage("ssair", "gen", onStage) { lowerToSSAIR(module) }
         if ssa.diagnostics.hasErrors { return "SSAIR: " + ssa.diagnostics.render() }
         // M7.3/7.4 — run the optimizer pipeline in place, verifying the GC-precision invariants
         // (§7.0.5) after each pass. Pipeline order is devirt → EA (§7.0.4): devirt un-uses a
@@ -61,34 +65,35 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
         if env["NOMU_NO_INLINE"] == nil { passes.append(Inline()) }
         if env["NOMU_NO_ESCAPE"] == nil { passes.append(StackPromotion()) }
         let pipeline = PassPipeline(passes)
-        let violations = cgStage("ssair passes") { pipeline.run(&ssaModule, stem: path) }
+        let violations = pipeline.run(&ssaModule, stem: path, onStage: onStage)
         if let first = violations.first { return "SSAIR verify: \(first)" }
         let egress = SSAIRToLLVM(ctx: ctx, mod: mod)
-        cgStage("ssair→llvm") { egress.lower(ssaModule, from: module) }
+        cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: module) }
         if let err = egress.error { return err }
         guard egress.loweredMain else { return "LLVM: no `main` function to lower" }
     } else {
         let escapes = ProcessInfo.processInfo.environment["NOMU_NO_ESCAPE"] == nil
             ? analyzeEscapes(module) : EscapeResult(nonEscaping: [])
         let lowerer = NOIRToLLVM(ctx: ctx, mod: mod, escapes: escapes)
-        lowerer.lower(module)
+        cgStage("llvm", "egress", onStage) { lowerer.lower(module) }
         if let err = lowerer.error { return err }
         guard lowerer.loweredMain else { return "LLVM: no `main` function to lower" }
     }
 
     var errorMessage: UnsafeMutablePointer<CChar>! = nil
-    let verifyRC = cgStage("verify") { LLVMVerifyModule(mod, LLVMReturnStatusAction, &errorMessage) }
+    let verifyRC = cgStage("llvm", "verify", onStage) { LLVMVerifyModule(mod, LLVMReturnStatusAction, &errorMessage) }
     if verifyRC != 0 {
         let message = String(cString: errorMessage)
         print("LLVM Module Verification Failed:\n\(message)")
         return "LLVM: module failed verification"
     }
-    return emitModuleObject(mod, to: path, optimize: optimize)
+    return emitModuleObject(mod, to: path, optimize: optimize, onStage: onStage)
 }
 
 /// Emit an already-built, verified module to a native object file for the host triple, via
 /// `llvm-c/TargetMachine.h`. Returns nil on success, else an error message.
-private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: Bool) -> String? {
+private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: Bool,
+                              onStage: StageSink? = nil) -> String? {
     let triple = LLVMGetDefaultTargetTriple()!
     defer { LLVMDisposeMessage(triple) }
     LLVMSetTarget(mod, triple)
@@ -151,7 +156,7 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     if ProcessInfo.processInfo.environment["NOMU_DUMP_LLVM"] != nil {
         (path + ".pre.ll").withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }
     }
-    let passErr = cgStage("llvm passes") { LLVMRunPasses(mod, pipeline, tm, opts) }
+    let passErr = cgStage("llvm", "opt", onStage) { LLVMRunPasses(mod, pipeline, tm, opts) }
     if let err = passErr {
         let m = LLVMGetErrorMessage(err).map { String(cString: $0) } ?? "unknown"
         LLVMConsumeError(err)
@@ -162,7 +167,7 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
         (path + ".post.ll").withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }
     }
     var emitErr: UnsafeMutablePointer<CChar>? = nil
-    let rc = cgStage("object emit") { path.withCString { cpath in
+    let rc = cgStage("llvm", "emit", onStage) { path.withCString { cpath in
         LLVMTargetMachineEmitToFile(tm, mod, cpath, LLVMObjectFile, &emitErr)
     } }
     if rc != 0 {

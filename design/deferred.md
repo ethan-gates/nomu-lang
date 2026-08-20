@@ -506,6 +506,22 @@ format + stage-boundary discipline before more IR node kinds and passes accrete.
 
 ---
 
+## Compiler self-profiling: phase-categorized timing ✅ (2026-08-20)
+
+`[observability]` — the `nomuc` timing table is now grouped by pipeline phase with per-phase
+subtotals + a per-stage breakdown: **parse** (lex, parse), **noir** (prelude, merge, typecheck, sema,
+mono), **ssair** (gen, per-pass devirtualization / inlining / stack-promotion, verify), **llvm**
+(egress, verify, opt, emit), **runtime**, **link**. The old opaque `codegen` bucket is gone. Stages
+timed deep in a module report up via a `StageSink` (`support/StageSink.swift`) so the lower modules
+(`llvmgen/LLVMBridge`, `ssairpasses/PassPipeline`) stay independent of the driver's `Timings`. The
+`ssair` phase appears only under `NOMU_EGRESS=ssair`; `NOMU_TIME_CODEGEN`'s standalone stderr print is
+superseded (kept as a no-sink fallback for direct `emitObject` callers).
+
+- **Deferred tail (minor):** per-pass *firing counts* alongside per-pass time (a pass reports how many
+  sites it rewrote), and gating the whole timing table behind a flag rather than always-on stderr.
+
+---
+
 ## Modules + multi-file / multi-module compilation
 
 **Type / Lifecycle:** `language-feature · needs-design` (language + compiler + driver + build system).

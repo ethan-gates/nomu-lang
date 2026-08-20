@@ -28,18 +28,34 @@ public struct PassPipeline {
     // and the returned list holds any violations (empty means clean). With `NOMU_DUMP_SSAIR_PASSES`
     // set and a `stem`, the IR entering each pass is written to `<stem>.<n>-before-<pass>.ssair` (and
     // the final IR to `<stem>.final.ssair`) for inspection.
+    // `onStage` (a `StageSink`) reports each pass's wall time under the `ssair` phase, plus the total
+    // post-pass verification time as one `ssair`/`verify` line — so a phase breakdown shows per-pass
+    // cost. Nil in tests / non-timed runs.
     @discardableResult
-    public func run(_ module: inout SSAModule, stem: String? = nil, verify: Bool = true) -> [String] {
+    public func run(_ module: inout SSAModule, stem: String? = nil, verify: Bool = true,
+                    onStage: StageSink? = nil) -> [String] {
         let dumpStem = ProcessInfo.processInfo.environment["NOMU_DUMP_SSAIR_PASSES"] != nil ? stem : nil
         var violations: [String] = []
+        var verifySecs = 0.0
         for (i, pass) in passes.enumerated() {
             if let stem = dumpStem { writeDump(module, "\(stem).\(i)-before-\(pass.name).ssair") }
+            let t0 = Date()
             pass.run(&module)
-            if verify { violations += verifySSAIR(module).map { "after \(pass.name): \($0)" } }
+            onStage?("ssair", pass.name, Date().timeIntervalSince(t0))
+            if verify {
+                let v0 = Date()
+                violations += verifySSAIR(module).map { "after \(pass.name): \($0)" }
+                verifySecs += Date().timeIntervalSince(v0)
+            }
         }
         // An empty pipeline still gets verified once — this validates the lowered module the egress
         // will consume (ssairgen's output), the useful check before any pass exists.
-        if verify && passes.isEmpty { violations += verifySSAIR(module) }
+        if verify && passes.isEmpty {
+            let v0 = Date()
+            violations += verifySSAIR(module)
+            verifySecs += Date().timeIntervalSince(v0)
+        }
+        if verify { onStage?("ssair", "verify", verifySecs) }
         if let stem = dumpStem { writeDump(module, "\(stem).final.ssair") }
         return violations
     }

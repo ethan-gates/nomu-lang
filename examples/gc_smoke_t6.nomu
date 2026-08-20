@@ -1,0 +1,43 @@
+// M7 · §7.0.5 T6 — safepoint coverage after a tier transform (invariant I9). Like the M6 STW smoke
+// (gc_smoke_stw.nomu), but the compute fiber's spin loop is produced by *inlining*: the bare loop
+// lives in a separate `loopSum` (a multi-block callee), which multi-block inlining (7.5) splices into
+// `spin`. The resulting loop has no call or allocation in its body, so its only safepoint is the
+// egress's loop-header poll. T6 proves that poll survives the inline transform — the STW handshake
+// still stops the carrier while it spins in the inlined loop. Run under NOMU_EGRESS=ssair (the tier).
+//
+// If inlining ever dropped the back-edge / loop-header poll, the carrier would never reach a
+// safepoint and the STW handshake would hang — so completion (exit 0) is the assertion.
+// Checked by tools/gc-t6-stw.sh.
+class Box {
+  var v: Int
+}
+
+// A bare compute loop, no calls or allocations inside — the field load `x.v` is not a safepoint.
+// Multi-block (entry / header / body / exit), so it inlines into `spin` via 7.5 phase B.
+fun loopSum(x: Box) -> Int {
+  var i = 0
+  var acc = 0
+  while i < 2000000000 {        // long loop → a back-edge poll each iteration; x live across it
+    acc = acc + x.v
+    i = i + 1
+  }
+  return acc
+}
+
+// The carrier body. After inlining, `spin`'s CFG *contains* loopSum's loop — an inlined loop whose
+// only safepoint is the loop-header poll.
+fun spin(x: Box) -> Int {
+  return loopSum(x)
+}
+
+fun parker() -> Int {
+  let p = Box(v: 888)
+  sleep(200)                    // park holding p live across the safepoint
+  return p.v
+}
+
+fun main() {
+  spawn let s = spin(Box(v: 777))   // a carrier runs the inlined compute loop
+  spawn let q = parker()            // another fiber parks holding a root
+  print(s + q)                      // joins both
+}

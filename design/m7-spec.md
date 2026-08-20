@@ -73,6 +73,8 @@ The tier preserves **GC precision info** (address spaces; which values are manag
 
 **GC-precision-survival invariants + test obligation.** EA (7.3) is the first transform to rewrite a managed allocation into a stack slot and to drop write barriers, so the tier's soundness under the moving collector rests on the invariants below. Bugs here are **silent** — relocation corruption, non-deterministic — so each invariant carries a forcing test with a ground-truth oracle: *running without a crash is not a pass.*
 
+The `In` and `Tn` labels are internal bookkeeping for this section, not phase numbers — **status is reported by phase (§7.x)**, with T/I mentioned only as color (e.g. "7.4 covers T4 + I6"). They are also two different mechanisms: the **`In` invariants** are enforced by `verifySSAIR` (I1–I7 today; the I9/I10 checks are the §7.6.2 addition) — a *compiler self-check* that runs during compilation to catch compiler bugs, distinct from user-code errors (which Sema catches earlier), and gated debug-on/release-off (§7.6.2). The **`Tn` obligations** are external behavioral test scripts (the `gc-*.sh` gates + the differentials) run in CI / on demand, never inside a user compile.
+
 *Master property (falsifiable).* For every program, with the tier ON the root set recovered at each safepoint and the set of executed write barriers is a **justified refinement** of the tier-OFF program — every removal is individually licensed by an invariant below (a stack-promoted object's slot; a barrier elided on a store into a root), and nothing otherwise-needed is dropped or added. T5 checks this at corpus scale; T4 checks it pointwise.
 
 *Address space / root identity.*
@@ -209,9 +211,9 @@ Placement calls: **Token** → `ast` (extract from `Lexer.swift` if clean, else 
   - **Interprocedural "any call argument escapes" lift** — the conservative rule; now *unlockable* since inlining (7.5) widens reach (a post-inline EA re-run), or via per-function escape summaries.
   - **Closure env promotion** — blocked on the `clo:N` addr0-param threading (the `p1` env-param addrspace wall; env is kept escaping for now so it stays heap).
   - **Spawn env promotion** — unsound as built (crosses the fiber boundary as a runtime-held root); needs the egress to copy env into fiber-owned storage.
-  - **T4 root-set introspection test ✅ (2026-08-19)** — `gc-smoke-tier.sh` asserts the exact tier-on root set under ssair+EA (the justified refinement of the EA-off set). T1–T5 now green; T6 gated on multi-block inlining, T7 is M12.
+  - **T4 root-set introspection test ✅ (2026-08-19)** — `gc-smoke-tier.sh` asserts the exact tier-on root set under ssair+EA (the justified refinement of the EA-off set). T1–T6 now green (T6 via `gc-t6-stw.sh` once multi-block inlining landed), T7 is M12.
 
-**Exit ✅ (GC-precision gate):** the deferred-tail shapes stack-allocate where non-escaping, and the GC-precision-survival gate (§7.0.5) holds — **T1–T5 green** (A/B × collector differential; forced evacuation of a promoted object's pointer; barrier obligations; exact tier-on root-set introspection; corpus matrix at scale). T6 gated on multi-block inlining (I9), T7 is M12. Gated by the escape A/B flag.
+**Exit ✅ (GC-precision gate):** the deferred-tail shapes stack-allocate where non-escaping, and the GC-precision-survival gate (§7.0.5) holds — **T1–T6 green** (A/B × collector differential; forced evacuation of a promoted object's pointer; barrier obligations; exact tier-on root-set introspection; corpus matrix at scale; safepoint coverage after multi-block inlining). T7 is M12. Gated by the escape A/B flag.
 
 ---
 
@@ -227,11 +229,15 @@ Placement calls: **Token** → `ast` (extract from `Lexer.swift` if clean, else 
 
 ---
 
-## 7.5 · Inlining/specialization + bounds-check elimination ◐ (inlining single-block slice ✅ 2026-08-19)
+## 7.5 · Inlining/specialization + bounds-check elimination ◐ (single-block ✅ 2026-08-19 · multi-block ✅ 2026-08-20)
 
 **Intent:** the throughput passes on the now-concrete, devirtualized, inlined bodies.
 
-**Inlining as built (single-block slice)** — `ssairpasses/Inlining.swift`, the `Inline` pass (pipeline **devirt → inline → EA**, §7.0.4; A/B-gated by `NOMU_NO_INLINE`). A callee that is one block ending in `ret` and ≤ 12 insts splices its instructions straight into the caller: params → the call args, each callee result → a fresh caller value, the returned value substituted for the call result. No CFG surgery / no return φ (that is the multi-block follow-up), so the deferred **I9/I10** verifier work isn't needed yet (single-block inlining adds no blocks or loops; the egress still inserts loop-header polls on the final CFG). Non-recursive (skips a direct self-call), single-level per run. Compounds with 7.3/7.4: a devirtualized `m:T:m` body inlines, and the box it dispatched on goes dead → promoted/DCE'd — e.g. `let d: any Drawable = Circle(…); d.draw()` collapses end-to-end to `const "O"`. **Fires on 54 calls across 18/43 corpus programs.** Differential 43/43 + GC tools green; inline-off A/B byte-identical. Tests: `ssairpasses/tests/InliningTests.swift`. **Deferred:** multi-block callees (block splicing + return φ, then the I9/I10 checks), a fixpoint for deep chains, a real cost model + specialization, and dead-callee DCE.
+**Inlining as built** — `ssairpasses/Inlining.swift`, the `Inline` pass (pipeline **devirt → inline → EA**, §7.0.4; A/B-gated by `NOMU_NO_INLINE`). Two phases, both skipping direct self-calls and inlining callee bodies snapshotted before any inlining:
+- **Phase A — single-block splice.** A callee that is one block ending in `ret` and ≤ 12 insts splices its instructions straight into the caller: params → the call args, each callee result → a fresh caller value, the returned value substituted for the call result. No CFG change.
+- **Phase B — multi-block CFG surgery (2026-08-20).** A callee with > 1 block (≤ 40 insts, entry block parameter-free, at least one `ret`) is inlined by splitting the caller block at the call, cloning the callee's blocks with fresh block + value ids, and rewriting each `ret v` into a branch into a fresh **continuation block whose single parameter is the return φ** (the join of every return value); the call result is replaced by that parameter, and the caller block branches into the callee's cloned entry. Runs to a fixpoint per caller under a 200-inst growth budget (so recursion/deep chains unroll only up to the budget). **I9/I10 hold by construction:** the transform clones blocks faithfully (every back-edge preserved, so loop headers — and the egress's unconditional loop-header poll — survive) and introduces no first-class aggregate; the post-pass verifier re-checks I1–I7 (edge arity I3 catches any φ-join error). Worked example: `classify(n){ if n<0 {return 0} return 1 }` called in a loop inlines to the caller's CFG with the two returns joining through a continuation-block parameter.
+
+Compounds with 7.3/7.4: a devirtualized `m:T:m` body inlines, and the box it dispatched on goes dead → promoted/DCE'd — e.g. `let d: any Drawable = Circle(…); d.draw()` collapses end-to-end to `const "O"`. Multi-block extends this to methods with control flow (the common real-code case). **Firing:** with inline on, method-call counts drop on 10+ corpus programs, several to zero (`computed` 6→0, `interfaces` 6→0). Egress differential 49/49 byte-identical (incl. benchmarks) + GC tools green; inline-off A/B byte-identical. Tests: `ssairpasses/tests/InliningTests.swift` (single-block splice, multi-block surgery, return-φ join, self-call skip). **Deferred:** a real cost model + value specialization, and dead-callee DCE. **T6 ✅** (safepoint coverage after inlining — `gc-t6-stw.sh`, see §7.0.5). The dedicated **I9/I10 verifier checks** remain *reachable* follow-on hardening (the transform is sound-by-construction as noted; T6 exercises I9 at runtime).
 
 - **Inlining + specialization** on top of monomorphization (M5), driven by Nomu type/cost info; inlining widens the reach of intra-procedural EA, devirt, and BCE across the old call boundary.
 - **Bounds-check elimination** on `index`: redundant-with-a-dominating-check, and provable-in-range-of-a-loop-bound.
@@ -239,9 +245,8 @@ Placement calls: **Token** → `ast` (extract from `Lexer.swift` if clean, else 
 **BCE scope decision (2026-08-19):** the **provable-in-range-of-a-loop-bound** case is **descoped**. It reasons about an implicit `while i < arr.count` guard, but the blessed path for check-free iteration is **`for … in` (+ ranges), bounds-check-free *by construction*** (safe-by-construction, Rust-iterator style) — so proving hand-written index loops safe is proving something idiomatic code won't write. The BCE residual — **dominating-redundant** (RMW / repeated same-`(array, index)` access) and **constant-fold** (`a[k]`, `k` and length both statically known, e.g. `a[0]` on a literal) — is minor and self-contained; **deferred** as a small later cleanup (a dominator tree + light value-numbering, no loop reasoning). The `for … in` bounds-check-free contract is recorded against the deferred `for-in`/iteration frontend item. So 7.5's active work is **inlining/specialization**.
 
 - **Remaining in 7.5:**
-  - **Multi-block callees** — block splicing + a return φ; **this is the trigger for the deferred I9/I10 verifier checks** (I9 safepoint coverage after block-merge/unroll; I10 no managed value sunk into an FCA across a safepoint).
-  - **Fixpoint for deep call chains** — the pass inlines single-level per run; iterate (bounded) for A→B→C.
-  - **Cost model + specialization** — a real inline heuristic (size/hotness) beyond "single block ≤ 12 insts"; specialization on Nomu type info atop mono.
+  - **Multi-block callees ✅ (2026-08-20)** — block splicing + return φ, run to a fixpoint per caller (bounded), so deep chains A→B→C also unroll. Sound-by-construction for I9/I10 (see above); T6 ✅ exercises I9 at runtime (`gc-t6-stw.sh`), the dedicated I9/I10 verifier checks are reachable follow-on hardening.
+  - **Cost model + specialization** — a real inline heuristic (size/hotness) beyond the fixed size caps; specialization on Nomu type info atop mono.
   - **Dead-callee DCE** — remove a function once all its calls inline (LLVM DCEs dead allocas today, but the SSAIR-level dead function lingers).
   - **BCE residual (descoped/minor)** — dominating-redundant + constant-fold only (loop-bound → `for … in`); a dominator tree + light value-numbering, no loop reasoning.
 
@@ -249,23 +254,42 @@ Placement calls: **Token** → `ast` (extract from `Lexer.swift` if clean, else 
 
 ---
 
-## M7 — remaining work (cross-phase / exit)
+## 7.6 · M7 exit — validation + residual hardening ◐
 
-Status of the numbered phases (2026-08-19): **7.1 ✅ · 7.2 ✅ · 7.3 🚧 · 7.4 ✅ · 7.5 ◐**. 7.5 is the last numbered phase — no 7.6+. The items below either finish an existing phase (listed under it above) or sit outside the 7.x numbering.
+The exit-validation phase: prove the tier and close the residual hardening, keeping the NOIR oracle around as the differential's reference. Retiring the oracle is its own terminal phase (7.7) so it stays last while 7.6 can still take on more hardening items.
 
-- **Per-phase tails** (detailed in-place above): 7.3 — φ-unification, interprocedural EA lift, closure-env / spawn-env promotion; 7.5 — multi-block inlining (+ I9/I10 verifier checks), fixpoint, cost model + specialization, dead-callee DCE, BCE residual; 7.4 — cross-function devirt (rides inlining).
+### 7.6.1 · Perf validation ✅ (2026-08-20)
 
-- **T-obligations (§7.0.5), unnumbered — the GC-precision survival gates:**
+Measured by `tools/perf-tier.py` — compiles each workload under six configs (`noir`, `off`, `esc`, `dev`, `di`, `all`; the SSAIR ones A/B-toggled by `NOMU_NO_*`), runs each best-of-N, and guards correctness (every tier config's stdout must match the NOIR baseline). Two tier microbenchmarks (`examples/benchmarks/micro_{dispatch,alloc}.nomu`) isolate the passes; the real GC workloads (`hashmap`, `gc_barrier`, `gc_footprint`, `binary-tree`) round it out.
+
+- **Results (best of 5, default -O0, ms).** `micro_dispatch` (per-iteration `any Shape` box + dispatch): off 243 → all 77, **3.16×**. `micro_alloc` (per-iteration non-escaping class): off 103 → all 11, **8.96×**. `gc_barrier` / `gc_footprint`: **~1.48×** each. `hashmap` / `binary-tree` are dominated by work the passes don't touch (≈1×).
+- **What the numbers say.** Escape analysis is the dominant lever — it carries `micro_alloc` outright and most of `micro_dispatch` (off 243 → esc 118). Devirt+inline pay off mainly *compounded* with EA: `di` alone barely moves `micro_dispatch` (243 → 214) because the box has to die for the dispatch-collapse to matter; the full pipeline (`all` 77) is where devirt→inline→dead-box-DCE lands. This matches the EA-first thesis (§7.0.2). The NOIR oracle already elides the `micro_alloc` allocation via its AST heuristic (noir 13 ≈ esc 12), so the tier reaches parity there by a sound analysis rather than a heuristic.
+
+### 7.6.2 · Verifier: I9/I10 checks + release gating ⬜
+
+Two related pieces on `verifySSAIR` (the compiler self-check that enforces the I-invariants — a guard against *compiler* bugs, distinct from the Tn test scripts; §7.0.5):
+- **Add the dedicated I9/I10 checks** (I9 safepoint coverage after block-merge/unroll; I10 no managed value sunk into an FCA across a safepoint). Sound-by-construction today — multi-block inlining (7.5) preserves every back-edge and creates no FCA — and **T6** (`gc-t6-stw.sh`, §7.0.5) exercises I9 at runtime; the static checks are belt-and-suspenders for future loop-structure transforms.
+- **Gate the verifier for release.** It runs on every SSAIR compile today (after each pass), a per-compile cost paid to catch compiler bugs. Gate it debug/assert-on, release-off (the LLVM `-verify` model) so `-O`/release compiles don't pay for it; keep it on for dev + the test gates. (Confirm the current gating when we touch code.)
+
+---
+
+## 7.7 · Retire the NOIR oracle ⬜ (terminal)
+
+The last M7 action, once every other tier item (7.3/7.4/7.5 tails, 7.6 hardening) is done and the differential is green. Delete `NOIRToLLVM` + its forwarders — kept as the differential oracle through the pass work, a net replacement — and retire the mid-level NOIR `EscapeAnalysis.swift` (the SSAIR pass replaces it). The SSAIR egress becomes the only path; `NOMU_EGRESS` and `tools/egress-diff.sh` retire with it (their job — proving parity — is then complete). Deleting the oracle removes the differential, so nothing that still wants differential coverage may be outstanding when this lands.
+
+---
+
+## M7 — status index
+
+Status of the numbered phases (updated 2026-08-20): **7.1 ✅ · 7.2 ✅ · 7.3 🚧 · 7.4 ✅ · 7.5 ◐ · 7.6 ◐ · 7.7 ⬜**. Every outstanding M7 item lives under a numbered phase — this section is the index into them, plus the T-obligation ledger.
+
+- **Per-phase tails** (detailed under each phase above): **7.3** — φ-unification, interprocedural EA lift, closure-env / spawn-env promotion; **7.5** — cost model + specialization, dead-callee DCE, BCE residual, the (now-reachable) I9/I10 verifier checks; **7.4** — cross-function devirt (now largely subsumed: an `any I` parameter's conformer becomes visible once the caller is inlined); **7.6** — verifier I9/I10 checks + release gating; **7.7** — retire the NOIR oracle (terminal).
+
+- **T-obligations — the GC-precision survival gates (defined in §7.0.5; their own T-numbering, not 7.x phases):**
   - **T1 ✅** A/B × collector differential (corpus 43/43 byte-identical, ssair vs NOIR oracle, each pass A/B-gated).
   - **T2 ✅** forced evacuation of a promoted object's interior pointer (`escape-nonleaf.sh`, I5).
   - **T3 ✅** barrier obligations (I7/I8) — `gc-gen.sh` runs with the tier **on** and proves a post-promotion cross-generation store's barrier fires (byte-identical to NoGC); the verifier's I7 guards that EA elides a barrier only into a stack slot. Both legs covered.
   - **T4 ✅ (2026-08-19)** root-set introspection — `gc-smoke-tier.sh`: under ssair+EA the walker recovers **exactly** `{111×2, env=444}`, the justified refinement of the EA-off 5-root set (222/333 promoted away; the closure root shifts to its heap env; dead 999 excluded). The strongest oracle — a dropped/spurious root is a failed assertion, not silent corruption.
   - **T5 ✅ (2026-08-19)** corpus root/barrier differential at scale — `gc-corpus-matrix.sh`: the corpus across {tier off, tier on} × {NoGC, GenImmix, GenImmix-stress}, every cell agreeing with the tier-off/NoGC baseline.
-  - **T6 ⬜ (gated)** safepoint coverage after transforms (I9) — needs a transform that removes safepoints (a call/alloc-free loop inlined/unrolled). Single-block inlining doesn't merge loops, so nothing exercises it yet; binds when **multi-block inlining/unrolling** lands. `gc-smoke-stw.sh` is the pattern.
+  - **T6 ✅ (2026-08-20)** safepoint coverage after transforms (I9) — `gc-t6-stw.sh` + `examples/gc_smoke_t6.nomu`: a bare compute loop in `loopSum` (multi-block) inlines into `spin`, giving an inlined loop with no interior call/alloc — its only safepoint is the egress's loop-header poll. Under the tier (`NOMU_EGRESS=ssair`) the script first asserts the loop is genuinely inlined (no residual call, a `condBr` loop in `spin`), then runs the STW smoke: the handshake stops the carrier spinning in the inlined loop, recovers the running root 777 (carrier context) + parked root 888 (registry), and resumes to completion — watchdogged, so a dropped poll would hang → timeout → fail. Proves the loop-header poll survives multi-block inlining.
   - **T7 ⬜ (M12)** randomized differential — a generated-program fuzzer, tier-on vs off under forced GC. Explicitly a lightweight seed now, full harness with M12 concurrency hardening.
-
-- **M7 exit cleanup (decided, unnumbered):** delete `NOIRToLLVM` + its forwarders (kept as the differential oracle through the pass work — deleted at M7 exit, netting a replacement), and retire the mid-level NOIR `EscapeAnalysis.swift` (the SSAIR pass replaces it).
-
-- **Perf validation (exit criterion ✅ 2026-08-20):** measured by `tools/perf-tier.py` — compiles each workload under six configs (`noir`, `off`, `esc`, `dev`, `di`, `all`; the SSAIR ones A/B-toggled by `NOMU_NO_*`), runs each best-of-N, and guards correctness (every tier config's stdout must match the NOIR baseline). Two tier microbenchmarks (`examples/benchmarks/micro_{dispatch,alloc}.nomu`) isolate the passes; the real GC workloads (`hashmap`, `gc_barrier`, `gc_footprint`) round it out.
-  - **Results (best of 5, default -O0, ms).** `micro_dispatch` (per-iteration `any Shape` box + dispatch): off 243 → all 77, **3.16×**. `micro_alloc` (per-iteration non-escaping class): off 103 → all 11, **8.96×**. `gc_barrier` / `gc_footprint`: **~1.48×** each. `hashmap` at ~10 ms is too short to read (noise).
-  - **What the numbers say.** Escape analysis is the dominant lever — it carries `micro_alloc` outright and most of `micro_dispatch` (off 243 → esc 118). Devirt+inline pay off mainly *compounded* with EA: `di` alone barely moves `micro_dispatch` (243 → 214) because the box has to die for the dispatch-collapse to matter; the full pipeline (`all` 77) is where devirt→inline→dead-box-DCE lands. This matches the EA-first thesis (§7.0.2). The NOIR oracle already elides the `micro_alloc` allocation via its AST heuristic (noir 13 ≈ esc 12), so the tier reaches parity there by a sound analysis rather than a heuristic.

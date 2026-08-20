@@ -21,17 +21,20 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     timings.file = path
     timings.optimize = options.optimize
     timings.bytes = source.utf8.count
+    // Which backend egress ran — the `ssair` phase appears only for the SSAIR tier, so name the
+    // egress in the header (mirrors LLVMBridge's `NOMU_EGRESS` check) to explain its presence/absence.
+    timings.egress = ProcessInfo.processInfo.environment["NOMU_EGRESS"] == "ssair" ? "ssair" : "noir"
 
     // Lexer and parser share one sink and collect errors rather than exiting on the first
     // (the no-crash contract — frontend/README.md P0); the driver is the exit boundary.
     let parseDiags = DiagnosticSink()
-    let tokens = timings.measure("lex") { () -> [Token] in
+    let tokens = timings.measure("parse", "lex") { () -> [Token] in
         var lexer = Lexer(source, file: path, diagnostics: parseDiags)
         return lexer.tokenize()
     }
     timings.tokens = tokens.count
 
-    var program = timings.measure("parse") { () -> Program in
+    var program = timings.measure("parse", "parse") { () -> Program in
         var parser = Parser(tokens, diagnostics: parseDiags)
         return parser.parse()
     }
@@ -72,12 +75,12 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     // Prepend the Nomu standard library, compiled with every program (M4.13). Under
     // the single compilation unit this is a decl concatenation; prelude symbols are
     // then callable from user code with no import. (Times the prelude's own lex+parse.)
-    program = timings.measure("prelude") { prependPrelude(program) }
+    program = timings.measure("noir", "prelude") { prependPrelude(program) }
 
     // Fold plain extensions into their target types before any checking (M4.12);
     // downstream passes then see one type with all its methods.
     let mergeDiags = DiagnosticSink()
-    program = timings.measure("merge") { mergeExtensions(program, into: mergeDiags) }
+    program = timings.measure("noir", "merge") { mergeExtensions(program, into: mergeDiags) }
     if mergeDiags.hasErrors {
         fputs(mergeDiags.render() + "\n", stderr)
         timings.report()
@@ -86,7 +89,7 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
 
     // Semantic pass → typed IR. POD + let/var checks (AST typechecker) run first (T2 §4).
     let typeDiags = DiagnosticSink()
-    timings.measure("typecheck") {
+    timings.measure("noir", "typecheck") {
         var checker = Typechecker(program, diagnostics: typeDiags)
         checker.check()
     }
@@ -96,7 +99,7 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
         exit(1)
     }
 
-    let semaResult = timings.measure("sema") { () -> SemaResult in
+    let semaResult = timings.measure("noir", "sema") { () -> SemaResult in
         var sema = Sema(program)
         let result = sema.check()
         // T4: exhaustiveness as an IR pass over the typed module, into the same sink.
@@ -125,7 +128,7 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     // decls (whole-program mono under the single compilation unit). An IR→IR pass; `any I`
     // stays dynamic. Runs only on error-free IR.
     let monoDiags = DiagnosticSink()
-    let monoModule = timings.measure("mono") { monomorphize(semaResult.module, into: monoDiags) }
+    let monoModule = timings.measure("noir", "mono") { monomorphize(semaResult.module, into: monoDiags) }
     if !monoDiags.isEmpty {
         fputs(monoDiags.render() + "\n", stderr)
         timings.report()
@@ -136,7 +139,7 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     // build/; --stop=ssair writes it and halts. A debug view, so ssairgen diagnostics report without
     // failing. The egress lowers SSAIR itself when NOMU_EGRESS=ssair; this is the inspectable dump.
     if options.ssair || options.stopAt == .ssair {
-        let ssa = timings.measure("ssairgen") { lowerToSSAIR(monoModule) }
+        let ssa = timings.measure("ssair", "gen") { lowerToSSAIR(monoModule) }
         writeArtifact(dumpSSAIR(ssa.module), toFile: stem + ".ssair")
         if options.stopAt == .ssair {
             if !ssa.diagnostics.isEmpty { fputs(ssa.diagnostics.render() + "\n", stderr) }
@@ -207,15 +210,17 @@ private func prependPrelude(_ program: Program) -> Program {
 // object → .a → link.
 private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: String, optimize: Bool, timings: Timings) {
     let objPath = stem + ".o"
-    // `codegen` is the whole LLVM path (IR lowering + transform passes + object emit) behind one
-    // bridge call; splitting it needs timing hooks inside LLVMBridge (a follow-up).
-    let err = timings.measure("codegen") { emitObject(module, to: objPath, optimize: optimize) }
+    // The LLVM path (SSAIR gen + passes, IR egress, LLVM opt, object emit) reports its sub-stages up
+    // through the `StageSink`, so the timing table's `ssair`/`llvm` phases break down rather than
+    // showing one opaque `codegen` bucket.
+    let err = emitObject(module, to: objPath, optimize: optimize,
+                         onStage: { timings.record(phase: $0, name: $1, seconds: $2) })
     if let err = err {
         fputs("error: \(err)\n", stderr)
         timings.report()
         exit(1)
     }
-    let archive = timings.measure("runtime") { cachedRuntimeArchive(buildRoot: buildRoot) }
+    let archive = timings.measure("runtime", "archive") { cachedRuntimeArchive(buildRoot: buildRoot) }
     guard let archive = archive else { timings.report(); exit(1) }
 
     let binPath = stem
@@ -233,7 +238,7 @@ private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: Strin
         linkArgs += [gcArchive,
                      "-framework", "CoreFoundation", "-framework", "IOKit", "-lobjc"]
     }
-    let linkStatus = timings.measure("link") { runProcess("/usr/bin/cc", linkArgs) }
+    let linkStatus = timings.measure("link", "cc") { runProcess("/usr/bin/cc", linkArgs) }
     if linkStatus != 0 {
         fputs("error: link failed\n", stderr)
         timings.report()
