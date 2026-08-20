@@ -11,7 +11,7 @@ fun main() {
   var i = 0
   while i < 200 {
     xs.append(Box(v: i))       // live: enters the array (buffer → Box, a traced chain)
-    let junk = Box(v: 0 - 1)   // garbage: dead after this iteration
+    let junk = Box(v: -1)      // garbage: dead after this iteration
     i = i + 1
   }
   var sum = 0

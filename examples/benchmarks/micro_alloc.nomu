@@ -1,0 +1,17 @@
+// Microbenchmark — allocation churn of a non-escaping object. Each iteration heap-allocates
+// a `Box` (a class, a managed reference), reads one field, and drops it. Escape analysis
+// (7.3) proves the object never escapes and promotes it to a stack slot; SROA + constant
+// folding then leave the loop body as `acc + i`. With EA off: a GC allocation every iteration.
+class Box {
+    var v: Int
+}
+fun main() {
+    var acc = 0
+    var i = 0
+    while i < 20000000 {
+        let b = Box(v: i)
+        acc = acc + b.v
+        i = i + 1
+    }
+    print(acc)
+}

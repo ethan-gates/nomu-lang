@@ -1,0 +1,22 @@
+// Microbenchmark — existential dispatch in a hot loop. Each iteration boxes a freshly
+// constructed concrete `Sq` as `any Shape` and dispatches `area()` through the witness.
+// With the tier on (devirt → inline → EA), the box is locally constructed, so the call
+// devirtualizes to `m:Sq:area`, inlines to `s * s`, and the now-dead box promotes/DCEs —
+// the loop body collapses to `acc + i * i`. Passes off: a heap box + indirect call each pass.
+interface Shape {
+    fun area() -> Int
+}
+struct Sq: Shape {
+    var s: Int
+    fun area() -> Int { return s * s }
+}
+fun main() {
+    var acc = 0
+    var i = 0
+    while i < 20000000 {
+        let d: any Shape = Sq(s: i)
+        acc = acc + d.area()
+        i = i + 1
+    }
+    print(acc)
+}

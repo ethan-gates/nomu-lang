@@ -12,21 +12,26 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export NOMUC=$ROOT/bazel-bin/src/nomu-cli/nomuc
 
-# Worker mode: one example, on vs off. Prints "OK <name>", "DIFF <name>", or "SKIP <name>".
+# Worker mode: one example, on vs off. Prints "OK <name>", "DIFF <name>", "CFAIL <name>", or
+# "SKIP <name>". The binary path is derived from the source's path relative to the repo root, so
+# programs under examples/benchmarks/ resolve correctly (not just top-level examples/).
 if [[ "${1:-}" == "--one" ]]; then
-  src=$2; name=$(basename "$src"); bin="$ROOT/build/examples/${name%.nomu}"
+  src=$2; name=$(basename "$src"); rel=${src#$ROOT/}; bin="$ROOT/build/${rel%.nomu}"
   run() { perl -e 'my $p=fork; if($p==0){exec @ARGV or exit 127} local $SIG{ALRM}=sub{kill 9,$p; exit 124}; alarm 20; waitpid($p,0); exit($?>>8)' "$@"; }
   "$NOMUC" "$src" >/dev/null 2>&1 || { echo "SKIP $name"; exit 0; }
   on=$(run "$bin" </dev/null 2>&1; echo "rc=$?")
-  NOMU_NO_ESCAPE=1 "$NOMUC" "$src" >/dev/null 2>&1
+  # A failed off-compile must be a hard failure: without this guard the run below reads the stale
+  # on-compiled binary, so on==off and a compile break masquerades as a pass.
+  NOMU_NO_ESCAPE=1 "$NOMUC" "$src" >/dev/null 2>&1 || { echo "CFAIL $name"; exit 0; }
   off=$(run "$bin" </dev/null 2>&1; echo "rc=$?")
   [[ "$on" == "$off" ]] && echo "OK $name" || echo "DIFF $name"
   exit 0
 fi
 
 ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 8)
-res=$(ls "$ROOT"/examples/*.nomu | grep -v '/stdin.nomu$' | xargs -P "$ncpu" -n1 zsh "$0" --one)
-pass=$(echo "$res" | grep -c '^OK ');  fail=$(echo "$res" | grep -c '^DIFF '); skip=$(echo "$res" | grep -c '^SKIP ')
-echo "identical=$pass differ=$fail skipped(compile)=$skip (+1 stdin, excluded by design)"
+res=$(ls "$ROOT"/examples/*.nomu "$ROOT"/examples/benchmarks/*.nomu | grep -v '/stdin.nomu$' | xargs -P "$ncpu" -n1 zsh "$0" --one)
+pass=$(echo "$res" | grep -c '^OK ');  fail=$(echo "$res" | grep -c '^DIFF '); skip=$(echo "$res" | grep -c '^SKIP '); cfail=$(echo "$res" | grep -c '^CFAIL ')
+echo "identical=$pass differ=$fail compile-fail=$cfail skipped(noir-compile)=$skip (+1 stdin, excluded by design)"
+if [[ $cfail -ne 0 ]]; then echo "FAIL — off-config compile broke on:"; echo "$res" | grep '^CFAIL '; exit 1; fi
 if [[ $fail -ne 0 ]]; then echo "FAIL — diverged on:"; echo "$res" | grep '^DIFF '; exit 1; fi
 echo "PASS: escape analysis is behavior-preserving across the example corpus"

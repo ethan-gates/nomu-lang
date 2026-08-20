@@ -38,7 +38,11 @@ public enum TokenKind: Hashable {
     case plus, minus, star, slash, percent
     case eqEq, bangEq
     case lt, gt, ltEq, gtEq
-    case amp                  // & — interface composition
+    case amp                  // & — interface composition (type position) / bitwise-and (expression)
+    case pipe                 // | — bitwise-or
+    case caret                // ^ — bitwise-xor
+    case tilde                // ~ — bitwise-not
+    case bang                 // ! — logical-not
 
     case eof
 }

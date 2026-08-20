@@ -136,8 +136,8 @@ public struct Lexer {
             if peek() == 0x3D { pos += 1; return .eqEq }
             return .eq
         case 0x21:                    // !
-            guard peek() == 0x3D else { error("unexpected character '!'", at: pos - 1); return nil }
-            pos += 1; return .bangEq
+            if peek() == 0x3D { pos += 1; return .bangEq }
+            return .bang
         case 0x3C:                    // <
             if peek() == 0x3D { pos += 1; return .ltEq }
             return .lt
@@ -145,6 +145,9 @@ public struct Lexer {
             if peek() == 0x3D { pos += 1; return .gtEq }
             return .gt
         case 0x26: return .amp        // &
+        case 0x7C: return .pipe       // |
+        case 0x5E: return .caret      // ^
+        case 0x7E: return .tilde      // ~
         default:
             // Unhandled. A non-ASCII byte begins a multibyte scalar that is not an identifier
             // (a symbol, emoji, …): consume the whole scalar and report it once, not per byte.

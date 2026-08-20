@@ -6,6 +6,7 @@ import ssair
 import support
 import XCTest
 import ssairgen
+import ssairpasses   // verifySSAIR — regression guard for block-argument threading
 
 // Block-sealing / direct-SSA-construction tests (m7-spec.md §7.2.2): nested loops, break/continue,
 // and a value live across a back-edge. Each drives the real pipeline (source → parse → Sema → NOIR →
@@ -78,6 +79,44 @@ final class BlockSealingTests: XCTestCase {
         XCTAssertEqual(count(out, "condBr"), 2, out)          // one per loop
         // entry + (outer header, body, exit) + (inner header, body, exit) = 7 blocks.
         XCTAssertEqual(blockHeaders(out).count, 7, out)
+    }
+
+    // Regression: a value carried on the *outer* back-edge and live across *two sequential inner
+    // loops* must thread as a parameter through each inner header, with a matching argument on every
+    // predecessor edge. The construction fixpoint once terminated on a per-block parameter-count
+    // check, which misses a parameter added to a deeper block via single-predecessor forwarding; the
+    // later `fillArgs` then grew a header's parameter set after its predecessors' arguments were
+    // fixed, leaving an edge whose argument count disagreed with the target (verifier I3). Here the
+    // accumulator `acc`/`i` are carried across both inner loops — the `binary-tree` shape, minimized.
+    func testNestedLoopBackEdgeLiveInVerifies() {
+        let src = """
+        fun f(n: Int, m: Int) -> Int {
+            var i = 0
+            var acc = 0
+            while i < n {
+                var a = 0
+                while a < m {
+                    a = a + 1
+                }
+                var b = 0
+                while b < m {
+                    b = b + 1
+                }
+                acc = acc + i
+                i = i + 1
+            }
+            return acc
+        }
+        """
+        var lexer = Lexer(src, file: "t.nomu")
+        var parser = Parser(lexer.tokenize())
+        var sema = Sema(parser.parse())
+        let result = sema.check()
+        XCTAssertFalse(result.diagnostics.hasErrors, result.diagnostics.render())
+        let gen = lowerToSSAIR(result.module)
+        XCTAssertFalse(gen.diagnostics.hasErrors, gen.diagnostics.render())
+        // Every CFG edge must pass exactly the target block's parameter count (I3).
+        XCTAssertEqual(verifySSAIR(gen.module), [], dumpSSAIR(gen.module))
     }
 
     // `break` terminates its block with a branch to the loop exit; `continue` with a branch back to

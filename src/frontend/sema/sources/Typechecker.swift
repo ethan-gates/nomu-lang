@@ -6,6 +6,7 @@ public struct Typechecker {
     private let diags: DiagnosticSink
     private var typeKinds: [String: DeclKind] = [
         "Int": .builtin,
+        "UInt8": .builtin,
         "Bool": .builtin,
         "String": .builtin,
     ]

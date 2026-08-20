@@ -16,7 +16,7 @@ fun main() {
     print(n.double / 4.0)   // 2.5   — widen then divide
     print(2.7.int)          // 3     — round half away from zero
     print(2.4.int)          // 2
-    let neg = 0 - 2
+    let neg = -2
     print(neg.double + 0.5) // -1.5
 
     // Comparisons on Double.

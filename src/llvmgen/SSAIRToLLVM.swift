@@ -286,7 +286,11 @@ final class SSAIRToLLVM {
         let span = inst.span
         switch inst.kind {
         case .constInt(let n):
-            define(inst, LLVMConstInt(e.i64, UInt64(bitPattern: Int64(n)), 1))
+            if inst.result?.type == .uint8 {
+                define(inst, LLVMConstInt(e.i8, UInt64(n & 0xFF), 0))
+            } else {
+                define(inst, LLVMConstInt(e.i64, UInt64(bitPattern: Int64(n)), 1))
+            }
         case .constDouble(let x):
             define(inst, LLVMConstReal(e.f64, x))
         case .constBool(let v):
@@ -295,7 +299,7 @@ final class SSAIRToLLVM {
             define(inst, e.lowerStringLit(s))
 
         case .binary(let op, let l, let r):
-            define(inst, lowerBinary(op, l, r))
+            define(inst, lowerBinary(op, l, r, span))
 
         case .alloc(let t):
             define(inst, lowerAlloc(t, span))
@@ -396,7 +400,7 @@ final class SSAIRToLLVM {
 
     // MARK: - Operations
 
-    private func lowerBinary(_ op: BinOp, _ l: SSAValue, _ r: SSAValue) -> LLVMValueRef {
+    private func lowerBinary(_ op: BinOp, _ l: SSAValue, _ r: SSAValue, _ span: Span) -> LLVMValueRef {
         let lv = val(l), rv = val(r)
         if l.type == .double {
             switch op {
@@ -416,23 +420,32 @@ final class SSAIRToLLVM {
                 default:   pred = LLVMRealOGE
                 }
                 return LLVMBuildFCmp(b, pred, lv, rv, "fcmp")
+            case .bitAnd, .bitOr, .bitXor, .shl, .shr:
+                e.fail("7.2.3: bitwise/shift operators are not valid on Double", span); return lv
             }
         }
+        // Integer path: signed for Int, unsigned for UInt8 — differing on div/rem, `>>`, and compares.
+        let unsigned = (l.type == .uint8)
         switch op {
         case .add: return LLVMBuildAdd(b, lv, rv, "add")
         case .sub: return LLVMBuildSub(b, lv, rv, "sub")
         case .mul: return LLVMBuildMul(b, lv, rv, "mul")
-        case .div: return LLVMBuildSDiv(b, lv, rv, "div")
-        case .mod: return LLVMBuildSRem(b, lv, rv, "rem")
+        case .div: return unsigned ? LLVMBuildUDiv(b, lv, rv, "div") : LLVMBuildSDiv(b, lv, rv, "div")
+        case .mod: return unsigned ? LLVMBuildURem(b, lv, rv, "rem") : LLVMBuildSRem(b, lv, rv, "rem")
+        case .bitAnd: return LLVMBuildAnd(b, lv, rv, "and")
+        case .bitOr:  return LLVMBuildOr(b, lv, rv, "or")
+        case .bitXor: return LLVMBuildXor(b, lv, rv, "xor")
+        case .shl:    return LLVMBuildShl(b, lv, rv, "shl")
+        case .shr:    return unsigned ? LLVMBuildLShr(b, lv, rv, "shr") : LLVMBuildAShr(b, lv, rv, "shr")
         case .eq, .neq, .lt, .gt, .lte, .gte:
             let pred: LLVMIntPredicate
             switch op {
             case .eq:  pred = LLVMIntEQ
             case .neq: pred = LLVMIntNE
-            case .lt:  pred = LLVMIntSLT
-            case .gt:  pred = LLVMIntSGT
-            case .lte: pred = LLVMIntSLE
-            default:   pred = LLVMIntSGE
+            case .lt:  pred = unsigned ? LLVMIntULT : LLVMIntSLT
+            case .gt:  pred = unsigned ? LLVMIntUGT : LLVMIntSGT
+            case .lte: pred = unsigned ? LLVMIntULE : LLVMIntSLE
+            default:   pred = unsigned ? LLVMIntUGE : LLVMIntSGE
             }
             return LLVMBuildICmp(b, pred, lv, rv, "cmp")
         }
@@ -598,6 +611,8 @@ final class SSAIRToLLVM {
             let (fn, fty) = e.runtimeFn("llvm.round.f64", ret: e.f64, params: [e.f64], varArg: false)
             let rounded = e.buildCall(fn, fty, [val(args[0])])!
             return LLVMBuildFPToSI(b, rounded, e.i64, "d2i")
+        case "__int_uint8_uint8": return LLVMBuildTrunc(b, val(args[0]), e.i8, "i2u8")
+        case "__uint8_int_int":   return LLVMBuildZExt(b, val(args[0]), e.i64, "u82i")
         default:
             if Builtins.cLeaf.contains(name) { return emitCLeaf(name, args) }
             // A user free function or a method symbol — resolve the declared callable.
@@ -654,6 +669,8 @@ final class SSAIRToLLVM {
         case .double:
             let (pf, pfty) = e.runtimeFn("rt_print_double", ret: e.voidTy, params: [e.f64], varArg: false)
             return e.buildCall(pf, pfty, [value])
+        case .uint8:
+            return e.buildCall(fn, pty, [e.intFormat(), LLVMBuildZExt(b, value, e.i64, "u82i")])
         case .bool:
             return e.buildCall(fn, pty, [e.intFormat(), LLVMBuildZExt(b, value, e.i64, "b2i")])
         case .string:
@@ -662,7 +679,7 @@ final class SSAIRToLLVM {
             let len32 = LLVMBuildTrunc(b, len, e.i32, "len32")
             return e.buildCall(fn, pty, [e.strFormat(), len32, data])
         default:
-            e.fail("7.2.3: print supports Int, Double, Bool, or String", span); return nil
+            e.fail("7.2.3: print supports Int, UInt8, Double, Bool, or String", span); return nil
         }
     }
 

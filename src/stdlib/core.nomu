@@ -23,7 +23,7 @@ enum Result<T, E> {
 }
 
 fun abs(n: Int) -> Int {
-    if n < 0 { return 0 - n }
+    if n < 0 { return -n }
     return n
 }
 

@@ -173,5 +173,10 @@ private func sym(_ op: BinOp) -> String {
     case .gt:  return ">"
     case .lte: return "<="
     case .gte: return ">="
+    case .bitAnd: return "&"
+    case .bitOr:  return "|"
+    case .bitXor: return "^"
+    case .shl:    return "<<"
+    case .shr:    return ">>"
     }
 }

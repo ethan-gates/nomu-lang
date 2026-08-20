@@ -52,6 +52,12 @@ Surface decisions that belong to a subsystem live with that subsystem, so the sy
 - **Interfaces** (`interface`, `extension`, `any`, `&`) — `interfaces.md`. Keyword spellings there are tentative.
 - **Closures** (trailing-closure syntax, `$0`/`$1` shorthand, capture lists) — `concurrency.md` §6, surface **Decided (2026-07-16)**, Swift-shaped, frontend-adjustable without semantic impact.
 - **Concurrency keywords** — the "shareable" spelling and actor/spawn surface are open (`concurrency.md`).
+- **Operators** — the shipped set and its precedence:
+  - Arithmetic `+ - * / %`, comparison `== != < > <= >=`, bitwise `& | ^`, shift `<< >>`, prefix `- ! ~`.
+  - Precedence, loosest to tightest: comparison < `|` < `^` < `&` < shift < additive < multiplicative < prefix < postfix. Bitwise and shift bind **tighter** than comparison (Go-style), so `x & mask == 0` reads as `(x & mask) == 0`.
+  - `&` is bitwise-and in expression position and interface composition (`any A & B`) in type position — the two parse contexts are separate. `<<`/`>>` are recombined from two adjacent `<`/`>` tokens in the parser, so nested generic closes (`Box<Box<Int>>`) are unaffected.
+  - `- ! ~` desugar in Sema to binary forms (`0 - x`, `x == false`, `x ^ allOnes`), so no unary node reaches NOIR/SSAIR.
+  - Open: grouping parentheses `(a + b)` do not parse yet (`deferred.md`); operator overloading via interface conformance is deferred (`generics.md` §10).
 
 ---
 

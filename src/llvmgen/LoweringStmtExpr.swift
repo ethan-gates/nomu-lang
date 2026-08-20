@@ -164,6 +164,8 @@ extension NOIRToLLVM {
     func lowerExpr(_ e: NOIRExpr) -> LLVMValueRef? {
         switch e.kind {
         case .intLit(let n):
+            // A UInt8 literal is an i8 constant (unsigned); every other integer literal is i64.
+            if e.type == .uint8 { return LLVMConstInt(i8, UInt64(n & 0xFF), /*SignExtend=*/0) }
             return LLVMConstInt(i64, UInt64(bitPattern: Int64(n)), /*SignExtend=*/1)
         case .doubleLit(let x):
             return LLVMConstReal(f64, x)
@@ -306,24 +308,33 @@ extension NOIRToLLVM {
                 default:   pred = LLVMRealOGE   // .gte
                 }
                 return LLVMBuildFCmp(b, pred, lv, rv, "fcmp")
+            case .bitAnd, .bitOr, .bitXor, .shl, .shr:
+                fail("bitwise/shift operators are not valid on Double", l.span); return lv
             }
         }
+        // Integer path: signed for Int, unsigned for UInt8 — differing on div/rem, `>>`, and compares.
+        let unsigned = (l.type == .uint8)
         switch op {
         case .add: return LLVMBuildAdd(b, lv, rv, "add")
         case .sub: return LLVMBuildSub(b, lv, rv, "sub")
         case .mul: return LLVMBuildMul(b, lv, rv, "mul")
-        case .div: return LLVMBuildSDiv(b, lv, rv, "div")
-        case .mod: return LLVMBuildSRem(b, lv, rv, "rem")
+        case .div: return unsigned ? LLVMBuildUDiv(b, lv, rv, "div") : LLVMBuildSDiv(b, lv, rv, "div")
+        case .mod: return unsigned ? LLVMBuildURem(b, lv, rv, "rem") : LLVMBuildSRem(b, lv, rv, "rem")
+        case .bitAnd: return LLVMBuildAnd(b, lv, rv, "and")
+        case .bitOr:  return LLVMBuildOr(b, lv, rv, "or")
+        case .bitXor: return LLVMBuildXor(b, lv, rv, "xor")
+        case .shl:    return LLVMBuildShl(b, lv, rv, "shl")
+        case .shr:    return unsigned ? LLVMBuildLShr(b, lv, rv, "shr") : LLVMBuildAShr(b, lv, rv, "shr")
         case .eq, .neq, .lt, .gt, .lte, .gte:
             // Comparisons on Int yield Bool — now the `icmp`'s native i1 directly (8.5.2, no zext).
             let pred: LLVMIntPredicate
             switch op {
             case .eq:  pred = LLVMIntEQ
             case .neq: pred = LLVMIntNE
-            case .lt:  pred = LLVMIntSLT
-            case .gt:  pred = LLVMIntSGT
-            case .lte: pred = LLVMIntSLE
-            default:   pred = LLVMIntSGE   // .gte
+            case .lt:  pred = unsigned ? LLVMIntULT : LLVMIntSLT
+            case .gt:  pred = unsigned ? LLVMIntUGT : LLVMIntSGT
+            case .lte: pred = unsigned ? LLVMIntULE : LLVMIntSLE
+            default:   pred = unsigned ? LLVMIntUGE : LLVMIntSGE   // .gte
             }
             return LLVMBuildICmp(b, pred, lv, rv, "cmp")
         }

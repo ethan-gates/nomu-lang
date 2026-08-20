@@ -36,6 +36,13 @@ Each entry carries a **Type** and a **Lifecycle** stage:
 
 ---
 
+## SSAIR tier — gaps found by the perf harness (2026-08-20, both fixed)
+
+Surfaced while building `tools/perf-tier.py` (m7-spec §7.5 exit). Both pre-existing; both fixed 2026-08-20.
+
+- **`binary-tree` block-argument threading bug (fixed).** `examples/benchmarks/binary-tree.nomu` under the SSAIR egress tripped `verifySSAIR` I3 *before any pass ran* (`bb2→bb4 passes 2 args, bb4 declares 5 params`). Cause: the `SSAIRGen.finalize` block-parameter fixpoint terminated on a *per-block* parameter-count check, but `read` forwards through single-predecessor blocks and can add a parameter to a block deeper in the CFG — so the fixpoint ended early, then `fillArgs` grew a header's parameters after its predecessors' arguments were fixed, leaving a ragged edge (which also defeated trivial-parameter elimination). Fix: terminate the fixpoint on the *global* parameter count across all blocks. Regression test: `BlockSealingTests.testNestedLoopBackEdgeLiveInVerifies` (a minimized two-inner-loop shape). The egress differential now covers `binary-tree` (43 → 49 programs, byte-identical).
+- **Differential blind spots (fixed).** Two holes the above hid: (1) the differential globbed `examples/*.nomu`, missing `examples/benchmarks/`; (2) it recompiled in place and compared the on-disk binary, so a *failed* SSAIR recompile left the prior (NOIR) binary and read as equal — a compile break looked like a pass. Fixed in `tools/escape-diff.sh` and a new committed `tools/egress-diff.sh` (NOIR vs SSAIR): both now glob examples + benchmarks and treat a non-zero compile as a hard `CFAIL`.
+
 ## `shared` on function-type / existential spellings
 
 **Type / Lifecycle:** `language-feature · ready-to-build` (trigger-gated).
@@ -94,12 +101,29 @@ Each entry carries a **Type** and a **Lifecycle** stage:
 Terse pointers, each tagged `[Type · Lifecycle]`. Promote to a full What/Why/Trigger/How entry when
 picked up.
 
-- **Operator surface design** `[language-feature · needs-design]` — a holistic pass over operators
-  before extending any. Open pieces: equality/relational on non-numerics (`String` uses `.eq(...)`
-  today, aggregates have none); **logical-not `!`** (only `!=` exists); **unary minus** (`-x`; write
-  `0 - x` today). Comparison type-checking already rejects non-numeric `== != < >` with a clean error
-  (`Sema.binaryResult`). Decide the whole set + the overload/requirement story together. Ref:
-  `generics.md` §10 (operators-as-requirements).
+- **Operator surface design** `[language-feature · partially-shipped]` — bitwise `& | ^`, shift
+  `<< >>`, and the prefix operators `- ! ~` shipped 2026-08-20 (Int + UInt8; `- ! ~` desugar to
+  binary forms in `Sema.checkUnary`). Overflow is raw wrapping arithmetic, no panics (Decided
+  2026-08-20). Still open: equality/relational on non-numerics (`String` uses `.eq(...)` today,
+  aggregates have none); the overload/requirement story (`generics.md` §10,
+  operators-as-requirements); grouping parentheses (own entry below). Comparison type-checking
+  rejects non-numeric `== != < >` with a clean error (`Sema.binaryResult`).
+  - **Precedence — Decided 2026-08-20 (Go-style, revisit-able).** Levels, loosest→tightest:
+    comparison (`== != < > <= >=`) < `|` < `^` < `&` < shift (`<< >>`) < additive (`+ -`) <
+    multiplicative (`* / %`) < prefix (`- ! ~`) < postfix. Bitwise and shift bind **tighter** than
+    comparison, so `x & mask == 0` reads as `(x & mask) == 0` — this drops the classic C footgun
+    (C puts `& ^ |` *looser* than `==`). All prefix ops share one level and are right-associative
+    (`- -x`, `!!x`, `~~x` nest). The chain lives in `Parser` (`parseComparison` → `parseBitOr` →
+    `parseBitXor` → `parseBitAnd` → `parseShift` → `parseAdditive` → `parseMultiplicative` →
+    `parseUnary` → `parsePostfix`); mirrored for the dump table in `syntax.md` §3. Open precedence
+    questions for the holistic pass: where logical `&&`/`||` will sit once they exist (Go puts
+    `&&` above `||`, both below comparison), and whether to keep the Go choice or move to a flatter
+    table if it surprises on real programs.
+  - **Two parse-context notes worth preserving.** `&` is bitwise-and in expression position and
+    interface composition (`any A & B`) in type position — resolved by which parser context is
+    active (precedent: `<` as both comparison and generic bracket). `<<`/`>>` are *not* lexer
+    tokens: they are recombined in the parser from two adjacent `<`/`>` tokens (adjacency required),
+    so a bare `>` still closes a generic argument list and `Box<Box<Int>>` is unaffected.
 - **Grouping parentheses as a primary expression** `[user-facing · ready-to-build]` — `(a + b) * c`
   does not parse; `(` only opens a call/param list. Add a parenthesized-expression case to
   `parsePrimary`. Small, self-contained (worked around in `examples/benchmarks/hashmap.nomu`).

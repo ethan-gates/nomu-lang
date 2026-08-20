@@ -30,7 +30,7 @@ public struct Shareability {
 
     public func isShareable(_ t: Type, visiting: Set<String> = []) -> Bool {
         switch t {
-        case .int, .double, .bool, .string, .named(_, .actor_):
+        case .int, .uint8, .double, .bool, .string, .named(_, .actor_):
             return true
         case .named(let name, _):
             return named(name, args: [], visiting: visiting)

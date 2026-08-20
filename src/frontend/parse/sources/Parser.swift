@@ -686,12 +686,15 @@ public struct Parser {
         parseComparison()
     }
 
+    // Precedence chain, loosest to tightest binding: comparison < `|` < `^` < `&` < shift <
+    // additive < multiplicative < unary prefix < postfix. Bitwise and shift bind tighter than
+    // comparison (Go-style), so `x & mask == 0` reads as `(x & mask) == 0`, not the C footgun.
     private mutating func parseComparison() -> Expr {
         let start = currentSpan
-        var lhs = parseAdditive()
+        var lhs = parseBitOr()
         while let op = comparisonOp() {
             advance()
-            lhs = .binary(op, lhs, parseAdditive(), span: spanFrom(start))
+            lhs = .binary(op, lhs, parseBitOr(), span: spanFrom(start))
         }
         return lhs
     }
@@ -708,6 +711,58 @@ public struct Parser {
         }
     }
 
+    private mutating func parseBitOr() -> Expr {
+        let start = currentSpan
+        var lhs = parseBitXor()
+        while currentKind == .pipe {
+            advance()
+            lhs = .binary(.bitOr, lhs, parseBitXor(), span: spanFrom(start))
+        }
+        return lhs
+    }
+
+    private mutating func parseBitXor() -> Expr {
+        let start = currentSpan
+        var lhs = parseBitAnd()
+        while currentKind == .caret {
+            advance()
+            lhs = .binary(.bitXor, lhs, parseBitAnd(), span: spanFrom(start))
+        }
+        return lhs
+    }
+
+    // `&` in expression position is bitwise-and (interface composition `any A & B` is parsed in
+    // type position, a separate path).
+    private mutating func parseBitAnd() -> Expr {
+        let start = currentSpan
+        var lhs = parseShift()
+        while currentKind == .amp {
+            advance()
+            lhs = .binary(.bitAnd, lhs, parseShift(), span: spanFrom(start))
+        }
+        return lhs
+    }
+
+    private mutating func parseShift() -> Expr {
+        let start = currentSpan
+        var lhs = parseAdditive()
+        while let op = shiftOp() {
+            advance(); advance()   // consume both `<`/`>` tokens
+            lhs = .binary(op, lhs, parseAdditive(), span: spanFrom(start))
+        }
+        return lhs
+    }
+
+    // `<<` / `>>` are two adjacent `<` / `>` tokens, recombined here rather than in the lexer so a
+    // bare `>` still closes a generic argument list (`Box<Box<Int>>` lexes as two `>`). Adjacency
+    // (no gap between the two tokens) is required, so `a > b` and `Foo<T>` are never misread.
+    private func shiftOp() -> BinOp? {
+        guard tokens[pos].span.endOffset == tokens[pos + 1].span.startOffset else { return nil }
+        if currentKind == .lt, peek() == .lt { return .shl }
+        if currentKind == .gt, peek() == .gt { return .shr }
+        return nil
+    }
+
     private mutating func parseAdditive() -> Expr {
         let start = currentSpan
         var lhs = parseMultiplicative()
@@ -721,7 +776,7 @@ public struct Parser {
 
     private mutating func parseMultiplicative() -> Expr {
         let start = currentSpan
-        var lhs = parsePostfix()
+        var lhs = parseUnary()
         while currentKind == .star || currentKind == .slash || currentKind == .percent {
             let op: BinOp
             switch currentKind {
@@ -730,9 +785,25 @@ public struct Parser {
             default:     op = .mod   // .percent
             }
             advance()
-            lhs = .binary(op, lhs, parsePostfix(), span: spanFrom(start))
+            lhs = .binary(op, lhs, parseUnary(), span: spanFrom(start))
         }
         return lhs
+    }
+
+    // Prefix operators: `-x` (negate), `!x` (logical not), `~x` (bitwise not). Right-associative
+    // (a prefix op applies to the unary expression that follows), so `- -x` and `!!x` nest.
+    private mutating func parseUnary() -> Expr {
+        let start = currentSpan
+        let op: UnaryOp?
+        switch currentKind {
+        case .minus: op = .neg
+        case .bang:  op = .not
+        case .tilde: op = .bitNot
+        default:     op = nil
+        }
+        guard let op else { return parsePostfix() }
+        advance()
+        return .unary(op, parseUnary(), span: spanFrom(start))
     }
 
     private mutating func parsePostfix() -> Expr {

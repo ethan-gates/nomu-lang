@@ -15,6 +15,8 @@
 - **Interfaces/protocols with default methods** — the abstraction mechanism, detailed in `interfaces.md`. — **Decided.**
 - **Modest local inference** — bottom-up expression typing plus declared annotations: `let x = expr` infers `x` from `expr`, a function's return is checked against its annotation, and closure params come from their annotations. A contextual expected type also flows *inward* to a leading-dot enum case (`.circle(...)` — §2), from the binding annotation, argument slot, or return position; that is the one place typing is top-down rather than bottom-up. No Hindley–Milner / global inference (generic inference is M5, `generics.md`). — **Decided (M4.9; contextual enum inference M4.10).**
 
+- **Scalar types** — `Int` (signed, i64), `Double` (f64), `Bool` (i1), `String`, and `UInt8` (unsigned byte, i8). `UInt8` (shipped 2026-08-20) has wrapping arithmetic and unsigned compares/shifts (`>>` is logical); it is a distinct type with no implicit conversion — `i.uint8` truncates Int→UInt8, `b.int` zero-extends UInt8→Int, matching the existing `i.double`/`d.int` conversion style. An integer literal adopts `UInt8` from a `UInt8` context (annotation, field, argument) with a compile-time 0…255 range check. A wider fixed-width integer family (`UInt16`/`Int32`/…) is deferred (`deferred.md`, SIMD/const-generics track).
+
 No inheritance + interfaces + extensions is the Swift-protocol / Rust-trait / Go-interface design — well-trodden and coherent.
 
 ---

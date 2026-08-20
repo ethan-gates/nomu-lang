@@ -70,6 +70,7 @@ extension LLVMGen {
         guard di != nil else { return nil }
         switch t {
         case .int:    return diBasic("Int", dwSigned, bits: 64)
+        case .uint8:  return diBasic("UInt8", dwUnsignedChar, bits: 8)
         case .double: return diBasic("Double", dwFloat, bits: 64)
         case .bool:   return diBasic("Bool", dwBoolean, bits: 8)   // i1, one byte in memory (8.5.2)
         case .string: return diStringType()

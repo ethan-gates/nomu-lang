@@ -40,6 +40,7 @@ final class LLVMGen {
     let i8ptr: LLVMTypeRef      // opaque `ptr` (addrspace 0) — code / static / C-owned memory
     let p1: LLVMTypeRef         // opaque `ptr addrspace(1)` — a managed (GC-heap) reference (8.4.1 D1)
     let i1: LLVMTypeRef         // 8.5.2 — `Bool` (0/1); LLVM's natural boolean
+    let i8: LLVMTypeRef         // `UInt8` — an 8-bit unsigned byte
     let i32: LLVMTypeRef
     let i64: LLVMTypeRef
     let f64: LLVMTypeRef        // `Double` — LLVM's native double
@@ -146,6 +147,7 @@ final class LLVMGen {
         i8ptr = LLVMPointerType(LLVMInt8TypeInContext(ctx), 0)
         p1 = LLVMPointerType(LLVMInt8TypeInContext(ctx), 1)
         i1 = LLVMInt1TypeInContext(ctx)
+        i8 = LLVMInt8TypeInContext(ctx)
         i32 = LLVMInt32TypeInContext(ctx)
         i64 = LLVMInt64TypeInContext(ctx)
         f64 = LLVMDoubleTypeInContext(ctx)

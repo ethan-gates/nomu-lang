@@ -27,7 +27,7 @@ class HashTable {
         if idx < 0 {
             idx = idx + self.capacity
         }
-        var firstTomb = 0 - 1
+        var firstTomb = -1
         var probes = 0
         while probes < self.capacity {
             let st = self.entries[idx].state

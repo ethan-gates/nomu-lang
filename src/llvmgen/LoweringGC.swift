@@ -92,7 +92,8 @@ extension NOIRToLLVM {
                 case "print", "concat": return args.contains { exprHasSafepoint($0.value) }   // leaf
                 case "__array_count_int", "__arraySet": return args.contains { exprHasSafepoint($0.value) }   // load / store
                 case "__arrayAppend": return true                                              // rt_array_grow may rt_alloc
-                case "__int_double_double", "__double_int_int": return args.contains { exprHasSafepoint($0.value) }   // pure sitofp / round+fptosi
+                case "__int_double_double", "__double_int_int",
+                     "__int_uint8_uint8", "__uint8_int_int": return args.contains { exprHasSafepoint($0.value) }   // pure numeric conversions
                 case "sleep", "readLine": return true                                          // non-leaf runtime
                 default: return true                                                            // user function
                 }

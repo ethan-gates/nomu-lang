@@ -373,6 +373,7 @@ public indirect enum Expr {
 
     case call(Expr, [Arg], span: Span)
     case binary(BinOp, Expr, Expr, span: Span)
+    case unary(UnaryOp, Expr, span: Span)
     case closure(params: [Param], ret: TypeRef?, body: Block, span: Span)
     case arrayLit([Expr], span: Span)          // [a, b, c] — an Array<T> literal
     case index(Expr, Expr, span: Span)         // a[i] — array subscript
@@ -393,7 +394,14 @@ public struct Arg {
     }
 }
 
-public enum BinOp {
+public enum BinOp: Equatable {
     case add, sub, mul, div, mod
     case eq, neq, lt, gt, lte, gte
+    case bitAnd, bitOr, bitXor, shl, shr
+}
+
+// Prefix operators. `neg` (`-x`) and `not` (`!x`) and `bitNot` (`~x`). Lowered to binary
+// forms in Sema (`0 - x`, `x == false`, `x ^ allOnes`), so no unary node reaches NOIR/SSAIR.
+public enum UnaryOp: Equatable {
+    case neg, not, bitNot
 }

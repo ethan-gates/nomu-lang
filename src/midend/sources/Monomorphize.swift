@@ -268,6 +268,7 @@ private final class Monomorphizer {
     private func typeKey(_ t: Type) -> String {
         switch t {
         case .int: return "Int"
+        case .uint8: return "UInt8"
         case .double: return "Double"
         case .bool: return "Bool"
         case .string: return "String"

@@ -595,7 +595,7 @@ final class FunctionLowerer {
     private func lowerExpr(_ e: NOIRExpr) -> SSAValue? {
         lastSpan = e.span
         switch e.kind {
-        case .intLit(let n):    return emit(.constInt(n), .int, e.span)
+        case .intLit(let n):    return emit(.constInt(n), e.type, e.span)   // .int, or .uint8 in a byte context
         case .doubleLit(let x): return emit(.constDouble(x), .double, e.span)
         case .boolLit(let b):   return emit(.constBool(b), .bool, e.span)
         case .stringLit(let s): return emit(.constString(s), .string, e.span)
@@ -1106,20 +1106,26 @@ final class FunctionLowerer {
         sealed.formUnion(order)
 
         // Fixpoint: reading a variable at a predecessor may itself introduce a parameter there, which
-        // its own predecessors must then supply. Iterate until the parameter set is stable.
+        // its own predecessors must then supply. Iterate until the parameter set is stable. The
+        // termination test watches the *global* parameter count, not this block's — `read` forwards
+        // through single-predecessor blocks and can add a parameter to a block deeper in the CFG
+        // (leaving `b`'s own count unchanged), so a per-block check terminates early and leaves an
+        // edge whose argument count disagrees with the target's final parameters (a nested-loop
+        // live-in threaded through an inner header). Once a full pass adds no parameter anywhere, the
+        // sets are stable and `fillArgs` below is a pure read.
+        func totalParams() -> Int { order.reduce(0) { $0 + (bbs[$1]?.params.count ?? 0) } }
         var changed = true
         while changed {
-            changed = false
+            let before = totalParams()
             for b in order {
                 guard let term = bbs[b]?.term else { continue }
                 for succ in successors(term.kind) {
                     for param in bbs[succ]?.params ?? [] {
-                        let before = bbs[b]?.params.count ?? 0
                         _ = read(param.name, b)
-                        if (bbs[b]?.params.count ?? 0) != before { changed = true }
                     }
                 }
             }
+            changed = totalParams() != before
         }
 
         // Materialize the argument lists now that every block's parameters are fixed. Compute each

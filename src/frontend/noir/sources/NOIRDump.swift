@@ -222,5 +222,6 @@ private func opSym(_ op: BinOp) -> String {
     case .add: return "+";  case .sub: return "-";  case .mul: return "*";  case .div: return "/";  case .mod: return "%"
     case .eq:  return "=="; case .neq: return "!="; case .lt:  return "<"
     case .gt:  return ">";  case .lte: return "<="; case .gte: return ">="
+    case .bitAnd: return "&"; case .bitOr: return "|"; case .bitXor: return "^"; case .shl: return "<<"; case .shr: return ">>"
     }
 }

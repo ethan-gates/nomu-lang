@@ -47,6 +47,7 @@ final class NOIRToLLVM {
     var i8ptr: LLVMTypeRef { e.i8ptr }
     var p1: LLVMTypeRef { e.p1 }
     var i1: LLVMTypeRef { e.i1 }
+    var i8: LLVMTypeRef { e.i8 }
     var i32: LLVMTypeRef { e.i32 }
     var i64: LLVMTypeRef { e.i64 }
     var f64: LLVMTypeRef { e.f64 }

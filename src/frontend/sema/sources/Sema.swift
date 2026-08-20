@@ -217,6 +217,7 @@ public struct Sema {
         }
         switch ref.name {
         case "Int":    return .int
+        case "UInt8":  return .uint8
         case "Double": return .double
         case "Bool":   return .bool
         case "String": return .string
@@ -337,6 +338,16 @@ public struct Sema {
         if classes[name] != nil { return .class_ }
         if actors[name]  != nil { return .actor_ }
         if interfaces[name] != nil { return .interface_ }
+        return nil
+    }
+
+    // The stored fields (label + resolved type, declaration order) of a constructible named type —
+    // a struct, class, or actor. Used to thread the expected field type into each constructor
+    // argument (so a literal adopts a `UInt8`/`Double` field) and to reject a mismatch cleanly.
+    private func constructorFields(_ name: String) -> [(label: String, type: Type)]? {
+        if let s = structs[name] { return s.fields.map { ($0.name, resolve($0.type)) } }
+        if let c = classes[name] { return c.fields.map { ($0.name, resolve($0.type)) } }
+        if let a = actors[name]  { return a.fields.map { ($0.name, resolve($0.type)) } }
         return nil
     }
 
@@ -1202,7 +1213,16 @@ public struct Sema {
     // its enum (M4.10). nil elsewhere; most expressions ignore it.
     private mutating func checkExpr(_ e: Expr, expected: Type? = nil) -> NOIRExpr {
         switch e {
-        case .intLit(let v, let span):    return NOIRExpr(type: .int,    span: span, kind: .intLit(v))
+        case .intLit(let v, let span):
+            // An integer literal takes a `UInt8` context directly (`let b: UInt8 = 200`), with a
+            // compile-time range check. Otherwise it is `Int`.
+            if expected == .uint8 {
+                if v < 0 || v > 255 {
+                    diags.error("integer literal '\(v)' is out of range for UInt8 (0...255)", at: span)
+                }
+                return NOIRExpr(type: .uint8, span: span, kind: .intLit(v))
+            }
+            return NOIRExpr(type: .int,    span: span, kind: .intLit(v))
         case .doubleLit(let v, let span): return NOIRExpr(type: .double, span: span, kind: .doubleLit(v))
         case .boolLit(let v, let span):   return NOIRExpr(type: .bool,   span: span, kind: .boolLit(v))
         case .stringLit(let v, let span): return NOIRExpr(type: .string, span: span, kind: .stringLit(v))
@@ -1244,6 +1264,14 @@ public struct Sema {
             }
             if b.type == .double, field == "int" {
                 return BuiltinsSema.member("__double_int_int", b, span)
+            }
+            // Byte conversions: `i.uint8` truncates Int→UInt8 (low 8 bits); `b.int` zero-extends
+            // UInt8→Int (unsigned, always 0...255). These are the only Int/UInt8 conversions.
+            if b.type == .int, field == "uint8" {
+                return BuiltinsSema.member("__int_uint8_uint8", b, span)
+            }
+            if b.type == .uint8, field == "int" {
+                return BuiltinsSema.member("__uint8_int_int", b, span)
             }
 
             // String property builtins (`str.hash`). Method builtins with arguments (`str.eq(x)`)
@@ -1310,9 +1338,16 @@ public struct Sema {
             return buildImplicitEnum(name, [], expected: expected, at: span)
 
         case .binary(let op, let l, let r, let span):
-            let lhs = checkExpr(l), rhs = checkExpr(r)
+            var lhs = checkExpr(l), rhs = checkExpr(r)
+            // A bare integer literal on one side of a UInt8 operation adopts the UInt8 type, so
+            // `b + 1`, `b << 2`, `b & 240` need no conversion (arithmetic still never converts a
+            // non-literal Int to UInt8).
+            (lhs, rhs) = adoptUInt8Literal(op, lhs, rhs)
             let type = binaryResult(op, lhs, rhs, at: span)
             return NOIRExpr(type: type, span: span, kind: .binary(op, lhs, rhs))
+
+        case .unary(let op, let operand, let span):
+            return checkUnary(op, operand, at: span)
 
         case .call(let callee, let args, let span):
             return checkCall(callee: callee, args: args, span: span, expected: expected)
@@ -1710,9 +1745,21 @@ public struct Sema {
             if genericArity(name) != nil {
                 return checkGenericConstruct(name, args, at: span)
             }
-            // Construction: TypeName(...) for struct/class/actor.
+            // Construction: TypeName(...) for struct/class/actor. Thread each field's declared type
+            // in as the expected type of its argument (matched by label, else by position), so a
+            // literal adopts a `UInt8`/`Double` field and a real mismatch is a clean diagnostic.
             if let k = kindOf(name), k != .enum_ {
-                let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr($0.value)) }
+                let fields = constructorFields(name)
+                let irArgs = args.enumerated().map { (i, a) -> NOIRArg in
+                    let exp: Type? = fields.flatMap { fs in
+                        a.label.flatMap { l in fs.first { $0.label == l }?.type } ?? (i < fs.count ? fs[i].type : nil)
+                    }
+                    let v = checkExpr(a.value, expected: exp)
+                    if let exp, v.type != exp, v.type != .error, exp != .error {
+                        diags.error("argument of type '\(v.type)' does not match expected '\(exp)'", at: v.span)
+                    }
+                    return NOIRArg(label: a.label, value: v)
+                }
                 return NOIRExpr(type: .named(name, k), span: span, kind: .construct(typeName: name, args: irArgs))
             }
             // Named function / non-print builtin.
@@ -1797,17 +1844,31 @@ public struct Sema {
     private func binaryResult(_ op: BinOp, _ lhs: NOIRExpr, _ rhs: NOIRExpr, at span: Span) -> Type {
         switch op {
         case .add, .sub, .mul, .div, .mod:
-            // Arithmetic is Int or Double, with no implicit conversion between them: both
-            // operands must be the same numeric type (use `.double`/`.int` to convert).
+            // Arithmetic is Int, UInt8, or Double, with no implicit conversion between them: both
+            // operands must be the same numeric type (use `.double`/`.int`/`.uint8` to convert).
             func numeric(_ t: Type, _ span: Span) -> Bool {
-                if t == .int || t == .double { return true }
-                if t != .error { diags.error("arithmetic requires Int or Double, got '\(t)'", at: span) }
+                if t == .int || t == .uint8 || t == .double { return true }
+                if t != .error { diags.error("arithmetic requires Int, UInt8, or Double, got '\(t)'", at: span) }
                 return false
             }
             let lok = numeric(lhs.type, lhs.span), rok = numeric(rhs.type, rhs.span)
             if lok && rok && lhs.type != rhs.type {
                 diags.error("arithmetic operands must match: '\(lhs.type)' and '\(rhs.type)' (no implicit conversion)", at: lhs.span)
-                return .int
+                return lok ? lhs.type : .int
+            }
+            return lok ? lhs.type : (rok ? rhs.type : .int)
+        case .bitAnd, .bitOr, .bitXor, .shl, .shr:
+            // Bitwise and shift are integer-only (Int or UInt8), operands the same type. `>>` is an
+            // arithmetic shift on the signed Int and a logical shift on the unsigned UInt8 (egress).
+            func integral(_ t: Type, _ span: Span) -> Bool {
+                if t == .int || t == .uint8 { return true }
+                if t != .error { diags.error("bitwise and shift operators require Int or UInt8, got '\(t)'", at: span) }
+                return false
+            }
+            let lok = integral(lhs.type, lhs.span), rok = integral(rhs.type, rhs.span)
+            if lok && rok && lhs.type != rhs.type {
+                diags.error("bitwise operands must match: '\(lhs.type)' and '\(rhs.type)' (no implicit conversion)", at: lhs.span)
+                return lok ? lhs.type : .int
             }
             return lok ? lhs.type : (rok ? rhs.type : .int)
         case .lt, .gt, .lte, .gte:
@@ -1819,12 +1880,64 @@ public struct Sema {
         }
     }
 
+    // `-x` / `!x` / `~x` desugar to a binary form so no unary node reaches NOIR (or the egress):
+    // `-x` → `0 - x`, `!x` → `x == false`, `~x` → `x ^ allOnes`.
+    private mutating func checkUnary(_ op: UnaryOp, _ operand: Expr, at span: Span) -> NOIRExpr {
+        let x = checkExpr(operand)
+        switch op {
+        case .neg:
+            switch x.type {
+            case .int, .uint8:
+                let zero = NOIRExpr(type: x.type, span: span, kind: .intLit(0))
+                return NOIRExpr(type: x.type, span: span, kind: .binary(.sub, zero, x))
+            case .double:
+                let zero = NOIRExpr(type: .double, span: span, kind: .doubleLit(0))
+                return NOIRExpr(type: .double, span: span, kind: .binary(.sub, zero, x))
+            default:
+                if x.type != .error { diags.error("unary '-' requires Int, UInt8, or Double, got '\(x.type)'", at: span) }
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+        case .not:
+            guard x.type == .bool || x.type == .error else {
+                diags.error("unary '!' requires Bool, got '\(x.type)'", at: span)
+                return NOIRExpr(type: .bool, span: span, kind: .boolLit(false))
+            }
+            let f = NOIRExpr(type: .bool, span: span, kind: .boolLit(false))
+            return NOIRExpr(type: .bool, span: span, kind: .binary(.eq, x, f))
+        case .bitNot:
+            switch x.type {
+            case .int:
+                let ones = NOIRExpr(type: .int, span: span, kind: .intLit(-1))
+                return NOIRExpr(type: .int, span: span, kind: .binary(.bitXor, x, ones))
+            case .uint8:
+                let ones = NOIRExpr(type: .uint8, span: span, kind: .intLit(255))
+                return NOIRExpr(type: .uint8, span: span, kind: .binary(.bitXor, x, ones))
+            default:
+                if x.type != .error { diags.error("unary '~' requires Int or UInt8, got '\(x.type)'", at: span) }
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+        }
+    }
+
+    // Let an integer literal opposite a UInt8 operand adopt UInt8 (range-checked), so `b + 1` and
+    // `b & 240` typecheck without an explicit conversion. Only a literal moves — a non-literal Int
+    // never silently becomes UInt8.
+    private func adoptUInt8Literal(_ op: BinOp, _ lhs: NOIRExpr, _ rhs: NOIRExpr) -> (NOIRExpr, NOIRExpr) {
+        func asUInt8(_ e: NOIRExpr) -> NOIRExpr? {
+            guard case .intLit(let v) = e.kind, e.type == .int, v >= 0, v <= 255 else { return nil }
+            return NOIRExpr(type: .uint8, span: e.span, kind: .intLit(v))
+        }
+        if lhs.type == .uint8, let r = asUInt8(rhs) { return (lhs, r) }
+        if rhs.type == .uint8, let l = asUInt8(lhs) { return (l, rhs) }
+        return (lhs, rhs)
+    }
+
     // Comparison operators are numeric-only for now (a holistic operator design comes later).
     // Relational (`< > <= >=`) allows Int/Double; equality (`== !=`) also allows Bool. Both sides
     // must be the same type. Strings compare with `.eq`, not `==`; aggregates have no operator yet.
     private func checkComparison(_ lhs: NOIRExpr, _ rhs: NOIRExpr, equality: Bool, at span: Span) {
         if lhs.type == .error || rhs.type == .error { return }
-        let allowed: [Type] = equality ? [.int, .double, .bool] : [.int, .double]
+        let allowed: [Type] = equality ? [.int, .uint8, .double, .bool] : [.int, .uint8, .double]
         if lhs.type != rhs.type {
             diags.error("cannot compare '\(lhs.type)' and '\(rhs.type)'", at: span)
             return

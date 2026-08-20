@@ -90,6 +90,9 @@ extension NOIRToLLVM {
             // Formatting (shortest round-trip, always a decimal point) lives in the C floor.
             let (pf, pty) = runtimeFn("rt_print_double", ret: voidTy, params: [f64], varArg: false)
             return buildCall(pf, pty, [value])
+        case .uint8:
+            // UInt8 is i8; widen (zero-extend, unsigned) to i64 for `%lld` — always prints 0...255.
+            return buildCall(fn, ty, [intFormat(), LLVMBuildZExt(b, value, i64, "u82i")])
         case .bool:
             // Bool is i1; printf's `%lld` reads an i64, so widen to i64 (prints 0/1 as before). (8.5.2)
             return buildCall(fn, ty, [intFormat(), LLVMBuildZExt(b, value, i64, "b2i")])
@@ -99,7 +102,7 @@ extension NOIRToLLVM {
             let len32 = LLVMBuildTrunc(b, len, i32, "len32")
             return buildCall(fn, ty, [strFormat(), len32, data])
         default:
-            fail("8.2.1: print supports Int, Double, Bool, or String", arg.value.span)
+            fail("8.2.1: print supports Int, UInt8, Double, Bool, or String", arg.value.span)
             return nil
         }
     }
@@ -121,6 +124,22 @@ extension NOIRToLLVM {
         let (fn, ty) = runtimeFn("llvm.round.f64", ret: f64, params: [f64], varArg: false)
         let rounded = buildCall(fn, ty, [v])!
         return LLVMBuildFPToSI(b, rounded, i64, "d2i")
+    }
+
+    // `i.uint8` — narrow Int (i64) to UInt8 (i8), keeping the low 8 bits.
+    func lowerIntToUInt8(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
+        guard let v = args.first.flatMap({ lowerExpr($0.value) }) else {
+            fail("__int_uint8_uint8 expects one argument", span); return nil
+        }
+        return LLVMBuildTrunc(b, v, i8, "i2u8")
+    }
+
+    // `b.int` — widen UInt8 (i8) to Int (i64), zero-extended (unsigned, always 0...255).
+    func lowerUInt8ToInt(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
+        guard let v = args.first.flatMap({ lowerExpr($0.value) }) else {
+            fail("__uint8_int_int expects one argument", span); return nil
+        }
+        return LLVMBuildZExt(b, v, i64, "u82i")
     }
 
     // A C-leaf builtin: a call to the same-named C function, with parameter/return types read from

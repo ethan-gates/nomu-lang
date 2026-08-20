@@ -12,7 +12,7 @@ fun main() {
     let x = 7
     let y = 4
     print(bigger(x, y))     // 7
-    print(classify(0 - 3))  // 0
+    print(classify(-3))     // 0
     print(classify(0))      // 1
     print(classify(9))      // 2
 }

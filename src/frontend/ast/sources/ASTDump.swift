@@ -149,6 +149,8 @@ private func describeExpr(_ e: Expr) -> String {
     case .implicitMember(let name, _): return ".\(name)"
     case .binary(let op, let l, let r, _):
         return "\(describeExpr(l)) \(describeOp(op)) \(describeExpr(r))"
+    case .unary(let op, let e, _):
+        return "\(describeUnaryOp(op))\(describeExpr(e))"
     case .call(let callee, let args, _):
         return "\(describeExpr(callee))(\(describeArgs(args)))"
     case .closure(let params, let ret, _, _):
@@ -192,5 +194,18 @@ private func describeOp(_ op: BinOp) -> String {
     case .gt:  return ">"
     case .lte: return "<="
     case .gte: return ">="
+    case .bitAnd: return "&"
+    case .bitOr:  return "|"
+    case .bitXor: return "^"
+    case .shl:    return "<<"
+    case .shr:    return ">>"
+    }
+}
+
+private func describeUnaryOp(_ op: UnaryOp) -> String {
+    switch op {
+    case .neg:    return "-"
+    case .not:    return "!"
+    case .bitNot: return "~"
     }
 }

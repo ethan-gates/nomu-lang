@@ -16,5 +16,5 @@ swift_test(
     name = "ssairgen_tests",
     srcs = glob(["tests/*.swift"]),
     deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir",
-            "//src/frontend/sema", "//src/midend/ssair", ":ssairgen"],
+            "//src/frontend/sema", "//src/midend/ssair", "//src/midend/ssairpasses", ":ssairgen"],
 )
