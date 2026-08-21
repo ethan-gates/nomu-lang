@@ -36,3 +36,24 @@ fun min(a: Int, b: Int) -> Int {
     if a < b { return a }
     return b
 }
+
+
+struct SimpleRNG {
+    var seed: Int
+    // Smaller parameters to prevent native Int overflow crashes
+    // Generates the next pseudo-random Int
+    fun next() -> Int {
+        // Uses only standard multiplication, addition, and remainder operators
+        let t = 1103515245 * self.seed + 12345
+        self.seed = t % 2147483647
+        return self.seed
+    }
+
+    // Returns a random Int within a bounded range
+    fun nextInBound(min: Int, max: Int) -> Int {
+        let currentRandom = self.next()
+        let rangeSize = max - min + 1
+        let scaledValue = currentRandom % rangeSize
+        return scaledValue + min
+    }
+}

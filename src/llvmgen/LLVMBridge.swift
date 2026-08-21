@@ -151,7 +151,7 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     // their call sites before the statepoint rewrite, so the poll's fast path is a bare load+branch
     // and only its cold slow-path call carries a statepoint. `default<O2>` already inlines.
     let pipeline = optimize
-        ? "default<O2>,rewrite-statepoints-for-gc"
+        ? "default<O3>,rewrite-statepoints-for-gc"
         : "function(mem2reg,sroa),always-inline,rewrite-statepoints-for-gc"
     if ProcessInfo.processInfo.environment["NOMU_DUMP_LLVM"] != nil {
         (path + ".pre.ll").withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }

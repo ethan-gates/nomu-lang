@@ -1338,7 +1338,12 @@ public struct Sema {
             return buildImplicitEnum(name, [], expected: expected, at: span)
 
         case .binary(let op, let l, let r, let span):
-            var lhs = checkExpr(l), rhs = checkExpr(r)
+            // A value op (arithmetic / bitwise / shift) produces its operand type, so an expected
+            // type flows into both operands — `let b: UInt8 = 5 + 3` or `1 << 4` types its literals
+            // as UInt8. A comparison yields Bool, so its context does not describe the operands.
+            let operandExpected: Type? = isComparisonOp(op) ? nil : expected
+            var lhs = checkExpr(l, expected: operandExpected)
+            var rhs = checkExpr(r, expected: operandExpected)
             // A bare integer literal on one side of a UInt8 operation adopts the UInt8 type, so
             // `b + 1`, `b << 2`, `b & 240` need no conversion (arithmetic still never converts a
             // non-literal Int to UInt8).
@@ -1347,7 +1352,9 @@ public struct Sema {
             return NOIRExpr(type: type, span: span, kind: .binary(op, lhs, rhs))
 
         case .unary(let op, let operand, let span):
-            return checkUnary(op, operand, at: span)
+            // `-x` / `~x` produce the operand's type, so an expected type flows in (`let m: UInt8 =
+            // ~0`); `!x` operates on Bool, so its context does not describe the operand.
+            return checkUnary(op, operand, at: span, expected: op == .not ? nil : expected)
 
         case .call(let callee, let args, let span):
             return checkCall(callee: callee, args: args, span: span, expected: expected)
@@ -1880,10 +1887,19 @@ public struct Sema {
         }
     }
 
+    // A comparison / equality operator (result Bool), vs a value op (result = operand type).
+    private func isComparisonOp(_ op: BinOp) -> Bool {
+        switch op {
+        case .eq, .neq, .lt, .gt, .lte, .gte: return true
+        default:                              return false
+        }
+    }
+
     // `-x` / `!x` / `~x` desugar to a binary form so no unary node reaches NOIR (or the egress):
-    // `-x` → `0 - x`, `!x` → `x == false`, `~x` → `x ^ allOnes`.
-    private mutating func checkUnary(_ op: UnaryOp, _ operand: Expr, at span: Span) -> NOIRExpr {
-        let x = checkExpr(operand)
+    // `-x` → `0 - x`, `!x` → `x == false`, `~x` → `x ^ allOnes`. `expected` flows into the operand
+    // for the value ops (`-`, `~`) so a UInt8 context reaches its literal.
+    private mutating func checkUnary(_ op: UnaryOp, _ operand: Expr, at span: Span, expected: Type?) -> NOIRExpr {
+        let x = checkExpr(operand, expected: expected)
         switch op {
         case .neg:
             switch x.type {
