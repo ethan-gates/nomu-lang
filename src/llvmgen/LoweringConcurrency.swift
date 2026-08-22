@@ -233,6 +233,7 @@ extension NOIRToLLVM {
             case "__double_int_int": return lowerDoubleToInt(args, span)
             case "__int_uint8_uint8": return lowerIntToUInt8(args, span)
             case "__uint8_int_int": return lowerUInt8ToInt(args, span)
+            case "__void_timemonotonic_int": return lowerTimeMonotonic(args, span)
             default:       break
             }
             // A closure-typed local is an indirect call; a global function name is direct.

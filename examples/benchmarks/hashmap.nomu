@@ -92,6 +92,9 @@ class HashTable {
     }
 
     fun set(key: String, value: Int) {
+        let t = Time()
+        let t1 = t.now
+
         if self.count * 4 + 4 > self.capacity * 3 {   // (count + 1) / capacity > 0.75
             self.resize(self.capacity * 2)
         }
@@ -101,6 +104,13 @@ class HashTable {
         if st == 0 {
             self.count = self.count + 1   // filled a fresh bucket; tombstone reuse / overwrite do not
         }
+        print("set() took: ")
+        print(t.ms_since(t1))
+        print("ms ")
+        print(t.micro_since(t1))
+        print("µs ")
+        print(t.ns_since(t1))
+        print("ns\n")
     }
 
     fun get(key: String) -> Option<Int> {
@@ -137,8 +147,12 @@ fun makeTable() -> HashTable {
 
 fun show(t: HashTable, key: String) {
     switch t.get(key) {
-    case .some(let v): print(v)
-    case .none:        print(0)
+    case .some(let v):
+        print(v)
+        print("\n")
+    case .none:
+        print(0)
+        print("\n")
     }
 }
 

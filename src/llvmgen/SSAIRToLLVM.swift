@@ -613,6 +613,7 @@ final class SSAIRToLLVM {
             return LLVMBuildFPToSI(b, rounded, e.i64, "d2i")
         case "__int_uint8_uint8": return LLVMBuildTrunc(b, val(args[0]), e.i8, "i2u8")
         case "__uint8_int_int":   return LLVMBuildZExt(b, val(args[0]), e.i64, "u82i")
+        case "__void_timemonotonic_int": return emitTimeMonotonic(args, span)
         default:
             if Builtins.cLeaf.contains(name) { return emitCLeaf(name, args) }
             // A user free function or a method symbol — resolve the declared callable.
@@ -681,6 +682,11 @@ final class SSAIRToLLVM {
         default:
             e.fail("7.2.3: print supports Int, UInt8, Double, Bool, or String", span); return nil
         }
+    }
+
+    private func emitTimeMonotonic(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
+        let (fn, pty) = e.runtimeFn("__void_timemonotonic_int", ret: e.i64, params: [], varArg: false)
+        return e.buildCall(fn, pty, [])
     }
 
     private func emitConcat(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {

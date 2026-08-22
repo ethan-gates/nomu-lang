@@ -76,6 +76,11 @@ extension NOIRToLLVM {
         }
     }
 
+    func lowerTimeMonotonic(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
+        let (fn, ty) = runtimeFn("__void_timemonotonic_int", ret: i64, params: [], varArg: false)
+        return buildCall(fn, ty, [])
+    }
+
     // print(Int|Bool) → printf("%lld\n", n);  print(String) → printf("%.*s\n", (int)len, data).
     func lowerPrint(_ args: [NOIRArg], _ span: Span) -> LLVMValueRef? {
         guard let arg = args.first, let value = lowerExpr(arg.value) else {

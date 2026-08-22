@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>   // strtod — shortest round-trip Double formatting
+#include <time.h>
 
 // Print a Double: the fewest significant digits that round-trip back to the same value, always
 // with a decimal point (so a whole-valued Double reads as `42.0`, never `42`), then a newline.
@@ -62,4 +63,17 @@ int64_t __string_hash_int(String s) {
 int64_t __string_eq_bool_string(String l, String r) {
     if (l.len != r.len) return 0;
     return memcmp(l.data, r.data, (size_t)l.len) == 0;
+}
+
+// Get monotonic time for benchmarking
+int64_t __void_timemonotonic_int(void) {
+    struct timespec ts;
+
+    // Using CLOCK_MONOTONIC for stable duration benchmarking.
+    // If you need real calendar time since 1970, swap with CLOCK_REALTIME.
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    // Cast variables to 64-bit first to avoid integer overflow
+    // during the 1-billion multiplication step.
+    return ((int64_t)ts.tv_sec * 1000000000LL) + (int64_t)ts.tv_nsec;
 }

@@ -37,6 +37,29 @@ fun min(a: Int, b: Int) -> Int {
     return b
 }
 
+struct Time {
+    // A quick struct used for basic timing, needs actual design work
+
+    // lowers to `clock_gettime(CLOCK_MONOTONIC, &ts);` from time.h
+    var now: Int {
+        return time_monotonic()
+    }
+
+    fun ms_since(t1: Int) -> Int {
+        let diff = time_monotonic() - t1
+        return diff / 1000000
+    }
+
+    fun micro_since(t1: Int) -> Int {
+        let diff = time_monotonic() - t1
+        return diff / 1000
+    }
+
+    fun ns_since(t1: Int) -> Int {
+        let t2 = time_monotonic()
+        return t2 - t1
+    }
+}
 
 struct SimpleRNG {
     var seed: Int

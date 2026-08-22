@@ -1748,6 +1748,10 @@ public struct Sema {
                 let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr($0.value)) }
                 return NOIRExpr(type: .void, span: span, kind: .call(callee: irVar(name, .void, span), args: irArgs, typeArgs: []))
             }
+
+            if name == "time_monotonic" {
+                return NOIRExpr(type: .int, span: span, kind: .call(callee: irVar("__void_timemonotonic_int", .int, span), args: [], typeArgs:[]))
+            }
             // Construction of a generic type — infer the type arguments from the fields (M5 5.2.3).
             if genericArity(name) != nil {
                 return checkGenericConstruct(name, args, at: span)

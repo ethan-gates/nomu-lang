@@ -121,14 +121,14 @@ extension LLVMGen {
 
     func intFormat() -> LLVMValueRef {
         if let f = intFmt { return f }
-        let f = LLVMBuildGlobalStringPtr(b, "%lld\n", "fmt_int")!
+        let f = LLVMBuildGlobalStringPtr(b, "%lld", "fmt_int")!
         intFmt = f
         return f
     }
 
     func strFormat() -> LLVMValueRef {
         if let f = strFmt { return f }
-        let f = LLVMBuildGlobalStringPtr(b, "%.*s\n", "fmt_str")!
+        let f = LLVMBuildGlobalStringPtr(b, "%.*s", "fmt_str")!
         strFmt = f
         return f
     }
