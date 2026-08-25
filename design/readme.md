@@ -40,9 +40,9 @@ Steering docs (`vision.md`, `roadmap.md`, this index) stay at the root. Docs cro
 
 - [plans/deferred.md](plans/deferred.md) — TODO backlog: feature work intentionally postponed, each with its un-park trigger.
 - [plans/ssair-backlog.md](plans/ssair-backlog.md) — consolidated backlog of SSAIR-tier work (passes, analyses, IR/infra, validation).
-- [plans/m7-spec.md](plans/m7-spec.md) — M7 build plan (the optimizer tier — SSAIR). **M7 done**; durable design folds into `internals/compiler.md` §1a/§2 + `internals/memory-model.md` §6.1, then this archives to `plans/archive/`.
 
-**Retired milestone specs** (spec deleted/archived once done; the code + the folded design are the record):
+**Retired milestone specs** — a spec is **deleted once done**: its durable design (and any directions not taken) folds into `language/` + `internals/`, and git + the code are the record.
+- **M7 (optimizer tier — SSAIR) — done (2026-08-24).** SSAIR + the pass framework + precise escape analysis (stack + scalar promotion), devirtualization, inlining; the NOIR→LLVM path retired at M7.7, leaving SSAIR the sole egress. Durable design folded to `internals/compiler.md` §1a (IR shape + decisions) and §2 (GC-precision invariants I1–I10 + `Tn` obligations), and `internals/memory-model.md` §6.1 (escape analysis as-built); tails in `plans/ssair-backlog.md`.
 - **M9 (LLVM backend) — done (2026-08-03).** Design/rationale in `internals/compiler.md` §2 (backend, GC substrate); follow-ups in `plans/deferred.md` ("Post-M9 backlog").
 - **M6 (real GC via MMTk) — done (2026-08-13).** Durable design folded to `internals/memory-model.md` §3, `internals/runtime.md` §6, `internals/compiler.md` §2, `internals/concurrency.md` §9.
 

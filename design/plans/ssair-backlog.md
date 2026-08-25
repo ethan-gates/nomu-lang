@@ -1,9 +1,11 @@
 # SSAIR tier — work backlog
 
 Consolidated backlog of SSAIR-stage (mid-level optimizer tier) work: passes, analyses, IR/infra, and
-validation. This is the **index + brainstorm surface** for the tier. The detailed build plan and the
-decisions live in `m7-spec.md` (§7.x); cross-cutting language/feature deferrals live in `deferred.md`.
-Items already scheduled under an M7 phase carry a `[§7.x]` pointer; items first raised here are `[new]`.
+validation. This is the **index + brainstorm surface** for the tier. The as-built design + decisions
+live in `internals/compiler.md` §1a/§2 + `internals/memory-model.md` §6.1 (the `m7-spec` build plan was
+retired on M7 completion); cross-cutting language/feature deferrals live in `deferred.md`. The `[§7.x]`
+tags are milestone-phase labels (shared vocabulary), not links to a live doc; `[new]` items were first
+raised here.
 
 **Tagging:** `[size · status]` — size ∈ {S, M, L}; status ∈ {shipped, next, deferred, evaluate}.
 

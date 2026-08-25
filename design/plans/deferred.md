@@ -783,7 +783,7 @@ midend/backend changes. Each is still a real feature; the shared thread is limit
   lowering is frontend (to the existing `while`). **Perf contract (decided 2026-08-19):** `for … in`
   is the **bounds-check-free-by-construction** iteration path (safe-by-construction, Rust-iterator
   style) — so array iteration needs no bounds-check-elimination pass; the M7 BCE loop-bound case was
-  descoped in favor of this (`m7-spec.md` §7.5). **Roadmap: one-liner pointer** — core surface, the
+  descoped in favor of this (`compiler.md` §1a, "As built"). **Roadmap: one-liner pointer** — core surface, the
   iterator interface is a small design contract, and it carries this perf-envelope commitment.
 - **Associated types + where-clauses on generics** `[language-feature · needs-design]` — associated
   types on interfaces (`associatedtype`) and `where` clauses on generic bounds. The heaviest of this

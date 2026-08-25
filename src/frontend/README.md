@@ -2,7 +2,7 @@
 
 The Nomu frontend — lexer, parser, AST, and the semantic pass (typed IR = NOIR). As of M7
 §7.1 the old single `frontend` module is **split into per-stage modules** grouped under this
-directory, with an interface/implementation separation (`design/plans/m7-spec.md` §7.1, `compiler.md`
+directory, with an interface/implementation separation (`design/internals/compiler.md` §8, `compiler.md`
 §8):
 
 - `frontend/ast` (Token, AST, ASTDump) — syntactic interface · `frontend/parse` (Lexer, Parser) — impl

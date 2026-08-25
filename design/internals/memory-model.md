@@ -115,9 +115,18 @@ A class whose fields are all `let` (recursively) is a deeply-immutable type — 
 
 ### 6.1 Escape analysis and allocation
 
-The compiler performs **escape analysis** to keep non-escaping objects off the GC heap (stack allocation / scalar replacement), and heap allocation uses the collector's fast path (bump-pointer in a thread-local buffer). — **Decided (direction); Deferred (implementation).**
+The compiler performs **escape analysis** to keep non-escaping objects off the GC heap (stack allocation / scalar replacement), and heap allocation uses the collector's fast path (bump-pointer in a thread-local buffer). — **Decided + Built (M6 conservative → M7 precise, 2026-08-24).**
 
 This is the mechanism that recovers manual-memory-grade performance for the common case with no programmer involvement. An object the compiler proves doesn't escape its frame never touches the collector at all. This analysis is a **best-effort optimization, not a soundness requirement**: if it can't prove locality, the fallback is "allocate on the GC heap" — always correct, merely unoptimized. Its precision affects speed only, never correctness, and never the programmer.
+
+**As built.** Two generations. **M6** shipped a conservative front-end pass (`EscapeAnalysis.swift`, NOIR→NOIR, intra-procedural, single-walk, no flow sensitivity) feeding codegen a side table of non-escaping sites; it un-heaped the leaf case. **M7** replaced it with a precise flow-sensitive pass on the SSAIR tier (def-use + CFG), reusing the same codegen-consumer contract, and retired the conservative pass with the NOIR egress (M7.7). The M7 pass does two rewrites:
+
+- **Stack promotion** — a non-escaping `alloc` (class instance, closure object, or `any I` box) becomes a `stackAlloc` and its write barriers drop; the egress builds the object storage on an entry alloca, so LLVM's SROA scalar-replaces it and a managed field becomes a statepoint-tracked SSA root (the I5 mechanism, `compiler.md` §2). Actors are never promoted (shared-heap semantics).
+- **Scalar promotion (loop-carried φ-web)** — a non-escaping class reassigned to a fresh allocation each iteration flows through a loop block-parameter φ; LLVM's SROA cannot un-heap a phi-captured allocation, so the tier decomposes the object into per-field SSA values (the object φ widens into one φ per field, the `alloc` disappears, a managed field becomes an ordinary `addrspace(1)` SSA root). This is **Approach B — field scalarization**, the move Swift SIL (explode loadable aggregates) and Go SSA (`decompose`) make above their backend. *(Rejected Approach A — a single hoisted stack slot threaded through the loop φ: it needs the `p1`-block-param addrspace wall, carries a field-order aliasing hazard when a prior object is read after the fresh one is built, and LLVM won't scalarize a phi-captured slot anyway, so the register win may not land.)*
+
+Non-escape is over-approximate (I4, `compiler.md` §2): a value escapes on return, any call/send/spawn argument, a store *of* the value, boxing, or capture. Scalar promotion's soundness reduces to two already-trusted mechanisms — SSA construction at field granularity, and `addrspace(1)` SSA values relocated by the statepoint rewriter.
+
+**Rejected / deferred directions.** *Array-buffer stack promotion was assessed and dropped* — a statically-bounded, never-appended `arrayLit` catches almost nothing (the costly arrays are `.append` loops and runtime-sized scratch buffers, exactly what such a gate rejects); the real lever is smallvec-style inline storage, a representation change that belongs with the stdlib `Array` design, not this pass. Deferred tails — interprocedural "any call argument escapes" lift, closure-env / spawn-env promotion, in-place-mutation scalar promotion, wider scalarizable field types — are in `plans/ssair-backlog.md`.
 
 ### 6.2 Deterministic resource cleanup
 

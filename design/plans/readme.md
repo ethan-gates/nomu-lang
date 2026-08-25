@@ -8,5 +8,6 @@ parked and in-flight work.
 - `ssair-backlog.md` — the SSAIR optimizer-tier backlog.
 - `mN-spec.md` — a milestone's ordered build plan (authored per `milestone-doc-guide.md` at the repo root).
 
-A completed milestone spec is **archived** to `archive/`, not deleted: its durable design folds up
-into `../language/` + `../internals/` first, and the slice-level history stays readable here.
+A completed milestone spec is **deleted**, not kept: its durable design — and any directions explicitly
+*not* taken — folds up into `../language/` + `../internals/` first, then git and the code are the record.
+(Nothing durable dies; a stale build-plan doesn't linger.)
