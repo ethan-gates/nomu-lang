@@ -2,7 +2,7 @@
 
 The Nomu compiler, split into per-stage Bazel modules grouped by pipeline phase (M7 §7.1 —
 interface modules hold each IR's format, implementation modules hold the code;
-`design/compiler.md` §8):
+`design/internals/compiler.md` §8):
 
 - **support** — Span, Diagnostic, the semantic Type model (shared leaf, top-level, no deps)
 

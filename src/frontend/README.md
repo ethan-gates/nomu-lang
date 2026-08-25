@@ -2,7 +2,7 @@
 
 The Nomu frontend — lexer, parser, AST, and the semantic pass (typed IR = NOIR). As of M7
 §7.1 the old single `frontend` module is **split into per-stage modules** grouped under this
-directory, with an interface/implementation separation (`design/m7-spec.md` §7.1, `compiler.md`
+directory, with an interface/implementation separation (`design/plans/m7-spec.md` §7.1, `compiler.md`
 §8):
 
 - `frontend/ast` (Token, AST, ASTDump) — syntactic interface · `frontend/parse` (Lexer, Parser) — impl
@@ -12,7 +12,7 @@ directory, with an interface/implementation separation (`design/m7-spec.md` §7.
 Siblings outside this directory: `support` (Span, Diagnostic, Type — the shared leaf, top-level)
 and `midend` (Monomorphize — NOIR→NOIR, grouped with the M7 SSAIR tier).
 
-The frontend is **kept across the C→LLVM backend transition** (`design/compiler.md` §6), so
+The frontend is **kept across the C→LLVM backend transition** (`design/internals/compiler.md` §6), so
 architectural gaps here are real — unlike C-backend-only limitations, which are throwaway
 scaffolding. This backlog covers the frontend stages as a whole; most remaining items (modular
 checking, the query engine, monomorphization) are Sema-centric.
@@ -23,7 +23,7 @@ A living, prioritized backlog of frontend work that keeps the committed
 architecture reachable — the tooling/query server (`compiler.md` §3), fine-grained
 incremental compilation (§8), and debug info (§1/§4). Seeded 2026-07-30 from the
 architecture evaluation. Design deferrals (features, not architecture) live in
-`design/deferred.md`.
+`design/plans/deferred.md`.
 
 ### P0 — no-crash contract + parser error recovery — **done (2026-07-30)**
 Was the **one live architectural blocker** for the query-server / LSP goal: the

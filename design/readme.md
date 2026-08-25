@@ -1,33 +1,52 @@
 # Nomu Design
 
-Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease and deployment, none of Rust's friction.* Design phase — these are working records, not specs.
+Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease and deployment, none of Rust's friction.* Design phase — these are working records.
 
 **Name:** Nomu · **source extension:** `.nomu` · **function keyword:** `fun`.
 
-## Contents
+## Layout
+
+The docs are organized by **audience/fidelity**, mirroring the three sources of truth from cheapest-to-read to most-exact:
+
+- **[`language/`](language/readme.md)** — the **contract**: what Nomu guarantees and aims for, programmer-facing, short. Distilled intent; source of the eventual public docs. *(Being authored, distilled from `internals/`.)*
+- **[`internals/`](internals/readme.md)** — the **as-built design**: how the compiler and runtime actually work, accurate to the code, for a dev/LLM making a change. The detailed design + rationale + invariants.
+- **code** — the exact source, most costly to read.
+- **[`plans/`](plans/readme.md)** — ephemeral work-tracking (backlogs, milestone build-plans); not durable design.
+
+Steering docs (`vision.md`, `roadmap.md`, this index) stay at the root. Docs cross-reference each other by name (`compiler.md §2`), so the name resolves regardless of folder.
+
+## Steering
 
 - [vision.md](vision.md) — what Nomu is for: goals, performance profile, design principles, rejected directions, and the tiebreaker for future decisions.
-- [memory-model.md](memory-model.md) — the value/reference split, the GC (MMTk), immutability, escape analysis, the performance recipe, and every binding form's memory meaning.
-- [types.md](types.md) — type system apart from interfaces: generics + dispatch, sum types + exhaustive matching, error handling.
-- [c-types.md](c-types.md) — C-backed standard-library types (String, `Array<T>`, planned numeric primitives + spawn group): layout, the allocation/GC seam, and the runtime contract, before they migrate into a Nomu-written stdlib.
-- [generics.md](generics.md) — **authoritative as-built spec** for generics: parameters, inference, checking, witness-passing + monomorphization, generic types, the `shared` bound + conditional conformance, exhaustiveness, `Result`.
-- [interfaces.md](interfaces.md) — conformance, dispatch, extensions, and composition.
-- [modules.md](modules.md) — **stub**: modules / compilation units and access control (undesigned; reserved).
-- [concurrency.md](concurrency.md) — concurrency model, suspension primitive, share analysis, closures, continuations.
-- [runtime.md](runtime.md) — the execution substrate: M:N scheduler, wakeup feeders, cross-thread resume, platform/syscall strategy, FFI-readiness.
-- [syntax.md](syntax.md) — surface-syntax principles (one canonical form per concept).
-- [macros.md](macros.md) — typed hygienic AST macros; extension-only role.
-- [compiler.md](compiler.md) — compiler architecture, mid-level IR, backend strategy, tooling, debugger.
-- [builtin.md](builtin.md) — how-to: adding a C-backed builtin method / property / free function and wiring it through Sema, codegen, and the safepoint pass (no lexer/parser change).
-- **M9 (LLVM backend) — done (2026-08-03), spec retired.** 8.1–8.4 and the 8.5.2/8.5.3 perf items shipped; the implementation is the record. Design/rationale live in `compiler.md` (§2 backend, incl. the GC backend substrate); forward-looking follow-ups are in `deferred.md` ("Post-M9 backlog"). 8.5.1/8.5.4 remain descoped perf.
-- **M6 (real GC via MMTk) — done (2026-08-13), spec retired.** The moving GenImmix collector, object model, precise roots/safepoints/barriers, async actor runtime, conservative escape analysis, inline allocation. The code is the record; durable design folded to `memory-model.md` §3 (object model), `runtime.md` §6 (safepoints, parked-fiber scan, mutator granularity), `compiler.md` §2 (GC backend substrate), `concurrency.md` §9 (actor runtime).
-- [loops.md](loops.md) — **draft for review**: Nomu's iteration construct (`while`) — syntax, semantics, lowering. The loop back-edge hosts the safepoint poll.
-- [m7-spec.md](m7-spec.md) — **working draft**: M7 implementation spec (build plan) for the optimizer tier — **SSAIR** (a lower CFG/SSA IR, separate from NOIR) + the pass framework + precise escape analysis, devirtualization, BCE, inlining. Design/why in `compiler.md` §1a. Follows `lang-project/milestone-doc-guide.md`.
-- [ssair-backlog.md](ssair-backlog.md) — consolidated backlog of SSAIR-tier work (passes, analyses, IR/infra, validation): the index + brainstorm surface, cross-referencing `m7-spec.md` (build plan) and `deferred.md`.
 - [roadmap.md](roadmap.md) — milestones (provisional, post-pivot).
-- [deferred.md](deferred.md) — TODO backlog: feature work intentionally postponed, each with its un-park trigger.
 
-The full decision history and rationale used to live in a separate `early-design.md`; it has been dissolved into the per-subsystem docs above, each of which now carries its own rationale and open questions.
+## Internals (as-built design)
+
+- [internals/memory-model.md](internals/memory-model.md) — the value/reference split, the GC (MMTk), immutability, escape analysis, the performance recipe, and every binding form's memory meaning.
+- [internals/types.md](internals/types.md) — type system apart from interfaces: generics + dispatch, sum types + exhaustive matching, error handling.
+- [internals/generics.md](internals/generics.md) — **authoritative as-built spec** for generics: parameters, inference, checking, witness-passing + monomorphization, generic types, the `shared` bound + conditional conformance, exhaustiveness, `Result`.
+- [internals/interfaces.md](internals/interfaces.md) — conformance, dispatch, extensions, and composition.
+- [internals/concurrency.md](internals/concurrency.md) — concurrency model, suspension primitive, share analysis, closures, continuations.
+- [internals/syntax.md](internals/syntax.md) — surface-syntax principles (one canonical form per concept).
+- [internals/loops.md](internals/loops.md) — Nomu's iteration construct (`while`) — syntax, semantics, lowering. The loop back-edge hosts the safepoint poll.
+- [internals/macros.md](internals/macros.md) — typed hygienic AST macros; extension-only role.
+- [internals/modules.md](internals/modules.md) — **stub**: modules / compilation units and access control (undesigned; reserved).
+- [internals/runtime.md](internals/runtime.md) — the execution substrate: M:N scheduler, wakeup feeders, cross-thread resume, platform/syscall strategy, FFI-readiness.
+- [internals/compiler.md](internals/compiler.md) — compiler architecture, mid-level IR (NOIR + the SSAIR optimizer tier), backend strategy, tooling, debugger.
+- [internals/c-types.md](internals/c-types.md) — C-backed standard-library types (String, `Array<T>`, planned numeric primitives + spawn group): layout, the allocation/GC boundary, and the runtime contract, before they migrate into a Nomu-written stdlib.
+- [internals/builtin.md](internals/builtin.md) — how-to: adding a C-backed builtin method / property / free function and wiring it through Sema, codegen, and the safepoint pass (no lexer/parser change).
+
+## Plans (ephemeral)
+
+- [plans/deferred.md](plans/deferred.md) — TODO backlog: feature work intentionally postponed, each with its un-park trigger.
+- [plans/ssair-backlog.md](plans/ssair-backlog.md) — consolidated backlog of SSAIR-tier work (passes, analyses, IR/infra, validation).
+- [plans/m7-spec.md](plans/m7-spec.md) — M7 build plan (the optimizer tier — SSAIR). **M7 done**; durable design folds into `internals/compiler.md` §1a/§2 + `internals/memory-model.md` §6.1, then this archives to `plans/archive/`.
+
+**Retired milestone specs** (spec deleted/archived once done; the code + the folded design are the record):
+- **M9 (LLVM backend) — done (2026-08-03).** Design/rationale in `internals/compiler.md` §2 (backend, GC substrate); follow-ups in `plans/deferred.md` ("Post-M9 backlog").
+- **M6 (real GC via MMTk) — done (2026-08-13).** Durable design folded to `internals/memory-model.md` §3, `internals/runtime.md` §6, `internals/compiler.md` §2, `internals/concurrency.md` §9.
+
+The full decision history once lived in a separate `early-design.md`; it has been dissolved into the per-subsystem docs, each of which now carries its own rationale and open questions.
 
 ## Reading the status tags
 

@@ -1,4 +1,4 @@
-// Loops (`design/loops.md`): the pre-tested `while` loop with `break` and `continue`.
+// Loops (`design/internals/loops.md`): the pre-tested `while` loop with `break` and `continue`.
 // Iteration is `var i = 0; while i < n { …; i += 1 }` until `for … in` and ranges land.
 
 fun sumTo(n: Int) -> Int {
