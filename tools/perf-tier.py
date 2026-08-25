@@ -3,17 +3,16 @@
 
 Compiles each workload under a set of pass configurations, runs the resulting binary
 several times (best wall-clock reported, to cut noise), and prints a table of times and
-speedups. Correctness is guarded: every tier config's stdout must match the NOIR baseline's,
+speedups. Correctness is guarded: every config's stdout must match the `off` baseline's,
 so a config that changes program output is flagged rather than silently trusted.
 
-Configurations (all but `noir` use the SSAIR egress; passes are A/B-toggled by NOMU_NO_*):
+Configurations (all on the SSAIR egress — the sole backend path; passes A/B-toggled by NOMU_NO_*):
 
-  noir   the pre-M7 NOIR oracle egress (reference point)
-  off    SSAIR, every pass disabled  (the inert tier — isolates egress cost)
-  esc    off + escape analysis only
+  off    every pass disabled  (the inert tier — the correctness + timing baseline)
+  esc    off + escape analysis (stack + scalar promotion) only
   dev    off + devirtualization only
   di     off + devirt + inline       (inline's targets come from devirt)
-  all    SSAIR, every pass on        (the compounded pipeline)
+  all    every pass on               (the compounded pipeline)
 
 Usage:
   tools/perf-tier.py [--iters N] [--release] [workload ...]
@@ -35,12 +34,11 @@ BENCH_DIR = os.path.join(ROOT, "examples", "benchmarks")
 # name -> extra environment (on top of the SSAIR egress, except `noir`). A pass is *enabled*
 # by the absence of its NOMU_NO_* flag; `off` disables all three.
 CONFIGS = [
-    ("noir", {}),                                                              # NOIR oracle
-    ("off",  {"NOMU_EGRESS": "ssair", "NOMU_NO_DEVIRT": "1", "NOMU_NO_INLINE": "1", "NOMU_NO_ESCAPE": "1"}),
-    ("esc",  {"NOMU_EGRESS": "ssair", "NOMU_NO_DEVIRT": "1", "NOMU_NO_INLINE": "1"}),
-    ("dev",  {"NOMU_EGRESS": "ssair", "NOMU_NO_INLINE": "1", "NOMU_NO_ESCAPE": "1"}),
-    ("di",   {"NOMU_EGRESS": "ssair", "NOMU_NO_ESCAPE": "1"}),
-    ("all",  {"NOMU_EGRESS": "ssair"}),
+    ("off", {"NOMU_NO_DEVIRT": "1", "NOMU_NO_INLINE": "1", "NOMU_NO_ESCAPE": "1"}),  # the inert tier
+    ("esc", {"NOMU_NO_DEVIRT": "1", "NOMU_NO_INLINE": "1"}),
+    ("dev", {"NOMU_NO_INLINE": "1", "NOMU_NO_ESCAPE": "1"}),
+    ("di",  {"NOMU_NO_ESCAPE": "1"}),
+    ("all", {}),                                                                     # every pass on
 ]
 
 # The tier microbenchmarks plus real GC/compute workloads.
@@ -131,9 +129,9 @@ def main():
                 continue
             ms, out = run_timed(binary, iters)
             times[name] = ms
-            if name == "noir":
-                baseline_out = out
-            elif baseline_out is not None and out != baseline_out:
+            if baseline_out is None:
+                baseline_out = out            # the first config (off) is the correctness reference
+            elif out != baseline_out:
                 note += f"  [!{name} output differs]"
 
         def cell(n):

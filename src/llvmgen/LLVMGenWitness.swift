@@ -1,5 +1,4 @@
 import sema
-import midend
 import noir
 import ast
 import support

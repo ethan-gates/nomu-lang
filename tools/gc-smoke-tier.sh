@@ -4,7 +4,7 @@
 # dropped or spurious root is a failed assertion rather than silent, non-deterministic relocation
 # corruption. Companion to tools/gc-smoke.sh (which pins EA OFF); this is the tier-ON refinement.
 #
-# Runs examples/gc_smoke.nomu under NOMU_EGRESS=ssair (EA on) + NOMU_GC_SMOKE=1; the runtime walks the
+# Runs examples/gc_smoke.nomu under (EA on) + NOMU_GC_SMOKE=1; the runtime walks the
 # stack at the `sleep` safepoint and reports each recovered root's offset-8 field on stderr.
 #
 # Expected: the EA-off 5-root set {111×2, 222, 333, closure} refines to **3 roots {111, 111, 444}**,
@@ -21,8 +21,8 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NOMUC=$ROOT/bazel-bin/src/nomu-cli/nomuc
 
-NOMU_EGRESS=ssair "$NOMUC" "$ROOT/examples/gc_smoke.nomu" >/dev/null || { echo "FAIL: compile"; exit 1; }
-out=$(NOMU_EGRESS=ssair NOMU_GC_SMOKE=1 "$ROOT/build/examples/gc_smoke" 2>&1 1>/dev/null)
+"$NOMUC" "$ROOT/examples/gc_smoke.nomu" >/dev/null || { echo "FAIL: compile"; exit 1; }
+out=$(NOMU_GC_SMOKE=1 "$ROOT/build/examples/gc_smoke" 2>&1 1>/dev/null)
 echo "$out"
 
 fail() { echo "FAIL: $1"; exit 1; }

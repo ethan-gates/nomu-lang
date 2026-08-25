@@ -1,4 +1,3 @@
-import midend
 import ssair
 import ssairgen
 import ssairpasses
@@ -7,9 +6,9 @@ import ast
 import support
 // M8 — the LLVM backend seam. All LLVM C-API use stays inside this module, so the driver sees a
 // flat surface: a typed `NOIRModule` in, a native object out (`emitObject`), or nil/error. The
-// per-node lowering lives in `Lowering.swift` (`NOIRToLLVM`); this file drives target setup, the GC
-// pass pipeline (`mem2reg`/`sroa` → `rewrite-statepoints-for-gc`, or `-O2` in release), and object
-// emission via `llvm-c/TargetMachine.h`.
+// lowering runs NOIR → SSAIR (`lowerToSSAIR`) → the optimizer pipeline → LLVM (`SSAIRToLLVM`); this
+// file drives that egress, target setup, the GC pass pipeline (`mem2reg`/`sroa` →
+// `rewrite-statepoints-for-gc`, or `-O2` in release), and object emission via `llvm-c/TargetMachine.h`.
 import Foundation
 import LLVM_C
 
@@ -46,42 +45,30 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
     defer { LLVMContextDispose(ctx) }
     let mod = LLVMModuleCreateWithNameInContext("nomu", ctx)!
 
-    // 6.5.2 — escape analysis feeds codegen a side table of non-escaping allocation sites to
-    // stack-allocate. Best-effort: `NOMU_NO_ESCAPE` disables it (empty table → every site heaps as
-    // before), which is the correctness fallback and the exit-criterion off switch.
-    // 7.2.3 — `NOMU_EGRESS=ssair` selects the SSAIR CFG-walk egress (NOIR→SSAIR→LLVM) over the default
-    // NOIR tree-walk, for the corpus differential. Both share `LLVMGen`, so the GC ABI is identical.
-    if ProcessInfo.processInfo.environment["NOMU_EGRESS"] == "ssair" {
-        let ssa = cgStage("ssair", "gen", onStage) { lowerToSSAIR(module) }
-        if ssa.diagnostics.hasErrors { return "SSAIR: " + ssa.diagnostics.render() }
-        // M7.3/7.4 — run the optimizer pipeline in place, verifying the GC-precision invariants
-        // (§7.0.5) after each pass. Pipeline order is devirt → EA (§7.0.4): devirt un-uses a
-        // locally-dispatched box so stack promotion then falls out. Each pass has an A/B env gate
-        // (`NOMU_NO_DEVIRT`, `NOMU_NO_ESCAPE`) so a tier-off baseline stays available.
-        var ssaModule = ssa.module
-        let env = ProcessInfo.processInfo.environment
-        var passes: [SSAPass] = []
-        if env["NOMU_NO_DEVIRT"] == nil { passes.append(Devirtualize()) }
-        if env["NOMU_NO_INLINE"] == nil { passes.append(Inline()) }
-        if env["NOMU_NO_ESCAPE"] == nil { passes.append(StackPromotion()) }
-        // Scalar promotion (§7.3.1) rides the escape A/B flag (off ⇒ no promotion) with its own bisect
-        // gate; it decomposes a loop-carried non-escaping class the simple-slot path leaves heap.
-        if env["NOMU_NO_ESCAPE"] == nil && env["NOMU_NO_SCALAR"] == nil { passes.append(ScalarPromotion()) }
-        let pipeline = PassPipeline(passes)
-        let violations = pipeline.run(&ssaModule, stem: path, onStage: onStage)
-        if let first = violations.first { return "SSAIR verify: \(first)" }
-        let egress = SSAIRToLLVM(ctx: ctx, mod: mod)
-        cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: module) }
-        if let err = egress.error { return err }
-        guard egress.loweredMain else { return "LLVM: no `main` function to lower" }
-    } else {
-        let escapes = ProcessInfo.processInfo.environment["NOMU_NO_ESCAPE"] == nil
-            ? analyzeEscapes(module) : EscapeResult(nonEscaping: [])
-        let lowerer = NOIRToLLVM(ctx: ctx, mod: mod, escapes: escapes)
-        cgStage("llvm", "egress", onStage) { lowerer.lower(module) }
-        if let err = lowerer.error { return err }
-        guard lowerer.loweredMain else { return "LLVM: no `main` function to lower" }
-    }
+    // The backend egress: NOIR → SSAIR → LLVM (the sole path since M7.7 retired the NOIR tree-walk).
+    // The optimizer pipeline runs in place, verifying the GC-precision invariants (§7.0.5) after every
+    // pass. Pipeline order is devirt → inline → stack/scalar promotion (§7.0.4): devirt un-uses a
+    // locally-dispatched box and inline exposes callee bodies, so promotion then falls out. Each pass
+    // has an A/B env gate (`NOMU_NO_DEVIRT`/`NOMU_NO_INLINE`/`NOMU_NO_ESCAPE`/`NOMU_NO_SCALAR`) so a
+    // tier-off baseline stays available for bisecting a regression.
+    let ssa = cgStage("ssair", "gen", onStage) { lowerToSSAIR(module) }
+    if ssa.diagnostics.hasErrors { return "SSAIR: " + ssa.diagnostics.render() }
+    var ssaModule = ssa.module
+    let env = ProcessInfo.processInfo.environment
+    var passes: [SSAPass] = []
+    if env["NOMU_NO_DEVIRT"] == nil { passes.append(Devirtualize()) }
+    if env["NOMU_NO_INLINE"] == nil { passes.append(Inline()) }
+    if env["NOMU_NO_ESCAPE"] == nil { passes.append(StackPromotion()) }
+    // Scalar promotion (§7.3.1) rides the escape A/B flag (off ⇒ no promotion) with its own bisect gate;
+    // it decomposes a loop-carried non-escaping class the simple-slot path leaves heap.
+    if env["NOMU_NO_ESCAPE"] == nil && env["NOMU_NO_SCALAR"] == nil { passes.append(ScalarPromotion()) }
+    let pipeline = PassPipeline(passes)
+    let violations = pipeline.run(&ssaModule, stem: path, onStage: onStage)
+    if let first = violations.first { return "SSAIR verify: \(first)" }
+    let egress = SSAIRToLLVM(ctx: ctx, mod: mod)
+    cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: module) }
+    if let err = egress.error { return err }
+    guard egress.loweredMain else { return "LLVM: no `main` function to lower" }
 
     var errorMessage: UnsafeMutablePointer<CChar>! = nil
     let verifyRC = cgStage("llvm", "verify", onStage) { LLVMVerifyModule(mod, LLVMReturnStatusAction, &errorMessage) }

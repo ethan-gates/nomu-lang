@@ -307,15 +307,19 @@ Two related pieces on `verifySSAIR` (the compiler self-check that enforces the I
 
 ---
 
-## 7.7 · Retire the NOIR oracle ⬜ (terminal)
+## 7.7 · Retire the NOIR oracle ✅ (2026-08-24, terminal)
 
-The last M7 action, once every other tier item (7.3/7.4/7.5 tails, 7.6 hardening) is done and the differential is green. Delete `NOIRToLLVM` + its forwarders — kept as the differential oracle through the pass work, a net replacement — and retire the mid-level NOIR `EscapeAnalysis.swift` (the SSAIR pass replaces it). The SSAIR egress becomes the only path; `NOMU_EGRESS` and `tools/egress-diff.sh` retire with it (their job — proving parity — is then complete). Deleting the oracle removes the differential, so nothing that still wants differential coverage may be outstanding when this lands.
+The last M7 action. After the final differential (51/51 byte-identical, NOIR vs ssair — the sign-off), the NOIR tree-walk was deleted: `NOIRToLLVM` and its `Lowering*.swift` extension files (the walker + its `LLVMGen` forwarders) and the mid-level NOIR `EscapeAnalysis.swift` + its test (the SSAIR `StackPromotion`/`ScalarPromotion` passes replace it). The `SSAIRToLLVM` egress is now the only backend path — the `NOMU_EGRESS` selector, `tools/egress-diff.sh`, and `perf-tier.py`'s `noir` config retired with it (their job — proving parity — is complete). `LLVMGen` (the shared GC-ABI emitter) and `SSAIRToLLVM` stay.
+
+**Decision (2026-08-24, Ethan).** SSAIR is the long-term direction and adding new features to two egresses is a standing cost, so the NOIR path retired now rather than after every tail. A coverage audit was declined — the final full differential is the sign-off, and future pass work is validated by the A/B pass gates (`NOMU_NO_*`) + the GC gates (which survive the oracle's removal) plus our own soundness reasoning. `verifySSAIR` stays on in all builds for now (expected to catch compiler bugs); release-gating it for compile speed is a later option, not taken. The remaining tails (§7.3/7.4/7.5) are parked in `ssair-backlog.md`, none needing NOIR-vs-SSAIR differential coverage.
+
+**Validation.** Full build + all unit tests green; every GC gate green (`scalar-carried`, `escape-nonleaf`, `gc-stress`, `gc-gen`, `arr-gc`, `gc-smoke-tier`, `gc-actor-teardown`, `gc-t6-stw`, `gc-corpus-matrix`); the example corpus compiles + runs through the sole SSAIR path.
 
 ---
 
 ## M7 — status index
 
-Status of the numbered phases (updated 2026-08-20): **7.1 ✅ · 7.2 ✅ · 7.3 🚧 · 7.4 ✅ · 7.5 ◐ · 7.6 ◐ · 7.7 ⬜**. Every outstanding M7 item lives under a numbered phase — this section is the index into them, plus the T-obligation ledger.
+Status of the numbered phases (updated 2026-08-24): **7.1 ✅ · 7.2 ✅ · 7.3 ✅ · 7.4 ✅ · 7.5 ✅ · 7.6 ✅ · 7.7 ✅ — M7 done.** The tier is the sole backend path; the NOIR oracle is retired (§7.7). Every phase's exit criterion is met; the remaining refinements (the §7.3/7.4/7.5 tails and 7.6.2's I9/I10 static checks + verifier release-gating) are **not blockers** — they are parked in `ssair-backlog.md`, none needing the retired differential. This section indexes the phases, plus the T-obligation ledger.
 
 - **Per-phase tails** (detailed under each phase above): **7.3** — scalar promotion for the loop-carried φ-web (§7.3.1 ✅), interprocedural EA lift, closure-env / spawn-env promotion; **7.5** — cost model + specialization, dead-callee DCE, BCE residual, the (now-reachable) I9/I10 verifier checks; **7.4** — cross-function devirt (now largely subsumed: an `any I` parameter's conformer becomes visible once the caller is inlined); **7.6** — verifier I9/I10 checks + release gating; **7.7** — retire the NOIR oracle (terminal).
 

@@ -12,8 +12,9 @@ interface modules hold each IR's format, implementation modules hold the code;
   AST/NOIR checking passes (impl)
 
 **midend/** — the mid-level tier (NOIR→NOIR and, from M7, the SSAIR optimizer tier)
-- **midend** — Monomorphize, EscapeAnalysis (NOIR→NOIR passes); the SSAIR modules
-  (`ssair`, `ssairgen`, `ssairpasses`) land here in M7 §7.2
+- **midend** — Monomorphize (NOIR→NOIR); the SSAIR optimizer tier
+  (`ssair`, `ssairgen`, `ssairpasses`). The old NOIR `EscapeAnalysis` retired with the NOIR egress
+  (M7 §7.7); the SSAIR `StackPromotion`/`ScalarPromotion` passes replace it.
 
 **Backend & driver**
 - **llvmgen** — NOIR → LLVM IR (C API) → native object; the GC pass pipeline

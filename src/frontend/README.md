@@ -10,7 +10,7 @@ directory, with an interface/implementation separation (`design/m7-spec.md` §7.
   Builtins, Exhaustiveness, Mutation, Shareability, ExtensionMerge) — impl
 
 Siblings outside this directory: `support` (Span, Diagnostic, Type — the shared leaf, top-level)
-and `midend` (Monomorphize, EscapeAnalysis — NOIR→NOIR passes, grouped with the M7 SSAIR tier).
+and `midend` (Monomorphize — NOIR→NOIR, grouped with the M7 SSAIR tier).
 
 The frontend is **kept across the C→LLVM backend transition** (`design/compiler.md` §6), so
 architectural gaps here are real — unlike C-backend-only limitations, which are throwaway

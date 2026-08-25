@@ -21,7 +21,7 @@ want="12345
 99950000"
 fail() { echo "FAIL: $1"; echo "  base: $(echo $base)"; echo "  evac: $(echo $evac)"; exit 1; }
 
-NOMU_EGRESS=ssair "$NOMUC" "$ROOT/examples/scalar_carried_nonleaf.nomu" >/dev/null 2>&1 || { echo "FAIL: compile"; exit 1; }
+"$NOMUC" "$ROOT/examples/scalar_carried_nonleaf.nomu" >/dev/null 2>&1 || { echo "FAIL: compile"; exit 1; }
 base=$(NOMU_GC_PLAN=nogc "$BIN" 2>/dev/null)
 evac=$(NOMU_GC_PLAN=immix NOMU_GC_STRESS=$STRESS "$BIN" 2>/dev/null); rc=$?
 

@@ -21,9 +21,9 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     timings.file = path
     timings.optimize = options.optimize
     timings.bytes = source.utf8.count
-    // Which backend egress ran — the `ssair` phase appears only for the SSAIR tier, so name the
-    // egress in the header (mirrors LLVMBridge's `NOMU_EGRESS` check) to explain its presence/absence.
-    timings.egress = ProcessInfo.processInfo.environment["NOMU_EGRESS"] == "ssair" ? "ssair" : "noir"
+    // The backend egress is the SSAIR tier (the sole path since M7.7 retired the NOIR tree-walk);
+    // named in the timing header for context.
+    timings.egress = "ssair"
 
     // Lexer and parser share one sink and collect errors rather than exiting on the first
     // (the no-crash contract — frontend/README.md P0); the driver is the exit boundary.
@@ -137,7 +137,7 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
 
     // SSAIR stage (M7 · 7.2.4). --emit-ssair writes the optimizer IR (post-mono NOIR → SSAIR) to
     // build/; --stop=ssair writes it and halts. A debug view, so ssairgen diagnostics report without
-    // failing. The egress lowers SSAIR itself when NOMU_EGRESS=ssair; this is the inspectable dump.
+    // failing. The backend lowers SSAIR itself (the sole egress); this is the standalone inspectable dump.
     if options.ssair || options.stopAt == .ssair {
         let ssa = timings.measure("ssair", "gen") { lowerToSSAIR(monoModule) }
         writeArtifact(dumpSSAIR(ssa.module), toFile: stem + ".ssair")

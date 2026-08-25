@@ -23,15 +23,14 @@ struct Callable {
 }
 
 // The shared LLVM/GC emission machinery — the code both egresses lower through: the LLVM context /
-// module / builder, the cached primitive types, and (added in later extraction slices) the
-// type-layout, GC-map, witness, and runtime-call primitives. Held by composition: each walker — the
-// old `NOIRToLLVM` tree-walk and the new `SSAIRToLLVM` CFG-walk (7.2.3) — owns one `LLVMGen` and
-// calls its primitives, so the GC ABI is emitted from a single place (no duplication during the 7.2
-// coexistence). `final`, so the primitives dispatch statically (m7-spec.md §7.2.3).
+// module / builder, the cached primitive types, and the type-layout, GC-map, witness, and runtime-call
+// primitives. Held by composition: the `SSAIRToLLVM` egress owns one `LLVMGen` and calls its
+// primitives, so the whole GC ABI is emitted from a single place. `final`, so the primitives dispatch
+// statically (m7-spec.md §7.2.3).
 //
-// Extraction is incremental: state and primitives move here a slice at a time, with `NOIRToLLVM`
-// forwarding to the moved members so its (unchanged) tree-walk bodies keep compiling. Those forwarders
-// are scaffolding — they die when the old path is deleted after the corpus differential.
+// This shared emitter was factored out (M7 §7.1.2 / §7.2.3) so the GC ABI lived in one place while the
+// NOIR tree-walk and the SSAIR CFG-walk co-existed behind the corpus differential. The NOIR walk
+// retired at M7.7; `LLVMGen` now serves `SSAIRToLLVM` alone.
 final class LLVMGen {
     let ctx: LLVMContextRef
     let mod: LLVMModuleRef

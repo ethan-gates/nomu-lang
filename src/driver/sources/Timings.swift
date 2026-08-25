@@ -18,7 +18,7 @@ public final class Timings {
     public var optimize = false
     public var bytes = 0
     public var tokens = 0
-    public var egress = "noir"   // "noir" (oracle) or "ssair" (tier); the `ssair` phase appears only for the latter
+    public var egress = "ssair"   // the backend egress (SSAIR tier — the sole path since M7.7)
 
     public init() { started = clock.now }
 
@@ -48,7 +48,7 @@ public final class Timings {
         var out = "── nomu timings ───────────────────────────\n"
         let name = (file as NSString).lastPathComponent
         out += "  file:      \(name)  (\(bytes) bytes, \(tokens) tokens)\n"
-        out += "  egress:    \(egress)\(egress == "noir" ? "  (NOMU_EGRESS=ssair for the SSAIR tier)" : "")\n"
+        out += "  egress:    \(egress)\n"
         out += "  optimize:  \(optimize ? "yes" : "no")\n"
 
         // Group by phase in first-appearance order.

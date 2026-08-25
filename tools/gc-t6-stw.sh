@@ -6,11 +6,10 @@
 # every root, and resumes. If inlining ever dropped the back-edge poll, the carrier would never reach
 # a safepoint and the handshake would hang — so the watchdogged completion (exit 0) is the assertion.
 #
-# Runs under NOMU_EGRESS=ssair (so multi-block inlining actually fires) and NOMU_NO_ESCAPE=1 (6.5.2 —
+# Runs under (so multi-block inlining actually fires) and NOMU_NO_ESCAPE=1 (6.5.2 —
 # keep the leaf heap roots this collector test relies on off the stack). Distinct from
 # gc-smoke-stw.sh, whose loop is written directly in `spin` (no inlining involved).
 set -u
-export NOMU_EGRESS=ssair
 export NOMU_NO_ESCAPE=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NOMUC=$ROOT/bazel-bin/src/nomu-cli/nomuc

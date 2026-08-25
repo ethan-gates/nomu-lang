@@ -7,16 +7,16 @@ import support
 import Foundation
 import LLVM_C
 
-// M7 · 7.2.3 — the SSAIR → LLVM egress. A CFG-walk sibling of the NOIR tree-walk (`NOIRToLLVM`):
-// both hold one shared `LLVMGen` and lower through its GC-ABI primitives, so the two egresses emit the
-// same object layout / alloc / barrier / witness / actor ABI from one place (§7.0.4). Where the NOIR
-// walker flattens structured control flow and allocas every scalar local, SSAIR already supplies a
-// CFG with block arguments and SSA values, so this egress maps blocks 1:1 (block args → LLVM φ) and
-// keeps SSA values in a per-function id→value table with no per-scalar spill.
+// M7 · 7.2.3 — the SSAIR → LLVM egress, the sole backend path since M7.7. A CFG-walk that holds one
+// `LLVMGen` and lowers through its GC-ABI primitives (object layout / alloc / barrier / witness / actor
+// ABI emitted from one place, §7.0.4). SSAIR supplies a CFG with block arguments and SSA values, so
+// this egress maps blocks 1:1 (block args → LLVM φ) and keeps SSA values in a per-function id→value
+// table with no per-scalar spill. (`LLVMGen` was factored out as a shared emitter while the retired
+// NOIR tree-walk still co-existed; it now serves this egress alone.)
 //
-// Type-layout + witness + actor metadata come from the original NOIR module (populated into `LLVMGen`
-// exactly as `NOIRToLLVM.lower` does), plus the closure/spawn environment aggregates the SSA module
-// synthesized. Function *declaration* is done here (the `m:Type:method` → `nomu_m_*` mangling); the
+// Type-layout + witness + actor metadata come from the original NOIR module (populated into `LLVMGen`),
+// plus the closure/spawn environment aggregates the SSA module synthesized. Function *declaration* is
+// done here (the `m:Type:method` → `nomu_m_*` mangling); the
 // shared witness/actor thunks find the resulting callables already declared, so their internal
 // `declareMethod`/`declareActorHandler` calls early-return without needing NOIR method bodies.
 final class SSAIRToLLVM {

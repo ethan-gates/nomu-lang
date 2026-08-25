@@ -17,10 +17,9 @@ swift_library(
     deps = [
         "//src/support",  # Span/Type/Diagnostic (interface leaf)
         "//src/frontend/ast",  # BinOp (NOIR reuses the AST binary-op enum)
-        "//src/frontend/noir",  # NOIRModule / the typed IR that NOIRToLLVM lowers
-        "//src/midend",  # analyzeEscapes / EscapeResult (escape analysis side table)
+        "//src/frontend/noir",  # NOIRModule — the type/witness metadata the SSAIRToLLVM egress reads
         "//src/midend/ssair",  # SSAModule / the SSAIR the SSAIRToLLVM egress lowers (7.2.3)
-        "//src/midend/ssairgen",  # lowerToSSAIR — NOIR→SSAIR, driven when NOMU_EGRESS=ssair
+        "//src/midend/ssairgen",  # lowerToSSAIR — NOIR→SSAIR, the backend egress's first stage
         "//src/midend/ssairpasses",  # the optimizer pipeline + GC-precision verifier (M7.3)
         "//src/frontend/sema",  # Builtins (the builtin-function table codegen shares)
         "@llvm-project//llvm:Core",

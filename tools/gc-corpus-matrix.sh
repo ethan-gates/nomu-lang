@@ -21,11 +21,11 @@ for f in "$ROOT"/examples/*.nomu; do
   bin="$ROOT/build/examples/$n"
 
   # Baseline: tier OFF, NoGC.
-  NOMU_EGRESS=ssair NOMU_NO_ESCAPE=1 NOMU_NO_DEVIRT=1 NOMU_NO_INLINE=1 "$NOMUC" "$f" >/dev/null 2>&1 || continue
+  NOMU_NO_ESCAPE=1 NOMU_NO_DEVIRT=1 NOMU_NO_INLINE=1 "$NOMUC" "$f" >/dev/null 2>&1 || continue
   base=$(NOMU_GC_PLAN=nogc runbin "$bin")
 
   # Tier ON binary, run under the three collector configs.
-  NOMU_EGRESS=ssair "$NOMUC" "$f" >/dev/null 2>&1 || { echo "  $n: tier-on compile FAIL"; fails=$((fails+1)); continue; }
+  "$NOMUC" "$f" >/dev/null 2>&1 || { echo "  $n: tier-on compile FAIL"; fails=$((fails+1)); continue; }
   on_nogc=$(NOMU_GC_PLAN=nogc runbin "$bin")
   on_gen=$(NOMU_GC_HEAP=$HEAP runbin "$bin")
   on_stress=$(NOMU_GC_STRESS=$STRESS runbin "$bin")
