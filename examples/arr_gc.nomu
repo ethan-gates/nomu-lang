@@ -21,5 +21,7 @@ fun main() {
     j = j + 1
   }
   print(xs.count)              // 200
+  print("\n")
   print(sum)                   // 0+1+...+199 = 19900
+  print("\n")
 }

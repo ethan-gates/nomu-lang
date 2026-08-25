@@ -1,0 +1,26 @@
+// Tier microbenchmark — loop-carried scalar promotion (m7-spec §7.3.1).
+//
+// `a` is reassigned to a FRESH non-escaping `Acc` each iteration, so its reference flows through the
+// loop's block parameter (an object φ). v1 StackPromotion leaves it heap (block args are marked
+// escaping) and LLVM cannot un-heap it (the managed-pointer φ defeats SROA), so `off` allocates an
+// `Acc` every iteration. Scalar promotion decomposes it into two `Int` φs (sum, seed), turning the loop
+// into register arithmetic — no allocation. The recurrence is a data-dependent LCG on `seed`, so the
+// scalarized loop cannot be constant-folded away: `off` vs `esc` measures alloc-per-iteration against a
+// register loop doing the same work. (For this workload escape analysis's win *is* scalar promotion —
+// StackPromotion never touches a loop-carried object; NOMU_NO_SCALAR=1 reverts esc to off.)
+
+class Acc {
+    var sum: Int
+    var seed: Int
+}
+
+fun main() {
+    var a = Acc(sum: 0, seed: 1)
+    var i = 0
+    while i < 20000000 {
+        a = Acc(sum: a.sum + a.seed % 7, seed: a.seed * 1103515245 + 12345)
+        i = i + 1
+    }
+    print(a.sum)
+    print("\n")
+}

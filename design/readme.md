@@ -23,6 +23,7 @@ Design docs for **Nomu**, a systems language: *Swift's expressiveness, Go's ease
 - **M6 (real GC via MMTk) — done (2026-08-13), spec retired.** The moving GenImmix collector, object model, precise roots/safepoints/barriers, async actor runtime, conservative escape analysis, inline allocation. The code is the record; durable design folded to `memory-model.md` §3 (object model), `runtime.md` §6 (safepoints, parked-fiber scan, mutator granularity), `compiler.md` §2 (GC backend substrate), `concurrency.md` §9 (actor runtime).
 - [loops.md](loops.md) — **draft for review**: Nomu's iteration construct (`while`) — syntax, semantics, lowering. The loop back-edge hosts the safepoint poll.
 - [m7-spec.md](m7-spec.md) — **working draft**: M7 implementation spec (build plan) for the optimizer tier — **SSAIR** (a lower CFG/SSA IR, separate from NOIR) + the pass framework + precise escape analysis, devirtualization, BCE, inlining. Design/why in `compiler.md` §1a. Follows `lang-project/milestone-doc-guide.md`.
+- [ssair-backlog.md](ssair-backlog.md) — consolidated backlog of SSAIR-tier work (passes, analyses, IR/infra, validation): the index + brainstorm surface, cross-referencing `m7-spec.md` (build plan) and `deferred.md`.
 - [roadmap.md](roadmap.md) — milestones (provisional, post-pivot).
 - [deferred.md](deferred.md) — TODO backlog: feature work intentionally postponed, each with its un-park trigger.
 

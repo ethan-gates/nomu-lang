@@ -32,7 +32,11 @@ fun main() {
   }
   sleep(10000)
   print(pair.a.v)              // 42 — interior ref relocated + field updated
+  print("\n")
   print(pair.b.v)              // 7
+  print("\n")
   print(inner.v)              // 42 — live root relocated
+  print("\n")
   print(sum)                   // 0+1+...+999 = 499500
+  print("\n")
 }

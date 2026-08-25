@@ -30,5 +30,7 @@ fun main() {
   h.item = Box(v: 42)     // mature `h` now points at a fresh nursery Box — barrier remembers `h`
   churn(5000)             // more nursery GCs: the young Box survives only if `h` was remembered
   print(h.item.v)         // 42 — the post-promotion store was tracked and relocated
+  print("\n")
   print(h.tag)            // 4242 — the mature object itself survived intact
+  print("\n")
 }

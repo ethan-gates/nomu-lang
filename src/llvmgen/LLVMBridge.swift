@@ -64,6 +64,9 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
         if env["NOMU_NO_DEVIRT"] == nil { passes.append(Devirtualize()) }
         if env["NOMU_NO_INLINE"] == nil { passes.append(Inline()) }
         if env["NOMU_NO_ESCAPE"] == nil { passes.append(StackPromotion()) }
+        // Scalar promotion (§7.3.1) rides the escape A/B flag (off ⇒ no promotion) with its own bisect
+        // gate; it decomposes a loop-carried non-escaping class the simple-slot path leaves heap.
+        if env["NOMU_NO_ESCAPE"] == nil && env["NOMU_NO_SCALAR"] == nil { passes.append(ScalarPromotion()) }
         let pipeline = PassPipeline(passes)
         let violations = pipeline.run(&ssaModule, stem: path, onStage: onStage)
         if let first = violations.first { return "SSAIR verify: \(first)" }

@@ -820,6 +820,10 @@ a rough estimate to help sequencing, not a commitment.
 - **Clean up the LLVM experiments** `[small · anytime]` — remove the throwaway bring-up scaffolding
   now that 8.x is green: `src/llvmgen/llvm_smoke.cpp`, the `llvmswift_smoke` binary + its
   `main.swift`, and any dead 8.1 smoke targets. Low risk; shrinks the backend surface.
+- **Parser crashes on a missing trailing `)`** `[small · anytime]` — a source file
+  missing a trailing close paren crashes the frontend instead of emitting a clean parse
+  diagnostic. Harden the parser to report unexpected-EOF / unclosed-delimiter as a
+  recoverable diagnostic (with the opening delimiter's span) rather than trapping.
 - **`nomuc` startup latency** `[profiled 2026-08-04; fix = opt build]` — `nomuc -h` is ~0.8 s with
   no compilation, **path-independent** and **99 % CPU** (0.81 s user / 0.01 s sys), i.e. it runs
   *before* `main`: **LLVM global constructors** (registering `cl::opt` options + target/pass

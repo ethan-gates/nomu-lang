@@ -44,7 +44,7 @@ CONFIGS = [
 ]
 
 # The tier microbenchmarks plus real GC/compute workloads.
-DEFAULT_WORKLOADS = ["micro_dispatch", "micro_alloc", "hashmap", "gc_barrier", "gc_footprint", "binary-tree"]
+DEFAULT_WORKLOADS = ["micro_dispatch", "micro_alloc", "micro_carried", "hashmap", "gc_barrier", "gc_footprint", "binary-tree"]
 
 
 def resolve(name):

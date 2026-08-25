@@ -1,0 +1,54 @@
+// 7.3.1 — a loop-carried NON-LEAF non-escaping class scalarizes, and its carried managed field is a
+// real GC root across the loop.
+//
+// `Node` is reassigned to a fresh allocation each iteration, so its reference flows through the loop's
+// block parameter (the φ). It never escapes (only `node.inner.v` / `node.n` read at the end), so scalar
+// promotion (m7-spec §7.3.1) decomposes it into per-field SSA values — its `inner` field becomes an
+// addrspace(1) SSA value threaded through the loop φ. That value is the ONLY reference to the heap
+// `Inner(v: 12345)` (kept heap because it is stored into the Nodes), and it is live across `churn`,
+// which allocates enough garbage to drive evacuations. If the scalarized managed field is not tracked
+// + relocated at the loop-header poll, `node.inner.v` reads a stale pointer → output diverges under
+// Immix. tools/scalar-carried.sh runs this under the moving collector (SSAIR egress) and checks the
+// output is unchanged. Until §7.3.1 lands, `Node` stays heap (loop-carried pointer φ) and the test is a
+// ready regression gate; once it lands, it exercises the scalarized-root relocation.
+
+class Inner {
+    var v: Int
+}
+
+class Node {
+    var inner: Inner
+    var n: Int
+}
+
+fun sink(x: Inner) -> Int {
+    return x.v
+}
+
+fun churn(n: Int) -> Int {
+    var acc = 0
+    var i = 0
+    while i < n {
+        let g = Inner(v: i)      // escapes into `sink` → heap garbage that drives collections
+        acc = acc + sink(g)
+        i = i + 1
+    }
+    return acc
+}
+
+fun main() {
+    var node = Node(inner: Inner(v: 12345), n: 0)   // Node loop-carried → scalar promotion; Inner heap
+    var total = 0
+    var i = 0
+    while i < 50 {
+        node = Node(inner: node.inner, n: node.n + 1)   // fresh Node each iter, carrying `inner` forward
+        total = total + churn(2000)                     // force collections while `node.inner` is live
+        i = i + 1
+    }
+    print(node.inner.v)   // 12345 — the carried managed field survived + relocated
+    print("\n")
+    print(node.n)         // 50
+    print("\n")
+    print(total)          // 99950000
+    print("\n")
+}
