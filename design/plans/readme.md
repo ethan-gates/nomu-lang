@@ -4,7 +4,11 @@
 [`../language/`](../language/readme.md) and [`../internals/`](../internals/readme.md); these track
 parked and in-flight work.
 
-- `deferred.md` — postponed feature work, each with its un-park trigger.
+- `tasks.md` — the backlog task **index** (scannable table, tagged by avenue / size / status),
+  pointing at one doc per task under `tasks/`. Each task has a stable identity number; docs are
+  named `tasks/1NN-slug.md`. Prioritized against two avenues (Risk / Usability / Infra). Dissolved
+  out of the former `deferred.md` (2026-08-25).
+- `tasks/` — the per-task docs (`1NN-slug.md`), each with its un-park trigger.
 - `ssair-backlog.md` — the SSAIR optimizer-tier backlog.
 - `mN-spec.md` — a milestone's ordered build plan (authored per `milestone-doc-guide.md` at the repo root).
 

@@ -7,8 +7,8 @@ import support
 import XCTest
 import ssairgen
 
-// Value-aggregate (Option B — slots), class, enum-match, and array-literal lowering (m7-spec.md
-// §7.2.2b-i). Drives source → parse → Sema → NOIR → SSAIR and asserts on the dumped ops.
+// Value-aggregate (Option B — slots), class, enum-match, and array-literal lowering
+// (ssair.md — IR shape). Drives source → parse → Sema → NOIR → SSAIR and asserts on the dumped ops.
 final class AggregateTests: XCTestCase {
     private func dump(_ source: String) -> String {
         var lexer = Lexer(source, file: "t.nomu")

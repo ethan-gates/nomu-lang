@@ -2,7 +2,7 @@
 
 The Nomu compiler, split into per-stage Bazel modules grouped by pipeline phase (M7 §7.1 —
 interface modules hold each IR's format, implementation modules hold the code;
-`design/internals/compiler.md` §8):
+`design/internals/architecture.md`):
 
 - **support** — Span, Diagnostic, the semantic Type model (shared leaf, top-level, no deps)
 
@@ -21,7 +21,7 @@ interface modules hold each IR's format, implementation modules hold the code;
 - **driver** — pipeline orchestration: parse → sema → midend → llvmgen → `cc`; owns `EmitMode`
 - **nomu-cli** — `nomuc` binary; argument parsing, calls into driver
 
-**runtime/** — the mandatory floor, linked into every emitted program (`compiler.md` §5)
+**runtime/** — the mandatory floor, linked into every emitted program (`c-types.md`)
 - **runtime/embedded** — the C runtime (M:N scheduler, poller, timer, actor mailbox, allocator
   seam) + the C core floor (`core.c`: String, primitives), bundled into `nomuc`
 - **runtime/gcbinding** — the thin MMTk `VMBinding` (Rust static archive)

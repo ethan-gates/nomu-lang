@@ -2,7 +2,7 @@ import ast
 import support
 
 // A human-readable dump of SSAIR — the `--emit-ssair` output (wired at 7.2.4) and the debug
-// visibility into lowering-in / the passes (design: compiler.md §1, m7-spec.md §7.2.4).
+// visibility into lowering-in / the passes (design: noir.md, ssair.md).
 //
 // A flat, textual SSA form (LLVM/MLIR-flavored): values are `%<id>` with a trailing `: Type`, blocks
 // are `bb<id>(params):` followed by their instructions and one terminator. Every def prints its type

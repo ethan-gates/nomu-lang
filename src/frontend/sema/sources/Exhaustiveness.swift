@@ -1,6 +1,6 @@
 import noir
 import support
-// Exhaustiveness — an IR pass over the typed module (design: compiler.md §1; types.md §2).
+// Exhaustiveness — an IR pass over the typed module (design: noir.md; types.md §2).
 //
 // A `switch` on an enum must cover every case; there is no `_`/default arm, so
 // exhaustiveness is exactly "every declared case appears." Runs after Sema on the

@@ -2,7 +2,7 @@ import noir
 import ast
 import support
 // The semantic pass: resolves names, types every expression, and lowers the AST
-// to the typed IR, collecting diagnostics (design: compiler.md §1). Concrete types
+// to the typed IR, collecting diagnostics (design: noir.md). Concrete types
 // only — interfaces/generics are M5; type methods are T3.
 
 public struct SemaResult {

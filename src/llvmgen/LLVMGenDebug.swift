@@ -2,7 +2,7 @@ import noir
 import support
 import LLVM_C
 
-// Debug info (8.3, DWARF Tier 0), moved into the shared emitter (m7-spec.md §7.2.3): the DIBuilder /
+// Debug info (8.3, DWARF Tier 0), moved into the shared emitter (ssair.md): the DIBuilder /
 // compile unit / file, per-function subprograms + scope, source locations, DWARF types, and local
 // `llvm.dbg.declare` records. Both egresses thread debug info through here.
 extension LLVMGen {

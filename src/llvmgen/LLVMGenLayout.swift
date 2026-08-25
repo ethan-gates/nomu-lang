@@ -3,7 +3,7 @@ import ast
 import support
 import LLVM_C
 
-// Type-layout primitives (moved from the tree-walk into the shared emitter, m7-spec.md §7.2.3): the
+// Type-layout primitives (moved from the tree-walk into the shared emitter, ssair.md): the
 // LLVM struct types for Nomu structs/classes/enums/actors, `Type` → `LLVMTypeRef`, field/slot
 // geometry. Built lazily and cached; layout is fed from the `structMap`/`enumMap`/… registries.
 extension LLVMGen {

@@ -248,7 +248,7 @@ private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: Strin
 }
 
 // Compile the runtime C sources to objects and archive them into `libnomuruntime.a` (the
-// `compiler.md` §6 "runtime library" item, real for the LLVM path). Replaces the C backend's
+// `backend.md` "runtime library" item, real for the LLVM path). Replaces the C backend's
 // per-file `cc` co-compile. Returns the archive path, or nil on failure (message on stderr).
 // The runtime `.a` is identical across programs (the C floor is embedded in nomuc), so it is content-
 // addressed and cached under `build/runtime/`. The key hashes the embedded runtime sources + host

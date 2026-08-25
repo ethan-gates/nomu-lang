@@ -7,7 +7,7 @@ import support
 import XCTest
 import ssairgen
 
-// Actors + structured concurrency (m7-spec.md §7.2.2): actor construction + mailbox, fire-and-forget
+// Actors + structured concurrency (ssair.md): actor construction + mailbox, fire-and-forget
 // sends, and `spawn let` (start + join-on-read + join-at-scope-exit).
 final class ConcurrencyTests: XCTestCase {
     private func dump(_ source: String) -> String {

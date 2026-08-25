@@ -3,7 +3,7 @@ import noir
 import ssair
 import support
 
-// Lowering-in: structured NOIR → SSAIR (m7-spec.md §7.2.2).
+// Lowering-in: structured NOIR → SSAIR (ssair.md).
 //
 // Direct SSA construction (Braun et al., "Simple and Efficient Construction of Static Single
 // Assignment Form"): as the structured tree lowers, the builder tracks the current SSA value of each

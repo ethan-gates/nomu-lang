@@ -1,7 +1,7 @@
 load("@rules_swift//swift:swift.bzl", "swift_library")
 
 # Syntactic interface module: Token (lex→parse), the untyped AST (parser output), and ASTDump.
-# The format that `parse` produces and `sema` consumes — see design/internals/compiler.md §8.
+# The format that `parse` produces and `sema` consumes — see design/internals/architecture.md.
 swift_library(
     name = "ast",
     srcs = glob(["sources/*.swift"]),

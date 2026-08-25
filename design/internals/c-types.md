@@ -12,9 +12,9 @@ literal, the `%` operator, and the `.double` / `.int` conversions are settled an
 pinned otherwise is the *layout and runtime contract*.
 
 **Siblings:** the value/reference split and GC category semantics live in `memory-model.md`; the moving
-collector's object model lives in `memory-model.md` §3 (address spaces, box shapes) and `compiler.md` §2
+collector's object model lives in `memory-model.md` §3 (address spaces, box shapes) and `backend.md`
 (GC backend substrate); the size/scan tables these types plug into are described in §1 below. The C
-runtime floor's origin is the M4.13 split (`compiler.md`). Codegen lives in `src/llvmgen/Lowering.swift`;
+runtime floor's origin is the M4.13 split (the library tiers, §6 below). Codegen lives in `src/llvmgen/Lowering.swift`;
 the runtime in `src/runtime/` (`runtime.c`, `core.c`, `runtime.h`); the GC binding in `src/gcbinding/lib.rs`.
 
 ---
@@ -155,3 +155,15 @@ Not yet built; listed so the doc is the map when they land.
 - **Spawn group / structured wait.** `spawn let x = …` exists (single static binding, joined on read /
   scope exit via `spawn_join`). A group waiting on a dynamic number of spawned tasks is a library type
   over the existing fiber-join machinery (`runtime.c` `joiner`) — likely no new grammar.
+
+---
+
+## 6. Library tiers (language / runtime / stdlib) — **Decided (2026-07-16)**
+
+The build realizes a three-layer separation (positioning in `vision.md` → "Library tiers"); the C runtime floor these types live in is the middle tier, from the M4.13 split:
+
+- **Language** — the compiler-known surface (type system, generics, interfaces, linear types, and a small named set of blessed intrinsics such as the continuation).
+- **Runtime** — the mandatory floor: GC (MMTk) + the M:N scheduler/poller. **Always linked** — there is no runtime-less build, because Nomu declines to define reference types or heap allocation without it.
+- **Standard library** — ordinary Nomu code with no compiler privilege, and **elidable**.
+
+Two deployment shapes fall out: **language + runtime** (no batteries; minimal footprint) and **+ stdlib**. The consequence for the compiler: privileged capabilities (`park`/`unpark`, GC intrinsics) are reached only through **language/runtime intrinsics**, never handed to a stdlib function that user code couldn't itself call — that is what keeps the stdlib pure and elidable.

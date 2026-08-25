@@ -4,7 +4,7 @@ import XCTest
 import ssair
 @testable import ssairpasses
 
-// Scalar promotion for the loop-carried φ-web (m7-spec §7.3.1). A non-escaping class that is reassigned
+// Scalar promotion for the loop-carried φ-web (ssair.md). A non-escaping class that is reassigned
 // to a fresh allocation each iteration flows through a loop block parameter (an object φ); the pass
 // decomposes it into per-field SSA values — the object `alloc` disappears and the φ widens into one φ
 // per field. An escaping loop-carried object stays heap (the whole web is atomic). Shapes below mirror

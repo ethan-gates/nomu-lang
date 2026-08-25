@@ -3,7 +3,7 @@ import noir      // NOIRInterface / NOIRConformance / NOIRComposite — witness 
 import support   // Type, Span, NamedKind
 
 // SSAIR — Nomu's low-level, control-flow-explicit, SSA optimizer IR.
-// Design: compiler.md §1a. Build plan: m7-spec.md §7.2.
+// Design: ssair.md. Build plan: ssair.md
 //
 // NOIR is structured (a nested tree that keeps `if`/`switch`/`while` as nodes). SSAIR is a CFG of
 // basic blocks in SSA form, with **block arguments** (not φ): a merge block declares parameters and
@@ -11,7 +11,7 @@ import support   // Type, Span, NamedKind
 // (escape analysis, devirtualization, bounds-check elimination, inlining/specialization) and, once
 // the NOIR→LLVM path is deleted at the end of 7.2, the single egress to LLVM. Nomu's MIR/SIL analog.
 //
-// Invariants every pass must hold (m7-spec.md §7.2 / §7.0.5):
+// Invariants every pass must hold (ssair.md):
 //  • **Typed values** — an `SSAValue` carries its post-monomorphization `Type`.
 //  • **Spans everywhere** — every instruction and terminator carries a source `Span`; debug info
 //    threads through the tier (dropping a span is a bug).
@@ -75,7 +75,7 @@ public indirect enum SSAInstKind {
     case elementAddr(base: SSAValue, index: SSAValue)      // array element slot (guard with `boundscheck`)
     case arrayLen(SSAValue)                                // an array handle's length
 
-    // Bounds check — an explicit op (Decided 2026-08-16, m7-spec.md §7.0.4) so BCE (7.5) is a pass
+    // Bounds check — an explicit op (Decided 2026-08-16, ssair.md) so BCE (7.5) is a pass
     // that proves it redundant and deletes it. The egress lowers a surviving `boundscheck` to the
     // trap form (compare `index UGE length` → `rt_bounds_trap` → `unreachable`).
     case boundscheck(index: SSAValue, length: SSAValue)

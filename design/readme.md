@@ -13,7 +13,7 @@ The docs are organized by **audience/fidelity**, mirroring the three sources of 
 - **code** — the exact source, most costly to read.
 - **[`plans/`](plans/readme.md)** — ephemeral work-tracking (backlogs, milestone build-plans); not durable design.
 
-Steering docs (`vision.md`, `roadmap.md`, this index) stay at the root. Docs cross-reference each other by name (`compiler.md §2`), so the name resolves regardless of folder.
+Steering docs (`vision.md`, `roadmap.md`, this index) stay at the root. Docs cross-reference each other by name (`backend.md`), so the name resolves regardless of folder.
 
 ## Steering
 
@@ -32,7 +32,12 @@ Steering docs (`vision.md`, `roadmap.md`, this index) stay at the root. Docs cro
 - [internals/macros.md](internals/macros.md) — typed hygienic AST macros; extension-only role.
 - [internals/modules.md](internals/modules.md) — **stub**: modules / compilation units and access control (undesigned; reserved).
 - [internals/runtime.md](internals/runtime.md) — the execution substrate: M:N scheduler, wakeup feeders, cross-thread resume, platform/syscall strategy, FFI-readiness.
-- [internals/compiler.md](internals/compiler.md) — compiler architecture, mid-level IR (NOIR + the SSAIR optimizer tier), backend strategy, tooling, debugger.
+- [internals/architecture.md](internals/architecture.md) — compiler architecture: the whole-flow pipeline, the interface/implementation module split, and the committed capabilities (debug info, incremental, query server).
+- [internals/noir.md](internals/noir.md) — the typed structured mid-level IR (NOIR): altitude, the semantic pass, and the passes that run on it.
+- [internals/backend.md](internals/backend.md) — LLVM codegen: backend strategy, the GC backend substrate (statepoints, seams, pass pipeline), and symbol mangling.
+- [internals/tooling.md](internals/tooling.md) — the tooling-first / query architecture, the same engine as fine-grained incremental compilation.
+- [internals/debugger.md](internals/debugger.md) — the debugger plan (emit DWARF, extend lldb): the tiered plan and pragmatics; fills in as it's built.
+- [internals/ssair.md](internals/ssair.md) — the SSAIR optimizer tier (M7): IR shape + decisions, the pass framework + four passes (escape analysis with stack/scalar promotion, devirtualization, inlining, BCE), lowering to LLVM, and the GC-precision invariants (I1–I10) the transforms preserve.
 - [internals/c-types.md](internals/c-types.md) — C-backed standard-library types (String, `Array<T>`, planned numeric primitives + spawn group): layout, the allocation/GC boundary, and the runtime contract, before they migrate into a Nomu-written stdlib.
 - [internals/builtin.md](internals/builtin.md) — how-to: adding a C-backed builtin method / property / free function and wiring it through Sema, codegen, and the safepoint pass (no lexer/parser change).
 
@@ -42,9 +47,9 @@ Steering docs (`vision.md`, `roadmap.md`, this index) stay at the root. Docs cro
 - [plans/ssair-backlog.md](plans/ssair-backlog.md) — consolidated backlog of SSAIR-tier work (passes, analyses, IR/infra, validation).
 
 **Retired milestone specs** — a spec is **deleted once done**: its durable design (and any directions not taken) folds into `language/` + `internals/`, and git + the code are the record.
-- **M7 (optimizer tier — SSAIR) — done (2026-08-24).** SSAIR + the pass framework + precise escape analysis (stack + scalar promotion), devirtualization, inlining; the NOIR→LLVM path retired at M7.7, leaving SSAIR the sole egress. Durable design folded to `internals/compiler.md` §1a (IR shape + decisions) and §2 (GC-precision invariants I1–I10 + `Tn` obligations), and `internals/memory-model.md` §6.1 (escape analysis as-built); tails in `plans/ssair-backlog.md`.
-- **M9 (LLVM backend) — done (2026-08-03).** Design/rationale in `internals/compiler.md` §2 (backend, GC substrate); follow-ups in `plans/deferred.md` ("Post-M9 backlog").
-- **M6 (real GC via MMTk) — done (2026-08-13).** Durable design folded to `internals/memory-model.md` §3, `internals/runtime.md` §6, `internals/compiler.md` §2, `internals/concurrency.md` §9.
+- **M7 (optimizer tier — SSAIR) — done (2026-08-24).** SSAIR + the pass framework + precise escape analysis (stack + scalar promotion), devirtualization, inlining; the NOIR→LLVM path retired at M7.7, leaving SSAIR the sole egress. Durable design folded to `internals/ssair.md` (IR shape, decisions, the four passes, GC-precision invariants I1–I10 + `Tn` obligations) and `internals/memory-model.md` §6.1 (escape analysis as-built); tails in `plans/ssair-backlog.md`.
+- **M9 (LLVM backend) — done (2026-08-03).** Design/rationale in `internals/backend.md` (backend, GC substrate); follow-ups in `plans/deferred.md` ("Post-M9 backlog").
+- **M6 (real GC via MMTk) — done (2026-08-13).** Durable design folded to `internals/memory-model.md` §3, `internals/runtime.md` §6, `internals/backend.md`, `internals/concurrency.md` §9.
 
 The full decision history once lived in a separate `early-design.md`; it has been dissolved into the per-subsystem docs, each of which now carries its own rationale and open questions.
 
@@ -70,5 +75,5 @@ Each doc owns its own rollup; the cross-cutting highlights:
 - **Error handling** — errors-as-values (no exceptions) Decided; the *form* (`Result`/tuple/other carrier, `?` operator, typed throws) is open (`types.md` §4).
 - **Modules & access control** — undesigned; a stub reserves the topic (`modules.md`).
 - **Keyword spellings** — `shareable`, `extension` (`syntax.md`, and their home docs).
-- **Backend** — MLIR vs. plain LLVM; Cranelift for debug builds (`compiler.md` §5).
+- **Backend** — MLIR vs. plain LLVM; Cranelift for debug builds (`backend.md`).
 - **Roadmap** — the milestone order is provisional post-pivot (`roadmap.md`).

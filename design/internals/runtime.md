@@ -86,9 +86,9 @@ FFI (calling C, and C calling back) is **not planned near-term**, and beyond `li
 
 ## 6. GC integration touchpoints
 
-The scheduler and the collector are co-designed at a few seams (object-model + backend detail in `compiler.md` §1–2, `memory-model.md` §3). Built as M6 (real GC via MMTk GenImmix); the decisions below are as-built.
+The scheduler and the collector are co-designed at a few seams (object-model + backend detail in `noir.md` / `backend.md`, `memory-model.md` §3). Built as M6 (real GC via MMTk GenImmix); the decisions below are as-built.
 
-- **Safepoints & precise stack maps** — a moving collector needs fibers to reach safepoints and their stacks scanned precisely. Roots come from LLVM statepoints (`compiler.md` §2), never conservative scanning.
+- **Safepoints & precise stack maps** — a moving collector needs fibers to reach safepoints and their stacks scanned precisely. Roots come from LLVM statepoints (`backend.md`), never conservative scanning.
 - **Write barriers** — inserted by codegen (the `__nomu_write_barrier` seam); the runtime honors them. GenImmix fills it as a generational logging barrier; LXR refills the same seam as the RC barrier.
 - **Root scanning across fibers** — every parked fiber's stack is a root set.
 

@@ -1,7 +1,7 @@
 import ssair
 import support
 
-// SSAIR verifier — the GC-precision-survival gate (m7-spec.md §7.0.5). Optimizer passes over a moving
+// SSAIR verifier — the GC-precision-survival gate (ssair.md). Optimizer passes over a moving
 // collector fail *silently* (relocation corruption, non-deterministic), so the driver runs this after
 // every transform and rejects a module that violates the invariants below. It checks the structural
 // properties a buggy transform would break; the full relational guarantee (root set / barrier set is a

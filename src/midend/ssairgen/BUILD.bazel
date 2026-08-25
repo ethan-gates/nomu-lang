@@ -1,7 +1,7 @@
 load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
 
 # Implementation module: lowering-in, structured NOIR → SSAIR (direct SSA construction). Scaffolded
-# at 7.2.1, filled at 7.2.2 (m7-spec.md §7.2). Consumes `noir`, produces `ssair`.
+# at 7.2.1, filled at 7.2.2 (ssair.md). Consumes `noir`, produces `ssair`.
 swift_library(
     name = "ssairgen",
     srcs = glob(["sources/*.swift"]),

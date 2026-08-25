@@ -1,6 +1,6 @@
 import ast
 import support
-// NOIR — the Nomu typed mid-level IR (structured; design: compiler.md §1).
+// NOIR — the Nomu typed mid-level IR (structured; design: noir.md).
 //
 // Produced by the semantic pass (Sema) from the AST; codegen consumes it (T2).
 // Structured — keeps `if`/`switch`/closures as nested nodes, not a CFG. Every

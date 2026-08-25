@@ -1,4 +1,4 @@
-// The semantic type model — what a `TypeRef` (syntax) resolves to (design: compiler.md §1).
+// The semantic type model — what a `TypeRef` (syntax) resolves to (design: noir.md).
 // Replaces the string-typing the codegen used to carry in `typeOf` / `Scope`.
 
 public enum NamedKind: Equatable {

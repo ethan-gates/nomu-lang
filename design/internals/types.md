@@ -46,7 +46,7 @@ Enums are value types (tagged unions, laid out inline); a recursive enum (`indir
 
 **Construction** (landed M4.10): an enum value names a case and its payload, either **qualified** — `Shape.circle(radius: 10)` — or with the **leading-dot** shorthand `.circle(radius: 10)`, where the enum type is inferred from context (§1). A no-payload case constructs bare (`Color.red`, or `.red`); payload is **labeled**, matching struct construction.
 
-Exhaustiveness is checked as a pass over the typed mid-level IR (`compiler.md` §1), the same altitude Rust checks it (THIR). A `switch` on an enum that misses a case is a compile error; there is no `_`/default arm, so exhaustive means every declared case appears.
+Exhaustiveness is checked as a pass over the typed mid-level IR (`noir.md`), the same altitude Rust checks it (THIR). A `switch` on an enum that misses a case is a compile error; there is no `_`/default arm, so exhaustive means every declared case appears.
 
 ---
 

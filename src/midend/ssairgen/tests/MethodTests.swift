@@ -7,8 +7,8 @@ import support
 import XCTest
 import ssairgen
 
-// Type-method bodies with `self`, concrete method calls, and unreachable-block pruning (m7-spec.md
-// §7.2.2b-ii).
+// Type-method bodies with `self`, concrete method calls, and unreachable-block pruning
+// (ssair.md — lowering-in / SSA construction).
 final class MethodTests: XCTestCase {
     private func dump(_ source: String) -> String {
         var lexer = Lexer(source, file: "t.nomu")

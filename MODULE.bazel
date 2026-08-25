@@ -44,7 +44,7 @@ use_repo(crate, "crates")
 # ---- LLVM (M8.1 · 8.1.1) ----
 # The official llvm/llvm-project Bazel overlay (utils/bazel), pinned to LLVM 23, built from
 # source. `llvm_configure` generates @llvm-project//llvm:Core, :Support, … cc_library targets
-# our compiler links against (design: compiler.md §2 backend). LLVM's Bazel build is peripheral-tier,
+# our compiler links against (design: backend.md). LLVM's Bazel build is peripheral-tier,
 # so the commit is pinned deliberately (in bazel/llvm_extensions.bzl).
 
 # Transitive deps the overlay's generated BUILD files reference (repo_name matters).

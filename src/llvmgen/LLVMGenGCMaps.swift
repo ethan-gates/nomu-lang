@@ -3,7 +3,7 @@ import ast
 import support
 import LLVM_C
 
-// M6 GC pointer-map machinery (moved into the shared emitter, m7-spec.md §7.2.3): assign a type-id +
+// M6 GC pointer-map machinery (moved into the shared emitter, ssair.md): assign a type-id +
 // managed-field offset map to each heap type (class/actor/closure/`any`-box/array-buffer/mailbox),
 // stamp it into an object header, and emit the flat runtime tables at module finalization.
 extension LLVMGen {

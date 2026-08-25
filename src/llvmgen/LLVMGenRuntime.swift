@@ -1,7 +1,7 @@
 import support
 import LLVM_C
 
-// Runtime/GC-ABI emission (moved into the shared emitter, m7-spec.md §7.2.3): the function-creation
+// Runtime/GC-ABI emission (moved into the shared emitter, ssair.md): the function-creation
 // seam, runtime-fn declarations, the inert mutator seams (`__nomu_poll`/`__nomu_gc_alloc`/
 // `__nomu_write_barrier`), managed allocation + the write-barrier store, and small LLVM helpers
 // (`buildCall`/`structGEP`/`gepByte`/`toUnmanaged`/string literals). Both egresses emit through here.

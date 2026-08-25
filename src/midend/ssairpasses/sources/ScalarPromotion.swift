@@ -2,7 +2,7 @@ import ssair
 import support
 import ast
 
-// Scalar promotion for the loop-carried φ-web (m7-spec.md §7.3.1). A non-escaping class object that is
+// Scalar promotion for the loop-carried φ-web (ssair.md). A non-escaping class object that is
 // reassigned to a fresh allocation each iteration flows through a loop block parameter (an object φ);
 // v1 `StackPromotion` leaves it heap because any block-argument value is marked escaping, and LLVM
 // leaves the managed-pointer φ un-promoted (SROA does not scalarize a phi-captured allocation). This

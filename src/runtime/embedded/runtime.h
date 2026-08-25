@@ -2,7 +2,7 @@
 //
 // The boundary between generated user code, the C core floor, and the privileged
 // runtime. Anything the generated `user.c` or the other C files call is declared
-// here; each `.c` includes this header. (Design: m4.13-spec.md; compiler.md §1.)
+// here; each `.c` includes this header. (Design: m4.13-spec.md; noir.md.)
 #ifndef NOMU_RUNTIME_H
 #define NOMU_RUNTIME_H
 
@@ -86,7 +86,7 @@ void  rt_mutex_unlock(void* m);
 void  rt_actor_send(void* mailbox, void* msg);
 void* rt_mailbox_pop(void* mailbox);
 
-// ---- GC root scanning (design: compiler.md §2 GC backend substrate; runtime.md §6) ----
+// ---- GC root scanning (design: backend.md GC backend substrate; runtime.md §6) ----
 // Parse the process's `__llvm_stackmaps` section into a return-address → live-GC-slot index.
 // Idempotent; called lazily by the walk. Inert until M6 turns on collection.
 void nomu_gc_stackmap_init(void);

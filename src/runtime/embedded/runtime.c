@@ -766,7 +766,7 @@ String rt_read_line(int fd) {
 }
 #endif
 
-// ---- GC root scanning (design: compiler.md §2 GC backend substrate; runtime.md §6) ----
+// ---- GC root scanning (design: backend.md GC backend substrate; runtime.md §6) ----
 // Parse the `__llvm_stackmaps` section (stackmap v3) into a return-address → live-GC-slot index,
 // then walk a stack (libunwind) mapping each frame's return address to its record and reading the
 // live roots. Inert now — nothing calls this except the smoke path (M6 drives it from the

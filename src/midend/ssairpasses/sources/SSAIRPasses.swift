@@ -2,7 +2,7 @@ import ssair
 import support
 import Foundation
 
-// The pass manager + the M7 passes over SSAIR (m7-spec.md §7.3–§7.5). Build order is EA-first (7.3),
+// The pass manager + the M7 passes over SSAIR (ssair.md). Build order is EA-first (7.3),
 // then devirt (7.4), then inlining/specialization + bounds-check elimination (7.5).
 //
 // Shape (7.3): passes mutate the module **in place**. SSAIR is value-type structs over copy-on-write

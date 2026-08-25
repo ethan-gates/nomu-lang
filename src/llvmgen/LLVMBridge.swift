@@ -126,7 +126,7 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
 
     // 8.4.1 — GC substrate pass pipeline. `mem2reg`/`sroa` promote our alloca-per-local lowering
     // to SSA so `RewriteStatepointsForGC` can see the `addrspace(1)` roots (a correctness
-    // prerequisite, compiler.md §2 GC backend substrate), then the rewrite turns every non-`gc-leaf` call in a
+    // prerequisite, backend.md GC backend substrate), then the rewrite turns every non-`gc-leaf` call in a
     // `gc "statepoint-example"` function into a `gc.statepoint` with relocatable roots. Nothing
     // moves in 8.4, so the relocations are identity — behavior is unchanged. The full `-O`
     // pipeline lands in 8.5; this is the minimum ordering the rewrite needs.

@@ -8,7 +8,7 @@ import XCTest
 import ssairgen
 import ssairpasses   // verifySSAIR — regression guard for block-argument threading
 
-// Block-sealing / direct-SSA-construction tests (m7-spec.md §7.2.2): nested loops, break/continue,
+// Block-sealing / direct-SSA-construction tests (ssair.md): nested loops, break/continue,
 // and a value live across a back-edge. Each drives the real pipeline (source → parse → Sema → NOIR →
 // SSAIR) and asserts on the dumped CFG.
 final class BlockSealingTests: XCTestCase {

@@ -4,7 +4,7 @@
 // file's `SourceMap`. Line/column are resolved lazily from the map when a diagnostic or debug-info
 // entry actually needs them — never computed eagerly per token. So a `Span` is small (two offsets +
 // a shared reference) and cheap to construct, while `span.begin.line` / `span.file` still work for
-// every consumer via the computed accessors below (design: `compiler.md` §1).
+// every consumer via the computed accessors below (design: `noir.md`).
 
 // Resolves byte offsets in one source file to 1-based line/column, and names the file. One per
 // lexed source; a `Span` holds a reference so any consumer can resolve on demand.

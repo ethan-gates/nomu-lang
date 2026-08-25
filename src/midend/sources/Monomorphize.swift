@@ -1,6 +1,6 @@
 import noir
 import support
-// Monomorphization — the specialization pass (design: generics.md §6, compiler.md §1).
+// Monomorphization — the specialization pass (design: generics.md §6, noir.md).
 // An IR→IR pass, run after Sema/exhaustiveness and before codegen.
 //
 // Under a single compilation unit there is no ABI boundary to preserve, so this
@@ -257,7 +257,7 @@ private final class Monomorphizer {
     }
 
     // The specialized decl name: `base<argKey,argKey>` — carried as a nominal name; Mangle
-    // 9-encodes the `<`, `>`, `,` (compiler.md §2a) into a valid C identifier.
+    // 9-encodes the `<`, `>`, `,` (backend.md) into a valid C identifier.
     private func specName(_ base: String, _ args: [Type]) -> String {
         args.isEmpty ? base : base + "<" + args.map(typeKey).joined(separator: ",") + ">"
     }

@@ -1,7 +1,7 @@
 import ast
 import support
 // A human-readable dump of NOIR — the `--emit-noir` output and the
-// minimum debug visibility into the typecheck phase (design: compiler.md §1).
+// minimum debug visibility into the typecheck phase (design: noir.md).
 //
 // Indented tree, printed like a pretty-printer: a subtree collapses onto ONE
 // line when its full flat rendering fits within `dumpWidth`; otherwise it breaks

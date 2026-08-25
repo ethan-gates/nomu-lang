@@ -26,7 +26,7 @@ struct Callable {
 // module / builder, the cached primitive types, and the type-layout, GC-map, witness, and runtime-call
 // primitives. Held by composition: the `SSAIRToLLVM` egress owns one `LLVMGen` and calls its
 // primitives, so the whole GC ABI is emitted from a single place. `final`, so the primitives dispatch
-// statically (m7-spec.md §7.2.3).
+// statically (ssair.md).
 //
 // This shared emitter was factored out (M7 §7.1.2 / §7.2.3) so the GC ABI lived in one place while the
 // NOIR tree-walk and the SSAIR CFG-walk co-existed behind the corpus differential. The NOIR walk
@@ -51,7 +51,7 @@ final class LLVMGen {
 
     let zeroSpan = Span(startOffset: -1, endOffset: -1, map: nil)   // synthetic: resolves to line 0
 
-    // The single error sink — first error wins, reported by the driver (design: compiler.md §1).
+    // The single error sink — first error wins, reported by the driver (design: noir.md).
     var error: String?
 
     // `some I` owner → its hidden concrete underlying (M5 A3); resolves `.opaque` to a real type.

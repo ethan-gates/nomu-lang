@@ -1,5 +1,5 @@
 // Collected diagnostics — the checker reports many errors and continues, rather
-// than exiting on the first (design: compiler.md §1). A reference type so a single sink
+// than exiting on the first (design: noir.md). A reference type so a single sink
 // threads through the semantic pass.
 
 public enum Severity {

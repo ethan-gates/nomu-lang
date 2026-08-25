@@ -7,7 +7,7 @@ import support
 import XCTest
 import ssairgen
 
-// Closure literals + closure conversion (m7-spec.md §7.2.2): captures → a synthesized env struct, the
+// Closure literals + closure conversion (ssair.md): captures → a synthesized env struct, the
 // body lifted to a top-level `SSAFunction`, the value produced by `makeClosure`.
 final class ClosureTests: XCTestCase {
     private func dump(_ source: String) -> String {

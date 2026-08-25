@@ -2,8 +2,7 @@
 
 The Nomu frontend — lexer, parser, AST, and the semantic pass (typed IR = NOIR). As of M7
 §7.1 the old single `frontend` module is **split into per-stage modules** grouped under this
-directory, with an interface/implementation separation (`design/internals/compiler.md` §8, `compiler.md`
-§8):
+directory, with an interface/implementation separation (`design/internals/architecture.md`):
 
 - `frontend/ast` (Token, AST, ASTDump) — syntactic interface · `frontend/parse` (Lexer, Parser) — impl
 - `frontend/noir` (NOIR, NOIRDump) — typed-IR interface · `frontend/sema` (Sema, Typechecker,
@@ -12,7 +11,7 @@ directory, with an interface/implementation separation (`design/internals/compil
 Siblings outside this directory: `support` (Span, Diagnostic, Type — the shared leaf, top-level)
 and `midend` (Monomorphize — NOIR→NOIR, grouped with the M7 SSAIR tier).
 
-The frontend is **kept across the C→LLVM backend transition** (`design/internals/compiler.md` §6), so
+The frontend is **kept across the C→LLVM backend transition** (`design/plans/deferred.md`, "C → LLVM transition checklist"), so
 architectural gaps here are real — unlike C-backend-only limitations, which are throwaway
 scaffolding. This backlog covers the frontend stages as a whole; most remaining items (modular
 checking, the query engine, monomorphization) are Sema-centric.
@@ -20,8 +19,9 @@ checking, the query engine, monomorphization) are Sema-centric.
 ## Architecture TODO
 
 A living, prioritized backlog of frontend work that keeps the committed
-architecture reachable — the tooling/query server (`compiler.md` §3), fine-grained
-incremental compilation (§8), and debug info (§1/§4). Seeded 2026-07-30 from the
+architecture reachable — the tooling/query server (`tooling.md`), fine-grained
+incremental compilation (`deferred.md`, pipeline hardening), and debug info
+(`noir.md` / `debugger.md`). Seeded 2026-07-30 from the
 architecture evaluation. Design deferrals (features, not architecture) live in
 `design/plans/deferred.md`.
 
@@ -90,11 +90,11 @@ automatic invalidation on a dependency's fingerprint change.
   no lookup index yet).
 - Watch item: **monomorphization** (5.4) fights incrementality — editing a generic
   re-stamps every instantiation. Witness-passing (the current baseline) does not;
-  design **cached monomorphizations** (`compiler.md` §7) if 5.4 lands.
+  design **cached monomorphizations** (`tooling.md`) if 5.4 lands.
 
 ### P2 — serializable / fingerprintable boundary formats
 Cache and tooling need each phase's output (tokens, AST, typed IR) to serialize
-fast and version stably (`compiler.md` §8). They're plain structs/enums today — keep
+fast and version stably (`architecture.md`). They're plain structs/enums today — keep
 them that way; add stable (de)serialization when the engine needs it.
 
 ## Notes

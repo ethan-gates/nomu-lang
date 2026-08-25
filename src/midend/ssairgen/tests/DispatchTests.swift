@@ -7,7 +7,7 @@ import support
 import XCTest
 import ssairgen
 
-// Dynamic dispatch + indirect calls (m7-spec.md §7.2.2c-i): boxing to `any I`, witness dispatch
+// Dynamic dispatch + indirect calls (ssair.md): boxing to `any I`, witness dispatch
 // through a box, `some I` static dispatch, and calls through a function value.
 final class DispatchTests: XCTestCase {
     private func dump(_ source: String) -> String {
