@@ -13,7 +13,7 @@ constant stack space.
 
 - **Self-tail-call → loop** — a small SSAIR pass. Rewrite a function's tail call to itself into a
   back-edge to entry with parameter reassignment (tail-recursive function → loop). High value,
-  self-contained, the common case. (In `../ssair-backlog.md` §5.)
+  self-contained, the common case. (In `148-ssair-optimizer-tier.md` §148.5.)
 - **General proper tail calls** (to any function, mutual recursion, trampoline/CPS) — larger. Needs
   the frontend/backend to emit LLVM `musttail`, a uniform calling convention across the tail edge, and
   care around the moving GC (`musttail` + statepoints have known friction; the safepoint/stack-map
@@ -35,4 +35,4 @@ self-tail-loop first; revisit a guarantee if a functional style or the self-host
 
 ## Refs
 
-deferred.md "Tail call optimization"; `../ssair-backlog.md` §5; [fiber stack strategy](104-fiber-stack-strategy.md).
+deferred.md "Tail call optimization"; `148-ssair-optimizer-tier.md` §148.5; [fiber stack strategy](104-fiber-stack-strategy.md).

@@ -1,6 +1,6 @@
 # SSAIR — the optimizer tier (M7)
 
-**Status: Built — M7 done (2026-08-24).** SSAIR is the sole backend path; the NOIR→LLVM tree-walk was retired at M7.7. This is the as-built **design home** for the tier — the *why*, the IR shape, the decisions (with the alternatives rejected along the way), the pass framework, and the GC-precision invariants every pass must preserve. Escape-analysis-as-built is in `memory-model.md` §6.1; the GC/statepoint substrate the tier rests on is `backend.md`; NOIR (the structured IR that lowers into SSAIR) is `noir.md`. Remaining refinements are in `plans/ssair-backlog.md`; the phased build history + per-slice records are in git + the code.
+**Status: Built — M7 done (2026-08-24).** SSAIR is the sole backend path; the NOIR→LLVM tree-walk was retired at M7.7. This is the as-built **design home** for the tier — the *why*, the IR shape, the decisions (with the alternatives rejected along the way), the pass framework, and the GC-precision invariants every pass must preserve. Escape-analysis-as-built is in `memory-model.md` §6.1; the GC/statepoint substrate the tier rests on is `backend.md`; NOIR (the structured IR that lowers into SSAIR) is `noir.md`. Remaining refinements are in `plans/tasks/148-ssair-optimizer-tier.md`; the phased build history + per-slice records are in git + the code.
 
 **One-line intent.** **SSAIR** is a lower, control-flow-explicit, SSA intermediate representation — a separate IR from NOIR (its own types, dumper, files), the level where the language-aware optimizations that carry the "faster than Swift/Go" thesis run. Structured NOIR lowers into SSAIR; SSAIR lowers to LLVM. It is Nomu's analog of **Rust's MIR / Swift's SIL**, sitting below THIR-altitude NOIR and above LLVM IR. (Named 2026-08-14; the sibling to NOIR, both ending in IR.)
 
@@ -54,7 +54,7 @@ The tier lands **after monomorphization** (passes see concrete types, no type pa
 3. **Inlining + specialization** — single-block splice and multi-block CFG surgery (with a return-φ join) to a bounded fixpoint. "Specialization" means **value/constant** specialization (mono already specializes on *types* whole-program) — the cost model + value specialization are backlogged.
 4. **Bounds-check elimination** — **the loop-bound case was descoped**: `for … in` (+ ranges) is the bounds-check-free-by-construction path, so proving hand-written index loops safe proves something idiomatic code won't write. The retained residual (dominating-redundant + constant-fold) is a deferred cleanup.
 
-The IR is designed so all four compose (see ordering), rather than as four independent bolt-ons. Interprocedural EA, cost-model inlining, and the closure/spawn-env promotions are the backlogged tails (`plans/ssair-backlog.md`).
+The IR is designed so all four compose (see ordering), rather than as four independent bolt-ons. Interprocedural EA, cost-model inlining, and the closure/spawn-env promotions are the backlogged tails (`plans/tasks/148-ssair-optimizer-tier.md`).
 
 ## Lowering out to LLVM
 
@@ -89,6 +89,6 @@ The tier shipped in phases **7.1** modularization → **7.2** SSAIR + inert lowe
 - **Interprocedural EA summary** — how much survives without whole-program iteration to fixpoint; whether monomorphization's whole-program view makes a cheap summary enough.
 - **Debug info through inlining** — inline-site DWARF records, or defer.
 - **Alias/effect model** — how much aliasing precision the passes need before the cost outweighs the win.
-- **Artifact/dump format** — the tier reuses a flat textual SSA dump (`dumpSSAIR`); whether it hardens into a versioned round-trippable format is the IR-hardening item (`plans/deferred.md`).
+- **Artifact/dump format** — the tier reuses a flat textual SSA dump (`dumpSSAIR`); whether it hardens into a versioned round-trippable format is the IR-hardening item (`plans/tasks/142-ir-pipeline-hardening.md`).
 
-The full backlog of tier work (passes, analyses, infra, validation) is `plans/ssair-backlog.md`.
+The full backlog of tier work (passes, analyses, infra, validation) is `plans/tasks/148-ssair-optimizer-tier.md`.

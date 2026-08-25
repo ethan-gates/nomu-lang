@@ -15,7 +15,7 @@
 
 `for … in` is the **bounds-check-free-by-construction** iteration path (safe-by-construction,
 Rust-iterator style) — so array iteration needs no bounds-check-elimination pass. The M7 BCE
-loop-bound case was descoped in favor of this (`ssair.md`, BCE; `../ssair-backlog.md` §4).
+loop-bound case was descoped in favor of this (`ssair.md`, BCE; `148-ssair-optimizer-tier.md` §148.4).
 
 ## Roadmap assessment (three-head)
 
@@ -25,8 +25,8 @@ the above perf-envelope commitment.
 ## Dependencies & triggers
 
 - **Depends on:** a stdlib iterator/sequence interface ([stdlib-core](120-stdlib-core.md)).
-- **Feeds:** the BCE descope (`../ssair-backlog.md`).
+- **Feeds:** the BCE descope (`148-ssair-optimizer-tier.md` §148.4).
 
 ## Refs
 
-deferred.md "Frontend surface features"; `ssair.md` (BCE); `../ssair-backlog.md` §4.
+deferred.md "Frontend surface features"; `ssair.md` (BCE); `148-ssair-optimizer-tier.md` §148.4.

@@ -12,4 +12,4 @@ Great tooling (Rust, TypeScript) comes from designing the compiler as a server e
 
 ## Open
 
-- **Incremental compilation + cached monomorphizations** — the shape that keeps LLVM iteration bearable; ties to the query architecture above and to monomorphization (`generics.md` §6). Backlog in `plans/deferred.md`.
+- **Incremental compilation + cached monomorphizations** — the shape that keeps LLVM iteration bearable; ties to the query architecture above and to monomorphization (`generics.md` §6). Backlog in `plans/tasks.md`.

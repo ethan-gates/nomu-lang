@@ -1,0 +1,11 @@
+
+
+struct str {
+    var state: Int
+    var count: UInt8
+    var long: String
+}
+
+fun newStr() -> str {
+    return str(state: 0, count: 0, long: "")
+}

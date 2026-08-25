@@ -22,5 +22,5 @@ detail). Start where the extraction is cleanest — settled surfaces first:
 - **concurrency** (the shareability rule, structured scopes, actors) ← `../internals/concurrency.md`
 
 Keep it to guarantees a Nomu author can rely on — no implementation detail. Update the deferred
-item ("Docs reorganization: working design docs vs. a language spec", `../plans/deferred.md`) and
+item ("Docs reorganization: working design docs vs. a language spec", `../plans/tasks/146-language-contract-tier.md`) and
 close it as these land.

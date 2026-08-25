@@ -1,11 +1,18 @@
 # Fiber stack strategy: growth, overflow, high-fiber-count throughput
 
 **Avenue:** Risk (the "better than Go" concurrency thesis) · **Type/Lifecycle:** `perf · needs-design`
-(runtime + compiler architecture) · **Size:** L · **Status:** evaluate · **Source:** deferred.md
-(2026-08-18) + roadmap M8
+(runtime + compiler architecture) · **Size:** L · **Status:** build deferred; direction provisionally
+decided (2026-08-25) · **Source:** deferred.md (2026-08-18) + roadmap M8
 
-**► Decide-early: before M8.** M8 scopes growable fiber stacks; the fixed-vs-dynamic decision must
-precede that build. Runtime + codegen shape depend on it. Design-ahead, not build-ahead.
+**Provisional decision (2026-08-25): defer the build, lean guard-page.** The build rides the late
+massive-fan-out workload ([103](103-dynamic-spawn-group.md)); fixed 128 KiB holds until then, and the
+GC substrate a moving scheme would need (statepoints + parked-fiber scan) is already built. The lean is
+**guard-page + lazy commit** — a runtime-only change (mmap + fault handler) with near-zero codegen
+ripple, which is what makes deferring safe. The one thing this forecloses against is **copy-on-grow**
+(Go-style prologue stack-limit checks + calling-convention changes); avoid baking ABI decisions that
+assume it. Optional cheap win now, decoupled from any growth scheme: a guard page on the current fixed
+stacks for clean overflow *detection* (crash instead of silent corruption). The decide-early flag is
+thereby answered — full evaluation below stands for when the build is picked up.
 
 ## What
 

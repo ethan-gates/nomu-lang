@@ -13,6 +13,22 @@ An unsafe layer: raw pointers, untyped memory (alloc/free off-heap or pinned wit
 load/store, pointer arithmetic, and manual layout. The escape hatch below the safe type system that
 low-level code needs.
 
+## Minimal scope (decided 2026-08-25)
+
+Build only as much as the stdlib primitives need — a growable raw **byte buffer**: allocate/free
+(GC-heap blob or pinned), raw load/store at an offset, `memcpy`/grow, length + capacity, and pointer
+arithmetic for indexing. That is enough to back a real UTF-8 `String` ([121](121-string-utf8-model.md))
+and a real `Array<T>` ([120](120-stdlib-core.md)); `Set`/`Dict` ride the same buffer (hand-written).
+Hold the wider surface (capability/provenance system, SIMD-aligned storage, FFI marshalling) until a
+consumer asks for it.
+
+**GC-scannable buffers — the one non-trivial bit.** A buffer whose elements are managed references
+(`Array<SomeClass>`, or a `Dict` of managed key/value) must be **traced by the precise collector**: the
+GC has to walk the element slots and relocate them on a move. `String` (raw bytes) and `Array<Int>` are
+non-scanned blobs and trivial; `Array<reference>` needs the buffer typed so the precise scan covers its
+element slots. Getting this right is what makes "real arrays" work, so it is in scope for the minimal
+build. Ref: `memory-model.md` §3 (object model / precise scan).
+
 ## Why consequential — a named hard prerequisite for
 
 - **[Self-hosting runtime](128-self-hosting-runtime.md)** — the collector + allocator manipulate untyped

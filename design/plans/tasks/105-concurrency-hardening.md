@@ -31,8 +31,8 @@ claim has a test and a precise statement behind it.
 
 Seed a lightweight version of the stress harness during M8 as ongoing discipline; M12 is the
 comprehensive formalization + exhaustive pass, not the first test. Overlaps the SSAIR randomized
-differential (T7, `../ssair-backlog.md` §9).
+differential (T7, `148-ssair-optimizer-tier.md` §148.9).
 
 ## Refs
 
-`concurrency.md`, `runtime.md` §6; roadmap M12; `../ssair-backlog.md` (T7).
+`concurrency.md`, `runtime.md` §6; roadmap M12; `148-ssair-optimizer-tier.md` §148.9 (T7).

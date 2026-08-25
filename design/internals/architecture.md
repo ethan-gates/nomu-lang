@@ -21,7 +21,7 @@ Each IR is its own **interface module** (its format: the types + dump), separate
 
 `support` | `ast` / `parse` | `noir` / `sema` | `midend` | `ssair` / `ssairgen` / `ssairpasses` | `llvmgen`
 
-The interface module is the structural home for the phase-output-format and format-stability work (deferred; see `plans/deferred.md` "Pipeline boundary hardening"), and the dependency surface the query architecture ([`tooling.md`](tooling.md)) memoizes against. Built as the first M7 slice; the module layout is the record.
+The interface module is the structural home for the phase-output-format and format-stability work (deferred; see `plans/tasks/142-ir-pipeline-hardening.md` "Pipeline boundary hardening"), and the dependency surface the query architecture ([`tooling.md`](tooling.md)) memoizes against. Built as the first M7 slice; the module layout is the record.
 
 ## Committed capabilities — architecture evaluation (2026-07-30)
 

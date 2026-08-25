@@ -9,7 +9,7 @@ Merges two overlapping deferred items: hardening the IR *formats* and hardening 
 
 **► Decide-early: inject the format discipline into the current M7 tier.** SSAIR is new right now; set
 the format + stage-boundary discipline before more IR node kinds and passes accrete. Cheapest moment.
-Design-ahead, with a light build. (Also tracked in `../ssair-backlog.md` §8.)
+Design-ahead, with a light build. (Also tracked in `148-ssair-optimizer-tier.md` §148.8.)
 
 ## What — evaluation axes
 
@@ -54,5 +54,5 @@ perf/programmer-expectation ripple. Rides M7 (IR tier) + M10 (tooling).
 ## Refs
 
 deferred.md "IR hardening", "Pipeline boundary hardening"; `noir.md` (pipeline); the emit/stop flags;
-`SSAIRDump` / `SSAIRGen`; `../ssair-backlog.md` §8; `architecture.md` (interface modules);
+`SSAIRDump` / `SSAIRGen`; `148-ssair-optimizer-tier.md` §148.8; `architecture.md` (interface modules);
 `src/frontend/README.md` (the `exit(1)`-on-first-error blocker).

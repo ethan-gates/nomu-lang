@@ -126,7 +126,7 @@ This is the mechanism that recovers manual-memory-grade performance for the comm
 
 Non-escape is over-approximate (I4, `ssair.md`): a value escapes on return, any call/send/spawn argument, a store *of* the value, boxing, or capture. Scalar promotion's soundness reduces to two already-trusted mechanisms — SSA construction at field granularity, and `addrspace(1)` SSA values relocated by the statepoint rewriter.
 
-**Rejected / deferred directions.** *Array-buffer stack promotion was assessed and dropped* — a statically-bounded, never-appended `arrayLit` catches almost nothing (the costly arrays are `.append` loops and runtime-sized scratch buffers, exactly what such a gate rejects); the real lever is smallvec-style inline storage, a representation change that belongs with the stdlib `Array` design, not this pass. Deferred tails — interprocedural "any call argument escapes" lift, closure-env / spawn-env promotion, in-place-mutation scalar promotion, wider scalarizable field types — are in `plans/ssair-backlog.md`.
+**Rejected / deferred directions.** *Array-buffer stack promotion was assessed and dropped* — a statically-bounded, never-appended `arrayLit` catches almost nothing (the costly arrays are `.append` loops and runtime-sized scratch buffers, exactly what such a gate rejects); the real lever is smallvec-style inline storage, a representation change that belongs with the stdlib `Array` design, not this pass. Deferred tails — interprocedural "any call argument escapes" lift, closure-env / spawn-env promotion, in-place-mutation scalar promotion, wider scalarizable field types — are in `plans/tasks/148-ssair-optimizer-tier.md`.
 
 ### 6.2 Deterministic resource cleanup
 

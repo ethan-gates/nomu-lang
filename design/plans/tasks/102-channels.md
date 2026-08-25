@@ -17,7 +17,7 @@ waited.
 ## Dependencies & triggers
 
 - **Ready:** M:N scheduler, poller, park/unpark, async actor runtime.
-- **Interacts with:** [cancellation](135-m8-cancellation-continuations.md) (a blocked channel op must be
+- **Interacts with:** [cancellation](135-cancellation-continuations.md) (a blocked channel op must be
   cancellable at a safepoint) and shareability (values crossing a channel are a task boundary — the
   shareability rule applies).
 

@@ -103,7 +103,7 @@ Intentionally out; none of these locks anything that contradicts adding them lat
 - **Nested type-argument inference.** Pinning `T` *through* a container argument that doesn't determine it (a `.none`) — supply an annotation for now (§3).
 - **Instance methods / computed properties on a generic type** — rejected with a clean error.
 - **Parameter-position `some`** (`fun f(x: some I)`) — subsumed by `<T: I>`, which expresses the same thing.
-- **`shared` on closure/function types and existentials** (`shared (A) -> B`, `shared any I`) — no consumer under a single compilation unit; the real trigger is interface requirements forwarding closures, or modules. Tracked in `deferred.md`.
+- **`shared` on closure/function types and existentials** (`shared (A) -> B`, `shared any I`) — no consumer under a single compilation unit; the real trigger is interface requirements forwarding closures, or modules. Tracked in `plans/tasks/132-shared-spellings.md`.
 - **Error-handling sugar** — `?` propagation and typed throws (`types.md` §4).
 - **Newtype / type-alias mechanism** — the distinct-nominal wrapper that lets a third module escape the orphan rule (§11), left undesigned; not blocking (no modules yet).
 - **Monomorphization cross-module policy** — re-scoping "specialize everything" to within-module + opt-in cross-module specialization, when modules land (§6).

@@ -8,9 +8,9 @@ tracking artifact; the per-task docs hold the detail.
   items in `../roadmap.md` (M8, M10–M13, LXR, the "Ongoing" set) were mined into them too.
   `roadmap.md` stays as-is pending its own rewrite; it states direction + the near horizon and
   draws from this backlog.
-- **Not here.** SSAIR optimizer-tier work lives in `ssair-backlog.md` (referenced, not
-  duplicated). Durable design lives in `../language/` + `../internals/`; these are ephemeral
-  work-tracking per `readme.md`.
+- **Not here.** Durable design lives in `../language/` + `../internals/`; this index is ephemeral
+  work-tracking per `readme.md`. The SSAIR optimizer tier is task [148](tasks/148-ssair-optimizer-tier.md),
+  which carries its sub-item backlog at `148.x` granularity.
 
 ## Two prioritization avenues
 
@@ -43,11 +43,11 @@ matters, lives in the roadmap horizon, not here. Drill-down inside a task uses t
 
 | # | Task | Avenue | Size | Status |
 | --- | --- | --- | --- | --- |
-| 135 | [Cancellation + one-shot continuations](tasks/135-m8-cancellation-continuations.md) | Risk | L | needs-design |
+| 135 | [Cancellation + one-shot continuations](tasks/135-cancellation-continuations.md) | Risk | L | needs-design |
 | 101 | [`defer` + linear types](tasks/101-defer-linear-types.md) | Usability | M | needs-design (► decide-early w/ M8) |
 | 102 | [Channels](tasks/102-channels.md) | Usability | M | needs-design |
 | 103 | [Dynamic fan-out spawn group](tasks/103-dynamic-spawn-group.md) | Risk | M | needs-design |
-| 104 | [Fiber stack strategy](tasks/104-fiber-stack-strategy.md) | Risk | L | needs-design (► decide-early, before M8) |
+| 104 | [Fiber stack strategy](tasks/104-fiber-stack-strategy.md) | Risk | L | build deferred; direction decided (guard-page lean) |
 | 105 | [Concurrency hardening (M12)](tasks/105-concurrency-hardening.md) | Risk | L | evaluate |
 | 106 | [Actor fiber-aware mutex](tasks/106-actor-fiber-aware-mutex.md) | Risk | M | ready-to-build |
 
@@ -93,6 +93,7 @@ matters, lives in the roadmap horizon, not here. Drill-down inside a task uses t
 | 132 | [`shared` function-type / existential spellings](tasks/132-shared-spellings.md) | Infra | S | ready-to-build (trigger-gated) |
 | 133 | [Fiber-pinned mutator cache](tasks/133-fiber-pinned-mutator-cache.md) | Infra | S | needs-grounding |
 | 134 | [MLIR consideration](tasks/134-mlir-consideration.md) | Infra | S | evaluate |
+| 148 | [SSAIR optimizer tier](tasks/148-ssair-optimizer-tier.md) | Risk | L | mostly-shipped (tails open) |
 
 ### Tooling, modules, macros
 
@@ -123,7 +124,7 @@ Design decisions to settle ahead of their build so later choices don't foreclose
 
 1. [`deinit` / finalization](tasks/108-deinit-finalization.md) — the finalization-vs-deterministic-cleanup fork,
    alongside M8's [`defer` + linear types](tasks/101-defer-linear-types.md).
-2. [Fiber stack strategy](tasks/104-fiber-stack-strategy.md) — fixed vs dynamic stacks, before M8 growable stacks.
+2. [Fiber stack strategy](tasks/104-fiber-stack-strategy.md) — ✓ resolved 2026-08-25: build deferred, guard-page lean.
 3. [IR + pipeline hardening](tasks/142-ir-pipeline-hardening.md) — IR text-format discipline while SSAIR is young (M7).
 4. [Modules](tasks/100-modules.md) — the separate-compilation-vs-whole-program-mono fork, before M10.
 5. [Unsafe raw memory](tasks/125-unsafe-raw-memory.md) — the unsafe surface, before the stdlib track starts.

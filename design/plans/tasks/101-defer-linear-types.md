@@ -16,12 +16,12 @@ linear/`defer`) alongside this. Design-ahead, not build-ahead.
 
 ## Why deferred
 
-Linear types' first concrete consumers are M8's [continuations](135-m8-cancellation-continuations.md)
+Linear types' first concrete consumers are M8's [continuations](135-cancellation-continuations.md)
 (resume-once) and resource cleanup. `defer` is useful earlier but was parked with the resource story.
 
 ## Dependencies & triggers
 
-- **Pairs with:** [cancellation + continuations](135-m8-cancellation-continuations.md) (resume-once
+- **Pairs with:** [cancellation + continuations](135-cancellation-continuations.md) (resume-once
   enforcement).
 - **Gates:** the resource-management contract and the [`deinit`](108-deinit-finalization.md) fork.
 

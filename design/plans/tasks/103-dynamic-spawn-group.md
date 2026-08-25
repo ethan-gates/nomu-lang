@@ -11,7 +11,7 @@ an unbounded/data-driven number of children), beyond today's static `spawn let` 
 
 ## Why deferred
 
-Sequenced after [cancellation](135-m8-cancellation-continuations.md) (decided 2026-08-10): it rides the
+Sequenced after [cancellation](135-cancellation-continuations.md) (decided 2026-08-10): it rides the
 structured-cancellation model for its fail-fast error mode. Its motivating use — benchmarking highly
 concurrent workloads — can wait, and static `spawn let` fan-out already ships.
 
