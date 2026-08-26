@@ -1,8 +1,15 @@
 # Self-hosted GC bring-up ladder (NoGC → mark-verify → Immix → GenImmix)
 
-**Avenue:** Risk (the core bet) · **Type/Lifecycle:** `runtime · needs-design` (runtime + GC + backend) ·
-**Size:** XL · **Status:** needs-design — build now · **Source:** distilled from
+**Avenue:** Risk (the core bet) · **Type/Lifecycle:** `runtime · design-drafted` (runtime + GC + backend) ·
+**Size:** XL · **Status:** design-drafted (ladder + rung 1) — build now · **Source:** distilled from
 [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
+
+**► Design:** [`internals/selfhosted-gc.md`](../../internals/selfhosted-gc.md) — the ladder architecture +
+differential-oracle method, the shared substrate reused across rungs (statepoints, the single allocation
+entry point, the type-id object model), and **rung 1 (NoGC)** in depth: a Nomu bump allocator over 125
+off-heap OS blocks behind the existing `__nomu_gc_alloc` entry, with the `addrspace(1)` production kept
+compiler-emitted and the policy (memory source, refill, header stamping, per-carrier state) in Nomu under
+149's subset rules. Rungs 2–4 at sketch depth; deepen as reached. Rung 1 ready to build.
 
 ## What
 

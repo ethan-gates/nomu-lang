@@ -88,8 +88,8 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 | --- | --- | --- | --- | --- |
 | 127 | [LXR collector (footprint endgame)](tasks/127-lxr-collector.md) | Risk | XL | final rung of the self-hosted GC ladder (after 150's GenImmix) |
 | 128 | [Self-hosting the runtime](tasks/128-self-hosting-runtime.md) | Risk | XL | build now — core bet; decomposes into 125 → 149 → 150 → 127 |
-| 149 | [Runtime-subset mechanism](tasks/149-runtime-subset.md) | Risk | M | needs-design — build now (self-host prereq) |
-| 150 | [Self-hosted GC bring-up ladder](tasks/150-selfhosted-gc-ladder.md) | Risk | XL | needs-design — build now (NoGC → mark-verify → Immix → GenImmix) |
+| 149 | [Runtime-subset mechanism](tasks/149-runtime-subset.md) | Risk | M | design-drafted — build now (surface A: module-default + `nosplit fun`, `internals/runtime-subset.md`; self-host prereq) |
+| 150 | [Self-hosted GC bring-up ladder](tasks/150-selfhosted-gc-ladder.md) | Risk | XL | design-drafted (ladder + rung 1) — build now (NoGC → mark-verify → Immix → GenImmix; `internals/selfhosted-gc.md`) |
 | 129 | [Tail-call optimization](tasks/129-tail-call-optimization.md) | Usability | M | needs-design |
 | 130 | [First-class FFI to the C ABI](tasks/130-ffi-c-abi.md) | Usability | L | needs-design |
 | 131 | [Shared-mutable primitive](tasks/131-shared-mutable-primitive.md) | Risk | M | ongoing |

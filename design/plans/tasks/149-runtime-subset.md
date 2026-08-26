@@ -1,8 +1,16 @@
 # Runtime-subset mechanism (the pragmas that let runtime code avoid its own services)
 
-**Avenue:** Risk (self-hosting prerequisite) · **Type/Lifecycle:** `language-feature · needs-design`
-(language + compiler checking) · **Size:** M · **Status:** needs-design — build now · **Source:**
+**Avenue:** Risk (self-hosting prerequisite) · **Type/Lifecycle:** `language-feature · design-drafted`
+(language + compiler checking) · **Size:** M · **Status:** design-drafted — build now · **Source:**
 distilled from [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
+
+**► Design:** [`internals/runtime-subset.md`](../../internals/runtime-subset.md). Surface pinned with
+Ethan: **surface A — module-default subset + a narrow per-function keyword refinement** (`nosplit fun`);
+no attribute grammar; the marker appears only in privileged runtime code. Represented internally as a
+per-function property set (`{noAlloc, noBarrier, noSafepoint, nosplit}`) seeded by module membership and
+refinable, so a finer per-function surface (attributes/keywords) stays a front-end addition later.
+Checking is a call-graph closure pass + codegen-site guards; the 125 primitives are the subset-legal
+allowlist. Ready to build.
 
 ## What
 
