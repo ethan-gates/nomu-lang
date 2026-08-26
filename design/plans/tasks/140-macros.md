@@ -1,7 +1,7 @@
-# Macros (M13)
+# Macros
 
 **Avenue:** Usability · **Type/Lifecycle:** `language-feature · needs-design` · **Size:** L ·
-**Status:** needs-design · **Source:** roadmap M13
+**Status:** needs-design · **Source:** `macros.md`
 
 ## What
 
@@ -17,4 +17,4 @@ introduced names don't capture or collide with user names).
 
 ## Refs
 
-roadmap M13; deferred.md "Identifier interning" (hygiene interaction); [comptime](141-comptime.md).
+deferred.md "Identifier interning" (hygiene interaction); [comptime](141-comptime.md).

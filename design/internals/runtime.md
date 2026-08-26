@@ -24,7 +24,7 @@ The doc set follows this vocabulary (pass done 2026-07-16): **fiber** for the ru
 - **M:N stackful fibers** — many fibers multiplexed over few OS carrier threads; a fiber has a real stack and can suspend anywhere. — **Locked** (`concurrency.md` §1).
 - **Work-stealing** across carriers, with per-carrier run queues and a shared overflow queue (Go/Tokio shape). — **Leaning.**
 - **A parallelism knob** (`GOMAXPROCS`-equivalent) caps carrier count. — **Leaning.**
-- **Stack growth** — growable **contiguous** stacks (copy-on-grow, Go's post-2014 model) so a fiber starts small and grows by copying to a larger buffer; segmented ("hot split") rejected. A copy relocates the stack, so every interior/frame-relative pointer and saved SP must be found and rewritten — this reuses the precise parked-fiber stack walk the moving GC already emits (statepoint stack maps + §6), extended from *scan* to *relocate*. Infrastructure is in place; **gated on the M8 dynamic spawn group** (`roadmap.md` M8) so the payoff (massive fan-out shrinking the fixed-128 KiB footprint) is measurable on that milestone's own concurrency benchmark the day it lands. — **Decided (contiguous copy-on-grow); scheduled at M8.**
+- **Stack growth** — growable **contiguous** stacks (copy-on-grow, Go's post-2014 model) so a fiber starts small and grows by copying to a larger buffer; segmented ("hot split") rejected. A copy relocates the stack, so every interior/frame-relative pointer and saved SP must be found and rewritten — this reuses the precise parked-fiber stack walk the moving GC already emits (statepoint stack maps + §6), extended from *scan* to *relocate*. Infrastructure is in place; **gated on the dynamic spawn group** (tasks `plans/tasks/104-fiber-stack-strategy.md`, `plans/tasks/103-dynamic-spawn-group.md`) so the payoff (massive fan-out shrinking the fixed-128 KiB footprint) is measurable on that workload's own concurrency benchmark the day it lands. — **Decided (contiguous copy-on-grow); scheduled with the dynamic spawn group.**
 - **Task-locals** — per-task storage analogous to goroutine-locals / thread-locals. Shape open. — **Open.**
 
 The abstract suspension primitive these rest on — `park`/`unpark(t)`/`current` with permit semantics — is Locked and specified in `concurrency.md` §2; this doc does not restate it.
@@ -182,7 +182,7 @@ Transitions:
 
 ### Deferred from M4
 
-- **Stack growth** — fixed 128KB stacks; growable **contiguous** (copy-on-grow) stacks scheduled at M8 (see the §1 stack-growth item and `roadmap.md` M8).
+- **Stack growth** — fixed 128KB stacks; growable **contiguous** (copy-on-grow) stacks scheduled with the dynamic spawn group (see the §1 stack-growth item and task `plans/tasks/104-fiber-stack-strategy.md`).
 - **Parallelism knob** — carrier count hardcoded at 4; `GOMAXPROCS`-equivalent not yet wired.
 - **Work stealing** — M4.3c; single shared queue used instead.
 - **Blocking-syscall offload** — M4.6; `nanosleep` / file reads block the carrier.

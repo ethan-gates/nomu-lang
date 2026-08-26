@@ -13,12 +13,12 @@ The docs are organized by **audience/fidelity**, mirroring the three sources of 
 - **code** — the exact source, most costly to read.
 - **[`plans/`](plans/readme.md)** — ephemeral work-tracking (backlogs, milestone build-plans); not durable design.
 
-Steering docs (`vision.md`, `roadmap.md`, this index) stay at the root. Docs cross-reference each other by name (`backend.md`), so the name resolves regardless of folder.
+Steering docs (`vision.md`, this index) stay at the root. Docs cross-reference each other by name (`backend.md`), so the name resolves regardless of folder.
 
 ## Steering
 
 - [vision.md](vision.md) — what Nomu is for: goals, performance profile, design principles, rejected directions, and the tiebreaker for future decisions.
-- [roadmap.md](roadmap.md) — milestones (provisional, post-pivot).
+- Near-term ordering and the work backlog live in `plans/` — [plans/horizon.md](plans/horizon.md) (what's next + why) and [plans/tasks.md](plans/tasks.md) (the task index). The former `roadmap.md` was retired; shipped-milestone history is in git + the per-subsystem `internals/` docs (see "Retired milestone specs" below).
 
 ## Internals (as-built design)
 
@@ -39,6 +39,7 @@ Steering docs (`vision.md`, `roadmap.md`, this index) stay at the root. Docs cro
 - [internals/debugger.md](internals/debugger.md) — the debugger plan (emit DWARF, extend lldb): the tiered plan and pragmatics; fills in as it's built.
 - [internals/ssair.md](internals/ssair.md) — the SSAIR optimizer tier (M7): IR shape + decisions, the pass framework + four passes (escape analysis with stack/scalar promotion, devirtualization, inlining, BCE), lowering to LLVM, and the GC-precision invariants (I1–I10) the transforms preserve.
 - [internals/c-types.md](internals/c-types.md) — C-backed standard-library types (String, `Array<T>`, planned numeric primitives + spawn group): layout, the allocation/GC boundary, and the runtime contract, before they migrate into a Nomu-written stdlib.
+- [internals/unsafe-memory.md](internals/unsafe-memory.md) — **design draft (task 125):** the unsafe raw-memory surface the self-hosted runtime is written in — `RawPtr` / `Ptr<T>` (library types, no new keywords), the addrspace(0) representation, the GC boundary (off-heap / immortal admitted, moving-heap interior gated), operations, and compiler wiring.
 - [internals/builtin.md](internals/builtin.md) — how-to: adding a C-backed builtin method / property / free function and wiring it through Sema, codegen, and the safepoint pass (no lexer/parser change).
 
 ## Plans (ephemeral)
@@ -71,9 +72,9 @@ Each doc owns its own rollup; the cross-cutting highlights:
 - **Generics** — **built through M5** and specified as-built in `generics.md` (parameters, inference, checking, witness-passing + monomorphization, generic types, `shared` bound, exhaustiveness, `Result`). Remaining open items are the deferred surface listed there (§10): operators-as-requirements, associated types, `?`/typed-throws, the newtype mechanism.
 - **Concurrency** — the model is essentially complete (`concurrency.md`): the shareability rule (§1), suspension core (§2), continuations (§3, §6), channels as a deferred library (§4), share analysis (§5), the **cancellation model** (§7), the **scope surface** (§8), and the **actor surface** (§9) are all decided. The **shared-mutable primitive** is decided-deferred (§10 — reserved fourth shareable category). Remaining: the **spelling batch** and the shared-mutable design when generics land.
 - **Runtime/scheduler** — work-stealing internals, stack growth, task-locals, remote-wake primitive, platform/syscall (no-libc) strategy, and deferred FFI attach/pinning (`runtime.md` §7).
-- **Deterministic resource cleanup** — `defer` is Decided; linear / non-copyable types deferred to M8 (`memory-model.md` §6.2).
+- **Deterministic resource cleanup** — `defer` is Decided; linear / non-copyable types deferred (`memory-model.md` §6.2; task `plans/tasks/101-defer-linear-types.md`).
 - **Error handling** — errors-as-values (no exceptions) Decided; the *form* (`Result`/tuple/other carrier, `?` operator, typed throws) is open (`types.md` §4).
 - **Modules & access control** — undesigned; a stub reserves the topic (`modules.md`).
 - **Keyword spellings** — `shareable`, `extension` (`syntax.md`, and their home docs).
 - **Backend** — MLIR vs. plain LLVM; Cranelift for debug builds (`backend.md`).
-- **Roadmap** — the milestone order is provisional post-pivot (`roadmap.md`).
+- **Planning** — near-term ordering is in `plans/horizon.md`; the backlog in `plans/tasks.md`.

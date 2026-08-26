@@ -2,7 +2,7 @@
 
 **Avenue:** Risk (high-concurrency thesis) · **Type/Lifecycle:** `language-feature · needs-design` ·
 **Size:** M · **Status:** designed (`concurrency.md` §8), sequenced after cancellation ·
-**Source:** roadmap M8
+**Source:** `concurrency.md` §8 (dynamic spawn group)
 
 ## What
 
@@ -30,5 +30,5 @@ Per `concurrency.md` §8; fail-fast on first child error via the cancellation mo
 
 ## Refs
 
-`concurrency.md` §8 (dynamic spawn group), §7 (cancellation); roadmap M8;
+`concurrency.md` §8 (dynamic spawn group), §7 (cancellation);
 [fiber-stack-strategy](104-fiber-stack-strategy.md).

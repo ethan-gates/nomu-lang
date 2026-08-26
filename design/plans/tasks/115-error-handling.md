@@ -24,5 +24,5 @@ midend/backend touch.
 
 ## Refs
 
-`types.md` §5 (errors); roadmap "Cross-cutting" (error handling); deferred.md "Frontend surface
+`types.md` §5 (errors); cross-cutting design (error handling); deferred.md "Frontend surface
 features".

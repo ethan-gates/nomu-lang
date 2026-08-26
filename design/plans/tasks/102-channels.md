@@ -1,16 +1,15 @@
 # Channels
 
 **Avenue:** Usability · **Type/Lifecycle:** `language-feature · needs-design` · **Size:** M ·
-**Status:** designed direction, unbuilt · **Source:** roadmap M8
+**Status:** designed direction, unbuilt · **Source:** `concurrency.md` §4 (channels as a deferred library)
 
 ## What
 
-The channels library — typed communication between fibers/tasks on the M:N runtime. Part of the M8
-concurrency-completion set.
+The channels library — typed communication between fibers/tasks on the M:N runtime. Part of the concurrency-completion set.
 
 ## Why deferred
 
-Sits on the M:N runtime (M4) and the async actor runtime (M6 §9); sequenced into M8 with the rest of
+Sits on the M:N runtime (M4) and the async actor runtime (M6 §9); sequenced with the rest of
 the concurrency surface. Actors + structured spawn already cover the common cases, so channels
 waited.
 
@@ -28,5 +27,5 @@ waited.
 
 ## Refs
 
-roadmap M8; `concurrency.md` §5 (shareability), §9 (actor runtime); `runtime.md` (scheduler,
+`concurrency.md` §5 (shareability), §9 (actor runtime); `runtime.md` (scheduler,
 park/unpark).

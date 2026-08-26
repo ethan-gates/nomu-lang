@@ -57,6 +57,6 @@ underlies LSP + Bazel scaling.
 
 ## Refs
 
-deferred.md "Modules + multi-file"; `modules.md`; `noir.md` §2a (mangling); roadmap M10;
+deferred.md "Modules + multi-file"; `modules.md`; `noir.md` §2a (mangling); [137 tooling](137-tooling-lsp-formatter.md);
 [incremental compilation](136-incremental-compilation.md), [ir-pipeline hardening](142-ir-pipeline-hardening.md),
 [shared spellings](132-shared-spellings.md).

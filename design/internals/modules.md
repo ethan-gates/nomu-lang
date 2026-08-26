@@ -2,7 +2,7 @@
 
 **Status:** **stub** — the design is undesigned. This doc reserves the topic and records what other docs already lean on, so it isn't lost. Access control shares this doc because it doesn't yet merit its own. Status tags: **Open**.
 
-**Not on the critical path.** M1–M3 (walking skeleton, type surface, concurrency on OS threads — `roadmap.md`) need neither modules nor access control, so this is deferred. But several decided areas reference it, so the boundaries below must eventually exist.
+**Not on the critical path.** The early milestones (walking skeleton, type surface, concurrency on OS threads) needed neither modules nor access control, so this was deferred; the design work is task `plans/tasks/100-modules.md`. Several decided areas reference it, so the boundaries below must eventually exist.
 
 ---
 

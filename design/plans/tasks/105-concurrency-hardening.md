@@ -1,7 +1,7 @@
-# Concurrency hardening (M12)
+# Concurrency hardening
 
 **Avenue:** Risk · **Type/Lifecycle:** `refactor · observability · evaluate` · **Size:** L ·
-**Status:** placed at M12 (after the full surface + debugger exist) · **Source:** roadmap M12
+**Status:** placed after the full concurrency surface + debugger exist · **Source:** `concurrency.md` / `runtime.md` §6
 
 ## What
 
@@ -19,8 +19,8 @@ Systematic battle-testing plus a bulletproof runtime spec for the concurrency su
 
 ## Why here
 
-The full surface is built by M12 (M8 cancellation / continuation / channels on top of the M:N
-runtime, structured scope, async actors) and the [debugger](138-debugger.md) (M11) can investigate races
+The full surface is built by then (cancellation / continuation / channels on top of the M:N
+runtime, structured scope, async actors) and the [debugger](138-debugger.md) can investigate races
 — so hardening covers the whole system once rather than a moving target.
 
 **Motivation:** M6·6.4 surfaced a ~1-in-150 latent park race caught by luck, not a test. The goal is
@@ -29,10 +29,10 @@ claim has a test and a precise statement behind it.
 
 ## Dependencies & triggers
 
-Seed a lightweight version of the stress harness during M8 as ongoing discipline; M12 is the
+Seed a lightweight version of the stress harness early as ongoing discipline; this task is the
 comprehensive formalization + exhaustive pass, not the first test. Overlaps the SSAIR randomized
 differential (T7, `148-ssair-optimizer-tier.md` §148.9).
 
 ## Refs
 
-`concurrency.md`, `runtime.md` §6; roadmap M12; `148-ssair-optimizer-tier.md` §148.9 (T7).
+`concurrency.md`, `runtime.md` §6; `148-ssair-optimizer-tier.md` §148.9 (T7).

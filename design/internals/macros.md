@@ -10,7 +10,7 @@
 
 **Typed AST macros** (Nim / Swift-macro style): the macro sees the parsed tree, runs at compile time, emits a tree; **hygienic**. — **Decided in principle; built last.**
 
-AST macros are the powerful, well-understood model. Hygiene keeps generated names from colliding with user names. Built last (roadmap M13, `roadmap.md`) — the core language is complete before macros arrive.
+AST macros are the powerful, well-understood model. Hygiene keeps generated names from colliding with user names. Built last (task `plans/tasks/140-macros.md`) — the core language is complete before macros arrive.
 
 ---
 
@@ -28,5 +28,5 @@ Consider building some *standard-library* features as macros later to keep the c
 
 ## 3. Open questions
 
-- **Surface syntax** — deferred with the rest of the macro work to M13 (`roadmap.md`).
+- **Surface syntax** — deferred with the rest of the macro work (task `plans/tasks/140-macros.md`).
 - **Which stdlib features (if any) are macro-implemented** — decide when the core is stable and the compiler-size tradeoff is real.

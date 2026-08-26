@@ -41,7 +41,7 @@ outcome. Also: aligned vector storage, the vector-register ABI (`c-types.md`), c
 
 **One-liner pointer.** Perf-envelope driven (fast default collections + vectorized stdlib) + the
 const-generics fork (type-system ripple if taken). Under the fixed-family path, only the
-*const-generics decision* + the *SIMD-backed default `Table` commitment* need a roadmap anchor.
+*const-generics decision* + the *SIMD-backed default `Table` commitment* need a planning anchor in `horizon.md`.
 
 ## Refs
 

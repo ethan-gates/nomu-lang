@@ -2,7 +2,7 @@
 
 **Avenue:** Usability · **Type/Lifecycle:** `language-feature · needs-design` (runtime + GC + codegen)
 · **Size:** L · **Status:** needs-design (substrate partly grounded) · **Source:** deferred.md
-(2026-08-18) + roadmap ("Ongoing")
+(2026-08-18)
 
 ## What
 
@@ -30,7 +30,7 @@ common leaf call approaches a raw C call; keep the boundary thin.
 
 ## Trigger / sequencing
 
-Currently "Ongoing" on the roadmap. The substrate (attach + pinning) rides the runtime; the surface
+A standing "Ongoing" item. The substrate (attach + pinning) rides the runtime; the surface
 benefits from [modules](100-modules.md) (binding organization) and matters once real C libraries are
 wanted. Settle the pinning + safepoint-transition model before the surface is built. Note:
 [stdlib I/O](120-stdlib-core.md) does **not** need this — the privileged C runtime exposes I/O builtins;

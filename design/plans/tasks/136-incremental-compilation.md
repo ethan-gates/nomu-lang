@@ -11,7 +11,7 @@ query-based architecture (`tooling.md`) and cached monomorphizations.
 
 ## Why broken out
 
-Called out in the [modules](100-modules.md) item as a candidate to break out as its own roadmap item. It
+Called out in the [modules](100-modules.md) item as a candidate to break out as its own task. It
 depends on the module interface format + stable stage boundaries, so it sits downstream of both
 modules and [IR/pipeline hardening](142-ir-pipeline-hardening.md).
 

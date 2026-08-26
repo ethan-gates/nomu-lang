@@ -2,7 +2,7 @@
 
 **Avenue:** Risk (the "better than Go" concurrency thesis) · **Type/Lifecycle:** `perf · needs-design`
 (runtime + compiler architecture) · **Size:** L · **Status:** build deferred; direction provisionally
-decided (2026-08-25) · **Source:** deferred.md (2026-08-18) + roadmap M8
+decided (2026-08-25) · **Source:** deferred.md (2026-08-18)
 
 **Provisional decision (2026-08-25): defer the build, lean guard-page.** The build rides the late
 massive-fan-out workload ([103](103-dynamic-spawn-group.md)); fixed 128 KiB holds until then, and the
@@ -46,7 +46,7 @@ The answer is likely a hybrid.
 
 ## Dependencies & triggers
 
-- **Trigger:** roadmap M8 (growable stacks + syscall-free switch, riding the dynamic spawn group).
+- **Trigger:** the dynamic spawn group ([103](103-dynamic-spawn-group.md)) — growable stacks + syscall-free switch ride it.
   Bring the *decision* ahead of the build.
 - **Couples with:** [TCO](129-tail-call-optimization.md) (lowers stack depth, eases the memory floor),
   GC statepoints, the dynamic spawn group.
@@ -59,5 +59,5 @@ analysis.
 
 ## Refs
 
-`runtime.md` §6 (safepoints, parked-fiber scan, mutator); roadmap M8; `runtime.c` `RT_STACK_SIZE` +
+`runtime.md` §6 (safepoints, parked-fiber scan, mutator); [103 dynamic spawn group](103-dynamic-spawn-group.md); `runtime.c` `RT_STACK_SIZE` +
 `swapcontext`.

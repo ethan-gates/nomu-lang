@@ -1,11 +1,18 @@
 # Unsafe raw memory / raw pointers
 
-**Avenue:** Infra (prereq for Risk self-hosting + Usability stdlib) · **Type/Lifecycle:**
-`language-feature · needs-design` (language + backend + memory model) · **Size:** L ·
-**Status:** needs-design · **Source:** deferred.md (2026-08-18)
+**Avenue:** Risk (first prerequisite of the self-hosted runtime) · **Type/Lifecycle:**
+`language-feature · design-drafted` (language + backend + memory model) · **Size:** L ·
+**Status:** design-drafted — build now · **Source:** deferred.md (2026-08-18)
 
-**► Decide-early: design before the stdlib track.** Collections, strings, SIMD, and self-hosting all
-rest on it, so settle the unsafe surface before the stdlib work starts. Design-ahead, not build-ahead.
+**► Design:** [`internals/unsafe-memory.md`](../../internals/unsafe-memory.md). Surface pinned with
+Ethan: **library types, no new keywords**, named **`RawPtr`** (untyped) and **`Ptr<T>`** (typed). Both
+value types holding one `addrspace(0)` word, so they are never GC roots. GC boundary: off-heap and
+immortal memory admitted; moving-heap interior gated behind 149's no-safepoint rule / pinning (deferred,
+co-designs with 150). Ready to build.
+
+**► Build now — first prerequisite of the self-hosted runtime ([128](128-self-hosting-runtime.md)).**
+The collector and allocator manipulate untyped memory, so this is the raw floor the runtime bet stands
+on. Design and build it now, ahead of the collector code ([150](150-selfhosted-gc-ladder.md)).
 
 ## What
 
@@ -13,21 +20,27 @@ An unsafe layer: raw pointers, untyped memory (alloc/free off-heap or pinned wit
 load/store, pointer arithmetic, and manual layout. The escape hatch below the safe type system that
 low-level code needs.
 
-## Minimal scope (decided 2026-08-25)
+## Scope
 
-Build only as much as the stdlib primitives need — a growable raw **byte buffer**: allocate/free
-(GC-heap blob or pinned), raw load/store at an offset, `memcpy`/grow, length + capacity, and pointer
-arithmetic for indexing. That is enough to back a real UTF-8 `String` ([121](121-string-utf8-model.md))
-and a real `Array<T>` ([120](120-stdlib-core.md)); `Set`/`Dict` ride the same buffer (hand-written).
-Hold the wider surface (capability/provenance system, SIMD-aligned storage, FFI marshalling) until a
-consumer asks for it.
+The real consumer is the **self-hosted runtime** ([128](128-self-hosting-runtime.md)): the collector and
+allocator need raw pointers, untyped memory (alloc/free off-heap or pinned), raw load/store, pointer
+arithmetic, and manual layout to implement the very services the safe language rests on.
 
-**GC-scannable buffers — the one non-trivial bit.** A buffer whose elements are managed references
-(`Array<SomeClass>`, or a `Dict` of managed key/value) must be **traced by the precise collector**: the
-GC has to walk the element slots and relocate them on a move. `String` (raw bytes) and `Array<Int>` are
-non-scanned blobs and trivial; `Array<reference>` needs the buffer typed so the precise scan covers its
-element slots. Getting this right is what makes "real arrays" work, so it is in scope for the minimal
-build. Ref: `memory-model.md` §3 (object model / precise scan).
+**Correction to the earlier "byte buffer for String/Array" scope.** A prior pass scoped this to "the
+growable byte buffer needed to back real String and Array." That was a mis-bundling: the growable,
+GC-scannable buffer machinery already exists inside codegen (`c-types.md` §3 — `Array<T>` is built and
+validated; the variable-size GC object model with per-element pointer maps is done, per `arr_gc`).
+String/Array being compiler intrinsics rather than extensible Nomu-source types is a real but *separate*
+stdlib gap (tracked with [120](120-stdlib-core.md)/[121](121-string-utf8-model.md)), and it wants a
+**safe** language-level buffer type, not this unsafe surface. This task is the unsafe raw-memory surface
+the runtime is written in.
+
+**GC boundary — the hard part.** Raw pointers into managed memory must be pinned or excluded from the
+moving collector's view, and the unsafe surface is where the GC's precise-root guarantee ends. The
+self-hosted collector is itself the code that defines that boundary, so this task and the GC ladder
+([150](150-selfhosted-gc-ladder.md)) co-design: the unsafe primitives are what the collector is written
+in, and the collector is what decides which raw pointers the GC may not touch. Ref: `memory-model.md` §3
+(object model / precise scan).
 
 ## Why consequential — a named hard prerequisite for
 

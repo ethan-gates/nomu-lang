@@ -1,7 +1,7 @@
 # `defer` + linear types
 
 **Avenue:** Usability (resource cleanup) · **Type/Lifecycle:** `language-feature · needs-design` ·
-**Size:** M · **Status:** cross-cutting, sequenced into M8 · **Source:** roadmap M8 + cross-cutting
+**Size:** M · **Status:** cross-cutting; sequenced with the concurrency-completion work ([135](135-cancellation-continuations.md)) · **Source:** cross-cutting design note
 
 **► Decide-early:** the resource-management story (this + [`deinit`/finalization](108-deinit-finalization.md))
 is one problem space — decide the fork (GC-finalized `deinit` vs deterministic cleanup only through
@@ -10,13 +10,13 @@ linear/`defer`) alongside this. Design-ahead, not build-ahead.
 ## What
 
 - **`defer`** — scoped cleanup that runs on scope exit. Wanted as soon as the language does I/O
-  (cross-cutting note in the roadmap: "wanted as soon as M3 does I/O").
+  (a cross-cutting design note: wanted as soon as the language does I/O).
 - **Linear types** — the type discipline behind resume-once (continuations) and resource cleanup
-  (a resource must be consumed exactly once). First hard requirement is M8.
+  (a resource must be consumed exactly once). First hard requirement is continuations ([135](135-cancellation-continuations.md)).
 
 ## Why deferred
 
-Linear types' first concrete consumers are M8's [continuations](135-cancellation-continuations.md)
+Linear types' first concrete consumers are [continuations](135-cancellation-continuations.md)
 (resume-once) and resource cleanup. `defer` is useful earlier but was parked with the resource story.
 
 ## Dependencies & triggers
@@ -34,4 +34,4 @@ Linear types' first concrete consumers are M8's [continuations](135-cancellation
 
 ## Refs
 
-roadmap M8 + "Cross-cutting" (error handling / `defer` / linear types); `concurrency.md` §7.
+Cross-cutting design (error handling / `defer` / linear types); `concurrency.md` §7.

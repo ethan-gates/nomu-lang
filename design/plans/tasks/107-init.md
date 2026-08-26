@@ -20,7 +20,7 @@ contract and was parked for a dedicated design pass.
 ## Roadmap assessment (three-head)
 
 **One-liner pointer.** Reshapes the construction contract (programmer-expectation) but rides the
-existing type-system track. The roadmap should flag the memberwise-only form as provisional.
+existing type-system track. The memberwise-only form is provisional.
 
 ## Dependencies & triggers
 

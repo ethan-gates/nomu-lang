@@ -3,7 +3,7 @@
 **Avenue:** Usability (+ GC architecture) · **Type/Lifecycle:** `language-feature · needs-design` ·
 **Size:** M · **Status:** needs-design · **Source:** deferred.md (2026-08-18 surface batch)
 
-**► Decide-early (ahead of roadmap):** decide the fork alongside M8's
+**► Decide-early:** decide the fork alongside the
 [`defer` + linear-types](101-defer-linear-types.md) resource-cleanup work — same problem space.
 Design-ahead, not build-ahead.
 

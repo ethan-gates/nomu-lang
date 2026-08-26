@@ -1,12 +1,12 @@
 # MLIR consideration
 
 **Avenue:** Infra · **Type/Lifecycle:** `refactor · evaluate` · **Size:** S (the evaluation) ·
-**Status:** ongoing consideration · **Source:** roadmap ("Ongoing")
+**Status:** ongoing consideration · **Source:** `backend.md` (MLIR vs. plain LLVM)
 
 ## What
 
 Evaluate whether MLIR belongs in the backend stack — as an alternative or complement to the current
-SSAIR → LLVM path. Listed "Ongoing" on the roadmap as a standing consideration, not a committed
+SSAIR → LLVM path. A standing consideration, not a committed
 direction.
 
 ## Notes
@@ -17,4 +17,4 @@ hand-rolled SSAIR, given the tier already exists.
 
 ## Refs
 
-roadmap "Ongoing" (MLIR consideration); `backend.md`; `ssair.md`.
+`backend.md` (MLIR vs. plain LLVM); `ssair.md`.

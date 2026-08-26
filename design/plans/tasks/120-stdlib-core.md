@@ -2,7 +2,7 @@
 
 **Avenue:** Usability · **Type/Lifecycle:** `user-facing · needs-design` (language + stdlib + runtime)
 · **Size:** L · **Status:** needs-design (GC gate lifted, M6 done) · **Source:** deferred.md
-(2026-08-18) + roadmap ("Stdlib via benchmarks")
+(2026-08-18)
 
 The named stdlib track. High-stakes sub-decisions are split into their own docs:
 [String / UTF-8 model](121-string-utf8-model.md), [numeric semantics](122-numeric-semantics.md),

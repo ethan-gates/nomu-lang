@@ -1,7 +1,7 @@
 # Shared-mutable primitive
 
 **Avenue:** Risk (concurrency model) · **Type/Lifecycle:** `language-feature · ongoing` · **Size:** M ·
-**Status:** design ongoing (M5 generics unblocked it) · **Source:** roadmap ("Ongoing")
+**Status:** design ongoing (M5 generics unblocked it) · **Source:** `concurrency.md` §5 (shareability), §10 (reserved shared-mutable category)
 
 ## What
 
@@ -11,7 +11,7 @@ proceed.
 
 ## Why deferred
 
-Listed "Ongoing" on the roadmap; it needed the M5 generics + the completed shareability checker
+A standing "Ongoing" item; it needed the M5 generics + the completed shareability checker
 (deeply-immutable classes, `String`, `<shared T>` bound) as a foundation. Those shipped.
 
 ## Dependencies & triggers
@@ -21,5 +21,5 @@ Listed "Ongoing" on the roadmap; it needed the M5 generics + the completed share
 
 ## Refs
 
-roadmap "Ongoing" (shared-mutable primitive design); `concurrency.md` §5 (shareability); `generics.md`
+`concurrency.md` §5 (shareability); `generics.md`
 §7 (`<shared T>`).

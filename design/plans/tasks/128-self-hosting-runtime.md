@@ -1,8 +1,8 @@
 # Self-hosting the runtime: GC + scheduler in Nomu, bootstrapped in assembly
 
-**Avenue:** Risk (author north-star) · **Type/Lifecycle:** `perf · refactor · needs-design` (runtime +
-language subset + compiler + GC) · **Size:** XL · **Status:** design-early, build-late (decided
-2026-08-18) · **Source:** deferred.md (2026-08-18)
+**Avenue:** Risk (author north-star, the core bet) · **Type/Lifecycle:** `perf · refactor · needs-design`
+(runtime + language subset + compiler + GC) · **Size:** XL · **Status:** build now — core bet;
+decomposes into 125 → 149 → 150 → 127 · **Source:** deferred.md (2026-08-18)
 
 ## What
 
@@ -38,16 +38,33 @@ Replaces MMTk (Rust, ~26 MB link archive) and the C runtime (`runtime.c` / `core
 
 ## Base prerequisites
 
-- **[Unsafe raw pointers / raw-memory primitives](125-unsafe-raw-memory.md)** — a hard floor (the
-  collector + allocator manipulate untyped memory).
-- The runtime-subset mechanism and stdlib low-level primitives (byte buffers).
+- **[125 unsafe raw memory](125-unsafe-raw-memory.md)** — a hard floor (the collector + allocator
+  manipulate untyped memory).
+- **[149 runtime-subset mechanism](149-runtime-subset.md)** — the pragmas + checking for runtime code.
 
-## Trigger / sequencing
+## Sequencing
 
-Implementation is very late (needs a mature, performant Nomu — M7 optimizer, M9 backend — plus the
-prerequisites). **Design early, build late (decided 2026-08-18):** settle the runtime-subset mechanism
-and the unsafe raw-pointer surface ahead of time so later decisions don't foreclose this, even while
-the build waits. Naturally paired with (or subsuming) the [LXR](127-lxr-collector.md) effort.
+**Build now — the core bet, not a late-stage task.** The earlier "design early, build late"
+call was made when Nomu had no memory management at all; it deferred the whole effort on the reasoning
+that a Nomu-compiled runtime only pays off once the backend is mature. That reasoning applied to the
+*final* performance/size numbers, not to the runtime's architecture — the unsafe surface, the
+runtime-subset mechanism, the bootstrap floor, the calling convention. Those are independent of backend
+maturity, and discovering them late is the real risk. MMTk/GenImmix now exists as a reference to diff
+against, which is what makes an incremental self-host tractable. So we build now, and expect early
+perf/size numbers to firm up as the backend matures.
+
+**Self-host first, then evolve the collector.** Self-hosting is a location change (MMTk/Rust → Nomu);
+[LXR](127-lxr-collector.md) is an algorithm change (GenImmix → RC-hybrid). Hold the algorithm constant
+while moving location, then change the algorithm inside the self-hosted runtime — one unknown at a time.
+
+**Decomposition:**
+- [125 unsafe raw memory](125-unsafe-raw-memory.md) — the raw-memory surface the collector/allocator need.
+- [149 runtime-subset mechanism](149-runtime-subset.md) — the pragmas + checking for runtime code.
+- [150 self-hosted GC ladder](150-selfhosted-gc-ladder.md) — NoGC → mark-verify → Immix → GenImmix, each
+  diffed against the matching MMTk plan.
+- [127 LXR](127-lxr-collector.md) — the final collector rung, an algorithm swap inside the self-hosted GC.
+- The M:N scheduler + per-arch bootstrap assembly floor stay under this task, sequenced after the GC
+  ladder (the GC can run hosted alongside the existing runtime first).
 
 ## Refs
 

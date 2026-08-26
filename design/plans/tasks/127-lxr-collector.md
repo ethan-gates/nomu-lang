@@ -1,7 +1,8 @@
 # LXR collector (footprint endgame)
 
-**Avenue:** Risk (the headline risk bet) · **Type/Lifecycle:** `perf · evaluate` · **Size:** XL ·
-**Status:** scheduled, gated on a benchmark-scale stdlib · **Source:** roadmap ("LXR-style collector")
+**Avenue:** Risk (the footprint endgame) · **Type/Lifecycle:** `perf · evaluate` · **Size:** XL ·
+**Status:** final rung of the self-hosted GC ladder — after 150's GenImmix ·
+**Source:** `memory-model.md` §3 (LXR RC-hybrid endgame)
 
 ## What
 
@@ -10,24 +11,28 @@ An *owned* RC-hybrid reimplementation behind the same `VMBinding` and reusing th
 collector at near-live-set footprint is the performance thesis; LXR pushes footprint further via
 reference counting hybridized with tracing.
 
-## Why deferred — the real gate
+## Sequencing
 
-**Intent (2026-08-04): scheduled, not open-ended** — targeted after M8 and the M11 debugger, but the
-**real gate is a benchmark-scale stdlib**. LXR is the footprint endgame, so validating it against
-Immix needs a stdlib mature enough to build meaningfully large programs to measure
-footprint/throughput on. Sequenced by that prerequisite, not a fixed milestone number.
+**The final rung of the self-hosted GC ladder** ([150](150-selfhosted-gc-ladder.md)), reached once
+self-hosted GenImmix is solid. It is the algorithm change (GenImmix → RC-hybrid) that happens *inside*
+the Nomu runtime after the self-hosting location change is done — the fold with self-hosting is decided
+(it is part of it), and the prior "gated on a benchmark-scale stdlib" gate is dropped. LXR uses Immix as
+its backing, so the region/line machinery built for the non-generational Immix rung carries in; the new
+work is the reclamation policy (RC-primary + backup tracing).
 
-Targets **mainline GenImmix** as the shipped collector (M6); LXR is the later owned effort, not a
-dependency on the stalled upstream MMTk branch.
+**The ladder doubles as the decision.** Real footprint/throughput numbers for self-hosted Immix and
+GenImmix tell us whether LXR's extra complexity earns its keep. LXR stays the intended endgame; the
+comparison confirms it. An earlier plan targeted LXR after the debugger against mainline GenImmix as the
+shipped collector — superseded: GenImmix is now a rung in the self-hosted ladder, and LXR follows it in
+Nomu.
 
-## Dependencies & triggers
+## Dependencies
 
-- **Gated on:** a [benchmark-scale stdlib](120-stdlib-core.md) (to measure footprint on real programs).
-- **May fold with:** [self-hosting the runtime](128-self-hosting-runtime.md) — LXR could be the collector
-  that gets written in Nomu. Decide whether to fold them.
-- **Kept open by:** a clean `VMBinding` + the `__nomu_write_barrier` seam (M6 substrate).
+- **Follows:** [150 self-hosted GC ladder](150-selfhosted-gc-ladder.md) through its GenImmix rung.
+- **Rests on:** [125 unsafe raw memory](125-unsafe-raw-memory.md) + [149 runtime-subset](149-runtime-subset.md)
+  (shared with the whole self-hosted runtime) and a clean `VMBinding` + the `__nomu_write_barrier` hook.
 
 ## Refs
 
-roadmap "LXR-style collector"; `memory-model.md` §3 (object model / `VMBinding`); `backend.md`
+`memory-model.md` §3 (object model / `VMBinding`); `backend.md`
 (barrier seam); [self-hosting](128-self-hosting-runtime.md).
