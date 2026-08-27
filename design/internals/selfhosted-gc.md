@@ -10,6 +10,34 @@ under 128, and [127 LXR](../plans/tasks/127-lxr-collector.md) is the final rung.
 across every rung, and **rung 1 (NoGC)** in depth — the build-now deliverable. Rungs 2–4 are specified at
 sketch depth (the task card holds their ordering rationale); they deepen as each is reached.
 
+**Rung 1 progress — slice A built.** The bump-allocator **policy** is written in Nomu over the 125 raw
+surface, under 149's subset rules: a `RawPtr` control block holds `{ base, cursor, limit }` (metadata in
+the arena — no globals, no heap object), `bumpNew` carves an off-heap OS block, `bumpAlloc` bumps
+fixed-size chunks and returns null on overflow. It compiles under `--runtime-subset=bumpNew,bumpAlloc`
+with no violations (the first real client exercising the 125↔149 interlock), and is byte-identical under
+NoGC and Immix-evacuation (`examples/bump_alloc.nomu` + `tools/bump-alloc.sh`). **Slice B foundation built — the runtime prelude.** The allocator now lives in `src/stdlib/runtime.nomu`,
+a second embedded prelude compiled into every program (beside `core.nomu`) and **runtime-subset by
+default** — the proper "designated file" for 149, replacing the interim `--runtime-subset` flag. Its
+functions (`rtArenaNew` / `rtBumpAlloc`) are auto-subset-checked (a violation injected into the prelude is
+flagged with no flag given) and callable from user code with no import (`examples/rt_prelude.nomu` +
+`tools/rt-prelude.sh`).
+
+**Rung 1 complete — slice B built. The self-hosted allocator is a selectable plan.** Under
+`NOMU_GC_PLAN=nomu` the codegen alloc seam (`__nomu_gc_alloc`, `LLVMGenRuntime.swift`) routes every managed
+allocation at the Nomu bump allocator: the extern flag `__nomu_selfhosted_alloc` (a Rust `AtomicU8` set in
+`nomu_gc_init`, mirroring `__nomu_barrier_active`) disables the MMTk-TLAB fast path and branches the slow
+path to `__nomu_selfhost_alloc`, which lazily creates one arena (`rtArenaNew`) and bumps chunks
+(`rtBumpAlloc`). The `addrspace(1)` object is produced at the seam via `ptrtoint`→`inttoptr` to `p1` — the
+same integer→`p1` step the fast path uses, which `RewriteStatepointsForGC` accepts as a fresh GC base
+(no `addrspacecast`, no `blessManaged` intrinsic, no FFI). MMTk is initialized NoGC and left idle as the
+diff oracle. Type-id headers are stamped by codegen at the construction site (the existing contract),
+so the allocator returns zeroed memory and never handles a `p1`. **Validated by the differential
+(`tools/selfhost-gc.sh`):** class objects, closures, arrays, and a heavy allocation loop are byte-identical
+under `NOMU_GC_PLAN=nogc` (MMTk) and `NOMU_GC_PLAN=nomu` (self-hosted); the full existing GC suite (through
+GenImmix) is unaffected. **Known limits (first cut):** a single 256 MiB arena with no refill (overflow
+returns null → a large-heap program would fault) and per-carrier state is process-global (single arena,
+not per-carrier) — both are follow-ups before the heavier rungs. **Next: rung 2 (mark-verify).**
+
 **Frame.** The collector is written in the 125 raw-memory primitives, under the 149 subset rules. It runs
 hosted alongside the existing runtime first; the per-arch bootstrap floor (under 128) pairs with
 self-hosting the scheduler, later. Ordering: `horizon.md`.
@@ -32,9 +60,10 @@ level down:
 
 1. **NoGC** — bump allocator + all plumbing (the 125 raw surface, the bootstrap path, stack-map
    emission). Everything but collection. The heap only grows.
-2. **Mark-verify** (diagnostic, no reclaim) — trace from roots, mark live, compare the live set against
-   MMTk's. Proves root scanning + tracing with zero reclamation or movement. A checkpoint; the heap still
-   only grows.
+2. **Mark-verify** (diagnostic, no reclaim) — trace from roots, mark live, and emit an address-independent
+   **fingerprint** of the marked set (§6); a separate MMTk run emits its own, and the two are diffed.
+   Proves root scanning + tracing with zero reclamation or movement. A checkpoint; the heap still only
+   grows.
 3. **Immix** (non-generational) — the first real collector: line/block reclamation + evacuation (movement
    + pointer fixup) + region management. Diff against MMTk's non-generational Immix.
 4. **GenImmix** — add the nursery, write barrier, remembered set. The one new variable is the
@@ -43,12 +72,22 @@ level down:
 Then [127 LXR](../plans/tasks/127-lxr-collector.md): swap reclamation to RC-primary; LXR uses Immix
 backing, so rung 3's region machinery carries in.
 
-**The method is the differential oracle.** Each rung runs the same program two ways — under the new
-self-hosted plan and under the matching MMTk plan — and requires **byte-identical output**. One variable
-enters per rung, with the previous rung (and MMTk) as the oracle, so a regression bisects to the one
-mechanism just added. This is the harness `tools/arr-gc.sh` / `tools/gc-stress.sh` already run
-(NoGC-vs-Immix differential); the self-hosted plan slots in as a third selector beside `nogc` / `immix`
-(§6).
+**The method is the differential oracle — with clean collector separation.** Each rung runs the same
+program two ways — under the new self-hosted plan and under the matching MMTk plan — and compares the two
+runs. One variable enters per rung, with the previous rung (and MMTk) as the oracle, so a regression
+bisects to the one mechanism just added. This is the harness `tools/arr-gc.sh` / `tools/gc-stress.sh`
+already run (NoGC-vs-Immix differential); the self-hosted plan slots in as a third selector beside
+`nogc` / `immix` (§6).
+
+**One collector per process — never co-resident.** A run binds exactly one plan at init (one heap, one
+allocator, one collector); MMTk and the self-hosted collector are both linked but mutually exclusive, so
+two collectors never manage one heap. Comparison is always **across two separate runs**, including for
+mark-verify: each side emits an address-independent fingerprint of its live set and the fingerprints are
+diffed (§6), which keeps the collectors decoupled in every live process. The one case a fingerprint diff across runs cannot serve
+is a **nondeterministic (concurrent) program**, whose two runs may legitimately reach different heap
+states — so mark-verify runs on the deterministic single-threaded fixtures (as the GC fixtures already
+are). Co-running as a passenger is held as a deferred fallback *only* for validating liveness under real
+concurrency (§7); the ladder does not use it.
 
 ## 2. The shared substrate — reused unchanged across rungs
 
@@ -83,6 +122,12 @@ subset discipline, header stamping, per-carrier allocation state, and stack-map 
 end-to-end in Nomu, before any tracing lands.
 
 ### 3.1 Division of labor at the allocation entry point
+
+**As built (slice B):** the self-hosted plan disables the inline fast path entirely and routes every
+allocation through the seam's slow path to the Nomu allocator, producing `p1` via `ptrtoint`→`inttoptr`
+at the seam. Keeping the inline fast path and having the Nomu allocator populate its cursor/limit (the
+speed win described below) is a **perf follow-up** — correctness rung 1 takes the simpler slow-path-only
+route. The rest of this section is the design intent for that follow-up.
 
 The allocation path splits into a compiler-emitted part and a Nomu-written part:
 
@@ -149,10 +194,14 @@ allocation, header, or per-carrier-state bug, with nothing else in scope.
 ## 4. Rungs 2–4 — sketch
 
 - **Rung 2 · Mark-verify.** The Nomu tracer reads statepoint roots (the plumbing rung 1 validated) and
-  the type-id side tables (`nomu_gc_typemap`, kind/stride) to scan objects, marks the transitive live
-  set, and diffs it against MMTk's live set. Proves root scanning + object-model tracing in Nomu with no
-  reclamation or movement. The object-model accessors (size, per-element pointer map) move into Nomu here,
-  reading the same static tables the Rust binding reads today.
+  the type-id side tables (`nomu_gc_typemap`, kind/stride) to scan objects and mark the transitive live
+  set, then emits an **address-independent fingerprint** of that set (§6). A separate MMTk run emits its
+  own from its authoritative liveness; the two fingerprints are diffed across runs (clean separation, §1
+  — no passenger tracer). Proves root scanning + object-model tracing in Nomu with no reclamation or
+  movement. The object-model accessors (size, per-element pointer map) move into Nomu here, reading the
+  same static tables the Rust binding reads today. The root-source mechanism — how the Nomu tracer
+  reaches roots — is pinned in §9 (one `pcsp`-shaped frame-pointer-free stack walk, a single route across
+  native targets); rung 2 comes up first on the existing C walk as scaffolding, then swaps in the Nomu walk.
 - **Rung 3 · Immix (non-generational).** The first collector that reclaims and moves: line/block
   reclamation, evacuation (copy + pointer fixup), region management. With liveness trusted from rung 2, a
   bug localizes to reclaim / move / region. The region machinery is the large reusable piece — it carries
@@ -183,9 +232,17 @@ across GC plans; `tools/arr-gc.sh`, `tools/gc-stress.sh`):
 - **Rung 1 invariant.** Same program under `NOMU_GC_PLAN=nogc` (MMTk NoGC) and the self-hosted plan →
   **byte-identical output**, plus a monotonically growing heap with no corruption. This checks allocation,
   header stamping, and per-carrier state; there is no collection to diff yet.
-- **Rung 2+.** The oracle sharpens: mark-verify diffs the live *set* against MMTk; Immix / GenImmix reuse
-  the arr-gc / gc-stress byte-identical-under-evacuation checks, now with the self-hosted plan as the
-  collecting leg.
+- **Rung 2 — the live-set fingerprint.** Mark-verify compares liveness across two separate runs (clean
+  separation, §1), so the comparison is over an **address-independent fingerprint** rather than raw object
+  identity: at a forced GC point each side, from its own authoritative live set, emits (a) per-type live
+  object counts / live bytes (MMTk already computes live bytes via `count_live_bytes_in_gc`) and (b) a
+  canonical-order content hash over each live object's `(type-id, scalar field bytes)`, walking from roots
+  in a deterministic order. Matching fingerprints prove the self-hosted tracer marked exactly the
+  reachable set — catching both a missed live object and a wrongly-marked dead one (dead objects sit on
+  the NoGC-growth heap, so a false mark shows up in the hash). Fixtures are deterministic single-threaded
+  programs so the two runs reach the same heap state.
+- **Rung 3+.** Immix / GenImmix reuse the arr-gc / gc-stress byte-identical-under-evacuation checks, now
+  with the self-hosted plan as the collecting leg.
 - **Unit level.** The allocator's block carve, refill, and header stamp are testable in isolation over a
   `RawPtr` block, independent of the collector.
 
@@ -201,15 +258,126 @@ across GC plans; `tools/arr-gc.sh`, `tools/gc-stress.sh`):
 - **MMTk retirement.** MMTk stays linked as the differential oracle across the ladder. When the
   self-hosted collector fully replaces it (and whether the `VMBinding` is kept as a permanent test
   oracle) settles at/after LXR. — **Open.**
+- **Passenger co-running for concurrent liveness.** The ladder keeps the collectors cleanly separated —
+  one per process, compared across runs (§1). The single case a cross-run fingerprint diff cannot serve is
+  validating liveness under a **nondeterministic (concurrent) program**, whose two runs may reach
+  different heap states. Running the self-hosted tracer as a read-only passenger inside an MMTk process
+  (same-instant heap, per-object diff) is held as a fallback for that case only; the ladder does not use
+  it, and mark-verify stays on deterministic fixtures. — **Deferred.**
 
 ## 8. Open questions
 
 - **Per-carrier state access** — the exact intrinsic shape Nomu uses to reach the current carrier's bump
   state (149 allowlist), and how it composes with the no-hoist-across-safepoint contract.
-- **`addrspace(1)` production** — whether it stays compiler-emitted (§3.1) or moves to a Nomu intrinsic
-  (§7) as later rungs need more of the path in Nomu.
+- **`addrspace(1)` production** — **Resolved.** The Nomu allocator returns a `RawPtr`; the seam produces
+  the managed object with `ptrtoint`→`inttoptr` to `p1` (the fast path's existing integer→`p1` step), which
+  `RewriteStatepointsForGC` treats as a fresh GC base — no `addrspacecast`, no `blessManaged` intrinsic
+  (§7), no FFI. The production stays compiler-emitted at the seam; the allocator never handles a `p1`.
 - **Side-table reachability** — confirming the codegen-emitted static tables (`nomu_gc_typemap`, …) are
   addressable from Nomu at rung 2 (static symbols reached as `RawPtr`), and whether the accessor is a
   language intrinsic or plain raw reads.
+- **Root-source mechanism** — **Resolved (§9).** GC root scanning is a frame-pointer-free `pcsp`-shaped
+  stack walk over a PC-keyed root map, one route across the native targets; rung 2 brings the tracer up on
+  the existing C walk first, then swaps in the Nomu walk under the fingerprint-diff guard. wasm uses a
+  shadow stack (deferred, §9).
 - **Hosted vs. bootstrap split** — the ladder runs hosted alongside the existing runtime; which pieces
   need the per-arch bootstrap floor (128) and when, versus staying hosted through rung 4.
+
+## 9. Root scanning — the walk mechanism (rung 2 root source)
+
+**Decided.** GC root scanning is a **stack walk**: from each safepoint it reconstructs the live Nomu
+frames and reads their pointer slots. It runs at every collection, on the pause path, so the walk is the
+performance-sensitive case — separate from exception unwinding and debugger backtraces, which are rare and
+tolerate a slow, full-featured mechanism. The walk mechanism is pinned below.
+
+**Two things the walk needs per frame:** (a) the frame boundary + return address, to step to the caller;
+(b) which slots hold live pointers — the roots. Part (b) is the precise stackmap, inherent to precise GC
+and already emitted (`__llvm_stackmaps` v3; the per-statepoint slot records the C walker reads at
+`runtime.c`). Part (a) is where the mechanism choice lives.
+
+**Three candidate mechanisms for (a):**
+- **CFI / DWARF interpreter** (what libunwind does). General — any frame, any PC, full register recovery —
+  and the standard tables external debuggers/profilers consume. A per-frame bytecode interpreter (slow)
+  and a runtime library dependency; ill-suited to the GC's frequent walk.
+- **Frame-pointer chain.** Two loads per frame via a reserved FP register. Fast to walk, and carries an
+  always-on cost on ordinary execution (the reserved register + prologue save/restore — ~1–2% on x86-64
+  where registers are scarce), and is wrong at arbitrary PCs (mid-prologue / async).
+- **Per-PC frame-size table (Go `pcsp` shape).** Read the frame size from a PC-keyed table, step by it.
+  Fast to walk, reserves no register, correct at arbitrary PCs. The frame-size data it needs is already in
+  the stackmap (per-function `StackSize` in the v3 function records, read at `runtime.c`).
+
+**Pin — one `pcsp`-shaped route for all native targets.** The root map is PC-keyed, with SP-relative slot
+offsets and a per-function frame size. The GC walk is frame-pointer-free: read the current SP/PC, look up
+the record, read the roots, add the frame size, repeat — stopping at the first return address with no
+record (the Nomu→C boundary; roots live only in Nomu frames because safepoints are inserted only in Nomu
+code). A single compiler/runtime path across arm64, x86-64, and RISC-V. Rationale by target:
+- **x86-64:** frame-pointer-free reclaims a general register — the axis the performance thesis cares about
+  — while keeping the fast walk.
+- **macOS/arm64:** the ABI mandates the frame pointer regardless, so `pcsp` reclaims nothing and costs
+  nothing there. Measured on the GC fixtures, the whole stackmap is 0.02–0.13% of the binary, and `pcsp`
+  adds no data beyond it (frame sizes already present) and no extra per-frame lookup (the record is looked
+  up for slots anyway). The mandated frame pointer stays available as a free assist for debugger backtraces.
+- **`.eh_frame` / compact-unwind stays emitted on every target.** External debuggers (lldb/gdb) and
+  profilers read it, and it is the fallback for stepping through foreign frames under an FFI build.
+  Emitting it costs binary size only, nothing at runtime.
+
+**Frame pointers are a per-target knob, not a mechanism requirement.** Mandated where the ABI requires
+(arm64), dropped where it costs a register (x86-64). The `pcsp` route works either way.
+
+**Dependency — fixed-size frames.** A per-PC frame size assumes the frame size at a PC is a compile-time
+constant. A frame doing dynamic stack allocation (`alloca` / variable-length stack storage) has no
+constant size and would need a frame pointer for that frame. Nomu's stack strategy (104) keeps frames
+fixed-size, which keeps the `pcsp` walk total; revisit if dynamic stack storage is ever added.
+
+**Trajectory.** The PC-keyed table is the first of a `pcsp`/`funcdata` family. When a sampling profiler or
+async preemption arrives (arbitrary-PC stops), extend the same table with per-PC register-recovery columns
+rather than adopting a general DWARF interpreter — Go runs its profiler and `defer`-on-panic off exactly
+such tables while keeping consumption fast. The rung-2 root map is shaped (keyed by return address, per
+PC) so those columns add without a reformat.
+
+**wasm — a separate root scheme. Deferred.** WebAssembly exposes no addressable native call stack, so
+neither a frame-pointer chain nor a `pcsp` walk applies. Precise roots on wasm come from an explicit
+shadow stack (or WasmGC / host GC). The root-source interface is shaped so a shadow-stack implementation
+replaces the stack walk without disturbing the tracer. — **Deferred.**
+
+**lldb is decoupled from this choice.** External debuggers unwind with their own machinery over the
+`.eh_frame` / DWARF the backend emits, not the runtime walker, so they keep the full feature set (register
+recovery, inline frames, variable inspection) regardless of the GC's `pcsp` walk. Keeping frame pointers
+where the ABI has them and continuing to emit standard unwind + debug info is what keeps lldb working;
+preserving debug locations through `RewriteStatepointsForGC` keeps its source view accurate (a test
+obligation). The built-in per-fiber backtrace rides the same `pcsp` walk for the frame list + line numbers;
+register/variable inspection is left to lldb over the emitted DWARF.
+
+**Rung 2 sequencing — building the tracer before the walk (revised).** Rather than borrow the C stack
+walk as throwaway scaffolding, rung 2 builds the tracer, marking, and fingerprint first in Nomu **seeded
+from an explicit root**, on single-root-reachable fixtures diffed against MMTk. This removes root discovery
+as a variable while the tracer is validated, keeps every new line in Nomu (no runtime.c growth), and lands
+the reusable collector code first. Root discovery then follows as its own step — the `pcsp` root map +
+frame-pointer-free Nomu walk — swapping the seed for real stack roots under the fingerprint-diff guard.
+
+**Rung 2 progress — increments 1–2 built.**
+- **Increment 1 · side-table reachability (built).** The Nomu tracer reads the codegen-emitted per-type-id
+  side tables (size, kind, stride, managed-pointer map; `c-types.md` §1/§3.2) through six `RawPtr.gcType*`
+  accessors that lower to the existing runtime accessors — **no new runtime C**. Differentially validated:
+  a Nomu-side table dump is byte-identical to the C `NOMU_GC_TYPEMAPS` dump in one process
+  (`examples/mark_types.nomu` + `tools/mark-types.sh`).
+- **Increment 2 · seed-based mark (built).** `rtMarkVerify` (runtime prelude, subset code) traces the
+  transitive live set from a seed root and marks each object with a header mark bit (bit 32 of the header —
+  the type-id occupies the low 32 bits, high bits zero, so marking leaves the type-id recoverable). No
+  reclaim, no move. `addrOf(obj)` (a `ptrtoint` on the managed `p1`, codegen-only) supplies the seed.
+  Validated on a graph exercising reachability, a shared child counted once (the mark bit), and a dead
+  heap object excluded (`examples/mark_verify.nomu` + `tools/mark-verify.sh`).
+- **Increment 3 · address-independent fingerprint (built).** Each live object contributes its type-id and
+  its scalar (non-pointer) field words to a summed, order-independent fingerprint; every managed slot and
+  the header are skipped, so no address enters it. Because it excludes addresses, it is byte-identical
+  across the two GC plans (MMTk and the self-hosted allocator use different address ranges) — the sharp
+  test that no pointer leaked in, and the precondition for the cross-run diff. Word-granularity for now
+  (8-byte-aligned fields; sub-word scalars are a later refinement).
+- **Increment 4 · array coverage (built).** `examples/mark_verify_arr.nomu` seeds from an `Array<Box>`
+  handle, exercising the tracer's variable-size (`kind==1`) path in both the mark loop and the content hash:
+  the handle's `bufptr` is followed into the buffer, each element slot scanned via the per-element pointer
+  map, and every live Box marked. `TOTAL 5` (handle + buffer + 3 Boxes) tests buffer scanning; the
+  fingerprint stays address-independent across plans (element pointers excluded, scalar words folded).
+- **Remaining (later increments):** the **MMTk-side fingerprint** in the same summed form + a
+  `tools/mark-verify` cross-run diff (the differential oracle replacing the fixture's known live set);
+  then the `pcsp` root map + frame-pointer-free Nomu walk to replace the seed with real stack roots.

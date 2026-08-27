@@ -1,0 +1,209 @@
+// Nomu runtime prelude — the privileged, self-hosted runtime tier, compiled into every program ahead of
+// user code (like the core prelude, but distinct). Every function here is runtime-subset by default
+// (task 149): it may not trigger an implicit GC allocation or call outside the subset + raw-memory
+// allowlist. This is the interim "designated file" the runtime-subset rules attach to until the module
+// system (task 100) makes it a designated module. The self-hosted GC/allocator (task 150) lives here.
+//
+// Bump allocator (task 150 · rung 1). State lives in a RawPtr control block — metadata in the arena, no
+// globals, no heap object. NoGC: it never frees and the heap only grows.
+// Control block (24 bytes): { base: RawPtr @0, cursor: Int @8, limit: Int @16 }.
+
+fun rtArenaNew(size: Int) -> RawPtr {
+  let ctl = RawPtr.alloc(bytes: 24, align: 8)
+  let data = RawPtr.alloc(bytes: size, align: 8)
+  ctl.store(data, toByteOffset: 0)     // base
+  ctl.store(0, toByteOffset: 8)        // cursor (bytes used)
+  ctl.store(size, toByteOffset: 16)    // limit
+  return ctl
+}
+
+// Bump `n` bytes off the arena; returns the chunk, or RawPtr.null when the block is full.
+fun rtBumpAlloc(ctl: RawPtr, n: Int) -> RawPtr {
+  let raw: Int = ctl.load(fromByteOffset: 8)
+  let bumped = raw + 7
+  let slots = bumped / 8
+  let cursor = slots * 8                     // 8-align the object start (headers are i64)
+  let limit: Int = ctl.load(fromByteOffset: 16)
+  if cursor + n > limit {
+    return RawPtr.null
+  }
+  let base: RawPtr = ctl.load(fromByteOffset: 0)
+  let obj = base.advanced(by: cursor)
+  ctl.store(cursor + n, toByteOffset: 8)
+  return obj
+}
+
+// Mark-verify tracer (task 150 · rung 2). Trace the live set from a seed root and mark each reachable
+// object, without reclaiming or moving anything (the NoGC heap only grows). The mark lives in the object
+// header: the 8-byte header holds the type-id in its low 32 bits with the high bits zero, so setting bit
+// 32 (adding 2^32) marks the object and leaves the type-id recoverable. Subset code — RawPtr plus the
+// gc-leaf type-table reads, no managed allocation. The object model is read through the same per-type-id
+// tables the MMTk binding reads (c-types.md §1/§3.2): a fixed object scans its managed-offset map; an
+// array buffer { header, cap, elems } scans the per-element map at each of `cap` slots.
+//
+// 2^32 = 4294967296 (no grouping parens yet, task 114 — kept as intermediate `let`s).
+
+// The type-id of an object, with any mark bit removed.
+fun rtObjTypeId(obj: RawPtr) -> Int {
+  let h: Int = obj.load(fromByteOffset: 0)
+  let hi = h / 4294967296
+  let lo = hi * 4294967296
+  return h - lo
+}
+
+// The address-independent content hash of one object: fold its type-id and its scalar (non-pointer) field
+// words into a 64-bit polynomial hash, skipping the header and every managed-pointer slot (so no raw
+// address enters the hash). A fixed object scans words in [8, size); an array buffer scans its `cap` word
+// then each element's non-managed words. Word granularity — fields are 8-byte aligned (sub-word scalars
+// are a later refinement). This is the per-object term the mark-verify fingerprint sums (§6/§9).
+fun rtObjHash(obj: RawPtr, tid: Int) -> Int {
+  let prime = 1099511628211
+  var h = tid + 1
+  h = h * prime
+  let kind = RawPtr.gcTypeKind(tid)
+  let nptr = RawPtr.gcTypeNumPtrs(tid)
+  if kind == 0 {
+    let size = RawPtr.gcTypeSize(tid)
+    var w = 8
+    while w < size {
+      var managed = false
+      var i = 0
+      while i < nptr {
+        let off = RawPtr.gcTypePtrOffset(tid, i)
+        if off == w {
+          managed = true
+        }
+        i = i + 1
+      }
+      if !managed {
+        let word: Int = obj.load(fromByteOffset: w)
+        h = h * prime
+        h = h + word
+      }
+      w = w + 8
+    }
+  } else {
+    let ecap: Int = obj.load(fromByteOffset: 8)      // array buffer: { header, cap, elems… }
+    h = h * prime
+    h = h + ecap
+    let stride = RawPtr.gcTypeStride(tid)
+    var e = 0
+    while e < ecap {
+      let elemBase = 16 + e * stride
+      var w = 0
+      while w < stride {
+        var managed = false
+        var i = 0
+        while i < nptr {
+          let off = RawPtr.gcTypePtrOffset(tid, i)
+          if off == w {
+            managed = true
+          }
+          i = i + 1
+        }
+        if !managed {
+          let at = elemBase + w
+          let word: Int = obj.load(fromByteOffset: at)
+          h = h * prime
+          h = h + word
+        }
+        w = w + 8
+      }
+      e = e + 1
+    }
+  }
+  return h
+}
+
+// Mark `obj` if not already marked, tallying its type into `counts` and folding its content hash into the
+// running fingerprint `fp` (a summed, order-independent aggregate). Returns true when newly marked.
+fun rtTryMark(obj: RawPtr, counts: RawPtr, fp: RawPtr) -> Bool {
+  let h: Int = obj.load(fromByteOffset: 0)
+  let hi = h / 4294967296
+  if hi > 0 {
+    return false
+  }
+  let tid = h                              // unmarked ⇒ high bits zero ⇒ header == type-id
+  let marked = h + 4294967296
+  obj.store(marked, toByteOffset: 0)
+  let slot = tid * 8
+  let c: Int = counts.load(fromByteOffset: slot)
+  counts.store(c + 1, toByteOffset: slot)
+  let oh = rtObjHash(obj, tid)
+  let f: Int = fp.load(fromByteOffset: 0)
+  fp.store(f + oh, toByteOffset: 0)
+  return true
+}
+
+// Trace from `root`, marking the transitive live set and tallying per-type-id live counts into `counts`
+// (a caller-sized, zeroed Int array indexed by type-id). Returns the total number of live objects.
+fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
+  let cap = 1048576
+  let bytes = cap * 8
+  let work = RawPtr.alloc(bytes: bytes, align: 8)
+  var top = 0
+  let rootNull = root.eq(RawPtr.null)
+  if !rootNull {
+    if rtTryMark(root, counts, fp) {
+      work.store(root, toByteOffset: 0)
+      top = 1
+    }
+  }
+  while top > 0 {
+    top = top - 1
+    let slot = top * 8
+    let obj: RawPtr = work.load(fromByteOffset: slot)
+    let tid = rtObjTypeId(obj)
+    let kind = RawPtr.gcTypeKind(tid)
+    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    if kind == 0 {
+      var i = 0
+      while i < nptr {
+        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let child: RawPtr = obj.load(fromByteOffset: off)
+        let childNull = child.eq(RawPtr.null)
+        if !childNull {
+          if rtTryMark(child, counts, fp) {
+            let dst = top * 8
+            work.store(child, toByteOffset: dst)
+            top = top + 1
+          }
+        }
+        i = i + 1
+      }
+    } else {
+      let ecap: Int = obj.load(fromByteOffset: 8)       // array buffer: { header, cap, elems… }
+      let stride = RawPtr.gcTypeStride(tid)
+      var e = 0
+      while e < ecap {
+        let elemBase = 16 + e * stride
+        var i = 0
+        while i < nptr {
+          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let at = elemBase + off
+          let child: RawPtr = obj.load(fromByteOffset: at)
+          let childNull = child.eq(RawPtr.null)
+          if !childNull {
+            if rtTryMark(child, counts, fp) {
+              let dst = top * 8
+              work.store(child, toByteOffset: dst)
+              top = top + 1
+            }
+          }
+          i = i + 1
+        }
+        e = e + 1
+      }
+    }
+  }
+  work.free()
+  let tcount = RawPtr.gcTypeCount()
+  var total = 0
+  var t = 0
+  while t < tcount {
+    let c: Int = counts.load(fromByteOffset: t * 8)
+    total = total + c
+    t = t + 1
+  }
+  return total
+}

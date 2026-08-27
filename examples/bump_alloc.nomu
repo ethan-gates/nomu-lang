@@ -1,0 +1,58 @@
+// Task 150 · rung 1 (NoGC), slice A — a bump allocator written in Nomu, over task-125 raw memory, under
+// task-149's runtime-subset rules. The allocator holds its state in a RawPtr control block (metadata in
+// the arena — no globals, no heap object), carves an off-heap OS block, and bump-allocates fixed-size
+// chunks. NoGC: it never frees and the heap only grows. This is the reusable allocator *policy*; wiring
+// the chunks into __nomu_gc_alloc as managed addrspace(1) GC objects is the following slice.
+//
+// bumpNew and bumpAlloc are compiled under `--runtime-subset=bumpNew,bumpAlloc`: they allocate only
+// off-heap (RawPtr), do pointer arithmetic, and call only the raw-memory primitives — so they trigger no
+// implicit GC allocation and pass the subset checker. `main` is ordinary code that drives them.
+//
+// Control block (24 bytes): { base: RawPtr @0, cursor: Int @8, limit: Int @16 }.
+// Expected output: 42 / 99 / 1 / 1.
+
+fun bumpNew(size: Int) -> RawPtr {
+  let ctl = RawPtr.alloc(bytes: 24, align: 8)
+  let data = RawPtr.alloc(bytes: size, align: 8)
+  ctl.store(data, toByteOffset: 0)     // base
+  ctl.store(0, toByteOffset: 8)        // cursor (bytes used)
+  ctl.store(size, toByteOffset: 16)    // limit
+  return ctl
+}
+
+// Bump `n` bytes off the arena; returns the chunk, or RawPtr.null when the block is full.
+fun bumpAlloc(ctl: RawPtr, n: Int) -> RawPtr {
+  let cursor: Int = ctl.load(fromByteOffset: 8)
+  let limit: Int = ctl.load(fromByteOffset: 16)
+  if cursor + n > limit {
+    return RawPtr.null
+  }
+  let base: RawPtr = ctl.load(fromByteOffset: 0)
+  let obj = base.advanced(by: cursor)
+  ctl.store(cursor + n, toByteOffset: 8)   // advance the cursor
+  return obj
+}
+
+fun main() {
+  let arena = bumpNew(4096)
+
+  let a = bumpAlloc(arena, 16)
+  let b = bumpAlloc(arena, 16)
+  a.store(42, toByteOffset: 8)
+  b.store(99, toByteOffset: 8)
+  let av: Int = a.load(fromByteOffset: 8)   // read back
+  let bv: Int = b.load(fromByteOffset: 8)
+  print(av)                                  // 42
+  print("\n")
+  print(bv)                                  // 99
+  print("\n")
+
+  // Adjacency: b sits exactly 16 bytes after a (the bump placed it there).
+  print(a.advanced(by: 16).eq(b))           // 1
+  print("\n")
+
+  // Overflow: a request past the remaining space returns null.
+  let full = bumpAlloc(arena, 4096)
+  print(full.isNull)                         // 1
+  print("\n")
+}

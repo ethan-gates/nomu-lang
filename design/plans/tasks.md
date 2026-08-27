@@ -79,7 +79,7 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 | 122 | [Numeric semantics + overflow](tasks/122-numeric-semantics.md) | Usability | M | needs-design |
 | 123 | [Copy-on-write for value collections](tasks/123-copy-on-write.md) | Usability | M | needs-design |
 | 124 | [Generic hash map](tasks/124-generic-hashmap.md) | Usability | M | blocked (D6 spill) |
-| 125 | [Unsafe raw memory / raw pointers](tasks/125-unsafe-raw-memory.md) | Risk | L | design-drafted — build now (`RawPtr`/`Ptr<T>`, `internals/unsafe-memory.md`; first prereq of self-hosted runtime 128) |
+| 125 | [Unsafe raw memory / raw pointers](tasks/125-unsafe-raw-memory.md) | Risk | L | built (minimal floor) — `RawPtr`/`Ptr<T>`, `internals/unsafe-memory.md`; first prereq of self-hosted runtime 128 |
 | 126 | [SIMD](tasks/126-simd.md) | Usability | L | needs-design |
 
 ### Runtime perf & the risk bets
@@ -88,8 +88,8 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 | --- | --- | --- | --- | --- |
 | 127 | [LXR collector (footprint endgame)](tasks/127-lxr-collector.md) | Risk | XL | final rung of the self-hosted GC ladder (after 150's GenImmix) |
 | 128 | [Self-hosting the runtime](tasks/128-self-hosting-runtime.md) | Risk | XL | build now — core bet; decomposes into 125 → 149 → 150 → 127 |
-| 149 | [Runtime-subset mechanism](tasks/149-runtime-subset.md) | Risk | M | design-drafted — build now (surface A: module-default + `nosplit fun`, `internals/runtime-subset.md`; self-host prereq) |
-| 150 | [Self-hosted GC bring-up ladder](tasks/150-selfhosted-gc-ladder.md) | Risk | XL | design-drafted (ladder + rung 1) — build now (NoGC → mark-verify → Immix → GenImmix; `internals/selfhosted-gc.md`) |
+| 149 | [Runtime-subset mechanism](tasks/149-runtime-subset.md) | Risk | M | in-progress — slice 1 built (runtime-prelude "designated file" + flag; call-graph closure check, `internals/runtime-subset.md`); remaining: codegen guards, `nosplit`, module designation |
+| 150 | [Self-hosted GC bring-up ladder](tasks/150-selfhosted-gc-ladder.md) | Risk | XL | in-progress — **rung 1 complete**: self-hosted allocator is a selectable plan (`NOMU_GC_PLAN=nomu`), byte-identical to MMTk NoGC across GC fixtures (`tools/selfhost-gc.sh`); next rung 2 (mark-verify) |
 | 129 | [Tail-call optimization](tasks/129-tail-call-optimization.md) | Usability | M | needs-design |
 | 130 | [First-class FFI to the C ABI](tasks/130-ffi-c-abi.md) | Usability | L | needs-design |
 | 131 | [Shared-mutable primitive](tasks/131-shared-mutable-primitive.md) | Risk | M | ongoing |

@@ -276,6 +276,8 @@ private final class Monomorphizer {
         case .named(let n, _): return n
         case .generic(let b, let a): return b + "<" + a.map(typeKey).joined(separator: ",") + ">"
         case .array(let e): return "Array<" + typeKey(e) + ">"
+        case .rawPtr: return "RawPtr"
+        case .ptr(let e): return "Ptr<" + typeKey(e) + ">"
         case .function(let p, let r): return "fn<" + (p.map(typeKey) + [typeKey(r)]).joined(separator: ",") + ">"
         case .existential(let i): return "any_" + i
         case .composition(let is_): return "any_" + is_.joined(separator: "_")

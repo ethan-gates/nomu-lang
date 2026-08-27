@@ -99,6 +99,17 @@ extension LLVMGen {
 
     func arrayElemStride(_ t: Type) -> Int { max(slotCount(t) * 8, 8) }
 
+    // The byte stride of a `Ptr<T>` element (task 125): the natural size of a scalar `T`, so raw typed
+    // memory is packed C-style — distinct from `arrayElemStride`'s 8-byte enum-slot model. Only the
+    // scalar element set (checked in Sema) reaches here.
+    func rawStride(_ t: Type) -> Int {
+        switch t {
+        case .uint8, .bool:                 return 1
+        case .int, .double, .rawPtr, .ptr:  return 8
+        default:                            return 8
+        }
+    }
+
     // Append the byte offsets of managed (`p1`) pointers within a field of type `t` laid out starting
     // at `baseSlot`. Recurses into inline value structs; String's buffer is runtime-owned (addr0) so
     // it is skipped, and enum payloads carry no references in the language today.
@@ -158,7 +169,9 @@ extension LLVMGen {
         emitI32Array("nomu_gc_typemap_sizes", typeSizes.isEmpty ? [0] : typeSizes)
         emitI32Array("nomu_gc_typemap_kind", typeKinds.isEmpty ? [0] : typeKinds)
         emitI32Array("nomu_gc_typemap_stride", typeStrides.isEmpty ? [0] : typeStrides)
-        let g = LLVMAddGlobal(mod, i64, "nomu_gc_typemap_count")!
+        // Reuse a forward declaration if the `__gcTypeCount` intrinsic (task 150) referenced it during
+        // function lowering; otherwise define it fresh. Same i64 type either way.
+        let g = LLVMGetNamedGlobal(mod, "nomu_gc_typemap_count") ?? LLVMAddGlobal(mod, i64, "nomu_gc_typemap_count")!
         LLVMSetInitializer(g, LLVMConstInt(i64, UInt64(typeMaps.count), 0))
         LLVMSetGlobalConstant(g, 1)
     }

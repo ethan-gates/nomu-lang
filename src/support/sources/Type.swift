@@ -21,6 +21,8 @@ public indirect enum Type: Equatable {
     case typeParam(String)                          // a generic type parameter `T` in scope (M5 5.2.1)
     case generic(base: String, args: [Type])        // an applied generic type `Box<Int>` (M5 5.2.1)
     case array(Type)                                // `Array<T>` — a builtin variable-size reference type (M6 stdlib). Reference semantics (a managed handle); the element `T` is monomorphized like any other generic argument.
+    case rawPtr                                     // `RawPtr` — an untyped, byte-addressable unmanaged (addrspace 0) address (task 125). A value type holding one raw word; never a GC root.
+    case ptr(Type)                                  // `Ptr<T>` — a typed unmanaged (addrspace 0) pointer to `T`; `T` gives the element stride + load/store type (task 125). A value type; never a GC root.
     case function(params: [Type], ret: Type)       // closures and named functions share this
     case error                                     // unresolved / failed typing; suppresses cascades
 }
@@ -43,6 +45,8 @@ extension Type: CustomStringConvertible {
         case .typeParam(let n): return n
         case .generic(let base, let args): return base + "<" + args.map(\.description).joined(separator: ", ") + ">"
         case .array(let elem): return "Array<\(elem)>"
+        case .rawPtr:          return "RawPtr"
+        case .ptr(let elem):   return "Ptr<\(elem)>"
         case .function(let params, let ret):
             return "(" + params.map(\.description).joined(separator: ", ") + ") -> \(ret)"
         }

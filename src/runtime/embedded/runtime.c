@@ -157,6 +157,24 @@ static void nomu_gc_dump_typemaps(void) {
 
 void rt_free(void* p) { free(p); }
 
+// Unsafe raw-memory floor (task 125 · RawPtr / Ptr<T>). Off-heap, unmanaged memory the moving
+// collector never sees — the surface the self-hosted allocator is built on (task 150). `align` is a
+// power-of-two byte alignment. Memory is zero-initialized to match the rt_alloc contract the allocator
+// relies on (fresh OS pages read as zero). Freed by hand via rt_raw_free; never GC-reclaimed.
+void* rt_raw_alloc(int64_t bytes, int64_t align) {
+    if (bytes <= 0) return NULL;
+    size_t a = (size_t)align < sizeof(void*) ? sizeof(void*) : (size_t)align;
+    void* p = NULL;
+    if (posix_memalign(&p, a, (size_t)bytes) != 0) {
+        fputs("out of memory\n", stderr);
+        exit(1);
+    }
+    memset(p, 0, (size_t)bytes);
+    return p;
+}
+
+void rt_raw_free(void* p) { free(p); }
+
 // Array bounds violation (M6 stdlib · Slice 3). Codegen emits a check on every subscript and calls
 // this on an out-of-range index; it prints and aborts (Swift-style trap). Never returns.
 void rt_bounds_trap(int64_t idx, int64_t len) {

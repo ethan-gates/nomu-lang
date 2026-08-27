@@ -1,0 +1,28 @@
+// Task 125 · slice 1 — RawPtr round-trip smoke test. Allocates an off-heap block, stores and loads
+// Ints at byte offsets, exercises pointer arithmetic (advanced) and a byte-sized element, then frees.
+// Expected output: 42 / 7 / 99 / 255. Checked by tools/raw-mem.sh.
+fun main() {
+  let p = RawPtr.alloc(bytes: 32, align: 8)
+  p.store(42, toByteOffset: 0)          // Int at byte 0
+  p.store(7, toByteOffset: 8)           // Int at byte 8
+  let a: Int = p.load(fromByteOffset: 0)
+  let b: Int = p.load(fromByteOffset: 8)
+  print(a)                              // 42
+  print("\n")
+  print(b)                              // 7
+  print("\n")
+
+  let q = p.advanced(by: 16)            // point 16 bytes in
+  q.store(99, toByteOffset: 0)
+  let c: Int = p.load(fromByteOffset: 16)   // read it back through the original pointer
+  print(c)                              // 99
+  print("\n")
+
+  let by: UInt8 = 255.uint8
+  p.store(by, toByteOffset: 24)         // a byte-sized element
+  let d: UInt8 = p.load(fromByteOffset: 24)
+  print(d.int)                          // 255
+  print("\n")
+
+  p.free()
+}

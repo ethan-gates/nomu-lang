@@ -1,8 +1,30 @@
 # Self-hosted GC bring-up ladder (NoGC → mark-verify → Immix → GenImmix)
 
-**Avenue:** Risk (the core bet) · **Type/Lifecycle:** `runtime · design-drafted` (runtime + GC + backend) ·
-**Size:** XL · **Status:** design-drafted (ladder + rung 1) — build now · **Source:** distilled from
-[128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
+**Avenue:** Risk (the core bet) · **Type/Lifecycle:** `runtime · in-progress` (runtime + GC + backend) ·
+**Size:** XL · **Status:** rung 1 complete (self-hosted allocator is a selectable plan) — next rung 2 ·
+**Source:** distilled from [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
+
+**► Rung 1 · slice A built.** The bump-allocator policy written in Nomu over 125 raw memory, under 149's
+subset rules: a `RawPtr` control block `{ base, cursor, limit }`, `bumpNew` (carve an off-heap block),
+`bumpAlloc` (bump + overflow→null). Compiles under `--runtime-subset=bumpNew,bumpAlloc` (first real
+125↔149 client); byte-identical under NoGC and Immix-evacuation. `examples/bump_alloc.nomu` +
+`tools/bump-alloc.sh`; design `internals/selfhosted-gc.md` §3.
+
+**► Slice B foundation built — the runtime prelude.** The allocator now lives in `src/stdlib/runtime.nomu`
+(embedded, compiled into every program, runtime-subset by default — the 149 "designated file"). Auto-subset
+verified, callable from user code (`examples/rt_prelude.nomu` + `tools/rt-prelude.sh`). The
+`addrspace(1)`-production question is **resolved**: the allocator returns a `RawPtr`, the seam does
+`ptrtoint`→`inttoptr` to `p1` (the fast path's existing integer→`p1` step) — no `addrspacecast`, no
+intrinsic.
+
+**► Slice B built — rung 1 complete.** `NOMU_GC_PLAN=nomu` routes every managed allocation at the Nomu
+allocator: an extern flag (`__nomu_selfhosted_alloc`, Rust `AtomicU8` set in `nomu_gc_init`) disables the
+MMTk fast path and branches the seam's slow path to `__nomu_selfhost_alloc` (lazy arena + `rtBumpAlloc`,
+`ptrtoint`→`inttoptr` to `p1`); MMTk runs NoGC-idle as the diff oracle. Class objects, closures, arrays,
+and heavy allocation are byte-identical under `nogc` vs `nomu` (`examples/selfhost_gc.nomu` +
+`tools/selfhost-gc.sh`); the full GC suite (through GenImmix) is unaffected. First-cut limits: single
+256 MiB arena, no refill; single (not per-carrier) arena. **Next — rung 2 (mark-verify):** the Nomu tracer
++ live-set fingerprint diff (clean-separation method, `selfhosted-gc.md` §1/§6). Then Immix, GenImmix.
 
 **► Design:** [`internals/selfhosted-gc.md`](../../internals/selfhosted-gc.md) — the ladder architecture +
 differential-oracle method, the shared substrate reused across rungs (statepoints, the single allocation

@@ -48,6 +48,8 @@ extension LLVMGen {
             return nil
         case .array:
             return p1   // `Array<T>` is a reference type — a managed pointer to the heap handle (M6)
+        case .rawPtr, .ptr:
+            return i8ptr   // `RawPtr` / `Ptr<T>` — an unmanaged addrspace(0) address (task 125); never a GC root
         case .existential, .composition:
             return p1   // `any I` / `any A & B` — a managed pointer to a heap { witness, payload } box (8.4.1)
         case .opaque:
@@ -141,6 +143,7 @@ extension LLVMGen {
     func slotCount(_ t: Type) -> Int {
         switch t {
         case .int, .uint8, .double, .bool: return 1
+        case .rawPtr, .ptr: return 1   // an addrspace(0) pointer word (task 125)
         case .string:     return 2
         case .function:   return 1   // a managed pointer to a heap { fn, caps… } box (8.4.1)
         case .existential, .composition: return 1   // a managed pointer to a heap { witness, payload } box

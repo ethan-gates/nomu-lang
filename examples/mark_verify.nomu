@@ -1,0 +1,56 @@
+// Task 150 rung 2 (mark-verify), increment 2: the Nomu tracer marks the transitive live set from a seed
+// root, with no reclaim or move. This fixture exercises the tracer's core correctness:
+//   - reachability: root → its children are counted live;
+//   - shared child: root.left and root.right are the same Leaf, counted once (the header mark bit);
+//   - dead exclusion: `dead` is a heap Node never linked into root's graph, so it must NOT be counted.
+// Type-ids (from mark_types): Node = 0 (managed at 8,16), Leaf = 1. Live from root: {root, leaf} → total 2,
+// Node count 1, Leaf count 1. `dead` (another Node) stays unmarked.
+class Leaf {
+  var v: Int
+}
+class Node {
+  var left: Leaf
+  var right: Leaf
+  var n: Int
+}
+
+// Returning forces heap allocation (a stack-promoted object carries no type-id header for the tracer).
+fun mkLeaf(v: Int) -> Leaf {
+  return Leaf(v: v)
+}
+fun mkNode(l: Leaf, r: Leaf, n: Int) -> Node {
+  return Node(left: l, right: r, n: n)
+}
+
+fun main() {
+  let leaf = mkLeaf(1)
+  let root = mkNode(leaf, leaf, 10)     // root.left == root.right == leaf (shared child)
+  let dead = mkNode(leaf, leaf, 99)     // heap, but never reachable from root
+  print(dead.n)                         // keep `dead` allocated; unreachable from the seed
+  print("\n")
+
+  let tcount = RawPtr.gcTypeCount()
+  let counts = RawPtr.alloc(bytes: tcount * 8, align: 8)
+  let fp = RawPtr.alloc(bytes: 8, align: 8)
+  let total = rtMarkVerify(addrOf(root), counts, fp)
+
+  print("TOTAL ")
+  print(total)
+  print("\n")
+  var t = 0
+  while t < tcount {
+    let c: Int = counts.load(fromByteOffset: t * 8)
+    print("LIVE ")
+    print(t)
+    print(" ")
+    print(c)
+    print("\n")
+    t = t + 1
+  }
+  // The address-independent content fingerprint: same value under any allocator (no address enters it),
+  // so it is identical across GC plans and is the term the MMTk cross-run diff will match.
+  let fpv: Int = fp.load(fromByteOffset: 0)
+  print("FP ")
+  print(fpv)
+  print("\n")
+}

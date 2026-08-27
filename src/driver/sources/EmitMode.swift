@@ -28,6 +28,10 @@ public struct EmitOptions {
     // statepoint rewrite needs and preserves Tier-0 debug info; `-O`/`--release` runs the full
     // `default<O2>` pipeline (faster code, debug info degraded). Both precede statepoint rewriting.
     public var optimize = false  // -O / --release
+    // Task 149 — interim runtime-subset designation: the set of function names compiled under the subset
+    // rules (no implicit GC alloc / heap construct / non-subset call). A compiler input standing in for
+    // module membership until the module system (task 100) lands. Set by `--runtime-subset=a,b`.
+    public var subsetFuncs: Set<String> = []
 
     public init() {}
 }

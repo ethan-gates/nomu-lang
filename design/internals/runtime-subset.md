@@ -1,9 +1,28 @@
 # Runtime Subset
 
-**Status:** design draft (task 149). The mechanism that lets code *inside* the runtime avoid recursively
+**Status:** slice 1 built (task 149). The mechanism that lets code *inside* the runtime avoid recursively
 invoking the services it implements — no implicit GC allocation, no write barrier, no compiler-inserted
 safepoint, and bounded stack growth. Nomu's analog to Go's `//go:nosplit` / `//go:nowritebarrier` /
 `//go:noescape`. Status tags: **Decided**, **Leaning**, **Deferred**, **Open**.
+
+**Built (slice 1).** Two designation sources + the call-graph closure check: a designated function may not
+trigger an implicit GC allocation (a heap construct — class/actor, closure, `any`-box, array — or `spawn`)
+or call a function that is not itself subset or an allowlisted primitive (the 125 `__raw*`/`__ptr*`
+intrinsics + pure leaves). Runs over the final NOIR module in `Sema.swift` (`checkRuntimeSubset`); tested
+by `tools/subset.sh`.
+
+Designation sources (both feed the same `subsetFuncs` set, resolved in the driver):
+- **The runtime prelude** (`src/stdlib/runtime.nomu`) — every function in it is subset **by default**.
+  This is the proper "designated file" surface A described, standing in for module membership until
+  [100](../plans/tasks/100-modules.md); the self-hosted runtime (150) lives here. Verified: a violation
+  injected into the prelude is flagged with no flag given (`tools/rt-prelude.sh`).
+- **`--runtime-subset=<names>`** — an ad-hoc compiler input, kept for designating functions outside the
+  prelude (tests, experiments).
+
+**Deferred to later slices:** the codegen-site guards (write-barrier / safepoint-poll suppression in
+subset code), the `nosplit fun` keyword (bounded stack, staged behind
+[104](../plans/tasks/104-fiber-stack-strategy.md)), and folding the file designation into module
+membership when [100](../plans/tasks/100-modules.md) lands.
 
 **API scope.** The surface is **module-default subset + a narrow per-function keyword refinement**
 (surface A, Decided with Ethan). The runtime tier is designated subset-by-default so the module-wide

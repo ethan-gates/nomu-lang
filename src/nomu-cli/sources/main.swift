@@ -26,6 +26,9 @@ for arg in CommandLine.arguments.dropFirst() {
     case "--emit-noir":        options.noir = true
     case "--emit-ssair":       options.ssair = true
     case "-O", "--release":    options.optimize = true
+    case let a where a.hasPrefix("--runtime-subset="):
+        let names = String(a.dropFirst("--runtime-subset=".count)).split(separator: ",").map(String.init)
+        options.subsetFuncs.formUnion(names)
     case let a where a.hasPrefix("--stop="):
         switch String(a.dropFirst("--stop=".count)) {
         case "ast":     options.stopAt = .ast

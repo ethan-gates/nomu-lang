@@ -13,6 +13,7 @@ public struct SemaResult {
 public struct Sema {
     private let program: Program
     private let diags = DiagnosticSink()
+    private let subsetFuncs: Set<String>   // task 149 — functions compiled under the runtime-subset rules
 
     // Global declarations, by name.
     private var structs: [String: StructDecl] = [:]
@@ -80,7 +81,10 @@ public struct Sema {
     // built once after global collection; discharges `<shared T>` bounds at call sites.
     private var shareChecker = Shareability(lookup: { _ in nil })
 
-    public init(_ program: Program) { self.program = program }
+    public init(_ program: Program, subsetFuncs: Set<String> = []) {
+        self.program = program
+        self.subsetFuncs = subsetFuncs
+    }
 
     public mutating func check() -> SemaResult {
         collectGlobals()
@@ -108,6 +112,7 @@ public struct Sema {
         for site in methodCallSites where mutation.mutating.contains(site.callee) && !site.receiverMutable {
             diags.error("cannot call mutating method on an immutable value — the receiver must be a 'var'", at: site.span)
         }
+        checkRuntimeSubset(mutation.module)
         return SemaResult(module: mutation.module, diagnostics: diags)
     }
 
@@ -221,6 +226,7 @@ public struct Sema {
         case "Double": return .double
         case "Bool":   return .bool
         case "String": return .string
+        case "RawPtr": return .rawPtr    // task 125 — untyped unmanaged address
         case "Void":   return .void
         default:
             if let k = kindOf(ref.name) {
@@ -291,6 +297,15 @@ public struct Sema {
             }
             return .array(resolve(args[0], selfAs: selfAs))
         }
+        // `Ptr<T>` is a builtin typed unmanaged pointer (task 125), also outside the user-generic-decl
+        // machinery — resolve to the dedicated `.ptr` type.
+        if base == "Ptr" {
+            guard args.count == 1 else {
+                diags.error("generic type 'Ptr' expects 1 type argument, got \(args.count)", at: span)
+                return .error
+            }
+            return .ptr(resolve(args[0], selfAs: selfAs))
+        }
         guard let arity = genericArity(base) else {
             if kindOf(base) != nil {
                 diags.error("type '\(base)' is not generic — it takes no type arguments", at: span)
@@ -329,6 +344,15 @@ public struct Sema {
         case .named(let iface, .interface_): return aggregatedProperties(iface).contains { $0.name == name }
         case .named(let tn, _):              return computedProps[tn]?[name] != nil
         default:                             return false
+        }
+    }
+
+    // A heap (reference) type: a class/actor instance or an Array handle — a managed `p1` at runtime,
+    // so `addrOf` (task 150 rung 2) can take its raw address. Structs/enums are value types.
+    private func isReferenceType(_ t: Type) -> Bool {
+        switch t {
+        case .named(_, .class_), .named(_, .actor_), .array: return true
+        default: return false
         }
     }
 
@@ -1255,7 +1279,14 @@ public struct Sema {
             if let (typeName, explicit) = typeNameAndArgs(base), lookup(typeName) == nil, enums[typeName] != nil {
                 return buildEnumInit(typeName, field, [], explicit: explicit, expected: expected, at: span)
             }
+            // Pointer static properties (task 125): `RawPtr.null`, `Ptr<T>.null`.
+            if let (tn, explicit) = typeNameAndArgs(base), lookup(tn) == nil, tn == "RawPtr" || tn == "Ptr" {
+                return checkPointerStaticMember(tn, explicit, field, span)
+            }
             let b = checkExpr(base)
+            // Pointer instance properties (task 125): `p.isNull`.
+            if case .rawPtr = b.type, field == "isNull" { return ptrIntrinsic("__ptrIsNull", .bool, [b], span) }
+            if case .ptr = b.type, field == "isNull" { return ptrIntrinsic("__ptrIsNull", .bool, [b], span) }
             // Numeric conversions (M6 stdlib), property-style: `i.double` widens Int→Double;
             // `d.int` narrows Double→Int, rounding to nearest (ties away from zero). These are the
             // only Int/Double conversions — arithmetic never converts implicitly.
@@ -1612,11 +1643,329 @@ public struct Sema {
         return substitute(resolve(f.type), subst)
     }
 
+    // Unsafe raw-memory surface (task 125). Element types are limited to the single-word scalars a
+    // plain addrspace(0) load/store can move; aggregates are out of the minimal floor.
+    private func isRawScalar(_ t: Type) -> Bool {
+        switch t {
+        case .int, .uint8, .double, .bool, .rawPtr, .ptr: return true
+        default: return false
+        }
+    }
+
+    // Validate a builtin call's argument labels against a fixed expected list (nil = an unlabeled
+    // positional argument). The pointer surface spells its offsets/counts explicitly (`toByteOffset:`,
+    // `by:`), so the labels are required, matching the design.
+    private mutating func checkArgLabels(_ args: [Arg], _ expected: [String?], _ ctx: String, _ span: Span) -> Bool {
+        guard args.count == expected.count else {
+            let sig = expected.map { $0.map { "\($0):" } ?? "_" }.joined(separator: ", ")
+            diags.error("\(ctx) expects \(expected.count) argument(s) (\(sig)), got \(args.count)", at: span)
+            return false
+        }
+        var ok = true
+        for (a, want) in zip(args, expected) where a.label != want {
+            let wantDesc = want.map { "label '\($0):'" } ?? "no label"
+            let gotDesc = a.label.map { "'\($0):'" } ?? "no label"
+            diags.error("\(ctx): expected \(wantDesc), got \(gotDesc)", at: span)
+            ok = false
+        }
+        return ok
+    }
+
+    // Check an `Int`-typed argument of a pointer builtin, enforcing the type as the virtual signature
+    // demands (a byte offset / count / alignment). `coerce(_, to: .int)` is a no-op, so this is what
+    // actually rejects a non-Int argument.
+    private mutating func intArg(_ e: Expr, _ ctx: String, _ what: String) -> NOIRExpr {
+        let v = checkExpr(e, expected: .int)
+        if v.type != .int, v.type != .error {
+            diags.error("\(ctx): \(what) must be an 'Int', got '\(v.type)'", at: v.span)
+        }
+        return v
+    }
+
+    // Build a NOIR call to a codegen intrinsic (`__rawAlloc` etc.); the result type is carried on the
+    // node so codegen reads the element type from it (e.g. a typed load).
+    private func ptrIntrinsic(_ name: String, _ result: Type, _ args: [NOIRExpr], _ span: Span) -> NOIRExpr {
+        let callee = NOIRExpr(type: .void, span: span, kind: .varRef(name))
+        return NOIRExpr(type: result, span: span,
+                        kind: .call(callee: callee, args: args.map { NOIRArg(label: nil, value: $0) }, typeArgs: []))
+    }
+
+    // Pointer static properties: `RawPtr.null` / `Ptr<T>.null` — a null address of the named type.
+    private mutating func checkPointerStaticMember(_ tn: String, _ explicit: [Type]?, _ field: String, _ span: Span) -> NOIRExpr {
+        guard field == "null" else {
+            let ty = tn == "Ptr" ? "Ptr<T>" : tn
+            diags.error("type '\(ty)' has no static property '\(field)'", at: span)
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+        }
+        if tn == "RawPtr" { return ptrIntrinsic("__ptrNull", .rawPtr, [], span) }
+        guard let elems = explicit, elems.count == 1 else {
+            diags.error("'Ptr' needs one type argument, e.g. 'Ptr<Int>.null'", at: span)
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+        }
+        return ptrIntrinsic("__ptrNull", .ptr(elems[0]), [], span)
+    }
+
+    private mutating func checkRawPtrStatic(_ method: String, _ args: [Arg], _ span: Span) -> NOIRExpr {
+        switch method {
+        case "alloc":
+            guard checkArgLabels(args, ["bytes", "align"], "RawPtr.alloc", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let bytes = intArg(args[0].value, "RawPtr.alloc", "bytes")
+            let align = intArg(args[1].value, "RawPtr.alloc", "align")
+            return ptrIntrinsic("__rawAlloc", .rawPtr, [bytes, align], span)
+        // GC type-table reads (task 150 rung 2). Reach the codegen-emitted per-type-id side tables
+        // (`c-types.md` §1/§3.2) from Nomu: each lowers to a call to the existing runtime accessor. All
+        // are gc-leaf pure reads — no managed heap, no alloc — so the Nomu tracer reads its object model
+        // through the same tables the MMTk binding reads.
+        case "gcTypeCount":
+            guard checkArgLabels(args, [], "RawPtr.gcTypeCount", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__gcTypeCount", .int, [], span)
+        case "gcTypeSize", "gcTypeKind", "gcTypeStride", "gcTypeNumPtrs":
+            guard checkArgLabels(args, [nil], "RawPtr.\(method)", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let id = intArg(args[0].value, "RawPtr.\(method)", "id")
+            let intr = "__" + method   // __gcTypeSize / __gcTypeKind / __gcTypeStride / __gcTypeNumPtrs
+            return ptrIntrinsic(intr, .int, [id], span)
+        case "gcTypePtrOffset":
+            guard checkArgLabels(args, [nil, nil], "RawPtr.gcTypePtrOffset", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let id = intArg(args[0].value, "RawPtr.gcTypePtrOffset", "id")
+            let i = intArg(args[1].value, "RawPtr.gcTypePtrOffset", "i")
+            return ptrIntrinsic("__gcTypePtrOffset", .int, [id, i], span)
+        default:
+            diags.error("type 'RawPtr' has no static method '\(method)'", at: span)
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+        }
+    }
+
+    private mutating func checkRawPtrMethod(_ recv: NOIRExpr, _ name: String, _ args: [Arg], _ span: Span, expected: Type?) -> NOIRExpr {
+        switch name {
+        case "free":
+            guard checkArgLabels(args, [], "RawPtr.free", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__rawFree", .void, [recv], span)
+        case "advanced":
+            guard checkArgLabels(args, ["by"], "RawPtr.advanced", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let by = intArg(args[0].value, "RawPtr.advanced", "by")
+            return ptrIntrinsic("__rawAdvanced", .rawPtr, [recv, by], span)
+        case "store":
+            guard checkArgLabels(args, [nil, "toByteOffset"], "RawPtr.store", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let value = checkExpr(args[0].value)
+            if value.type != .error, !isRawScalar(value.type) {
+                diags.error("RawPtr.store supports scalar element types (Int, UInt8, Double, Bool, RawPtr, Ptr<T>), got '\(value.type)'", at: value.span)
+            }
+            let off = intArg(args[1].value, "RawPtr.store", "toByteOffset")
+            return ptrIntrinsic("__rawStore", .void, [recv, value, off], span)
+        case "load":
+            guard checkArgLabels(args, ["fromByteOffset"], "RawPtr.load", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            guard let elem = expected, isRawScalar(elem) else {
+                diags.error("cannot infer the element type of 'RawPtr.load' — annotate the result with a scalar type (Int, UInt8, Double, Bool, RawPtr, Ptr<T>)", at: span)
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let off = intArg(args[0].value, "RawPtr.load", "fromByteOffset")
+            return ptrIntrinsic("__rawLoad", elem, [recv, off], span)
+        case "eq":
+            guard checkArgLabels(args, [nil], "RawPtr.eq", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let other = checkExpr(args[0].value)
+            if other.type != .rawPtr, other.type != .error {
+                diags.error("RawPtr.eq expects a 'RawPtr' argument, got '\(other.type)'", at: other.span)
+            }
+            return ptrIntrinsic("__ptrEq", .bool, [recv, other], span)
+        case "asPtr":
+            guard checkArgLabels(args, [], "RawPtr.asPtr", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            guard case .ptr = (expected ?? .error) else {
+                diags.error("cannot infer the target type of 'RawPtr.asPtr' — annotate the result as 'Ptr<T>'", at: span)
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__rawAsPtr", expected!, [recv], span)
+        default:
+            diags.error("value of type 'RawPtr' has no method '\(name)'", at: span)
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+        }
+    }
+
+    private mutating func checkPtrStatic(_ elem: Type, _ method: String, _ args: [Arg], _ span: Span) -> NOIRExpr {
+        switch method {
+        case "alloc":
+            guard checkArgLabels(args, ["count"], "Ptr.alloc", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            if elem != .error, !isRawScalar(elem) {
+                diags.error("Ptr<T>.alloc requires a scalar element type (Int, UInt8, Double, Bool, RawPtr, Ptr<T>), got '\(elem)'", at: span)
+            }
+            let count = intArg(args[0].value, "Ptr.alloc", "count")
+            return ptrIntrinsic("__ptrAlloc", .ptr(elem), [count], span)
+        default:
+            diags.error("type 'Ptr<\(elem)>' has no static method '\(method)'", at: span)
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+        }
+    }
+
+    private mutating func checkPtrMethod(_ recv: NOIRExpr, _ elem: Type, _ name: String, _ args: [Arg], _ span: Span) -> NOIRExpr {
+        if elem != .error, !isRawScalar(elem) {
+            diags.error("Ptr<\(elem)> supports scalar element types (Int, UInt8, Double, Bool, RawPtr, Ptr<T>)", at: span)
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+        }
+        switch name {
+        case "load":
+            guard checkArgLabels(args, ["at"], "Ptr.load", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let at = intArg(args[0].value, "Ptr.load", "at")
+            return ptrIntrinsic("__ptrLoad", elem, [recv, at], span)
+        case "store":
+            guard checkArgLabels(args, [nil, "at"], "Ptr.store", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let value = coerce(checkExpr(args[0].value, expected: elem), to: elem)
+            checkAssignable(value.type, to: elem, role: "argument", at: value.span)
+            let at = intArg(args[1].value, "Ptr.store", "at")
+            return ptrIntrinsic("__ptrStore", .void, [recv, value, at], span)
+        case "advanced":
+            guard checkArgLabels(args, ["by"], "Ptr.advanced", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let by = intArg(args[0].value, "Ptr.advanced", "by")
+            return ptrIntrinsic("__ptrAdvanced", .ptr(elem), [recv, by], span)
+        case "asRaw":
+            guard checkArgLabels(args, [], "Ptr.asRaw", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__ptrAsRaw", .rawPtr, [recv], span)
+        case "free":
+            guard checkArgLabels(args, [], "Ptr.free", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__rawFree", .void, [recv], span)   // same addrspace(0) word as RawPtr.free
+        case "eq":
+            guard checkArgLabels(args, [nil], "Ptr.eq", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let other = checkExpr(args[0].value)
+            if other.type != .ptr(elem), other.type != .error {
+                diags.error("Ptr<\(elem)>.eq expects a 'Ptr<\(elem)>' argument, got '\(other.type)'", at: other.span)
+            }
+            return ptrIntrinsic("__ptrEq", .bool, [recv, other], span)
+        default:
+            diags.error("value of type 'Ptr<\(elem)>' has no method '\(name)'", at: span)
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+        }
+    }
+
+    // Task 149 — the runtime-subset check (design: runtime-subset.md §4, the call-graph closure). A
+    // function designated runtime-subset may not do the things it would otherwise implement: trigger an
+    // implicit GC allocation (a heap construct — class/actor, closure, `any`-box, array — or a `spawn`),
+    // or call a function that is not itself subset or an allowlisted primitive. The allowlist is the 125
+    // raw-memory intrinsics (gc-leaf, no managed heap) plus pure non-allocating leaves. Runs over the
+    // final NOIR module (pre-mono), where callees carry source names. The codegen-site guards (barrier /
+    // safepoint suppression) are a later slice; this catches the alloc + call recursion the allocator
+    // must avoid.
+    private func checkRuntimeSubset(_ module: NOIRModule) {
+        guard !subsetFuncs.isEmpty else { return }
+        for decl in module.decls {
+            guard case .funcDecl(let f) = decl, subsetFuncs.contains(f.name) else { continue }
+            for s in f.body { subsetWalkStmt(s, inFn: f.name) }
+        }
+    }
+
+    // A callee a subset function may reach: the 125 primitives and pure non-allocating leaves.
+    private func subsetAllows(_ name: String) -> Bool {
+        if name.hasPrefix("__raw") || name.hasPrefix("__ptr") { return true }   // 125 raw memory (gc-leaf)
+        if name.hasPrefix("__gc") { return true }                               // GC introspection reads (gc-leaf, task 150 rung 2)
+        if Builtins.cLeaf.contains(name) { return true }                        // pure C leaves
+        switch name {
+        case "__int_double_double", "__double_int_int", "__int_uint8_uint8", "__uint8_int_int": return true
+        default: return subsetFuncs.contains(name)                              // another subset function
+        }
+    }
+
+    private func subsetWalkStmt(_ s: NOIRStmt, inFn: String) {
+        switch s.kind {
+        case .letBinding(_, _, let v): subsetWalkExpr(v, inFn: inFn)
+        case .spawnLet(_, let v, _):
+            diags.error("runtime-subset function '\(inFn)' may not 'spawn' — it allocates a task", at: s.span)
+            subsetWalkExpr(v, inFn: inFn)
+        case .assign(let t, let v), .compoundAssign(let t, let v):
+            subsetWalkExpr(t, inFn: inFn); subsetWalkExpr(v, inFn: inFn)
+        case .ret(let e): if let e { subsetWalkExpr(e, inFn: inFn) }
+        case .ifStmt(let c, let th, let el):
+            subsetWalkExpr(c, inFn: inFn)
+            th.forEach { subsetWalkStmt($0, inFn: inFn) }
+            (el ?? []).forEach { subsetWalkStmt($0, inFn: inFn) }
+        case .whileStmt(let c, let body):
+            subsetWalkExpr(c, inFn: inFn)
+            body.forEach { subsetWalkStmt($0, inFn: inFn) }
+        case .switchStmt(let sw):
+            subsetWalkExpr(sw.subject, inFn: inFn)
+            for arm in sw.arms { arm.body.forEach { subsetWalkStmt($0, inFn: inFn) } }
+        case .exprStmt(let e): subsetWalkExpr(e, inFn: inFn)
+        case .breakStmt, .continueStmt: break
+        }
+    }
+
+    private func subsetWalkExpr(_ e: NOIRExpr, inFn: String) {
+        switch e.kind {
+        case .construct(let typeName, let args):
+            if let k = kindOf(typeName), k == .class_ || k == .actor_ {
+                diags.error("runtime-subset function '\(inFn)' may not allocate a '\(typeName)' — heap allocation is forbidden in runtime-subset code", at: e.span)
+            }
+            args.forEach { subsetWalkExpr($0.value, inFn: inFn) }
+        case .closure:
+            diags.error("runtime-subset function '\(inFn)' may not create a closure — it is heap-boxed", at: e.span)
+        case .box(let v, _):
+            diags.error("runtime-subset function '\(inFn)' may not box a value as 'any' — heap allocation", at: e.span)
+            subsetWalkExpr(v, inFn: inFn)
+        case .arrayLit(let elems):
+            diags.error("runtime-subset function '\(inFn)' may not build an array — heap allocation", at: e.span)
+            elems.forEach { subsetWalkExpr($0, inFn: inFn) }
+        case .call(let callee, let args, _):
+            if case .varRef(let name) = callee.kind, !subsetAllows(name) {
+                diags.error("runtime-subset function '\(inFn)' may not call '\(name)' — only other runtime-subset functions and the raw-memory primitives are allowed", at: e.span)
+            }
+            args.forEach { subsetWalkExpr($0.value, inFn: inFn) }
+        case .methodCall(let recv, _, let margs):
+            subsetWalkExpr(recv, inFn: inFn); margs.forEach { subsetWalkExpr($0, inFn: inFn) }
+        case .binary(_, let l, let r): subsetWalkExpr(l, inFn: inFn); subsetWalkExpr(r, inFn: inFn)
+        case .fieldAccess(let base, _): subsetWalkExpr(base, inFn: inFn)
+        case .index(let base, let idx): subsetWalkExpr(base, inFn: inFn); subsetWalkExpr(idx, inFn: inFn)
+        case .enumInit(_, _, let args): args.forEach { subsetWalkExpr($0.value, inFn: inFn) }
+        default: break   // literals, varRef, and other leaves carry no allocation or call
+        }
+    }
+
     private mutating func checkCall(callee: Expr, args: [Arg], span: Span, expected: Type? = nil) -> NOIRExpr {
         // Qualified enum construction: `EnumType.case(args)` or `EnumType<Args>.case(args)`.
         if case .member(let base, let caseName, _) = callee,
            let (typeName, explicit) = typeNameAndArgs(base), lookup(typeName) == nil, enums[typeName] != nil {
             return buildEnumInit(typeName, caseName, args, explicit: explicit, expected: expected, at: span)
+        }
+        // Pointer static constructors (task 125): `RawPtr.alloc(...)`, `Ptr<T>.alloc(...)`.
+        if case .member(let base, let method, _) = callee,
+           let (tn, explicit) = typeNameAndArgs(base), lookup(tn) == nil {
+            if tn == "RawPtr" { return checkRawPtrStatic(method, args, span) }
+            if tn == "Ptr" {
+                guard let elems = explicit, elems.count == 1 else {
+                    diags.error("'Ptr' needs one type argument, e.g. 'Ptr<Int>.\(method)(...)'", at: span)
+                    return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+                }
+                return checkPtrStatic(elems[0], method, args, span)
+            }
         }
         // Leading-dot enum construction: `.case(args)` — enum inferred from context.
         if case .implicitMember(let caseName, _) = callee {
@@ -1643,6 +1992,15 @@ public struct Sema {
                     diags.error("value of type '\(recv.type)' has no method '\(name)'", at: span)
                     return NOIRExpr(type: .error, span: span, kind: .intLit(0))
                 }
+            }
+            // RawPtr instance methods (task 125): free / advanced / store / load / asPtr.
+            if case .rawPtr = recv.type {
+                return checkRawPtrMethod(recv, name, args, span, expected: expected)
+            }
+            // Ptr<T> instance methods (task 125): load / store / advanced / asRaw. T is fixed by the
+            // receiver, so load/store need no annotation (unlike RawPtr).
+            if case .ptr(let elem) = recv.type {
+                return checkPtrMethod(recv, elem, name, args, span)
             }
             // String method builtins. `eq(other)` is byte equality (there is no `==` on String yet).
             if recv.type == .string {
@@ -1751,6 +2109,20 @@ public struct Sema {
 
             if name == "time_monotonic" {
                 return NOIRExpr(type: .int, span: span, kind: .call(callee: irVar("__void_timemonotonic_int", .int, span), args: [], typeArgs:[]))
+            }
+            // addrOf(obj) — the raw address of a heap (reference-type) object as a RawPtr (task 150 rung 2).
+            // A GC-internal seed for the mark-verify tracer: it hands the Nomu tracer a root to walk from.
+            // Valid only on a non-moving heap (rung 2 NoGC); a moving collector would invalidate the alias.
+            if name == "addrOf" {
+                guard args.count == 1 else {
+                    diags.error("addrOf expects one argument (a heap object)", at: span)
+                    return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+                }
+                let a = checkExpr(args[0].value)
+                if a.type != .error, !isReferenceType(a.type) {
+                    diags.error("addrOf expects a heap (reference-type) object, got '\(a.type)'", at: span)
+                }
+                return ptrIntrinsic("__gcObjAddr", .rawPtr, [a], span)
             }
             // Construction of a generic type — infer the type arguments from the fields (M5 5.2.3).
             if genericArity(name) != nil {

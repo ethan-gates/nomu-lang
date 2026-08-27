@@ -1,0 +1,23 @@
+// Task 149 · slice 1 — a runtime-subset function that stays within the rules: it allocates only
+// off-heap (RawPtr, task 125), does pointer arithmetic, and calls only the raw-memory primitives. It
+// triggers no implicit GC allocation and calls nothing outside the allowlist, so
+// `--runtime-subset=carve,advance` compiles clean. `carve` also calls `advance`, another subset
+// function — the closure rule allows subset→subset calls. `main` is ordinary (non-subset) code.
+// Expected output: 42.
+fun advance(p: RawPtr, n: Int) -> RawPtr {
+  return p.advanced(by: n)
+}
+
+fun carve(block: RawPtr, offset: Int) -> RawPtr {
+  return advance(block, offset)          // subset → subset call, allowed
+}
+
+fun main() {
+  let arena = RawPtr.alloc(bytes: 4096, align: 8)
+  let slot = carve(arena, 128)
+  slot.store(42, toByteOffset: 0)
+  let v: Int = slot.load(fromByteOffset: 0)
+  print(v)
+  print("\n")
+  arena.free()
+}

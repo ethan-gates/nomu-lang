@@ -1,0 +1,35 @@
+// Task 125 · slice 2 — Ptr<T> typed pointer. Allocates a typed buffer, writes/reads elements at their
+// natural stride (index-scaled, no manual byte math), walks it with advanced, exercises a byte-stride
+// element (Ptr<UInt8>), and round-trips through the RawPtr <-> Ptr<T> reinterprets.
+// Expected output: 10 / 20 / 30 / 30 / 7.
+fun main() {
+  // Ptr<Int>: 3 elements, 8-byte stride.
+  let p = Ptr<Int>.alloc(count: 3)
+  p.store(10, at: 0)
+  p.store(20, at: 1)
+  p.store(30, at: 2)
+  print(p.load(at: 0))                  // 10
+  print("\n")
+  print(p.load(at: 1))                  // 20
+  print("\n")
+
+  // advanced steps by whole elements: q points at element 2.
+  let q = p.advanced(by: 2)
+  print(q.load(at: 0))                  // 30
+  print("\n")
+
+  // Reinterpret to RawPtr and read element 2 by its byte offset (2 * 8 = 16) — must agree.
+  let r = p.asRaw()
+  let viaRaw: Int = r.load(fromByteOffset: 16)
+  print(viaRaw)                         // 30
+  print("\n")
+  p.free()
+
+  // Ptr<UInt8>: 4 elements, 1-byte stride (packed, unlike an 8-byte array slot).
+  let bytes = Ptr<UInt8>.alloc(count: 4)
+  bytes.store(7.uint8, at: 3)
+  let last: UInt8 = bytes.load(at: 3)
+  print(last.int)                       // 7
+  print("\n")
+  bytes.free()
+}

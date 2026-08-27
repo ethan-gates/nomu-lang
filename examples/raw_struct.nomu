@@ -1,0 +1,45 @@
+// Task 125 · slice 3 — RawPtr composition, shareability, and identity.
+//   - FCA: a value struct holding a RawPtr field stays a plain aggregate (no managed pointer, so no
+//     category-3 relocation problem) — store/load through the field works.
+//   - Shareability: a RawPtr is a value word, so it crosses a task boundary (spawn captures it) and
+//     the spawned task reads the same shared off-heap memory.
+//   - Identity: RawPtr.null / .isNull / .eq.
+// Expected output: 123 / 456 / 123 / 1 / 0 / 1 / 0.
+struct Block {
+  var mem: RawPtr
+  var size: Int
+}
+
+fun readAt(p: RawPtr, off: Int) -> Int {
+  return p.load(fromByteOffset: off)
+}
+
+fun main() {
+  let m = RawPtr.alloc(bytes: 32, align: 8)
+  m.store(123, toByteOffset: 0)
+
+  let blk = Block(mem: m, size: 32)         // RawPtr field in a value struct
+  blk.mem.store(456, toByteOffset: 8)
+  let a: Int = blk.mem.load(fromByteOffset: 0)
+  let c: Int = blk.mem.load(fromByteOffset: 8)
+  print(a)                                  // 123
+  print("\n")
+  print(c)                                  // 456
+  print("\n")
+
+  spawn let s = readAt(m, 0)                // RawPtr crosses the task boundary
+  print(s)                                  // 123
+  print("\n")
+
+  let n = RawPtr.null
+  print(n.isNull)                           // 1
+  print("\n")
+  print(m.isNull)                           // 0
+  print("\n")
+  print(blk.mem.eq(m))                      // 1 — the field aliases the same address
+  print("\n")
+  print(m.eq(n))                            // 0
+  print("\n")
+
+  m.free()
+}

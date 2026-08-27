@@ -1,14 +1,22 @@
 # Unsafe raw memory / raw pointers
 
 **Avenue:** Risk (first prerequisite of the self-hosted runtime) · **Type/Lifecycle:**
-`language-feature · design-drafted` (language + backend + memory model) · **Size:** L ·
-**Status:** design-drafted — build now · **Source:** deferred.md (2026-08-18)
+`language-feature · built` (language + backend + memory model) · **Size:** L ·
+**Status:** built (minimal floor) · **Source:** deferred.md (2026-08-18)
 
 **► Design:** [`internals/unsafe-memory.md`](../../internals/unsafe-memory.md). Surface pinned with
 Ethan: **library types, no new keywords**, named **`RawPtr`** (untyped) and **`Ptr<T>`** (typed). Both
 value types holding one `addrspace(0)` word, so they are never GC roots. GC boundary: off-heap and
 immortal memory admitted; moving-heap interior gated behind 149's no-safepoint rule / pinning (deferred,
-co-designs with 150). Ready to build.
+co-designs with 150).
+
+**► Built (three slices).** RawPtr (alloc/free/load/store/advanced), Ptr<T> (typed access at natural
+stride, asPtr/asRaw), and composition + identity (shareable value types, FCA-safe struct fields,
+null/isNull/eq). Codegen `__raw*`/`__ptr*` intrinsics in `SSAIRToLLVM.swift`; `rt_raw_alloc`/`rt_raw_free`
+in `runtime.c`. Element set is the single-word scalars (`RawScalar`); each builtin enforces a virtual
+Nomu generic signature. Tests: `tools/raw-mem.sh`, `tools/typed-ptr.sh`, `tools/raw-struct.sh` (each
+byte-identical under NoGC and Immix-evacuation). Deferred tails live in `unsafe-memory.md` §7/§9
+(aggregate elements, interior-heap pinning, `unsafe {}` capability). First client: 150 rung 1.
 
 **► Build now — first prerequisite of the self-hosted runtime ([128](128-self-hosting-runtime.md)).**
 The collector and allocator manipulate untyped memory, so this is the raw floor the runtime bet stands

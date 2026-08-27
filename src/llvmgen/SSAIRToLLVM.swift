@@ -606,6 +606,84 @@ final class SSAIRToLLVM {
         case "__array_count_int": return LLVMBuildLoad2(b, e.i64, e.gepByte(val(args[0]), LLVMConstInt(e.i64, 8, 0)), "arr.count")
         case "__arraySet":    return emitArraySet(args, span)
         case "__arrayAppend": return emitArrayAppend(args, span)
+        // Unsafe raw memory (task 125). RawPtr / Ptr<T> are addrspace(0) i8ptr words; load/store/advance
+        // are plain addrspace(0) memory ops (no barrier, never a GC root), alloc/free hit the raw floor.
+        case "__rawAlloc":
+            let (fn, fty) = e.runtimeFn("rt_raw_alloc", ret: e.i8ptr, params: [e.i64, e.i64], varArg: false)
+            return e.buildCall(fn, fty, [val(args[0]), val(args[1])])
+        case "__rawFree":
+            let (fn, fty) = e.runtimeFn("rt_raw_free", ret: e.voidTy, params: [e.i8ptr], varArg: false)
+            return e.buildCall(fn, fty, [val(args[0])])
+        case "__rawAdvanced":
+            return e.gepByte(val(args[0]), val(args[1]))
+        case "__rawStore":
+            LLVMBuildStore(b, val(args[1]), e.gepByte(val(args[0]), val(args[2])))
+            return LLVMConstInt(e.i64, 0, 0)
+        case "__rawLoad":
+            guard let lt = ty(resultType, span) else { return nil }
+            return LLVMBuildLoad2(b, lt, e.gepByte(val(args[0]), val(args[1])), "raw.load")
+        // Ptr<T>: typed element access at the natural stride of T (index-scaled, C-style packed).
+        case "__ptrAlloc":
+            guard case .ptr(let elem) = resultType else { e.fail("125: __ptrAlloc result not Ptr<T>", span); return nil }
+            let strideV = LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0)
+            let bytes = LLVMBuildMul(b, val(args[0]), strideV, "ptr.bytes")!
+            let (fn, fty) = e.runtimeFn("rt_raw_alloc", ret: e.i8ptr, params: [e.i64, e.i64], varArg: false)
+            return e.buildCall(fn, fty, [bytes, strideV])
+        case "__ptrStore":
+            let off = LLVMBuildMul(b, val(args[2]), LLVMConstInt(e.i64, UInt64(e.rawStride(args[1].type)), 0), "ptr.off")!
+            LLVMBuildStore(b, val(args[1]), e.gepByte(val(args[0]), off))
+            return LLVMConstInt(e.i64, 0, 0)
+        case "__ptrLoad":
+            guard let lt = ty(resultType, span) else { return nil }
+            let off = LLVMBuildMul(b, val(args[1]), LLVMConstInt(e.i64, UInt64(e.rawStride(resultType)), 0), "ptr.off")!
+            return LLVMBuildLoad2(b, lt, e.gepByte(val(args[0]), off), "ptr.load")
+        case "__ptrAdvanced":
+            guard case .ptr(let elem) = resultType else { e.fail("125: __ptrAdvanced result not Ptr<T>", span); return nil }
+            let off = LLVMBuildMul(b, val(args[1]), LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "ptr.adv")!
+            return e.gepByte(val(args[0]), off)
+        case "__ptrAsRaw", "__rawAsPtr":
+            return val(args[0])   // no-op reinterpret — both are one addrspace(0) word
+        case "__ptrNull":
+            return LLVMConstPointerNull(e.i8ptr)
+        case "__ptrIsNull":
+            return LLVMBuildICmp(b, LLVMIntEQ, val(args[0]), LLVMConstPointerNull(e.i8ptr), "ptr.isnull")
+        case "__ptrEq":
+            return LLVMBuildICmp(b, LLVMIntEQ, val(args[0]), val(args[1]), "ptr.eq")
+        // GC type-table reads (task 150 rung 2): reach the codegen-emitted per-type-id side tables from
+        // Nomu through the existing runtime accessors (`c-types.md` §1/§3.2). Pure gc-leaf reads — the
+        // Nomu tracer describes an object's layout through the same tables the MMTk binding reads.
+        case "__gcObjAddr":
+            // A managed object (addrspace(1) p1) → its raw address as a RawPtr (addrspace(0)). ptrtoint
+            // then inttoptr — the same bit-preserving step the alloc path uses in reverse. Sound only on
+            // the non-moving rung-2 heap; a moving collector would relocate the object out from under it.
+            let a = LLVMBuildPtrToInt(b, val(args[0]), e.i64, "obj.addr")!
+            return LLVMBuildIntToPtr(b, a, e.i8ptr, "obj.raw")
+        case "__gcTypeCount":
+            let g = LLVMGetNamedGlobal(e.mod, "nomu_gc_typemap_count") ?? LLVMAddGlobal(e.mod, e.i64, "nomu_gc_typemap_count")
+            return LLVMBuildLoad2(b, e.i64, g, "gc.tcount")
+        case "__gcTypeSize":
+            let (fn, fty) = e.runtimeFn("nomu_gc_typesize", ret: e.i64, params: [e.i64], varArg: false)
+            return e.buildCall(fn, fty, [val(args[0])])
+        case "__gcTypeStride":
+            let (fn, fty) = e.runtimeFn("nomu_gc_typestride", ret: e.i64, params: [e.i64], varArg: false)
+            return e.buildCall(fn, fty, [val(args[0])])
+        case "__gcTypeKind":
+            let (fn, fty) = e.runtimeFn("nomu_gc_typekind", ret: e.i32, params: [e.i64], varArg: false)
+            let k = e.buildCall(fn, fty, [val(args[0])])!
+            return LLVMBuildZExt(b, k, e.i64, "gc.kind")
+        case "__gcTypeNumPtrs":
+            let (fn, fty) = e.runtimeFn("nomu_gc_typemap", ret: e.i8ptr, params: [e.i64, e.i8ptr], varArg: false)
+            let cslot = e.entryAlloca(e.i32, "gc.nptr")
+            _ = e.buildCall(fn, fty, [val(args[0]), cslot])
+            let c = LLVMBuildLoad2(b, e.i32, cslot, "gc.nptr.v")!
+            return LLVMBuildZExt(b, c, e.i64, "gc.nptr.z")
+        case "__gcTypePtrOffset":
+            let (fn, fty) = e.runtimeFn("nomu_gc_typemap", ret: e.i8ptr, params: [e.i64, e.i8ptr], varArg: false)
+            let cslot = e.entryAlloca(e.i32, "gc.off.c")
+            let base = e.buildCall(fn, fty, [val(args[0]), cslot])!
+            let off = LLVMBuildMul(b, val(args[1]), LLVMConstInt(e.i64, 4, 0), "gc.off.byte")!
+            let elt = LLVMBuildLoad2(b, e.i32, e.gepByte(base, off), "gc.off.v")!
+            return LLVMBuildZExt(b, elt, e.i64, "gc.off.z")
         case "__int_double_double": return LLVMBuildSIToFP(b, val(args[0]), e.f64, "i2d")
         case "__double_int_int":
             let (fn, fty) = e.runtimeFn("llvm.round.f64", ret: e.f64, params: [e.f64], varArg: false)

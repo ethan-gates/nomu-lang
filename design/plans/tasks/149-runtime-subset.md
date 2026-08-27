@@ -1,8 +1,17 @@
 # Runtime-subset mechanism (the pragmas that let runtime code avoid its own services)
 
-**Avenue:** Risk (self-hosting prerequisite) · **Type/Lifecycle:** `language-feature · design-drafted`
-(language + compiler checking) · **Size:** M · **Status:** design-drafted — build now · **Source:**
-distilled from [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
+**Avenue:** Risk (self-hosting prerequisite) · **Type/Lifecycle:** `language-feature · in-progress`
+(language + compiler checking) · **Size:** M · **Status:** slice 1 built — designation + call-graph
+closure check · **Source:** distilled from [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
+
+**► Built (slice 1).** Two designation sources — the **runtime prelude** (`src/stdlib/runtime.nomu`,
+subset-by-default; the proper "designated file" until [100](100-modules.md)) and an ad-hoc
+`--runtime-subset=<names>` flag — feeding the NOIR call-graph closure check in `Sema.swift`
+(`checkRuntimeSubset`): a subset function may not allocate on the heap (class/actor construct, closure,
+`any`-box, array, `spawn`) or call outside the allowlist (subset functions + the 125 `__raw*`/`__ptr*`
+primitives + pure leaves). Test: `tools/subset.sh`. **Remaining slices:** codegen-site guards
+(write-barrier / safepoint-poll suppression), the `nosplit fun` keyword (staged behind
+[104](104-fiber-stack-strategy.md)), module-membership designation with [100](100-modules.md).
 
 **► Design:** [`internals/runtime-subset.md`](../../internals/runtime-subset.md). Surface pinned with
 Ethan: **surface A — module-default subset + a narrow per-function keyword refinement** (`nosplit fun`);

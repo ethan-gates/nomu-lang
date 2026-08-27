@@ -1,0 +1,19 @@
+// Task 150 · rung 1 slice B (foundation) — the bump allocator now lives in the runtime prelude
+// (runtime.nomu), compiled into every program and runtime-subset by default. This user program calls it
+// with no --runtime-subset flag: the prelude functions are designated automatically.
+// Expected output: 7 / 11 / 1.
+fun main() {
+  let arena = rtArenaNew(4096)
+  let a = rtBumpAlloc(arena, 16)
+  let b = rtBumpAlloc(arena, 16)
+  a.store(7, toByteOffset: 8)
+  b.store(11, toByteOffset: 8)
+  let av: Int = a.load(fromByteOffset: 8)
+  let bv: Int = b.load(fromByteOffset: 8)
+  print(av)
+  print("\n")
+  print(bv)
+  print("\n")
+  print(a.advanced(by: 16).eq(b))
+  print("\n")
+}

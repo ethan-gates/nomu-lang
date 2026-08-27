@@ -32,6 +32,11 @@ public struct Shareability {
         switch t {
         case .int, .uint8, .double, .bool, .string, .named(_, .actor_):
             return true
+        case .rawPtr, .ptr:
+            // A raw pointer is one unmanaged addrspace(0) word — shareable like an Int, regardless of
+            // `T` (the address is copied, the pointee is not). Safety of the pointee is the unsafe
+            // surface's contract, not the share rule's (task 125).
+            return true
         case .named(let name, _):
             return named(name, args: [], visiting: visiting)
         case .generic(let base, let args):

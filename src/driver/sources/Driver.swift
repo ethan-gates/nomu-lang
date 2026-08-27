@@ -75,7 +75,8 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     // Prepend the Nomu standard library, compiled with every program (M4.13). Under
     // the single compilation unit this is a decl concatenation; prelude symbols are
     // then callable from user code with no import. (Times the prelude's own lex+parse.)
-    program = timings.measure("noir", "prelude") { prependPrelude(program) }
+    let runtimeSubsetNames: Set<String>
+    (program, runtimeSubsetNames) = timings.measure("noir", "prelude") { prependPrelude(program) }
 
     // Fold plain extensions into their target types before any checking (M4.12);
     // downstream passes then see one type with all its methods.
@@ -100,7 +101,7 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     }
 
     let semaResult = timings.measure("noir", "sema") { () -> SemaResult in
-        var sema = Sema(program)
+        var sema = Sema(program, subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames))
         let result = sema.check()
         // T4: exhaustiveness as an IR pass over the typed module, into the same sink.
         checkExhaustiveness(result.module, into: result.diagnostics)
@@ -190,18 +191,31 @@ private func outputDirectory(for input: URL, root: URL) -> String {
     return rel.isEmpty ? build : build + "/" + rel
 }
 
-// Lex + parse the embedded prelude and prepend its decls to the program (M4.13). The
-// prelude is trusted source, so a diagnostic here is a compiler bug, not user error.
-private func prependPrelude(_ program: Program) -> Program {
-    let preludeDiags = DiagnosticSink()
-    var lexer = Lexer(EmbeddedSources.preludeSource, file: EmbeddedSources.preludeName, diagnostics: preludeDiags)
-    var parser = Parser(lexer.tokenize(), diagnostics: preludeDiags)
-    let prelude = parser.parse()
-    if preludeDiags.hasErrors {
-        fputs("internal error: failed to parse the embedded prelude\n" + preludeDiags.render() + "\n", stderr)
-        exit(1)
+// Lex + parse the embedded preludes and prepend their decls to the program (M4.13). Two preludes,
+// both trusted source (a diagnostic here is a compiler bug): the **core** prelude (`core.nomu` — Option,
+// Result, numeric helpers) and the **runtime** prelude (`runtime.nomu` — the self-hosted runtime tier,
+// task 150). Every function in the runtime prelude is runtime-subset by default (task 149) — its names
+// are returned so the subset checker treats them as designated, the interim "designated file" until the
+// module system (task 100) lands.
+private func prependPrelude(_ program: Program) -> (Program, Set<String>) {
+    func parseEmbedded(_ source: String, _ name: String) -> Program {
+        let diags = DiagnosticSink()
+        var lexer = Lexer(source, file: name, diagnostics: diags)
+        var parser = Parser(lexer.tokenize(), diagnostics: diags)
+        let parsed = parser.parse()
+        if diags.hasErrors {
+            fputs("internal error: failed to parse the embedded prelude '\(name)'\n" + diags.render() + "\n", stderr)
+            exit(1)
+        }
+        return parsed
     }
-    return Program(decls: prelude.decls + program.decls)
+    let core = parseEmbedded(EmbeddedSources.preludeSource, EmbeddedSources.preludeName)
+    let runtime = parseEmbedded(EmbeddedSources.runtimePreludeSource, EmbeddedSources.runtimePreludeName)
+    let runtimeSubset = Set(runtime.decls.compactMap { decl -> String? in
+        if case .funcDecl(let f) = decl { return f.name }
+        return nil
+    })
+    return (Program(decls: core.decls + runtime.decls + program.decls), runtimeSubset)
 }
 
 // LLVM backend binary stage (8.1.4): emit a host object via the LLVM C API, build the runtime

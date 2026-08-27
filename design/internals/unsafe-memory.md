@@ -1,13 +1,15 @@
 # Unsafe Raw Memory
 
-**Status:** design draft (task 125). The unsafe layer the self-hosted runtime is written in — raw
-pointers, untyped off-heap memory, raw load/store, and pointer arithmetic, below the safe type system.
-Status tags: **Decided**, **Leaning**, **Deferred**, **Open**.
+**Status:** built (task 125). The unsafe layer the self-hosted runtime is written in — raw pointers,
+untyped off-heap memory, raw load/store, and pointer arithmetic, below the safe type system. Status
+tags: **Decided**, **Leaning**, **Deferred**, **Open**. The surface built in three slices (RawPtr /
+Ptr<T> / composition + identity); the method spellings in §4 are now **pinned** (built), the codegen
+lives in `SSAIRToLLVM.swift` (`__raw*` / `__ptr*` intrinsics) + `runtime.c` (`rt_raw_alloc`/`rt_raw_free`),
+and the surface is validated by `tools/raw-mem.sh`, `tools/typed-ptr.sh`, `tools/raw-struct.sh`.
 
 **API scope.** Two type names are agreed: **`RawPtr`** and **`Ptr<T>`**. The surface is **library types
 with no new keywords** — the unsafe-ness rides the type name and its module; grammar is unchanged
-(Decided with Ethan). The method spellings in §4 are **Leaning** (illustrative) until pinned against the
-allocator's first real use.
+(Decided with Ethan). The §4 method spellings are pinned as built.
 
 **Frame.** The consumer is the self-hosted runtime ([128](../plans/tasks/128-self-hosting-runtime.md)):
 the allocator and collector ([150](../plans/tasks/150-selfhosted-gc-ladder.md)) manipulate untyped
@@ -75,26 +77,41 @@ gates the third.
 Unsafe raw pointers are unmanaged memory the collector does not touch; the boundary holds because the
 runtime's own memory is off-heap.
 
-## 4. Operations (Leaning — spellings illustrative)
+## 4. Operations (built — spellings pinned)
 
 Operations are methods and static (type) functions on the two types. Byte offsets apply at the raw
-level, element indices at the typed level.
+level, element indices at the typed level. Argument labels are **required** (the surface spells offsets
+and counts explicitly). Each builtin presents a **virtual signature** the type-checker enforces exactly
+as if it were a Nomu generic, though no Nomu body exists (labels, `Int` arguments, and the element-type
+constraint are all checked). The supported element set is the single-word scalars a plain `addrspace(0)`
+load/store moves: `RawScalar` = `Int`, `UInt8`, `Double`, `Bool`, `RawPtr`, `Ptr<T>` (aggregates are out
+of the minimal floor).
 
 **`RawPtr`**
 - `RawPtr.alloc(bytes: Int, align: Int) -> RawPtr` — raw off-heap block (case 1). Static.
-- `p.free()` — release it.
-- `p.load(fromByteOffset: Int) -> T` / `p.store(_ v: T, toByteOffset: Int)` — access at a byte offset,
-  reinterpreting the bytes as `T`.
+- `RawPtr.null -> RawPtr` — a null address. Static property.
+- `p.free() -> Void` — release it.
+- `p.load<T: RawScalar>(fromByteOffset: Int) -> T` — `T` inferred from context (a checking-position
+  expression; a bare `let x = p.load(…)` errors asking for an annotation).
+- `p.store<T: RawScalar>(_ value: T, toByteOffset: Int) -> Void`.
 - `p.advanced(by: Int) -> RawPtr` — byte arithmetic (GEP over `i8`).
-- `p.asPtr() -> Ptr<T>` — reinterpret to a typed pointer.
+- `p.asPtr<T>() -> Ptr<T>` — reinterpret to a typed pointer (`T` from context).
+- `p.isNull -> Bool` (property) · `p.eq(_ other: RawPtr) -> Bool` — pointer identity.
 
 **`Ptr<T>`**
 - `Ptr<T>.alloc(count: Int) -> Ptr<T>` — `count` elements of `T`. Static.
-- `p.load(at: Int = 0) -> T` / `p.store(_ v: T, at: Int = 0)` — element access at stride `sizeof(T)`.
-- `p.advanced(by: Int) -> Ptr<T>` — element arithmetic (GEP over `T`; `by * stride` bytes).
+- `Ptr<T>.null -> Ptr<T>` — a typed null. Static property.
+- `p.free() -> Void` — release it (added for symmetry with `alloc`; routes to `rt_raw_free`).
+- `p.load(at: Int) -> T` / `p.store(_ value: T, at: Int) -> Void` — element access; `T` is fixed by the
+  receiver, so no annotation is needed (unlike `RawPtr`).
+- `p.advanced(by: Int) -> Ptr<T>` — element arithmetic (`by * stride` bytes).
 - `p.asRaw() -> RawPtr` — reinterpret to untyped.
+- `p.isNull -> Bool` · `p.eq(_ other: Ptr<T>) -> Bool`.
 
-A `RawPtr.null` value and pointer equality are **Leaning** (the allocator's sentinel checks want them).
+**Element stride.** `Ptr<T>` uses the **natural** byte size of `T` (`UInt8`/`Bool` → 1, `Int`/`Double`/
+pointer → 8), so typed raw memory is packed C-style — distinct from `Array`'s 8-byte enum-slot stride
+(`c-types.md` §3.2). A `Ptr<Int>` element `i` and a `RawPtr` byte offset `i*8` address the same location
+(cross-checked in `tools/typed-ptr.sh`).
 
 ## 5. Compiler wiring
 
@@ -150,9 +167,14 @@ This is the conservative-but-correct baseline; tightening it is future work (§7
 
 ## 9. Open questions
 
-- **Method spellings** — the §4 names (`fromByteOffset:` / `at:` / `advanced(by:)`) are Leaning; pin
-  against the allocator's first real use.
-- **Null / equality surface** — `RawPtr.null`, pointer `==`.
+- **Method spellings** — pinned as built (§4). Labels required; equality is a method (`eq`) + property
+  (`isNull`) rather than an `==` operator (operator overloading is a separate track). Revisit `==` if/when
+  operators land.
+- **`Ptr<T>.load(at:)` default** — the design sketched `at: Int = 0`; the build requires `at:` explicitly
+  (consistent with `RawPtr`, and no default-argument machinery on builtins yet). Add a default later if
+  ergonomics want it.
+- **Aggregate element types** — the element set is the single-word scalars (`RawScalar`); an aggregate
+  `T` (a struct read/written whole) needs a memcpy-style path, deferred.
 - **Interior-heap pinning** — the pin's shape (a scoped API vs. reliance on 149's no-safepoint regions),
   settled with 150.
 - **Raw-access aliasing** — whether untyped `RawPtr` stays may-alias-anything or gains a typed-memory

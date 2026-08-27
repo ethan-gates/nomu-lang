@@ -1,0 +1,38 @@
+// Task 150 rung 2 (mark-verify), increment 4: array coverage — exercise the tracer's variable-size path.
+// Seeding from an Array<Box> handle, the tracer must follow the handle's bufptr to the buffer (a kind=1
+// array object), scan each of the buffer's element slots via the per-element pointer map, and mark every
+// live Box. Live set from the handle: 1 handle + 1 buffer + 3 Boxes = 5 objects. If the tracer skipped the
+// kind=1 buffer path, only {handle, buffer} would be marked (total 2) — so TOTAL 5 tests buffer scanning.
+class Box {
+  var v: Int
+}
+
+fun main() {
+  var xs: Array<Box> = []
+  xs.append(Box(v: 10))
+  xs.append(Box(v: 20))
+  xs.append(Box(v: 30))
+
+  let tcount = RawPtr.gcTypeCount()
+  let counts = RawPtr.alloc(bytes: tcount * 8, align: 8)
+  let fp = RawPtr.alloc(bytes: 8, align: 8)
+  let total = rtMarkVerify(addrOf(xs), counts, fp)
+
+  print("TOTAL ")
+  print(total)
+  print("\n")
+  var t = 0
+  while t < tcount {
+    let c: Int = counts.load(fromByteOffset: t * 8)
+    print("LIVE ")
+    print(t)
+    print(" ")
+    print(c)
+    print("\n")
+    t = t + 1
+  }
+  let fpv: Int = fp.load(fromByteOffset: 0)
+  print("FP ")
+  print(fpv)
+  print("\n")
+}

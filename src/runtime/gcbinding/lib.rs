@@ -67,6 +67,14 @@ static MUTATORS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 #[unsafe(no_mangle)]
 pub static __nomu_barrier_active: AtomicU8 = AtomicU8::new(0);
 
+// Nonzero iff allocation is routed at the self-hosted Nomu allocator (`NOMU_GC_PLAN=nomu`, task 150 rung 1
+// slice B) instead of MMTk. The codegen alloc seam loads this flag: when set, it disables its MMTk-TLAB
+// fast path and routes the slow path at the Nomu allocator (`ptrtoint`→`inttoptr` to `p1`). Under this
+// plan MMTk is initialized NoGC and left idle (the diff oracle). `u8` for a trivial C-ABI load, same as
+// `__nomu_barrier_active`.
+#[unsafe(no_mangle)]
+pub static __nomu_selfhosted_alloc: AtomicU8 = AtomicU8::new(0);
+
 // The generational unlog-bit side-metadata layout, exported for the codegen-inlined barrier fast path
 // so it computes the bit address without hardcoding MMTk's constants (they update here if MMTk's layout
 // changes). For object `o` (log_num_of_bits = 0, i.e. 1 bit/region):
@@ -515,6 +523,12 @@ pub extern "C" fn nomu_gc_init(heap_bytes: usize) {
     let plan = match std::env::var("NOMU_GC_PLAN").as_deref() {
         Ok("nogc") => PlanSelector::NoGC,
         Ok("immix") => PlanSelector::Immix,
+        // `nomu` (task 150): allocation is self-hosted; MMTk is initialized NoGC and left idle as the
+        // diff oracle. The seam reads `__nomu_selfhosted_alloc` to route allocation at the Nomu allocator.
+        Ok("nomu") => {
+            __nomu_selfhosted_alloc.store(1, Ordering::Relaxed);
+            PlanSelector::NoGC
+        }
         _ => PlanSelector::GenImmix,
     };
     let nogc = matches!(plan, PlanSelector::NoGC);

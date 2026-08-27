@@ -199,12 +199,17 @@ extension LLVMGen {
         let gMax = LLVMAddGlobal(mod, i64, "__nomu_max_non_los")!
         let gMut = LLVMAddGlobal(mod, i8ptr, "rt_mutator")!
         LLVMSetThreadLocal(gMut, 1)
+        // task 150 — under `NOMU_GC_PLAN=nomu` this extern flag (set at init) routes allocation at the
+        // self-hosted Nomu allocator: the MMTk-TLAB fast path is disabled and the slow path branches to it.
+        let gSelf = LLVMAddGlobal(mod, i8, "__nomu_selfhosted_alloc")!
         let memset = runtimeFn("memset", ret: i8ptr, params: [i8ptr, i32, i64], varArg: false)
         withStubBody(fn) {
             let size = LLVMGetParam(fn, 0)!
             let fastBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.fast")!
             let bumpBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.bump")!
             let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.slow")!
+            let selfBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.self")!
+            let mmtkBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.mmtk")!
             let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.done")!
             let off = LLVMBuildLoad2(b, i64, gOff, "bump.off")!
             let offOk = LLVMBuildICmp(b, LLVMIntNE, off, LLVMConstInt(i64, .max, 0), "off.ok")!
@@ -212,7 +217,10 @@ extension LLVMGen {
             let mutOk = LLVMBuildICmp(b, LLVMIntNE, mut, LLVMConstPointerNull(i8ptr), "mut.ok")!
             let maxlos = LLVMBuildLoad2(b, i64, gMax, "maxlos")!
             let sizeOk = LLVMBuildICmp(b, LLVMIntULE, size, maxlos, "size.ok")!
-            let canFast = LLVMBuildAnd(b, LLVMBuildAnd(b, offOk, mutOk, "g1"), sizeOk, "canfast")!
+            let selfOn = LLVMBuildLoad2(b, i8, gSelf, "selfhost")!
+            let selfOff = LLVMBuildICmp(b, LLVMIntEQ, selfOn, LLVMConstInt(i8, 0, 0), "self.off")!
+            let g12 = LLVMBuildAnd(b, LLVMBuildAnd(b, offOk, mutOk, "g1"), sizeOk, "g12")!
+            let canFast = LLVMBuildAnd(b, g12, selfOff, "canfast")!   // self-hosted plan never fast-paths
             LLVMBuildCondBr(b, canFast, fastBB, slowBB)
             LLVMPositionBuilderAtEnd(b, fastBB)
             let cursorPtr = gepByte(mut, off)
@@ -229,21 +237,80 @@ extension LLVMGen {
             _ = buildCall(memset.0, memset.1, [toUnmanaged(obj), LLVMConstInt(i32, 0, 0), size])
             LLVMBuildBr(b, doneBB)
             LLVMPositionBuilderAtEnd(b, slowBB)
-            let slowP = buildCall(rtAlloc(), rtAllocTy(), [size])!
+            LLVMBuildCondBr(b, selfOff, mmtkBB, selfBB)   // flag off → MMTk; on → self-hosted
+            LLVMPositionBuilderAtEnd(b, selfBB)
+            let selfP = buildCall(nomuSelfhostAlloc().0, nomuSelfhostAlloc().1, [size])!
+            LLVMBuildBr(b, doneBB)
+            LLVMPositionBuilderAtEnd(b, mmtkBB)
+            let mmtkP = buildCall(rtAlloc(), rtAllocTy(), [size])!
             LLVMBuildBr(b, doneBB)
             LLVMPositionBuilderAtEnd(b, doneBB)
             let phi = LLVMBuildPhi(b, p1, "obj")!
-            var vals: [LLVMValueRef?] = [obj, slowP]
-            var blks: [LLVMBasicBlockRef?] = [bumpBB, slowBB]
+            var vals: [LLVMValueRef?] = [obj, selfP, mmtkP]
+            var blks: [LLVMBasicBlockRef?] = [bumpBB, selfBB, mmtkBB]
             vals.withUnsafeMutableBufferPointer { vp in
                 blks.withUnsafeMutableBufferPointer { bp in
-                    LLVMAddIncoming(phi, vp.baseAddress, bp.baseAddress, 2)
+                    LLVMAddIncoming(phi, vp.baseAddress, bp.baseAddress, 3)
                 }
             }
             LLVMBuildRet(b, phi)
         }
         gcAllocFn = (fn, ty)
         return gcAllocFn!
+    }
+
+    // The self-hosted allocation slow path (task 150 rung 1 slice B): route allocation at the Nomu bump
+    // allocator in the runtime prelude (`rtArenaNew` / `rtBumpAlloc`). On first call it creates one arena
+    // and caches it in `__nomu_selfhost_arena`; each call bumps a chunk and produces the managed object via
+    // `ptrtoint`→`inttoptr` to `p1` — the same integer→`p1` step the fast path uses, which
+    // `RewriteStatepointsForGC` accepts as a fresh GC base (no `addrspacecast`, no intrinsic). The bump
+    // memory is fresh-zeroed by `rt_raw_alloc` and never reused under NoGC, so the object is
+    // zero-initialized with no memset. The allocator holds no `p1`; the seam produces it here.
+    func nomuSelfhostAlloc() -> (LLVMValueRef, LLVMTypeRef) {
+        if let s = selfhostAllocFn { return s }
+        let ty = fnType(p1, [i64])
+        let fn = LLVMAddFunction(mod, "__nomu_selfhost_alloc", ty)!
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        LLVMSetGC(fn, "statepoint-example")
+        let gArena = LLVMAddGlobal(mod, i8ptr, "__nomu_selfhost_arena")!
+        LLVMSetInitializer(gArena, LLVMConstPointerNull(i8ptr))
+        LLVMSetLinkage(gArena, LLVMInternalLinkage)
+        // The runtime prelude is always compiled in, so its allocator functions are declared. Guard
+        // defensively: a missing prelude falls back to a null return rather than a codegen crash.
+        guard let arenaNew = callables["f:rtArenaNew"], let bump = callables["f:rtBumpAlloc"] else {
+            withStubBody(fn) { LLVMBuildRet(b, LLVMConstPointerNull(p1)) }
+            selfhostAllocFn = (fn, ty)
+            return selfhostAllocFn!
+        }
+        let arenaSize = LLVMConstInt(i64, UInt64(256 * 1024 * 1024), 0)   // 256 MiB single arena (no refill yet)
+        withStubBody(fn) {
+            let size = LLVMGetParam(fn, 0)!
+            let entryBB = LLVMGetInsertBlock(b)!
+            let mkBB = LLVMAppendBasicBlockInContext(ctx, fn, "arena.mk")!
+            let useBB = LLVMAppendBasicBlockInContext(ctx, fn, "arena.use")!
+            let arena0 = LLVMBuildLoad2(b, i8ptr, gArena, "arena")!
+            let isNull = LLVMBuildICmp(b, LLVMIntEQ, arena0, LLVMConstPointerNull(i8ptr), "arena.null")!
+            LLVMBuildCondBr(b, isNull, mkBB, useBB)
+            LLVMPositionBuilderAtEnd(b, mkBB)
+            let made = buildCall(arenaNew.fn, arenaNew.ty, [arenaSize])!
+            LLVMBuildStore(b, made, gArena)
+            LLVMBuildBr(b, useBB)
+            LLVMPositionBuilderAtEnd(b, useBB)
+            let arena = LLVMBuildPhi(b, i8ptr, "arena.p")!
+            var avals: [LLVMValueRef?] = [arena0, made]
+            var ablks: [LLVMBasicBlockRef?] = [entryBB, mkBB]
+            avals.withUnsafeMutableBufferPointer { vp in
+                ablks.withUnsafeMutableBufferPointer { bp in
+                    LLVMAddIncoming(arena, vp.baseAddress, bp.baseAddress, 2)
+                }
+            }
+            let raw = buildCall(bump.fn, bump.ty, [arena, size])!
+            let addr = LLVMBuildPtrToInt(b, raw, i64, "raw.i")!
+            let obj = LLVMBuildIntToPtr(b, addr, p1, "obj")!
+            LLVMBuildRet(b, obj)
+        }
+        selfhostAllocFn = (fn, ty)
+        return selfhostAllocFn!
     }
 
     // The `__nomu_write_barrier` seam: a post-store object-remembering barrier with an inlined fast

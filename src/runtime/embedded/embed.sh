@@ -5,7 +5,7 @@
 # (##"""…"""##) mean the file contents pass through verbatim — no escaping.
 set -euo pipefail
 
-out="$1"; rt_h="$2"; rt_c="$3"; core_c="$4"; prelude="$5"
+out="$1"; rt_h="$2"; rt_c="$3"; core_c="$4"; prelude="$5"; rt_prelude="$6"
 
 emit() {  # $1 = Swift constant name, $2 = source file
     printf '    public static let %s = ##"""\n' "$1"
@@ -22,5 +22,7 @@ emit() {  # $1 = Swift constant name, $2 = source file
     emit coreC "$core_c"
     echo '    public static let preludeName = "core.nomu"'
     emit preludeSource "$prelude"
+    echo '    public static let runtimePreludeName = "runtime.nomu"'
+    emit runtimePreludeSource "$rt_prelude"
     echo '}'
 } > "$out"

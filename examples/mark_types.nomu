@@ -1,0 +1,54 @@
+// Task 150 rung 2 (mark-verify), increment 1: prove the Nomu tracer can read the codegen-emitted
+// per-type-id side tables (c-types.md §1/§3.2) — object size + managed-pointer map — from Nomu, through
+// the RawPtr.gcType* accessors (which reach the same tables the MMTk binding reads, no new runtime C).
+// The differential (tools/mark-types.sh) diffs this Nomu dump against the C NOMU_GC_TYPEMAPS dump.
+//
+// Layouts: Leaf { header, v } → 16 bytes, no managed fields. Node { header, left, right, n } → 32 bytes,
+// managed pointers at offsets 8 and 16 (left, right). Constructing both registers their type-ids.
+class Leaf {
+  var v: Int
+}
+class Node {
+  var left: Leaf
+  var right: Leaf
+  var n: Int
+}
+
+// Dump every registered type-id's (size, managed-offset map), one line each, read entirely from Nomu.
+fun dumpTypes() {
+  let count = RawPtr.gcTypeCount()
+  var id = 0
+  while id < count {
+    let size = RawPtr.gcTypeSize(id)
+    let nptr = RawPtr.gcTypeNumPtrs(id)
+    print("TYPE ")
+    print(id)
+    print(" ")
+    print(size)
+    print(" ")
+    print(nptr)
+    var i = 0
+    while i < nptr {
+      let off = RawPtr.gcTypePtrOffset(id, i)
+      print(" ")
+      print(off)
+      i = i + 1
+    }
+    print("\n")
+    id = id + 1
+  }
+}
+
+// Returning the Node escapes it out of this frame, so it is heap-allocated (a stack-promoted object
+// carries no type-id). That registers Node's type-id with its managed-pointer map at offsets 8 and 16.
+fun makeNode(a: Leaf) -> Node {
+  return Node(left: a, right: a, n: 2)
+}
+
+fun main() {
+  let a = Leaf(v: 1)
+  let root = makeNode(a)
+  print(root.n)     // keep the graph live
+  print("\n")
+  dumpTypes()
+}

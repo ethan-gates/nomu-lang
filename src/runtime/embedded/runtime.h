@@ -35,6 +35,8 @@ typedef struct { Fiber* fiber; } SpawnHandle;
 void* rt_alloc(size_t size);
 void* rt_alloc_immortal(size_t size);   // M6 · 6.2.4 — non-moving String buffers (immortal interim)
 void  rt_free(void* p);
+void* rt_raw_alloc(int64_t bytes, int64_t align);   // task 125 — unmanaged off-heap memory (RawPtr/Ptr<T>)
+void  rt_raw_free(void* p);                          // task 125 — free rt_raw_alloc memory
 void  rt_bounds_trap(int64_t idx, int64_t len);   // M6 stdlib — array subscript out-of-range trap
 void  rt_gc_write_barrier(void* obj, void* slot, void* val);   // M6 · 6.3.1 — generational write barrier
 

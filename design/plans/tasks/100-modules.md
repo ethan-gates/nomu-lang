@@ -49,6 +49,16 @@ compile-time / runtime-perf tradeoff.
 The [`shared` spellings](132-shared-spellings.md) (hidden bodies across a module boundary) and
 "Module-level interface as input" both fire when modules land.
 
+**Runtime-subset designation ([149](149-runtime-subset.md)) should move onto module membership.** Surface
+A for the runtime subset is "the runtime tier is subset-by-default" — a module-level property. Until this
+task lands there is no module boundary to hang it on, so 149 uses an **interim file designation** (a
+compiler input marking specific source files subset; functions in them get the no-alloc / no-barrier /
+no-safepoint properties). When modules exist, replace the file designation with module membership: a
+designated runtime/privileged module makes its functions subset by default. The internal per-function
+property set (`runtime-subset.md` §3) stays unchanged — only the *source* that populates it moves from
+file to module, so this is a designation swap, not a rework. See `runtime-subset.md` §8 (open: module
+designation mechanism).
+
 ## Roadmap assessment
 
 **Yes — a named milestone**, with [incremental compilation](136-incremental-compilation.md) and the

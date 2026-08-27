@@ -1,0 +1,23 @@
+// Task 150 rung 1 slice B — real managed objects allocated by the self-hosted Nomu allocator.
+// Class instances (heap-allocated GC objects) built + read back; under NOMU_GC_PLAN=nomu the allocation
+// routes through the Nomu bump allocator instead of MMTk. Expected: 42 / 7 / 100.
+class Box {
+  var v: Int
+}
+fun main() {
+  let a = Box(v: 42)
+  let b = Box(v: 7)
+  var sum = 0
+  var i = 0
+  while i < 100 {
+    let t = Box(v: 1)
+    sum = sum + t.v
+    i = i + 1
+  }
+  print(a.v)
+  print("\n")
+  print(b.v)
+  print("\n")
+  print(sum)
+  print("\n")
+}

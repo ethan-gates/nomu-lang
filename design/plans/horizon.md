@@ -18,6 +18,11 @@ constant while moving location, then hold location constant while changing the a
 
 ## Now — the self-hosting foundation
 
+**Status:** 125 **built** (`RawPtr`/`Ptr<T>`), 149 **slice 1 built** (runtime-prelude "designated file" +
+call-graph closure check; remaining: codegen barrier/poll guards, `nosplit`, module designation), 150
+**rung 1 complete** (self-hosted allocator is a selectable plan, `NOMU_GC_PLAN=nomu`, byte-identical to
+MMTk NoGC). **Next: 150 rung 2 (mark-verify).** Tests: `tools/{raw-mem,typed-ptr,raw-struct,subset,bump-alloc,rt-prelude,selfhost-gc}.sh`.
+
 - [125 Unsafe raw memory](tasks/125-unsafe-raw-memory.md) — the raw-pointer / untyped-memory surface the
   collector and allocator manipulate. The first hard prerequisite. (Its earlier "byte buffer for
   String/Array" scope was a mis-bundling; the stdlib buffer machinery already exists in codegen. The real
@@ -33,10 +38,11 @@ constant while moving location, then hold location constant while changing the a
 diffed against the matching MMTk plan as a correctness oracle (the NoGC→GenImmix ramp that worked for the
 MMTk integration, one level down):
 
-1. **NoGC** — bump allocator + all plumbing (unsafe memory, bootstrap, stack-map emission). Everything
-   but collection.
-2. **Mark-verify** — trace from roots, mark, compare the live set to MMTk's. Proves root scanning +
-   tracing with no reclamation or movement. A checkpoint; the heap only grows.
+1. **NoGC** — **complete.** Bump allocator + all plumbing, in Nomu; a selectable plan (`NOMU_GC_PLAN=nomu`)
+   handing out managed objects via `ptrtoint`→`inttoptr`, byte-identical to MMTk NoGC.
+2. **Mark-verify** — **next.** Trace from roots, mark, and diff a live-set fingerprint against MMTk across
+   separate runs (clean-separation method, `selfhosted-gc.md` §1/§6). Proves root scanning + tracing with
+   no reclamation or movement. A checkpoint; the heap only grows.
 3. **Immix (non-generational)** — first real collector: line/block reclamation + evacuation (movement +
    pointer fixup) + region management. Diff vs MMTk Immix.
 4. **GenImmix** — add the nursery, write barrier, remembered set. Diff vs MMTk GenImmix.

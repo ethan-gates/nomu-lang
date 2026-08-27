@@ -1,0 +1,22 @@
+// Task 149 · slice 1 — a runtime-subset function that breaks the rules. Under `--runtime-subset=bad`
+// the checker reports two violations: allocating a class (heap allocation), and calling `helper`, a
+// function that is not itself runtime-subset. Without the flag the same file compiles fine (the rules
+// apply only to designated code).
+class Box {
+  var v: Int
+}
+
+fun helper(n: Int) -> Int {
+  return n + 1
+}
+
+fun bad(n: Int) -> Int {
+  let b = Box(v: n)        // ✗ heap allocation
+  let x = helper(n)        // ✗ calls a non-subset function
+  return b.v + x
+}
+
+fun main() {
+  print(bad(10))
+  print("\n")
+}

@@ -131,6 +131,7 @@ final class LLVMGen {
     var runtimeFns: [String: (fn: LLVMValueRef, ty: LLVMTypeRef)] = [:]
     var pollFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var gcAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
+    var selfhostAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // task 150 — self-hosted alloc slow path
     var barrierFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var stopWorldGlobalCache: LLVMValueRef?
     var intFmt: LLVMValueRef?
