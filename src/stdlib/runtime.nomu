@@ -465,6 +465,858 @@ fun rtScanParkedFibers(outBuf: RawPtr, cap: Int) -> Int {
   return n
 }
 
+// ---- Immix region substrate (task 150 · rung 3, increment 150.3.1) ----
+// The block/line region structure + side metadata tables over 125 off-heap memory: the geometry, the
+// addr↔index math, and the block/line state a collector reads and writes. No allocation policy or
+// collection yet (those are 150.3.2+). Geometry matches MMTk Immix (selfhosted-gc.md §10.1): a 32768-byte
+// block, a 256-byte line, 128 lines per block. Metadata lives in side tables keyed by block/line index
+// (§10.2, Decided), one byte per entry, over the reserved heap range. Entry value 0 is the initial state
+// (block FREE / line unmarked), and rt_raw_alloc zero-fills, so the fresh tables start correct.
+//
+// Space descriptor (112 bytes):
+//   { heapBase: RawPtr @0, numBlocks: Int @8, lineTable: RawPtr @16, blockTable: RawPtr @24,
+//     freeCursor: Int @32, heapBaseInt: Int @40, allocCursor: Int @48, allocLimit: Int @56,
+//     losHead: RawPtr @64, allocBlock: Int @72, allocLine: Int @80, freeList: RawPtr @88,
+//     freeListTop: Int @96, scanBlock: Int @104 }.
+// allocCursor/allocLimit are heap-relative byte offsets bounding the current hole (0/0 → refill). freeCursor
+// bumps never-used blocks. allocBlock/allocLine track the block being filled + its next line to scan for
+// holes (allocBlock −1 = none). freeList is a stack of reclaimed empty block indices (freeListTop entries).
+// scanBlock is the next block index the allocator scans for a recyclable block. losHead is the large-object
+// list. Block state byte: 0 FREE, 1 RECYCLABLE, 2 UNAVAILABLE.  Line mark byte: 0 unmarked, 1 marked.
+
+// Reserve a heap of `numBlocks` 32 KiB blocks + its side tables; return the space descriptor.
+fun rtImmixNew(numBlocks: Int) -> RawPtr {
+  let block = 32768
+  let heapBytes = numBlocks * block
+  let heap = RawPtr.alloc(bytes: heapBytes, align: block)
+  let lineBytes = numBlocks * 128
+  let lineTable = RawPtr.alloc(bytes: lineBytes, align: 8)
+  let blockTable = RawPtr.alloc(bytes: numBlocks, align: 8)
+  let freeList = RawPtr.alloc(bytes: numBlocks * 8, align: 8)
+  let ctl = RawPtr.alloc(bytes: 112, align: 8)
+  ctl.store(heap, toByteOffset: 0)
+  ctl.store(numBlocks, toByteOffset: 8)
+  ctl.store(lineTable, toByteOffset: 16)
+  ctl.store(blockTable, toByteOffset: 24)
+  ctl.store(0, toByteOffset: 32)
+  let baseInt = heap.toInt()
+  ctl.store(baseInt, toByteOffset: 40)
+  ctl.store(0, toByteOffset: 48)     // allocCursor
+  ctl.store(0, toByteOffset: 56)     // allocLimit
+  ctl.store(0, toByteOffset: 64)     // losHead (null)
+  ctl.store(-1, toByteOffset: 72)    // allocBlock (none)
+  ctl.store(0, toByteOffset: 80)     // allocLine
+  ctl.store(freeList, toByteOffset: 88)
+  ctl.store(0, toByteOffset: 96)     // freeListTop
+  ctl.store(0, toByteOffset: 104)    // scanBlock
+  return ctl
+}
+
+// The base address of block `bi`.
+fun rtBlockAddr(space: RawPtr, bi: Int) -> RawPtr {
+  let heap: RawPtr = space.load(fromByteOffset: 0)
+  return heap.advanced(by: bi * 32768)
+}
+
+// The block index containing `addr` (addr − heapBase) / block.
+fun rtBlockIndexOf(space: RawPtr, addr: RawPtr) -> Int {
+  let base: Int = space.load(fromByteOffset: 40)
+  let a = addr.toInt()
+  let d = a - base
+  return d / 32768
+}
+
+// The global line index containing `addr` (addr − heapBase) / line.
+fun rtLineIndexOf(space: RawPtr, addr: RawPtr) -> Int {
+  let base: Int = space.load(fromByteOffset: 40)
+  let a = addr.toInt()
+  let d = a - base
+  return d / 256
+}
+
+// Block-state accessors (side table, one byte per block).
+fun rtBlockState(space: RawPtr, bi: Int) -> Int {
+  let tbl: RawPtr = space.load(fromByteOffset: 24)
+  let s: UInt8 = tbl.load(fromByteOffset: bi)
+  return s.int
+}
+fun rtSetBlockState(space: RawPtr, bi: Int, state: Int) {
+  let tbl: RawPtr = space.load(fromByteOffset: 24)
+  tbl.store(state.uint8, toByteOffset: bi)
+}
+
+// Line-mark accessors (side table, one byte per line).
+fun rtLineMarked(space: RawPtr, li: Int) -> Int {
+  let tbl: RawPtr = space.load(fromByteOffset: 16)
+  let m: UInt8 = tbl.load(fromByteOffset: li)
+  return m.int
+}
+fun rtMarkLine(space: RawPtr, li: Int) {
+  let tbl: RawPtr = space.load(fromByteOffset: 16)
+  tbl.store(1.uint8, toByteOffset: li)
+}
+fun rtClearLine(space: RawPtr, li: Int) {
+  let tbl: RawPtr = space.load(fromByteOffset: 16)
+  tbl.store(0.uint8, toByteOffset: li)
+}
+
+// Hand out the next never-used block from the pool: bump the free cursor, mark the block UNAVAILABLE, and
+// return its base — or RawPtr.null when the pool is exhausted. Reuse of swept blocks is 150.3.5; this is
+// the fresh-block source the hole-aware allocator (150.3.2) draws from.
+fun rtAcquireBlock(space: RawPtr) -> RawPtr {
+  let fc: Int = space.load(fromByteOffset: 32)
+  let nb: Int = space.load(fromByteOffset: 8)
+  if fc >= nb {
+    return RawPtr.null
+  }
+  let addr = rtBlockAddr(space, fc)
+  rtSetBlockState(space, fc, 2)
+  space.store(fc + 1, toByteOffset: 32)
+  return addr
+}
+
+// Large-object space (task 150 · rung 3, increment 150.3.3). An object larger than a 32 KiB block cannot
+// fit the block allocator, so it is allocated whole off-heap and never moved. Each LOS chunk carries an
+// 8-byte link word ahead of the object: { next: RawPtr @0, object: header + payload @8… }. The chunks form
+// a singly-linked list off the space's losHead so reclamation (150.3.5) can walk them; rt_raw_alloc
+// zero-fills, so the object is zero-initialized like a block object. The object pointer (chunk + 8) is what
+// the seam turns into the managed `p1` — codegen never sees the link word.
+fun rtLosAlloc(space: RawPtr, need: Int) -> RawPtr {
+  let raw = RawPtr.alloc(bytes: need + 8, align: 8)
+  let head: RawPtr = space.load(fromByteOffset: 64)
+  raw.store(head, toByteOffset: 0)              // link → previous LOS head
+  space.store(raw, toByteOffset: 64)            // new head
+  return raw.advanced(by: 8)                    // object starts after the link word
+}
+
+// Hand out the next never-used block index (bump freeCursor), or −1 when the heap is exhausted. Unlike
+// rtAcquireBlock this sets no state and returns an index — the hole-aware allocator manages state.
+fun rtAcquireNeverUsed(space: RawPtr) -> Int {
+  let fc: Int = space.load(fromByteOffset: 32)
+  let nb: Int = space.load(fromByteOffset: 8)
+  if fc >= nb {
+    return -1
+  }
+  space.store(fc + 1, toByteOffset: 32)
+  return fc
+}
+
+// Choose the next block for the allocator to fill (task 150 · rung 3): a reclaimed empty block off the free
+// list first, then a recyclable block (has holes) scanned from scanBlock, then a never-used block. Returns
+// the block index, or −1 when the heap is exhausted. Reclaimed + recyclable blocks are why the heap does not
+// grow when garbage was collected (150.3.5).
+fun rtNextAllocBlock(space: RawPtr) -> Int {
+  let top: Int = space.load(fromByteOffset: 96)
+  if top > 0 {
+    let fl: RawPtr = space.load(fromByteOffset: 88)
+    let newTop = top - 1
+    let bi: Int = fl.load(fromByteOffset: newTop * 8)
+    space.store(newTop, toByteOffset: 96)
+    return bi
+  }
+  var sb: Int = space.load(fromByteOffset: 104)
+  let fc: Int = space.load(fromByteOffset: 32)
+  var found = -1
+  var scanning = true
+  while scanning {
+    if sb >= fc {
+      scanning = false
+    } else {
+      let st = rtBlockState(space, sb)
+      if st == 1 {
+        found = sb
+        sb = sb + 1
+        scanning = false
+      } else {
+        sb = sb + 1
+      }
+    }
+  }
+  space.store(sb, toByteOffset: 104)
+  if found >= 0 {
+    return found
+  }
+  return rtAcquireNeverUsed(space)
+}
+
+// Advance the allocator to the next hole (a run of free/unmarked lines) big enough for `need` bytes, setting
+// allocCursor/allocLimit (heap-relative offsets). Scans the current block's line table forward from
+// allocLine; on block exhaustion picks the next block (rtNextAllocBlock). Returns false when the heap is
+// exhausted. A run too small for `need` is skipped (a fragmentation cost accepted in the first cut). Because
+// the line table is the last collection's liveness (a freshly acquired or reclaimed block reads all-free),
+// the same scan serves fresh blocks (one whole-block hole) and recyclable blocks (holes between live lines).
+fun rtNextHole(space: RawPtr, need: Int) -> Bool {
+  var done = false
+  var result = false
+  while !done {
+    let ab: Int = space.load(fromByteOffset: 72)
+    if ab < 0 {
+      let nb = rtNextAllocBlock(space)
+      if nb < 0 {
+        done = true
+      } else {
+        space.store(nb, toByteOffset: 72)
+        space.store(0, toByteOffset: 80)
+      }
+    } else {
+      let al: Int = space.load(fromByteOffset: 80)
+      if al >= 128 {
+        space.store(-1, toByteOffset: 72)      // block exhausted → pick another next iteration
+      } else {
+        let firstLine = ab * 128
+        let gi = firstLine + al
+        if rtLineMarked(space, gi) == 1 {
+          space.store(al + 1, toByteOffset: 80)
+        } else {
+          var e = al
+          var run = true
+          while run {
+            if e >= 128 {
+              run = false
+            } else {
+              let ge = firstLine + e
+              if rtLineMarked(space, ge) == 1 {
+                run = false
+              } else {
+                e = e + 1
+              }
+            }
+          }
+          space.store(e, toByteOffset: 80)     // advance past this run
+          let runLines = e - al
+          let holeBytes = runLines * 256
+          if holeBytes >= need {
+            let startOff = ab * 32768 + al * 256
+            let endOff = ab * 32768 + e * 256
+            space.store(startOff, toByteOffset: 48)
+            space.store(endOff, toByteOffset: 56)
+            done = true
+            result = true
+          }
+        }
+      }
+    }
+  }
+  return result
+}
+
+// Allocate `n` bytes of managed object space (task 150 · rung 3). Hole-aware bump: 8-align the request, bump
+// within the current hole, and on exhaustion advance to the next hole/block (rtNextHole), reusing reclaimed
+// and recyclable space produced by collection (150.3.5). An object larger than a block routes to the
+// large-object space (150.3.3). Returns a RawPtr into the heap (or a LOS chunk), or RawPtr.null when the
+// heap is exhausted. This is the target the codegen self-hosted-alloc seam routes to under NOMU_GC_PLAN=nomu.
+fun rtImmixAlloc(space: RawPtr, n: Int) -> RawPtr {
+  let bumped = n + 7
+  let need = bumped / 8 * 8
+  if need > 32768 {
+    return rtLosAlloc(space, need)             // larger than a block → large-object space (150.3.3)
+  }
+  var done = false
+  var result = RawPtr.null
+  while !done {
+    let cur: Int = space.load(fromByteOffset: 48)
+    let lim: Int = space.load(fromByteOffset: 56)
+    if cur + need <= lim {
+      let heap: RawPtr = space.load(fromByteOffset: 0)
+      result = heap.advanced(by: cur)
+      space.store(cur + need, toByteOffset: 48)
+      done = true
+    } else {
+      let ok = rtNextHole(space, need)
+      if !ok {
+        result = RawPtr.null
+        done = true
+      }
+    }
+  }
+  return result
+}
+
+// ---- Line marking (task 150 · rung 3, increment 150.3.4) ----
+// A diagnostic checkpoint: extend the tracer to mark the lines each live object spans, before any
+// reclamation uses them (150.3.5). Object marking (header bit 32) is unchanged from rung 2; this adds, per
+// live object *in the Immix heap*, a mark on every line its bytes occupy. LOS objects (outside the heap
+// range) are marked by header bit only — they are reclaimed as whole units, not by line. The line-mark set
+// is then verified (rtLineMarkCheck): every live in-heap object sits on marked lines (completeness) and no
+// line is marked beyond the live set's footprint (soundness). The rung-2 fingerprint still holds unchanged.
+
+// Mark every line the object [obj, obj+size) occupies. Skips objects outside the Immix heap (LOS/other).
+fun rtMarkObjLines(space: RawPtr, obj: RawPtr, size: Int) {
+  let base: Int = space.load(fromByteOffset: 40)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let heapEnd = base + nb * 32768
+  let a = obj.toInt()
+  if a < base {
+    return
+  }
+  if a >= heapEnd {
+    return
+  }
+  let first = rtLineIndexOf(space, obj)
+  let lastAddr = obj.advanced(by: size - 1)
+  let last = rtLineIndexOf(space, lastAddr)
+  var li = first
+  while li <= last {
+    rtMarkLine(space, li)
+    li = li + 1
+  }
+}
+
+// Trace from `root` (as rtMarkVerify) and additionally mark each live in-heap object's lines. Objects are
+// marked with header bit 32, counted, and folded into the fingerprint exactly as rung 2; line marking is
+// the only addition, applied when each object is popped (size from the type tables: fixed size, or
+// 16 + cap*stride for a variable-size buffer). Returns the total live count.
+fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
+  let cap = 1048576
+  let bytes = cap * 8
+  let work = RawPtr.alloc(bytes: bytes, align: 8)
+  var top = 0
+  let rootNull = root.eq(RawPtr.null)
+  if !rootNull {
+    if rtTryMark(root, counts, fp) {
+      work.store(root, toByteOffset: 0)
+      top = 1
+    }
+  }
+  while top > 0 {
+    top = top - 1
+    let slot = top * 8
+    let obj: RawPtr = work.load(fromByteOffset: slot)
+    let tid = rtObjTypeId(obj)
+    let kind = RawPtr.gcTypeKind(tid)
+    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    if kind == 0 {
+      let size = RawPtr.gcTypeSize(tid)
+      rtMarkObjLines(space, obj, size)
+      var i = 0
+      while i < nptr {
+        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let child: RawPtr = obj.load(fromByteOffset: off)
+        let childNull = child.eq(RawPtr.null)
+        if !childNull {
+          if rtTryMark(child, counts, fp) {
+            let dst = top * 8
+            work.store(child, toByteOffset: dst)
+            top = top + 1
+          }
+        }
+        i = i + 1
+      }
+    } else {
+      let ecap: Int = obj.load(fromByteOffset: 8)
+      let stride = RawPtr.gcTypeStride(tid)
+      let size = 16 + ecap * stride
+      rtMarkObjLines(space, obj, size)
+      var e = 0
+      while e < ecap {
+        let elemBase = 16 + e * stride
+        var i = 0
+        while i < nptr {
+          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let at = elemBase + off
+          let child: RawPtr = obj.load(fromByteOffset: at)
+          let childNull = child.eq(RawPtr.null)
+          if !childNull {
+            if rtTryMark(child, counts, fp) {
+              let dst = top * 8
+              work.store(child, toByteOffset: dst)
+              top = top + 1
+            }
+          }
+          i = i + 1
+        }
+        e = e + 1
+      }
+    }
+  }
+  work.free()
+  let tcount = RawPtr.gcTypeCount()
+  var total = 0
+  var t = 0
+  while t < tcount {
+    let c: Int = counts.load(fromByteOffset: t * 8)
+    total = total + c
+    t = t + 1
+  }
+  return total
+}
+
+// Count the marked lines in the space's line table.
+fun rtCountMarkedLines(space: RawPtr) -> Int {
+  let nb: Int = space.load(fromByteOffset: 8)
+  let tbl: RawPtr = space.load(fromByteOffset: 16)
+  let n = nb * 128
+  var count = 0
+  var li = 0
+  while li < n {
+    let m: UInt8 = tbl.load(fromByteOffset: li)
+    if m.int == 1 {
+      count = count + 1
+    }
+    li = li + 1
+  }
+  return count
+}
+
+// If `obj` is a non-null marked object (header bit 32 set), clear the mark (restore header to the type-id)
+// and return true; else false. The verifier walks by clearing marks, so it visits each live object once.
+fun rtUnmarkIfMarked(obj: RawPtr) -> Bool {
+  let isNull = obj.eq(RawPtr.null)
+  if isNull {
+    return false
+  }
+  let h: Int = obj.load(fromByteOffset: 0)
+  let hi = h / 4294967296
+  if hi == 0 {
+    return false
+  }
+  let lo = hi * 4294967296
+  let tid = h - lo
+  obj.store(tid, toByteOffset: 0)
+  return true
+}
+
+// Verify the line-mark set independently of the marking pass. Re-walk the live set (clearing bit 32 so each
+// object is visited once), and for each in-heap object confirm every line it spans is marked (completeness)
+// while recording its lines in a scratch table. Then compare the scratch coverage to the actual marked-line
+// count (soundness — no line marked beyond the live footprint). Returns 0 when both hold; +1 on an unmarked
+// live line, +2 on a count mismatch. Clears all header marks as a side effect.
+fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
+  let nb: Int = space.load(fromByteOffset: 8)
+  let base: Int = space.load(fromByteOffset: 40)
+  let heapEnd = base + nb * 32768
+  let ntot = nb * 128
+  let scratch = RawPtr.alloc(bytes: ntot, align: 8)
+  let cap = 1048576
+  let work = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var violations = 0
+  var top = 0
+  if rtUnmarkIfMarked(root) {
+    work.store(root, toByteOffset: 0)
+    top = 1
+  }
+  while top > 0 {
+    top = top - 1
+    let obj: RawPtr = work.load(fromByteOffset: top * 8)
+    let tid = rtObjTypeId(obj)
+    let kind = RawPtr.gcTypeKind(tid)
+    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    var size = 0
+    if kind == 0 {
+      size = RawPtr.gcTypeSize(tid)
+    } else {
+      let ecap: Int = obj.load(fromByteOffset: 8)
+      let stride = RawPtr.gcTypeStride(tid)
+      size = 16 + ecap * stride
+    }
+    let a = obj.toInt()
+    var inHeap = true
+    if a < base {
+      inHeap = false
+    }
+    if a >= heapEnd {
+      inHeap = false
+    }
+    if inHeap {
+      let first = rtLineIndexOf(space, obj)
+      let lastAddr = obj.advanced(by: size - 1)
+      let last = rtLineIndexOf(space, lastAddr)
+      var li = first
+      while li <= last {
+        if rtLineMarked(space, li) == 0 {
+          violations = violations + 1
+        }
+        scratch.store(1.uint8, toByteOffset: li)
+        li = li + 1
+      }
+    }
+    if kind == 0 {
+      var i = 0
+      while i < nptr {
+        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let child: RawPtr = obj.load(fromByteOffset: off)
+        if rtUnmarkIfMarked(child) {
+          work.store(child, toByteOffset: top * 8)
+          top = top + 1
+        }
+        i = i + 1
+      }
+    } else {
+      let ecap2: Int = obj.load(fromByteOffset: 8)
+      let stride2 = RawPtr.gcTypeStride(tid)
+      var ee = 0
+      while ee < ecap2 {
+        let elemBase = 16 + ee * stride2
+        var i2 = 0
+        while i2 < nptr {
+          let off2 = RawPtr.gcTypePtrOffset(tid, i2)
+          let at = elemBase + off2
+          let child2: RawPtr = obj.load(fromByteOffset: at)
+          if rtUnmarkIfMarked(child2) {
+            work.store(child2, toByteOffset: top * 8)
+            top = top + 1
+          }
+          i2 = i2 + 1
+        }
+        ee = ee + 1
+      }
+    }
+  }
+  var covered = 0
+  var k = 0
+  while k < ntot {
+    let s: UInt8 = scratch.load(fromByteOffset: k)
+    if s.int == 1 {
+      covered = covered + 1
+    }
+    k = k + 1
+  }
+  work.free()
+  scratch.free()
+  let actual = rtCountMarkedLines(space)
+  var status = 0
+  if violations > 0 {
+    status = status + 1
+  }
+  if actual != covered {
+    status = status + 2
+  }
+  return status
+}
+
+// ---- Sweep reclamation — the first functioning self-hosted collector (task 150 · rung 3, 150.3.5) ----
+// A non-moving mark-sweep collection over the Immix regions: mark the live set from a root (header bit +
+// line marks), reclaim by line/block (unmarked lines are free; a block with no live line returns to the
+// pool, a mixed block is recyclable), reclaim the LOS by whole chunk, then reset marks and the allocator so
+// reclaimed + recyclable space is reused (the hole-aware allocator above). Evacuation is off — objects do
+// not move (150.3.7). Driven explicitly (rtImmixCollect) on a deterministic single-thread root set, as
+// mark-verify drove the tracer; wiring it at a real STW over all mutators is the scheduler-coupled 128.3.2.
+
+// Set the header mark bit (32) if unmarked; return true when newly marked. Like rtTryMark but without the
+// counts/fingerprint bookkeeping (collection needs only the mark).
+fun rtTryMarkBare(obj: RawPtr) -> Bool {
+  let h: Int = obj.load(fromByteOffset: 0)
+  let hi = h / 4294967296
+  if hi > 0 {
+    return false
+  }
+  let marked = h + 4294967296
+  obj.store(marked, toByteOffset: 0)
+  return true
+}
+
+// Mark the transitive live set from `root`: header bit 32 on each object, plus line marks for in-heap
+// objects (rtMarkObjLines; LOS objects get the header bit only, reclaimed by whole chunk).
+fun rtImmixMark(space: RawPtr, root: RawPtr) {
+  let cap = 1048576
+  let work = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var top = 0
+  let rootNull = root.eq(RawPtr.null)
+  if !rootNull {
+    if rtTryMarkBare(root) {
+      work.store(root, toByteOffset: 0)
+      top = 1
+    }
+  }
+  while top > 0 {
+    top = top - 1
+    let obj: RawPtr = work.load(fromByteOffset: top * 8)
+    let tid = rtObjTypeId(obj)
+    let kind = RawPtr.gcTypeKind(tid)
+    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    var size = 0
+    if kind == 0 {
+      size = RawPtr.gcTypeSize(tid)
+    } else {
+      let ecap: Int = obj.load(fromByteOffset: 8)
+      let stride = RawPtr.gcTypeStride(tid)
+      size = 16 + ecap * stride
+    }
+    rtMarkObjLines(space, obj, size)
+    if kind == 0 {
+      var i = 0
+      while i < nptr {
+        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let child: RawPtr = obj.load(fromByteOffset: off)
+        let childNull = child.eq(RawPtr.null)
+        if !childNull {
+          if rtTryMarkBare(child) {
+            work.store(child, toByteOffset: top * 8)
+            top = top + 1
+          }
+        }
+        i = i + 1
+      }
+    } else {
+      let ecap2: Int = obj.load(fromByteOffset: 8)
+      let stride2 = RawPtr.gcTypeStride(tid)
+      var e = 0
+      while e < ecap2 {
+        let elemBase = 16 + e * stride2
+        var i = 0
+        while i < nptr {
+          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let at = elemBase + off
+          let child: RawPtr = obj.load(fromByteOffset: at)
+          let childNull = child.eq(RawPtr.null)
+          if !childNull {
+            if rtTryMarkBare(child) {
+              work.store(child, toByteOffset: top * 8)
+              top = top + 1
+            }
+          }
+          i = i + 1
+        }
+        e = e + 1
+      }
+    }
+  }
+  work.free()
+}
+
+// Clear every line mark — the start of a collection, before liveness is re-derived.
+fun rtClearAllLines(space: RawPtr) {
+  let nb: Int = space.load(fromByteOffset: 8)
+  let tbl: RawPtr = space.load(fromByteOffset: 16)
+  let n = nb * 128
+  var i = 0
+  while i < n {
+    tbl.store(0.uint8, toByteOffset: i)
+    i = i + 1
+  }
+}
+
+// Reclaim by block: for each handed-out block, count its marked (live) lines and set its state — FREE (no
+// live line, returned to the free list for reuse), RECYCLABLE (mixed, has holes), or UNAVAILABLE (all live).
+fun rtImmixSweepBlocks(space: RawPtr) {
+  let fc: Int = space.load(fromByteOffset: 32)
+  space.store(0, toByteOffset: 96)           // reset free list
+  let fl: RawPtr = space.load(fromByteOffset: 88)
+  var bi = 0
+  while bi < fc {
+    let firstLine = bi * 128
+    var marked = 0
+    var li = 0
+    while li < 128 {
+      let gi = firstLine + li
+      if rtLineMarked(space, gi) == 1 {
+        marked = marked + 1
+      }
+      li = li + 1
+    }
+    if marked == 0 {
+      rtSetBlockState(space, bi, 0)
+      let top: Int = space.load(fromByteOffset: 96)
+      fl.store(bi, toByteOffset: top * 8)
+      space.store(top + 1, toByteOffset: 96)
+    } else {
+      if marked == 128 {
+        rtSetBlockState(space, bi, 2)
+      } else {
+        rtSetBlockState(space, bi, 1)
+      }
+    }
+    bi = bi + 1
+  }
+}
+
+// Reclaim the large-object space: walk the LOS list, free every unmarked (dead) chunk, and relink the marked
+// (live) ones (their marks are cleared later by rtImmixUnmark). Reforms losHead over the survivors.
+fun rtImmixSweepLos(space: RawPtr) {
+  var cur: RawPtr = space.load(fromByteOffset: 64)
+  var newHead = RawPtr.null
+  var curNull = cur.eq(RawPtr.null)
+  while !curNull {
+    let next: RawPtr = cur.load(fromByteOffset: 0)
+    let obj = cur.advanced(by: 8)
+    let h: Int = obj.load(fromByteOffset: 0)
+    let hi = h / 4294967296
+    if hi > 0 {
+      cur.store(newHead, toByteOffset: 0)
+      newHead = cur
+    } else {
+      cur.free()
+    }
+    cur = next
+    curNull = cur.eq(RawPtr.null)
+  }
+  space.store(newHead, toByteOffset: 64)
+}
+
+// Clear the header mark bit across the live set (re-walk from root). Runs after the sweeps have read the
+// marks, so the next collection starts clean. Reaches LOS survivors through the graph too.
+fun rtImmixUnmark(root: RawPtr) {
+  let cap = 1048576
+  let work = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var top = 0
+  if rtUnmarkIfMarked(root) {
+    work.store(root, toByteOffset: 0)
+    top = 1
+  }
+  while top > 0 {
+    top = top - 1
+    let obj: RawPtr = work.load(fromByteOffset: top * 8)
+    let tid = rtObjTypeId(obj)
+    let kind = RawPtr.gcTypeKind(tid)
+    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    if kind == 0 {
+      var i = 0
+      while i < nptr {
+        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let child: RawPtr = obj.load(fromByteOffset: off)
+        if rtUnmarkIfMarked(child) {
+          work.store(child, toByteOffset: top * 8)
+          top = top + 1
+        }
+        i = i + 1
+      }
+    } else {
+      let ecap: Int = obj.load(fromByteOffset: 8)
+      let stride = RawPtr.gcTypeStride(tid)
+      var e = 0
+      while e < ecap {
+        let elemBase = 16 + e * stride
+        var i = 0
+        while i < nptr {
+          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let at = elemBase + off
+          let child: RawPtr = obj.load(fromByteOffset: at)
+          if rtUnmarkIfMarked(child) {
+            work.store(child, toByteOffset: top * 8)
+            top = top + 1
+          }
+          i = i + 1
+        }
+        e = e + 1
+      }
+    }
+  }
+  work.free()
+}
+
+// One non-moving collection from `root`: clear line marks, mark the live set, reclaim by block and by LOS
+// chunk, unmark, then reset the allocator so the next allocation reuses reclaimed + recyclable space. The
+// heap shrinks: dead blocks return to the pool and dead LOS chunks are freed.
+fun rtImmixCollect(space: RawPtr, root: RawPtr) {
+  rtClearAllLines(space)
+  rtImmixMark(space, root)
+  rtImmixSweepBlocks(space)
+  rtImmixSweepLos(space)
+  rtImmixUnmark(root)
+  space.store(-1, toByteOffset: 72)   // allocBlock: none
+  space.store(0, toByteOffset: 80)    // allocLine
+  space.store(0, toByteOffset: 48)    // allocCursor
+  space.store(0, toByteOffset: 56)    // allocLimit
+  space.store(0, toByteOffset: 104)   // scanBlock (rescan recyclable from the start)
+}
+
+// Blocks handed out from the never-used pool (freeCursor) — the heap's high-water mark in blocks.
+fun rtImmixBlocksUsed(space: RawPtr) -> Int {
+  return space.load(fromByteOffset: 32)
+}
+
+// Reclaimed empty blocks currently on the free list (set by the last sweep).
+fun rtImmixFreeBlocks(space: RawPtr) -> Int {
+  return space.load(fromByteOffset: 96)
+}
+
+// ---- Forwarding word + copy primitive (task 150 · rung 3, increment 150.3.6) ----
+// The mechanism evacuation (150.3.7) is built on. The forwarding record is §10.8 (Decided): the new address
+// goes in the stale copy's payload word 0 (offset 8), and header bit 33 flags "forwarded". Header layout:
+// bits 0–31 type-id, bit 32 mark (150.2.2), bit 33 forwarded. `rtObjTypeId` already strips all high bits, so
+// size/kind reads keep working on a marked or forwarded header. Overwriting payload word 0 is sound because
+// the object is copied first (size computed before the clobber) and the stale original is only ever read for
+// its forwarding pointer afterward. The payload-word-0 slot exists for every managed type — `rtCheckPayloadWord`
+// guards that (§10.8): a fixed object is header + ≥1 field (≥16 bytes), an array buffer is header + cap + ….
+
+// The object's total size in bytes from the type tables: fixed size, or 16 + cap*stride for a buffer. Must
+// be read before forwarding clobbers payload word 0 (a buffer's cap lives there).
+fun rtObjSize(obj: RawPtr) -> Int {
+  let tid = rtObjTypeId(obj)
+  let kind = RawPtr.gcTypeKind(tid)
+  if kind == 0 {
+    return RawPtr.gcTypeSize(tid)
+  }
+  let ecap: Int = obj.load(fromByteOffset: 8)
+  let stride = RawPtr.gcTypeStride(tid)
+  return 16 + ecap * stride
+}
+
+// Copy `bytes` (a multiple of 8) word by word — the whole object including its header.
+fun rtCopyWords(dst: RawPtr, src: RawPtr, bytes: Int) {
+  var o = 0
+  while o < bytes {
+    let w: Int = src.load(fromByteOffset: o)
+    dst.store(w, toByteOffset: o)
+    o = o + 8
+  }
+}
+
+// Header bit 33 set → the object has been evacuated; payload word 0 holds its new address.
+fun rtIsForwarded(obj: RawPtr) -> Bool {
+  let h: Int = obj.load(fromByteOffset: 0)
+  let hi = h / 4294967296
+  let bit33 = hi / 2 - hi / 4 * 2
+  if bit33 == 1 {
+    return true
+  }
+  return false
+}
+
+// The forwarding address (payload word 0) of an already-forwarded object.
+fun rtForwardingPointer(obj: RawPtr) -> RawPtr {
+  let p: RawPtr = obj.load(fromByteOffset: 8)
+  return p
+}
+
+// Flag `obj` forwarded (set header bit 33 if not already) and store its new address in payload word 0.
+fun rtSetForwarded(obj: RawPtr, newAddr: RawPtr) {
+  let h: Int = obj.load(fromByteOffset: 0)
+  let hi = h / 4294967296
+  let bit33 = hi / 2 - hi / 4 * 2
+  var nh = h
+  if bit33 == 0 {
+    nh = h + 8589934592
+  }
+  obj.store(nh, toByteOffset: 0)
+  obj.store(newAddr, toByteOffset: 8)
+}
+
+// Evacuate `obj`: allocate a fresh slot, copy the object into it, install the forwarding record in the
+// original, and return the new address (or null if allocation fails). Size is read before the copy so the
+// forwarding clobber of payload word 0 is safe. The copy inherits the original's header (mark bit, no
+// forwarded bit — that is set only on the original), which is the end state evacuation wants.
+fun rtCopyObject(space: RawPtr, obj: RawPtr) -> RawPtr {
+  let size = rtObjSize(obj)
+  let dst = rtImmixAlloc(space, size)
+  let dstNull = dst.eq(RawPtr.null)
+  if dstNull {
+    return RawPtr.null
+  }
+  rtCopyWords(dst, obj, size)
+  rtSetForwarded(obj, dst)
+  return dst
+}
+
+// Count managed types with no payload word (fixed size < 16) — the forwarding record needs payload word 0
+// (§10.8). 0 confirms the payload-word-0 forwarding scheme is valid for every managed type in the program.
+fun rtCheckPayloadWord() -> Int {
+  let tcount = RawPtr.gcTypeCount()
+  var bad = 0
+  var t = 0
+  while t < tcount {
+    let kind = RawPtr.gcTypeKind(t)
+    if kind == 0 {
+      let sz = RawPtr.gcTypeSize(t)
+      if sz < 16 {
+        bad = bad + 1
+      }
+    }
+    t = t + 1
+  }
+  return bad
+}
+
 // ---- Scheduler root (task 128.3.1) ----
 // The global scheduled-mailbox queue head (`rt_sched_head`) is a single managed GC root: rooting it keeps
 // the whole `sched_next` chain — every queued mailbox, its pending messages, and each receiver actor — alive

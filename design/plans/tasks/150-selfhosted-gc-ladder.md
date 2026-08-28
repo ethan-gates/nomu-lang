@@ -82,6 +82,15 @@ adds one hard mechanism with the previous as an oracle:
 Then [127 LXR](127-lxr-collector.md): swap reclamation to RC-primary. LXR uses Immix backing, so rung 3's
 region machinery carries in.
 
+**Sequencing — the ladder pauses at 150.3, and 128.1 (scheduler self-host) is interleaved before 150.4.**
+Immix is a real functioning collector (reclaims + moves), so it is a natural pause point. The work then
+turns to the scheduler half ([128.1](128-self-hosting-runtime.md)) before GenImmix, because GenImmix's
+STW-over-all-mutators root scan ([128.3.2](128-self-hosting-runtime.md)) reads every carrier's saved
+safepoint context (the self-hosted scheduler's machinery) and the generational barrier co-designs with the
+carrier path. Order: **150.3 → 128.1 → 150.4 → retire MMTk → 127**. Immix runs hosted on the existing C
+scheduler; GenImmix lands on the self-hosted one. MMTk retires as the production collector once self-hosted
+GenImmix matches its oracle (kept as a test oracle: `selfhosted-gc.md` §7, Open).
+
 ## Why this shape
 
 - **One variable per rung, each with an oracle.** A direct NoGC→GenImmix jump debugs ~five independent
@@ -126,8 +135,40 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
   - 150.2.8 — MMTk-side fingerprint + cross-run diff (the independent oracle; `RawPtr.gcForceCollect()`).
   - *Handed off:* full-runtime root-scanning integration (parked-fiber/scheduler-root walk, STW over all
     mutators) → [128.3](128-self-hosting-runtime.md) (128.3.1 / 128.3.2).
-- **150.3 — Immix (non-generational).** First collector that reclaims + moves. **Next.**
-- **150.4 — GenImmix.** Nursery + write barrier + remembered set.
+- **150.3 — Immix (non-generational).** First collector that reclaims + moves. **Current rung** — design
+  deepened (`selfhosted-gc.md` §10; geometry, metadata, allocation, sweep, evacuation, fixup all pinned;
+  side-table metadata + payload-word-0 forwarding **Decided**). Eight increments, each with the MMTk Immix
+  oracle:
+  - 150.3.1 — region substrate: block pool over 125 + side metadata tables (line marks, block state).
+    **Built.** Prelude `rtImmix*` (space descriptor, block pool, addr↔index math, byte-per-entry line/block
+    tables), one new intrinsic `RawPtr.toInt()` (ptrtoint) for addr→index math. `examples/immix_region.nomu`
+    + `tools/immix-region.sh` (adjacency, index round-trip, state transitions, pool exhaustion;
+    byte-identical NoGC vs Immix, auto-subset).
+  - 150.3.2 — region-structured allocator (`rtImmixAlloc`: bump within block, refill fresh block on
+    overflow), routed behind the self-hosted-alloc seam (`NOMU_GC_PLAN=nomu`, 256 MiB space), non-collecting.
+    **Built.** Byte-identical to MMTk NoGC on `selfhost-gc` + a 3-block-crossing fixture
+    (`examples/immix_alloc.nomu` + `tools/immix-alloc.sh`). Line-granular hole reuse lands with sweep (150.3.5).
+  - 150.3.3 — large-object space (`rtLosAlloc`: objects larger than a block allocated whole off-heap,
+    linked off `losHead`, never moved), non-collecting. **Built.** Diff vs MMTk NoGC on a large `Array<Int>`
+    (`examples/immix_los.nomu` + `tools/immix-los.sh`). First-cut LOS threshold = block size; the
+    medium-object overflow allocator folds into 150.3.5.
+  - 150.3.4 — line marking in the tracer (diagnostic, no reclaim). **Built.** `rtMarkVerifyImmix` marks
+    each live in-heap object's lines; `rtLineMarkCheck` verifies completeness + soundness (returns 0); new
+    `RawPtr.gcSelfhostSpace()` intrinsic. `examples/immix_line_mark.nomu` + `tools/immix-line-mark.sh`.
+  - 150.3.5 — sweep reclamation (non-moving). **Built — first functioning self-hosted collector.**
+    `rtImmixCollect` (clear lines → mark → reclaim by block + LOS → unmark → reset); hole-aware allocator
+    (`rtNextHole`/`rtNextAllocBlock`) reuses reclaimed + recyclable space. `examples/immix_sweep.nomu` +
+    `tools/immix-sweep.sh` (reclamation + reuse + live survival). Driven explicitly on a deterministic root
+    set; automatic collection at a real STW (whole-program `arr-gc`/`gc-stress` under `nomu`) is 128.3.2.
+  - 150.3.6 — forwarding word (header bit 33 + new address in payload word 0) + copy primitive
+    (`rtCopyObject`/`rtIsForwarded`/`rtForwardingPointer`). **Built.** `rtCheckPayloadWord` = 0 (assumption
+    holds). `examples/immix_forward.nomu` + `tools/immix-forward.sh`.
+  - 150.3.7 — evacuation forward-during-trace + pointer fixup (slots + roots). Fragmentation fixture; diff
+    under evacuation; fingerprint invariant.
+  - 150.3.8 — copy reserve + defrag trigger tuning. `gc-stress` under pressure; diff vs MMTk Immix.
+  - *First cut is single-carrier + `gcForceCollect`-driven on deterministic fixtures;* multi-mutator STW
+    that drives it in a concurrent program is [128.3.2](128-self-hosting-runtime.md), after the scheduler.
+- **150.4 — GenImmix.** Nursery + write barrier + remembered set. **After the scheduler self-host (128.1).**
 - Then [127 LXR](127-lxr-collector.md): reclamation swapped to RC-primary, on 150.3's region machinery.
 
 ## Refs

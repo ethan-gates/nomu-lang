@@ -1,0 +1,32 @@
+// Task 150 · rung 3 (Immix), increment 150.3.2 — the region-structured allocator, exercised across block
+// boundaries. Under NOMU_GC_PLAN=nomu every managed allocation routes through the Nomu Immix allocator
+// (rtImmixAlloc): bump within a 32 KiB block, refill a fresh block from the pool on overflow. A Box is 16
+// bytes (header + Int), so 2048 fit per block; 5000 allocations span three blocks and refill twice.
+//
+// The sum over 5000 distinct writes proves every allocation returned valid, non-overlapping memory across
+// the refills; `a`/`b` allocated after the loop prove post-crossing allocation reads back correctly. Output
+// must be byte-identical under MMTk NoGC (the oracle) and the self-hosted Immix allocator — non-collecting,
+// heap grows.
+//
+// Expected output: 12497500 / 42 / 7.
+class Box {
+  var v: Int
+}
+fun main() {
+  var sum = 0
+  var i = 0
+  while i < 5000 {
+    let t = Box(v: i)
+    sum = sum + t.v
+    i = i + 1
+  }
+  print(sum)          // 0 + 1 + … + 4999 = 12497500
+  print("\n")
+
+  let a = Box(v: 42)
+  let b = Box(v: 7)
+  print(a.v)          // 42
+  print("\n")
+  print(b.v)          // 7
+  print("\n")
+}

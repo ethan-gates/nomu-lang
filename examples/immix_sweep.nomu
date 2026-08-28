@@ -1,0 +1,53 @@
+// Task 150 · rung 3 (Immix), increment 150.3.5 — sweep reclamation, the first functioning self-hosted
+// collector (non-moving). A small live set is kept in `live`; two batches of unreachable garbage bracket a
+// collection. The collection marks only what `live` reaches, reclaims every dead block back to the pool,
+// and resets the allocator, so the second garbage batch reuses reclaimed space instead of growing the heap.
+//
+// Compiled with NOMU_NO_ESCAPE=1 so the Boxes are heap-allocated (not stack-promoted). Runs under
+// NOMU_GC_PLAN=nomu — collection operates on the self-hosted Immix heap. Single-threaded with a controlled
+// root set (as mark-verify), since sweep reclaims the whole heap: everything live must be reachable from the
+// root passed to rtImmixCollect.
+//
+// Checks: blocks were reclaimed (freed > 0); the heap did not grow across the second batch (reuse); the live
+// objects survived and read back. Expected output: 1 / 1 / 111 / 222 / 2.
+class Box {
+  var v: Int
+}
+fun main() {
+  var live: Array<Box> = []
+  live.append(Box(v: 111))
+  live.append(Box(v: 222))
+
+  let space = RawPtr.gcSelfhostSpace()
+
+  // batch 1 — unreachable garbage, filling several blocks
+  var i = 0
+  while i < 20000 {
+    let junk = Box(v: i)
+    i = i + 1
+  }
+  let usedB1 = rtImmixBlocksUsed(space)
+
+  // collect: only `live` is reachable, so the garbage blocks are reclaimed
+  rtImmixCollect(space, addrOf(live))
+  let freed = rtImmixFreeBlocks(space)
+  print(freed > 0)            // 1  — blocks were reclaimed (heap shrank)
+  print("\n")
+
+  // batch 2 — same garbage volume; reuses reclaimed blocks rather than growing the heap
+  var j = 0
+  while j < 20000 {
+    let junk = Box(v: j)
+    j = j + 1
+  }
+  let usedB2 = rtImmixBlocksUsed(space)
+  print(usedB2 <= usedB1)     // 1  — no growth: reclaimed space was reused
+
+  print("\n")
+  print(live[0].v)            // 111 — live objects survived (non-moving)
+  print("\n")
+  print(live[1].v)            // 222
+  print("\n")
+  print(live.count)           // 2
+  print("\n")
+}

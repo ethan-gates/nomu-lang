@@ -269,52 +269,59 @@ extension LLVMGen {
         return gcAllocFn!
     }
 
-    // The self-hosted allocation slow path (task 150 rung 1 slice B): route allocation at the Nomu bump
-    // allocator in the runtime prelude (`rtArenaNew` / `rtBumpAlloc`). On first call it creates one arena
-    // and caches it in `__nomu_selfhost_arena`; each call bumps a chunk and produces the managed object via
-    // `ptrtoint`→`inttoptr` to `p1` — the same integer→`p1` step the fast path uses, which
-    // `RewriteStatepointsForGC` accepts as a fresh GC base (no `addrspacecast`, no intrinsic). The bump
-    // memory is fresh-zeroed by `rt_raw_alloc` and never reused under NoGC, so the object is
-    // zero-initialized with no memset. The allocator holds no `p1`; the seam produces it here.
+    // The self-hosted allocation slow path (task 150): route allocation at the Nomu Immix allocator in the
+    // runtime prelude (`rtImmixNew` / `rtImmixAlloc`, rung 3 increment 150.3.2). On first call it creates
+    // one Immix space and caches its descriptor in `__nomu_selfhost_space`; each call bumps a chunk within
+    // the current 32 KiB block (refilling from the block pool on overflow) and produces the managed object
+    // via `ptrtoint`→`inttoptr` to `p1` — the same integer→`p1` step the fast path uses, which
+    // `RewriteStatepointsForGC` accepts as a fresh GC base (no `addrspacecast`, no intrinsic). The block
+    // memory is fresh-zeroed by `rt_raw_alloc` and never reused while non-collecting, so the object is
+    // zero-initialized with no memset. The allocator holds no `p1`; the seam produces it here. (Rung 1's
+    // single-arena bump `rtArenaNew`/`rtBumpAlloc` stays in the prelude for its own tests.)
     func nomuSelfhostAlloc() -> (LLVMValueRef, LLVMTypeRef) {
         if let s = selfhostAllocFn { return s }
         let ty = fnType(p1, [i64])
         let fn = LLVMAddFunction(mod, "__nomu_selfhost_alloc", ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         LLVMSetGC(fn, "statepoint-example")
-        let gArena = LLVMAddGlobal(mod, i8ptr, "__nomu_selfhost_arena")!
-        LLVMSetInitializer(gArena, LLVMConstPointerNull(i8ptr))
-        LLVMSetLinkage(gArena, LLVMInternalLinkage)
+        // Get-or-add: `RawPtr.gcSelfhostSpace()` (the tracer's reach into this space) may have created the
+        // same global first, so share it rather than minting a duplicate symbol.
+        let gSpace = LLVMGetNamedGlobal(mod, "__nomu_selfhost_space") ?? {
+            let g = LLVMAddGlobal(mod, i8ptr, "__nomu_selfhost_space")!
+            LLVMSetInitializer(g, LLVMConstPointerNull(i8ptr))
+            LLVMSetLinkage(g, LLVMInternalLinkage)
+            return g
+        }()
         // The runtime prelude is always compiled in, so its allocator functions are declared. Guard
         // defensively: a missing prelude falls back to a null return rather than a codegen crash.
-        guard let arenaNew = callables["f:rtArenaNew"], let bump = callables["f:rtBumpAlloc"] else {
+        guard let immixNew = callables["f:rtImmixNew"], let immixAlloc = callables["f:rtImmixAlloc"] else {
             withStubBody(fn) { LLVMBuildRet(b, LLVMConstPointerNull(p1)) }
             selfhostAllocFn = (fn, ty)
             return selfhostAllocFn!
         }
-        let arenaSize = LLVMConstInt(i64, UInt64(256 * 1024 * 1024), 0)   // 256 MiB single arena (no refill yet)
+        let numBlocks = LLVMConstInt(i64, UInt64(8192), 0)   // 8192 × 32 KiB = 256 MiB heap
         withStubBody(fn) {
             let size = LLVMGetParam(fn, 0)!
             let entryBB = LLVMGetInsertBlock(b)!
-            let mkBB = LLVMAppendBasicBlockInContext(ctx, fn, "arena.mk")!
-            let useBB = LLVMAppendBasicBlockInContext(ctx, fn, "arena.use")!
-            let arena0 = LLVMBuildLoad2(b, i8ptr, gArena, "arena")!
-            let isNull = LLVMBuildICmp(b, LLVMIntEQ, arena0, LLVMConstPointerNull(i8ptr), "arena.null")!
+            let mkBB = LLVMAppendBasicBlockInContext(ctx, fn, "space.mk")!
+            let useBB = LLVMAppendBasicBlockInContext(ctx, fn, "space.use")!
+            let space0 = LLVMBuildLoad2(b, i8ptr, gSpace, "space")!
+            let isNull = LLVMBuildICmp(b, LLVMIntEQ, space0, LLVMConstPointerNull(i8ptr), "space.null")!
             LLVMBuildCondBr(b, isNull, mkBB, useBB)
             LLVMPositionBuilderAtEnd(b, mkBB)
-            let made = buildCall(arenaNew.fn, arenaNew.ty, [arenaSize])!
-            LLVMBuildStore(b, made, gArena)
+            let made = buildCall(immixNew.fn, immixNew.ty, [numBlocks])!
+            LLVMBuildStore(b, made, gSpace)
             LLVMBuildBr(b, useBB)
             LLVMPositionBuilderAtEnd(b, useBB)
-            let arena = LLVMBuildPhi(b, i8ptr, "arena.p")!
-            var avals: [LLVMValueRef?] = [arena0, made]
+            let space = LLVMBuildPhi(b, i8ptr, "space.p")!
+            var avals: [LLVMValueRef?] = [space0, made]
             var ablks: [LLVMBasicBlockRef?] = [entryBB, mkBB]
             avals.withUnsafeMutableBufferPointer { vp in
                 ablks.withUnsafeMutableBufferPointer { bp in
-                    LLVMAddIncoming(arena, vp.baseAddress, bp.baseAddress, 2)
+                    LLVMAddIncoming(space, vp.baseAddress, bp.baseAddress, 2)
                 }
             }
-            let raw = buildCall(bump.fn, bump.ty, [arena, size])!
+            let raw = buildCall(immixAlloc.fn, immixAlloc.ty, [space, size])!
             let addr = LLVMBuildPtrToInt(b, raw, i64, "raw.i")!
             let obj = LLVMBuildIntToPtr(b, addr, p1, "obj")!
             LLVMBuildRet(b, obj)

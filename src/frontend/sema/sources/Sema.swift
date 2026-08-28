@@ -1792,6 +1792,14 @@ public struct Sema {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return ptrIntrinsic("__gcSchedHead", .rawPtr, [], span)
+        // The self-hosted Immix space descriptor (task 150 rung 3): the codegen-internal global
+        // `__nomu_selfhost_space` the alloc seam lazily creates under NOMU_GC_PLAN=nomu. Null under other
+        // plans (MMTk allocates). The self-hosted tracer reads it to mark lines in the space objects live in.
+        case "gcSelfhostSpace":
+            guard checkArgLabels(args, [], "RawPtr.gcSelfhostSpace", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__gcSelfhostSpace", .rawPtr, [], span)
         default:
             diags.error("type 'RawPtr' has no static method '\(method)'", at: span)
             return NOIRExpr(type: .error, span: span, kind: .intLit(0))
@@ -1840,6 +1848,14 @@ public struct Sema {
                 diags.error("RawPtr.eq expects a 'RawPtr' argument, got '\(other.type)'", at: other.span)
             }
             return ptrIntrinsic("__ptrEq", .bool, [recv, other], span)
+        // The pointer's numeric address as an Int (ptrtoint), for addr→index math over raw memory (the
+        // Immix side tables, task 150 rung 3): `(addr − heapBase) / lineSize`. Sound on addrspace(0) raw
+        // memory the collector owns off-heap.
+        case "toInt":
+            guard checkArgLabels(args, [], "RawPtr.toInt", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__rawToInt", .int, [recv], span)
         case "asPtr":
             guard checkArgLabels(args, [], "RawPtr.asPtr", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))

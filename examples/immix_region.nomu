@@ -1,0 +1,65 @@
+// Task 150 · rung 3 (Immix), increment 150.3.1 — the region substrate: block/line geometry, the side
+// metadata tables, the addr↔index math, and block/line state transitions. Everything is off-heap
+// addrspace(0) memory (via the prelude's rtImmix* functions over 125 raw memory), so there is no
+// allocation policy or collection here — this exercises the structure a collector reads and writes.
+//
+// Geometry (selfhosted-gc.md §10.1): 32768-byte block, 256-byte line, 128 lines/block. Side tables are
+// one byte per line / per block (§10.2). The functions live in the runtime prelude (src/stdlib/runtime.nomu),
+// auto-subset by default (task 149) — no --runtime-subset flag needed.
+//
+// Expected output: 1 / 1 / 2 / 261 / 5 / 2 / 1 / 0 / 1 / 0 / 0 / 1.
+
+fun main() {
+  let space = rtImmixNew(8)
+
+  // Block pool hands out block-adjacent bases: b1 = b0 + 32768, b2 = b1 + 32768.
+  let b0 = rtAcquireBlock(space)
+  let b1 = rtAcquireBlock(space)
+  let b2 = rtAcquireBlock(space)
+  print(b1.eq(b0.advanced(by: 32768)))   // 1
+  print("\n")
+  print(b2.eq(b1.advanced(by: 32768)))   // 1
+  print("\n")
+
+  // addr→index math: an address in block 2, line 5 of that block, +40 bytes in.
+  let off = 5 * 256 + 40
+  let addr = rtBlockAddr(space, 2).advanced(by: off)
+  let bi = rtBlockIndexOf(space, addr)
+  let li = rtLineIndexOf(space, addr)
+  print(bi)                              // 2
+  print("\n")
+  print(li)                              // 261  (2*128 + 5)
+  print("\n")
+  print(li - bi * 128)                   // 5    (line within its block)
+  print("\n")
+
+  // Block state transitions: acquire left block 2 UNAVAILABLE (2); set it RECYCLABLE (1).
+  print(rtBlockState(space, 2))          // 2
+  print("\n")
+  rtSetBlockState(space, 2, 1)
+  print(rtBlockState(space, 2))          // 1
+  print("\n")
+
+  // Line mark transitions: line 261 starts unmarked, mark it, a neighbor stays unmarked.
+  print(rtLineMarked(space, 261))        // 0
+  print("\n")
+  rtMarkLine(space, 261)
+  print(rtLineMarked(space, 261))        // 1
+  print("\n")
+  print(rtLineMarked(space, 262))        // 0
+  print("\n")
+
+  // Pool exhaustion: 3 blocks handed out; take the remaining 5 (the last is block 7, non-null), then the
+  // next request finds the pool empty and returns null.
+  var last = RawPtr.null
+  var i = 0
+  while i < 5 {
+    last = rtAcquireBlock(space)
+    i = i + 1
+  }
+  print(last.isNull)                     // 0  (block 7, the last real block)
+  print("\n")
+  let over = rtAcquireBlock(space)
+  print(over.isNull)                     // 1
+  print("\n")
+}

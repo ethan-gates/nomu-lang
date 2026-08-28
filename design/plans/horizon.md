@@ -23,8 +23,13 @@ call-graph closure check; remaining: codegen barrier/poll guards, `nosplit`, mod
 **150.1 (NoGC) complete** (self-hosted allocator is a selectable plan, `NOMU_GC_PLAN=nomu`, byte-identical
 to MMTk NoGC) and **150.2 (mark-verify) substantially built** (150.2.1–150.2.8; the tracer, self-hosted
 pcsp walk, and MMTk-side fingerprint oracle — full-runtime root-scanning integration handed to 128.3).
-**128.3.1** (self-hosted parked-fiber walk) built + oracle-checked; scheduler-root (`rt_sched_head`)
-remaining. **Next: 150.3 (Immix).** Tests: `tools/{raw-mem,typed-ptr,raw-struct,subset,bump-alloc,rt-prelude,selfhost-gc,mark-verify,mark-verify-oracle,walk-mark,walk-multiframe,walk-parked}.sh`.
+**128.3.1** (self-hosted parked-fiber walk + scheduler-root) built + oracle-checked. **150.3 (Immix) in
+progress — 150.3.1–150.3.6 built** (region substrate + `RawPtr.toInt()`; region-structured allocator +
+LOS; line marking + verifier + `RawPtr.gcSelfhostSpace()`; **sweep reclamation — the first functioning
+self-hosted collector**, non-moving, hole-aware reuse; forwarding word + copy primitive, payload-word-0
+guard clean); **150.3.7 (evacuation + pointer fixup) next.** Whole-program automatic collection at a real
+STW is 128.3.2. Tests:
+`tools/{raw-mem,typed-ptr,raw-struct,subset,bump-alloc,rt-prelude,selfhost-gc,mark-verify,mark-verify-oracle,walk-mark,walk-multiframe,walk-parked,sched-root,immix-region,immix-alloc,immix-los,immix-line-mark,immix-sweep,immix-forward}.sh`.
 
 - [125 Unsafe raw memory](tasks/125-unsafe-raw-memory.md) — the raw-pointer / untyped-memory surface the
   collector and allocator manipulate. The first hard prerequisite. (Its earlier "byte buffer for
@@ -55,12 +60,26 @@ MMTk integration, one level down):
   reclamation policy changes. The ladder doubles as the experiment — real footprint/throughput numbers
   for Immix and GenImmix in Nomu tell us whether LXR's extra complexity earns its keep.
 
+**The ladder pauses at Immix, and the scheduler self-host is interleaved before GenImmix.** Rung 3 Immix
+is a real functioning collector — it reclaims and moves — so it is a natural resting point. At that point
+the work turns to the scheduler half (128.1), for two reasons that make the interleave the right order:
+GenImmix's stop-the-world over all mutators (128.3.2) reads every running carrier's saved safepoint
+context, which is the self-hosted scheduler's machinery; and the generational write barrier co-designs
+with the mutator/carrier path. So the order is **Immix (150.3) → scheduler self-host (128.1) → GenImmix
+(150.4) → retire MMTk → LXR (127)**. Immix runs hosted on the existing C scheduler in the meantime;
+GenImmix lands on the self-hosted one.
+
 ## Later under self-hosting — the scheduler + bootstrap floor
 
 - The M:N scheduler in Nomu and the per-arch **bootstrap assembly floor** (context switch, entry / TLS /
-  stack setup) stay under [128](tasks/128-self-hosting-runtime.md). The GC ladder can run hosted alongside
-  the existing runtime first; the bootstrap floor pairs with self-hosting the scheduler.
+  stack setup) stay under [128](tasks/128-self-hosting-runtime.md), and now come **after Immix, before
+  GenImmix** (the interleave above). The GC ladder runs hosted alongside the existing runtime through
+  Immix; the bootstrap floor pairs with self-hosting the scheduler.
   [104 fiber stacks](tasks/104-fiber-stack-strategy.md) rides that later work.
+- **MMTk retires after self-hosted GenImmix.** With GenImmix reclaiming + moving generationally in Nomu
+  and matching the MMTk GenImmix oracle, the MMTk/Rust collector is removed as the production path (kept as
+  a test oracle is a separate open question, `selfhosted-gc.md` §7). LXR (127) then proceeds inside the
+  self-hosted runtime.
 
 ## In parallel — frontend + stdlib, independent of the runtime work
 

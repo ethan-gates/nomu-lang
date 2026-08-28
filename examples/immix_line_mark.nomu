@@ -1,0 +1,44 @@
+// Task 150 · rung 3 (Immix), increment 150.3.4 — line marking (diagnostic). The tracer marks the live set
+// (header bit 32, as rung 2) and additionally marks the lines each live in-heap object spans. No reclaim,
+// no move — a checkpoint like mark-verify, proving line marking before 150.3.5 reclaims by it.
+//
+// Seeded from an Array<Box> (50 boxes): the live set is the handle + the pointer buffer (spanning several
+// lines) + the 50 Box objects (fixed, one line each, packed a few per line) — exercising both the fixed
+// (kind 0) and variable-size (kind 1) span computations. rtLineMarkCheck then re-derives the line set
+// independently and confirms completeness (every live object sits on marked lines) and soundness (no line
+// marked beyond the live footprint). Runs under NOMU_GC_PLAN=nomu — line marking is a self-hosted-heap
+// concept (the space descriptor is null under MMTk plans). Object marking + fingerprint are the same logic
+// rung 2's mark-verify already checks cross-plan.
+//
+// Expected output: TOTAL 52 / LINECHECK 0 / LINES>0 1.
+class Box {
+  var v: Int
+}
+fun main() {
+  var xs: Array<Box> = []
+  var i = 0
+  while i < 50 {
+    xs.append(Box(v: i))
+    i = i + 1
+  }
+
+  let space = RawPtr.gcSelfhostSpace()
+  let tcount = RawPtr.gcTypeCount()
+  let counts = RawPtr.alloc(bytes: tcount * 8, align: 8)
+  let fp = RawPtr.alloc(bytes: 8, align: 8)
+
+  let total = rtMarkVerifyImmix(space, addrOf(xs), counts, fp)
+  print("TOTAL ")
+  print(total)                    // 52 (handle + buffer + 50 Boxes)
+  print("\n")
+
+  let status = rtLineMarkCheck(space, addrOf(xs))
+  print("LINECHECK ")
+  print(status)                   // 0 (complete + sound)
+  print("\n")
+
+  let lc = rtCountMarkedLines(space)
+  print("LINES>0 ")
+  print(lc > 0)                   // 1 (lines were actually marked)
+  print("\n")
+}

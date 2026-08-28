@@ -649,6 +649,10 @@ final class SSAIRToLLVM {
             return LLVMBuildICmp(b, LLVMIntEQ, val(args[0]), LLVMConstPointerNull(e.i8ptr), "ptr.isnull")
         case "__ptrEq":
             return LLVMBuildICmp(b, LLVMIntEQ, val(args[0]), val(args[1]), "ptr.eq")
+        case "__rawToInt":
+            // A RawPtr (addrspace(0)) → its numeric address as an Int (ptrtoint). Sound on raw memory (the
+            // Immix heap + side tables are addrspace(0)); the collector uses it for addr→index math (150.3.1).
+            return LLVMBuildPtrToInt(b, val(args[0]), e.i64, "raw.toint")
         // GC type-table reads (task 150 rung 2): reach the codegen-emitted per-type-id side tables from
         // Nomu through the existing runtime accessors (`c-types.md` §1/§3.2). Pure gc-leaf reads — the
         // Nomu tracer describes an object's layout through the same tables the MMTk binding reads.
@@ -692,6 +696,17 @@ final class SSAIRToLLVM {
             // linked in); the load yields the mailbox object pointer the C root scan reports at the same point.
             let g = LLVMGetNamedGlobal(e.mod, "rt_sched_head") ?? LLVMAddGlobal(e.mod, e.i8ptr, "rt_sched_head")
             return LLVMBuildLoad2(b, e.i8ptr, g, "gc.schedhead")
+        case "__gcSelfhostSpace":
+            // Task 150 rung 3: load the codegen-internal global `__nomu_selfhost_space` (the Immix space
+            // descriptor the alloc seam lazily creates under NOMU_GC_PLAN=nomu). Get-or-add with the same
+            // internal linkage + null initializer the seam uses, so both sites share one global.
+            let g = LLVMGetNamedGlobal(e.mod, "__nomu_selfhost_space") ?? {
+                let ng = LLVMAddGlobal(e.mod, e.i8ptr, "__nomu_selfhost_space")!
+                LLVMSetInitializer(ng, LLVMConstPointerNull(e.i8ptr))
+                LLVMSetLinkage(ng, LLVMInternalLinkage)
+                return ng
+            }()
+            return LLVMBuildLoad2(b, e.i8ptr, g, "gc.selfhostspace")
         case "__gcTypeCount":
             let g = LLVMGetNamedGlobal(e.mod, "nomu_gc_typemap_count") ?? LLVMAddGlobal(e.mod, e.i64, "nomu_gc_typemap_count")
             return LLVMBuildLoad2(b, e.i64, g, "gc.tcount")

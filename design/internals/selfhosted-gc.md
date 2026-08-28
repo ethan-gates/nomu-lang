@@ -7,8 +7,9 @@ under 128, and [127 LXR](../plans/tasks/127-lxr-collector.md) is the final rung.
 **Decided**, **Leaning**, **Deferred**, **Open**.
 
 **Scope of this draft.** The **ladder architecture + methodology**, the **shared substrate** that carries
-across every rung, and **rung 1 (NoGC)** in depth — the build-now deliverable. Rungs 2–4 are specified at
-sketch depth (the task card holds their ordering rationale); they deepen as each is reached.
+across every rung, **rung 1 (NoGC)** in depth (§3), **rung 2 (mark-verify)** built with a per-increment
+log (§9), and **rung 3 (Immix)** in depth (§10) — the current build target. Rung 4 (GenImmix) stays at
+sketch depth (§4) and deepens when reached, after the scheduler self-host (`horizon.md`).
 
 **Rung 1 progress — slice A built.** The bump-allocator **policy** is written in Nomu over the 125 raw
 surface, under 149's subset rules: a `RawPtr` control block holds `{ base, cursor, limit }` (metadata in
@@ -205,7 +206,8 @@ allocation, header, or per-carrier-state bug, with nothing else in scope.
 - **Rung 3 · Immix (non-generational).** The first collector that reclaims and moves: line/block
   reclamation, evacuation (copy + pointer fixup), region management. With liveness trusted from rung 2, a
   bug localizes to reclaim / move / region. The region machinery is the large reusable piece — it carries
-  into GenImmix and LXR. Diff against MMTk Immix.
+  into GenImmix and LXR. Diff against MMTk Immix. **In depth: §10** (mark-verify built, so rung 3 is the
+  current rung).
 - **Rung 4 · GenImmix.** Add the nursery, the write barrier (fill `__nomu_write_barrier` with Nomu
   logging logic — the header's logged bit is already co-designed for a one-GEP reach, `backend.md`), and
   the remembered set. Self-hosted Immix is the reference; the only new variable is the generational
@@ -457,3 +459,254 @@ fingerprint diff are complete and oracle-checked.** ("Increment N" below = subta
   cross-run fingerprint diff cannot serve, since a concurrent program's two runs may reach different heaps).
 - **Next on the collector-policy ladder:** rung 3 (Immix) — reclaim + move (line/block reclamation,
   evacuation + pointer fixup, region management), driven off the existing C STW handshake while hosted.
+
+## 10. Rung 3 — Immix, in depth
+
+**Ladder placement (Decided).** Immix is where the self-hosted collector first reclaims and moves, so it
+is a real functioning GC and the ladder's pause point: after it the work turns to the scheduler half
+(128.1), then GenImmix (150.4) lands on the self-hosted scheduler, then MMTk retires (`horizon.md`, the
+150 card). Rung 3 runs **hosted on the existing C runtime** — the C STW handshake and, where the
+self-hosted STW-over-all-mutators walk is still absent (128.3.2, blocked on the scheduler), the proven
+root walk over stopped/deterministic contexts. It reuses the rung-2 tracer (`rtMarkVerify`) for liveness,
+so a rung-3 bug localizes to one of three added mechanisms: reclaim, move, or region management. The
+oracle is MMTk's non-generational Immix, through the existing byte-identical-under-evacuation harness
+(`arr-gc` / `gc-stress`) with the self-hosted plan as the collecting leg.
+
+**What rung 3 adds over mark-verify.** Mark-verify traced, marked, and fingerprinted on a monotonically
+growing heap. Rung 3 turns the heap into reclaimable, defragmenting regions and adds three mechanisms:
+region-structured allocation (§10.2–10.3), line/block reclamation (§10.5), and evacuation with pointer
+fixup (§10.6–10.7). The object model, the tracer's slot-walk, the pcsp root walk, and the header mark bit
+carry in unchanged.
+
+### 10.1 Match MMTk's Immix geometry (Decided)
+
+The self-hosted Immix uses the same region constants as MMTk's Immix so the differential is
+apples-to-apples and a divergence points at policy, keeping geometry out of the variable set:
+- **Block** — 32 KiB, the unit acquired from and returned to the block pool.
+- **Line** — 256 bytes, the unit of reclamation inside a block (128 lines per block).
+- **Large-object threshold** — read from the same `__nomu_max_non_los` the codegen fast path already
+  publishes (`gcbinding/lib.rs`): objects above it go to a separate non-moving large-object space (LOS),
+  since the copy allocator cannot evacuate an object larger than the line/block bound. The self-hosted LOS
+  is a coarse page-granular free list at first (§10.3).
+
+Blocks come from the 125 off-heap surface (`RawPtr.alloc`), the same source rung 1 uses for its arena;
+Immix carves them into lines rather than one linear bump region.
+
+### 10.2 Region metadata (Decided: side tables in Nomu)
+
+Immix needs per-line and per-block state: line mark marks (live/free), block state (free / recyclable /
+unavailable), and per-block free-line bookkeeping. Two placements were considered:
+- **In-band block headers** — reserve the first line(s) of each block for its metadata. Keeps metadata
+  next to the data (cache-local on sweep) and costs a slice of every block.
+- **Side tables keyed by block/line index** — a separate metadata region indexed by `(addr − heapBase) /
+  lineSize`, mirroring MMTk's side-metadata layout.
+
+**Decided: side tables**, because it matches MMTk's structure (easing the diff), keeps object layout
+identical to rung 1/2 (the tracer and fingerprint stay untouched), and generalizes to the mark/forwarding
+side metadata GenImmix and LXR add. The line mark table is one byte per 256-byte line (0.4% overhead);
+the block table is one entry per 32 KiB. Both are allocated once over 125 raw memory at heap init, sized
+to the reserved address range.
+
+### 10.3 Allocation into recyclable space
+
+The bump path becomes a **hole-aware bump**: allocate linearly inside a run of contiguous free lines (a
+hole), and when the hole is exhausted find the next hole in the current recyclable block, or acquire a
+fresh block from the pool. This is the standard Immix allocator shape:
+- **Small objects (≤ line)** — the normal allocator: bump within the current hole, advance to the next
+  hole / block on overflow.
+- **Medium objects (> line, ≤ threshold)** — an **overflow allocator** that goes straight to fresh
+  (fully empty) blocks, so a large object never has to fit in the small gaps of a recyclable block.
+- **Large objects (> `__nomu_max_non_los`)** — the LOS: allocate whole pages, never moved, marked in
+  place, reclaimed as whole allocations.
+
+The per-carrier state rung 1 established (cursor/limit) generalizes to per-carrier `(cursor, limit,
+currentBlock, currentHole)`; the no-hoist-across-safepoint contract on the cursor/limit load
+(`runtime.md` §6) is unchanged. First cut may run single-carrier (as rung 1 did) and generalize with the
+scheduler work.
+
+### 10.4 Marking and line marking
+
+Object marking already exists — the rung-2 tracer sets header bit 32 and walks slots through the type-id
+tables (`rtMarkVerify`). Rung 3 adds **line marking**: as each live object is marked, mark the line(s) it
+occupies in the line mark table. The object's exact bounds are known (start address + size from the
+type-id tables), so lines are marked precisely; Immix's conservative "mark one extra line" convention (to
+cover an object that abuts the next line) is available as a fallback if a precise-bounds edge case
+appears. A block with no marked lines after tracing is wholly dead; a block with some marked and some free
+lines is **recyclable**; a block with all lines marked is **unavailable** this cycle.
+
+### 10.5 Reclamation (sweep)
+
+After tracing, sweep the line mark table per block:
+- **Free lines** (unmarked) rejoin their block's holes for the next allocation cycle.
+- **Free blocks** (no marked line) return to the block pool for reuse; returning empty blocks to the OS
+  (madvise/decommit) is a footprint follow-up (§7, Open).
+- **Recyclable blocks** (mixed) are queued for the hole-aware allocator to fill next cycle.
+Reclamation is the mechanism that distinguishes a leak (a marked-live line never freed) from an
+early-free (a reachable object's line swept), and those fail distinguishably against the oracle: a leak
+grows the heap past MMTk's, an early-free corrupts a live object the fingerprint/output then catches.
+
+### 10.6 Evacuation (defragmentation)
+
+Immix copies to defragment when fragmentation warrants it. The self-hosted scheme mirrors MMTk's
+forward-during-trace:
+1. **Select source blocks.** Before tracing, choose fragmented blocks (few live lines, many holes) as
+   evacuation candidates, budgeted against available free blocks (evacuate only what fresh blocks can
+   absorb — the `__nomu_max_non_los`/copy-reserve bound the binding already respects).
+2. **Copy on first visit.** When the tracer reaches a live object in a candidate block that is not yet
+   copied, allocate a fresh slot (the copy allocator, into non-candidate blocks), `memcpy` the object,
+   and install a **forwarding record** in the original (§10.8).
+3. **Fix up pointers.** The referring slot the tracer came through is rewritten to the new address; every
+   later reference to the same object reads the forwarding record and is rewritten too. Because the
+   self-hosted tracer already walks every managed slot (`rtMarkVerify`), the evacuating variant writes the
+   forwarded address back into each slot as it visits it — one store added to the existing slot walk.
+
+Non-candidate blocks are marked in place exactly as §10.4–10.5; only objects in candidate blocks move.
+This is the "opportunistic evacuation" that makes Immix a mostly-non-moving collector with defragmentation
+when needed.
+
+### 10.7 Pointer fixup — one store on the existing slot walk
+
+The tracer's slot walk (fixed-object managed-offset map; array-buffer per-element map) is the exact place
+fixup happens: for each managed slot, read the child, follow its forwarding record if forwarded, mark the
+target, and store the (possibly updated) pointer back. Roots are fixed the same way — the pcsp walk
+(`rtWalkFrom` / `rtCollectRoots`) already yields the address of each root slot, so a forwarded root's slot
+is rewritten in place. This keeps fixup as a small delta on machinery rung 2 built, rather than a new pass.
+
+### 10.8 Forwarding record — where it lives (Decided: pointer in payload word 0, state in header high bits)
+
+Evacuation needs, per object, a forwarding state (not-forwarded / being-forwarded / forwarded) and, once
+forwarded, the new address. The header's low 32 bits hold the type-id and bit 32 holds the mark; the
+remaining high bits are free but too few for a full pointer. Options:
+- **Forwarding pointer in the original's first payload word, 2 state bits in the header high bits.** The
+  object is copied before the original is clobbered, so overwriting payload word 0 of the *stale* copy is
+  safe; the tracer reads the state bits, and if forwarded, reads word 0 for the target. Matches the
+  classic Immix/MMTk forwarding-word approach.
+- **Forwarding pointer in a side table** keyed by object address. Keeps the object bytes untouched
+  (simpler to reason about) at the cost of a second side structure and a lookup per reference.
+
+**Decided: pointer-in-payload-word-0 + 2 header state bits** — it needs no new side structure, the state
+bits sit in already-free header space, and it matches the oracle's layout. Single-threaded first cut needs
+no atomics on the state bits; the being-forwarded state and a CAS are added when the collector runs
+concurrently (post-scheduler). The one guard is a build-time check that no managed type is smaller than
+one payload word (150.3.6 verifies this against the type tables; header + ≥1 field holds for every managed
+type today).
+
+### 10.9 STW and the collection driver (Decided: hosted on the C handshake)
+
+Rung 3 does not bring up its own stop-the-world. It runs the collection body between the existing C
+`nomu_gc_stop_the_world` and `resume_the_world` (`gcbinding/lib.rs`, `runtime.c`), the handshake M6 built
+and `gc-smoke-stw` validates. The self-hosted collection is: stop → collect roots (the pcsp walk over each
+stopped context; single-thread/deterministic fixtures first, since STW-over-all-mutators self-hosted
+scanning is 128.3.2, blocked on 128.1) → trace + mark + line-mark + evacuate → sweep → resume. When the
+self-hosted scheduler lands, the same collection body drives off the self-hosted STW with no change to the
+collector logic — the driver swaps, the policy holds.
+
+### 10.10 Relationship to 125 and 149 — the moving-heap gate opens here
+
+Rung 3 is where 125 §3.3 (interior raw pointers into a moving heap) first bites: evacuation holds raw
+pointers into the from-space and to-space across the copy, and the sweep holds raw line/block pointers
+across reclamation. The guarantee that makes this valid is the **`noSafepoint` region** (149): the
+collection body runs with no safepoint, so no other party moves the heap under these raw pointers. Rung 3
+closes 125's deferred moving-heap gate by being its first real client, the way rung 1 was 149's first
+client. The collector stays subset code: it allocates through 125 (block pool, side tables), never through
+`__nomu_gc_alloc`, and takes no compiler-inserted safepoint on the collection path.
+
+### 10.11 Testing — the differential, now with a collecting leg
+
+- **Byte-identical under evacuation.** `arr-gc` / `gc-stress` run under `NOMU_GC_PLAN=nomu` (self-hosted
+  Immix) and MMTk Immix; output must match byte-for-byte, and the heap must shrink after collection rather
+  than grow monotonically (the rung-1/2 invariant inverts here — reclamation is now expected).
+- **A fragmentation fixture.** A program that allocates, drops interleaved objects to fragment blocks,
+  then forces a collection (`RawPtr.gcForceCollect()`, built at 150.2.8) — asserting live objects survive
+  at new addresses (evacuation happened), dead lines/blocks were reclaimed (heap shrank), and output
+  matches the MMTk Immix leg.
+- **Fingerprint still holds.** The rung-2 address-independent fingerprint (§6) is invariant under
+  evacuation by construction (it excludes addresses), so it stays a live check that evacuation moved
+  bytes faithfully and fixed up every pointer — a missed fixup dangles and diverges the fingerprint or
+  faults.
+- **Unit level.** Line marking, hole finding, block state transitions, and the forwarding record are each
+  testable in isolation over a `RawPtr` block, independent of a full collection.
+
+### 10.12 What rung 3 excludes
+
+No nursery, no write barrier, no remembered set — the generational layer is rung 4 (GenImmix), which lands
+after the scheduler self-host. The `__nomu_write_barrier` hook stays inert through rung 3 (Immix is
+non-generational, `c-types.md`). Returning empty blocks to the OS is a footprint follow-up (§7). Concurrent
+/ parallel collection (multiple GC workers, atomic forwarding) is out of scope; the first cut collects on
+one worker under STW, and the concurrency comes with the scheduler.
+
+### 10.13 First-cut scope (Decided) and remaining tuning
+
+**First-cut scope, locked:** single-carrier allocator + collection (generalize per-carrier with the
+scheduler, 128.1); force-evacuate all candidate blocks for a deterministic diff before tuning a
+fragmentation trigger; collection driven by `RawPtr.gcForceCollect()` on single-thread/deterministic
+fixtures (STW-over-all-mutators is 128.3.2, blocked on the scheduler); forwarding record as §10.8. These
+match the rung-1/rung-2 discipline (single-arena first, deterministic force-collect) and keep every
+increment diffable against MMTk Immix.
+
+Remaining tuning, deferred inside rung 3 (each with the MMTk Immix oracle):
+- **Copy reserve / evacuation budget** — how many blocks to hold back so evacuation never runs out of
+  to-space mid-collection (MMTk reserves a fraction; pick and validate). Addressed at 150.3.8.
+- **Defragmentation trigger** — the fragmentation threshold and block-selection order that replace
+  force-all. Addressed at 150.3.8.
+- **LOS reclamation granularity** — page-granular free list first; coalescing only if large-object churn
+  in the fixtures demands it.
+
+### 10.14 Increment ladder (150.3.1–150.3.8)
+
+Rung 3 comes up in eight increments, each one mechanism with an oracle, mirroring the rung-2 ladder
+(150.2.1–150.2.8). Canonical list + status in the 150 card's **## Subtasks**; the shape:
+1. **150.3.1 — region substrate. Built.** Block pool over 125 + side metadata tables (line marks, block
+   state), unit-tested (carve, index math, state transitions); no allocation change yet. Prelude
+   `rtImmixNew` / `rtBlockAddr` / `rtBlockIndexOf` / `rtLineIndexOf` / `rtBlockState` / `rtSetBlockState` /
+   `rtLineMarked` / `rtMarkLine` / `rtClearLine` / `rtAcquireBlock`; byte-per-entry line/block tables over
+   zero-filled 125 memory; one new intrinsic `RawPtr.toInt()` (ptrtoint) for addr→index math.
+   `examples/immix_region.nomu` + `tools/immix-region.sh`.
+2. **150.3.2 — region-structured allocator. Built.** `rtImmixAlloc`: 8-align, bump within the current
+   32 KiB block, refill a fresh block from the pool on overflow; routed behind the codegen
+   self-hosted-alloc seam under `NOMU_GC_PLAN=nomu` (`nomuSelfhostAlloc`, 8192-block / 256 MiB space).
+   Non-collecting, heap grows. Byte-identical to MMTk NoGC across `selfhost-gc` (classes/closures/arrays/
+   heavy) and a 3-block-crossing fixture (`examples/immix_alloc.nomu` + `tools/immix-alloc.sh`). Hole
+   reuse *within* swept blocks (line-granular hole scan) is not needed until recyclable blocks exist, so it
+   lands with reclamation (150.3.5); objects larger than a block need the LOS (150.3.3).
+3. **150.3.3 — large-object space (LOS). Built.** `rtLosAlloc`: an object larger than a block is allocated
+   whole off-heap with an 8-byte link word ahead of it, linked off the space's `losHead` for later
+   reclamation, never moved; `rtImmixAlloc` routes `need > 32768` there. First-cut LOS threshold is the
+   block size (32 KiB) — objects that cannot fit a block; aligning it with MMTk's `__nomu_max_non_los` (so
+   near-block objects also skip blocks) is an evacuation-efficiency tuning item (150.3.7), and the
+   medium-object *overflow allocator* (routing >line objects to fresh blocks to avoid small holes) only
+   matters once swept recyclable blocks exist, so it folds into 150.3.5. Validated by a large `Array<Int>`
+   whose buffer grows past a block into the LOS (`examples/immix_los.nomu` + `tools/immix-los.sh`),
+   byte-identical to MMTk NoGC.
+4. **150.3.4 — line marking (diagnostic). Built.** `rtMarkVerifyImmix` traces as rung 2 and additionally
+   marks each live *in-heap* object's lines (`rtMarkObjLines`; LOS objects header-marked only). A new
+   intrinsic `RawPtr.gcSelfhostSpace()` reaches the space the objects live in. `rtLineMarkCheck`
+   independently re-derives the line set (unmark-walk) and confirms completeness (every live object on
+   marked lines) + soundness (marked-line count == live footprint), returning 0. No reclaim — a checkpoint
+   like mark-verify; object marking + fingerprint are the rung-2 logic (checked cross-plan by `mark-verify`).
+   `examples/immix_line_mark.nomu` + `tools/immix-line-mark.sh` (Array<Box>, 52 live, LINECHECK 0).
+5. **150.3.5 — sweep reclamation (non-moving). Built — the first functioning self-hosted collector.**
+   `rtImmixCollect` = clear line marks → mark live (header + line marks) → reclaim by block
+   (`rtImmixSweepBlocks`: dead block → free list, mixed → recyclable, full → unavailable) → reclaim the LOS
+   by whole chunk (`rtImmixSweepLos`) → unmark → reset the allocator. The allocator became hole-aware
+   (`rtNextHole` scans free-line runs; `rtNextAllocBlock` draws reclaimed-free → recyclable → never-used),
+   so reclaimed + recyclable space is reused and the heap does not grow when garbage was collected.
+   Validated by `examples/immix_sweep.nomu` + `tools/immix-sweep.sh`: two equal garbage batches bracket a
+   collection; blocks are reclaimed, the heap does not grow across the second batch, the live set survives
+   (non-moving). Driven explicitly on a deterministic single-thread root set (as mark-verify drove the
+   tracer); driving it automatically at a real STW so whole programs (`arr-gc`/`gc-stress`) collect
+   end-to-end under `NOMU_GC_PLAN=nomu` is the driver-coupled integration (128.3.2, blocked on the
+   scheduler, §10.9). The medium-object overflow allocator (§10.3) folds in here as a later refinement; the
+   first cut skips holes too small for the request.
+6. **150.3.6 — forwarding word + copy primitive. Built.** Header bit 33 = forwarded, new address in payload
+   word 0 (§10.8). `rtCopyObject` (size read → fresh slot → `rtCopyWords` → `rtSetForwarded`),
+   `rtIsForwarded` / `rtForwardingPointer`, `rtObjSize`. `rtCheckPayloadWord` confirmed **0** types lack a
+   payload word (the §10.8 assumption holds for every managed type). Unit-tested in isolation (copy, forward,
+   read back): `examples/immix_forward.nomu` + `tools/immix-forward.sh`.
+7. **150.3.7 — evacuation + pointer fixup.** Forward-during-trace (force-all candidates), rewrite slots
+   and roots. Fragmentation fixture; diff under evacuation; fingerprint invariant catches a missed fixup.
+8. **150.3.8 — copy reserve + defrag trigger.** Make evacuation safe against to-space exhaustion, then
+   replace force-all with a fragmentation threshold. `gc-stress` under pressure, diff vs MMTk Immix.
+
+Then rung 3 is complete as a hosted collector; the multi-mutator STW that drives it in a real concurrent
+program is 128.3.2, after the scheduler (128.1).

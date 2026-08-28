@@ -1,0 +1,39 @@
+// Task 150 · rung 3 (Immix), increment 150.3.6 — forwarding word + copy primitive, in isolation. The
+// mechanism evacuation (150.3.7) rests on: copy an object to a fresh slot, install a forwarding record in
+// the original (header bit 33 + new address in payload word 0), and read it back. No tracing, no live
+// evacuation yet — just the primitive.
+//
+// Compiled with NOMU_NO_ESCAPE=1 (heap object for addrOf), run under NOMU_GC_PLAN=nomu (the self-hosted
+// heap the copy is allocated into).
+//
+// Expected output: 12345 / 1 / 1 / 0 / 0.
+class Box {
+  var v: Int
+}
+fun main() {
+  let b = Box(v: 12345)
+  let space = RawPtr.gcSelfhostSpace()
+  let src = addrOf(b)
+
+  let copy = rtCopyObject(space, src)
+
+  // the copy holds the same payload
+  let vCopy: Int = copy.load(fromByteOffset: 8)
+  print(vCopy)                     // 12345
+  print("\n")
+
+  // the original is now forwarded to the copy
+  print(rtIsForwarded(src))        // 1
+  print("\n")
+  let fwd = rtForwardingPointer(src)
+  print(fwd.eq(copy))              // 1
+  print("\n")
+
+  // the copy itself is not forwarded
+  print(rtIsForwarded(copy))       // 0
+  print("\n")
+
+  // every managed type has a payload word 0 to hold the forwarding pointer (§10.8 guard)
+  print(rtCheckPayloadWord())      // 0
+  print("\n")
+}

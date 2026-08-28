@@ -1,0 +1,29 @@
+// Task 150 · rung 3 (Immix), increment 150.3.3 — the large-object space (LOS). An Array<Int> grown by
+// appending reallocates a doubling buffer; once the buffer exceeds a 32 KiB block (past ~4094 Ints) it can
+// no longer fit the block allocator, so under NOMU_GC_PLAN=nomu it routes to the LOS (rtLosAlloc): a whole
+// off-heap chunk, linked for later reclamation, never moved. 5000 appends force several such large buffers.
+//
+// The sum + a read of the last element prove the large LOS buffer is valid and readable across growth.
+// Output must be byte-identical under MMTk NoGC (the oracle) and the self-hosted allocator — non-collecting.
+//
+// Expected output: 5000 / 12497500 / 4999.
+fun main() {
+  var xs: Array<Int> = []
+  var i = 0
+  while i < 5000 {
+    xs.append(i)
+    i = i + 1
+  }
+  var sum = 0
+  var j = 0
+  while j < xs.count {
+    sum = sum + xs[j]
+    j = j + 1
+  }
+  print(xs.count)     // 5000
+  print("\n")
+  print(sum)          // 0 + 1 + … + 4999 = 12497500
+  print("\n")
+  print(xs[4999])     // 4999  (read back from the large LOS buffer)
+  print("\n")
+}
