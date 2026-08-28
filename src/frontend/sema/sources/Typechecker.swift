@@ -7,6 +7,7 @@ public struct Typechecker {
     private var typeKinds: [String: DeclKind] = [
         "Int": .builtin,
         "UInt8": .builtin,
+        "UInt64": .builtin,
         "Bool": .builtin,
         "String": .builtin,
     ]

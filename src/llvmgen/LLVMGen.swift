@@ -125,6 +125,7 @@ final class LLVMGen {
     let dwFloat: LLVMDWARFTypeEncoding = 4        // DW_ATE_float
     let dwBoolean: LLVMDWARFTypeEncoding = 2      // DW_ATE_boolean
     let dwUnsignedChar: LLVMDWARFTypeEncoding = 8 // DW_ATE_unsigned_char
+    let dwUnsigned: LLVMDWARFTypeEncoding = 7     // DW_ATE_unsigned
 
     // Runtime-fn declarations + the inert mutator seams (`__nomu_poll`/`__nomu_gc_alloc`/
     // `__nomu_write_barrier`), cached once each.
@@ -135,6 +136,7 @@ final class LLVMGen {
     var barrierFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var stopWorldGlobalCache: LLVMValueRef?
     var intFmt: LLVMValueRef?
+    var uintFmt: LLVMValueRef?
     var strFmt: LLVMValueRef?
     // §6.6 — inline the allocation bump fast path; `NOMU_NO_INLINE_ALLOC` reverts to the out-of-line
     // `rt_alloc` tail-call for A/B measurement.

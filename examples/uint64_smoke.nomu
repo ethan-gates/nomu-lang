@@ -1,0 +1,46 @@
+// Smoke test for the UInt64 type + putByte intrinsic — the primitives an in-source
+// small-string type builds on. Packs bytes into a 64-bit word, extracts them, emits
+// them one byte at a time, and exercises wrapping arithmetic + unsigned compare/shift.
+
+fun main() {
+    // Pack "Hi!\n" into one UInt64, little-endian byte order.
+    var w: UInt64 = 0
+    let h: UInt8 = 72     // 'H'
+    let i: UInt8 = 105    // 'i'
+    let bang: UInt8 = 33  // '!'
+    let nl: UInt8 = 10    // '\n'
+    let b0 = h.uint64 << 0
+    let b1 = i.uint64 << 8
+    let b2 = bang.uint64 << 16
+    let b3 = nl.uint64 << 24
+    w = w | b0
+    w = w | b1
+    w = w | b2
+    w = w | b3
+
+    // Extract each byte (logical right shift + mask) and emit it.
+    var k: UInt64 = 0
+    while k < 4 {
+        let shift = k * 8
+        let sh = w >> shift
+        let masked = sh & 255
+        let byte = masked.uint8
+        putByte(byte)
+        k += 1
+    }
+
+    // Wrapping arithmetic + all-ones via ~, printed as unsigned.
+    let zero: UInt64 = 0
+    let ones: UInt64 = ~zero    // 2^64 - 1
+    print(ones)                 // 18446744073709551615
+    let wrapped: UInt64 = ones + 1
+    print(wrapped)              // 0 (wraps, no trap)
+
+    // Unsigned comparison: ones is the max value, so ones > 5 holds.
+    if ones > 5 { print(1) } else { print(0) }   // 1
+
+    // Round-trip Int <-> UInt64.
+    let n: Int = 4096
+    let back: Int = n.uint64.int
+    print(back)                 // 4096
+}

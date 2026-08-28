@@ -136,6 +136,13 @@ extension LLVMGen {
         return f
     }
 
+    func uintFormat() -> LLVMValueRef {
+        if let f = uintFmt { return f }
+        let f = LLVMBuildGlobalStringPtr(b, "%llu", "fmt_uint")!
+        uintFmt = f
+        return f
+    }
+
     func strFormat() -> LLVMValueRef {
         if let f = strFmt { return f }
         let f = LLVMBuildGlobalStringPtr(b, "%.*s", "fmt_str")!

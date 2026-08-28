@@ -82,7 +82,7 @@ final class BitwiseTests: XCTestCase {
     func testBitwiseRejectsDouble() {
         let r = sema("fun f() -> Double { return 1.0 & 2.0 }")
         XCTAssertTrue(r.diagnostics.hasErrors)
-        XCTAssertTrue(r.diagnostics.render().contains("Int or UInt8"), r.diagnostics.render())
+        XCTAssertTrue(r.diagnostics.render().contains("Int, UInt8, or UInt64"), r.diagnostics.render())
     }
 
     // `-x`, `!x`, `~x` lower to binary forms in Sema (no unary node reaches NOIR).

@@ -30,7 +30,7 @@ public struct Shareability {
 
     public func isShareable(_ t: Type, visiting: Set<String> = []) -> Bool {
         switch t {
-        case .int, .uint8, .double, .bool, .string, .named(_, .actor_):
+        case .int, .uint8, .uint64, .double, .bool, .string, .named(_, .actor_):
             return true
         case .rawPtr, .ptr:
             // A raw pointer is one unmanaged addrspace(0) word — shareable like an Int, regardless of

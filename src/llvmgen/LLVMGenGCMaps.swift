@@ -105,7 +105,7 @@ extension LLVMGen {
     func rawStride(_ t: Type) -> Int {
         switch t {
         case .uint8, .bool:                 return 1
-        case .int, .double, .rawPtr, .ptr:  return 8
+        case .int, .uint64, .double, .rawPtr, .ptr:  return 8
         default:                            return 8
         }
     }

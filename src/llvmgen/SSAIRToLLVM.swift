@@ -424,8 +424,8 @@ final class SSAIRToLLVM {
                 e.fail("7.2.3: bitwise/shift operators are not valid on Double", span); return lv
             }
         }
-        // Integer path: signed for Int, unsigned for UInt8 — differing on div/rem, `>>`, and compares.
-        let unsigned = (l.type == .uint8)
+        // Integer path: signed for Int, unsigned for UInt8/UInt64 — differing on div/rem, `>>`, and compares.
+        let unsigned = (l.type == .uint8 || l.type == .uint64)
         switch op {
         case .add: return LLVMBuildAdd(b, lv, rv, "add")
         case .sub: return LLVMBuildSub(b, lv, rv, "sub")
@@ -600,6 +600,7 @@ final class SSAIRToLLVM {
     private func lowerDirectCall(_ name: String, _ args: [SSAValue], resultType: Type, span: Span) -> LLVMValueRef? {
         switch name {
         case "print":    return emitPrint(args, span)
+        case "putByte":  return emitPutByte(args, span)
         case "concat":   return emitConcat(args, span)
         case "sleep":    return emitSleep(args, span)
         case "readLine": return emitReadLine()
@@ -740,6 +741,12 @@ final class SSAIRToLLVM {
             return LLVMBuildFPToSI(b, rounded, e.i64, "d2i")
         case "__int_uint8_uint8": return LLVMBuildTrunc(b, val(args[0]), e.i8, "i2u8")
         case "__uint8_int_int":   return LLVMBuildZExt(b, val(args[0]), e.i64, "u82i")
+        // UInt64 conversions: Int↔UInt64 share the i64 representation (no-op reinterpret); UInt8→UInt64
+        // zero-extends, UInt64→UInt8 truncates to the low byte.
+        case "__int_uint64_uint64":     return val(args[0])
+        case "__uint64_int_int":        return val(args[0])
+        case "__uint8_uint64_uint64":   return LLVMBuildZExt(b, val(args[0]), e.i64, "u82u64")
+        case "__uint64_uint8_uint8":    return LLVMBuildTrunc(b, val(args[0]), e.i8, "u642u8")
         case "__void_timemonotonic_int": return emitTimeMonotonic(args, span)
         default:
             if Builtins.cLeaf.contains(name) { return emitCLeaf(name, args) }
@@ -799,6 +806,8 @@ final class SSAIRToLLVM {
             return e.buildCall(pf, pfty, [value])
         case .uint8:
             return e.buildCall(fn, pty, [e.intFormat(), LLVMBuildZExt(b, value, e.i64, "u82i")])
+        case .uint64:
+            return e.buildCall(fn, pty, [e.uintFormat(), value])
         case .bool:
             return e.buildCall(fn, pty, [e.intFormat(), LLVMBuildZExt(b, value, e.i64, "b2i")])
         case .string:
@@ -809,6 +818,15 @@ final class SSAIRToLLVM {
         default:
             e.fail("7.2.3: print supports Int, UInt8, Double, Bool, or String", span); return nil
         }
+    }
+
+    // putByte(b): write one raw byte to stdout via libc `putchar`. Output is libc-buffered (block- or
+    // line-buffered) and flushed on normal program exit; no explicit flush primitive is exposed.
+    private func emitPutByte(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
+        guard let arg = args.first else { e.fail("putByte expects one argument", span); return nil }
+        let (fn, fty) = e.runtimeFn("putchar", ret: e.i32, params: [e.i32], varArg: false)
+        let c = LLVMBuildZExt(b, val(arg), e.i32, "byte")
+        return e.buildCall(fn, fty, [c])
     }
 
     private func emitTimeMonotonic(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {

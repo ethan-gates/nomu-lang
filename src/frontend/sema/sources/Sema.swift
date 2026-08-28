@@ -223,6 +223,7 @@ public struct Sema {
         switch ref.name {
         case "Int":    return .int
         case "UInt8":  return .uint8
+        case "UInt64": return .uint64
         case "Double": return .double
         case "Bool":   return .bool
         case "String": return .string
@@ -1058,11 +1059,13 @@ public struct Sema {
                 let ftype = fieldType(of: b.type, field: field, at: mspan)
                 let target = NOIRExpr(type: ftype, span: mspan, kind: .fieldAccess(base: b, field: field))
                 rejectLetFieldTarget(target)
-                return NOIRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
+                // The `+=` operand takes the target's type as context, so a bare literal adopts it
+                // (`w += 1` on a UInt64 keeps the whole op UInt64) rather than defaulting to Int.
+                return NOIRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs, expected: ftype)), span: span)
             }
             let target = checkExpr(lhs)
             rejectLetFieldTarget(target)
-            return NOIRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs)), span: span)
+            return NOIRStmt(kind: .compoundAssign(target: target, value: checkExpr(rhs, expected: target.type)), span: span)
 
         case .ret(let e, let span):
             // A `some I` return is not a coercion target — it yields the concrete value
@@ -1246,6 +1249,15 @@ public struct Sema {
                 }
                 return NOIRExpr(type: .uint8, span: span, kind: .intLit(v))
             }
+            // A `UInt64` context takes a nonnegative literal directly. Literals are stored as a signed
+            // 64-bit `Int`, so values in 2^63...2^64-1 are out of literal reach — build those with `~`
+            // and shifts (e.g. `~UInt64(0)` for all-ones).
+            if expected == .uint64 {
+                if v < 0 {
+                    diags.error("integer literal '\(v)' is out of range for UInt64 (must be nonnegative)", at: span)
+                }
+                return NOIRExpr(type: .uint64, span: span, kind: .intLit(v))
+            }
             return NOIRExpr(type: .int,    span: span, kind: .intLit(v))
         case .doubleLit(let v, let span): return NOIRExpr(type: .double, span: span, kind: .doubleLit(v))
         case .boolLit(let v, let span):   return NOIRExpr(type: .bool,   span: span, kind: .boolLit(v))
@@ -1303,6 +1315,20 @@ public struct Sema {
             }
             if b.type == .uint8, field == "int" {
                 return BuiltinsSema.member("__uint8_int_int", b, span)
+            }
+            // Word conversions: `i.uint64` reinterprets Int→UInt64 (same 64 bits); `u.int` reinterprets
+            // back. `b.uint64` zero-extends UInt8→UInt64; `u.uint8` truncates UInt64→UInt8 (low 8 bits).
+            if b.type == .int, field == "uint64" {
+                return BuiltinsSema.member("__int_uint64_uint64", b, span)
+            }
+            if b.type == .uint64, field == "int" {
+                return BuiltinsSema.member("__uint64_int_int", b, span)
+            }
+            if b.type == .uint8, field == "uint64" {
+                return BuiltinsSema.member("__uint8_uint64_uint64", b, span)
+            }
+            if b.type == .uint64, field == "uint8" {
+                return BuiltinsSema.member("__uint64_uint8_uint8", b, span)
             }
 
             // String property builtins (`str.hash`). Method builtins with arguments (`str.eq(x)`)
@@ -1647,7 +1673,7 @@ public struct Sema {
     // plain addrspace(0) load/store can move; aggregates are out of the minimal floor.
     private func isRawScalar(_ t: Type) -> Bool {
         switch t {
-        case .int, .uint8, .double, .bool, .rawPtr, .ptr: return true
+        case .int, .uint8, .uint64, .double, .bool, .rawPtr, .ptr: return true
         default: return false
         }
     }
@@ -2178,6 +2204,20 @@ public struct Sema {
                 return NOIRExpr(type: .void, span: span, kind: .call(callee: irVar(name, .void, span), args: irArgs, typeArgs: []))
             }
 
+            // putByte(b: UInt8) — write one raw byte to stdout (libc-buffered, flushed at exit).
+            // The low-level output primitive a string type builds its printing on.
+            if name == "putByte" {
+                guard args.count == 1 else {
+                    diags.error("putByte expects one argument (a UInt8)", at: span)
+                    return NOIRExpr(type: .void, span: span, kind: .intLit(0))
+                }
+                let a = checkExpr(args[0].value, expected: .uint8)
+                if a.type != .uint8, a.type != .error {
+                    diags.error("putByte expects a UInt8, got '\(a.type)'", at: a.span)
+                }
+                return NOIRExpr(type: .void, span: span, kind: .call(callee: irVar(name, .void, span), args: [NOIRArg(label: nil, value: a)], typeArgs: []))
+            }
+
             if name == "time_monotonic" {
                 return NOIRExpr(type: .int, span: span, kind: .call(callee: irVar("__void_timemonotonic_int", .int, span), args: [], typeArgs:[]))
             }
@@ -2301,8 +2341,8 @@ public struct Sema {
             // Arithmetic is Int, UInt8, or Double, with no implicit conversion between them: both
             // operands must be the same numeric type (use `.double`/`.int`/`.uint8` to convert).
             func numeric(_ t: Type, _ span: Span) -> Bool {
-                if t == .int || t == .uint8 || t == .double { return true }
-                if t != .error { diags.error("arithmetic requires Int, UInt8, or Double, got '\(t)'", at: span) }
+                if t == .int || t == .uint8 || t == .uint64 || t == .double { return true }
+                if t != .error { diags.error("arithmetic requires Int, UInt8, UInt64, or Double, got '\(t)'", at: span) }
                 return false
             }
             let lok = numeric(lhs.type, lhs.span), rok = numeric(rhs.type, rhs.span)
@@ -2315,8 +2355,8 @@ public struct Sema {
             // Bitwise and shift are integer-only (Int or UInt8), operands the same type. `>>` is an
             // arithmetic shift on the signed Int and a logical shift on the unsigned UInt8 (egress).
             func integral(_ t: Type, _ span: Span) -> Bool {
-                if t == .int || t == .uint8 { return true }
-                if t != .error { diags.error("bitwise and shift operators require Int or UInt8, got '\(t)'", at: span) }
+                if t == .int || t == .uint8 || t == .uint64 { return true }
+                if t != .error { diags.error("bitwise and shift operators require Int, UInt8, or UInt64, got '\(t)'", at: span) }
                 return false
             }
             let lok = integral(lhs.type, lhs.span), rok = integral(rhs.type, rhs.span)
@@ -2350,7 +2390,7 @@ public struct Sema {
         switch op {
         case .neg:
             switch x.type {
-            case .int, .uint8:
+            case .int, .uint8, .uint64:
                 let zero = NOIRExpr(type: x.type, span: span, kind: .intLit(0))
                 return NOIRExpr(type: x.type, span: span, kind: .binary(.sub, zero, x))
             case .double:
@@ -2375,8 +2415,11 @@ public struct Sema {
             case .uint8:
                 let ones = NOIRExpr(type: .uint8, span: span, kind: .intLit(255))
                 return NOIRExpr(type: .uint8, span: span, kind: .binary(.bitXor, x, ones))
+            case .uint64:
+                let ones = NOIRExpr(type: .uint64, span: span, kind: .intLit(-1))
+                return NOIRExpr(type: .uint64, span: span, kind: .binary(.bitXor, x, ones))
             default:
-                if x.type != .error { diags.error("unary '~' requires Int or UInt8, got '\(x.type)'", at: span) }
+                if x.type != .error { diags.error("unary '~' requires Int, UInt8, or UInt64, got '\(x.type)'", at: span) }
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
         }
@@ -2386,12 +2429,16 @@ public struct Sema {
     // `b & 240` typecheck without an explicit conversion. Only a literal moves — a non-literal Int
     // never silently becomes UInt8.
     private func adoptUInt8Literal(_ op: BinOp, _ lhs: NOIRExpr, _ rhs: NOIRExpr) -> (NOIRExpr, NOIRExpr) {
-        func asUInt8(_ e: NOIRExpr) -> NOIRExpr? {
-            guard case .intLit(let v) = e.kind, e.type == .int, v >= 0, v <= 255 else { return nil }
-            return NOIRExpr(type: .uint8, span: e.span, kind: .intLit(v))
+        func asType(_ e: NOIRExpr, _ target: Type, range: ClosedRange<Int>? = nil) -> NOIRExpr? {
+            guard case .intLit(let v) = e.kind, e.type == .int, v >= 0 else { return nil }
+            if let r = range, !r.contains(v) { return nil }
+            return NOIRExpr(type: target, span: e.span, kind: .intLit(v))
         }
-        if lhs.type == .uint8, let r = asUInt8(rhs) { return (lhs, r) }
-        if rhs.type == .uint8, let l = asUInt8(lhs) { return (l, rhs) }
+        if lhs.type == .uint8, let r = asType(rhs, .uint8, range: 0...255) { return (lhs, r) }
+        if rhs.type == .uint8, let l = asType(lhs, .uint8, range: 0...255) { return (l, rhs) }
+        // A bare nonnegative Int literal adopts UInt64 against a UInt64 operand (`w << 8`, `w & 255`).
+        if lhs.type == .uint64, let r = asType(rhs, .uint64) { return (lhs, r) }
+        if rhs.type == .uint64, let l = asType(lhs, .uint64) { return (l, rhs) }
         return (lhs, rhs)
     }
 
@@ -2400,7 +2447,7 @@ public struct Sema {
     // must be the same type. Strings compare with `.eq`, not `==`; aggregates have no operator yet.
     private func checkComparison(_ lhs: NOIRExpr, _ rhs: NOIRExpr, equality: Bool, at span: Span) {
         if lhs.type == .error || rhs.type == .error { return }
-        let allowed: [Type] = equality ? [.int, .uint8, .double, .bool] : [.int, .uint8, .double]
+        let allowed: [Type] = equality ? [.int, .uint8, .uint64, .double, .bool] : [.int, .uint8, .uint64, .double]
         if lhs.type != rhs.type {
             diags.error("cannot compare '\(lhs.type)' and '\(rhs.type)'", at: span)
             return

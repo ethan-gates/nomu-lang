@@ -269,6 +269,7 @@ private final class Monomorphizer {
         switch t {
         case .int: return "Int"
         case .uint8: return "UInt8"
+        case .uint64: return "UInt64"
         case .double: return "Double"
         case .bool: return "Bool"
         case .string: return "String"

@@ -70,6 +70,7 @@ extension Type {
         case "void":   return .void
         case "int":    return .int
         case "uint8":  return .uint8
+        case "uint64": return .uint64
         case "double": return .double
         case "bool":   return .bool
         case "string": return .string

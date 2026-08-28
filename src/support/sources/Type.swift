@@ -9,6 +9,7 @@ public enum NamedKind: Equatable {
 public indirect enum Type: Equatable {
     case int
     case uint8    // an 8-bit unsigned byte; wrapping arithmetic, unsigned compares/shifts (i8)
+    case uint64   // a 64-bit unsigned word; wrapping arithmetic, unsigned compares/shifts (i64)
     case double
     case bool
     case string
@@ -32,6 +33,7 @@ extension Type: CustomStringConvertible {
         switch self {
         case .int:    return "Int"
         case .uint8:  return "UInt8"
+        case .uint64: return "UInt64"
         case .double: return "Double"
         case .bool:   return "Bool"
         case .string: return "String"

@@ -25,6 +25,7 @@ extension LLVMGen {
         switch t {
         case .int:        return i64
         case .uint8:      return i8    // an 8-bit unsigned byte
+        case .uint64:     return i64   // a 64-bit unsigned word
         case .double:     return f64
         case .bool:       return i1    // 8.5.2 — Bool is LLVM's native i1 (was i64)
         case .string:     return strTy
@@ -142,7 +143,7 @@ extension LLVMGen {
     // 8-byte slots a value occupies in an enum payload. Every supported leaf is 8-aligned.
     func slotCount(_ t: Type) -> Int {
         switch t {
-        case .int, .uint8, .double, .bool: return 1
+        case .int, .uint8, .uint64, .double, .bool: return 1
         case .rawPtr, .ptr: return 1   // an addrspace(0) pointer word (task 125)
         case .string:     return 2
         case .function:   return 1   // a managed pointer to a heap { fn, caps… } box (8.4.1)
