@@ -28,6 +28,7 @@ extern void* nomu_gc_alloc(void* mutator, size_t size, size_t align);
 extern void* nomu_gc_alloc_immortal(void* mutator, size_t size, size_t align);
 extern void nomu_gc_write_barrier_post(void* mutator, void* src, void* slot, void* target);
 extern void nomu_gc_report_stats(void);   // M6 · 6.3.2 — footprint report (NOMU_GC_STATS)
+extern void nomu_gc_force_collect(void* mutator); // task 150 rung 2 — force one GC (mark-verify oracle)
 
 // One MMTk mutator per carrier thread (Q1). Bound lazily on the thread's first allocation; a fiber
 // migrating carriers allocates against whichever carrier it currently runs on (thread-local storage
@@ -66,6 +67,17 @@ void* rt_alloc_immortal(size_t size) {
     }
     memset(p, 0, size);
     return p;
+}
+
+// ---- Forced collection (task 150 rung 2, mark-verify oracle) ----
+// The codegen `__gcForceCollect` intrinsic lowers to a call here so a Nomu fixture can drive one GC at a
+// clean program point and read MMTk's live-set fingerprint (`MMTK-FP`, under NOMU_GC_MARKVERIFY). Uses
+// this carrier's mutator; binds lazily in case the fixture forces a collection before its first alloc.
+void rt_gc_force_collect(void) {
+    if (!rt_mutator) {
+        rt_mutator = nomu_gc_bind_mutator((void*)pthread_self());
+    }
+    nomu_gc_force_collect(rt_mutator);
 }
 
 // ---- Generational write barrier seam (M6 · 6.3.1) ----
@@ -701,6 +713,7 @@ static void* rt_timer_thread(void* _) {
 
 static void nomu_gc_smoke(void);        // M8.4.3 — defined below (current-stack root-walk smoke)
 static void nomu_gc_smoke_parked(void); // M6 · 6.2.2 — defined below (parked-fiber root-walk smoke)
+static void nomu_gc_smoke_sched(void);  // task 128.3.1 — defined below (scheduler-root oracle)
 
 int64_t rt_sleep_ms(int64_t ms) {
     // M8.4.3 smoke (env-gated, inert otherwise): `sleep` is a safepoint (this call is a statepoint),
@@ -713,6 +726,13 @@ int64_t rt_sleep_ms(int64_t ms) {
     // parked worker's own sleep does not re-enter the scan and stall waiting for a peer.
     if (getenv("NOMU_GC_SMOKE_PARKED") && rt_current == rt_main_fiber) {
         nomu_gc_smoke_parked();
+    }
+    // task 128.3.1 scheduler-root oracle: from `main`'s safepoint, read `rt_sched_head` the same way the
+    // root scan does. The fixture runs single-carrier (NOMU_CARRIERS=1) so a queued mailbox is still at the
+    // head here — the mailbox fiber cannot drain it until `main` parks below — and the self-hosted
+    // `RawPtr.gcSchedHead()` read must match this pointer.
+    if (getenv("NOMU_GC_SMOKE_SCHED") && rt_current == rt_main_fiber) {
+        nomu_gc_smoke_sched();
     }
     uint64_t expiry = rt_now_ns() + (uint64_t)ms * 1000000ULL;
     // Handoff protocol (M6 · 6.4): hold rt_queue_mu across the park so the timer thread's wake (which
@@ -1102,6 +1122,51 @@ void nomu_gc_scan_parked_fibers(nomu_root_visitor visit, void* userdata) {
     pthread_mutex_unlock(&rt_queue_mu);
 }
 
+// task 128.3.1 — hand the self-hosted pcsp walk each parked fiber's innermost *Nomu* frame anchor. Under
+// rt_queue_mu, for every FIBER_PARKED fiber, cross its C park frames (swapcontext/`rt_sleep_ms`) with the
+// C unwinder to the first frame carrying a stackmap record, and write that frame's `(sp, pc)` pair into
+// `outBuf` (2 words per fiber, up to `cap` words). Returns the pair count. The Nomu side (`rtScanParkedFibers`)
+// runs `rtWalkFrom` from each anchor — reading root slots and stepping between Nomu frames self-hosted.
+//
+// Crossing the C park frames stays in C by necessity: Darwin's `swapcontext` is hand-written asm with no
+// clean frame-pointer chain and C frames carry no pcsp table, so a raw FP-walk can't step out of them —
+// only CFI (`.eh_frame`, via libunwind) can. Once the self-hosted context switch lands (128.1), a parked
+// fiber's saved context is a Nomu-defined structure and this bridge is replaced by a direct Nomu-frame
+// anchor. STW-safety of the walk is 128.3.2's concern; here the smoke fixture keeps the target fiber parked.
+int64_t rt_gc_parked_anchors(void* outBuf, int64_t cap) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    nomu_gc_stackmap_init();
+    int64_t n = 0;
+    uint64_t* out = (uint64_t*)outBuf;
+    pthread_mutex_lock(&rt_queue_mu);
+    for (Fiber* f = rt_fiber_list; f && n + 1 < cap; f = f->rt_next) {
+        if (f->status != FIBER_PARKED) {
+            continue;
+        }
+        unw_context_t ctx;
+        nomu_gc_ucontext_to_unwctx(&f->ctx, &ctx);
+        unw_cursor_t cur;
+        unw_init_local(&cur, &ctx);
+        while (unw_step(&cur) > 0) {
+            unw_word_t ip = 0, sp = 0;
+            unw_get_reg(&cur, UNW_REG_IP, &ip);
+            unw_get_reg(&cur, UNW_REG_SP, &sp);
+            if (gc_lookup((uintptr_t)ip)) {
+                out[n++] = (uint64_t)sp;
+                out[n++] = (uint64_t)ip;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&rt_queue_mu);
+    return n / 2;
+#else
+    (void)outBuf;
+    (void)cap;
+    return 0;
+#endif
+}
+
 // GC-root-walk smoke (M8.4.3, env-gated). At a `sleep` safepoint the caller's live class objects
 // are recorded; the walk recovers them. The smoke fixture uses `class { var v: Int }`, whose object
 // layout is `{ i64 header, i64 v }`, so dereferencing a recovered root at offset 8 yields the known
@@ -1146,6 +1211,17 @@ static void nomu_gc_smoke_parked(void) {
     fprintf(stderr, "nomu-gc-smoke-parked: walk begin\n");
     nomu_gc_scan_parked_fibers(gc_smoke_visitor, &count);
     fprintf(stderr, "nomu-gc-smoke-parked: %d roots\n", count);
+}
+
+// task 128.3.1 scheduler-root oracle (env-gated). Reads `rt_sched_head` — the single managed root reported
+// by nomu_gc_scan_parked_fibers — under rt_queue_mu and prints its pointer. The self-hosted
+// `RawPtr.gcSchedHead()` read (which loads the same global) is diffed against this. Runs from `main`'s
+// safepoint while the fixture's queued mailbox is still at the head (single-carrier: no drainer has run).
+static void nomu_gc_smoke_sched(void) {
+    pthread_mutex_lock(&rt_queue_mu);
+    NomuMailbox* head = rt_sched_head;
+    pthread_mutex_unlock(&rt_queue_mu);
+    fprintf(stderr, "nomu-gc-smoke-sched: sched-root %lld\n", (long long)(intptr_t)head);
 }
 
 // M6 · 6.2.3 stop-the-world smoke (env-gated). Exercises the full handshake with no real collection:
@@ -1195,7 +1271,12 @@ int main(void) {
     pthread_t __timer_t;
     pthread_create(&__timer_t, NULL, rt_timer_thread, NULL);
     pthread_detach(__timer_t);
-    int ncarriers = 4;                                  // parallelism knob — will be configurable later
+    int ncarriers = 4;                                  // parallelism knob (default)
+    const char* ncarriers_env = getenv("NOMU_CARRIERS"); // override (≥1); single-carrier gives deterministic
+    if (ncarriers_env) {                                 // scheduling for tests that must observe a transient
+        int v = atoi(ncarriers_env);                     // scheduler state (e.g. the `rt_sched_head` root scan)
+        if (v >= 1) ncarriers = v;
+    }
     rt_main_fiber = fiber_spawn(__rt_main_entry, NULL); // 6.2.2 — remember `main` for the parked smoke
     for (int i = 1; i < ncarriers; i++) {
         pthread_t t;

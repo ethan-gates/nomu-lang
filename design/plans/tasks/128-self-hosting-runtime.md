@@ -64,7 +64,54 @@ while moving location, then change the algorithm inside the self-hosted runtime 
   diffed against the matching MMTk plan.
 - [127 LXR](127-lxr-collector.md) — the final collector rung, an algorithm swap inside the self-hosted GC.
 - The M:N scheduler + per-arch bootstrap assembly floor stay under this task, sequenced after the GC
-  ladder (the GC can run hosted alongside the existing runtime first).
+  ladder (the GC can run hosted alongside the existing runtime first). This task also inherits the GC's
+  **full-runtime root-scanning integration** from [150](150-selfhosted-gc-ladder.md): invoking the
+  self-hosted stack walk at a real stop-the-world over all live mutators, plus the parked-fiber
+  (`scan_parked_fibers`) and scheduler-root (`rt_sched_head`) sources. The ladder proves collector policy
+  hosted on the existing C scheduler; wiring the self-hosted walk into a real STW couples to the
+  carrier/context machinery built here, so it lands with the scheduler.
+
+## Subtasks
+
+The parts this task owns directly (the delegated prerequisites 125/149/150/127 keep their own numbers):
+
+- **128.1 — M:N scheduler in Nomu.** Replace the C/pthread scheduler (run queue, carriers, fibers,
+  safepoints) with a self-hosted one under the 149 subset.
+- **128.2 — Per-arch bootstrap assembly floor.** The irreducible asm: context switch, thread/TLS/stack
+  setup, the entry sequence before collector + scheduler are live.
+- **128.3 — Full-runtime root-scanning integration (inherited from 150).** The GC ladder proves the
+  collector's marking/tracing/fingerprint and the current-stack pcsp walk hosted on the existing C
+  scheduler (150.2, `selfhosted-gc.md` §9). The remaining root-scanning pieces couple to the
+  scheduler/carrier machinery, so they land here:
+  - **128.3.1 — Self-hosted parked-fiber walk + scheduler-root (both built).** The parked-fiber
+    walk is built and oracle-checked: `rt_gc_parked_anchors` (C) hands Nomu each parked fiber's innermost
+    Nomu-frame anchor as a `(sp, pc)` pair, and `rtWalkFrom` (Nomu — a copy of the current-stack walk's
+    pcsp loop, parameterized by an explicit anchor; kept separate because `rtCollectRoots` must keep its
+    own inline for the caller-spill constraint, `selfhosted-gc.md` §9) reads its root slots and steps
+    between Nomu frames self-hosted. Recovers a parked
+    worker's live set `{111, 222}` and excludes the dead object, matching the C `nomu_gc_scan_parked_fibers`
+    libunwind oracle in one process (`examples/walk_parked.nomu` + `tools/walk-parked.sh`). The caller-spill
+    constraint (`selfhosted-gc.md` §9) does not apply — a saved context's roots were already spilled at the
+    park.
+    - *Finding — crossing the C park frames stays in C for now.* The first plan (Nomu skips the park frames
+      via a frame-pointer chain from the saved `ucontext`) does not work: Darwin's `swapcontext` is asm with
+      no clean FP chain, so a raw FP-walk derives the wrong SP for the first Nomu frame (found it latched
+      onto the right function but an SP off by 96 bytes). C frames also carry no pcsp table, so only CFI
+      (`.eh_frame`/libunwind) can step out of them — the C runtime already has it. So C crosses the park
+      frames and hands over a Nomu-frame anchor; the GC-relevant walk (Nomu frames) is self-hosted. A fully
+      self-hosted entry needs the park to save a Nomu-frame anchor directly, which lands with the
+      self-hosted context switch (**128.1**).
+    - *Scheduler root (built).* `rt_sched_head` — the global scheduled-mailbox queue head, a single managed
+      root that keeps every queued mailbox's pending work alive — is read self-hosted via `RawPtr.gcSchedHead()`
+      (a direct load of the C global; `rtScanSchedRoot` reports it) and diffed in-process against a C oracle
+      that reads the same global. The fixture sends one fire-and-forget `bump` and runs single-carrier
+      (`NOMU_CARRIERS=1`, a new env knob on the carrier count) so the mailbox fiber cannot drain the head
+      before `main` reads it (`examples/sched_root.nomu` + `tools/sched-root.sh`). With this, root scanning is
+      complete for all three source shapes buildable now — live stack, saved/parked context, and global —
+      leaving only 128.3.2 (STW-over-all-mutators integration, blocked on 128.1).
+  - **128.3.2 — STW-over-all-mutators walk integration.** Drive the self-hosted walk at a real
+    stop-the-world across every live mutator (each running carrier's saved safepoint context + carrier
+    enumeration), standing in for the C libunwind walk the MMTk binding calls today. Needs 128.1.
 
 ## Refs
 

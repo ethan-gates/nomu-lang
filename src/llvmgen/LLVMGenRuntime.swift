@@ -44,6 +44,16 @@ extension LLVMGen {
         LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, k, 0))
     }
 
+    func addNoInline(_ fn: LLVMValueRef) {
+        let k = LLVMGetEnumAttributeKindForName("noinline", "noinline".utf8.count)
+        LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, k, 0))
+    }
+
+    // Prelude functions that read their own stack frame (`llvm.frameaddress`/`returnaddress`, task 150 the
+    // pcsp walk) must not be inlined — inlining would resolve those intrinsics to the caller's frame and
+    // shift the walk by one frame. Kept as a name set until a per-function attribute exists.
+    static let noInlineFns: Set<String> = ["rtCollectRoots"]
+
     // Build a stub seam's body without disturbing the caller's builder position / debug location.
     func withStubBody(_ fn: LLVMValueRef, _ build: () -> Void) {
         let savedBlock = LLVMGetInsertBlock(b)

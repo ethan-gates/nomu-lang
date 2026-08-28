@@ -658,6 +658,40 @@ final class SSAIRToLLVM {
             // the non-moving rung-2 heap; a moving collector would relocate the object out from under it.
             let a = LLVMBuildPtrToInt(b, val(args[0]), e.i64, "obj.addr")!
             return LLVMBuildIntToPtr(b, a, e.i8ptr, "obj.raw")
+        case "__gcStackmapBase", "__gcStackmapSize":
+            // The linker synthesizes `section$start$<seg>$<sect>` / `section$end$…` symbols whose addresses
+            // bracket the section — the libc-free way to reach `__llvm_stackmaps` from generated code. The
+            // `\u{01}` prefix suppresses LLVM's automatic `_` Mach-O mangling so the literal ld64 name is used.
+            let startName = "\u{01}section$start$__LLVM_STACKMAPS$__llvm_stackmaps"
+            let endName = "\u{01}section$end$__LLVM_STACKMAPS$__llvm_stackmaps"
+            let start = LLVMGetNamedGlobal(e.mod, startName) ?? LLVMAddGlobal(e.mod, e.i8ptr, startName)
+            if name == "__gcStackmapBase" { return start }
+            let end = LLVMGetNamedGlobal(e.mod, endName) ?? LLVMAddGlobal(e.mod, e.i8ptr, endName)
+            let sb = LLVMBuildPtrToInt(b, start, e.i64, "sm.b")!
+            let se = LLVMBuildPtrToInt(b, end, e.i64, "sm.e")!
+            return LLVMBuildSub(b, se, sb, "sm.size")
+        case "__gcFrameAddr":
+            let (fn, fty) = e.runtimeFn("llvm.frameaddress.p0", ret: e.i8ptr, params: [e.i32], varArg: false)
+            return e.buildCall(fn, fty, [LLVMConstInt(e.i32, 0, 0)])
+        case "__gcReturnAddr":
+            let (fn, fty) = e.runtimeFn("llvm.returnaddress.p0", ret: e.i8ptr, params: [e.i32], varArg: false)
+            let ra = e.buildCall(fn, fty, [LLVMConstInt(e.i32, 0, 0)])!
+            return LLVMBuildPtrToInt(b, ra, e.i64, "retaddr")
+        case "__gcForceCollect":
+            // Drive one collection at a clean point (task 150 rung 2, mark-verify oracle) via the C
+            // runtime, which forwards the current carrier's mutator to MMTk's user-collection request.
+            let (fn, fty) = e.runtimeFn("rt_gc_force_collect", ret: e.voidTy, params: [], varArg: false)
+            return e.buildCall(fn, fty, [])
+        case "__gcParkedAnchors":
+            // Task 128.3.1: fetch each parked fiber's saved frame-pointer anchor from the C fiber registry.
+            let (fn, fty) = e.runtimeFn("rt_gc_parked_anchors", ret: e.i64, params: [e.i8ptr, e.i64], varArg: false)
+            return e.buildCall(fn, fty, [val(args[0]), val(args[1])])
+        case "__gcSchedHead":
+            // Task 128.3.1 (scheduler root): load the C global `rt_sched_head` — the scheduled-mailbox queue
+            // head, a single managed root. Reference it directly as an extern global (defined in runtime.c and
+            // linked in); the load yields the mailbox object pointer the C root scan reports at the same point.
+            let g = LLVMGetNamedGlobal(e.mod, "rt_sched_head") ?? LLVMAddGlobal(e.mod, e.i8ptr, "rt_sched_head")
+            return LLVMBuildLoad2(b, e.i8ptr, g, "gc.schedhead")
         case "__gcTypeCount":
             let g = LLVMGetNamedGlobal(e.mod, "nomu_gc_typemap_count") ?? LLVMAddGlobal(e.mod, e.i64, "nomu_gc_typemap_count")
             return LLVMBuildLoad2(b, e.i64, g, "gc.tcount")

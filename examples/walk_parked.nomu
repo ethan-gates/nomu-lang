@@ -1,0 +1,43 @@
+// Task 128.3.1 — self-hosted parked-fiber root scan. `worker` builds two live class objects and one dead
+// one, then parks at `sleep(200)` holding the live pair across the safepoint. While it is parked, `main`
+// calls `rtScanParkedFibers`: the C runtime hands each parked fiber's saved frame pointer, and Nomu chains
+// past the C park frames (swapcontext/`rt_sleep_ms`) to worker's frame, then runs the pcsp walk over its
+// saved stack. Expected recovered set: {111, 222}; the dead 999 (last used before the park) is excluded.
+// A class is `{ i64 header, i64 v }`, so offset 8 is the known Int. Under NOMU_GC_SMOKE_PARKED the C
+// libunwind walk runs at the same point (its `v=` on stderr) — the in-process differential oracle.
+class Box {
+  var v: Int
+}
+
+fun worker() -> Int {
+  let a = Box(v: 111)
+  let b = Box(v: 222)
+  let dead = Box(v: 999)              // used only below — dead at the park
+  print(dead.v)                       // 999 (dead's last use)
+  print("\n")
+  sleep(200)                          // park holding a, b live across the safepoint
+  return a.v + b.v                    // 333
+}
+
+fun main() {
+  spawn let r = worker()              // worker runs and parks at its sleep(200)
+  sleep(10)                           // let worker park (and fire the C oracle walk under the env flag)
+
+  let buf = RawPtr.alloc(bytes: 512, align: 8)
+  let nr = rtScanParkedFibers(buf, 64)
+  print("nroots ")
+  print(nr)
+  print("\n")
+  var i = 0
+  while i < nr {
+    let root: RawPtr = buf.load(fromByteOffset: i * 8)
+    let v: Int = root.load(fromByteOffset: 8)
+    print("PARKED-ROOT ")
+    print(v)
+    print("\n")
+    i = i + 1
+  }
+  buf.free()
+  print(r)                            // 333 — joins worker
+  print("\n")
+}

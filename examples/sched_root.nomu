@@ -1,0 +1,38 @@
+// Task 128.3.1 — self-hosted scheduler-root scan. The global scheduled-mailbox queue head
+// (`rt_sched_head`) is a single managed GC root: rooting it keeps every queued mailbox's pending
+// messages and receiver actor alive so fire-and-forget work survives a collection. `main` sends one
+// fire-and-forget message (`bump`), which enqueues the Counter's mailbox onto the scheduled queue —
+// `rt_sched_head` now points at it. Run single-carrier (NOMU_CARRIERS=1), so the mailbox fiber that
+// would drain it cannot run until `main` parks: the head stays put while `main` reads it.
+//
+// `rtScanSchedRoot` reads `rt_sched_head` self-hosted (`RawPtr.gcSchedHead()` loads the global directly)
+// and reports it. Under NOMU_GC_SMOKE_SCHED the C oracle reads the same global at `main`'s sleep
+// safepoint (its `sched-root` line on stderr) — the in-process differential. The recovered pointer must
+// be non-null and equal to the oracle's.
+
+actor Counter {
+    var count: Int = 0
+    on bump(by: Int) { count += by }
+}
+
+fun main() {
+    let c = Counter()
+    c.bump(by: 7)                       // enqueue → rt_sched_head = Counter's mailbox (not yet drained)
+
+    let buf = RawPtr.alloc(bytes: 64, align: 8)
+    let nr = rtScanSchedRoot(buf, 0, 8)  // read the scheduler root self-hosted, capture it into buf
+    print("nroots ")
+    print(nr)
+    print("\n")
+    var i = 0
+    while i < nr {
+        let asInt: Int = buf.load(fromByteOffset: i * 8)   // the captured pointer's value (bytes as Int)
+        print("SCHED-ROOT ")
+        print(asInt)
+        print("\n")
+        i = i + 1
+    }
+    buf.free()
+
+    sleep(10)                           // fires the C oracle at main's safepoint, then parks → mailbox drains
+}

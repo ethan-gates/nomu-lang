@@ -1,0 +1,66 @@
+// Task 150 rung 2 (mark-verify) — the MMTk-side fingerprint (the independent oracle), diffed against the
+// self-hosted Nomu tracer in one run under immix. `xs` (an Array<Box>) is the entire live managed graph:
+// its handle + buffer + 3 Boxes = 5 objects.
+//
+//   B (MMTk):  RawPtr.gcForceCollect() drives one GC. Under NOMU_GC_MARKVERIFY the MMTk binding folds
+//              every object it traces (its authoritative live set) into an address-independent content
+//              hash and prints `MMTK-FP <B>` at GC end.
+//   A (Nomu):  rtCollectRoots walks the real stack roots (the same roots MMTk traced from), and
+//              rtMarkVerify folds the same hash over the tracer's live set, printed as `FP <A>`.
+//
+// Both trace the same real roots, so A == B — the cross-run fingerprint diff made apples-to-apples.
+class Box {
+  var v: Int
+}
+
+fun run() -> Int {
+  var xs: Array<Box> = []
+  xs.append(Box(v: 10))
+  xs.append(Box(v: 20))
+  xs.append(Box(v: 30))
+
+  // B: force one GC. MMTk emits MMTK-FP over its live set (immix + NOMU_GC_MARKVERIFY).
+  RawPtr.gcForceCollect()
+
+  // A: the self-hosted tracer over the same real roots. rtCollectRoots recovers the live handle of xs
+  // (updated by the GC if objects moved); rtMarkVerify marks the transitive set and folds the fingerprint.
+  let rootBuf = RawPtr.alloc(bytes: 512, align: 8)
+  let nroots = rtCollectRoots(rootBuf, 64)
+  let tcount = RawPtr.gcTypeCount()
+  let counts = RawPtr.alloc(bytes: tcount * 8, align: 8)
+  let fp = RawPtr.alloc(bytes: 8, align: 8)
+  var i = 0
+  while i < nroots {
+    let root: RawPtr = rootBuf.load(fromByteOffset: i * 8)
+    let ignored = rtMarkVerify(root, counts, fp)
+    i = i + 1
+  }
+  var total = 0
+  var t = 0
+  while t < tcount {
+    let c: Int = counts.load(fromByteOffset: t * 8)
+    total = total + c
+    t = t + 1
+  }
+  print("total ")
+  print(total)
+  print("\n")
+  let fpv: Int = fp.load(fromByteOffset: 0)
+  print("FP ")
+  print(fpv)
+  print("\n")
+
+  // Keep xs genuinely live across the walk (its handle is the recovered root).
+  var s = 0
+  var j = 0
+  while j < xs.count {
+    s = s + xs[j].v
+    j = j + 1
+  }
+  return s
+}
+
+fun main() {
+  print(run())
+  print("\n")
+}

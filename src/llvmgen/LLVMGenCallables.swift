@@ -69,6 +69,7 @@ extension LLVMGen {
         }
         let (fn, fnTy) = emitFunction(llvmName, ret: retTy, params: paramTys,
                                       debug: (f.name, f.span.begin.line))
+        if LLVMGen.noInlineFns.contains(f.name) { addNoInline(fn) }
         callables[key] = Callable(fn: fn, ty: fnTy, ir: f, selfType: selfType,
                                   selfByPointer: selfByPointer)
         pending.append(key)

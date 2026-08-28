@@ -20,8 +20,11 @@ constant while moving location, then hold location constant while changing the a
 
 **Status:** 125 **built** (`RawPtr`/`Ptr<T>`), 149 **slice 1 built** (runtime-prelude "designated file" +
 call-graph closure check; remaining: codegen barrier/poll guards, `nosplit`, module designation), 150
-**rung 1 complete** (self-hosted allocator is a selectable plan, `NOMU_GC_PLAN=nomu`, byte-identical to
-MMTk NoGC). **Next: 150 rung 2 (mark-verify).** Tests: `tools/{raw-mem,typed-ptr,raw-struct,subset,bump-alloc,rt-prelude,selfhost-gc}.sh`.
+**150.1 (NoGC) complete** (self-hosted allocator is a selectable plan, `NOMU_GC_PLAN=nomu`, byte-identical
+to MMTk NoGC) and **150.2 (mark-verify) substantially built** (150.2.1–150.2.8; the tracer, self-hosted
+pcsp walk, and MMTk-side fingerprint oracle — full-runtime root-scanning integration handed to 128.3).
+**128.3.1** (self-hosted parked-fiber walk) built + oracle-checked; scheduler-root (`rt_sched_head`)
+remaining. **Next: 150.3 (Immix).** Tests: `tools/{raw-mem,typed-ptr,raw-struct,subset,bump-alloc,rt-prelude,selfhost-gc,mark-verify,mark-verify-oracle,walk-mark,walk-multiframe,walk-parked}.sh`.
 
 - [125 Unsafe raw memory](tasks/125-unsafe-raw-memory.md) — the raw-pointer / untyped-memory surface the
   collector and allocator manipulate. The first hard prerequisite. (Its earlier "byte buffer for

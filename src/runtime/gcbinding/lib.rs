@@ -8,7 +8,7 @@
 //! crate is the only Rust (Q2), linked into every emitted program via the 6.1.0 section embed.
 
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use mmtk::util::copy::{CopySemantics, GCWorkerCopyContext};
@@ -133,6 +133,65 @@ fn sample_footprint() {
             g.used_at_max_live = used;
         }
     }
+}
+
+// ---- Mark-verify oracle (task 150 rung 2) ----
+// The independent live-set fingerprint: with `NOMU_GC_MARKVERIFY` set, MMTk emits the *same* summed,
+// address-independent content hash over *its* authoritative live set that the self-hosted Nomu tracer
+// emits over the roots it walks. `scan_object` (called once per live object during the trace) folds each
+// object's hash into `MV_FP`; the sum is reset at GC start (`stop_all_mutators`) and printed at GC end
+// (`resume_mutators`) as `MMTK-FP <sum>`. A fixture forces one GC (→ MMTk's B), then runs the Nomu tracer
+// (→ A) and asserts A == B — the cross-run diff, now apples-to-apples since both trace real roots.
+static MV_ON: AtomicBool = AtomicBool::new(false);
+// Wrapping i64 sum, matching the Nomu tracer's `Int` arithmetic (rtObjHash/rtMarkVerify in runtime.nomu):
+// `fetch_add` wraps on overflow, so the bit pattern tracks the Nomu side's `h + oh` exactly.
+static MV_FP: AtomicI64 = AtomicI64::new(0);
+
+// Port of `rtObjHash` (src/stdlib/runtime.nomu): the address-independent content hash of one object —
+// fold its type-id and its scalar (non-pointer) field words into a 64-bit polynomial hash, skipping the
+// header and every managed-pointer slot so no address enters it. A fixed object (kind 0) scans words in
+// [8, size); an array buffer (kind 1) folds its `cap` word then each element's non-managed words. Word
+// granularity (8-byte-aligned fields), wrapping i64 arithmetic, prime 1099511628211 — identical to the
+// Nomu tracer so the two fingerprints match term-for-term.
+fn mv_obj_hash(base: Address, type_id: u64) -> i64 {
+    const PRIME: i64 = 1099511628211;
+    let mut h: i64 = (type_id as i64).wrapping_add(1);
+    h = h.wrapping_mul(PRIME);
+    let mut count: i32 = 0;
+    let offs = unsafe { nomu_gc_typemap(type_id, &mut count) };
+    // Is byte-offset `w` a managed-pointer slot (skipped, so no address enters the hash)?
+    let managed = |w: usize| -> bool {
+        (0..count as isize).any(|i| unsafe { *offs.offset(i) } as usize == w)
+    };
+    if unsafe { nomu_gc_typekind(type_id) } == 0 {
+        let size = unsafe { nomu_gc_typesize(type_id) } as usize;
+        let mut w = 8usize;
+        while w < size {
+            if !managed(w) {
+                let word = unsafe { (base + w).load::<i64>() };
+                h = h.wrapping_mul(PRIME).wrapping_add(word);
+            }
+            w += 8;
+        }
+    } else {
+        let ecap = unsafe { (base + 8usize).load::<i64>() }; // array buffer: { header, cap, elems… }
+        h = h.wrapping_mul(PRIME).wrapping_add(ecap);
+        let stride = unsafe { nomu_gc_typestride(type_id) } as usize;
+        let mut e: i64 = 0;
+        while e < ecap {
+            let elem_base = 16usize + (e as usize) * stride;
+            let mut w = 0usize;
+            while w < stride {
+                if !managed(w) {
+                    let word = unsafe { (base + elem_base + w).load::<i64>() };
+                    h = h.wrapping_mul(PRIME).wrapping_add(word);
+                }
+                w += 8;
+            }
+            e += 1;
+        }
+    }
+    h
 }
 
 /// Print the footprint gathered over the run (M6 · 6.3.2). Called by the runtime at program exit under
@@ -356,6 +415,11 @@ impl Collection<NomuVM> for VMCollection {
         unsafe {
             nomu_gc_stop_the_world();
         }
+        // Mark-verify oracle (task 150 rung 2): reset the fingerprint at GC start so `MMTK-FP` reflects
+        // this collection's live set alone (the tracing that folds into it runs after this returns).
+        if MV_ON.load(Ordering::Relaxed) {
+            MV_FP.store(0, Ordering::Relaxed);
+        }
         for mutator in VMActivePlan::mutators() {
             mutator_visitor(mutator);
         }
@@ -364,6 +428,11 @@ impl Collection<NomuVM> for VMCollection {
         // Sample the footprint at GC end (live_bytes_in_last_gc is now updated) before resuming (6.3.2).
         if STATS_ON.load(Ordering::Relaxed) {
             sample_footprint();
+        }
+        // Mark-verify oracle (task 150 rung 2): the trace is complete, so `MV_FP` now holds MMTk's summed
+        // fingerprint over its authoritative live set — the independent B the Nomu tracer's A is diffed against.
+        if MV_ON.load(Ordering::Relaxed) {
+            println!("MMTK-FP {}", MV_FP.load(Ordering::Relaxed));
         }
         unsafe {
             nomu_gc_resume_the_world();
@@ -459,6 +528,11 @@ impl Scanning<NomuVM> for VMScanning {
         let base = object.to_raw_address();
         // The type-id is the low 32 bits of the header word (`reserved` is the high half, 6.1.2).
         let type_id = unsafe { base.load::<u32>() } as u64;
+        // Mark-verify oracle (task 150 rung 2): fold this live object into MMTk's fingerprint. `scan_object`
+        // fires once per live object during the trace, so the sum covers MMTk's authoritative live set.
+        if MV_ON.load(Ordering::Relaxed) {
+            MV_FP.fetch_add(mv_obj_hash(base, type_id), Ordering::Relaxed);
+        }
         let mut count: i32 = 0;
         let offs = unsafe { nomu_gc_typemap(type_id, &mut count) };
         if unsafe { nomu_gc_typekind(type_id) } != 0 {
@@ -552,6 +626,12 @@ pub extern "C" fn nomu_gc_init(heap_bytes: usize) {
         STATS_LIVE.store(true, Ordering::Relaxed);
         let _ = builder.options.count_live_bytes_in_gc.set(true);
     }
+    // Mark-verify oracle (task 150 rung 2): emit MMTk's live-set fingerprint each GC (`MMTK-FP <sum>`),
+    // the independent B the self-hosted Nomu tracer's A is diffed against. Only meaningful under a
+    // collecting plan (immix), which actually traces; inert under NoGC.
+    if std::env::var("NOMU_GC_MARKVERIFY").is_ok() {
+        MV_ON.store(true, Ordering::Relaxed);
+    }
     let _ = builder
         .options
         .gc_trigger
@@ -618,6 +698,19 @@ pub extern "C" fn nomu_gc_bind_mutator(tls: *mut c_void) -> *mut Mutator<NomuVM>
     // Register the carrier's mutator so the collector can enumerate it at STW (6.2.4).
     MUTATORS.lock().unwrap().push(handle as usize);
     handle
+}
+
+/// Force a collection at a clean program point (task 150 rung 2, mark-verify oracle). The C runtime
+/// calls this (`rt_gc_force_collect`, passing its thread-local `rt_mutator`) so a fixture can drive one
+/// GC deterministically and read MMTk's live-set fingerprint (`MMTK-FP`). `force = true` collects even
+/// under a plan that would otherwise defer. Inert under NoGC (no collection is wired up).
+#[unsafe(no_mangle)]
+pub extern "C" fn nomu_gc_force_collect(mutator: *mut Mutator<NomuVM>) {
+    if mutator.is_null() {
+        return;
+    }
+    let tls = unsafe { (*mutator).mutator_tls };
+    memory_manager::handle_user_collection_request(mmtk(), tls);
 }
 
 /// Allocate `size` bytes (aligned to `align`) through the given carrier's mutator — the runtime

@@ -207,3 +207,281 @@ fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
   }
   return total
 }
+
+// ---- Stack-map parsing (task 150 · rung 2, the pcsp root walk) ----
+// Parse the `__llvm_stackmaps` (v3) section — reached libc-free via the linker section-bracket symbols
+// (RawPtr.gcStackmapBase / gcStackmapSize) — to recover, per statepoint, its return address, its
+// SP/FP-relative root slots, and its function's frame size. Format: llvm/Object/StackMapParser.h; the C
+// runtime parses the same bytes in `nomu_gc_stackmap_init`. Little-endian scalar reads: load 8 bytes and
+// take the low 16/32 bits by modulo (2^16 = 65536, 2^32 = 4294967296 — no grouping parens yet, task 114).
+
+fun rtU16(base: RawPtr, off: Int) -> Int {
+  let w: Int = base.load(fromByteOffset: off)
+  let hi = w / 65536
+  return w - hi * 65536
+}
+fun rtU32(base: RawPtr, off: Int) -> Int {
+  let w: Int = base.load(fromByteOffset: off)
+  let hi = w / 4294967296
+  return w - hi * 4294967296
+}
+fun rtAlign8(x: Int) -> Int {
+  let a = x + 7
+  return a / 8 * 8
+}
+
+// Parse the whole structure and return the byte offset one past the last record. A structural self-check:
+// it equals the section size exactly when every record's variable length was computed correctly. Header
+// (16 bytes) + nfuncs StkSizeRecords (24 each) + nconsts constants (8 each), then nrecs records:
+//   +0 u64 id, +8 u32 instr-offset, +14 u16 NumLocations, +16 locations (12 each), align8,
+//   then u16 NumLiveOuts, live-outs (4 each), align8.
+fun rtStackmapEnd() -> Int {
+  let base = RawPtr.gcStackmapBase()
+  let nfuncs = rtU32(base, 4)
+  let nconsts = rtU32(base, 8)
+  let nrecs = rtU32(base, 12)
+  var cur = 16 + nfuncs * 24 + nconsts * 8
+  var k = 0
+  while k < nrecs {
+    let nloc = rtU16(base, cur + 14)
+    let locBytes = 16 + nloc * 12
+    let locEnd = rtAlign8(locBytes)
+    let nlive = rtU16(base, cur + locEnd)
+    let recBytes = locEnd + 2 + nlive * 4
+    let recSize = rtAlign8(recBytes)
+    cur = cur + recSize
+    k = k + 1
+  }
+  return cur
+}
+
+// A signed 32-bit read (stack-slot offsets are signed — FP-relative slots are typically negative).
+fun rtI32(base: RawPtr, off: Int) -> Int {
+  let u = rtU32(base, off)
+  let half = 2147483648
+  if u >= half {
+    return u - 4294967296
+  }
+  return u
+}
+
+// ---- The pcsp stack walk (task 150 · rung 2) — recover the live roots from a stack ----
+// Walk outward one frame at a time, reading each frame's root slots from its stackmap record and stepping
+// to the caller by the frame's recorded size. Frame-pointer-free: SP is tracked and advanced by the
+// per-function StackSize (the pcsp route, §9). arm64/Mach-O layout — a frame's { saved FP, saved LR } pair
+// sits at CFA-16, so with CFA = SP + StackSize the caller's return address is at CFA-8 and the frame pointer
+// (for FP-relative slots) is CFA-16.
+// Recover the live roots from the current stack, from index `n0`, into `outBuf` (up to `cap`). Anchor on
+// rtCollectRoots's caller frame: its SP is this frame's CFA (FP + 16), its PC is our return address — then
+// walk outward one frame at a time via the pcsp route (§9), terminating at the first return address with no
+// stackmap record (the Nomu→C boundary). Subset code (no managed heap).
+//
+// The frame-reading loop is deliberately kept in this one function (not factored behind a call): the walk
+// reads root slots through a pointer derived from `llvm.frameaddress`, and that memory effect appearing in
+// the same function the caller calls is what makes the optimizer keep the *caller's* live GC roots spilled
+// at the call statepoint (where the walk reads them). Moving the loop behind an ordinary call drops that
+// effect and the caller stops spilling its roots — they vanish from the statepoint (task 150 rung 2).
+fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
+  let base = RawPtr.gcStackmapBase()
+  let nfuncs = rtU32(base, 4)
+  let nconsts = rtU32(base, 8)
+  let recStart = 16 + nfuncs * 24 + nconsts * 8
+  var n = 0
+  let fp0 = RawPtr.gcFrameAddr()
+  var sp = fp0.advanced(by: 16)
+  var pc = RawPtr.gcReturnAddr()
+  var walking = true
+  while walking {
+    var found = false
+    var frameSize = 0
+    var recCur = recStart
+    var fi = 0
+    while fi < nfuncs {
+      let fRec = 16 + fi * 24
+      let funcAddr: Int = base.load(fromByteOffset: fRec)
+      let fStackSize: Int = base.load(fromByteOffset: fRec + 8)
+      let recCount: Int = base.load(fromByteOffset: fRec + 16)
+      var ri = 0
+      while ri < recCount {
+        let ioff = rtU32(base, recCur + 8)
+        let retAddr = funcAddr + ioff
+        let nloc = rtU16(base, recCur + 14)
+        let locEnd = rtAlign8(16 + nloc * 12)
+        let nlive = rtU16(base, recCur + locEnd)
+        let recSize = rtAlign8(locEnd + 2 + nlive * 4)
+        if retAddr == pc {
+          found = true
+          frameSize = fStackSize
+          let frameFp = sp.advanced(by: fStackSize - 16)
+          var li = 3                              // skip the 3 leading meta locations
+          while li < nloc {
+            let locOff = recCur + 16 + li * 12
+            let w0: Int = base.load(fromByteOffset: locOff)
+            let kind = w0 - w0 / 256 * 256          // u8 kind at +0
+            if kind == 3 {                          // Indirect [reg + offset] — a stack slot
+              let reg = rtU16(base, locOff + 4)
+              let slotOff = rtI32(base, locOff + 8)
+              var slotBase = sp
+              if reg == 29 {                        // DWARF x29 = frame pointer
+                slotBase = frameFp
+              }
+              let slotPtr = slotBase.advanced(by: slotOff)
+              let root: RawPtr = slotPtr.load(fromByteOffset: 0)
+              let rootNull = root.eq(RawPtr.null)
+              if !rootNull {
+                if n < cap {
+                  outBuf.store(root, toByteOffset: n * 8)
+                  n = n + 1
+                }
+              }
+            }
+            li = li + 1
+          }
+        }
+        recCur = recCur + recSize
+        ri = ri + 1
+      }
+      fi = fi + 1
+    }
+    if !found {
+      walking = false
+    } else {
+      let cfa = sp.advanced(by: frameSize)
+      let nextPc: Int = cfa.load(fromByteOffset: -8)
+      pc = nextPc
+      sp = cfa
+    }
+  }
+  return n
+}
+
+// ---- Parked-fiber root scan (task 128.3.1) ----
+// Scan every parked fiber's stack for GC roots. The C runtime hands us each parked fiber's innermost Nomu
+// frame anchor as a (sp, pc) pair (`rt_gc_parked_anchors`) — it crosses the C park frames (swapcontext /
+// `rt_sleep_ms`) with its unwinder, which is unavoidable while parking goes through Darwin's asm
+// `swapcontext` (no clean frame-pointer chain, no pcsp table for C frames). From each Nomu anchor the pcsp
+// walk (`rtWalkFrom`) reads root slots and steps between Nomu frames self-hosted. Oracle: the C
+// `nomu_gc_scan_parked_fibers` walk (`gc-smoke-parked` shape), diffed in-process. A fully self-hosted entry
+// waits on the self-hosted context switch (128.1); driving this at a real STW over all mutators is 128.3.2.
+
+// The pcsp walk from an explicit (sp, pc) anchor over a *saved* context — a parked fiber now, an STW-stopped
+// carrier later — appending live root object addresses into `outBuf` (up to `cap`, from index `n0`), one
+// Nomu frame at a time, terminating at the first return address with no record (the Nomu→C boundary).
+//
+// This is a deliberate copy of rtCollectRoots's loop, not a call from it: rtCollectRoots reads root slots
+// through an `llvm.frameaddress`-derived pointer, and that memory effect must appear in the frameaddress
+// function's own body to make its live caller spill its roots at the call statepoint (selfhosted-gc.md §9).
+// A saved-context anchor carries no such dependency — its frame's roots were already spilled at the fiber's
+// park/safepoint — so factoring the loop here is sound; only rtCollectRoots must keep it inline.
+fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int) -> Int {
+  let base = RawPtr.gcStackmapBase()
+  let nfuncs = rtU32(base, 4)
+  let nconsts = rtU32(base, 8)
+  let recStart = 16 + nfuncs * 24 + nconsts * 8
+  var n = n0
+  var sp = spIn
+  var pc = pcIn
+  var walking = true
+  while walking {
+    var found = false
+    var frameSize = 0
+    var recCur = recStart
+    var fi = 0
+    while fi < nfuncs {
+      let fRec = 16 + fi * 24
+      let funcAddr: Int = base.load(fromByteOffset: fRec)
+      let fStackSize: Int = base.load(fromByteOffset: fRec + 8)
+      let recCount: Int = base.load(fromByteOffset: fRec + 16)
+      var ri = 0
+      while ri < recCount {
+        let ioff = rtU32(base, recCur + 8)
+        let retAddr = funcAddr + ioff
+        let nloc = rtU16(base, recCur + 14)
+        let locEnd = rtAlign8(16 + nloc * 12)
+        let nlive = rtU16(base, recCur + locEnd)
+        let recSize = rtAlign8(locEnd + 2 + nlive * 4)
+        if retAddr == pc {
+          found = true
+          frameSize = fStackSize
+          let frameFp = sp.advanced(by: fStackSize - 16)
+          var li = 3
+          while li < nloc {
+            let locOff = recCur + 16 + li * 12
+            let w0: Int = base.load(fromByteOffset: locOff)
+            let kind = w0 - w0 / 256 * 256
+            if kind == 3 {
+              let reg = rtU16(base, locOff + 4)
+              let slotOff = rtI32(base, locOff + 8)
+              var slotBase = sp
+              if reg == 29 {
+                slotBase = frameFp
+              }
+              let slotPtr = slotBase.advanced(by: slotOff)
+              let root: RawPtr = slotPtr.load(fromByteOffset: 0)
+              let rootNull = root.eq(RawPtr.null)
+              if !rootNull {
+                if n < cap {
+                  outBuf.store(root, toByteOffset: n * 8)
+                  n = n + 1
+                }
+              }
+            }
+            li = li + 1
+          }
+        }
+        recCur = recCur + recSize
+        ri = ri + 1
+      }
+      fi = fi + 1
+    }
+    if !found {
+      walking = false
+    } else {
+      let cfa = sp.advanced(by: frameSize)
+      let nextPc: Int = cfa.load(fromByteOffset: -8)
+      pc = nextPc
+      sp = cfa
+    }
+  }
+  return n
+}
+
+// Scan every parked fiber, appending its live roots into `outBuf` (up to `cap`). Returns the total. The C
+// runtime hands each parked fiber's innermost Nomu frame anchor as a (sp, pc) pair (`rt_gc_parked_anchors`,
+// crossing the C park frames with its unwinder); `rtWalkFrom` runs the pcsp walk from each, self-hosted.
+fun rtScanParkedFibers(outBuf: RawPtr, cap: Int) -> Int {
+  let anchorCap = 128
+  let anchors = RawPtr.alloc(bytes: anchorCap * 8, align: 8)
+  let nf = RawPtr.gcParkedAnchors(anchors, anchorCap)
+  var n = 0
+  var i = 0
+  while i < nf {
+    let sp: RawPtr = anchors.load(fromByteOffset: i * 16)
+    let pc: Int = anchors.load(fromByteOffset: i * 16 + 8)
+    n = rtWalkFrom(sp, pc, outBuf, n, cap)
+    i = i + 1
+  }
+  anchors.free()
+  return n
+}
+
+// ---- Scheduler root (task 128.3.1) ----
+// The global scheduled-mailbox queue head (`rt_sched_head`) is a single managed GC root: rooting it keeps
+// the whole `sched_next` chain — every queued mailbox, its pending messages, and each receiver actor — alive
+// even when the actor is otherwise unreferenced, so fire-and-forget outstanding work survives GC. The C root
+// scan (`nomu_gc_scan_parked_fibers`) reports it alongside the parked fibers; this reads the same global
+// self-hosted (`RawPtr.gcSchedHead()` loads it directly) and appends it into `outBuf` when the queue is
+// non-empty. Returns the new count. The chain past the head is reached through the mailbox pointer map (a
+// scanned field), so reporting the head alone suffices — the tracer follows `sched_next` from there.
+fun rtScanSchedRoot(outBuf: RawPtr, n0: Int, cap: Int) -> Int {
+  var n = n0
+  let head = RawPtr.gcSchedHead()
+  let headNull = head.eq(RawPtr.null)
+  if !headNull {
+    if n < cap {
+      outBuf.store(head, toByteOffset: n * 8)
+      n = n + 1
+    }
+  }
+  return n
+}

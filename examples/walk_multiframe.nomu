@@ -1,0 +1,35 @@
+// Task 150 rung 2 — multi-frame pcsp walk validated against the C libunwind walk. Roots live in two
+// frames: inner holds c(33), d(44); outer holds a(11), b(22) across the inner call. rtCollectRoots (the
+// Nomu pcsp walk) runs immediately before sleep(0); under NOMU_GC_SMOKE the C walk runs at that same
+// sleep safepoint. Both see the same live set, so the distinct root .v values must match: {11,22,33,44}.
+// Distinct v's identify objects (no shared object), so this checks the walk steps inner -> outer -> main.
+class Box {
+  var v: Int
+}
+fun inner() -> Int {
+  let c = Box(v: 33)
+  let d = Box(v: 44)
+  let rootBuf = RawPtr.alloc(bytes: 512, align: 8)
+  let n = rtCollectRoots(rootBuf, 64)
+  var i = 0
+  while i < n {
+    let r: RawPtr = rootBuf.load(fromByteOffset: i * 8)
+    let v: Int = r.load(fromByteOffset: 8)
+    print("NOMU-ROOT ")
+    print(v)
+    print("\n")
+    i = i + 1
+  }
+  sleep(0)
+  return c.v + d.v
+}
+fun outer() -> Int {
+  let a = Box(v: 11)
+  let b = Box(v: 22)
+  let r = inner()
+  return r + a.v + b.v
+}
+fun main() {
+  print(outer())
+  print("\n")
+}

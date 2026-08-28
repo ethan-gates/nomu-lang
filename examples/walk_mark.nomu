@@ -1,0 +1,51 @@
+// Task 150 rung 2 — real-root discovery feeding the tracer. rtCollectRoots walks the current stack via
+// the pcsp route to recover live roots; each is handed to the mark-verify tracer. The array xs is used in
+// a loop after the walk, so it is unambiguously live across the rtCollectRoots statepoint (its handle is
+// the recovered root). Live set from xs: handle + buffer + 2 Boxes = 4. The fingerprint excludes addresses,
+// so it is identical across GC plans — proving the walk recovered a real, correct root, not a stale address.
+class Box {
+  var v: Int
+}
+fun run() -> Int {
+  var xs: Array<Box> = []
+  xs.append(Box(v: 10))
+  xs.append(Box(v: 20))
+  let rootBuf = RawPtr.alloc(bytes: 512, align: 8)
+  let nroots = rtCollectRoots(rootBuf, 64)
+  let tcount = RawPtr.gcTypeCount()
+  let counts = RawPtr.alloc(bytes: tcount * 8, align: 8)
+  let fp = RawPtr.alloc(bytes: 8, align: 8)
+  var i = 0
+  while i < nroots {
+    let root: RawPtr = rootBuf.load(fromByteOffset: i * 8)
+    let ignored = rtMarkVerify(root, counts, fp)
+    i = i + 1
+  }
+  var total = 0
+  var t = 0
+  while t < tcount {
+    let c: Int = counts.load(fromByteOffset: t * 8)
+    total = total + c
+    t = t + 1
+  }
+  var s = 0
+  var j = 0
+  while j < xs.count {
+    s = s + xs[j].v
+    j = j + 1
+  }
+  print("nroots ")
+  print(nroots)
+  print(" total ")
+  print(total)
+  print("\n")
+  let fpv: Int = fp.load(fromByteOffset: 0)
+  print("FP ")
+  print(fpv)
+  print("\n")
+  return s
+}
+fun main() {
+  print(run())
+  print("\n")
+}

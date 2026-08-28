@@ -1737,6 +1737,61 @@ public struct Sema {
             let id = intArg(args[0].value, "RawPtr.gcTypePtrOffset", "id")
             let i = intArg(args[1].value, "RawPtr.gcTypePtrOffset", "i")
             return ptrIntrinsic("__gcTypePtrOffset", .int, [id, i], span)
+        // The `__llvm_stackmaps` section (task 150 rung 2, the pcsp root walk): base address + byte size,
+        // reached through the linker-provided section-bracket symbols (no libc, no new runtime C). The Nomu
+        // pcsp walk parses this section (return-address → SP-relative root slots + per-function frame size).
+        case "gcStackmapBase":
+            guard checkArgLabels(args, [], "RawPtr.gcStackmapBase", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__gcStackmapBase", .rawPtr, [], span)
+        case "gcStackmapSize":
+            guard checkArgLabels(args, [], "RawPtr.gcStackmapSize", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__gcStackmapSize", .int, [], span)
+        // Stack-walk anchors (task 150 rung 2, pcsp walk): the caller frame's frame pointer (as a RawPtr)
+        // and the return address into the caller (as an Int) — `llvm.frameaddress`/`llvm.returnaddress`.
+        // From these the pcsp walk derives each frame's SP and steps by the stackmap's per-function size.
+        case "gcFrameAddr":
+            guard checkArgLabels(args, [], "RawPtr.gcFrameAddr", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__gcFrameAddr", .rawPtr, [], span)
+        case "gcReturnAddr":
+            guard checkArgLabels(args, [], "RawPtr.gcReturnAddr", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__gcReturnAddr", .int, [], span)
+        // Force one collection at a clean program point (task 150 rung 2, mark-verify oracle): drive a
+        // deterministic GC so MMTk emits its live-set fingerprint (`MMTK-FP`, under NOMU_GC_MARKVERIFY),
+        // the independent oracle the self-hosted Nomu tracer's fingerprint is diffed against.
+        case "gcForceCollect":
+            guard checkArgLabels(args, [], "RawPtr.gcForceCollect", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__gcForceCollect", .void, [], span)
+        // Task 128.3.1 (parked-fiber root scan): fetch each parked fiber's saved frame-pointer anchor from
+        // the C fiber registry into `outBuf` (up to `cap` words), returning the count. The self-hosted walk
+        // (`rtScanParkedFibers`) chains past the C park frames from each anchor and runs the pcsp walk.
+        case "gcParkedAnchors":
+            guard checkArgLabels(args, [nil, nil], "RawPtr.gcParkedAnchors", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let outBuf = checkExpr(args[0].value)
+            if outBuf.type != .error, outBuf.type != .rawPtr {
+                diags.error("RawPtr.gcParkedAnchors expects a RawPtr buffer, got '\(outBuf.type)'", at: outBuf.span)
+            }
+            let cap = intArg(args[1].value, "RawPtr.gcParkedAnchors", "cap")
+            return ptrIntrinsic("__gcParkedAnchors", .int, [outBuf, cap], span)
+        // Task 128.3.1 (scheduler root): read the global scheduled-mailbox queue head (`rt_sched_head`), a
+        // single managed GC root that keeps every queued mailbox's pending work alive. Returns its value as a
+        // RawPtr (null when the queue is empty). The self-hosted scan (`rtScanSchedRoot`) reports it as a root.
+        case "gcSchedHead":
+            guard checkArgLabels(args, [], "RawPtr.gcSchedHead", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__gcSchedHead", .rawPtr, [], span)
         default:
             diags.error("type 'RawPtr' has no static method '\(method)'", at: span)
             return NOIRExpr(type: .error, span: span, kind: .intLit(0))

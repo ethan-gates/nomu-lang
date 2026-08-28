@@ -1,0 +1,33 @@
+// Task 150 rung 2 (pcsp root walk), sub-step: reach and parse the `__llvm_stackmaps` (v3) section from
+// Nomu, libc-free (linker section-bracket symbols, no new runtime C). Self-validating: the version byte is
+// 3, and parsing every variable-length record must land the cursor exactly on the section size — a
+// structural check of the record-size arithmetic with no external oracle.
+fun main() {
+  let base = RawPtr.gcStackmapBase()
+  let size = RawPtr.gcStackmapSize()
+  let w0: Int = base.load(fromByteOffset: 0)
+  let version = w0 - w0 / 256 * 256
+  let nfuncs = rtU32(base, 4)
+  let nrecs = rtU32(base, 12)
+  let parsedEnd = rtStackmapEnd()
+
+  print("version ")
+  print(version)
+  print("\n")
+  print("nfuncs ")
+  print(nfuncs)
+  print("\n")
+  print("nrecs ")
+  print(nrecs)
+  print("\n")
+  // The structural invariant: parsed end == section size.
+  if parsedEnd == size {
+    print("PARSE-OK\n")
+  } else {
+    print("PARSE-MISMATCH ")
+    print(parsedEnd)
+    print(" ")
+    print(size)
+    print("\n")
+  }
+}

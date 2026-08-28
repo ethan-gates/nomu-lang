@@ -355,29 +355,105 @@ as a variable while the tracer is validated, keeps every new line in Nomu (no ru
 the reusable collector code first. Root discovery then follows as its own step — the `pcsp` root map +
 frame-pointer-free Nomu walk — swapping the seed for real stack roots under the fingerprint-diff guard.
 
-**Rung 2 progress — increments 1–2 built.**
-- **Increment 1 · side-table reachability (built).** The Nomu tracer reads the codegen-emitted per-type-id
+**150.2 (mark-verify) progress — 150.2.1–150.2.8 built. Single-thread root scanning + the cross-run
+fingerprint diff are complete and oracle-checked.** ("Increment N" below = subtask 150.2.N.)
+- **150.2.1 · side-table reachability (built).** The Nomu tracer reads the codegen-emitted per-type-id
   side tables (size, kind, stride, managed-pointer map; `c-types.md` §1/§3.2) through six `RawPtr.gcType*`
   accessors that lower to the existing runtime accessors — **no new runtime C**. Differentially validated:
   a Nomu-side table dump is byte-identical to the C `NOMU_GC_TYPEMAPS` dump in one process
   (`examples/mark_types.nomu` + `tools/mark-types.sh`).
-- **Increment 2 · seed-based mark (built).** `rtMarkVerify` (runtime prelude, subset code) traces the
+- **150.2.2 · seed-based mark (built).** `rtMarkVerify` (runtime prelude, subset code) traces the
   transitive live set from a seed root and marks each object with a header mark bit (bit 32 of the header —
   the type-id occupies the low 32 bits, high bits zero, so marking leaves the type-id recoverable). No
   reclaim, no move. `addrOf(obj)` (a `ptrtoint` on the managed `p1`, codegen-only) supplies the seed.
   Validated on a graph exercising reachability, a shared child counted once (the mark bit), and a dead
   heap object excluded (`examples/mark_verify.nomu` + `tools/mark-verify.sh`).
-- **Increment 3 · address-independent fingerprint (built).** Each live object contributes its type-id and
+- **150.2.3 · address-independent fingerprint (built).** Each live object contributes its type-id and
   its scalar (non-pointer) field words to a summed, order-independent fingerprint; every managed slot and
   the header are skipped, so no address enters it. Because it excludes addresses, it is byte-identical
   across the two GC plans (MMTk and the self-hosted allocator use different address ranges) — the sharp
   test that no pointer leaked in, and the precondition for the cross-run diff. Word-granularity for now
   (8-byte-aligned fields; sub-word scalars are a later refinement).
-- **Increment 4 · array coverage (built).** `examples/mark_verify_arr.nomu` seeds from an `Array<Box>`
+- **150.2.4 · array coverage (built).** `examples/mark_verify_arr.nomu` seeds from an `Array<Box>`
   handle, exercising the tracer's variable-size (`kind==1`) path in both the mark loop and the content hash:
   the handle's `bufptr` is followed into the buffer, each element slot scanned via the per-element pointer
   map, and every live Box marked. `TOTAL 5` (handle + buffer + 3 Boxes) tests buffer scanning; the
   fingerprint stays address-independent across plans (element pointers excluded, scalar words folded).
-- **Remaining (later increments):** the **MMTk-side fingerprint** in the same summed form + a
-  `tools/mark-verify` cross-run diff (the differential oracle replacing the fixture's known live set);
-  then the `pcsp` root map + frame-pointer-free Nomu walk to replace the seed with real stack roots.
+- **150.2.5 · stack-map access + parse (built).** Toward real roots: the `__llvm_stackmaps` (v3)
+  section is reached from Nomu **libc-free** via the linker section-bracket symbols
+  (`section$start$…`/`section$end$…`, `\01`-prefixed to skip Mach-O `_` mangling), exposed as
+  `RawPtr.gcStackmapBase` / `gcStackmapSize` — no `getsectiondata`, no new runtime C. The v3 structure is
+  parsed in Nomu (`rtStackmapEnd` + `rtU16`/`rtU32`/`rtAlign8` in the prelude), self-validated: the version
+  byte is 3 and stepping every variable-length record lands the cursor exactly on the section size
+  (`examples/stackmap_probe.nomu` + `tools/stackmap-probe.sh`). The existing stackmap already carries the
+  `pcsp` data — per-function `StackSize` in its function records, SP/FP-relative slots in its statepoint
+  records — so no new codegen root map is needed for the first cut.
+- **150.2.6 · the pcsp walk + real-root integration (built).** `rtCollectRoots` (runtime prelude)
+  recovers the live roots from the current stack, self-hosted and libc-free: anchor on the caller frame
+  (its SP is `llvm.frameaddress` + 16, its PC is `llvm.returnaddress`), look the PC up in the parsed
+  stackmap, read each `kind==3` root slot (`SP + offset`, or `SP + StackSize − 16 + offset` for the
+  FP-relative slots), then step to the caller by `SP += StackSize` — no frame-pointer chain, no libunwind.
+  Two anchor intrinsics (`RawPtr.gcFrameAddr`/`gcReturnAddr` → `llvm.frameaddress`/`returnaddress`) and a
+  `noinline` mark on `rtCollectRoots` (so the frame intrinsics resolve to its own frame) are the only new
+  codegen; no runtime C. End-to-end (`examples/walk_mark.nomu` + `tools/walk-mark.sh`): the walk recovers
+  the handle of a live `Array<Box>`, hands it to the tracer, which marks the live set (handle + buffer + 2
+  Boxes = 4) and emits a fingerprint **identical across both GC plans** — a stale/garbage root would fault
+  or diverge, so the match proves the recovered root is real and the whole self-hosted chain (walk →
+  tracer → fingerprint) is sound.
+  - *Notes / limits:* the walk reads `kind==3` (stack-spilled) slots; `RewriteStatepointsForGC` spills GC
+    roots to the stack, so `kind==1` (register) is not needed in practice (a later refinement if it
+    appears). A root must be genuinely live at the walk's statepoint — an optimizer that drops a
+    dead-after value legitimately records no root there (a fixture-design point, not a walk limit). arm64
+    frame layout assumed (FP/LR pair at CFA-16); the per-arch constants generalize with the target.
+  - *Constraint — the walk loop must stay in the frameaddress function (found the hard way).* The walk
+    reads its caller's roots at the caller's call statepoint, and the caller only spills those roots there
+    because the walk function reads memory through a pointer derived from `llvm.frameaddress` — that memory
+    effect, appearing in the same function the caller calls, is what makes the optimizer keep the caller's
+    live GC values spilled at the statepoint. Factoring the loop into an ordinary helper (anchor computed in
+    `rtCollectRoots`, loop in a callee reading through an argument pointer) moves that effect out of the
+    caller's direct callee: the caller stops spilling and its roots vanish from the statepoint (nloc drops
+    to the 3 meta locations, zero roots recovered). `alwaysinline` on the helper did not fold it back
+    reliably in the current pipeline. So `rtCollectRoots` keeps the frame-reading loop inline. This makes
+    the current-stack walk sensitive to codegen changes; a parked-fiber or STW walk (which anchors on a
+    *saved* context, where roots were already spilled at the park/safepoint) does not depend on this
+    caller-spill effect, so it can factor the loop freely — the coupling is specific to reading the walk's
+    own live caller.
+- **150.2.7 · multi-frame walk, differential vs the C walk (built).** `examples/walk_multiframe.nomu`
+  holds roots in two frames (inner: 33, 44; outer: 11, 22) and runs `rtCollectRoots` immediately before
+  `sleep(0)`; under `NOMU_GC_SMOKE` the C libunwind walk runs at that same safepoint. The Nomu pcsp walk
+  recovers `{33,44}` from inner and `{11,22}` from outer — stepping `inner → outer → main` and terminating
+  cleanly at the C boundary — and its distinct root set matches the C walk exactly (`tools/walk-multiframe.sh`).
+  This validates the frame-stepping (`SP += StackSize`, return address at `[CFA-8]`) against the proven
+  oracle. Compiled with `NOMU_NO_ESCAPE=1` so the leaf `Box` roots are heap-allocated (else stack-promoted,
+  the same requirement `gc-smoke` has). Single-thread root scanning is now complete and oracle-checked.
+- **150.2.8 · the MMTk-side fingerprint, cross-run diff (built).** MMTk now emits the **same** summed,
+  address-independent fingerprint over **its** authoritative live set that the Nomu tracer emits over the
+  roots it walks — the independent oracle. `mv_obj_hash` in the Rust binding (`gcbinding/lib.rs`) ports
+  `rtObjHash` term-for-term (wrapping i64, prime 1099511628211, header + managed slots skipped);
+  `scan_object` (once per live object during the trace) folds it into a global sum under
+  `NOMU_GC_MARKVERIFY`, reset at GC start (`stop_all_mutators`) and printed as `MMTK-FP <sum>` at GC end
+  (`resume_mutators`). A Nomu fixture drives one deterministic collection through a new `RawPtr.gcForceCollect()`
+  intrinsic (Sema + SSAIRToLLVM → C `rt_gc_force_collect` → Rust `nomu_gc_force_collect(mutator)` →
+  `handle_user_collection_request`, using the C thread-local `rt_mutator`). Under **immix** + `NOMU_GC_MARKVERIFY`
+  the fixture forces a GC (→ B), then runs the self-hosted pcsp walk + tracer over the same real stack roots
+  (→ A), and asserts A == B in one run (`examples/mark_verify_oracle.nomu` + `tools/mark-verify-oracle.sh`,
+  live set = Array<Box> handle + buffer + 3 Boxes = 5). Apples-to-apples now that both trace real roots: a
+  missed live object or a wrongly-marked dead one moves one sum and not the other. The tracer runs *after*
+  the GC, so it reads objects at their post-collection locations — fine, the fingerprint excludes addresses;
+  MMTk's mark bits are side metadata, so the Nomu header bit 32 never collides.
+- **Handed to [128](../plans/tasks/128-self-hosting-runtime.md) — full-runtime root-scanning integration
+  (128.3).** The **parked-fiber + scheduler-root sources** (`scan_parked_fibers`, `rt_sched_head`; task
+  **128.3.1**) are now built and oracle-checked there: the parked-fiber pcsp walk over a saved context, and
+  the scheduler root read self-hosted via `RawPtr.gcSchedHead()` (a direct load of the C global, diffed in
+  one process against a C read; `examples/sched_root.nomu`). With those, root scanning is self-hosted for all
+  three source shapes buildable now — live stack, saved/parked context, and global. The one remaining piece,
+  **STW-over-all-mutators integration** (invoking the self-hosted walk at a real STW safepoint over all live
+  mutators; task **128.3.2**), reuses the proven saved-context walk (`rtWalkFrom`) but couples to the
+  scheduler/carrier machinery (each running carrier's saved safepoint context, carrier enumeration), which is
+  the scheduler half under 128 (needs 128.1).
+  The collector-policy ladder proves marking/tracing/fingerprint hosted on the existing C scheduler; wiring
+  the self-hosted walk into a real STW lands with the scheduler, so this slice moves to 128, and rung 3
+  proceeds while it waits. The single-frame walk here uses the C libunwind walk as its in-process oracle (the
+  cross-run fingerprint diff cannot serve, since a concurrent program's two runs may reach different heaps).
+- **Next on the collector-policy ladder:** rung 3 (Immix) — reclaim + move (line/block reclamation,
+  evacuation + pointer fixup, region management), driven off the existing C STW handshake while hosted.
