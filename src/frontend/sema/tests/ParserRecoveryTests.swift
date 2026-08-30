@@ -73,6 +73,20 @@ final class ParserRecoveryTests: XCTestCase {
         XCTAssertTrue(diags.hasErrors)
     }
 
+    func testUnclosedDelimiterAtEOFDoesNotCrash() {
+        // An expression that ends exactly at the EOF token — from a missing closing delimiter —
+        // once trapped: shiftOp() read tokens[pos + 1] past the end while probing for `<<`/`>>`.
+        // Each of these must report a diagnostic and return rather than crash.
+        for src in ["fun m() -> Int { let x = foo(",
+                    "fun m() -> Int { let x = foo(1, 2",
+                    "fun m() -> Int { let x = (1 + 2",
+                    "fun m() -> Int { let x = [1, 2",
+                    "fun m() -> Int { let x = 1 <"] {
+            let (_, diags) = parse(src)
+            XCTAssertTrue(diags.hasErrors, "expected errors for \(src)")
+        }
+    }
+
     // The following inputs once hung the parser: a loop whose sub-parser consumed no token and
     // whose recovery set already held the offending token, so neither made progress. Each must
     // now *terminate* (if it regresses, the test run hangs) and report the error. The

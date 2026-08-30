@@ -43,6 +43,78 @@ final class SemaTests: XCTestCase {
         XCTAssertEqual(base.type, .named("Point", .struct_))
     }
 
+    func testLogicalOperatorsTypeAsBool() {
+        let r = sema("fun f(a: Bool, b: Bool) -> Bool { return a && b || a }")
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let f) = r.module.decls[0],
+              case .ret(let e?) = f.body[0].kind else { XCTFail(); return }
+        XCTAssertEqual(e.type, .bool)
+    }
+
+    func testLogicalOperatorRejectsNonBool() {
+        XCTAssertTrue(sema("fun f() -> Bool { return 3 && true }").diagnostics.hasErrors)
+        XCTAssertTrue(sema("fun f() -> Bool { return true || 5 }").diagnostics.hasErrors)
+    }
+
+    func testStaticMethodResolvesToFreeFunc() {
+        let r = sema("""
+        struct Point {
+            var x: Int
+            static fun origin() -> Point { return Point(x: 0) }
+        }
+        fun main() -> Int {
+            let p = Point.origin()
+            return p.x
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        // The static method is emitted as a free function named `Point.origin`.
+        let emitted = r.module.decls.contains { if case .funcDecl(let fn) = $0 { return fn.name == "Point.origin" }; return false }
+        XCTAssertTrue(emitted)
+        // The call site lowers to a direct call of that function, typed as the enclosing type.
+        guard case .funcDecl(let main)? = r.module.decls.first(where: { if case .funcDecl(let fn) = $0 { return fn.name == "main" }; return false }),
+              case .letBinding(_, _, let value) = main.body[0].kind,
+              case .call(let callee, _, _) = value.kind,
+              case .varRef(let n) = callee.kind else { XCTFail(); return }
+        XCTAssertEqual(n, "Point.origin")
+        XCTAssertEqual(value.type, .named("Point", .struct_))
+    }
+
+    func testStaticMethodBodyCannotUseSelf() {
+        let r = sema("""
+        struct P {
+            var x: Int
+            static fun bad() -> Int { return self.x }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testInstanceMethodNotCallableOnType() {
+        let r = sema("""
+        struct P {
+            var x: Int
+            fun get() -> Int { return x }
+        }
+        fun main() -> Int { return P.get() }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
+    func testStaticMethodNotCallableOnValue() {
+        let r = sema("""
+        struct P {
+            var x: Int
+            static fun origin() -> P { return P(x: 0) }
+        }
+        fun main() -> Int {
+            let p = P(x: 1)
+            return p.origin().x
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.hasErrors)
+    }
+
     func testConstruction() {
         let r = sema("""
         struct Point {

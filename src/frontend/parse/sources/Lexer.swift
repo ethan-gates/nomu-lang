@@ -144,8 +144,12 @@ public struct Lexer {
         case 0x3E:                    // >
             if peek() == 0x3D { pos += 1; return .gtEq }
             return .gt
-        case 0x26: return .amp        // &
-        case 0x7C: return .pipe       // |
+        case 0x26:                    // &
+            if peek() == 0x26 { pos += 1; return .ampAmp }   // && logical-and
+            return .amp
+        case 0x7C:                    // |
+            if peek() == 0x7C { pos += 1; return .pipePipe } // || logical-or
+            return .pipe
         case 0x5E: return .caret      // ^
         case 0x7E: return .tilde      // ~
         default:
@@ -246,6 +250,7 @@ public struct Lexer {
             if eq(lo, "struct") { return .kwStruct }
             if eq(lo, "switch") { return .kwSwitch }
             if eq(lo, "return") { return .kwReturn }
+            if eq(lo, "static") { return .kwStatic }
         case 8:
             if eq(lo, "continue") { return .kwContinue }
         case 9:

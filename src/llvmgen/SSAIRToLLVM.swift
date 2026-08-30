@@ -26,6 +26,11 @@ final class SSAIRToLLVM {
     var values: [Int: LLVMValueRef] = [:]          // SSAValue.id → LLVM value
     var blockMap: [Int: LLVMBasicBlockRef] = [:]   // SSABlock.id → LLVM basic block
     var blocksById: [Int: SSABlock] = [:]          // SSABlock.id → the block (for edge φ wiring)
+    // φ incomings, deferred until every block's instructions are lowered: a branch argument may be
+    // defined in a block that lowers after the branch's block (e.g. a loop latch whose block id
+    // precedes the case block that computes the carried value), so resolving `val(arg)` eagerly would
+    // miss it. Captured at terminator time (the predecessor is the current block), wired at the end.
+    var pendingIncomings: [(phi: LLVMValueRef, pred: LLVMBasicBlockRef, arg: SSAValue)] = []
     var spawnHandles: [Int: LLVMValueRef] = [:]    // spawn binding id → its handle alloca
 
     var loweredMain = false
@@ -179,7 +184,7 @@ final class SSAIRToLLVM {
     private func defineFunction(_ f: SSAFunction) {
         let (key, _, _, _) = keyAndSelf(f)
         guard let c = e.callables[key] else { return }
-        values = [:]; blockMap = [:]; blocksById = [:]; spawnHandles = [:]
+        values = [:]; blockMap = [:]; blocksById = [:]; spawnHandles = [:]; pendingIncomings.removeAll(keepingCapacity: true)
         curFnName = f.name
         e.currentFn = c.fn
 
@@ -219,6 +224,9 @@ final class SSAIRToLLVM {
             lowerBlock(blk)
             if error != nil { return }
         }
+
+        // Every value is now defined; wire the deferred φ incomings (block-argument edges).
+        flushIncomings()
     }
 
     // The loop headers of a function: back-edge targets, found by a DFS that marks a node "on the
@@ -387,15 +395,26 @@ final class SSAIRToLLVM {
         }
     }
 
-    // Register each edge argument as an incoming value of the target block's φ, from the current block.
+    // Record each edge argument as a pending incoming of the target block's φ, from the current block.
+    // The predecessor block is fixed now; the argument's LLVM value is resolved in `flushIncomings`,
+    // after every block is lowered, so an argument defined in a later-lowered block still resolves.
     private func passArgs(to target: Int, _ args: [SSAValue]) {
         guard !args.isEmpty, let params = blocksById[target]?.params else { return }
-        let pred = LLVMGetInsertBlock(b)
+        guard let pred = LLVMGetInsertBlock(b) else { return }
         for (i, arg) in args.enumerated() where i < params.count {
-            var incoming: [LLVMValueRef?] = [val(arg)]
-            var block: [LLVMBasicBlockRef?] = [pred]
-            LLVMAddIncoming(values[params[i].id], &incoming, &block, 1)
+            guard let phi = values[params[i].id] else { continue }
+            pendingIncomings.append((phi: phi, pred: pred, arg: arg))
         }
+    }
+
+    // Wire every deferred φ incoming once all definitions exist.
+    private func flushIncomings() {
+        for p in pendingIncomings {
+            var incoming: [LLVMValueRef?] = [val(p.arg)]
+            var block: [LLVMBasicBlockRef?] = [p.pred]
+            LLVMAddIncoming(p.phi, &incoming, &block, 1)
+        }
+        pendingIncomings.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Operations
@@ -422,6 +441,8 @@ final class SSAIRToLLVM {
                 return LLVMBuildFCmp(b, pred, lv, rv, "fcmp")
             case .bitAnd, .bitOr, .bitXor, .shl, .shr:
                 e.fail("7.2.3: bitwise/shift operators are not valid on Double", span); return lv
+            case .and, .or:
+                e.fail("logical '&&'/'||' are lowered to branches in SSAIRgen; none should reach the egress", span); return lv
             }
         }
         // Integer path: signed for Int, unsigned for UInt8/UInt64 — differing on div/rem, `>>`, and compares.
@@ -448,6 +469,8 @@ final class SSAIRToLLVM {
             default:   pred = unsigned ? LLVMIntUGE : LLVMIntSGE
             }
             return LLVMBuildICmp(b, pred, lv, rv, "cmp")
+        case .and, .or:
+            e.fail("logical '&&'/'||' are lowered to branches in SSAIRgen; none should reach the egress", span); return lv
         }
     }
 

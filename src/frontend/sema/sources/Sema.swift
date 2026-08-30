@@ -21,6 +21,10 @@ public struct Sema {
     private var classes: [String: ClassDecl]  = [:]
     private var actors:  [String: ActorDecl]  = [:]
     private var interfaces: [String: InterfaceDecl] = [:]   // M5 A1
+
+    // `static fun` members lowered to free functions (named `Type.method`, no `self`), collected
+    // during declaration lowering and appended to the module's decls after the main pass.
+    private var pendingStaticFuncs: [NOIRDecl] = []
     private var funcs:   [String: FnSig]      = [:]   // named functions + non-print builtins
 
     // Computed properties (M5 A1), by owning type then property name. Drives member
@@ -102,6 +106,8 @@ public struct Sema {
             if isGenericType(decl) { decls.append(lowerGenericDecl(decl)); continue }
             decls.append(lowerDecl(decl))
         }
+        // `static fun` members lowered as free functions, emitted alongside the type decls.
+        decls.append(contentsOf: pendingStaticFuncs)
 
         // M4.11: infer method mutating-ness, validate `let`-field / `self` writes,
         // annotate the IR, then check that mutating value-type calls have a mutable receiver.
@@ -376,12 +382,22 @@ public struct Sema {
         return nil
     }
 
-    // The declared instance method `name` on a struct/enum/class, if any (T3).
+    // The declared instance method `name` on a struct/enum/class, if any (T3). Static members are
+    // excluded — they are called on the type, never on a value.
     private func methodDecl(_ typeName: String, _ kind: NamedKind, _ name: String) -> FuncDecl? {
+        typeMethods(typeName, kind)?.first { $0.name == name && !$0.isStatic }
+    }
+
+    // The declared `static fun name` on a struct/enum/class, if any — the type-associated form.
+    private func staticMethodDecl(_ typeName: String, _ kind: NamedKind, _ name: String) -> FuncDecl? {
+        typeMethods(typeName, kind)?.first { $0.name == name && $0.isStatic }
+    }
+
+    private func typeMethods(_ typeName: String, _ kind: NamedKind) -> [FuncDecl]? {
         switch kind {
-        case .struct_: return structs[typeName]?.methods.first { $0.name == name }
-        case .enum_:   return enums[typeName]?.methods.first { $0.name == name }
-        case .class_:  return classes[typeName]?.methods.first { $0.name == name }
+        case .struct_: return structs[typeName]?.methods
+        case .enum_:   return enums[typeName]?.methods
+        case .class_:  return classes[typeName]?.methods
         case .actor_, .interface_:  return nil
         }
     }
@@ -395,18 +411,21 @@ public struct Sema {
             var methods = lowerMethods(s.methods, selfType: .named(s.name, .struct_), fields: fields)
             methods += lowerAccessors(s.properties, selfType: .named(s.name, .struct_), fields: fields)
             methods += lowerInheritedDefaults(s.name, selfType: .named(s.name, .struct_), fields: fields)
+            lowerStaticMethods(s.methods, typeName: s.name)
             return .structDecl(NOIRStruct(name: s.name, fields: fields, methods: methods, span: s.span))
         case .enumDecl(let e):
             let cases = e.cases.map { NOIREnumCase(name: $0.name, fields: $0.fields.map(lowerField), span: $0.span) }
             var methods = lowerMethods(e.methods, selfType: .named(e.name, .enum_), fields: [])
             methods += lowerAccessors(e.properties, selfType: .named(e.name, .enum_), fields: [])
             methods += lowerInheritedDefaults(e.name, selfType: .named(e.name, .enum_), fields: [])
+            lowerStaticMethods(e.methods, typeName: e.name)
             return .enumDecl(NOIREnum(name: e.name, cases: cases, methods: methods, span: e.span))
         case .classDecl(let c):
             let fields = c.fields.map(lowerField)
             var methods = lowerMethods(c.methods, selfType: .named(c.name, .class_), fields: fields)
             methods += lowerAccessors(c.properties, selfType: .named(c.name, .class_), fields: fields)
             methods += lowerInheritedDefaults(c.name, selfType: .named(c.name, .class_), fields: fields)
+            lowerStaticMethods(c.methods, typeName: c.name)
             return .classDecl(NOIRClass(name: c.name, fields: fields, methods: methods, span: c.span))
         case .actorDecl(let a):
             return .actorDecl(lowerActor(a))
@@ -816,7 +835,7 @@ public struct Sema {
     private mutating func lowerMethods(_ methods: [FuncDecl], selfType: Type, fields: [NOIRField]) -> [NOIRFunc] {
         var out: [NOIRFunc] = []
         let ownerType: String? = { if case .named(let n, _) = selfType { return n }; return nil }()
-        for m in methods {
+        for m in methods where !m.isStatic {
             let params = m.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
             // A `some I` method return keys its opaque identity by "m:Type.method" — the same
             // key the call site uses when it resolves the method's return type (M5 A3).
@@ -832,6 +851,25 @@ public struct Sema {
             out.append(NOIRFunc(name: m.name, params: params, returnType: ret, body: body, isMutating: false, span: m.span))
         }
         return out
+    }
+
+    // Lower each `static fun` member as a free function named `Type.method` — no `self` and no
+    // fields in scope, so a body that references `self` or a bare field name is an undefined-name
+    // error. The qualified name is unspellable by users, so it never collides with a real free
+    // function; the call site `Type.method(...)` targets it as an ordinary direct call.
+    private mutating func lowerStaticMethods(_ methods: [FuncDecl], typeName: String) {
+        for m in methods where m.isStatic {
+            let params = m.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
+            let ret = resolve(m.returnType)
+            pushScope()
+            for p in params { declare(p.name, p.type) }
+            let saved = currentReturnType; currentReturnType = ret
+            let body = lowerBlock(m.body)
+            currentReturnType = saved
+            popScope()
+            pendingStaticFuncs.append(.funcDecl(NOIRFunc(name: "\(typeName).\(m.name)", params: params,
+                                                         returnType: ret, body: body, isMutating: false, span: m.span)))
+        }
     }
 
     private mutating func registerProps(_ typeName: String, _ props: [ComputedProperty], generics: [GenericParam] = []) {
@@ -2047,9 +2085,11 @@ public struct Sema {
     }
 
     private mutating func checkCall(callee: Expr, args: [Arg], span: Span, expected: Type? = nil) -> NOIRExpr {
-        // Qualified enum construction: `EnumType.case(args)` or `EnumType<Args>.case(args)`.
+        // Qualified enum construction: `EnumType.case(args)` or `EnumType<Args>.case(args)`. A
+        // `static fun` of the same enum takes precedence over case construction for that name.
         if case .member(let base, let caseName, _) = callee,
-           let (typeName, explicit) = typeNameAndArgs(base), lookup(typeName) == nil, enums[typeName] != nil {
+           let (typeName, explicit) = typeNameAndArgs(base), lookup(typeName) == nil, enums[typeName] != nil,
+           staticMethodDecl(typeName, .enum_, caseName) == nil {
             return buildEnumInit(typeName, caseName, args, explicit: explicit, expected: expected, at: span)
         }
         // Pointer static constructors (task 125): `RawPtr.alloc(...)`, `Ptr<T>.alloc(...)`.
@@ -2063,6 +2103,32 @@ public struct Sema {
                 }
                 return checkPtrStatic(elems[0], method, args, span)
             }
+        }
+        // Static method: `Type.method(args)` — a type-associated function with no receiver. Only
+        // for a non-generic user type (generic types reject members entirely, so no static free
+        // function is ever emitted for them); the call lowers to a direct call of `Type.method`.
+        if case .member(let base, let name, _) = callee,
+           let (tn, _) = typeNameAndArgs(base), lookup(tn) == nil, genericArity(tn) == nil,
+           let k = kindOf(tn), let m = staticMethodDecl(tn, k, name) {
+            let paramTypes = m.params.map { resolve($0.type) }
+            let irArgs = checkArgs(args, expectedParams: paramTypes)
+            checkArgTypes(irArgs.map(\.value), against: paramTypes, at: span)
+            let ret = resolve(m.returnType)
+            let calleeType = Type.function(params: paramTypes, ret: ret)
+            return NOIRExpr(type: ret, span: span,
+                          kind: .call(callee: irVar("\(tn).\(name)", calleeType, span), args: irArgs, typeArgs: []))
+        }
+        // `Type.member(...)` on a user type that is not a static method: a targeted diagnostic
+        // instead of falling through to "undefined name 'Type'" (the type name is not a value).
+        if case .member(let base, let name, _) = callee,
+           let (tn, _) = typeNameAndArgs(base), lookup(tn) == nil, genericArity(tn) == nil,
+           let k = kindOf(tn), k != .enum_ {
+            if methodDecl(tn, k, name) != nil {
+                diags.error("'\(name)' is an instance method of '\(tn)'; call it on a value, not on the type", at: span)
+            } else {
+                diags.error("type '\(tn)' has no static method '\(name)'", at: span)
+            }
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
         }
         // Leading-dot enum construction: `.case(args)` — enum inferred from context.
         if case .implicitMember(let caseName, _) = callee {
@@ -2370,6 +2436,17 @@ public struct Sema {
             return .bool
         case .eq, .neq:
             checkComparison(lhs, rhs, equality: true, at: span)
+            return .bool
+        case .and, .or:
+            // Logical `&&` / `||`: both operands Bool, result Bool. Short-circuit lowering happens
+            // in SSAIRgen; here it types like any Bool-producing operator.
+            let sym = op == .and ? "&&" : "||"
+            if lhs.type != .bool && lhs.type != .error {
+                diags.error("logical '\(sym)' requires Bool, got '\(lhs.type)'", at: lhs.span)
+            }
+            if rhs.type != .bool && rhs.type != .error {
+                diags.error("logical '\(sym)' requires Bool, got '\(rhs.type)'", at: rhs.span)
+            }
             return .bool
         }
     }

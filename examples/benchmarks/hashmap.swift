@@ -39,84 +39,31 @@ struct Entry {
     var value: Int
 }
 
-func base64char(n: Int) -> String {
-    if n == 0 { return "A" }
-    else if n == 1 { return "B" }
-    else if n == 2 { return "C" }
-    else if n == 3 { return "D" }
-    else if n == 4 { return "E" }
-    else if n == 5 { return "F" }
-    else if n == 6 { return "G" }
-    else if n == 7 { return "H" }
-    else if n == 8 { return "I" }
-    else if n == 9 { return "J" }
-    else if n == 10 { return "K" }
-    else if n == 11 { return "L" }
-    else if n == 12 { return "M" }
-    else if n == 13 { return "N" }
-    else if n == 14 { return "O" }
-    else if n == 15 { return "P" }
-    else if n == 16 { return "Q" }
-    else if n == 17 { return "R" }
-    else if n == 18 { return "S" }
-    else if n == 19 { return "T" }
-    else if n == 20 { return "U" }
-    else if n == 21 { return "V" }
-    else if n == 22 { return "W" }
-    else if n == 23 { return "X" }
-    else if n == 24 { return "Y" }
-    else if n == 25 { return "Z" }
-    else if n == 26 { return "a" }
-    else if n == 27 { return "b" }
-    else if n == 28 { return "c" }
-    else if n == 29 { return "d" }
-    else if n == 30 { return "e" }
-    else if n == 31 { return "f" }
-    else if n == 32 { return "g" }
-    else if n == 33 { return "h" }
-    else if n == 34 { return "i" }
-    else if n == 35 { return "j" }
-    else if n == 36 { return "k" }
-    else if n == 37 { return "l" }
-    else if n == 38 { return "m" }
-    else if n == 39 { return "n" }
-    else if n == 40 { return "o" }
-    else if n == 41 { return "p" }
-    else if n == 42 { return "q" }
-    else if n == 43 { return "r" }
-    else if n == 44 { return "s" }
-    else if n == 45 { return "t" }
-    else if n == 46 { return "u" }
-    else if n == 47 { return "v" }
-    else if n == 48 { return "w" }
-    else if n == 49 { return "x" }
-    else if n == 50 { return "y" }
-    else if n == 51 { return "z" }
-    else if n == 52 { return "0" }
-    else if n == 53 { return "1" }
-    else if n == 54 { return "2" }
-    else if n == 55 { return "3" }
-    else if n == 56 { return "4" }
-    else if n == 57 { return "5" }
-    else if n == 58 { return "6" }
-    else if n == 59 { return "7" }
-    else if n == 60 { return "8" }
-    else if n == 61 { return "9" }
-    else if n == 62 { return "-" }
-    else if n == 63 { return "_" }
-
-    return ""
-}
-
-func intToStr(n: Int) -> String {
+func int_to_str(n: Int, chars: Int = 6) -> String {
     var s = ""
     var t = n
     var i = 0
-    while i < 8 {
-        s = base64char(n: t & 63) + s
+    while i < chars {
+        let b64_dec = t & 63
+        var b64_ascii = 0
+        if b64_dec < 26 {
+            b64_ascii = b64_dec + 65
+        } else if b64_dec < 52 {
+            b64_ascii = b64_dec + 71
+        } else if b64_dec < 62 {
+            b64_ascii = b64_dec - 4
+        } else if b64_dec == 62 {
+            b64_ascii = 45
+        } else {
+            b64_ascii = 95
+        }
+        if let scalar = UnicodeScalar(b64_ascii) {
+            s.append(Character(scalar))
+        }
         t = t >> 6
         i += 1
     }
+
     return s
 }
 
@@ -276,38 +223,13 @@ func expected_sum(n: Int) -> Int {
 }
 
 func main() {
-    let t = makeTable()
-    t.set(key: "hello", value: 1)
-    t.set(key: "hi", value: 2)
-    t.set(key: "hay", value: 3)
-    t.set(key: "hai", value: 4)
-    t.set(key: "sup", value: 5)
-    t.set(key: "gday", value: 6)
-    t.set(key: "ay", value: 7)
-    t.set(key: "yo", value: 8)
-    t.set(key: "yaho", value: 9)
-
-    // show(t, "hello")   // 1
-    // show(t, "yaho")    // 9
-    // show(t, "missing") // 0
-
-    // t.set("hi", 20)    // overwrite
-    // show(t, "hi")      // 20
-
-    // print(t.contains("hai"))   // 1 (true)
-    // print(t.delete("hai"))     // 1 (true)
-    // print(t.contains("hai"))   // 0 (false, now a tombstone)
-    // print(t.delete("hai"))     // 0 (already gone)
-
-    // show(t, "gday")    // 6 — still reachable past the tombstone
-
     var sng = SimpleRNG(seed: 42)
-
     let table = makeTable()
     let items_max = 1000000
+
     var i = 0
     while i < items_max {
-        let k = intToStr(n: sng.next())
+        let k = int_to_str(n: sng.next())
         table.set(key: k, value: i)
         i += 1
     }
@@ -316,7 +238,7 @@ func main() {
     i = 0
     sng = SimpleRNG(seed: 42)
     while i < items_max {
-        let maybe_i = table.get(key: intToStr(n: sng.next()))
+        let maybe_i = table.get(key: int_to_str(n: sng.next()))
         switch maybe_i {
             case .some(let actual): sum += actual
             case .none: break

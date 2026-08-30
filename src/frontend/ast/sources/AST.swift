@@ -263,10 +263,11 @@ public struct FuncDecl {
     public let params: [Param]
     public let returnType: TypeRef?
     public let body: Block
+    public let isStatic: Bool             // `static fun` — a type-associated function, no `self` receiver
     public let span: Span
 
-    public init(name: String, generics: [GenericParam], params: [Param], returnType: TypeRef?, body: Block, span: Span) {
-        self.name = name; self.generics = generics; self.params = params; self.returnType = returnType; self.body = body; self.span = span
+    public init(name: String, generics: [GenericParam], params: [Param], returnType: TypeRef?, body: Block, isStatic: Bool = false, span: Span) {
+        self.name = name; self.generics = generics; self.params = params; self.returnType = returnType; self.body = body; self.isStatic = isStatic; self.span = span
     }
 }
 
@@ -398,6 +399,7 @@ public enum BinOp: Equatable {
     case add, sub, mul, div, mod
     case eq, neq, lt, gt, lte, gte
     case bitAnd, bitOr, bitXor, shl, shr
+    case and, or   // logical && / || — short-circuit; lowered to branches in SSAIRgen
 }
 
 // Prefix operators. `neg` (`-x`) and `not` (`!x`) and `bitNot` (`~x`). Lowered to binary

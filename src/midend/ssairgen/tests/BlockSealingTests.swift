@@ -143,4 +143,30 @@ final class BlockSealingTests: XCTestCase {
         XCTAssertEqual(count(out, "condBr"), 3, out)
         XCTAssertTrue(out.contains("ret "), out)
     }
+
+    // `&&` / `||` short-circuit: each lowers to a condBr on the left operand and a merge phi, never
+    // an eager binary op. The right operand is evaluated only in the branch that needs it.
+    func testShortCircuitLowersToBranches() {
+        for src in ["fun f(a: Bool, b: Bool) -> Bool { return a && b }",
+                    "fun f(a: Bool, b: Bool) -> Bool { return a || b }"] {
+            let out = dump(src)
+            XCTAssertEqual(count(out, "condBr"), 1, out)   // branch on the left operand
+            XCTAssertFalse(out.contains("&&"), out)        // no eager logical op in the IR
+            XCTAssertFalse(out.contains("||"), out)
+        }
+    }
+
+    // The merge block's result parameter must be threaded from both predecessors (skip-value edge and
+    // rhs edge) with the right argument count — the block-argument invariant.
+    func testShortCircuitCFGVerifies() {
+        let src = "fun f(a: Bool, b: Bool, c: Bool) -> Bool { return a && b || c }"
+        var lexer = Lexer(src, file: "t.nomu")
+        var parser = Parser(lexer.tokenize())
+        var sema = Sema(parser.parse())
+        let result = sema.check()
+        XCTAssertFalse(result.diagnostics.hasErrors, result.diagnostics.render())
+        let gen = lowerToSSAIR(result.module)
+        XCTAssertFalse(gen.diagnostics.hasErrors, gen.diagnostics.render())
+        XCTAssertEqual(verifySSAIR(gen.module), [], dumpSSAIR(gen.module))
+    }
 }

@@ -45,19 +45,30 @@ struct Time {
         return time_monotonic()
     }
 
-    fun ms_since(t1: Int) -> Int {
-        let diff = time_monotonic() - t1
+    fun ms_diff(t1: Int, t2: Int) -> Int {
+        let diff = t2 - t1
         return diff / 1000000
     }
 
-    fun micro_since(t1: Int) -> Int {
-        let diff = time_monotonic() - t1
+    fun micro_diff(t1: Int, t2: Int) -> Int {
+        let diff = t2 - t1
         return diff / 1000
     }
 
-    fun ns_since(t1: Int) -> Int {
-        let t2 = time_monotonic()
+    fun ns_diff(t1: Int, t2: Int) -> Int {
         return t2 - t1
+    }
+
+    fun took(label: String, t1: Int) {
+        let t2 = self.now
+        print(label)
+        print(" took: ")
+        print(self.ms_diff(t1, t2))
+        print("ms ")
+        print(self.micro_diff(t1, t2))
+        print("µs ")
+        print(self.ns_diff(t1, t2))
+        print("ns\n")
     }
 }
 
@@ -79,150 +90,4 @@ struct SimpleRNG {
         let scaledValue = currentRandom % rangeSize
         return scaledValue + min
     }
-}
-
-
-struct str {
-    var hi: UInt64
-    var lo: UInt64
-
-    var len: UInt8 {
-        let len_bits: UInt64 = hi >> 56
-        return len_bits.uint8
-    }
-
-    fun set(val: Int, index: Int) {
-        let v = val.uint8
-        let i = index.uint8
-        if i > 14 { return }
-        self.set_byte(v, i + 1)
-        if i + 1 > len {
-            self.set_byte(i + 1, 0.uint8)
-        }
-    }
-
-    // Gets the byte corresponding to character at index
-    // i.e. get_byte(0) returns bits 8-15 (since 0-7 is len)
-    fun get_byte(index: UInt8) -> UInt8 {
-        if index >= self.len { return 0 }
-        if index < 7 {
-            let rightByteShift: UInt8 = 6.uint8 - index
-            let rightBitShift: UInt8 = rightByteShift * 8
-            let shifted: UInt64 = self.hi >> rightBitShift.uint64
-            let masked: UInt64 = shifted & 255.uint64
-            return masked.uint8
-        } else {
-            let rightByteShift: UInt8 = 14.uint8 - index
-            let rightBitShift: UInt8 = rightByteShift * 8
-            let shifted: UInt64 = self.lo >> rightBitShift.uint64
-            let masked: UInt64 = shifted & 255.uint64
-            return masked.uint8
-        }
-    }
-
-    fun set_byte(val: UInt8, index: UInt8) {
-        if index > 15 { return }
-
-        let value64 = val.uint64
-        let topByteMask: UInt64 = 255.uint64 << 56
-
-        // 1. Update the byte value at the specific slot index
-        if index < 8 {
-            let shift: UInt64 = index.uint64 * 8
-
-            let targetMask = topByteMask >> shift
-            let invertedMask = ~targetMask
-
-            let clearedHi = self.hi & invertedMask
-            // correct ^^
-            let shiftedValue = value64 << 56 - shift
-
-            let newHi = clearedHi | shiftedValue
-            self.hi = newHi
-        } else {
-            let localIndex = index - 8
-            let shift: UInt64 = localIndex.uint64 * 8
-
-            let targetMask = topByteMask >> shift
-            let invertedMask = ~targetMask
-            let clearedLo = self.lo & invertedMask
-
-            let shiftedValue = value64 << 56 - shift
-            let newLo = clearedLo | shiftedValue
-
-            self.lo = newLo
-        }
-    }
-
-    fun hex_byte(n: UInt8) {
-        let hi_mask = n & 240.uint8
-        let hi_bits = hi_mask >> 4
-        let lo_bits = n & 15.uint8
-
-        if hi_bits == 15.uint8 { print("F") }
-        else if hi_bits == 14.uint8 { print("E") }
-        else if hi_bits == 13.uint8 { print("D") }
-        else if hi_bits == 12.uint8 { print("C") }
-        else if hi_bits == 11.uint8 { print("B") }
-        else if hi_bits == 10.uint8 { print("A") }
-        else { print(hi_bits) }
-
-        if lo_bits == 15.uint8 { print("F") }
-        else if lo_bits == 14.uint8 { print("E") }
-        else if lo_bits == 13.uint8 { print("D") }
-        else if lo_bits == 12.uint8 { print("C") }
-        else if lo_bits == 11.uint8 { print("B") }
-        else if lo_bits == 10.uint8 { print("A") }
-        else { print(lo_bits) }
-    }
-
-    fun hex_64(n: UInt64) {
-        var i = 7
-        while i >= 0 {
-            var shifted = n >> i.uint64 * 8
-            var byte = 255.uint64 & shifted
-
-            self.hex_byte(byte.uint8)
-            i = i - 1
-            print(" ")
-        }
-    }
-
-    fun show() {
-        print("0x")
-        self.hex_64(hi)
-        print(" ")
-        self.hex_64(lo)
-        print("\n")
-    }
-
-    fun putStr() {
-        var i = 0.uint8
-        print("\"")
-        while i < self.len {
-            putByte(self.get_byte(i))
-            i += 1
-        }
-        print("\"\n")
-    }
-
-    fun addBase64(val: Int) {
-        var base64 = 0
-        if val < 26 {
-            base64 = val + 65
-        } else if val < 52 {
-            base64 = val + 71
-        } else if val < 62 {
-            base64 = val - 4
-        } else if val == 62 {
-            base64 = 45
-        } else {
-            base64 = 95
-        }
-        self.set(val: base64, index: self.len)
-    }
-}
-
-fun newStr() -> str {
-    return str(hi: 0, lo: 0)
 }

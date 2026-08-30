@@ -70,7 +70,8 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
 private func appendMethod(_ m: FuncDecl, ind: String, into lines: inout [String]) {
     let params = m.params.map { "\($0.label): \($0.type.name)" }.joined(separator: ", ")
     let ret = m.returnType.map { " -> \($0.name)" } ?? ""
-    lines.append("\(ind)Method '\(m.name)'(\(params))\(ret)")
+    let kind = m.isStatic ? "StaticMethod" : "Method"
+    lines.append("\(ind)\(kind) '\(m.name)'(\(params))\(ret)")
     appendBlock(m.body, ind: ind + "  ", into: &lines)
 }
 
@@ -199,6 +200,8 @@ private func describeOp(_ op: BinOp) -> String {
     case .bitXor: return "^"
     case .shl:    return "<<"
     case .shr:    return ">>"
+    case .and:    return "&&"
+    case .or:     return "||"
     }
 }
 

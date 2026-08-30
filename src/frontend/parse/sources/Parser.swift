@@ -108,11 +108,11 @@ public struct Parser {
                 case .field(let f):    fields.append(f)
                 case .property(let p): properties.append(p)
                 }
-            } else if check(.kwFunc) {
-                requireLineStart("fun")
+            } else if check(.kwFunc) || check(.kwStatic) {
+                requireLineStart(check(.kwStatic) ? "static" : "fun")
                 methods.append(parseFuncDecl())
             } else {
-                error("expected 'let', 'var', or 'fun' in struct body, got \(currentKind)")
+                error("expected 'let', 'var', 'fun', or 'static fun' in struct body, got \(currentKind)")
                 recover(to: Self.memberBoundary)
             }
             // A member introducer for a *different* body kind (e.g. `case`/`on` here) is in the
@@ -150,11 +150,11 @@ public struct Parser {
                 error("enums cannot store fields")
                 advance()   // consume `let`, then skip the field's tokens to the next member
                 recover(to: Self.memberBoundary)
-            } else if check(.kwFunc) {
-                requireLineStart("fun")
+            } else if check(.kwFunc) || check(.kwStatic) {
+                requireLineStart(check(.kwStatic) ? "static" : "fun")
                 methods.append(parseFuncDecl())
             } else {
-                error("expected 'case', 'var', or 'fun' in enum body, got \(currentKind)")
+                error("expected 'case', 'var', 'fun', or 'static fun' in enum body, got \(currentKind)")
                 recover(to: Self.memberBoundary)
             }
             if pos == before { advance() }   // stray boundary token (e.g. `on`): force progress
@@ -200,11 +200,11 @@ public struct Parser {
                 case .field(let f):    fields.append(f)
                 case .property(let p): properties.append(p)
                 }
-            } else if check(.kwFunc) {
-                requireLineStart("fun")
+            } else if check(.kwFunc) || check(.kwStatic) {
+                requireLineStart(check(.kwStatic) ? "static" : "fun")
                 methods.append(parseFuncDecl())
             } else {
-                error("expected 'let', 'var', or 'fun' in class body, got \(currentKind)")
+                error("expected 'let', 'var', 'fun', or 'static fun' in class body, got \(currentKind)")
                 recover(to: Self.memberBoundary)
             }
             if pos == before { advance() }   // stray boundary token (e.g. `case`/`on`): force progress
@@ -353,6 +353,10 @@ public struct Parser {
 
     private mutating func parseFuncDecl() -> FuncDecl {
         let start = currentSpan
+        // `static fun …` — a type-associated function with no `self`. The modifier is only
+        // meaningful inside a type body; a stray top-level `static` never reaches here (the
+        // top-level dispatch keys on `fun`), so an accepted `static` here always precedes a member.
+        let isStatic = eat(.kwStatic)
         expect(.kwFunc)
         let name = expectIdent()
         let generics = parseGenericParams()
@@ -362,7 +366,7 @@ public struct Parser {
             returnType = parseTypeRef()
         }
         let body = parseBlock()
-        return FuncDecl(name: name, generics: generics, params: params, returnType: returnType, body: body, span: spanFrom(start))
+        return FuncDecl(name: name, generics: generics, params: params, returnType: returnType, body: body, isStatic: isStatic, span: spanFrom(start))
     }
 
     // MARK: - Fields and params
@@ -683,11 +687,35 @@ public struct Parser {
     // MARK: - Expressions
 
     private mutating func parseExpr() -> Expr {
-        parseComparison()
+        parseLogicalOr()
     }
 
-    // Precedence chain, loosest to tightest binding: comparison < `|` < `^` < `&` < shift <
-    // additive < multiplicative < unary prefix < postfix. Bitwise and shift bind tighter than
+    // `||` — loosest binding of all, so `a && b || c` reads as `(a && b) || c`. Short-circuit:
+    // codegen (SSAIRgen) lowers it to branches, evaluating the right side only when the left is false.
+    private mutating func parseLogicalOr() -> Expr {
+        let start = currentSpan
+        var lhs = parseLogicalAnd()
+        while currentKind == .pipePipe {
+            advance()
+            lhs = .binary(.or, lhs, parseLogicalAnd(), span: spanFrom(start))
+        }
+        return lhs
+    }
+
+    // `&&` — binds tighter than `||`, looser than comparison, so `a == b && c` reads as
+    // `(a == b) && c`. Short-circuit, like `||`.
+    private mutating func parseLogicalAnd() -> Expr {
+        let start = currentSpan
+        var lhs = parseComparison()
+        while currentKind == .ampAmp {
+            advance()
+            lhs = .binary(.and, lhs, parseComparison(), span: spanFrom(start))
+        }
+        return lhs
+    }
+
+    // Precedence chain, loosest to tightest binding: `||` < `&&` < comparison < `|` < `^` < `&` <
+    // shift < additive < multiplicative < unary prefix < postfix. Bitwise and shift bind tighter than
     // comparison (Go-style), so `x & mask == 0` reads as `(x & mask) == 0`, not the C footgun.
     private mutating func parseComparison() -> Expr {
         let start = currentSpan
@@ -757,7 +785,11 @@ public struct Parser {
     // bare `>` still closes a generic argument list (`Box<Box<Int>>` lexes as two `>`). Adjacency
     // (no gap between the two tokens) is required, so `a > b` and `Foo<T>` are never misread.
     private func shiftOp() -> BinOp? {
-        guard tokens[pos].span.endOffset == tokens[pos + 1].span.startOffset else { return nil }
+        // The adjacency test reads the next token directly; guard the last-token case (the EOF
+        // token is always last) so an expression that ends at EOF — e.g. from a missing closing
+        // delimiter — does not index past the end. At EOF there is no two-token `<<`/`>>` anyway.
+        guard pos + 1 < tokens.count,
+              tokens[pos].span.endOffset == tokens[pos + 1].span.startOffset else { return nil }
         if currentKind == .lt, peek() == .lt { return .shl }
         if currentKind == .gt, peek() == .gt { return .shr }
         return nil
@@ -865,6 +897,14 @@ public struct Parser {
             advance(); return .boolLit(v, span: spanFrom(start))
         case .stringLit(let v):
             advance(); return .stringLit(v, span: spanFrom(start))
+        case .lParen:
+            // Grouping parentheses: `(a + b) * c`. Transparent — the inner expression is
+            // returned as-is, so precedence falls out of the recursive parseExpr. A trailing
+            // call / member / subscript is attached by parsePostfix off the returned node.
+            advance()
+            let inner = parseExpr()
+            expect(.rParen)
+            return inner
         case .lBrace:
             return parseClosure()
         case .lBracket:

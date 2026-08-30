@@ -17,6 +17,10 @@ extension LLVMGen {
             guard let ft = llvmType(f.type, f.span) else { return nil }
             elems.append(ft)
         }
+        // A zero-field struct (e.g. a method-only `Time`) would lower to LLVM's empty type `{}`, which
+        // the GC statepoint rewrite can't pass as a call argument ("Empty type passed to intrinsic").
+        // Give it a one-byte placeholder so it is a real 1-byte value; no field ever indexes it.
+        if elems.isEmpty { elems.append(i8) }
         setStructBody(st, elems)
         return st
     }

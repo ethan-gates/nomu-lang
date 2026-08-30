@@ -17,6 +17,7 @@ public enum TokenKind: Hashable {
     case kwInterface
     case kwExtension
     case kwFunc, kwLet, kwVar
+    case kwStatic
     case kwOn, kwSpawn
     case kwSwitch, kwCase, kwReturn
     case kwIf, kwElse
@@ -40,6 +41,8 @@ public enum TokenKind: Hashable {
     case lt, gt, ltEq, gtEq
     case amp                  // & — interface composition (type position) / bitwise-and (expression)
     case pipe                 // | — bitwise-or
+    case ampAmp               // && — logical-and (short-circuit)
+    case pipePipe             // || — logical-or (short-circuit)
     case caret                // ^ — bitwise-xor
     case tilde                // ~ — bitwise-not
     case bang                 // ! — logical-not

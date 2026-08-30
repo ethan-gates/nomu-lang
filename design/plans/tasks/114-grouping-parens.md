@@ -1,13 +1,18 @@
 # Grouping parentheses as a primary expression
 
-**Avenue:** Usability · **Type/Lifecycle:** `user-facing · ready-to-build` · **Size:** S ·
-**Status:** ready-to-build · **Source:** deferred.md (2026-08 session)
+**Avenue:** Usability · **Type/Lifecycle:** `user-facing · shipped` · **Size:** S ·
+**Status:** shipped · **Source:** deferred.md (2026-08 session)
 
 ## What
 
-`(a + b) * c` does not parse today; `(` only opens a call/param list. Add a parenthesized-expression
-case to `parsePrimary`. Small, self-contained (currently worked around in
-`examples/benchmarks/hashmap.nomu`).
+`(a + b) * c` did not parse; `(` only opened a call/param list. A `.lParen` case was added to
+`parsePrimary` that parses the inner expression with `parseExpr` (full precedence falls out of the
+recursion) and expects `.rParen`. Grouping is transparent — no AST node; the inner expression is
+returned as-is, so a trailing call / member / subscript attaches via `parsePostfix`. Unclosed
+parens report a clean `expected rParen` diagnostic rather than trapping.
+
+Tests: `ParserTests.testGroupingParens` (precedence inversion) and `testGroupedExprTakesPostfix`
+(postfix off a group).
 
 ## Dependencies & triggers
 

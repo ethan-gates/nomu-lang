@@ -223,5 +223,6 @@ private func opSym(_ op: BinOp) -> String {
     case .eq:  return "=="; case .neq: return "!="; case .lt:  return "<"
     case .gt:  return ">";  case .lte: return "<="; case .gte: return ">="
     case .bitAnd: return "&"; case .bitOr: return "|"; case .bitXor: return "^"; case .shl: return "<<"; case .shr: return ">>"
+    case .and: return "&&"; case .or: return "||"
     }
 }

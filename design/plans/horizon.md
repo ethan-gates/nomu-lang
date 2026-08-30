@@ -86,9 +86,9 @@ GenImmix lands on the self-hosted one.
 Usability work, proceeding independently of the core bet:
 
 - [117 `for … in`](tasks/117-for-in-iteration.md), [115 error handling `?`](tasks/115-error-handling.md),
-  and cheap papercuts [114 grouping parens](tasks/114-grouping-parens.md),
-  [143 parser recovery](tasks/143-parser-error-recovery.md),
-  [119 float literals](tasks/119-float-exponent-literals.md).
+  and cheap papercut [119 float literals](tasks/119-float-exponent-literals.md).
+  [114 grouping parens](tasks/114-grouping-parens.md) and [143 parser recovery](tasks/143-parser-error-recovery.md)
+  are shipped (143's continue-into-Sema tail rides [137](tasks/137-tooling-lsp-formatter.md)).
 - Real, extensible [120 Array](tasks/120-stdlib-core.md) / [121 String](tasks/121-string-utf8-model.md) as
   Nomu-source types. Today they are codegen intrinsics you cannot extend, and String leaks via immortal
   buffers; making them real Nomu types wants a *safe* language-level buffer type, tracked with the stdlib

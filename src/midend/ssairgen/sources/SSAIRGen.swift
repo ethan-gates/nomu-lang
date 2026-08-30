@@ -238,6 +238,7 @@ final class FunctionLowerer {
     private var curId = 0
     private var nextBlock = 0
     private var nextValue = 0
+    private var scCounter = 0   // unique synthetic-variable ids for short-circuit && / || results
 
     // SSA construction state (Braun): current value per variable per block, sealed blocks, CFG preds.
     private var currentDef: [Int: [String: SSAValue]] = [:]
@@ -558,6 +559,32 @@ final class FunctionLowerer {
         seal(mergeB); curId = mergeB
     }
 
+    // Short-circuit `&&` / `||`, lowered like `var r = <skip-value>; if <takes-rhs> { r = rhs }`:
+    //   a && b  evaluates b only when a is true;  the skip value (a false) is `false`.
+    //   a || b  evaluates b only when a is false; the skip value (a true)  is `true`.
+    // The result flows through a synthetic variable, so the Braun SSA construction builds the merge
+    // phi automatically (exactly as an `if` that assigns the variable in one arm).
+    private func lowerShortCircuit(_ op: BinOp, _ l: NOIRExpr, _ r: NOIRExpr, _ span: Span) -> SSAValue? {
+        guard let lv = lowerExpr(l) else { return nil }
+        let name = "$sc\(scCounter)"; scCounter += 1
+        let rhsB = newBlock()
+        let mergeB = newBlock()
+        let skip = emit(.constBool(op == .or), .bool, span)   // value when the rhs is skipped
+        write(name, curId, skip)
+        // `&&` takes the rhs when lhs is true; `||` takes it when lhs is false.
+        let (thenTarget, elseTarget) = op == .and ? (rhsB, mergeB) : (mergeB, rhsB)
+        terminate(.condBr(cond: lv, then: thenTarget, thenArgs: [], else: elseTarget, elseArgs: []), span)
+        addPred(rhsB, curId); addPred(mergeB, curId)
+
+        seal(rhsB); curId = rhsB
+        guard let rv = lowerExpr(r) else { return nil }
+        write(name, curId, rv)
+        terminate(.br(target: mergeB, args: []), span); addPred(mergeB, curId)
+
+        seal(mergeB); curId = mergeB
+        return read(name, mergeB)
+    }
+
     // `while cond { body }` → header (re-tests each iteration) / body / exit. The header stays
     // **unsealed** while the condition and body lower, so a variable read in the header creates an
     // incomplete block parameter; the back-edge from the body completes its predecessors, and the
@@ -604,6 +631,7 @@ final class FunctionLowerer {
             return readVar(name, e.span, fieldType: e.type)
 
         case .binary(let op, let l, let r):
+            if op == .and || op == .or { return lowerShortCircuit(op, l, r, e.span) }
             guard let lv = lowerExpr(l), let rv = lowerExpr(r) else { return nil }
             return emit(.binary(op, lv, rv), e.type, e.span)
 

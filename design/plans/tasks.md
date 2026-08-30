@@ -56,14 +56,14 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 
 | # | Task | Avenue | Size | Status |
 | --- | --- | --- | --- | --- |
-| 107 | [`init` — custom initializers](tasks/107-init.md) | Usability | M | needs-design |
+| 107 | [`init` — custom initializers](tasks/107-init.md) | Usability | M | needs-design (static-method factories shipped as the lighter path) |
 | 108 | [`deinit` / finalization](tasks/108-deinit-finalization.md) | Usability | M | needs-design (► decide-early w/ M8) |
 | 109 | [Tuples](tasks/109-tuples.md) | Usability | L | needs-design |
 | 110 | [Pattern matching (full)](tasks/110-pattern-matching.md) | Usability | L | needs-design |
 | 111 | [Operator overloading (user types)](tasks/111-operator-overloading.md) | Usability | M | needs-design |
 | 112 | [Parameter labels + argument model](tasks/112-param-labels-args.md) | Usability | M | needs-design |
 | 113 | [Operator surface (built-ins)](tasks/113-operator-surface.md) | Usability | M | partially-shipped |
-| 114 | [Grouping parentheses](tasks/114-grouping-parens.md) | Usability | S | ready-to-build |
+| 114 | [Grouping parentheses](tasks/114-grouping-parens.md) | Usability | S | shipped |
 | 115 | [Error handling — `?` + typed throws](tasks/115-error-handling.md) | Usability | M | needs-design |
 | 116 | [Optional ergonomics](tasks/116-optional-ergonomics.md) | Usability | S | needs-design |
 | 117 | [`for … in` + iteration protocol](tasks/117-for-in-iteration.md) | Usability | M | needs-design |
@@ -115,7 +115,7 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 | # | Task | Avenue | Size | Status |
 | --- | --- | --- | --- | --- |
 | 142 | [IR + pipeline-boundary hardening](tasks/142-ir-pipeline-hardening.md) | Infra | M | needs-design (► decide-early: format w/ M7) |
-| 143 | [Parser / frontend error recovery](tasks/143-parser-error-recovery.md) | Usability | M | ready-to-build |
+| 143 | [Parser / frontend error recovery](tasks/143-parser-error-recovery.md) | Usability | M | shipped (continue-into-Sema tail → 137) |
 | 144 | [Frontend perf (interning, lexer, streaming)](tasks/144-frontend-perf.md) | Infra | M | needs-grounding |
 | 145 | [Monomorphization cost model](tasks/145-monomorphization-cost.md) | Infra | S | evaluate |
 | 146 | [Author the `language/` contract tier](tasks/146-language-contract-tier.md) | Infra | M | in-progress |

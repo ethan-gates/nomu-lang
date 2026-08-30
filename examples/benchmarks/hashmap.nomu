@@ -8,9 +8,256 @@
 // Elements are read field-wise (`entries[i].state`, `.key`, `.value`) and written whole
 // (`entries[i] = Entry(...)`), which is what the array element model supports today.
 
+fun nl() {
+    print("\n")
+}
+
+struct str {
+    var hi: UInt64
+    var lo: UInt64
+
+    var len: UInt8 {
+        return (hi >> 56).uint8
+    }
+
+    fun set(val: Int, index: Int) {
+        let v = val.uint8
+        let i = index.uint8
+        if i > 14 { return }
+        self.set_byte(v, i + 1)
+        if i + 1 > len {
+            self.set_byte(i + 1, 0.uint8)
+        }
+    }
+
+    // Gets the byte corresponding to character at index
+    // i.e. get_byte(0) returns bits 8-15 (since 0-7 is len)
+    fun get_byte(index: UInt8) -> UInt8 {
+        if index >= self.len { return 0 }
+        if index < 7 {
+            let rightByteShift: UInt8 = 6.uint8 - index
+            let rightBitShift: UInt8 = rightByteShift * 8
+            let shifted: UInt64 = self.hi >> rightBitShift.uint64
+            let masked: UInt64 = shifted & 255.uint64
+            return masked.uint8
+        } else {
+            let rightByteShift: UInt8 = 14.uint8 - index
+            let rightBitShift: UInt8 = rightByteShift * 8
+            let shifted: UInt64 = self.lo >> rightBitShift.uint64
+            let masked: UInt64 = shifted & 255.uint64
+            return masked.uint8
+        }
+    }
+
+    fun set_byte(val: UInt8, index: UInt8) {
+        if index > 15 { return }
+
+        let value64 = val.uint64
+        let topByteMask: UInt64 = 255.uint64 << 56
+
+        // 1. Update the byte value at the specific slot index
+        if index < 8 {
+            let shift: UInt64 = index.uint64 * 8
+
+            let targetMask = topByteMask >> shift
+            let invertedMask = ~targetMask
+
+            let clearedHi = self.hi & invertedMask
+            // correct ^^
+            let shiftedValue = value64 << 56 - shift
+
+            let newHi = clearedHi | shiftedValue
+            self.hi = newHi
+        } else {
+            let localIndex = index - 8
+            let shift: UInt64 = localIndex.uint64 * 8
+
+            let targetMask = topByteMask >> shift
+            let invertedMask = ~targetMask
+            let clearedLo = self.lo & invertedMask
+
+            let shiftedValue = value64 << 56 - shift
+            let newLo = clearedLo | shiftedValue
+
+            self.lo = newLo
+        }
+    }
+
+    fun hex_byte(n: UInt8) {
+        let hi_mask = n & 240.uint8
+        let hi_bits = hi_mask >> 4
+        let lo_bits = n & 15.uint8
+
+        if hi_bits == 15.uint8 { print("F") }
+        else if hi_bits == 14.uint8 { print("E") }
+        else if hi_bits == 13.uint8 { print("D") }
+        else if hi_bits == 12.uint8 { print("C") }
+        else if hi_bits == 11.uint8 { print("B") }
+        else if hi_bits == 10.uint8 { print("A") }
+        else { print(hi_bits) }
+
+        if lo_bits == 15.uint8 { print("F") }
+        else if lo_bits == 14.uint8 { print("E") }
+        else if lo_bits == 13.uint8 { print("D") }
+        else if lo_bits == 12.uint8 { print("C") }
+        else if lo_bits == 11.uint8 { print("B") }
+        else if lo_bits == 10.uint8 { print("A") }
+        else { print(lo_bits) }
+    }
+
+    fun hex_64(n: UInt64) {
+        var i = 7
+        while i >= 0 {
+            var shifted = n >> i.uint64 * 8
+            var byte = 255.uint64 & shifted
+
+            self.hex_byte(byte.uint8)
+            i = i - 1
+            print(" ")
+        }
+    }
+
+    fun show() {
+        print("0x")
+        self.hex_64(hi)
+        print(" ")
+        self.hex_64(lo)
+        print("\n")
+    }
+
+    fun putStr() {
+        var i = 0.uint8
+        print("\"")
+        while i < self.len {
+            putByte(self.get_byte(i))
+            i += 1
+        }
+        print("\"\n")
+    }
+
+    // Takes an i64 and takes 6 bits at a time for chars times
+    // building a string out of it
+    fun addBase64(val: Int) {
+        let chars = 6
+
+        var t = val
+        var i = 0
+        while i < chars {
+            let b64_dec = t & 63
+            var b64_ascii = 0
+            if b64_dec < 26 {
+                b64_ascii = b64_dec + 65
+            } else if b64_dec < 52 {
+                b64_ascii = b64_dec + 71
+            } else if b64_dec < 62 {
+                b64_ascii = b64_dec - 4
+            } else if b64_dec == 62 {
+                b64_ascii = 45
+            } else {
+                b64_ascii = 95
+            }
+            self.set(val: b64_ascii, index: self.len.int)
+            t = t >> 6
+            i += 1
+        }
+    }
+
+    fun fnv_1a() -> Int {
+        var lengthShifted = self.hi >> 56
+        let length: UInt64 = lengthShifted & 255
+
+        var clampedLength: UInt64 = length
+        if clampedLength > 15 {
+            clampedLength = 15
+        }
+
+        var hash = 3421674724.uint64 << 32
+        hash = hash + 2216829733.uint64
+        let prime: UInt64 = 1099511628211
+
+        // Split the FNV prime constant into its high and low 32-bit halves
+        let primeHigh = prime >> 32
+        let primeLow = prime & 4294967295
+
+        var index: UInt64 = 0
+
+        while index < clampedLength {
+            var byte: UInt64 = 0
+
+            if index < 7 {
+                var shift: UInt64 = index + 1
+                shift = shift * 8
+                shift = 56 - shift
+
+                var part1Shifted = self.hi >> shift
+                byte = part1Shifted & 255
+            } else {
+                var shift = index - 7
+                shift = shift * 8
+                shift = 56 - shift
+
+                var part2Shifted = self.lo >> shift
+                byte = part2Shifted & 255
+            }
+
+            hash = hash ^ byte
+
+            // Manual 64-bit wrapping multiplication without any operator overflow
+            let hashHigh = hash >> 32
+            let hashLow = hash & 4294967295
+
+            let productLowLow = hashLow * primeLow
+            let productLowHigh = hashLow * primeHigh
+            let productHighLow = hashHigh * primeLow
+
+            var totalHigh = productLowHigh + productHighLow
+            let productLowLowHigh = productLowLow >> 32
+            totalHigh = totalHigh + productLowLowHigh
+
+            var finalHighShifted = totalHigh << 32
+            let finalLowMasked = productLowLow & 4294967295
+
+            hash = finalHighShifted + finalLowMasked
+
+            index = index + 1
+        }
+
+        let umax = ~0.uint64
+        let maxDivTwo = umax / 2
+        let forcedPositive64 = hash % maxDivTwo
+        let result: Int = forcedPositive64.int
+
+        return result
+    }
+
+    fun eq(rhs: str) -> Bool {
+        let hi_match: Bool = rhs.hi == self.hi
+        let lo_match: Bool = rhs.lo == self.lo
+        if hi_match {
+            if lo_match {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+fun newStr(randToB64: Int) -> str {
+    var s = str(hi: 0, lo: 0)
+    s.addBase64(val: randToB64)
+    return s
+}
+
+fun emptyStr() -> str {
+    return str(hi: 0, lo: 0)
+}
+
+// =====================================================================
+//                             Hashmap
+// =====================================================================
 struct Entry {
     var state: Int
-    var key: String
+    var key: str
     var value: Int
 }
 
@@ -22,8 +269,8 @@ class HashTable {
     // The slot a key lives in, or the slot it should be inserted into: the first tombstone seen
     // while probing (reused), else the terminating empty slot. A returned slot with state 1 is a
     // match; any other state means the key is absent.
-    fun findSlot(key: String) -> Int {
-        var idx = key.hash % self.capacity
+    fun findSlot(key: str) -> Int {
+        var idx = key.fnv_1a() % self.capacity
         if idx < 0 {
             idx = idx + self.capacity
         }
@@ -68,7 +315,7 @@ class HashTable {
         var fresh: Array<Entry> = []
         var j = 0
         while j < newCap {
-            fresh.append(Entry(state: 0, key: "", value: 0))
+            fresh.append(Entry(state: 0, key: emptyStr(), value: 0))
             j = j + 1
         }
         self.entries = fresh
@@ -85,13 +332,13 @@ class HashTable {
 
     // Insert a known-absent key into a table with no matching key (used during rehash). Always
     // lands on an empty slot, so it always adds to the live count.
-    fun insertLive(key: String, value: Int) {
+    fun insertLive(key: str, value: Int) {
         let idx = self.findSlot(key)
         self.entries[idx] = Entry(state: 1, key: key, value: value)
         self.count = self.count + 1
     }
 
-    fun set(key: String, value: Int) {
+    fun set(key: str, value: Int) {
         let t = Time()
         let t1 = t.now
 
@@ -104,16 +351,10 @@ class HashTable {
         if st == 0 {
             self.count = self.count + 1   // filled a fresh bucket; tombstone reuse / overwrite do not
         }
-        print("set() took: ")
-        print(t.ms_since(t1))
-        print("ms ")
-        print(t.micro_since(t1))
-        print("µs ")
-        print(t.ns_since(t1))
-        print("ns\n")
+        // t.took("set()", t1)
     }
 
-    fun get(key: String) -> Option<Int> {
+    fun get(key: str) -> Option<Int> {
         let idx = self.findSlot(key)
         if self.entries[idx].state == 1 {
             return Option<Int>.some(value: self.entries[idx].value)
@@ -121,17 +362,17 @@ class HashTable {
         return Option<Int>.none
     }
 
-    fun contains(key: String) -> Bool {
+    fun contains(key: str) -> Bool {
         let idx = self.findSlot(key)
         return self.entries[idx].state == 1
     }
 
     // Replace a live slot with a tombstone. `count` is unchanged: the tombstone still occupies the
     // probe sequence (that is what tombstones are for).
-    fun delete(key: String) -> Bool {
+    fun delete(key: str) -> Bool {
         let idx = self.findSlot(key)
         if self.entries[idx].state == 1 {
-            self.entries[idx] = Entry(state: 2, key: "", value: 0)
+            self.entries[idx] = Entry(state: 2, key: emptyStr(), value: 0)
             return true
         }
         return false
@@ -145,7 +386,7 @@ fun makeTable() -> HashTable {
     return t
 }
 
-fun show(t: HashTable, key: String) {
+fun show(t: HashTable, key: str) {
     switch t.get(key) {
     case .some(let v):
         print(v)
@@ -156,29 +397,48 @@ fun show(t: HashTable, key: String) {
     }
 }
 
+fun expected_sum(n: Int) -> Int {
+    let half = n / 2
+    return n * half - half
+}
+
+
 fun main() {
-    let t = makeTable()
-    t.set("hello", 1)
-    t.set("hi", 2)
-    t.set("hay", 3)
-    t.set("hai", 4)
-    t.set("sup", 5)
-    t.set("gday", 6)
-    t.set("ay", 7)
-    t.set("yo", 8)
-    t.set("yaho", 9)
+    var rand = SimpleRNG(seed: 42)
 
-    show(t, "hello")   // 1
-    show(t, "yaho")    // 9
-    show(t, "missing") // 0
+    var table = makeTable()
 
-    t.set("hi", 20)    // overwrite
-    show(t, "hi")      // 20
+    let items_max = 1000000
 
-    print(t.contains("hai"))   // 1 (true)
-    print(t.delete("hai"))     // 1 (true)
-    print(t.contains("hai"))   // 0 (false, now a tombstone)
-    print(t.delete("hai"))     // 0 (already gone)
+    var i = 0
+    while i < items_max {
+        let k = newStr(randToB64: rand.next())
+        table.set(key: k, value: i)
+        i += 1
+    }
 
-    show(t, "gday")    // 6 — still reachable past the tombstone
+    var sum = 0
+    i = 0
+    rand = SimpleRNG(seed: 42)
+    while i < items_max {
+        let maybe_i = table.get(key: newStr(randToB64: rand.next()))
+        switch maybe_i {
+            case .some(let actual): sum += actual
+            case .none: break
+        }
+        i += 1
+    }
+
+    print("table stats: count=")
+    print(table.count)
+    print(" cap=")
+    print(table.capacity)
+    let ex = expected_sum(n: items_max)
+    if ex != sum {
+        print("ERROR: sum doesn't match\n")
+        print(sum)
+        print("\n")
+        print(ex)
+    }
+
 }

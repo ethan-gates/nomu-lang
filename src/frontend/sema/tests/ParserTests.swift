@@ -141,6 +141,53 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(op, .add)  // + binds looser than *, so top-level op is add
     }
 
+    func testLogicalOperatorPrecedence() {
+        // `a && b || c` parses as `(a && b) || c` — `||` is loosest, so it is the top-level op.
+        let p = parse("fun f(a: Bool, b: Bool, c: Bool) -> Bool { return a && b || c }")
+        guard case .funcDecl(let f) = p.decls[0],
+              case .ret(let expr?, _) = f.body[0],
+              case .binary(.or, let lhs, _, _) = expr,
+              case .binary(.and, _, _, _) = lhs else { XCTFail(); return }
+    }
+
+    func testLogicalAndBindsLooserThanComparison() {
+        // `a == b && c` parses as `(a == b) && c` — `&&` is looser than `==`.
+        let p = parse("fun f(a: Int, b: Int, c: Bool) -> Bool { return a == b && c }")
+        guard case .funcDecl(let f) = p.decls[0],
+              case .ret(let expr?, _) = f.body[0],
+              case .binary(.and, let lhs, _, _) = expr,
+              case .binary(.eq, _, _, _) = lhs else { XCTFail(); return }
+    }
+
+    func testGroupingParens() {
+        // Parens invert the natural precedence: without them + binds looser than *, so the
+        // top-level op would be add; grouping the sum makes multiply the outermost op.
+        let p = parse("fun f() -> Int { return (3 + 4) * 2 }")
+        guard case .funcDecl(let f) = p.decls[0],
+              case .ret(let expr?, _) = f.body[0],
+              case .binary(let op, let lhs, _, _) = expr else { XCTFail(); return }
+        XCTAssertEqual(op, .mul)
+        guard case .binary(let innerOp, _, _, _) = lhs else { XCTFail(); return }
+        XCTAssertEqual(innerOp, .add)  // the grouped sub-expression
+    }
+
+    func testGroupedExprTakesPostfix() {
+        // A call / member / subscript attaches to a parenthesized expression via parsePostfix.
+        let p = parse("fun f() -> Int { return (3 + 4).foo }")
+        guard case .funcDecl(let f) = p.decls[0],
+              case .ret(let expr?, _) = f.body[0],
+              case .member(let inner, let field, _) = expr,
+              case .binary(.add, _, _, _) = inner else { XCTFail(); return }
+        XCTAssertEqual(field, "foo")
+    }
+
+    func testStaticMethodParses() {
+        let p = parse("struct P {\nvar x: Int\nstatic fun origin() -> P { return P(x: 0) }\nfun sum() -> Int { return x }\n}")
+        guard case .structDecl(let s) = p.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(s.methods.first { $0.name == "origin" }?.isStatic, true)
+        XCTAssertEqual(s.methods.first { $0.name == "sum" }?.isStatic, false)
+    }
+
     func testLabeledCall() {
         let p = parse("fun f() -> Int { return Point(x: 1, y: 2).x }")
         guard case .funcDecl(let f) = p.decls[0],
