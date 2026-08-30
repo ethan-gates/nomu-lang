@@ -1391,18 +1391,78 @@ final class SemaTests: XCTestCase {
         XCTAssertFalse(r.diagnostics.hasErrors, r.diagnostics.render())
     }
 
-    func testGenericMethodsRejected() {
-        // Instance methods on a generic type are deferred past 5.2.3.
+    func testGenericStructInstanceMethod() {
+        // Task 151 slice 1: instance methods on a generic struct are lowered; a call on an applied
+        // instance resolves the signature with the type args substituted (here `T` → Int).
         let r = sema("""
         struct Box<T> {
             let value: T
-            fun get() -> T {
-                return value
-            }
+            fun get() -> T { return value }
+        }
+        fun main() -> Int {
+            let b = Box<Int>(value: 42)
+            return b.get()
         }
         """)
-        XCTAssertTrue(r.diagnostics.hasErrors)
-        XCTAssertTrue(r.diagnostics.render().contains("aren't supported yet"), r.diagnostics.render())
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        // The generic struct carries its method into the IR (mono specializes it per instantiation).
+        let box = r.module.decls.first { if case .structDecl(let s) = $0 { return s.name == "Box" }; return false }
+        guard case .structDecl(let s)? = box else { XCTFail(); return }
+        XCTAssertTrue(s.methods.contains { $0.name == "get" })
+        // The call site is typed at the substituted return type (Int), through a `.methodCall`.
+        guard case .funcDecl(let main)? = r.module.decls.first(where: { if case .funcDecl(let f) = $0 { return f.name == "main" }; return false }),
+              case .ret(let e?) = main.body[1].kind,
+              case .methodCall = e.kind else { XCTFail(); return }
+        XCTAssertEqual(e.type, .int)
+    }
+
+    func testGenericComputedPropertyResolves() {
+        // A computed property on a generic type: the getter's declared `T` substitutes to the
+        // instantiation's argument (here `T` → Int).
+        let r = sema("""
+        struct Box<T> {
+            var value: T
+            var stored: T { return value }
+        }
+        fun main() -> Int {
+            let b = Box<Int>(value: 9)
+            return b.stored
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let main)? = r.module.decls.first(where: { if case .funcDecl(let f) = $0 { return f.name == "main" }; return false }),
+              case .ret(let e?) = main.body[1].kind else { XCTFail(); return }
+        XCTAssertEqual(e.type, .int)   // `stored` typed at the substituted return type
+    }
+
+    func testGenericStaticMethodResolves() {
+        // A `static fun` on a generic type is emitted as a generic free function `Box.make`; the call
+        // `Box<Int>.make(…)` threads the type args so monomorphization specializes it.
+        let r = sema("""
+        struct Box<T> {
+            var value: T
+            static fun make(v: T) -> Box<T> { return Box<T>(value: v) }
+        }
+        fun main() -> Int {
+            let b = Box<Int>.make(v: 3)
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        let make = r.module.decls.first { if case .funcDecl(let f) = $0 { return f.name == "Box.make" }; return false }
+        guard case .funcDecl(let f)? = make else { XCTFail(); return }
+        XCTAssertFalse(f.generics.isEmpty)   // a generic template mono specializes per instantiation
+    }
+
+    func testGenericStaticMethodNeedsExplicitTypeArgs() {
+        let r = sema("""
+        struct Box<T> {
+            var value: T
+            static fun make(v: T) -> Box<T> { return Box<T>(value: v) }
+        }
+        fun main() -> Int { let b = Box.make(v: 3) return 0 }
+        """)
+        XCTAssertTrue(r.diagnostics.render().contains("needs explicit type arguments"), r.diagnostics.render())
     }
 
     func testGenericBindingTypeMismatchRejected() {

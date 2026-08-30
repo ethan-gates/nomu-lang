@@ -89,10 +89,14 @@ Usability work, proceeding independently of the core bet:
   and cheap papercut [119 float literals](tasks/119-float-exponent-literals.md).
   [114 grouping parens](tasks/114-grouping-parens.md) and [143 parser recovery](tasks/143-parser-error-recovery.md)
   are shipped (143's continue-into-Sema tail rides [137](tasks/137-tooling-lsp-formatter.md)).
+- [151 methods on generic types](tasks/151-generic-type-methods.md) — **shipped.** Instance methods, computed
+  properties, and `static fun` now work on generic structs/classes/enums (the frontend fed the mono+codegen
+  halves that already handled them). This unblocks the two items below and the real-iterables form of 117.
+  Tails: type-arg inference for generic statics, and the D6 by-value read limit.
 - Real, extensible [120 Array](tasks/120-stdlib-core.md) / [121 String](tasks/121-string-utf8-model.md) as
   Nomu-source types. Today they are codegen intrinsics you cannot extend, and String leaks via immortal
   buffers; making them real Nomu types wants a *safe* language-level buffer type, tracked with the stdlib
-  work. A secondary goal, separate from the runtime bet.
+  work. **Rides [151](tasks/151-generic-type-methods.md)** (a real `Array<T>` needs methods on a generic type).
 
 ## Settle cheaply, regardless
 

@@ -511,17 +511,31 @@ public struct Sema {
         let irGenerics = generics.map { NOIRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name), isShared: $0.isShared) }
         switch decl {
         case .structDecl(let s):
-            rejectGenericMembers(s.methods, s.properties, at: s.span)
+            // Instance methods on a generic struct (task 151, slice 1). `self` is the applied generic
+            // type `S<T…>`; fields and signatures resolve with the type's params in scope (set above),
+            // so a `T` becomes `.typeParam`. Monomorphization specializes each method per instantiation.
+            let selfT = Type.generic(base: s.name, args: generics.map { .typeParam($0.name) })
+            let fields = s.fields.map(lowerField)
+            let methods = lowerMethods(s.methods, selfType: selfT, fields: fields)
+                        + lowerAccessors(s.properties, selfType: selfT, fields: fields)
+            lowerStaticMethods(s.methods, typeName: s.name, generics: irGenerics)
             return .structDecl(NOIRStruct(name: s.name, generics: irGenerics,
-                                        fields: s.fields.map(lowerField), methods: [], span: s.span))
+                                        fields: fields, methods: methods, span: s.span))
         case .classDecl(let c):
-            rejectGenericMembers(c.methods, c.properties, at: c.span)
+            let selfT = Type.generic(base: c.name, args: generics.map { .typeParam($0.name) })
+            let fields = c.fields.map(lowerField)
+            let methods = lowerMethods(c.methods, selfType: selfT, fields: fields)
+                        + lowerAccessors(c.properties, selfType: selfT, fields: fields)
+            lowerStaticMethods(c.methods, typeName: c.name, generics: irGenerics)
             return .classDecl(NOIRClass(name: c.name, generics: irGenerics,
-                                      fields: c.fields.map(lowerField), methods: [], span: c.span))
+                                      fields: fields, methods: methods, span: c.span))
         case .enumDecl(let e):
-            rejectGenericMembers(e.methods, e.properties, at: e.span)
+            let selfT = Type.generic(base: e.name, args: generics.map { .typeParam($0.name) })
             let cases = e.cases.map { NOIREnumCase(name: $0.name, fields: $0.fields.map(lowerField), span: $0.span) }
-            return .enumDecl(NOIREnum(name: e.name, generics: irGenerics, cases: cases, methods: [], span: e.span))
+            let methods = lowerMethods(e.methods, selfType: selfT, fields: [])
+                        + lowerAccessors(e.properties, selfType: selfT, fields: [])
+            lowerStaticMethods(e.methods, typeName: e.name, generics: irGenerics)
+            return .enumDecl(NOIREnum(name: e.name, generics: irGenerics, cases: cases, methods: methods, span: e.span))
         default: preconditionFailure("unreachable")
         }
     }
@@ -531,6 +545,7 @@ public struct Sema {
             diags.error("methods and computed properties on a generic type aren't supported yet (M5 5.2.3)", at: span)
         }
     }
+
 
     // A method requirement (or default) named `name` reachable from an interface,
     // including inherited requirements (aggregated over the refinement graph).
@@ -834,7 +849,12 @@ public struct Sema {
     // declared by bare name, mirroring how actor handlers see their fields (T3).
     private mutating func lowerMethods(_ methods: [FuncDecl], selfType: Type, fields: [NOIRField]) -> [NOIRFunc] {
         var out: [NOIRFunc] = []
-        let ownerType: String? = { if case .named(let n, _) = selfType { return n }; return nil }()
+        let ownerType: String? = {
+            switch selfType {
+            case .named(let n, _), .generic(let n, _): return n
+            default:                                   return nil
+            }
+        }()
         for m in methods where !m.isStatic {
             let params = m.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
             // A `some I` method return keys its opaque identity by "m:Type.method" — the same
@@ -857,7 +877,8 @@ public struct Sema {
     // fields in scope, so a body that references `self` or a bare field name is an undefined-name
     // error. The qualified name is unspellable by users, so it never collides with a real free
     // function; the call site `Type.method(...)` targets it as an ordinary direct call.
-    private mutating func lowerStaticMethods(_ methods: [FuncDecl], typeName: String) {
+    private mutating func lowerStaticMethods(_ methods: [FuncDecl], typeName: String,
+                                             generics: [NOIRGenericParam] = []) {
         for m in methods where m.isStatic {
             let params = m.params.map { NOIRParam(label: $0.label, name: $0.name, type: resolve($0.type), span: $0.span) }
             let ret = resolve(m.returnType)
@@ -867,8 +888,11 @@ public struct Sema {
             let body = lowerBlock(m.body)
             currentReturnType = saved
             popScope()
-            pendingStaticFuncs.append(.funcDecl(NOIRFunc(name: "\(typeName).\(m.name)", params: params,
-                                                         returnType: ret, body: body, isMutating: false, span: m.span)))
+            // On a generic type the free function carries the type's parameters, so monomorphization
+            // treats it as a generic template and specializes it per instantiation (task 151).
+            pendingStaticFuncs.append(.funcDecl(NOIRFunc(name: "\(typeName).\(m.name)", generics: generics,
+                                                         params: params, returnType: ret, body: body,
+                                                         isMutating: false, span: m.span)))
         }
     }
 
@@ -1068,6 +1092,22 @@ public struct Sema {
                     // The setter mutates the value; on a value type it needs a mutable receiver.
                     if kind != .class_ {
                         methodCallSites.append(CallSite(callee: "\(tn).\(field).set",
+                                                        receiverMutable: isMutableReceiver(base), span: span))
+                    }
+                    let call = NOIRExpr(type: .void, span: span,
+                                      kind: .methodCall(receiver: b, method: "\(field).set", args: [value]))
+                    return NOIRStmt(kind: .exprStmt(call), span: span)
+                }
+                // Computed-property write on an applied generic type `Box<Int>` (task 151).
+                if case .generic(let gbase, let gargs) = b.type, let info = computedProps[gbase]?[field] {
+                    let propType = substitute(info.type, genericSubst(gbase, gargs))
+                    guard info.hasSetter else {
+                        diags.error("cannot assign to read-only computed property '\(field)'", at: span)
+                        return NOIRStmt(kind: .exprStmt(checkExpr(rhs, expected: propType)), span: span)
+                    }
+                    let value = checkExpr(rhs, expected: propType)
+                    if kindOf(gbase) != .class_ {
+                        methodCallSites.append(CallSite(callee: "\(gbase).\(field).set",
                                                         receiverMutable: isMutableReceiver(base), span: span))
                     }
                     let call = NOIRExpr(type: .void, span: span,
@@ -1420,6 +1460,12 @@ public struct Sema {
                 return NOIRExpr(type: info.type, span: span,
                               kind: .methodCall(receiver: b, method: "\(field).get", args: []))
             }
+            // A computed-property read on an applied generic type `Box<Int>` (task 151): the getter's
+            // declared type substitutes `T` to the concrete argument.
+            if case .generic(let gbase, let gargs) = b.type, let info = computedProps[gbase]?[field] {
+                return NOIRExpr(type: substitute(info.type, genericSubst(gbase, gargs)), span: span,
+                              kind: .methodCall(receiver: b, method: "\(field).get", args: []))
+            }
             // A field read on an applied generic type `Box<Int>` (M5 5.2.3): the field is stored
             // boxed; its declared `T` substitutes to the concrete argument for the result type.
             if case .generic(let gbase, let gargs) = b.type {
@@ -1696,6 +1742,28 @@ public struct Sema {
 
     // A field read on `Box<Int>`: resolve the field's declared type with the type's parameters
     // in scope, then substitute the applied arguments to get the concrete result type (M5 5.2.3).
+    private func genericParamsOf(_ base: String) -> [GenericParam] {
+        structs[base]?.generics ?? enums[base]?.generics ?? classes[base]?.generics ?? []
+    }
+
+    // The substitution binding a generic type's own parameters to an instantiation's arguments
+    // (`Box<Int>` → `[T: Int]`).
+    private func genericSubst(_ base: String, _ args: [Type]) -> [String: Type] {
+        var subst: [String: Type] = [:]
+        for (p, a) in zip(genericParamsOf(base), args) { subst[p.name] = a }
+        return subst
+    }
+
+    // A generic type's method signature at an instantiation `Base<args>`: each param/return type is
+    // resolved with the type's own generic params in scope (so a bare `T` becomes `.typeParam`), then
+    // substituted to the concrete arguments. Mirrors `genericMemberType` for fields (task 151).
+    private mutating func genericMethodSig(_ base: String, _ args: [Type], _ m: FuncDecl) -> (params: [Type], ret: Type) {
+        let gens = genericParamsOf(base)
+        let saved = genericScope; genericScope = Set(gens.map(\.name)); defer { genericScope = saved }
+        let subst = genericSubst(base, args)
+        return (m.params.map { substitute(resolve($0.type), subst) }, substitute(resolve(m.returnType), subst))
+    }
+
     private mutating func genericMemberType(_ base: String, _ args: [Type], _ field: String, at span: Span) -> Type {
         guard let shape = genericTypeShape(base), let f = shape.fields.first(where: { $0.name == field }) else {
             diags.error("type '\(base)' has no field '\(field)'", at: span)
@@ -2108,8 +2176,24 @@ public struct Sema {
         // for a non-generic user type (generic types reject members entirely, so no static free
         // function is ever emitted for them); the call lowers to a direct call of `Type.method`.
         if case .member(let base, let name, _) = callee,
-           let (tn, _) = typeNameAndArgs(base), lookup(tn) == nil, genericArity(tn) == nil,
+           let (tn, explicit) = typeNameAndArgs(base), lookup(tn) == nil,
            let k = kindOf(tn), let m = staticMethodDecl(tn, k, name) {
+            // A generic type's static method: `Box<Int>.make(...)`. The signature substitutes the
+            // explicit type args, and they ride on the call so monomorphization specializes the
+            // static free function per instantiation (task 151). Inference of the args from the
+            // value arguments is not done yet — the args are required explicitly.
+            if let arity = genericArity(tn) {
+                guard let targs = explicit, targs.count == arity else {
+                    diags.error("static method '\(tn).\(name)' on a generic type needs explicit type arguments, e.g. '\(tn)<…>.\(name)(…)'", at: span)
+                    return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+                }
+                let (paramTypes, ret) = genericMethodSig(tn, targs, m)
+                let irArgs = checkArgs(args, expectedParams: paramTypes)
+                checkArgTypes(irArgs.map(\.value), against: paramTypes, at: span)
+                let calleeType = Type.function(params: paramTypes, ret: ret)
+                return NOIRExpr(type: ret, span: span,
+                              kind: .call(callee: irVar("\(tn).\(name)", calleeType, span), args: irArgs, typeArgs: targs))
+            }
             let paramTypes = m.params.map { resolve($0.type) }
             let irArgs = checkArgs(args, expectedParams: paramTypes)
             checkArgTypes(irArgs.map(\.value), against: paramTypes, at: span)
@@ -2217,6 +2301,21 @@ public struct Sema {
                 checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: recv.type) }, at: span)
                 return NOIRExpr(type: resolve(req.returnType, selfAs: recv.type), span: span,
                               kind: .methodCall(receiver: recv, method: name, args: irArgs))
+            }
+            // Instance method on an applied generic type `Box<Int>` (task 151): resolve the method on
+            // the template and substitute the instantiation's type args into its signature. The
+            // `.methodCall` rides through, and monomorphization specializes the body per instantiation.
+            if case .generic(let gbase, let gargs) = recv.type,
+               let gkind = kindOf(gbase),
+               let method = methodDecl(gbase, gkind, name) {
+                let (paramTypes, ret) = genericMethodSig(gbase, gargs, method)
+                let irArgs = args.map { checkExpr($0.value) }
+                checkArgTypes(irArgs, against: paramTypes, at: span)
+                if gkind != .class_ {
+                    methodCallSites.append(CallSite(callee: "\(gbase).\(name)",
+                                                    receiverMutable: isMutableReceiver(base), span: span))
+                }
+                return NOIRExpr(type: ret, span: span, kind: .methodCall(receiver: recv, method: name, args: irArgs))
             }
             if case .named(let typeName, let kind) = recv.type {
                 // Actor send: base.handler(args).

@@ -69,6 +69,7 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 | 117 | [`for … in` + iteration protocol](tasks/117-for-in-iteration.md) | Usability | M | needs-design |
 | 118 | [Associated types + where-clauses](tasks/118-associated-types.md) | Usability | L | needs-design |
 | 119 | [Float-exponent literals](tasks/119-float-exponent-literals.md) | Usability | S | needs-design |
+| 151 | [Methods on generic types](tasks/151-generic-type-methods.md) | Usability | M | shipped (instance + computed + static, all of struct/class/enum); tails: static type-arg inference, D6 by-value read |
 
 ### Stdlib & memory model (Usability)
 
