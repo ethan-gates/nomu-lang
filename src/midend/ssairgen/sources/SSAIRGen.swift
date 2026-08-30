@@ -215,6 +215,8 @@ private func collectUsesExpr(_ e: NOIRExpr, _ bound: Set<String>, _ used: inout 
         for el in elements { collectUsesExpr(el, bound, &used) }
     case .index(let base, let idx):
         collectUsesExpr(base, bound, &used); collectUsesExpr(idx, bound, &used)
+    case .staticCall(_, _, let args):
+        for a in args { collectUsesExpr(a, bound, &used) }   // monomorphization lowers these to `call`
     }
 }
 
@@ -637,6 +639,12 @@ final class FunctionLowerer {
 
         case .call(let callee, let args, let typeArgs):
             return lowerCall(callee: callee, args: args, typeArgs: typeArgs, type: e.type, span: e.span)
+
+        case .staticCall(let onType, let method, _):
+            // Monomorphization rewrites every `.staticCall` to a concrete `.call`, so one reaching
+            // the egress means an unspecialized dispatch (a bug), not valid input.
+            fail("static requirement '\(onType).\(method)' was not resolved by monomorphization", e.span)
+            return nil
 
         case .index(let base, let idx):
             return lowerIndex(base: base, idx: idx, elem: e.type, span: e.span)

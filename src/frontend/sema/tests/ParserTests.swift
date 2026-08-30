@@ -244,6 +244,18 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(s.properties[1].setter?.paramName, "s")
     }
 
+    func testStaticInterfaceRequirementParses() {
+        let p = parse("""
+        interface Zeroable {
+            static fun zero() -> Self
+            fun get() -> Int
+        }
+        """)
+        guard case .interfaceDecl(let i) = p.decls[0] else { XCTFail(); return }
+        XCTAssertEqual(i.methods.first { $0.name == "zero" }?.isStatic, true)
+        XCTAssertEqual(i.methods.first { $0.name == "get" }?.isStatic, false)
+    }
+
     func testInterfaceDecl() {
         let p = parse("""
         interface Drawable {

@@ -43,6 +43,129 @@ final class SemaTests: XCTestCase {
         XCTAssertEqual(base.type, .named("Point", .struct_))
     }
 
+    func testStaticInterfaceRequirementDispatch() {
+        // A `static fun zero() -> Self` requirement, satisfied by a conformer's static method and
+        // called through a bound `<T: Zeroable>` as `T.zero()` — lowers to a `.staticCall` that mono
+        // resolves to the concrete conformer.
+        let r = sema("""
+        interface Zeroable {
+            static fun zero() -> Self
+        }
+        struct MyInt: Zeroable {
+            var v: Int
+            static fun zero() -> MyInt { return MyInt(v: 0) }
+        }
+        fun zeroLike<T: Zeroable>(hint: T) -> T { return T.zero() }
+        fun main() -> Int {
+            let a = MyInt(v: 9)
+            let z = zeroLike(hint: a)
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let f)? = r.module.decls.first(where: { if case .funcDecl(let fn) = $0 { return fn.name == "zeroLike" }; return false }),
+              case .ret(let e?) = f.body[0].kind,
+              case .staticCall(_, let method, _) = e.kind else { XCTFail(); return }
+        XCTAssertEqual(method, "zero")
+    }
+
+    func testGenericFuncInfersTypeParamFromExpectedReturn() {
+        // A type parameter that appears only in the return type is inferred from the call's expected
+        // type (the `makeTable<K>() -> HashTable<K>` pattern). Before this, only argument-inference
+        // existed, so `makeEmpty()` reported "cannot infer type parameter 'T'".
+        let r = sema("""
+        struct Box<T> {
+            var v: T
+        }
+        fun makeEmpty<T>() -> Array<Box<T>> {
+            let a: Array<Box<T>> = []
+            return a
+        }
+        fun main() -> Int {
+            let xs: Array<Box<Int>> = makeEmpty()
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .funcDecl(let main)? = r.module.decls.first(where: { if case .funcDecl(let f) = $0 { return f.name == "main" }; return false }),
+              case .letBinding(_, _, let value) = main.body[0].kind,
+              case .call(_, _, let typeArgs) = value.kind else { XCTFail(); return }
+        XCTAssertEqual(typeArgs, [.int])   // T inferred as Int from `Array<Box<Int>>`
+    }
+
+    func testBoundTypeParamSatisfiesSameBound() {
+        // A bound type parameter `K: Hashable` satisfies a `<K2: Hashable>` bound, so `Entry<K>` is
+        // usable inside `Table<K: Hashable>` (the hashmap case). Before the fix this reported
+        // "K does not conform to Hashable".
+        let r = sema("""
+        interface Hashable {
+            fun hash() -> UInt64
+        }
+        struct Entry<K: Hashable> {
+            var key: K
+        }
+        struct Table<K: Hashable> {
+            var e: Entry<K>
+            fun wrap(k: K) -> Entry<K> { return Entry<K>(key: k) }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+    }
+
+    func testStaticRequirementDispatchInsideGenericType() {
+        // `T.zero()` inside a generic type's method, where `T` is the type's own bound parameter.
+        // The instantiation `Entry<MyInt>` pins `T`, and mono resolves the `.staticCall` to MyInt.
+        let r = sema("""
+        interface Zeroable {
+            static fun zero() -> Self
+        }
+        struct MyInt: Zeroable {
+            var v: Int
+            static fun zero() -> MyInt { return MyInt(v: 0) }
+        }
+        struct Entry<T: Zeroable> {
+            var tag: Int
+            fun make() -> T { return T.zero() }
+        }
+        fun main() -> Int {
+            let e = Entry<MyInt>(tag: 1)
+            let z = e.make()
+            return 0
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        // The generic type's method body carries the static-requirement dispatch.
+        let entry = r.module.decls.first { if case .structDecl(let s) = $0 { return s.name == "Entry" }; return false }
+        guard case .structDecl(let s)? = entry,
+              let make = s.methods.first(where: { $0.name == "make" }),
+              case .ret(let e?) = make.body[0].kind,
+              case .staticCall(_, "zero", _) = e.kind else { XCTFail(); return }
+    }
+
+    func testStaticRequirementInterfaceIsConstraintOnly() {
+        let r = sema("""
+        interface Zeroable {
+            static fun zero() -> Self
+        }
+        fun f(x: any Zeroable) -> Int { return 0 }
+        """)
+        XCTAssertTrue(r.diagnostics.render().contains("declares a static requirement and is constraint-only"), r.diagnostics.render())
+    }
+
+    func testStaticRequirementMustBeSatisfiedByStaticMethod() {
+        // An instance method of the same name does not satisfy a static requirement.
+        let r = sema("""
+        interface Zeroable {
+            static fun zero() -> Self
+        }
+        struct Bad: Zeroable {
+            var v: Int
+            fun zero() -> Bad { return Bad(v: 0) }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.render().contains("missing static method 'zero'"), r.diagnostics.render())
+    }
+
     func testLogicalOperatorsTypeAsBool() {
         let r = sema("fun f(a: Bool, b: Bool) -> Bool { return a && b || a }")
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())

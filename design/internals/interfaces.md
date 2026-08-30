@@ -89,6 +89,12 @@ A requirement may mention `Self`, standing for the conforming type (`fun clone()
 - **Both kinds are usable as `<T: I>`.** A `Self`-mentioning bound compiles because monomorphization specializes it to a concrete `T` where `-> Self` is a direct call — no witness needed (`generics.md` §4).
 - The property is computed at interface declaration and **propagates through refinement** (`B: A` is constraint-only if `A` is).
 
+### 6.1 Static requirements — also constraint-only
+
+- **`static fun` requirements.** An interface may declare `static fun name(…) -> …` requirements (e.g. `static fun zero() -> Self` for a `Zeroable`/`Numeric`-style protocol). A conformer satisfies one with a matching `static fun`; a static requirement and an instance method never cross-satisfy. `Self` in the requirement binds to the conformer.
+- **Constraint-only, for a stronger reason than non-covariant `Self`.** A static method has **no receiver**, so there is no value to carry a witness and no concrete type to name behind `any I`. An interface with any static requirement is usable as `<T: I>` / `some I` and **rejected as `any I`** (diagnosed at type formation). It emits no witness table. This is the same fundamental limit as trait-object safety (Rust) / existential restrictions (Swift): a requirement with no `Self` receiver can't be dispatched through erasure.
+- **Dispatch** is through the bound only: `T.zero()` where `T: Zeroable` lowers to a `.staticCall(onType: T, …)` node that **monomorphization resolves** to the concrete conformer's static method (`Conformer.zero`, the static free function), rewriting it to a direct call. Under whole-program mono every such `T` is specialized to a concrete type, so no witness slot for statics is needed. Property propagates through refinement.
+
 ---
 
 ## 7. Composition & refinement

@@ -300,6 +300,7 @@ public indirect enum ExprKind {
     case enumInit(typeName: String, caseName: String, args: [NOIRArg])    // enum value construction (M4.10)
     case methodCall(receiver: NOIRExpr, method: String, args: [NOIRExpr])   // actor sends (T3: type methods)
     case call(callee: NOIRExpr, args: [NOIRArg], typeArgs: [Type])   // function / builtin call; typeArgs non-empty for a generic call (M5 5.2.2)
+    case staticCall(onType: Type, method: String, args: [NOIRExpr])   // `T.m(…)` static interface-requirement dispatch; mono resolves `onType` to a concrete conformer and lowers to a direct `call`
     case binary(BinOp, NOIRExpr, NOIRExpr)
     case closure(params: [NOIRParam], body: [NOIRStmt])
     case box(value: NOIRExpr, interfaces: [String])       // M5 A1.4/A1.5b: wrap a conformer as `any I` / `any A & B`

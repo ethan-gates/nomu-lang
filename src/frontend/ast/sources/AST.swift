@@ -75,10 +75,11 @@ public struct InterfaceMethod {
     public let params: [Param]
     public let returnType: TypeRef?
     public let defaultBody: Block?    // nil = mandatory requirement; non-nil = overridable default
+    public let isStatic: Bool         // `static fun` requirement — satisfied by a static method, called `T.name(…)`
     public let span: Span
 
-    public init(name: String, params: [Param], returnType: TypeRef?, defaultBody: Block?, span: Span) {
-        self.name = name; self.params = params; self.returnType = returnType; self.defaultBody = defaultBody; self.span = span
+    public init(name: String, params: [Param], returnType: TypeRef?, defaultBody: Block?, isStatic: Bool = false, span: Span) {
+        self.name = name; self.params = params; self.returnType = returnType; self.defaultBody = defaultBody; self.isStatic = isStatic; self.span = span
     }
 }
 

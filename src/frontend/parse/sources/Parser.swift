@@ -272,14 +272,14 @@ public struct Parser {
         while !check(.rBrace) && !check(.eof) {
             panicking = false
             let before = pos
-            if check(.kwFunc) {
-                requireLineStart("fun")
+            if check(.kwFunc) || check(.kwStatic) {
+                requireLineStart(check(.kwStatic) ? "static" : "fun")
                 methods.append(parseInterfaceMethod())
             } else if check(.kwVar) {
                 requireLineStart("var")
                 properties.append(parseInterfacePropertyReq())
             } else {
-                error("expected 'fun' or 'var' requirement in interface body, got \(currentKind)")
+                error("expected 'fun', 'static fun', or 'var' requirement in interface body, got \(currentKind)")
                 recover(to: Self.memberBoundary)
             }
             if pos == before { advance() }   // stray boundary token (e.g. `case`/`on`): force progress
@@ -291,6 +291,7 @@ public struct Parser {
     // A method requirement: a signature, optionally followed by a `{ … }` default body.
     private mutating func parseInterfaceMethod() -> InterfaceMethod {
         let start = currentSpan
+        let isStatic = eat(.kwStatic)
         expect(.kwFunc)
         let name = expectIdent()
         let params = parseParamList()
@@ -298,7 +299,7 @@ public struct Parser {
         if eat(.arrow) { returnType = parseTypeRef() }
         let defaultBody: Block? = check(.lBrace) ? parseBlock() : nil
         return InterfaceMethod(name: name, params: params, returnType: returnType,
-                               defaultBody: defaultBody, span: spanFrom(start))
+                               defaultBody: defaultBody, isStatic: isStatic, span: spanFrom(start))
     }
 
     // A property requirement: `var name: T { get }` or `{ get set }` — accessor shapes

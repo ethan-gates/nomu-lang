@@ -213,6 +213,13 @@ private final class Monomorphizer {
             kind = .arrayLit(elements: elements.map { rewriteExpr($0, s) })
         case .index(let base, let idx):
             kind = .index(base: rewriteExpr(base, s), idx: rewriteExpr(idx, s))
+        case .staticCall(let onType, let method, let args):
+            // Resolve the dispatch type (a bound type parameter → the concrete conformer) and lower
+            // to a direct call of that type's static method free function `Conformer.method`.
+            let rty = resolveType(onType, s)
+            let tn = namedName(rty) ?? "<unresolved>"
+            let callee = NOIRExpr(type: .void, span: e.span, kind: .varRef("\(tn).\(method)"))
+            kind = .call(callee: callee, args: args.map { NOIRArg(label: nil, value: rewriteExpr($0, s)) }, typeArgs: [])
         }
         return NOIRExpr(type: newType, span: e.span, kind: kind)
     }

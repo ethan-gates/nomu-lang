@@ -90,6 +90,8 @@ private struct ExhaustivenessPass {
             for el in elements { walkExpr(el) }
         case .index(let base, let idx):
             walkExpr(base); walkExpr(idx)
+        case .staticCall(_, _, let args):
+            for a in args { walkExpr(a) }
         }
     }
 

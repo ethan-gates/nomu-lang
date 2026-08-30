@@ -272,8 +272,11 @@ public struct Sema {
         // guarantee two `Self` values share a concrete type, so `any I` is rejected at type
         // formation (M5 5.6, interfaces.md §4.4). Covariant-only `Self` (return position) is
         // erasure-safe and allowed. `some I` / a generic bound `<T: I>` remain fine for both.
-        for n in set where hasNonCovariantSelf(n) {
-            diags.error("interface '\(n)' uses Self in a non-covariant position (a parameter, a settable property, or nested in a function type) and is constraint-only — use 'some \(n)' or a generic bound '<T: \(n)>', not 'any \(n)'", at: span)
+        for n in set where isConstraintOnly(n) {
+            let reason = hasStaticRequirement(n)
+                ? "declares a static requirement"
+                : "uses Self in a non-covariant position (a parameter, a settable property, or nested in a function type)"
+            diags.error("interface '\(n)' \(reason) and is constraint-only — use 'some \(n)' or a generic bound '<T: \(n)>', not 'any \(n)'", at: span)
             return .error
         }
         return set.count == 1 ? .existential(set[0]) : .composition(set)
@@ -612,6 +615,19 @@ public struct Sema {
         ownHasNonCovariantSelf(iface) || transitiveBases(iface).contains { ownHasNonCovariantSelf($0) }
     }
 
+    // A static requirement (`static fun`) has no receiver, so it can't be dispatched through an
+    // erased `any I` value — the interface is constraint-only, like a non-covariant `Self`.
+    private func hasStaticRequirement(_ iface: String) -> Bool {
+        let own = { (n: String) in self.interfaces[n]?.methods.contains(where: \.isStatic) ?? false }
+        return own(iface) || transitiveBases(iface).contains(where: own)
+    }
+
+    // An interface usable as a generic bound / `some I` but not `any I` (M5 5.6): a non-covariant
+    // `Self`, or a static requirement.
+    private func isConstraintOnly(_ iface: String) -> Bool {
+        hasNonCovariantSelf(iface) || hasStaticRequirement(iface)
+    }
+
     // The full method-requirement set of `iface` = its own plus every inherited one,
     // deduplicated by signature; each carries its resolved default (§4.3).
     private func aggregatedMethods(_ iface: String) -> [InterfaceMethod] {
@@ -629,7 +645,7 @@ public struct Sema {
         return order.map { key in
             let m = rep[key]!
             return InterfaceMethod(name: m.name, params: m.params, returnType: m.returnType,
-                                   defaultBody: resolveDefault(defaults[key] ?? []), span: m.span)
+                                   defaultBody: resolveDefault(defaults[key] ?? []), isStatic: m.isStatic, span: m.span)
         }
     }
 
@@ -689,13 +705,13 @@ public struct Sema {
             // witness table. A covariant-only interface *does* — each `-> Self` requirement's slot
             // is **erased to `any I`** (`selfAs: .existential`), so the slot has a uniform concrete
             // representation (`AnyBox`); the thunk re-boxes the concrete result (M5 5.6).
-            if hasNonCovariantSelf(i.name) { continue }
+            if isConstraintOnly(i.name) { continue }
             let selfErased = Type.existential(i.name)
             // Aggregated (flattened) surface: the witness table carries inherited slots too.
             let methods = aggregatedMethods(i.name).map { NOIRMethodReq(name: $0.name, params: $0.params.map { resolve($0.type, selfAs: selfErased) }, ret: resolve($0.returnType, selfAs: selfErased)) }
             let props = aggregatedProperties(i.name).map { NOIRPropReq(name: $0.name, type: resolve($0.type, selfAs: selfErased), isSettable: $0.isSettable) }
             // Only any-able bases carry a witness, so only they get a base pointer (M5 A1.4 upcast).
-            let bases = transitiveBases(i.name).filter { !hasNonCovariantSelf($0) }.sorted()
+            let bases = transitiveBases(i.name).filter { !isConstraintOnly($0) }.sorted()
             out.append(NOIRInterface(name: i.name, methods: methods, properties: props, bases: bases))
         }
         return out
@@ -792,9 +808,11 @@ public struct Sema {
     // types and return type, or (if none) by the interface's overridable default.
     private mutating func checkMethodRequirement(_ req: InterfaceMethod, typeName: String, kind: NamedKind, interface conf: Conformance, methods: [FuncDecl]) {
         let selfType = Type.named(typeName, kind)
-        let named = methods.filter { $0.name == req.name }
+        // A `static fun` requirement is satisfied by a `static fun` of the type; an instance
+        // requirement by an instance method. The kinds never cross-satisfy.
+        let named = methods.filter { $0.name == req.name && $0.isStatic == req.isStatic }
         if named.contains(where: { methodMatches(req, $0, selfAs: selfType) }) { return }
-        if req.defaultBody != nil {
+        if req.defaultBody != nil && !req.isStatic {
             // Satisfied by the interface's overridable default — this conformer inherits
             // it, so it is synthesized once as a concrete method of the type (M5 A1.4).
             if !(inheritedDefaults[typeName] ?? []).contains(where: { $0.name == req.name }) {
@@ -802,10 +820,11 @@ public struct Sema {
             }
             return
         }
+        let kindWord = req.isStatic ? "static method" : "method"
         if named.isEmpty {
-            diags.error("type '\(typeName)' does not conform to '\(conf.name)': missing method '\(req.name)'", at: conf.span)
+            diags.error("type '\(typeName)' does not conform to '\(conf.name)': missing \(kindWord) '\(req.name)'", at: conf.span)
         } else {
-            diags.error("type '\(typeName)' does not conform to '\(conf.name)': method '\(req.name)' has the wrong signature", at: conf.span)
+            diags.error("type '\(typeName)' does not conform to '\(conf.name)': \(kindWord) '\(req.name)' has the wrong signature", at: conf.span)
         }
     }
 
@@ -1556,7 +1575,7 @@ public struct Sema {
     // A call to a generic function (M5 5.2.2): infer each type parameter from the arguments,
     // check every inferred type satisfies the parameter's bounds (a witness must exist), and
     // record the inferred type arguments so codegen can pass the witnesses.
-    private mutating func checkGenericCall(_ name: String, _ sig: FnSig, _ args: [NOIRArg], at span: Span) -> NOIRExpr {
+    private mutating func checkGenericCall(_ name: String, _ sig: FnSig, _ args: [NOIRArg], at span: Span, expected: Type? = nil) -> NOIRExpr {
         if args.count != sig.params.count {
             diags.error("function '\(name)' expects \(sig.params.count) argument(s), got \(args.count)", at: span)
         }
@@ -1568,8 +1587,15 @@ public struct Sema {
         // (a `.none` argument can't pin `T`); that surfaces as the ordinary "cannot infer" error.
         var subst: [String: Type] = [:]
         for (p, a) in zip(sig.params, args) { unify(param: p, arg: a.value.type, into: &subst, at: span) }
+        // Type parameters that appear only in the return type (`makeTable<K>() -> HashTable<K>`) can't
+        // be inferred from the arguments; fall back to the call's expected type when one is known
+        // (`var t: HashTable<str> = makeTable()`). Best-effort and structural — a shape that doesn't
+        // line up simply binds nothing, leaving the "cannot infer" error below.
+        if let expected, sig.generics.contains(where: { subst[$0.name] == nil }) {
+            bindFromExpected(sig.ret, expected, into: &subst)
+        }
         for g in sig.generics where subst[g.name] == nil {
-            diags.error("cannot infer type parameter '\(g.name)' of '\(name)' from the arguments", at: span)
+            diags.error("cannot infer type parameter '\(g.name)' of '\(name)' from the arguments or the expected type", at: span)
             subst[g.name] = .error
         }
         for g in sig.generics {
@@ -1618,6 +1644,26 @@ public struct Sema {
         }
     }
 
+    // Best-effort binding of return-position type parameters from the call's expected type. Unlike
+    // `unify`, it never reports a mismatch: where the shapes line up it binds an unbound parameter,
+    // and anywhere they diverge it just stops (the real diagnostic is the "cannot infer" error).
+    private func bindFromExpected(_ ret: Type, _ expected: Type, into subst: inout [String: Type]) {
+        guard expected != .error else { return }
+        switch (ret, expected) {
+        case (.typeParam(let t), _):
+            if subst[t] == nil { subst[t] = expected }
+        case let (.generic(rb, ra), .generic(eb, ea)) where rb == eb && ra.count == ea.count:
+            for (r, e) in zip(ra, ea) { bindFromExpected(r, e, into: &subst) }
+        case let (.array(re), .array(ee)):
+            bindFromExpected(re, ee, into: &subst)
+        case let (.function(rp, rr), .function(ep, er)) where rp.count == ep.count:
+            for (r, e) in zip(rp, ep) { bindFromExpected(r, e, into: &subst) }
+            bindFromExpected(rr, er, into: &subst)
+        default:
+            break
+        }
+    }
+
     private mutating func mismatch(_ param: Type, _ arg: Type, at span: Span) {
         if param != .error && arg != .error {
             diags.error("argument of type '\(arg)' does not match expected '\(param)'", at: span)
@@ -1663,6 +1709,12 @@ public struct Sema {
     // specializes to a concrete `T` — no witness required (M5 5.6).
     private func typeConforms(_ t: Type, to iface: String) -> Bool {
         if case .named(let tn, _) = t { return allConformsTo[tn]?.contains(iface) == true }
+        // A bound type parameter satisfies a bound it declares, directly or by refinement — so a
+        // `K: Hashable` in scope can be passed as the argument of a `<K2: Hashable>` type (`Entry<K>`).
+        if case .typeParam(let n) = t {
+            let bounds = genericBounds[n] ?? []
+            return bounds.contains(iface) || bounds.contains { transitiveBases($0).contains(iface) }
+        }
         return false
     }
 
@@ -2172,6 +2224,19 @@ public struct Sema {
                 return checkPtrStatic(elems[0], method, args, span)
             }
         }
+        // Static interface-requirement call on a bounded type parameter: `T.zero()` where `T: I` and
+        // `I` declares a `static fun zero` requirement. `Self` in the requirement binds to `T`; the
+        // `.staticCall` is resolved by monomorphization to the concrete conformer's static method.
+        if case .member(let base, let name, _) = callee, case .ident(let tp, _) = base,
+           genericScope.contains(tp),
+           let iface = (genericBounds[tp] ?? []).first(where: { aggregatedMethods($0).contains { $0.name == name && $0.isStatic } }),
+           let req = aggregatedMethods(iface).first(where: { $0.name == name && $0.isStatic }) {
+            let selfT = Type.typeParam(tp)
+            let irArgs = args.map { checkExpr($0.value) }
+            checkArgTypes(irArgs, against: req.params.map { resolve($0.type, selfAs: selfT) }, at: span)
+            let ret = resolve(req.returnType, selfAs: selfT)
+            return NOIRExpr(type: ret, span: span, kind: .staticCall(onType: selfT, method: name, args: irArgs))
+        }
         // Static method: `Type.method(args)` — a type-associated function with no receiver. Only
         // for a non-generic user type (generic types reject members entirely, so no static free
         // function is ever emitted for them); the call lowers to a direct call of `Type.method`.
@@ -2425,7 +2490,7 @@ public struct Sema {
             if let sig = funcs[name] {
                 if !sig.generics.isEmpty {
                     let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr($0.value)) }
-                    return checkGenericCall(name, sig, irArgs, at: span)
+                    return checkGenericCall(name, sig, irArgs, at: span, expected: expected)
                 }
                 let irArgs = checkArgs(args, expectedParams: sig.params)
                 checkArgTypes(irArgs.map(\.value), against: sig.params, at: span)

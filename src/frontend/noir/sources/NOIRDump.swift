@@ -190,6 +190,8 @@ private func children(_ e: NOIRExpr) -> [(slot: String, expr: NOIRExpr)] {
         return elements.map { ("elem", $0) }
     case .index(let base, let idx):
         return [("base", base), ("index", idx)]
+    case .staticCall(_, _, let args):
+        return args.map { ("arg", $0) }
     }
 }
 
@@ -212,6 +214,7 @@ private func head(_ e: NOIRExpr) -> String {
     case .box(_, let ifaces):      return "box any \(ifaces.joined(separator: " & "))"
     case .arrayLit(let elements):  return "arrayLit [\(elements.count)]"
     case .index:                   return "index"
+    case .staticCall(let t, let m, _): return "staticCall \(t).\(m)"
     }
 }
 
