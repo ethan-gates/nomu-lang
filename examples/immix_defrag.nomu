@@ -1,0 +1,72 @@
+// Task 150 · rung 3 (Immix), increment 150.3.8 — copy reserve + defrag trigger. Evacuation becomes
+// selective: only fragmented blocks are evacuated, and only as many as fresh to-space can absorb (the
+// reserve). A sparse survivor set (every 50th Box kept, the rest dropped) fragments the heap; the first
+// collection is non-moving and seeds the fragmentation histogram (defragTable), and the second selects those
+// fragmented blocks and compacts their survivors into fresh to-space.
+//
+// Compiled NOMU_NO_ESCAPE=1 (heap objects), run under NOMU_GC_PLAN=nomu (the self-hosted Immix heap).
+// Single-threaded with a controlled root set; rtImmixCollectDefrag returns the root's new address, which the
+// fixture reads the compacted survivors through.
+//
+// Checks: the first collection did NOT move the root (the trigger is selective, not force-all — no history
+// yet); a survivor then moved and its value reads back through the fixed-up slot (defrag fired); the
+// address-independent fingerprint is invariant across the compaction; from-space was reclaimed. Expected
+// output: 1 / 1 / 1000 / 1 / 1.
+class Box {
+  var v: Int
+}
+fun main() {
+  var keep: Array<Box> = []
+  var i = 0
+  while i < 8000 {
+    let b = Box(v: i + 1000)
+    let m = i - i / 50 * 50           // i mod 50 (no grouping parens yet, task 114)
+    if m == 0 {
+      keep.append(b)
+    }
+    i = i + 1
+  }
+
+  let space = RawPtr.gcSelfhostSpace()
+
+  // first collection: no defrag history, so it runs non-moving and only seeds the fragmentation histogram
+  let r1 = rtImmixCollectDefrag(space, addrOf(keep))
+  print(r1.eq(addrOf(keep)))          // 1 — the root did not move (selective trigger, not force-all)
+  print("\n")
+
+  // fingerprint of the (still-sparse) live set before the compacting collection
+  let tc = RawPtr.gcTypeCount()
+  let counts = RawPtr.alloc(bytes: tc * 8, align: 8)
+  let fp = RawPtr.alloc(bytes: 8, align: 8)
+  let before = rtMarkVerify(r1, counts, fp)
+  let fpBefore: Int = fp.load(fromByteOffset: 0)
+  rtImmixUnmark(r1)
+
+  let oldBox0A = addrOf(keep[0]).toInt()
+
+  // second collection: the fragmented blocks are selected as sources and their survivors compacted
+  let r2 = rtImmixCollectDefrag(space, r1)
+
+  // reach the compacted survivor: handle.bufptr (byte 16) → buffer element 0 (byte 16), both slots fixed up
+  let buf: RawPtr = r2.load(fromByteOffset: 16)
+  let box0: RawPtr = buf.load(fromByteOffset: 16)
+  let newBox0A = box0.toInt()
+  print(newBox0A != oldBox0A)          // 1 — a survivor moved (defrag fired)
+  print("\n")
+
+  let v0: Int = box0.load(fromByteOffset: 8)
+  print(v0)                            // 1000 — value read back through the fixed-up slot
+  print("\n")
+
+  let counts2 = RawPtr.alloc(bytes: tc * 8, align: 8)
+  let fp2 = RawPtr.alloc(bytes: 8, align: 8)
+  let after = rtMarkVerify(r2, counts2, fp2)
+  let fpAfter: Int = fp2.load(fromByteOffset: 0)
+  rtImmixUnmark(r2)
+  print(fpBefore == fpAfter)           // 1 — address-independent fingerprint invariant (no missed fixup)
+  print("\n")
+
+  let freed = rtImmixFreeBlocks(space)
+  print(freed > 0)                     // 1 — the emptied source blocks were reclaimed
+  print("\n")
+}

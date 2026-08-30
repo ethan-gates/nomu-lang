@@ -473,16 +473,19 @@ fun rtScanParkedFibers(outBuf: RawPtr, cap: Int) -> Int {
 // (§10.2, Decided), one byte per entry, over the reserved heap range. Entry value 0 is the initial state
 // (block FREE / line unmarked), and rt_raw_alloc zero-fills, so the fresh tables start correct.
 //
-// Space descriptor (112 bytes):
+// Space descriptor (120 bytes):
 //   { heapBase: RawPtr @0, numBlocks: Int @8, lineTable: RawPtr @16, blockTable: RawPtr @24,
 //     freeCursor: Int @32, heapBaseInt: Int @40, allocCursor: Int @48, allocLimit: Int @56,
 //     losHead: RawPtr @64, allocBlock: Int @72, allocLine: Int @80, freeList: RawPtr @88,
-//     freeListTop: Int @96, scanBlock: Int @104 }.
+//     freeListTop: Int @96, scanBlock: Int @104, defragTable: RawPtr @112 }.
 // allocCursor/allocLimit are heap-relative byte offsets bounding the current hole (0/0 → refill). freeCursor
 // bumps never-used blocks. allocBlock/allocLine track the block being filled + its next line to scan for
 // holes (allocBlock −1 = none). freeList is a stack of reclaimed empty block indices (freeListTop entries).
 // scanBlock is the next block index the allocator scans for a recyclable block. losHead is the large-object
-// list. Block state byte: 0 FREE, 1 RECYCLABLE, 2 UNAVAILABLE.  Line mark byte: 0 unmarked, 1 marked.
+// list. defragTable is a per-block side table holding each block's live-line count from the last sweep — the
+// fragmentation histogram the defrag trigger (150.3.8) selects evacuation sources from (§10.6). Block state
+// byte: 0 FREE, 1 RECYCLABLE, 2 UNAVAILABLE, 3 DEFRAG_SOURCE (transient: a block selected for evacuation this
+// collection, overwritten by the sweep). Line mark byte: 0 unmarked, 1 marked.
 
 // Reserve a heap of `numBlocks` 32 KiB blocks + its side tables; return the space descriptor.
 fun rtImmixNew(numBlocks: Int) -> RawPtr {
@@ -493,7 +496,8 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   let lineTable = RawPtr.alloc(bytes: lineBytes, align: 8)
   let blockTable = RawPtr.alloc(bytes: numBlocks, align: 8)
   let freeList = RawPtr.alloc(bytes: numBlocks * 8, align: 8)
-  let ctl = RawPtr.alloc(bytes: 112, align: 8)
+  let defragTable = RawPtr.alloc(bytes: numBlocks, align: 8)
+  let ctl = RawPtr.alloc(bytes: 120, align: 8)
   ctl.store(heap, toByteOffset: 0)
   ctl.store(numBlocks, toByteOffset: 8)
   ctl.store(lineTable, toByteOffset: 16)
@@ -509,6 +513,7 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   ctl.store(freeList, toByteOffset: 88)
   ctl.store(0, toByteOffset: 96)     // freeListTop
   ctl.store(0, toByteOffset: 104)    // scanBlock
+  ctl.store(defragTable, toByteOffset: 112)  // per-block last-sweep live-line count (defrag histogram)
   return ctl
 }
 
@@ -1088,10 +1093,13 @@ fun rtClearAllLines(space: RawPtr) {
 
 // Reclaim by block: for each handed-out block, count its marked (live) lines and set its state — FREE (no
 // live line, returned to the free list for reuse), RECYCLABLE (mixed, has holes), or UNAVAILABLE (all live).
+// The live-line count is also recorded in defragTable as the next collection's fragmentation histogram — the
+// defrag trigger (150.3.8) selects evacuation sources from blocks this sweep found sparsely live (§10.6).
 fun rtImmixSweepBlocks(space: RawPtr) {
   let fc: Int = space.load(fromByteOffset: 32)
   space.store(0, toByteOffset: 96)           // reset free list
   let fl: RawPtr = space.load(fromByteOffset: 88)
+  let dt: RawPtr = space.load(fromByteOffset: 112)
   var bi = 0
   while bi < fc {
     let firstLine = bi * 128
@@ -1104,6 +1112,7 @@ fun rtImmixSweepBlocks(space: RawPtr) {
       }
       li = li + 1
     }
+    dt.store(marked.uint8, toByteOffset: bi)   // record the live-line count for next collection's defrag selection
     if marked == 0 {
       rtSetBlockState(space, bi, 0)
       let top: Int = space.load(fromByteOffset: 96)
@@ -1315,6 +1324,248 @@ fun rtCheckPayloadWord() -> Int {
     t = t + 1
   }
   return bad
+}
+
+// ---- Evacuation + pointer fixup — the moving collector (task 150 · rung 3, 150.3.7 / 150.3.8) ----
+// Forward-during-trace (selfhosted-gc.md §10.6/§10.7): as the tracer visits the graph it copies each
+// reachable object in a source block into fresh to-space (rtCopyObject, installing the forwarding record of
+// §10.8) and rewrites the slot it came through — and the root — to the survivor's new address. One store
+// added to the slot walk 150.2 already built. A block is an evacuation source iff its state byte is 3
+// (DEFRAG_SOURCE); everything else is marked in place. The two callers differ only in how they set that
+// flag: rtImmixEvacCollect (150.3.7) marks every used block a source (force-all); rtImmixCollectDefrag
+// (150.3.8) selects only fragmented blocks within a copy-reserve budget. Runs under the runtime subset's
+// noSafepoint (149), which is what makes holding raw pointers into the moving heap across the copy sound —
+// it closes 125 §3.3's deferred moving-heap gate.
+
+// The post-evacuation address of `obj`. A candidate (in the Immix heap, in a DEFRAG_SOURCE block, not yet
+// forwarded) is copied into to-space and its forwarding record installed; an already-forwarded object yields
+// its forwarding pointer; a non-candidate (LOS/off-heap, or in a non-source block) is returned unchanged and
+// marked in place by the caller.
+fun rtEvacuate(space: RawPtr, obj: RawPtr) -> RawPtr {
+  if rtIsForwarded(obj) {
+    return rtForwardingPointer(obj)
+  }
+  let base: Int = space.load(fromByteOffset: 40)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let heapEnd = base + nb * 32768
+  let a = obj.toInt()
+  if a < base {
+    return obj                       // off-heap (LOS): never moves
+  }
+  if a >= heapEnd {
+    return obj
+  }
+  let d = a - base
+  let bi = d / 32768
+  if rtBlockState(space, bi) != 3 {
+    return obj                       // non-source (marked in place) or a to-space copy — do not move
+  }
+  let copy = rtCopyObject(space, obj)
+  return copy
+}
+
+// Forward-during-trace from `root`: evacuate the root and every reachable source-block object into to-space,
+// rewriting each managed slot (and the root itself) to the survivor's address as the trace visits it, and
+// line-marking each survivor at its final location so the following sweep reclaims the emptied source blocks
+// and keeps the marked-in-place survivors. Returns the root's post-evacuation address. Shared children and
+// cycles resolve through the forwarded-bit guard in rtEvacuate and the mark-bit guard here, so every object
+// is copied and scanned exactly once.
+fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
+  let rootNull = root.eq(RawPtr.null)
+  if rootNull {
+    return root
+  }
+  let cap = 1048576
+  let work = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var top = 0
+  let newRoot = rtEvacuate(space, root)
+  if rtTryMarkBare(newRoot) {
+    work.store(newRoot, toByteOffset: 0)
+    top = 1
+  }
+  while top > 0 {
+    top = top - 1
+    let obj: RawPtr = work.load(fromByteOffset: top * 8)
+    let tid = rtObjTypeId(obj)
+    let kind = RawPtr.gcTypeKind(tid)
+    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    var size = 0
+    if kind == 0 {
+      size = RawPtr.gcTypeSize(tid)
+    } else {
+      let ecap: Int = obj.load(fromByteOffset: 8)
+      let stride = RawPtr.gcTypeStride(tid)
+      size = 16 + ecap * stride
+    }
+    rtMarkObjLines(space, obj, size)
+    if kind == 0 {
+      var i = 0
+      while i < nptr {
+        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let child: RawPtr = obj.load(fromByteOffset: off)
+        let childNull = child.eq(RawPtr.null)
+        if !childNull {
+          let nc = rtEvacuate(space, child)
+          obj.store(nc, toByteOffset: off)
+          if rtTryMarkBare(nc) {
+            work.store(nc, toByteOffset: top * 8)
+            top = top + 1
+          }
+        }
+        i = i + 1
+      }
+    } else {
+      let ecap2: Int = obj.load(fromByteOffset: 8)
+      let stride2 = RawPtr.gcTypeStride(tid)
+      var e = 0
+      while e < ecap2 {
+        let elemBase = 16 + e * stride2
+        var i = 0
+        while i < nptr {
+          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let at = elemBase + off
+          let child: RawPtr = obj.load(fromByteOffset: at)
+          let childNull = child.eq(RawPtr.null)
+          if !childNull {
+            let nc = rtEvacuate(space, child)
+            obj.store(nc, toByteOffset: at)
+            if rtTryMarkBare(nc) {
+              work.store(nc, toByteOffset: top * 8)
+              top = top + 1
+            }
+          }
+          i = i + 1
+        }
+        e = e + 1
+      }
+    }
+  }
+  work.free()
+  return newRoot
+}
+
+// Point the copy allocator at fresh to-space only for the evacuation trace: reset the bump cursor and skip
+// the recyclable scan past every used block, so copies draw from reclaimed-free and never-used blocks (both
+// FREE, never a source or a marked-in-place block). Shared setup for both evacuating collectors.
+fun rtSetupCopyAllocator(space: RawPtr) {
+  let fc: Int = space.load(fromByteOffset: 32)
+  space.store(fc, toByteOffset: 104)        // recyclable scan past every used block
+  space.store(-1, toByteOffset: 72)         // allocBlock: none → first copy draws a fresh/free block
+  space.store(0, toByteOffset: 80)          // allocLine
+  space.store(0, toByteOffset: 48)          // allocCursor
+  space.store(0, toByteOffset: 56)          // allocLimit
+}
+
+// Reset the mutator's allocator after a collection: no current block, rescan recyclable from the start so
+// reclaimed + recyclable space is reused by the next allocation.
+fun rtResetAllocator(space: RawPtr) {
+  space.store(-1, toByteOffset: 72)
+  space.store(0, toByteOffset: 80)
+  space.store(0, toByteOffset: 48)
+  space.store(0, toByteOffset: 56)
+  space.store(0, toByteOffset: 104)
+}
+
+// One force-all evacuating collection from `root` (150.3.7): mark every used block a source, so every live
+// object moves to fresh to-space; fix up all slots and the root; reclaim the emptied from-space by the
+// 150.3.5 sweep. Returns the root's new address (the root moves — the caller adopts it). The general
+// collector (rtImmixCollectDefrag, 150.3.8) selects sources by fragmentation; this is its evacuate-everything
+// special case, kept as a maximal-move stress path.
+fun rtImmixEvacCollect(space: RawPtr, root: RawPtr) -> RawPtr {
+  rtClearAllLines(space)
+  let fc: Int = space.load(fromByteOffset: 32)
+  var bi = 0
+  while bi < fc {
+    rtSetBlockState(space, bi, 3)           // every used block is a source
+    bi = bi + 1
+  }
+  space.store(0, toByteOffset: 96)          // free list empty — to-space is fresh (never-used) only
+  rtSetupCopyAllocator(space)
+  let newRoot = rtImmixEvacMark(space, root)
+  rtImmixSweepBlocks(space)
+  rtImmixSweepLos(space)
+  rtImmixUnmark(newRoot)
+  rtResetAllocator(space)
+  return newRoot
+}
+
+// ---- Copy reserve + defrag trigger — the general collector (task 150 · rung 3, 150.3.8) ----
+// The defrag trigger replaces force-all: only fragmented blocks are evacuated, and only as many as fresh
+// to-space can absorb (the copy reserve). Fragmentation is read from defragTable — each block's live-line
+// count as of the last sweep (§10.6, MMTk's "previous GC mark histogram drives this GC's defrag"). A block
+// is a source iff it holds live data but is sparsely filled (0 < lastLiveLines ≤ threshold). The reserve
+// bounds the source count by available empty blocks: each source needs at most one to-space block, so
+// selecting at most (available − reserve) sources leaves the reserve free even if a source turned out full —
+// the guarantee that evacuation never runs out of to-space mid-collection. When the heap is near-full
+// (budget 0) no sources are selected and the collection is non-moving. Selection is deterministic (scan
+// order), so the collector diffs against MMTk Immix run to run.
+
+// Half a block — a block with at most this many live lines (more than half holes) is fragmented enough to
+// evacuate. The fragmentation threshold; tuning it (and the block-selection order) is the defrag policy knob.
+fun rtDefragThreshold() -> Int {
+  return 64
+}
+
+// Select evacuation sources for this collection and mark them DEFRAG_SOURCE (state 3). A block qualifies
+// when the last sweep found it sparsely live (0 < count ≤ threshold) and it is still a used block (state
+// RECYCLABLE/UNAVAILABLE). At most `budget` blocks are selected — budget is the available empty-block count
+// (free list + never-used) minus the copy reserve — so to-space can always absorb the survivors. Returns the
+// number selected (0 ⇒ the collection runs non-moving). Freshly allocated blocks with no histogram (count 0)
+// are never sources; the first collection therefore never evacuates and only seeds defragTable.
+fun rtSelectDefragSources(space: RawPtr) -> Int {
+  let fc: Int = space.load(fromByteOffset: 32)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let flTop: Int = space.load(fromByteOffset: 96)
+  let neverUsed = nb - fc
+  let available = flTop + neverUsed
+  var reserve = available / 16
+  if reserve < 1 {
+    reserve = 1
+  }
+  var budget = available - reserve
+  if budget < 0 {
+    budget = 0
+  }
+  let threshold = rtDefragThreshold()
+  let dt: RawPtr = space.load(fromByteOffset: 112)
+  var selected = 0
+  var bi = 0
+  while bi < fc {
+    if selected < budget {
+      let cnt: UInt8 = dt.load(fromByteOffset: bi)
+      let live = cnt.int
+      if live > 0 {
+        if live <= threshold {
+          let st = rtBlockState(space, bi)
+          if st != 0 {
+            rtSetBlockState(space, bi, 3)   // DEFRAG_SOURCE for this collection
+            selected = selected + 1
+          }
+        }
+      }
+    }
+    bi = bi + 1
+  }
+  return selected
+}
+
+// One collection from `root`, the general Immix collector (150.3.8): select fragmented blocks as evacuation
+// sources within the copy reserve, evacuate their live objects to fresh to-space while marking every other
+// live object in place, then reclaim the emptied sources + dead blocks by the 150.3.5 sweep (which also
+// records the next collection's fragmentation histogram). Returns the root's post-collection address — the
+// root moves only if it sat in a source block, so the caller adopts the returned pointer. With zero sources
+// this is exactly the non-moving collector (rtImmixCollect); with every used block a source it is force-all
+// (rtImmixEvacCollect) — one path, the evacuation set chosen by fragmentation.
+fun rtImmixCollectDefrag(space: RawPtr, root: RawPtr) -> RawPtr {
+  let nSources = rtSelectDefragSources(space)
+  rtClearAllLines(space)
+  rtSetupCopyAllocator(space)
+  let newRoot = rtImmixEvacMark(space, root)
+  rtImmixSweepBlocks(space)
+  rtImmixSweepLos(space)
+  rtImmixUnmark(newRoot)
+  rtResetAllocator(space)
+  return newRoot
 }
 
 // ---- Scheduler root (task 128.3.1) ----

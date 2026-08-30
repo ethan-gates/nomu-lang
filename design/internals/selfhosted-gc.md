@@ -645,10 +645,13 @@ match the rung-1/rung-2 discipline (single-arena first, deterministic force-coll
 increment diffable against MMTk Immix.
 
 Remaining tuning, deferred inside rung 3 (each with the MMTk Immix oracle):
-- **Copy reserve / evacuation budget** — how many blocks to hold back so evacuation never runs out of
-  to-space mid-collection (MMTk reserves a fraction; pick and validate). Addressed at 150.3.8.
-- **Defragmentation trigger** — the fragmentation threshold and block-selection order that replace
-  force-all. Addressed at 150.3.8.
+- **Copy reserve / evacuation budget** — **Built (150.3.8).** Source count is capped at available empty
+  blocks (free list + never-used) minus a 1/16 reserve; each source needs at most one to-space block, so the
+  reserve is always free at collection end. Budget 0 (near-full heap) makes the collection non-moving.
+- **Defragmentation trigger** — **Built (150.3.8).** A block is an evacuation source iff the last sweep
+  found it sparsely live (`0 < count ≤ 64` of 128 lines), read from the per-block `defragTable` histogram.
+  The threshold value and a spill-based block-selection order (in place of the current forward scan) are the
+  remaining policy knobs, and ride on the same histogram.
 - **LOS reclamation granularity** — page-granular free list first; coalescing only if large-object churn
   in the fixtures demands it.
 
@@ -703,10 +706,44 @@ Rung 3 comes up in eight increments, each one mechanism with an oracle, mirrorin
    `rtIsForwarded` / `rtForwardingPointer`, `rtObjSize`. `rtCheckPayloadWord` confirmed **0** types lack a
    payload word (the §10.8 assumption holds for every managed type). Unit-tested in isolation (copy, forward,
    read back): `examples/immix_forward.nomu` + `tools/immix-forward.sh`.
-7. **150.3.7 — evacuation + pointer fixup.** Forward-during-trace (force-all candidates), rewrite slots
-   and roots. Fragmentation fixture; diff under evacuation; fingerprint invariant catches a missed fixup.
-8. **150.3.8 — copy reserve + defrag trigger.** Make evacuation safe against to-space exhaustion, then
-   replace force-all with a fragmentation threshold. `gc-stress` under pressure, diff vs MMTk Immix.
+7. **150.3.7 — evacuation + pointer fixup. Built — the moving collector.** `rtImmixEvacCollect` snapshots
+   `freeCursor` as a from-space boundary (force-all: every block handed out before the collection is a
+   candidate), points the copy allocator past all candidates (free list emptied, recyclable scan set to the
+   boundary) so copies land only in fresh to-space, then forward-during-traces (`rtImmixEvacMark` +
+   `rtEvacuate`): each candidate is copied on first visit (installing the §10.8 forwarding record), each
+   managed slot and the root are rewritten to the survivor's address as the trace visits them, and every
+   survivor is line-marked at its final location. The 150.3.5 sweep then reclaims the emptied from-space.
+   Returns the root's new address — the root moves under force-all, so the caller adopts it (the pcsp-root
+   rewrite is 128.3.2). Shared children and cycles resolve through the forwarded-bit guard in `rtEvacuate`
+   and the mark-bit guard, so each object is copied and scanned once; LOS objects are out of heap range, so
+   they are scanned for fixup but never moved. `noSafepoint` (149, held by every `runtime.nomu` function)
+   is what makes holding raw pointers into the moving heap across the copy sound — this closes 125 §3.3's
+   deferred moving-heap gate as its first real client. `rtImmixCollect` (non-moving, 150.3.5) stays as the
+   separate path; unifying the two behind a defrag trigger is 150.3.8. `examples/immix_evac.nomu` +
+   `tools/immix-evac.sh` (root moved, a live Box moved and its value reads back through the fixed-up slot,
+   the address-independent fingerprint is invariant across the move — a missed fixup diverges it — and
+   from-space was reclaimed).
+8. **150.3.8 — copy reserve + defrag trigger. Built — rung 3 complete as a hosted collector.**
+   `rtImmixCollectDefrag` is the general collector: `rtSelectDefragSources` reads `defragTable` (each block's
+   live-line count recorded by the last sweep — MMTk's "previous GC mark histogram drives this GC's defrag")
+   and marks a block DEFRAG_SOURCE (block-state 3) iff it holds live data but is sparsely filled
+   (`0 < count ≤ rtDefragThreshold()`, 64 of 128 lines), capping the source count at the **copy reserve
+   budget** = available empty blocks (free list + never-used) − reserve (1/16, floor 1). Since each source
+   needs at most one to-space block, selecting ≤ budget sources leaves the reserve free even if a source
+   turned out full — evacuation never runs out of to-space; when the heap is near-full (budget 0) no sources
+   are chosen and the collection is non-moving. `rtEvacuate` now keys off block-state 3, so the same trace
+   body (`rtImmixEvacMark`) serves all three collectors: zero sources = non-moving (`rtImmixCollect`), all
+   used blocks sources = force-all (`rtImmixEvacCollect`, which sets state 3 on every used block), and the
+   fragmentation-selected middle = `rtImmixCollectDefrag`. `defragTable` is a per-block side table added to
+   the space descriptor (now 120 bytes, `defragTable@112`); the sweep records the histogram for the next
+   collection. The first collection has no histogram (table zeroed), so it never evacuates and only seeds it
+   — evacuation is thereby demonstrably conditional. `examples/immix_defrag.nomu` + `tools/immix-defrag.sh`
+   (sparse survivors fragment the heap; the first collection is non-moving, the second selects the fragmented
+   blocks and compacts their survivors to new addresses, the fingerprint is invariant, and the sources are
+   reclaimed). Remaining defrag-policy tuning (the threshold value and a spill-based block-selection order in
+   place of the simple scan) rides on this histogram as a front-end change.
 
-Then rung 3 is complete as a hosted collector; the multi-mutator STW that drives it in a real concurrent
-program is 128.3.2, after the scheduler (128.1).
+Rung 3 is now complete as a hosted collector — region substrate, allocator, LOS, line marking, sweep,
+forwarding, evacuation, and the copy-reserve/defrag trigger. The multi-mutator STW that drives it in a real
+concurrent program is 128.3.2, after the scheduler (128.1); per the horizon sequencing the ladder pauses
+here and the work turns to the scheduler self-host (128.1) before GenImmix (150.4).

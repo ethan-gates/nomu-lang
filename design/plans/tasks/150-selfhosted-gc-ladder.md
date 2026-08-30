@@ -1,9 +1,10 @@
 # Self-hosted GC bring-up ladder (NoGC → mark-verify → Immix → GenImmix)
 
 **Avenue:** Risk (the core bet) · **Type/Lifecycle:** `runtime · in-progress` (runtime + GC + backend) ·
-**Size:** XL · **Status:** 150.2 (mark-verify) substantially built (tracer + cross-run fingerprint diff,
-150.2.1–150.2.8); collector-policy ladder continues at 150.3 (Immix); full-runtime root-scanning
-integration handed to [128](128-self-hosting-runtime.md) (128.3) ·
+**Size:** XL · **Status:** 150.3 (Immix) complete as a hosted collector (150.3.1–150.3.8: substrate,
+allocator, LOS, line marking, sweep, forwarding, evacuation + fixup, copy-reserve/defrag trigger); the
+ladder pauses here for the scheduler self-host (128.1) before GenImmix (150.4). Full-runtime root-scanning
+integration (multi-mutator STW) handed to [128](128-self-hosting-runtime.md) (128.3) ·
 **Source:** distilled from [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
 
 The ladder's rungs are the subtasks: **150.1** NoGC, **150.2** mark-verify, **150.3** Immix, **150.4**
@@ -135,9 +136,12 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
   - 150.2.8 — MMTk-side fingerprint + cross-run diff (the independent oracle; `RawPtr.gcForceCollect()`).
   - *Handed off:* full-runtime root-scanning integration (parked-fiber/scheduler-root walk, STW over all
     mutators) → [128.3](128-self-hosting-runtime.md) (128.3.1 / 128.3.2).
-- **150.3 — Immix (non-generational).** First collector that reclaims + moves. **Current rung** — design
-  deepened (`selfhosted-gc.md` §10; geometry, metadata, allocation, sweep, evacuation, fixup all pinned;
-  side-table metadata + payload-word-0 forwarding **Decided**). Eight increments, each with the MMTk Immix
+- **150.3 — Immix (non-generational). Complete as a hosted collector (150.3.1–150.3.8).** First collector
+  that reclaims + moves: region substrate, allocator, LOS, line marking, sweep, forwarding, evacuation +
+  pointer fixup, and the copy-reserve/defrag trigger, each diffed against the MMTk Immix oracle. Design
+  `selfhosted-gc.md` §10. The ladder now pauses here (per `horizon.md`): the multi-mutator STW that drives it
+  in a real concurrent program is [128.3.2](128-self-hosting-runtime.md), after the scheduler self-host
+  ([128.1](128-self-hosting-runtime.md)); GenImmix is 150.4. Eight increments, each with the MMTk Immix
   oracle:
   - 150.3.1 — region substrate: block pool over 125 + side metadata tables (line marks, block state).
     **Built.** Prelude `rtImmix*` (space descriptor, block pool, addr↔index math, byte-per-entry line/block
@@ -163,9 +167,27 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
   - 150.3.6 — forwarding word (header bit 33 + new address in payload word 0) + copy primitive
     (`rtCopyObject`/`rtIsForwarded`/`rtForwardingPointer`). **Built.** `rtCheckPayloadWord` = 0 (assumption
     holds). `examples/immix_forward.nomu` + `tools/immix-forward.sh`.
-  - 150.3.7 — evacuation forward-during-trace + pointer fixup (slots + roots). Fragmentation fixture; diff
-    under evacuation; fingerprint invariant.
-  - 150.3.8 — copy reserve + defrag trigger tuning. `gc-stress` under pressure; diff vs MMTk Immix.
+  - 150.3.7 — evacuation forward-during-trace + pointer fixup (slots + roots). **Built — the moving
+    collector.** `rtImmixEvacCollect` (returns the new root) snapshots `freeCursor` as a from-space boundary
+    (force-all), points the copy allocator at fresh to-space only, then `rtImmixEvacMark`/`rtEvacuate` copy
+    each candidate on first visit (§10.8 forwarding record) and rewrite each managed slot + the root to the
+    survivor as the trace visits it; the 150.3.5 sweep reclaims the emptied from-space. LOS never moves;
+    shared/cyclic refs resolve once via the forwarded-/mark-bit guards. `noSafepoint` (149) closes 125 §3.3's
+    moving-heap gate. `rtImmixCollect` (non-moving) stays separate; unifying behind a defrag trigger is
+    150.3.8. `examples/immix_evac.nomu` + `tools/immix-evac.sh` (root + Box moved, value reads back through
+    the fixed-up slot, fingerprint invariant, from-space reclaimed).
+  - 150.3.8 — copy reserve + defrag trigger. **Built — rung 3 complete as a hosted collector.**
+    `rtImmixCollectDefrag` is the general collector: `rtSelectDefragSources` reads a new per-block
+    `defragTable` histogram (each block's live-line count from the last sweep) and marks a block
+    DEFRAG_SOURCE (state 3) iff it is sparsely live (`0 < count ≤ 64`), capped at the copy-reserve budget
+    (available empty blocks − 1/16, floor 1) so to-space never runs out — each source needs ≤ 1 to-space
+    block, and budget 0 makes the collection non-moving. `rtEvacuate` keys off state 3, so one trace body
+    (`rtImmixEvacMark`) serves non-moving (0 sources), force-all (all used blocks sources,
+    `rtImmixEvacCollect`), and the fragmentation-selected middle. The first collection has no histogram, so
+    it never moves and only seeds `defragTable`. Descriptor grew to 120 bytes (`defragTable@112`).
+    `examples/immix_defrag.nomu` + `tools/immix-defrag.sh` (first collection non-moving, second compacts the
+    fragmented blocks' survivors, fingerprint invariant, sources reclaimed). Remaining policy knobs (the
+    threshold value, a spill-based selection order) ride on the histogram.
   - *First cut is single-carrier + `gcForceCollect`-driven on deterministic fixtures;* multi-mutator STW
     that drives it in a concurrent program is [128.3.2](128-self-hosting-runtime.md), after the scheduler.
 - **150.4 — GenImmix.** Nursery + write barrier + remembered set. **After the scheduler self-host (128.1).**

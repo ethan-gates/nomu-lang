@@ -1,0 +1,73 @@
+// Task 150 · rung 3 (Immix), increment 150.3.7 — evacuation + pointer fixup. A live set reachable from a
+// root array is force-evacuated: every reachable in-heap object is copied to fresh to-space and every managed
+// slot (the array's element slots) and the root itself are rewritten to the survivor's new address.
+// Interleaved garbage fills several from-space blocks, which the collection reclaims once the live set has
+// moved out.
+//
+// Compiled NOMU_NO_ESCAPE=1 (heap objects, so addrOf sees real heap addresses), run under NOMU_GC_PLAN=nomu
+// (the self-hosted Immix heap the copies are allocated into). Single-threaded with a controlled root set: the
+// returned pointer is the root's new address, which the fixture reads the moved live set through.
+//
+// Checks: the root moved (evacuation happened); a live Box moved and its value reads back through the
+// fixed-up element slot; the address-independent fingerprint (§6) is invariant across the move (a missed
+// fixup would diverge it); from-space blocks were reclaimed. Expected output: 1 / 1 / 111 / 1 / 1.
+class Box {
+  var v: Int
+}
+fun main() {
+  var live: Array<Box> = []
+  live.append(Box(v: 111))
+  live.append(Box(v: 222))
+  live.append(Box(v: 333))
+
+  let space = RawPtr.gcSelfhostSpace()
+
+  // garbage to occupy (and fragment) several from-space blocks
+  var i = 0
+  while i < 20000 {
+    let junk = Box(v: i)
+    i = i + 1
+  }
+
+  // fingerprint of the live set before evacuation, then clear the marks it set
+  let tc = RawPtr.gcTypeCount()
+  let counts = RawPtr.alloc(bytes: tc * 8, align: 8)
+  let fp = RawPtr.alloc(bytes: 8, align: 8)
+  let before = rtMarkVerify(addrOf(live), counts, fp)
+  let fpBefore: Int = fp.load(fromByteOffset: 0)
+  rtImmixUnmark(addrOf(live))
+
+  let oldRootA = addrOf(live).toInt()
+  let oldBox0A = addrOf(live[0]).toInt()
+
+  // evacuate: force-all — the root and every live object move to fresh to-space
+  let newRoot = rtImmixEvacCollect(space, addrOf(live))
+
+  let newRootA = newRoot.toInt()
+  print(newRootA != oldRootA)          // 1 — the root moved (evacuation happened)
+  print("\n")
+
+  // reach the moved Box: handle.bufptr (byte 16) → buffer element 0 (byte 16), both slots fixed up
+  let buf: RawPtr = newRoot.load(fromByteOffset: 16)
+  let box0: RawPtr = buf.load(fromByteOffset: 16)
+  let newBox0A = box0.toInt()
+  print(newBox0A != oldBox0A)          // 1 — the live Box moved too
+  print("\n")
+
+  let v0: Int = box0.load(fromByteOffset: 8)
+  print(v0)                            // 111 — value read back through the fixed-up slot
+  print("\n")
+
+  // fingerprint over the moved graph must equal the pre-evacuation fingerprint
+  let counts2 = RawPtr.alloc(bytes: tc * 8, align: 8)
+  let fp2 = RawPtr.alloc(bytes: 8, align: 8)
+  let after = rtMarkVerify(newRoot, counts2, fp2)
+  let fpAfter: Int = fp2.load(fromByteOffset: 0)
+  rtImmixUnmark(newRoot)
+  print(fpBefore == fpAfter)           // 1 — address-independent fingerprint invariant (no missed fixup)
+  print("\n")
+
+  let freed = rtImmixFreeBlocks(space)
+  print(freed > 0)                     // 1 — from-space blocks were reclaimed
+  print("\n")
+}
