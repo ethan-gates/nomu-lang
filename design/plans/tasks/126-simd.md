@@ -8,7 +8,7 @@ backend + type-system) · **Size:** L · **Status:** needs-design · **Source:**
 Explicit SIMD in two layers: a **stdlib SIMD module** (fixed-width vector types + elementwise ops,
 comparisons, reductions, movemask, like Swift's `SIMD`) and **backend support** lowering them to LLVM
 `<N x T>` vectors + target intrinsics (SSE/AVX, NEON) with a scalar fallback. LLVM supplies the
-plumbing; the surface, type-system integration, and cross-target abstraction are the work.
+plumbing; the surface, type-system integration, and cross-target abstraction are the work.  Read https://mitchellh.com/writing/everyone-should-know-simd#the-common-shape for fun
 
 ## Motivating example — swiss tables
 

@@ -1,0 +1,403 @@
+// Task 128.1.7 (feeder 1 of 2) · the self-hosted timer heap. A wakeup feeder (concurrency.md §2 layer 2):
+// a fiber that sleeps registers its deadline on a min-heap and parks; a dedicated timer thread waits on a
+// futex until the earliest deadline, then unparks the fiber. Built over the 128.1.6 scheduler machinery
+// (mutex, MT-safe queue, carriers, TLS rt_current, lock-coupled park) plus the monotonic clock and the
+// futex *timeout* (both from 128.1.1) — no new substrate. Mirrors the C runtime's rt_timer_thread /
+// rt_sleep_ms (runtime.c), the differential oracle.
+//
+// Two locks, careful order (the C runtime's rule): the scheduler lock guards the run queue, a separate
+// timer lock guards the heap. A sleeper holds the *scheduler* lock across [push deadline · park] so the
+// timer thread's unpark (which takes the scheduler lock) cannot re-queue it mid-save — the lock-handoff
+// park protocol, now spanning two subsystems. To register it takes the timer lock while holding the scheduler
+// lock (order: scheduler → timer). The timer thread never holds the timer lock while reaching for the
+// scheduler lock (it pops under the timer lock, releases it, then unparks), so the two orders cannot
+// deadlock.
+//
+// Off-heap layouts (byte offsets):
+//   Sched (80B): 0 head · 8 tail · 16 sched-mutex · 24 wake-gen · 32 outstanding · 40 stopping
+//                · 48 timer-mutex · 56 timer-gen · 64 timer-count · 72 timer-entries (ptr)
+//   Timer entry (16B): 0 expiry-ns · 8 fiber
+//   Fiber (240B): as 128.1.6 (…168 state · 200 sched · 232 carrierCtx)
+//   sleep arg (48B): 0 sched · 8 duration-ns · 16 id · 24 seq-buffer · 32 seq-index · 40 (unused)
+//
+// Scenario: four fibers sleep 40/80/120/160 ms; each records its id at its wake rank. Correct iff they
+// wake in deadline order → 1 2 3 4 (min-heap orders the deadlines, the timer thread fires them in turn),
+// and all four wake (liveness). NoGC only (raw carriers + timer thread). Checked by tools/scheduler-timer.sh.
+
+fun mutexLock(m: RawPtr) {
+  var c: Int = m.atomicCas(0, 1, atByteOffset: 0)
+  if c != 0 {
+    if c != 2 {
+      c = m.atomicExchange(2, atByteOffset: 0)
+    }
+    while c != 0 {
+      m.futexWait(expected: 2, timeoutMicros: 0)
+      c = m.atomicExchange(2, atByteOffset: 0)
+    }
+  }
+}
+
+fun mutexUnlock(m: RawPtr) {
+  let prev: Int = m.atomicExchange(0, atByteOffset: 0)
+  if prev == 2 {
+    m.futexWake(all: false)
+  }
+}
+
+fun enqueue(sched: RawPtr, fib: RawPtr) {
+  fib.store(RawPtr.null, toByteOffset: 176)
+  let tail: RawPtr = sched.load(fromByteOffset: 8)
+  if tail.isNull {
+    sched.store(fib, toByteOffset: 0)
+    sched.store(fib, toByteOffset: 8)
+  } else {
+    tail.store(fib, toByteOffset: 176)
+    sched.store(fib, toByteOffset: 8)
+  }
+}
+
+fun dequeue(sched: RawPtr) -> RawPtr {
+  let h: RawPtr = sched.load(fromByteOffset: 0)
+  if h.isNull {
+    return h
+  }
+  let nx: RawPtr = h.load(fromByteOffset: 176)
+  sched.store(nx, toByteOffset: 0)
+  if nx.isNull {
+    sched.store(RawPtr.null, toByteOffset: 8)
+  }
+  h.store(RawPtr.null, toByteOffset: 176)
+  return h
+}
+
+fun wakeCarrier(sched: RawPtr, all: Bool) {
+  let gw = sched.advanced(by: 24)
+  gw.atomicFetchAdd(1, atByteOffset: 0)
+  gw.futexWake(all: all)
+}
+
+// Wake the timer thread (it waits on the timer-gen word): bump the word, then futexWake.
+fun wakeTimer(sched: RawPtr) {
+  let tg = sched.advanced(by: 56)
+  tg.atomicFetchAdd(1, atByteOffset: 0)
+  tg.futexWake(all: false)
+}
+
+// Raise the stop flag and wake everyone (idle carriers + the timer thread) so they exit for the join.
+fun signalStop(sched: RawPtr) {
+  sched.atomicStore(1, toByteOffset: 40)
+  wakeCarrier(sched, true)
+  wakeTimer(sched)
+}
+
+// ---- min-heap on the timer-entries buffer (entry i at i*16: expiry at +0, fiber at +8). Called with the
+// timer lock held. ----
+
+fun heapSwap(ents: RawPtr, a: Int, b: Int) {
+  let ea = a * 16
+  let eb = b * 16
+  let x1: Int = ents.load(fromByteOffset: ea)
+  let f1: RawPtr = ents.load(fromByteOffset: ea + 8)
+  let x2: Int = ents.load(fromByteOffset: eb)
+  let f2: RawPtr = ents.load(fromByteOffset: eb + 8)
+  ents.store(x2, toByteOffset: ea)
+  ents.store(f2, toByteOffset: ea + 8)
+  ents.store(x1, toByteOffset: eb)
+  ents.store(f1, toByteOffset: eb + 8)
+}
+
+fun timerPush(sched: RawPtr, expiry: Int, fib: RawPtr) {
+  let ents: RawPtr = sched.load(fromByteOffset: 72)
+  var i: Int = sched.load(fromByteOffset: 64)
+  sched.store(i + 1, toByteOffset: 64)
+  ents.store(expiry, toByteOffset: i * 16)
+  ents.store(fib, toByteOffset: i * 16 + 8)
+  var go = true
+  while go {
+    if i == 0 {
+      go = false
+    } else {
+      let p = (i - 1) / 2
+      let ep: Int = ents.load(fromByteOffset: p * 16)
+      let ei: Int = ents.load(fromByteOffset: i * 16)
+      if ep <= ei {
+        go = false
+      } else {
+        heapSwap(ents, p, i)
+        i = p
+      }
+    }
+  }
+}
+
+// Remove and return the earliest-deadline fiber's entry: the caller has already checked count > 0. Writes
+// the popped expiry/fiber via the two out-slots (offsets 0 and 8 of `out`).
+fun timerPopMin(sched: RawPtr, out: RawPtr) {
+  let ents: RawPtr = sched.load(fromByteOffset: 72)
+  let x0: Int = ents.load(fromByteOffset: 0)
+  let f0: RawPtr = ents.load(fromByteOffset: 8)
+  out.store(x0, toByteOffset: 0)
+  out.store(f0, toByteOffset: 8)
+  var n: Int = sched.load(fromByteOffset: 64) - 1
+  sched.store(n, toByteOffset: 64)
+  if n > 0 {
+    let xl: Int = ents.load(fromByteOffset: n * 16)
+    let fl: RawPtr = ents.load(fromByteOffset: n * 16 + 8)
+    ents.store(xl, toByteOffset: 0)
+    ents.store(fl, toByteOffset: 8)
+    var i = 0
+    var go = true
+    while go {
+      let l = 2 * i + 1
+      let r = 2 * i + 2
+      var s = i
+      let es: Int = ents.load(fromByteOffset: s * 16)
+      if l < n {
+        let el: Int = ents.load(fromByteOffset: l * 16)
+        if el < es {
+          s = l
+        }
+      }
+      let es2: Int = ents.load(fromByteOffset: s * 16)
+      if r < n {
+        let er: Int = ents.load(fromByteOffset: r * 16)
+        if er < es2 {
+          s = r
+        }
+      }
+      if s == i {
+        go = false
+      } else {
+        heapSwap(ents, i, s)
+        i = s
+      }
+    }
+  }
+}
+
+fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+  let stack = RawPtr.alloc(bytes: 65536, align: 16)
+  let stackTop = stack.advanced(by: 65536)
+  let fib = RawPtr.alloc(bytes: 240, align: 16)
+  fib.store(0, toByteOffset: 168)
+  fib.store(RawPtr.null, toByteOffset: 176)
+  fib.store(entry, toByteOffset: 184)
+  fib.store(arg, toByteOffset: 192)
+  fib.store(sched, toByteOffset: 200)
+  fib.store(stack, toByteOffset: 208)
+  fib.store(RawPtr.null, toByteOffset: 216)
+  fib.store(RawPtr.null, toByteOffset: 224)
+  fib.store(RawPtr.null, toByteOffset: 232)
+  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberMain), arg: fib)
+  return fib
+}
+
+fun fiberSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+  let fib = fiberNew(sched, entry, arg)
+  mutexLock(sched.advanced(by: 16))
+  fib.store(0, toByteOffset: 168)
+  enqueue(sched, fib)
+  mutexUnlock(sched.advanced(by: 16))
+  wakeCarrier(sched, false)
+  return fib
+}
+
+fun unpark(sched: RawPtr, fib: RawPtr) {
+  mutexLock(sched.advanced(by: 16))
+  fib.store(0, toByteOffset: 168)
+  enqueue(sched, fib)
+  mutexUnlock(sched.advanced(by: 16))
+  wakeCarrier(sched, false)
+}
+
+// Sleep `nanos`: register the deadline on the timer heap and park, holding the scheduler lock across both
+// so the timer thread cannot unpark us before our context is saved. Resumes when the timer thread fires.
+fun fiberSleep(sched: RawPtr, nanos: Int) {
+  let self = RawPtr.tlsGet()
+  let expiry: Int = RawPtr.monotonicNanos() + nanos
+  mutexLock(sched.advanced(by: 16))          // scheduler lock (held across the park — handoff)
+  mutexLock(sched.advanced(by: 48))          // timer lock (order: scheduler → timer)
+  timerPush(sched, expiry, self)
+  mutexUnlock(sched.advanced(by: 48))
+  wakeTimer(sched)
+  self.store(2, toByteOffset: 168)
+  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
+  self.ctxSwitchTo(carrierCtx)               // save holding the scheduler lock; switch to the carrier
+  mutexUnlock(sched.advanced(by: 16))        // resumed → release
+}
+
+fun fiberMain(fib: RawPtr) -> RawPtr {
+  let sched: RawPtr = fib.load(fromByteOffset: 200)
+  mutexUnlock(sched.advanced(by: 16))
+  let entry: RawPtr = fib.load(fromByteOffset: 184)
+  let arg: RawPtr = fib.load(fromByteOffset: 192)
+  let res = entry.callEntry(arg)
+  mutexLock(sched.advanced(by: 16))
+  fib.store(res, toByteOffset: 216)
+  fib.store(3, toByteOffset: 168)
+  let prev: Int = sched.atomicFetchAdd(-1, atByteOffset: 32)
+  if prev == 1 {
+    signalStop(sched)
+  }
+  let carrierCtx: RawPtr = fib.load(fromByteOffset: 232)
+  fib.ctxSwitchTo(carrierCtx)
+  return fib
+}
+
+fun schedLoop(sched: RawPtr, myCtx: RawPtr) {
+  mutexLock(sched.advanced(by: 16))
+  var go = true
+  while go {
+    let stp: Int = sched.atomicLoad(fromByteOffset: 40)
+    if stp != 0 {
+      go = false
+    } else {
+      let fib = dequeue(sched)
+      if fib.isNull {
+        let gw = sched.advanced(by: 24)
+        let gen: Int = gw.atomicLoad(fromByteOffset: 0)
+        mutexUnlock(sched.advanced(by: 16))
+        gw.futexWait(expected: gen, timeoutMicros: 1000000)
+        mutexLock(sched.advanced(by: 16))
+      } else {
+        fib.store(myCtx, toByteOffset: 232)
+        fib.store(1, toByteOffset: 168)
+        RawPtr.tlsSet(fib)
+        myCtx.ctxSwitchTo(fib)
+      }
+    }
+  }
+  mutexUnlock(sched.advanced(by: 16))
+}
+
+fun carrierMain(carg: RawPtr) -> RawPtr {
+  let sched: RawPtr = carg.load(fromByteOffset: 0)
+  let ctx: RawPtr = carg.load(fromByteOffset: 8)
+  schedLoop(sched, ctx)
+  return carg
+}
+
+// The timer thread: sleep on the timer-gen futex until the earliest deadline (or a push), then unpark the
+// due fiber. Exits on the stop flag.
+fun timerMain(sched: RawPtr) -> RawPtr {
+  let out = RawPtr.alloc(bytes: 16, align: 8)
+  var go = true
+  while go {
+    let stp: Int = sched.atomicLoad(fromByteOffset: 40)
+    if stp != 0 {
+      go = false
+    } else {
+      mutexLock(sched.advanced(by: 48))
+      let count: Int = sched.load(fromByteOffset: 64)
+      if count == 0 {
+        let tg = sched.advanced(by: 56)
+        let gen: Int = tg.atomicLoad(fromByteOffset: 0)
+        mutexUnlock(sched.advanced(by: 48))
+        tg.futexWait(expected: gen, timeoutMicros: 1000000)     // wait for a push (1 s backstop)
+      } else {
+        let ents: RawPtr = sched.load(fromByteOffset: 72)
+        let next: Int = ents.load(fromByteOffset: 0)
+        let now: Int = RawPtr.monotonicNanos()
+        if next <= now {
+          timerPopMin(sched, out)
+          mutexUnlock(sched.advanced(by: 48))
+          let f: RawPtr = out.load(fromByteOffset: 8)
+          unpark(sched, f)                                       // fire: make the sleeper runnable
+        } else {
+          let tg = sched.advanced(by: 56)
+          let gen: Int = tg.atomicLoad(fromByteOffset: 0)
+          mutexUnlock(sched.advanced(by: 48))
+          let waitUs: Int = (next - now) / 1000
+          tg.futexWait(expected: gen, timeoutMicros: waitUs)     // wait until the deadline (or a push)
+        }
+      }
+    }
+  }
+  return sched
+}
+
+// ---- fiber body (not subset; via callEntry). Sleep, then record this fiber's id at its wake rank. ----
+fun sleepBody(arg: RawPtr) -> RawPtr {
+  let sched: RawPtr = arg.load(fromByteOffset: 0)
+  let dur: Int = arg.load(fromByteOffset: 8)
+  let id: Int = arg.load(fromByteOffset: 16)
+  let seqBuf: RawPtr = arg.load(fromByteOffset: 24)
+  let seqIdx: RawPtr = arg.load(fromByteOffset: 32)
+  fiberSleep(sched, dur)
+  let rank: Int = seqIdx.atomicFetchAdd(1, atByteOffset: 0)
+  seqBuf.store(id, toByteOffset: rank * 8)
+  return RawPtr.null
+}
+
+fun newSched(cap: Int) -> RawPtr {
+  let sched = RawPtr.alloc(bytes: 80, align: 8)
+  sched.store(RawPtr.null, toByteOffset: 0)
+  sched.store(RawPtr.null, toByteOffset: 8)
+  sched.store(0, toByteOffset: 16)
+  sched.store(0, toByteOffset: 24)
+  sched.store(0, toByteOffset: 32)
+  sched.store(0, toByteOffset: 40)
+  sched.store(0, toByteOffset: 48)
+  sched.store(0, toByteOffset: 56)
+  sched.store(0, toByteOffset: 64)
+  let ents = RawPtr.alloc(bytes: cap * 16, align: 8)
+  sched.store(ents, toByteOffset: 72)
+  return sched
+}
+
+fun main() {
+  let carriers = 2
+  let n = 4
+  let sched = newSched(16)
+  sched.atomicStore(n, toByteOffset: 32)          // outstanding fibers
+
+  let seqBuf = RawPtr.alloc(bytes: 8 * n, align: 8)
+  let seqIdx = RawPtr.alloc(bytes: 8, align: 8)
+  seqIdx.atomicStore(0, toByteOffset: 0)
+  let body = RawPtr.ofFunc(sleepBody)
+
+  // Four fibers, deadlines 40/80/120/160 ms, ids 1..4 in that order.
+  var i = 0
+  while i < n {
+    let a = RawPtr.alloc(bytes: 48, align: 8)
+    a.store(sched, toByteOffset: 0)
+    a.store((i + 1) * 40000000, toByteOffset: 8)  // (i+1)*40 ms in ns
+    a.store(i + 1, toByteOffset: 16)
+    a.store(seqBuf, toByteOffset: 24)
+    a.store(seqIdx, toByteOffset: 32)
+    fiberSpawn(sched, body, a)
+    i = i + 1
+  }
+
+  // Start carriers + the timer thread.
+  let handles = RawPtr.alloc(bytes: 8 * carriers, align: 8)
+  var c = 0
+  while c < carriers {
+    let ctx = RawPtr.alloc(bytes: 168, align: 16)
+    let carg = RawPtr.alloc(bytes: 16, align: 8)
+    carg.store(sched, toByteOffset: 0)
+    carg.store(ctx, toByteOffset: 8)
+    let h = handles.advanced(by: 8 * c)
+    h.threadCreate(entry: RawPtr.ofFunc(carrierMain), arg: carg)
+    c = c + 1
+  }
+  let th = RawPtr.alloc(bytes: 8, align: 8)
+  th.threadCreate(entry: RawPtr.ofFunc(timerMain), arg: sched)
+
+  var k = 0
+  while k < carriers {
+    let h = handles.advanced(by: 8 * k)
+    h.threadJoin()
+    k = k + 1
+  }
+  th.threadJoin()
+
+  // Wake order = deadline order = 1 2 3 4.
+  var j = 0
+  while j < n {
+    let v: Int = seqBuf.load(fromByteOffset: j * 8)
+    print(v)
+    print("\n")
+    j = j + 1
+  }
+}

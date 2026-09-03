@@ -32,7 +32,7 @@ private func cgStage<T>(_ phase: String, _ name: String, _ onStage: StageSink?, 
 /// it with the runtime `.a`). Returns nil on success, else a `file:line:col`-prefixed error.
 /// `optimize` selects the release (`default<O2>`) pipeline over the debug default (8.5.3).
 public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = false,
-                       onStage: StageSink? = nil) -> String? {
+                       subsetFuncs: Set<String> = [], onStage: StageSink? = nil) -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
@@ -51,7 +51,7 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
     // locally-dispatched box and inline exposes callee bodies, so promotion then falls out. Each pass
     // has an A/B env gate (`NOMU_NO_DEVIRT`/`NOMU_NO_INLINE`/`NOMU_NO_ESCAPE`/`NOMU_NO_SCALAR`) so a
     // tier-off baseline stays available for bisecting a regression.
-    let ssa = cgStage("ssair", "gen", onStage) { lowerToSSAIR(module) }
+    let ssa = cgStage("ssair", "gen", onStage) { lowerToSSAIR(module, subsetFuncs: subsetFuncs) }
     if ssa.diagnostics.hasErrors { return "SSAIR: " + ssa.diagnostics.render() }
     var ssaModule = ssa.module
     let env = ProcessInfo.processInfo.environment

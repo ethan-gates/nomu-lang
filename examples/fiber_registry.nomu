@@ -1,0 +1,111 @@
+// Task 128.1.6 · the live-fiber registry, in isolation. An intrusive doubly-linked list of every live
+// fiber, threaded through link slots in the fiber itself, so the scheduler inserts on spawn and removes
+// on completion in O(1) (no scan to find the node), and a stop-the-world walk iterates it to reach every
+// parked fiber's roots. Here it is tested as a data structure on its own — insert, O(1) remove of an
+// arbitrary node (head, tail, or middle), and full iteration — before 128.3.2 drives the iteration from a
+// real STW over all mutators. Same "prove the piece in isolation first" shape as walk_parked.nomu.
+//
+// The registry maintenance is runtime-subset (raw links only, no managed alloc, no safepoint), because a
+// real scheduler runs it on the carrier under the scheduler lock. Off-heap layouts (byte offsets):
+//   Registry (8B): 0 head
+//   Node (24B):    0 payload · 8 reg-next · 16 reg-prev
+//
+// Scenario prints the (count, sum) of the live set after each mutation:
+//   build 5 (payloads 1..5)      → 5 15
+//   remove a middle node (p3)    → 4 12   (O(1): unlink via its own prev/next)
+//   remove the head (p5)         → 3 7
+//   remove the tail (p1)         → 2 6
+// Checked by tools/fiber-registry.sh.
+
+// Insert at the head — O(1). New node's prev is null, next is the old head; the old head (if any) points
+// back at the new node.
+fun regInsert(reg: RawPtr, node: RawPtr) {
+  let head: RawPtr = reg.load(fromByteOffset: 0)
+  node.store(RawPtr.null, toByteOffset: 16)     // prev = null (new head)
+  node.store(head, toByteOffset: 8)             // next = old head
+  if head.isNull {
+  } else {
+    head.store(node, toByteOffset: 16)          // old head's prev = node
+  }
+  reg.store(node, toByteOffset: 0)              // head = node
+}
+
+// Remove a known node — O(1), no search. Splice its neighbours together; fix the head if it was first.
+fun regRemove(reg: RawPtr, node: RawPtr) {
+  let prev: RawPtr = node.load(fromByteOffset: 16)
+  let next: RawPtr = node.load(fromByteOffset: 8)
+  if prev.isNull {
+    reg.store(next, toByteOffset: 0)            // node was the head
+  } else {
+    prev.store(next, toByteOffset: 8)           // prev.next = next
+  }
+  if next.isNull {
+  } else {
+    next.store(prev, toByteOffset: 16)          // next.prev = prev
+  }
+}
+
+// Iterate head → next, returning the number of live nodes (the "STW visits each" walk).
+fun regCount(reg: RawPtr) -> Int {
+  var n = 0
+  var cur: RawPtr = reg.load(fromByteOffset: 0)
+  while cur.isNull == false {
+    n = n + 1
+    cur = cur.load(fromByteOffset: 8)
+  }
+  return n
+}
+
+// Iterate head → next, returning the sum of payloads.
+fun regSum(reg: RawPtr) -> Int {
+  var s = 0
+  var cur: RawPtr = reg.load(fromByteOffset: 0)
+  while cur.isNull == false {
+    let v: Int = cur.load(fromByteOffset: 0)
+    s = s + v
+    cur = cur.load(fromByteOffset: 8)
+  }
+  return s
+}
+
+fun mkNode(payload: Int) -> RawPtr {
+  let n = RawPtr.alloc(bytes: 24, align: 8)
+  n.store(payload, toByteOffset: 0)
+  n.store(RawPtr.null, toByteOffset: 8)
+  n.store(RawPtr.null, toByteOffset: 16)
+  return n
+}
+
+fun report(reg: RawPtr) {
+  print(regCount(reg))
+  print(" ")
+  print(regSum(reg))
+  print("\n")
+}
+
+fun main() {
+  let reg = RawPtr.alloc(bytes: 8, align: 8)
+  reg.store(RawPtr.null, toByteOffset: 0)
+
+  // Build: insert payloads 1..5 (head order becomes 5,4,3,2,1).
+  let p1 = mkNode(1)
+  let p2 = mkNode(2)
+  let p3 = mkNode(3)
+  let p4 = mkNode(4)
+  let p5 = mkNode(5)
+  regInsert(reg, p1)
+  regInsert(reg, p2)
+  regInsert(reg, p3)
+  regInsert(reg, p4)
+  regInsert(reg, p5)
+  report(reg)                 // 5 15
+
+  regRemove(reg, p3)          // middle node
+  report(reg)                 // 4 12
+
+  regRemove(reg, p5)          // head
+  report(reg)                 // 3 7
+
+  regRemove(reg, p1)          // tail
+  report(reg)                 // 2 6
+}

@@ -1,0 +1,409 @@
+// Task 128.1.8 · actor mailbox + capped mailbox-fiber pool, self-hosted (concurrency.md §9, the
+// fire-and-forget message-send model). Built over the 128.1.6/128.1.7 scheduler machinery (mutex, MT-safe
+// run queue, carriers, TLS rt_current, lock-coupled park). Mirrors the C runtime's rt_actor_send /
+// rt_mailbox_pool (runtime.c), the differential oracle; the earlier pthread-mutex actor is retired.
+//
+// The pieces:
+//   • Mailbox — an MT-safe FIFO of messages (mb_head/mb_tail), a `scheduled` flag, and a sched_next link.
+//   • Scheduled-mailbox queue — a global intrusive FIFO (through sched_next) of mailboxes with pending
+//     work. (Its head is the GC root already read self-hosted at 128.3.1.)
+//   • Single-drain invariant — a mailbox is `scheduled` (queued or draining) at most once, so its handlers
+//     run serially, non-reentrant, per-sender FIFO — without a per-actor lock. On send, the 0→1 edge
+//     appends it to the scheduled queue; a drain that empties it clears the flag under the same lock a
+//     concurrent send takes, so no message is lost.
+//   • Capped mailbox-fiber pool — reusable fibers (≤ CAP) that pull mailboxes off the scheduled queue and
+//     drain each to completion, parking on a free-list when the queue is empty. The cap is the point:
+//     more busy actors than fibers just means excess mailboxes wait and a freed fiber picks them up.
+//   • Drain-to-quiescence — active_drains counts scheduled mailboxes; fire-and-forget creates no user
+//     fiber, so the run stays alive while a producer is active or drains are outstanding, and stops when
+//     both reach zero (§9 drain-then-collect).
+//
+// Unlike the C runtime — where the drain loop is emitted by codegen because it must hold the mailbox and
+// message as tracked GC roots across each handler call — this drain loop is plain Nomu: the mailboxes and
+// messages are off-heap raw memory the collector never moves.
+//
+// Off-heap layouts (byte offsets):
+//   Sched (88B): 0 head · 8 tail · 16 mutex · 24 wake-gen · 32 stopping · 40 sched-mb-head
+//                · 48 sched-mb-tail · 56 active-drains · 64 producer-active · 72 mbfiber-count · 80 mbfiber-free
+//   Mailbox (32B): 0 mb_head · 8 mb_tail · 16 scheduled · 24 sched_next
+//   Message (32B): 0 next · 8 thunk(handler code) · 16 actor · 24 seq(payload)
+//   Actor (16B):   0 expected · 8 counters
+//   Counters (16B):0 handled · 8 errors
+//   Fiber (256B):  …168 state · 200 sched · 208 stackBase · 232 carrierCtx · 240 pool_next
+//
+// Scenario: 8 actors, 50 messages each (seq 0..49 in send order from the single sender, main), a pool cap
+// of 4 (fewer than actors → fibers are reused). Each handler checks its seq equals the actor's expected
+// counter (per-sender FIFO + single-drain) and bumps it; a global `handled` counts deliveries, `errors`
+// counts any out-of-order handling. Correct iff handled = 400 and errors = 0. NoGC only. Checked by
+// tools/scheduler-actor.sh.
+
+fun mutexLock(m: RawPtr) {
+  var c: Int = m.atomicCas(0, 1, atByteOffset: 0)
+  if c != 0 {
+    if c != 2 {
+      c = m.atomicExchange(2, atByteOffset: 0)
+    }
+    while c != 0 {
+      m.futexWait(expected: 2, timeoutMicros: 0)
+      c = m.atomicExchange(2, atByteOffset: 0)
+    }
+  }
+}
+
+fun mutexUnlock(m: RawPtr) {
+  let prev: Int = m.atomicExchange(0, atByteOffset: 0)
+  if prev == 2 {
+    m.futexWake(all: false)
+  }
+}
+
+fun enqueue(sched: RawPtr, fib: RawPtr) {
+  fib.store(RawPtr.null, toByteOffset: 176)
+  let tail: RawPtr = sched.load(fromByteOffset: 8)
+  if tail.isNull {
+    sched.store(fib, toByteOffset: 0)
+    sched.store(fib, toByteOffset: 8)
+  } else {
+    tail.store(fib, toByteOffset: 176)
+    sched.store(fib, toByteOffset: 8)
+  }
+}
+
+fun dequeue(sched: RawPtr) -> RawPtr {
+  let h: RawPtr = sched.load(fromByteOffset: 0)
+  if h.isNull {
+    return h
+  }
+  let nx: RawPtr = h.load(fromByteOffset: 176)
+  sched.store(nx, toByteOffset: 0)
+  if nx.isNull {
+    sched.store(RawPtr.null, toByteOffset: 8)
+  }
+  h.store(RawPtr.null, toByteOffset: 176)
+  return h
+}
+
+fun wakeCarrier(sched: RawPtr, all: Bool) {
+  let gw = sched.advanced(by: 24)
+  gw.atomicFetchAdd(1, atByteOffset: 0)
+  gw.futexWake(all: all)
+}
+
+// Caller holds the scheduler lock. Raise stop + wake idle carriers so they exit for the join.
+fun signalStop(sched: RawPtr) {
+  sched.atomicStore(1, toByteOffset: 32)
+  wakeCarrier(sched, true)
+}
+
+// ---- scheduled-mailbox queue (intrusive FIFO through sched_next). Caller holds the scheduler lock. ----
+
+fun schedMbPush(sched: RawPtr, mb: RawPtr) {
+  mb.store(RawPtr.null, toByteOffset: 24)
+  let tail: RawPtr = sched.load(fromByteOffset: 48)
+  if tail.isNull {
+    sched.store(mb, toByteOffset: 40)
+    sched.store(mb, toByteOffset: 48)
+  } else {
+    tail.store(mb, toByteOffset: 24)
+    sched.store(mb, toByteOffset: 48)
+  }
+}
+
+fun schedMbPop(sched: RawPtr) -> RawPtr {
+  let mb: RawPtr = sched.load(fromByteOffset: 40)
+  if mb.isNull {
+    return mb
+  }
+  let nx: RawPtr = mb.load(fromByteOffset: 24)
+  sched.store(nx, toByteOffset: 40)
+  if nx.isNull {
+    sched.store(RawPtr.null, toByteOffset: 48)
+  }
+  mb.store(RawPtr.null, toByteOffset: 24)
+  return mb
+}
+
+// ---- mailbox-fiber pool ----
+
+fun mailboxFiberNew(sched: RawPtr) -> RawPtr {
+  let stack = RawPtr.alloc(bytes: 65536, align: 16)
+  let stackTop = stack.advanced(by: 65536)
+  let f = RawPtr.alloc(bytes: 256, align: 16)
+  f.store(0, toByteOffset: 168)
+  f.store(sched, toByteOffset: 200)
+  f.store(stack, toByteOffset: 208)
+  f.store(RawPtr.null, toByteOffset: 232)
+  f.store(RawPtr.null, toByteOffset: 240)
+  f.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(mailboxFiberMain), arg: sched)
+  return f
+}
+
+// Ensure a mailbox fiber will service the queue: wake a parked one, else create one up to the cap. Caller
+// holds the scheduler lock; called on the 0→1 schedule edge.
+fun mailboxDispatch(sched: RawPtr) {
+  let f: RawPtr = sched.load(fromByteOffset: 80)
+  if f.isNull {
+    let cnt: Int = sched.load(fromByteOffset: 72)
+    if cnt < 4 {                                       // CAP = 4
+      let nf = mailboxFiberNew(sched)
+      sched.store(cnt + 1, toByteOffset: 72)
+      enqueue(sched, nf)
+    }
+    // else: all mailbox fibers busy and at the cap — the mailbox waits in the scheduled queue.
+  } else {
+    let nx: RawPtr = f.load(fromByteOffset: 240)
+    sched.store(nx, toByteOffset: 80)                  // pop the free-list
+    f.store(RawPtr.null, toByteOffset: 240)
+    f.store(0, toByteOffset: 168)
+    enqueue(sched, f)
+  }
+  wakeCarrier(sched, false)
+}
+
+// ---- send / drain ----
+
+// Fire-and-forget: enqueue `msg` on the mailbox FIFO; on the 0→1 edge, schedule the mailbox and dispatch a
+// fiber. Returns immediately. Caller does NOT hold the scheduler lock.
+fun actorSend(sched: RawPtr, mb: RawPtr, msg: RawPtr) {
+  mutexLock(sched.advanced(by: 16))
+  msg.store(RawPtr.null, toByteOffset: 0)
+  let tail: RawPtr = mb.load(fromByteOffset: 8)
+  if tail.isNull {
+    mb.store(msg, toByteOffset: 0)
+  } else {
+    tail.store(msg, toByteOffset: 0)
+  }
+  mb.store(msg, toByteOffset: 8)
+  let scheduled: Int = mb.load(fromByteOffset: 16)
+  if scheduled == 0 {
+    mb.store(1, toByteOffset: 16)
+    schedMbPush(sched, mb)
+    let d: Int = sched.load(fromByteOffset: 56)
+    sched.store(d + 1, toByteOffset: 56)               // active_drains++
+    mailboxDispatch(sched)
+  }
+  mutexUnlock(sched.advanced(by: 16))
+}
+
+// Pop the next message (FIFO), or null on empty. On empty, clear `scheduled` under the lock (1→0 edge) and,
+// if that was the last outstanding drain and the producer is done, quiesce.
+fun mailboxPop(sched: RawPtr, mb: RawPtr) -> RawPtr {
+  mutexLock(sched.advanced(by: 16))
+  let msg: RawPtr = mb.load(fromByteOffset: 0)
+  if msg.isNull {
+    mb.store(0, toByteOffset: 16)                       // scheduled = 0
+    let d: Int = sched.load(fromByteOffset: 56)
+    sched.store(d - 1, toByteOffset: 56)                // active_drains--
+    let pa: Int = sched.load(fromByteOffset: 64)
+    if d - 1 == 0 {
+      if pa == 0 {
+        signalStop(sched)
+      }
+    }
+    mutexUnlock(sched.advanced(by: 16))
+    return msg
+  }
+  let nx: RawPtr = msg.load(fromByteOffset: 0)
+  mb.store(nx, toByteOffset: 0)
+  if nx.isNull {
+    mb.store(RawPtr.null, toByteOffset: 8)
+  }
+  mutexUnlock(sched.advanced(by: 16))
+  return msg
+}
+
+// Drain a mailbox to empty: pop → run the handler thunk → repeat. Runs without the scheduler lock (each
+// mailboxPop takes it briefly). Plain Nomu — the mailbox/messages are off-heap, never moved by the GC.
+fun mailboxDrain(sched: RawPtr, mb: RawPtr) {
+  var go = true
+  while go {
+    let msg = mailboxPop(sched, mb)
+    if msg.isNull {
+      go = false
+    } else {
+      let thunk: RawPtr = msg.load(fromByteOffset: 8)
+      thunk.callEntry(msg)
+    }
+  }
+}
+
+// A mailbox fiber's top level: pull a scheduled mailbox and drain it; park on the free-list when none.
+// Entered/resumed with the scheduler lock HELD (the carrier switched in holding it) — the loop-top
+// invariant, so schedMbPop runs under the lock. Exits on stop by yielding to its carrier.
+fun mailboxFiberMain(sched: RawPtr) -> RawPtr {
+  var go = true
+  while go {
+    let stp: Int = sched.atomicLoad(fromByteOffset: 32)
+    if stp != 0 {
+      go = false
+    } else {
+      let mb = schedMbPop(sched)
+      if mb.isNull {
+        let self = RawPtr.tlsGet()
+        let oldFree: RawPtr = sched.load(fromByteOffset: 80)
+        self.store(oldFree, toByteOffset: 240)          // push self onto the free-list
+        sched.store(self, toByteOffset: 80)
+        self.store(2, toByteOffset: 168)
+        let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
+        self.ctxSwitchTo(carrierCtx)                    // hand lock to carrier; resume holding it
+      } else {
+        mutexUnlock(sched.advanced(by: 16))
+        mailboxDrain(sched, mb)                         // drains mb; clears scheduled when empty
+        mutexLock(sched.advanced(by: 16))
+      }
+    }
+  }
+  let self = RawPtr.tlsGet()
+  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
+  self.ctxSwitchTo(carrierCtx)                          // stop: yield to the carrier (holding the lock)
+  return sched
+}
+
+fun schedLoop(sched: RawPtr, myCtx: RawPtr) {
+  mutexLock(sched.advanced(by: 16))
+  var go = true
+  while go {
+    let stp: Int = sched.atomicLoad(fromByteOffset: 32)
+    if stp != 0 {
+      go = false
+    } else {
+      let fib = dequeue(sched)
+      if fib.isNull {
+        let gw = sched.advanced(by: 24)
+        let gen: Int = gw.atomicLoad(fromByteOffset: 0)
+        mutexUnlock(sched.advanced(by: 16))
+        gw.futexWait(expected: gen, timeoutMicros: 1000000)
+        mutexLock(sched.advanced(by: 16))
+      } else {
+        fib.store(myCtx, toByteOffset: 232)
+        fib.store(1, toByteOffset: 168)
+        RawPtr.tlsSet(fib)
+        myCtx.ctxSwitchTo(fib)
+      }
+    }
+  }
+  mutexUnlock(sched.advanced(by: 16))
+}
+
+fun carrierMain(carg: RawPtr) -> RawPtr {
+  let sched: RawPtr = carg.load(fromByteOffset: 0)
+  let ctx: RawPtr = carg.load(fromByteOffset: 8)
+  schedLoop(sched, ctx)
+  return carg
+}
+
+// ---- message handler (not subset; run via callEntry). Serial per actor (single-drain), so the actor's
+// `expected` counter needs no atomics; the global counters are touched across fibers, so atomic. ----
+fun bumpHandler(msg: RawPtr) -> RawPtr {
+  let recv: RawPtr = msg.load(fromByteOffset: 16)
+  let seq: Int = msg.load(fromByteOffset: 24)
+  let counters: RawPtr = recv.load(fromByteOffset: 8)
+  let expected: Int = recv.load(fromByteOffset: 0)
+  if seq == expected {
+    recv.store(expected + 1, toByteOffset: 0)
+    counters.atomicFetchAdd(1, atByteOffset: 0)         // handled++
+  } else {
+    counters.atomicFetchAdd(1, atByteOffset: 8)         // errors++ (out of order → FIFO/single-drain broken)
+  }
+  return RawPtr.null
+}
+
+fun newSched() -> RawPtr {
+  let sched = RawPtr.alloc(bytes: 88, align: 8)
+  sched.store(RawPtr.null, toByteOffset: 0)
+  sched.store(RawPtr.null, toByteOffset: 8)
+  sched.store(0, toByteOffset: 16)
+  sched.store(0, toByteOffset: 24)
+  sched.store(0, toByteOffset: 32)
+  sched.store(RawPtr.null, toByteOffset: 40)
+  sched.store(RawPtr.null, toByteOffset: 48)
+  sched.store(0, toByteOffset: 56)
+  sched.store(0, toByteOffset: 64)
+  sched.store(0, toByteOffset: 72)
+  sched.store(RawPtr.null, toByteOffset: 80)
+  return sched
+}
+
+fun main() {
+  let carriers = 3
+  let na = 8
+  let nm = 50
+  let sched = newSched()
+  sched.store(1, toByteOffset: 64)              // producer_active = 1
+
+  let counters = RawPtr.alloc(bytes: 16, align: 8)
+  counters.store(0, toByteOffset: 0)
+  counters.store(0, toByteOffset: 8)
+
+  let actors = RawPtr.alloc(bytes: 8 * na, align: 8)
+  let mboxes = RawPtr.alloc(bytes: 8 * na, align: 8)
+  var i = 0
+  while i < na {
+    let ac = RawPtr.alloc(bytes: 16, align: 8)
+    ac.store(0, toByteOffset: 0)                 // expected = 0
+    ac.store(counters, toByteOffset: 8)
+    let mb = RawPtr.alloc(bytes: 32, align: 8)
+    mb.store(RawPtr.null, toByteOffset: 0)
+    mb.store(RawPtr.null, toByteOffset: 8)
+    mb.store(0, toByteOffset: 16)
+    mb.store(RawPtr.null, toByteOffset: 24)
+    actors.store(ac, toByteOffset: 8 * i)
+    mboxes.store(mb, toByteOffset: 8 * i)
+    i = i + 1
+  }
+  let thunk = RawPtr.ofFunc(bumpHandler)
+
+  // Start the carriers.
+  let handles = RawPtr.alloc(bytes: 8 * carriers, align: 8)
+  var c = 0
+  while c < carriers {
+    let ctx = RawPtr.alloc(bytes: 168, align: 16)
+    let carg = RawPtr.alloc(bytes: 16, align: 8)
+    carg.store(sched, toByteOffset: 0)
+    carg.store(ctx, toByteOffset: 8)
+    let h = handles.advanced(by: 8 * c)
+    h.threadCreate(entry: RawPtr.ofFunc(carrierMain), arg: carg)
+    c = c + 1
+  }
+
+  // Send seq 0..nm-1 to every actor in order (main is the single sender → per-actor FIFO).
+  var s = 0
+  while s < nm {
+    var a = 0
+    while a < na {
+      let mb: RawPtr = mboxes.load(fromByteOffset: 8 * a)
+      let ac: RawPtr = actors.load(fromByteOffset: 8 * a)
+      let msg = RawPtr.alloc(bytes: 32, align: 8)
+      msg.store(RawPtr.null, toByteOffset: 0)
+      msg.store(thunk, toByteOffset: 8)
+      msg.store(ac, toByteOffset: 16)
+      msg.store(s, toByteOffset: 24)
+      actorSend(sched, mb, msg)
+      a = a + 1
+    }
+    s = s + 1
+  }
+
+  // Producer done: drop the guard; if everything already drained, stop now.
+  mutexLock(sched.advanced(by: 16))
+  sched.store(0, toByteOffset: 64)              // producer_active = 0
+  let d: Int = sched.load(fromByteOffset: 56)
+  if d == 0 {
+    signalStop(sched)
+  }
+  mutexUnlock(sched.advanced(by: 16))
+
+  var k = 0
+  while k < carriers {
+    let h = handles.advanced(by: 8 * k)
+    h.threadJoin()
+    k = k + 1
+  }
+
+  let handled: Int = counters.load(fromByteOffset: 0)
+  let errors: Int = counters.load(fromByteOffset: 8)
+  print(handled)                                // 400
+  print("\n")
+  print(errors)                                 // 0
+  print("\n")
+}

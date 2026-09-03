@@ -1,0 +1,41 @@
+// Task 128.2 · asm floor driven from Nomu — single-fiber context round-trip. Unlike asmswitch.nomu
+// (a C harness), here the fiber entry is a Nomu function reached through RawPtr.ofFunc, and main drives
+// the switch through the RawPtr intrinsics (fiberInit / ctxSwitchTo). This is the 128.1.2 checkpoint: a
+// Nomu-seeded fiber runs on its own stack and returns control cleanly.
+//
+// The fiber's argument is a control block (off-heap RawPtr): slot 0 = the fiber's own context buffer,
+// slot 8 = main's context buffer, slot 16 = a witness the fiber writes. main switches into the fiber; the
+// fiber records the witness and switches back; main reads the witness. All memory is off-heap raw memory
+// (no managed allocation, so no GC interaction across the stack switch).
+// Expected output: 42. Checked by tools/fiberswitch.sh.
+fun fiberEntry(cb: RawPtr) -> RawPtr {
+  cb.store(42, toByteOffset: 16)                 // witness: the fiber ran, with its argument delivered
+  let fiberCtx: RawPtr = cb.load(fromByteOffset: 0)
+  let mainCtx: RawPtr = cb.load(fromByteOffset: 8)
+  fiberCtx.ctxSwitchTo(mainCtx)                  // hand control back to main
+  return cb                                      // unreached (the trampoline traps if we return)
+}
+
+fun main() {
+  let mainCtx = RawPtr.alloc(bytes: 168, align: 16)    // callee-saved context buffers (§2.1 layout)
+  let fiberCtx = RawPtr.alloc(bytes: 168, align: 16)
+  let stack = RawPtr.alloc(bytes: 65536, align: 16)    // the fiber's stack
+  let cb = RawPtr.alloc(bytes: 24, align: 8)           // control block
+
+  cb.store(fiberCtx, toByteOffset: 0)
+  cb.store(mainCtx, toByteOffset: 8)
+  cb.store(0, toByteOffset: 16)
+
+  let stackTop = stack.advanced(by: 65536)
+  fiberCtx.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberEntry), arg: cb)
+  mainCtx.ctxSwitchTo(fiberCtx)                        // into the fiber; it records 42 and switches back
+
+  let w: Int = cb.load(fromByteOffset: 16)
+  print(w)
+  print("\n")
+
+  cb.free()
+  stack.free()
+  fiberCtx.free()
+  mainCtx.free()
+}

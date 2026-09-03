@@ -179,7 +179,7 @@ private final class Monomorphizer {
         let newType = resolveType(e.type, s)
         let kind: ExprKind
         switch e.kind {
-        case .intLit, .doubleLit, .boolLit, .stringLit, .varRef:
+        case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .funcRef:
             kind = e.kind
         case .fieldAccess(let base, let field):
             kind = .fieldAccess(base: rewriteExpr(base, s), field: field)

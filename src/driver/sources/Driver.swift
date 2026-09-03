@@ -151,7 +151,8 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
 
     // Backend (M8): lower the typed IR via LLVM's C API → object → link with the runtime .a.
     // (The C backend was the differential oracle through 8.2 and was retired at the 8.2 exit.)
-    emitLLVMBinary(monoModule, stem: stem, buildRoot: buildRoot, optimize: options.optimize, timings: timings)
+    emitLLVMBinary(monoModule, stem: stem, buildRoot: buildRoot, optimize: options.optimize,
+                   subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames), timings: timings)
     timings.report()
 }
 
@@ -222,12 +223,13 @@ private func prependPrelude(_ program: Program) -> (Program, Set<String>) {
 // static archive, and link them into a native executable. Reports the binary path (like the C
 // path). Everything LLVM stays behind `emitHelloWorldObject` in LLVMBridge — this only orchestrates
 // object → .a → link.
-private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: String, optimize: Bool, timings: Timings) {
+private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: String, optimize: Bool,
+                            subsetFuncs: Set<String>, timings: Timings) {
     let objPath = stem + ".o"
     // The LLVM path (SSAIR gen + passes, IR egress, LLVM opt, object emit) reports its sub-stages up
     // through the `StageSink`, so the timing table's `ssair`/`llvm` phases break down rather than
     // showing one opaque `codegen` bucket.
-    let err = emitObject(module, to: objPath, optimize: optimize,
+    let err = emitObject(module, to: objPath, optimize: optimize, subsetFuncs: subsetFuncs,
                          onStage: { timings.record(phase: $0, name: $1, seconds: $2) })
     if let err = err {
         fputs("error: \(err)\n", stderr)
@@ -299,8 +301,9 @@ private func runtimeArchiveKey() -> String {
     mix(EmbeddedSources.runtimeHeader)
     mix(EmbeddedSources.runtimeC)
     mix(EmbeddedSources.coreC)
+    mix(EmbeddedSources.rtAsmArm64)   // the asm floor is archived in (task 128.2)
     mix(hostArch)
-    mix("recipe-1")   // bump when the compile/archive commands below change
+    mix("recipe-2")   // bump when the compile/archive commands below change
     return String(h, radix: 16)
 }
 
@@ -324,9 +327,19 @@ private func buildRuntimeArchive(inDir dir: String) -> String? {
     if runProcess("/usr/bin/cc", ["-w", "-I", dir, "-c", dir + "/core.c", "-o", coreO]) != 0 {
         fputs("error: failed to compile core.c\n", stderr); return nil
     }
+    var members = [runtimeO, coreO]
+    // The asm floor (task 128.2): assemble the per-arch `.s` (clang assembles `.s` directly) and archive
+    // it beside the C objects, so its symbols (rtSwitch, rtFiberInit) resolve in every emitted binary.
+    if hostArch == "arm64" {
+        let asmO = dir + "/rtasm.o"
+        if runProcess("/usr/bin/cc", ["-c", dir + "/rtasm.s", "-o", asmO]) != 0 {
+            fputs("error: failed to assemble rtasm.s\n", stderr); return nil
+        }
+        members.append(asmO)
+    }
     // Rebuild from scratch so stale members never accumulate; `rcs` creates + indexes the archive.
     try? FileManager.default.removeItem(atPath: archive)
-    if runProcess("/usr/bin/ar", ["rcs", archive, runtimeO, coreO]) != 0 {
+    if runProcess("/usr/bin/ar", ["rcs"] + [archive] + members) != 0 {
         fputs("error: failed to archive runtime\n", stderr); return nil
     }
     return archive
@@ -373,11 +386,14 @@ private func runProcess(_ exe: String, _ args: [String]) -> Int32 {
 
 // Write the embedded runtime/core C sources + ABI header into `dir` (M4.13).
 private func writeRuntimeSources(toDir dir: String) {
-    let files = [
+    var files = [
         ("runtime.h", EmbeddedSources.runtimeHeader),
         ("runtime.c", EmbeddedSources.runtimeC),
         ("core.c",    EmbeddedSources.coreC),
     ]
+    // The asm floor (task 128.2), per-arch. arm64 only for now; x86-64 is deferred, and core.c's
+    // self-test degrades to a stub there, so no `.s` is needed to link.
+    if hostArch == "arm64" { files.append(("rtasm.s", EmbeddedSources.rtAsmArm64)) }
     for (name, contents) in files {
         guard (try? contents.write(toFile: dir + "/" + name, atomically: true, encoding: .utf8)) != nil else {
             fputs("error: failed to write runtime source '\(name)'\n", stderr)

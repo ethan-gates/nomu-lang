@@ -2,16 +2,25 @@
 
 **Avenue:** Risk (self-hosting prerequisite) · **Type/Lifecycle:** `language-feature · in-progress`
 (language + compiler checking) · **Size:** M · **Status:** slice 1 built — designation + call-graph
-closure check · **Source:** distilled from [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
+closure check + safepoint-poll suppression · **Source:** distilled from
+[128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
 
 **► Built (slice 1).** Two designation sources — the **runtime prelude** (`src/stdlib/runtime.nomu`,
 subset-by-default; the proper "designated file" until [100](100-modules.md)) and an ad-hoc
 `--runtime-subset=<names>` flag — feeding the NOIR call-graph closure check in `Sema.swift`
 (`checkRuntimeSubset`): a subset function may not allocate on the heap (class/actor construct, closure,
 `any`-box, array, `spawn`) or call outside the allowlist (subset functions + the 125 `__raw*`/`__ptr*`
-primitives + pure leaves). Test: `tools/subset.sh`. **Remaining slices:** codegen-site guards
-(write-barrier / safepoint-poll suppression), the `nosplit fun` keyword (staged behind
-[104](104-fiber-stack-strategy.md)), module-membership designation with [100](100-modules.md).
+primitives + pure leaves). Test: `tools/subset.sh`.
+
+**► Built (poll-suppression, 128.1.1 prerequisite).** The first codegen-site guard: the resolved
+`noSafepoint` property now rides from the subset designation to the backend (`SSAFunction.noSafepoint`,
+seeded in `lowerToSSAIR`), and `SSAIRToLLVM` elides the loop-header `__nomu_poll` for a subset function —
+so the self-hosted scheduler loop cannot recursively try to stop the world. Verified in the emitted
+machine code (the poll's slow-path call is present in an ordinary loop, absent in the same loop under
+`--runtime-subset`). Test: `tools/subset-poll.sh`. **Remaining slices:** the write-barrier codegen guard
+(runtime code works over `addrspace(0)` raw memory, which has no managed store to barrier, so it is inert
+today), the `nostackgrow fun` keyword (staged behind [104](104-fiber-stack-strategy.md)), and
+module-membership designation with [100](100-modules.md).
 
 **► Design:** [`internals/runtime-subset.md`](../../internals/runtime-subset.md). Surface pinned with
 Ethan: **surface A — module-default subset + a narrow per-function keyword refinement** (`nosplit fun`);

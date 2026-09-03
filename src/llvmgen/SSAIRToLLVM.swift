@@ -214,7 +214,11 @@ final class SSAIRToLLVM {
         // NOIR walker does the same at each `while` header; placed after the header's φs and before its
         // body, so every iteration passes through it. (Eliding it when the loop already hits a safepoint
         // each iteration — NOIR's `loopBodyHasSafepoint` — is a later refinement / the safepoint pass.)
-        let headers = loopHeaders(f)
+        // A runtime-subset (`noSafepoint`) function elides the poll (task 149, runtime-subset.md §4): its
+        // code may run during a stop-the-world, so a poll here would recursively try to stop the world.
+        // The closure check (Sema) already keeps subset code from reaching a non-subset callee, so no poll
+        // hides behind a call either. This is the codegen-site guard the scheduler loop needs (128.1.1).
+        let headers = f.noSafepoint ? Set<Int>() : loopHeaders(f)
         for blk in f.blocks {
             LLVMPositionBuilderAtEnd(b, blockMap[blk.id])
             if headers.contains(blk.id) {
@@ -362,6 +366,14 @@ final class SSAIRToLLVM {
             define(inst, lowerArrayLit(elements, elem, span))
         case .makeClosure(let funcName, let env, let onStack):
             define(inst, makeClosure(funcName, env, onStack, span))
+        case .funcAddr(let name):
+            // The bare C-ABI code pointer of a top-level function (task 128.2, RawPtr.ofFunc). The
+            // callable's `fn` is a `ptr` already usable as an addrspace(0) RawPtr (the closure/spawn
+            // paths store it into an i8ptr slot directly), so no cast is needed.
+            guard let c = e.callables["f:\(name)"] else {
+                e.fail("128.2: unknown function '\(name)' for RawPtr.ofFunc", span); return
+            }
+            define(inst, c.fn)
         }
     }
 
@@ -646,6 +658,131 @@ final class SSAIRToLLVM {
         case "__rawLoad":
             guard let lt = ty(resultType, span) else { return nil }
             return LLVMBuildLoad2(b, lt, e.gepByte(val(args[0]), val(args[1])), "raw.load")
+        // Atomics (task 128.1.1, scheduler substrate). i64 seq-cst ops over an addrspace(0) RawPtr slot —
+        // pure LLVM instructions, no OS/asm. The primitive under the MT-safe run queue, STW flags, and
+        // futex words. gc-leaf: no barrier, never a GC root. The fixture keeps offsets 8-aligned.
+        case "__atomicLoad":
+            let ld = LLVMBuildLoad2(b, e.i64, e.gepByte(val(args[0]), val(args[1])), "atomic.load")
+            LLVMSetOrdering(ld, LLVMAtomicOrderingSequentiallyConsistent)
+            LLVMSetAlignment(ld, 8)
+            return ld
+        case "__atomicStore":
+            let st = LLVMBuildStore(b, val(args[1]), e.gepByte(val(args[0]), val(args[2])))
+            LLVMSetOrdering(st, LLVMAtomicOrderingSequentiallyConsistent)
+            LLVMSetAlignment(st, 8)
+            return LLVMConstInt(e.i64, 0, 0)
+        case "__atomicCas":
+            // cmpxchg yields { i64 old, i1 success }; return the old word (caller compares to `expected`).
+            let cx = LLVMBuildAtomicCmpXchg(b, e.gepByte(val(args[0]), val(args[3])),
+                                            val(args[1]), val(args[2]),
+                                            LLVMAtomicOrderingSequentiallyConsistent,
+                                            LLVMAtomicOrderingSequentiallyConsistent, 0)
+            return LLVMBuildExtractValue(b, cx, 0, "atomic.cas.old")
+        case "__atomicFetchAdd":
+            return LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpAdd, e.gepByte(val(args[0]), val(args[2])),
+                                      val(args[1]), LLVMAtomicOrderingSequentiallyConsistent, 0)
+        case "__atomicExchange":
+            // atomicrmw xchg: swap the word for `value`, yield the previous word. The futex-mutex xchg.
+            return LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpXchg, e.gepByte(val(args[0]), val(args[2])),
+                                      val(args[1]), LLVMAtomicOrderingSequentiallyConsistent, 0)
+        // Raw OS clock (task 128.1.1, scheduler substrate). Monotonic nanoseconds straight from the OS —
+        // on macOS the libSystem entry `uint64_t clock_gettime_nsec_np(clockid_t)` (the stable Darwin
+        // floor, selfhosted-scheduler.md §3.3), no C-runtime shim. `CLOCK_MONOTONIC` is 6 on Darwin. The
+        // Linux lowering (raw `clock_gettime`/vDSO) lands with the Linux build target (§5).
+        case "__sysMonotonicNanos":
+            let (fn, fty) = e.runtimeFn("clock_gettime_nsec_np", ret: e.i64, params: [e.i32], varArg: false)
+            return e.buildCall(fn, fty, [LLVMConstInt(e.i32, 6, 0)])
+        // Asm-floor isolation self-test (task 128.2): the runtime harness rt_asm_selftest drives a
+        // context-switch round-trip and returns 1/0. Just a call to the runtime symbol.
+        case "__sysAsmSelfTest":
+            let (fn, fty) = e.runtimeFn("rt_asm_selftest", ret: e.i64, params: [], varArg: false)
+            return e.buildCall(fn, fty, [])
+        // Carrier-local slot (task 128.1.6): the running fiber handle (`rt_current`). Backed by a
+        // `_Thread_local` word in the embedded floor (core.c). tlsGet reads it, tlsSet writes it.
+        case "__sysTlsGet":
+            let (fn, fty) = e.runtimeFn("rt_tls_get", ret: e.i8ptr, params: [], varArg: false)
+            return e.buildCall(fn, fty, [])
+        case "__sysTlsSet":
+            let (fn, fty) = e.runtimeFn("rt_tls_set", ret: e.voidTy, params: [e.i8ptr], varArg: false)
+            _ = e.buildCall(fn, fty, [val(args[0])])
+            return LLVMConstInt(e.i64, 0, 0)
+        // I/O poller substrate (task 128.1.7): the macOS kqueue floor + pipe/read/write, bound as libSystem
+        // externs (selfhosted-scheduler.md §3.3). fd numbers and counts are i32 at the C boundary; buffers
+        // are raw i8ptr. Results are sign-extended back to i64.
+        case "__sysKqueue":
+            let (fn, fty) = e.runtimeFn("kqueue", ret: e.i32, params: [], varArg: false)
+            return LLVMBuildSExt(b, e.buildCall(fn, fty, [])!, e.i64, "kqueue.r")
+        case "__sysKevent":
+            // int kevent(int kq, const struct kevent* changes, int nchanges, struct kevent* events,
+            //            int nevents, const struct timespec* timeout) — timeout NULL = block.
+            let (fn, fty) = e.runtimeFn("kevent", ret: e.i32,
+                                        params: [e.i32, e.i8ptr, e.i32, e.i8ptr, e.i32, e.i8ptr], varArg: false)
+            let kq = LLVMBuildTrunc(b, val(args[0]), e.i32, "kq")
+            let nch = LLVMBuildTrunc(b, val(args[2]), e.i32, "nch")
+            let nev = LLVMBuildTrunc(b, val(args[4]), e.i32, "nev")
+            let r = e.buildCall(fn, fty, [kq, val(args[1]), nch, val(args[3]), nev, LLVMConstNull(e.i8ptr)])
+            return LLVMBuildSExt(b, r!, e.i64, "kevent.r")
+        case "__sysPipe":
+            let (fn, fty) = e.runtimeFn("pipe", ret: e.i32, params: [e.i8ptr], varArg: false)
+            return LLVMBuildSExt(b, e.buildCall(fn, fty, [val(args[0])])!, e.i64, "pipe.r")
+        case "__sysWrite":
+            // ssize_t write(int fd, const void* buf, size_t count)
+            let (fn, fty) = e.runtimeFn("write", ret: e.i64, params: [e.i32, e.i8ptr, e.i64], varArg: false)
+            let wfd = LLVMBuildTrunc(b, val(args[0]), e.i32, "wfd")
+            return e.buildCall(fn, fty, [wfd, val(args[1]), val(args[2])])
+        case "__sysRead":
+            // ssize_t read(int fd, void* buf, size_t count)
+            let (fn, fty) = e.runtimeFn("read", ret: e.i64, params: [e.i32, e.i8ptr, e.i64], varArg: false)
+            let rfd = LLVMBuildTrunc(b, val(args[0]), e.i32, "rfd")
+            return e.buildCall(fn, fty, [rfd, val(args[1]), val(args[2])])
+        // Asm-floor context switch (task 128.2): rtSwitch(from, to). Void — returns a dummy word.
+        case "__sysCtxSwitch":
+            let (fn, fty) = e.runtimeFn("rtSwitch", ret: e.voidTy, params: [e.i8ptr, e.i8ptr], varArg: false)
+            _ = e.buildCall(fn, fty, [val(args[0]), val(args[1])])
+            return LLVMConstInt(e.i64, 0, 0)
+        case "__sysFiberInit":
+            let (fn, fty) = e.runtimeFn("rtFiberInit", ret: e.voidTy,
+                                        params: [e.i8ptr, e.i8ptr, e.i8ptr, e.i8ptr], varArg: false)
+            _ = e.buildCall(fn, fty, [val(args[0]), val(args[1]), val(args[2]), val(args[3])])
+            return LLVMConstInt(e.i64, 0, 0)
+        // Carrier thread create (task 128.2): pthread_create(handle, NULL, entry, arg). `entry` is a
+        // (RawPtr)->RawPtr Nomu function address, ABI-identical to void*(*)(void*).
+        case "__sysThreadCreate":
+            let (fn, fty) = e.runtimeFn("pthread_create", ret: e.i32,
+                                        params: [e.i8ptr, e.i8ptr, e.i8ptr, e.i8ptr], varArg: false)
+            let r = e.buildCall(fn, fty, [val(args[0]), LLVMConstNull(e.i8ptr), val(args[1]), val(args[2])])
+            return LLVMBuildSExt(b, r!, e.i64, "thread.create.r")
+        case "__sysThreadJoin":
+            // pthread_join(pthread_t, NULL); the handle (a pointer-sized pthread_t) is loaded from the slot.
+            let t = LLVMBuildLoad2(b, e.i8ptr, val(args[0]), "pthread.t")
+            let (fn, fty) = e.runtimeFn("pthread_join", ret: e.i32, params: [e.i8ptr, e.i8ptr], varArg: false)
+            let r = e.buildCall(fn, fty, [t!, LLVMConstNull(e.i8ptr)])
+            return LLVMBuildSExt(b, r!, e.i64, "thread.join.r")
+        // Indirect call through a RawPtr code address with the fiber-entry ABI i8ptr(i8ptr) (task 128.1.3).
+        case "__sysCallEntry":
+            return e.buildCall(val(args[0]), e.fnType(e.i8ptr, [e.i8ptr]), [val(args[1])])
+        // Futex (task 128.1.1, scheduler substrate). macOS __ulock_wait / __ulock_wake — the libSystem
+        // futex floor (selfhosted-scheduler.md §3.3), no C-runtime shim. Operation bits (private XNU ABI):
+        // UL_COMPARE_AND_WAIT = 1; ULF_NO_ERRNO = 0x01000000 returns the negated errno rather than setting
+        // the thread-local errno (so the primitive stays subset-friendly, no libc errno slot); ULF_WAKE_ALL
+        // = 0x100 wakes every waiter (STW broadcast) instead of one (lock handoff).
+        case "__sysFutexWait":
+            // int __ulock_wait(uint32 operation, void* addr, uint64 value, uint32 timeout_us)
+            let (wf, wt) = e.runtimeFn("__ulock_wait", ret: e.i32,
+                                       params: [e.i32, e.i8ptr, e.i64, e.i32], varArg: false)
+            let op = LLVMConstInt(e.i32, 0x0100_0001, 0)
+            let tmo = LLVMBuildTrunc(b, val(args[2]), e.i32, "futex.tmo")
+            let r = e.buildCall(wf, wt, [op, val(args[0]), val(args[1]), tmo])
+            return LLVMBuildSExt(b, r!, e.i64, "futex.wait.r")
+        case "__sysFutexWake":
+            // int __ulock_wake(uint32 operation, void* addr, uint64 wake_value)
+            let (kf, kt) = e.runtimeFn("__ulock_wake", ret: e.i32,
+                                       params: [e.i32, e.i8ptr, e.i64], varArg: false)
+            let oneOp = LLVMConstInt(e.i32, 0x0100_0001, 0)
+            let allOp = LLVMConstInt(e.i32, 0x0100_0001 | 0x100, 0)
+            let op = LLVMBuildSelect(b, val(args[1]), allOp, oneOp, "futex.wake.op")
+            let r = e.buildCall(kf, kt, [op, val(args[0]), LLVMConstInt(e.i64, 0, 0)])
+            return LLVMBuildSExt(b, r!, e.i64, "futex.wake.r")
         // Ptr<T>: typed element access at the natural stride of T (index-scaled, C-style packed).
         case "__ptrAlloc":
             guard case .ptr(let elem) = resultType else { e.fail("125: __ptrAlloc result not Ptr<T>", span); return nil }
@@ -720,6 +857,12 @@ final class SSAIRToLLVM {
             // linked in); the load yields the mailbox object pointer the C root scan reports at the same point.
             let g = LLVMGetNamedGlobal(e.mod, "rt_sched_head") ?? LLVMAddGlobal(e.mod, e.i8ptr, "rt_sched_head")
             return LLVMBuildLoad2(b, e.i8ptr, g, "gc.schedhead")
+        case "__schedHandle":
+            // Task 128.3.2: load the C global `rt_nomu_sched` — the self-hosted scheduler's Sched handle,
+            // bound at boot under NOMU_SCHED=nomu (null under the C plan). Lets a driver reach the scheduler
+            // to run the self-hosted STW walk (nomuSchedWalkParked). Same direct-extern-load shape as __gcSchedHead.
+            let g = LLVMGetNamedGlobal(e.mod, "rt_nomu_sched") ?? LLVMAddGlobal(e.mod, e.i8ptr, "rt_nomu_sched")
+            return LLVMBuildLoad2(b, e.i8ptr, g, "sched.handle")
         case "__gcSelfhostSpace":
             // Task 150 rung 3: load the codegen-internal global `__nomu_selfhost_space` (the Immix space
             // descriptor the alloc seam lazily creates under NOMU_GC_PLAN=nomu). Get-or-add with the same

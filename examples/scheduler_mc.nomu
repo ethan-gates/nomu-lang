@@ -1,0 +1,267 @@
+// Task 128.1.5 · multi-carrier scheduler: N carrier OS threads draining one shared MT-safe run queue in
+// parallel, idle carriers sleeping on a futex and woken on push (cross-thread wake). Built over the
+// substrate (raw memory + atomics + the futex + thread-create + the asm context switch) and the 128.1.4
+// futex mutex. This is the first rung where the scheduler lock genuinely CONTENDS: the main thread and
+// the carrier threads all take it, so the mutex slow path (__ulock_wait) actually fires.
+//
+// What this rung proves, and what it defers:
+//   • proves — N carriers pull work off the shared queue concurrently under the lock; an idle carrier
+//     (empty queue) sleeps on a wake-generation futex word and is woken when a producer pushes; the whole
+//     set shuts down cleanly when the last fiber completes. Concurrent correctness is asserted on the sum
+//     of an atomic accumulator (deterministic regardless of interleaving) + termination under a watchdog.
+//   • defers — a fiber that self-parks (`park()` with no args) must identify the running fiber, which
+//     needs thread-local `rt_current`; that TLS slot lands at 128.1.6. So cross-thread PARK/UNPARK of
+//     fibers (where the lost-wakeup park race fully reproduces) rides the rung after TLS. park/unpark were already
+//     validated single-carrier at 128.1.4. Fibers here run to completion without parking.
+//
+// Because a fiber must switch back to whichever carrier switched into it, the running carrier's context
+// buffer is stored INTO the fiber at switch-in (offset 232) and read back at completion — no TLS needed
+// for that half; the carrier context is off-heap and carrier-owned.
+//
+// Off-heap layouts (byte offsets):
+//   Sched (48B):  0 runq-head · 8 runq-tail · 16 mutex-word · 24 wake-gen word · 32 outstanding · 40 stopping
+//   Fiber (240B): 0..167 ctx buffer · 168 state · 176 next · 184 entry · 192 arg · 200 sched
+//                 · 208 stackBase · 216 result · 224 joiner · 232 carrierCtx (the carrier running it)
+//   Carrier arg (16B): 0 sched · 8 ctx-buffer (168B, carrier's own, pre-allocated by main)
+//   state: 0 ready · 1 running · 3 done      mutex-word: 0 unlocked · 1 locked · 2 contended
+//
+// Runs under NoGC only: the carrier threads are raw pthreads, not registered mutators, so a moving
+// collection's stop-the-world neither knows nor waits for them (same envelope as tools/pingpong.sh); they
+// touch only off-heap memory, so this is safe. Expected output (looped): 600. Checked by tools/scheduler-mc.sh.
+
+// ---- Mutex: 3-state futex word (Drepper "mutex1"). Uncontended fast path is one CAS; under contention a
+// waiter sleeps in __ulock_wait and the releaser wakes one. Now actually exercised (main vs carriers). ----
+
+fun mutexLock(m: RawPtr) {
+  var c: Int = m.atomicCas(0, 1, atByteOffset: 0)
+  if c != 0 {
+    if c != 2 {
+      c = m.atomicExchange(2, atByteOffset: 0)
+    }
+    while c != 0 {
+      m.futexWait(expected: 2, timeoutMicros: 0)     // 0 = wait indefinitely; unlock wakes us
+      c = m.atomicExchange(2, atByteOffset: 0)
+    }
+  }
+}
+
+fun mutexUnlock(m: RawPtr) {
+  let prev: Int = m.atomicExchange(0, atByteOffset: 0)
+  if prev == 2 {
+    m.futexWake(all: false)
+  }
+}
+
+// ---- run queue (intrusive; head at 0, tail at 8). Only touched with the scheduler lock held. ----
+
+fun enqueue(sched: RawPtr, fib: RawPtr) {
+  fib.store(RawPtr.null, toByteOffset: 176)
+  let tail: RawPtr = sched.load(fromByteOffset: 8)
+  if tail.isNull {
+    sched.store(fib, toByteOffset: 0)
+    sched.store(fib, toByteOffset: 8)
+  } else {
+    tail.store(fib, toByteOffset: 176)
+    sched.store(fib, toByteOffset: 8)
+  }
+}
+
+fun dequeue(sched: RawPtr) -> RawPtr {
+  let h: RawPtr = sched.load(fromByteOffset: 0)
+  if h.isNull {
+    return h
+  }
+  let nx: RawPtr = h.load(fromByteOffset: 176)
+  sched.store(nx, toByteOffset: 0)
+  if nx.isNull {
+    sched.store(RawPtr.null, toByteOffset: 8)
+  }
+  h.store(RawPtr.null, toByteOffset: 176)
+  return h
+}
+
+// Wake protocol: bump the generation word (so a carrier between "unlock" and "futexWait" sees the change
+// and does not sleep — closes the pre-sleep lost-wakeup window), then wake a sleeping carrier. `all` wakes
+// every idle carrier (used for the shutdown broadcast); otherwise one (a single unit of pushed work).
+fun wakeCarrier(sched: RawPtr, all: Bool) {
+  let gw = sched.advanced(by: 24)
+  gw.atomicFetchAdd(1, atByteOffset: 0)
+  gw.futexWake(all: all)
+}
+
+// ---- fiber machinery ----
+
+fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+  let stack = RawPtr.alloc(bytes: 65536, align: 16)
+  let stackTop = stack.advanced(by: 65536)
+  let fib = RawPtr.alloc(bytes: 240, align: 16)
+  fib.store(0, toByteOffset: 168)
+  fib.store(RawPtr.null, toByteOffset: 176)
+  fib.store(entry, toByteOffset: 184)
+  fib.store(arg, toByteOffset: 192)
+  fib.store(sched, toByteOffset: 200)
+  fib.store(stack, toByteOffset: 208)
+  fib.store(RawPtr.null, toByteOffset: 216)
+  fib.store(RawPtr.null, toByteOffset: 224)
+  fib.store(RawPtr.null, toByteOffset: 232)
+  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberMain), arg: fib)
+  return fib
+}
+
+// Spawn runnable: enqueue under the lock (a producer), then wake one idle carrier. The outstanding count
+// is preset by main to the total, so spawn does not touch it.
+fun fiberSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+  let fib = fiberNew(sched, entry, arg)
+  mutexLock(sched.advanced(by: 16))
+  fib.store(0, toByteOffset: 168)
+  enqueue(sched, fib)
+  mutexUnlock(sched.advanced(by: 16))
+  wakeCarrier(sched, false)
+  return fib
+}
+
+// The fiber trampoline. Resumes with the lock held (its carrier switched in holding it), releases it,
+// runs the user body lock-free, re-acquires it to record completion, decrements the outstanding count,
+// and if it drove the count to zero raises the stop flag and broadcasts a wake so every idle carrier
+// exits. Then switches back to the carrier that ran it (its stored context buffer), holding the lock.
+fun fiberMain(fib: RawPtr) -> RawPtr {
+  let sched: RawPtr = fib.load(fromByteOffset: 200)
+  mutexUnlock(sched.advanced(by: 16))
+  let entry: RawPtr = fib.load(fromByteOffset: 184)
+  let arg: RawPtr = fib.load(fromByteOffset: 192)
+  let res = entry.callEntry(arg)
+  mutexLock(sched.advanced(by: 16))
+  fib.store(res, toByteOffset: 216)
+  fib.store(3, toByteOffset: 168)
+  let prev: Int = sched.atomicFetchAdd(-1, atByteOffset: 32)
+  if prev == 1 {
+    sched.atomicStore(1, toByteOffset: 40)         // last fiber done → stop the carriers
+    wakeCarrier(sched, true)
+  }
+  let carrierCtx: RawPtr = fib.load(fromByteOffset: 232)
+  fib.ctxSwitchTo(carrierCtx)
+  return fib
+}
+
+// The carrier loop, one per OS thread, over its own context buffer. Hold the lock; switch into each ready
+// fiber with it held (recording this carrier's context in the fiber so it can switch back); regain
+// control still holding it when the fiber completes. On an empty queue, exit if stopping, else sleep on
+// the wake-gen futex until a producer pushes.
+fun schedLoop(sched: RawPtr, myCtx: RawPtr) {
+  mutexLock(sched.advanced(by: 16))
+  var go = true
+  while go {
+    let fib = dequeue(sched)
+    if fib.isNull {
+      let stp: Int = sched.atomicLoad(fromByteOffset: 40)
+      if stp != 0 {
+        go = false
+      } else {
+        let gw = sched.advanced(by: 24)
+        let gen: Int = gw.atomicLoad(fromByteOffset: 0)
+        mutexUnlock(sched.advanced(by: 16))
+        gw.futexWait(expected: gen, timeoutMicros: 1000000)   // sleep until push; 1 s backstop
+        mutexLock(sched.advanced(by: 16))
+      }
+    } else {
+      fib.store(myCtx, toByteOffset: 232)    // record the carrier so the fiber can switch back
+      fib.store(1, toByteOffset: 168)
+      myCtx.ctxSwitchTo(fib)
+    }
+  }
+  mutexUnlock(sched.advanced(by: 16))
+}
+
+// Carrier thread entry (pthread ABI RawPtr->RawPtr). arg: [0] sched · [8] this carrier's context buffer.
+fun carrierMain(carg: RawPtr) -> RawPtr {
+  let sched: RawPtr = carg.load(fromByteOffset: 0)
+  let ctx: RawPtr = carg.load(fromByteOffset: 8)
+  schedLoop(sched, ctx)
+  return carg
+}
+
+// ---- fiber body (not subset; runs through callEntry). Adds `amt` to a shared accumulator atomically,
+// since several carriers add at once. arg: [0] accumulator ptr · [8] amount. ----
+fun bumpBody(arg: RawPtr) -> RawPtr {
+  let accP: RawPtr = arg.load(fromByteOffset: 0)
+  let amt: Int = arg.load(fromByteOffset: 8)
+  accP.atomicFetchAdd(amt, atByteOffset: 0)
+  return RawPtr.null
+}
+
+fun newSched() -> RawPtr {
+  let sched = RawPtr.alloc(bytes: 48, align: 8)
+  sched.store(RawPtr.null, toByteOffset: 0)
+  sched.store(RawPtr.null, toByteOffset: 8)
+  sched.store(0, toByteOffset: 16)      // mutex-word: unlocked
+  sched.store(0, toByteOffset: 24)      // wake-gen: 0
+  sched.store(0, toByteOffset: 32)      // outstanding: set by main
+  sched.store(0, toByteOffset: 40)      // stopping: 0
+  return sched
+}
+
+fun main() {
+  let carriers = 4
+  let phase1 = 100
+  let phase2 = 100
+  let amt = 3
+  let total = phase1 + phase2                 // 200 fibers × 3 = 600
+
+  let sched = newSched()
+  let acc = RawPtr.alloc(bytes: 8, align: 8)
+  acc.atomicStore(0, toByteOffset: 0)
+  sched.atomicStore(total, toByteOffset: 32)  // preset outstanding to the total, so no early shutdown
+
+  // One shared, read-only arg for every fiber: [0] accumulator · [8] amount.
+  let arg = RawPtr.alloc(bytes: 16, align: 8)
+  arg.store(acc, toByteOffset: 0)
+  arg.store(amt, toByteOffset: 8)
+  let body = RawPtr.ofFunc(bumpBody)
+
+  // Phase 1 — enqueue before the carriers exist; they will drain these first.
+  var i = 0
+  while i < phase1 {
+    fiberSpawn(sched, body, arg)
+    i = i + 1
+  }
+
+  // Start the carriers. Each gets its own pre-allocated context buffer (no concurrent alloc on threads).
+  let handles = RawPtr.alloc(bytes: 8 * carriers, align: 8)
+  var c = 0
+  while c < carriers {
+    let ctx = RawPtr.alloc(bytes: 168, align: 16)
+    let carg = RawPtr.alloc(bytes: 16, align: 8)
+    carg.store(sched, toByteOffset: 0)
+    carg.store(ctx, toByteOffset: 8)
+    let h = handles.advanced(by: 8 * c)
+    h.threadCreate(entry: RawPtr.ofFunc(carrierMain), arg: carg)
+    c = c + 1
+  }
+
+  // Let the carriers drain phase 1 and go idle (sleep on the wake-gen futex), so phase 2 exercises a real
+  // cross-thread wake of a sleeping carrier.
+  let t0 = RawPtr.monotonicNanos()
+  var now = t0
+  while now - t0 < 50000000 {                 // ~50 ms
+    now = RawPtr.monotonicNanos()
+  }
+
+  // Phase 2 — push more work from the main thread; each spawn wakes a sleeping carrier.
+  var j = 0
+  while j < phase2 {
+    fiberSpawn(sched, body, arg)
+    j = j + 1
+  }
+
+  // Join the carriers (they exit once the last fiber drives outstanding to zero and broadcasts stop).
+  var k = 0
+  while k < carriers {
+    let h = handles.advanced(by: 8 * k)
+    h.threadJoin()
+    k = k + 1
+  }
+
+  let sum: Int = acc.atomicLoad(fromByteOffset: 0)
+  print(sum)                                   // 600
+  print("\n")
+}

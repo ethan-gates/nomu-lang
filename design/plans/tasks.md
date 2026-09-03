@@ -70,6 +70,7 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 | 118 | [Associated types + where-clauses](tasks/118-associated-types.md) | Usability | L | needs-design |
 | 119 | [Float-exponent literals](tasks/119-float-exponent-literals.md) | Usability | S | needs-design |
 | 151 | [Methods on generic types](tasks/151-generic-type-methods.md) | Usability | M | shipped (instance + computed + static, all of struct/class/enum); tails: static type-arg inference, D6 by-value read |
+| 152 | [First-class functions & closures](tasks/152-first-class-functions.md) | Usability | L | needs-design — deferred; **not** built during self-hosting. Runtime met its need with the `RawPtr.ofFunc` primitive (128.1.2), which claims no user surface |
 
 ### Stdlib & memory model (Usability)
 

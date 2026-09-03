@@ -1,0 +1,333 @@
+// Task 128.1.7 (feeder 2 of 2) · the self-hosted I/O poller (kqueue). The other wakeup feeder
+// (concurrency.md §2 layer 2): a fiber that needs an fd readable registers it with the kqueue and parks;
+// a dedicated poller thread blocks in kevent() and, when the fd is ready, unparks the fiber it stashed in
+// the event's udata. Built over the 128.1.6 scheduler machinery plus the new kqueue substrate
+// (RawPtr.kqueue / kevent / pipe / readFd / writeFd — libSystem externs, selfhosted-scheduler.md §3.3).
+// Mirrors the C runtime's kqueue poller (runtime.c rt_wait_readable), the differential oracle.
+//
+// The lock-handoff, poller edition (runtime.c comment): waitReadable holds the *scheduler* lock across
+// [register the fd · park], and the poller thread does its kevent() wait WITHOUT that lock and takes it
+// only to unpark — so the poller cannot re-queue a fiber before its context is saved. Registers happen
+// under the scheduler lock (serialized), while the poller waits concurrently; the kqueue is a shared
+// kernel object that sees a change submitted from another thread.
+//
+// Shutdown: a self-pipe. signalStop writes one byte to the stop pipe, whose read-end is registered with
+// the kqueue, so the poller's blocked kevent() returns and it recognizes the stop fd and exits.
+//
+// Off-heap layouts (byte offsets):
+//   Sched (72B): 0 head · 8 tail · 16 sched-mutex · 24 wake-gen · 32 outstanding · 40 stopping
+//                · 48 kq-fd · 56 stop-read-fd · 64 stop-write-fd
+//   kevent (32B): 0 ident(fd) · 8 filter|flags|fflags (packed) · 16 data · 24 udata(fiber)
+//   poll arg (32B): 0 sched · 8 read-fd · 16 id · 24 accumulator
+//   Fiber (240B): as 128.1.6
+//
+// EVFILT_READ = -1, EV_ADD = 0x0001, EV_ONESHOT = 0x0010 → the packed word at kevent+8 is
+//   0xFFFF | (0x0011 << 16) = 1179647  (filter = -1 as int16, flags = EV_ADD|EV_ONESHOT, fflags = 0).
+//
+// Eight fibers each wait on their own pipe; main writes their id into each; the poller wakes each, it
+// reads its byte and adds it to a shared accumulator. Correct iff every fiber wakes exactly once and reads
+// its byte → accumulator = 1+2+…+8 = 36, and it terminates. NoGC only. Checked by tools/scheduler-poller.sh.
+
+fun mutexLock(m: RawPtr) {
+  var c: Int = m.atomicCas(0, 1, atByteOffset: 0)
+  if c != 0 {
+    if c != 2 {
+      c = m.atomicExchange(2, atByteOffset: 0)
+    }
+    while c != 0 {
+      m.futexWait(expected: 2, timeoutMicros: 0)
+      c = m.atomicExchange(2, atByteOffset: 0)
+    }
+  }
+}
+
+fun mutexUnlock(m: RawPtr) {
+  let prev: Int = m.atomicExchange(0, atByteOffset: 0)
+  if prev == 2 {
+    m.futexWake(all: false)
+  }
+}
+
+fun enqueue(sched: RawPtr, fib: RawPtr) {
+  fib.store(RawPtr.null, toByteOffset: 176)
+  let tail: RawPtr = sched.load(fromByteOffset: 8)
+  if tail.isNull {
+    sched.store(fib, toByteOffset: 0)
+    sched.store(fib, toByteOffset: 8)
+  } else {
+    tail.store(fib, toByteOffset: 176)
+    sched.store(fib, toByteOffset: 8)
+  }
+}
+
+fun dequeue(sched: RawPtr) -> RawPtr {
+  let h: RawPtr = sched.load(fromByteOffset: 0)
+  if h.isNull {
+    return h
+  }
+  let nx: RawPtr = h.load(fromByteOffset: 176)
+  sched.store(nx, toByteOffset: 0)
+  if nx.isNull {
+    sched.store(RawPtr.null, toByteOffset: 8)
+  }
+  h.store(RawPtr.null, toByteOffset: 176)
+  return h
+}
+
+fun wakeCarrier(sched: RawPtr, all: Bool) {
+  let gw = sched.advanced(by: 24)
+  gw.atomicFetchAdd(1, atByteOffset: 0)
+  gw.futexWake(all: all)
+}
+
+// Raise the stop flag, wake idle carriers, and poke the poller awake by writing to the stop pipe.
+fun signalStop(sched: RawPtr) {
+  sched.atomicStore(1, toByteOffset: 40)
+  wakeCarrier(sched, true)
+  let stopW: Int = sched.load(fromByteOffset: 64)
+  let b = RawPtr.alloc(bytes: 8, align: 8)
+  b.store(1, toByteOffset: 0)
+  RawPtr.writeFd(fd: stopW, buf: b, count: 1)
+}
+
+fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+  let stack = RawPtr.alloc(bytes: 65536, align: 16)
+  let stackTop = stack.advanced(by: 65536)
+  let fib = RawPtr.alloc(bytes: 240, align: 16)
+  fib.store(0, toByteOffset: 168)
+  fib.store(RawPtr.null, toByteOffset: 176)
+  fib.store(entry, toByteOffset: 184)
+  fib.store(arg, toByteOffset: 192)
+  fib.store(sched, toByteOffset: 200)
+  fib.store(stack, toByteOffset: 208)
+  fib.store(RawPtr.null, toByteOffset: 216)
+  fib.store(RawPtr.null, toByteOffset: 224)
+  fib.store(RawPtr.null, toByteOffset: 232)
+  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberMain), arg: fib)
+  return fib
+}
+
+fun fiberSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+  let fib = fiberNew(sched, entry, arg)
+  mutexLock(sched.advanced(by: 16))
+  fib.store(0, toByteOffset: 168)
+  enqueue(sched, fib)
+  mutexUnlock(sched.advanced(by: 16))
+  wakeCarrier(sched, false)
+  return fib
+}
+
+fun unpark(sched: RawPtr, fib: RawPtr) {
+  mutexLock(sched.advanced(by: 16))
+  fib.store(0, toByteOffset: 168)
+  enqueue(sched, fib)
+  mutexUnlock(sched.advanced(by: 16))
+  wakeCarrier(sched, false)
+}
+
+// Wait for `fd` to become readable: register it with the kqueue (one-shot, stashing this fiber as udata)
+// and park, holding the scheduler lock across both so the poller cannot unpark us before our save.
+fun waitReadable(sched: RawPtr, fd: Int) {
+  let self = RawPtr.tlsGet()
+  let kq: Int = sched.load(fromByteOffset: 48)
+  let ch = RawPtr.alloc(bytes: 32, align: 8)
+  ch.store(fd, toByteOffset: 0)
+  ch.store(1179647, toByteOffset: 8)          // EVFILT_READ | (EV_ADD|EV_ONESHOT)<<16
+  ch.store(0, toByteOffset: 16)
+  ch.store(self, toByteOffset: 24)            // udata = this fiber
+  mutexLock(sched.advanced(by: 16))
+  RawPtr.kevent(kq: kq, changes: ch, nchanges: 1, events: RawPtr.null, nevents: 0)
+  self.store(2, toByteOffset: 168)
+  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
+  self.ctxSwitchTo(carrierCtx)
+  mutexUnlock(sched.advanced(by: 16))
+}
+
+fun fiberMain(fib: RawPtr) -> RawPtr {
+  let sched: RawPtr = fib.load(fromByteOffset: 200)
+  mutexUnlock(sched.advanced(by: 16))
+  let entry: RawPtr = fib.load(fromByteOffset: 184)
+  let arg: RawPtr = fib.load(fromByteOffset: 192)
+  let res = entry.callEntry(arg)
+  mutexLock(sched.advanced(by: 16))
+  fib.store(res, toByteOffset: 216)
+  fib.store(3, toByteOffset: 168)
+  let prev: Int = sched.atomicFetchAdd(-1, atByteOffset: 32)
+  if prev == 1 {
+    signalStop(sched)
+  }
+  let carrierCtx: RawPtr = fib.load(fromByteOffset: 232)
+  fib.ctxSwitchTo(carrierCtx)
+  return fib
+}
+
+fun schedLoop(sched: RawPtr, myCtx: RawPtr) {
+  mutexLock(sched.advanced(by: 16))
+  var go = true
+  while go {
+    let stp: Int = sched.atomicLoad(fromByteOffset: 40)
+    if stp != 0 {
+      go = false
+    } else {
+      let fib = dequeue(sched)
+      if fib.isNull {
+        let gw = sched.advanced(by: 24)
+        let gen: Int = gw.atomicLoad(fromByteOffset: 0)
+        mutexUnlock(sched.advanced(by: 16))
+        gw.futexWait(expected: gen, timeoutMicros: 1000000)
+        mutexLock(sched.advanced(by: 16))
+      } else {
+        fib.store(myCtx, toByteOffset: 232)
+        fib.store(1, toByteOffset: 168)
+        RawPtr.tlsSet(fib)
+        myCtx.ctxSwitchTo(fib)
+      }
+    }
+  }
+  mutexUnlock(sched.advanced(by: 16))
+}
+
+fun carrierMain(carg: RawPtr) -> RawPtr {
+  let sched: RawPtr = carg.load(fromByteOffset: 0)
+  let ctx: RawPtr = carg.load(fromByteOffset: 8)
+  schedLoop(sched, ctx)
+  return carg
+}
+
+// The poller thread: block in kevent(); on a ready fd, unpark the fiber in its udata; on the stop fd, exit.
+fun pollerMain(sched: RawPtr) -> RawPtr {
+  let kq: Int = sched.load(fromByteOffset: 48)
+  let stopR: Int = sched.load(fromByteOffset: 56)
+  let ev = RawPtr.alloc(bytes: 32, align: 8)
+  var go = true
+  while go {
+    let nr: Int = RawPtr.kevent(kq: kq, changes: RawPtr.null, nchanges: 0, events: ev, nevents: 1)
+    if nr > 0 {
+      let ident: Int = ev.load(fromByteOffset: 0)
+      if ident == stopR {
+        go = false
+      } else {
+        let f: RawPtr = ev.load(fromByteOffset: 24)
+        unpark(sched, f)
+      }
+    }
+  }
+  return sched
+}
+
+// ---- fiber body (not subset; via callEntry). Wait for our pipe to be readable, read the byte, add it. ----
+fun pollBody(arg: RawPtr) -> RawPtr {
+  let sched: RawPtr = arg.load(fromByteOffset: 0)
+  let rfd: Int = arg.load(fromByteOffset: 8)
+  let acc: RawPtr = arg.load(fromByteOffset: 24)
+  waitReadable(sched, rfd)
+  let buf = RawPtr.alloc(bytes: 8, align: 8)
+  RawPtr.readFd(fd: rfd, buf: buf, count: 1)
+  let byte: Int = buf.load(fromByteOffset: 0)
+  acc.atomicFetchAdd(byte, atByteOffset: 0)
+  return RawPtr.null
+}
+
+fun newSched() -> RawPtr {
+  let sched = RawPtr.alloc(bytes: 72, align: 8)
+  sched.store(RawPtr.null, toByteOffset: 0)
+  sched.store(RawPtr.null, toByteOffset: 8)
+  sched.store(0, toByteOffset: 16)
+  sched.store(0, toByteOffset: 24)
+  sched.store(0, toByteOffset: 32)
+  sched.store(0, toByteOffset: 40)
+  sched.store(0, toByteOffset: 48)
+  sched.store(0, toByteOffset: 56)
+  sched.store(0, toByteOffset: 64)
+  return sched
+}
+
+fun main() {
+  let carriers = 2
+  let n = 8
+  let sched = newSched()
+  sched.atomicStore(n, toByteOffset: 32)          // outstanding fibers
+
+  let kq = RawPtr.kqueue()
+  sched.store(kq, toByteOffset: 48)
+
+  // Stop pipe: read-end registered with the kqueue, write-end poked by signalStop.
+  let stopfds = RawPtr.alloc(bytes: 8, align: 8)
+  RawPtr.pipe(fds: stopfds)
+  let sboth: Int = stopfds.load(fromByteOffset: 0)
+  let stopR = sboth % 4294967296
+  let stopW = sboth / 4294967296
+  sched.store(stopR, toByteOffset: 56)
+  sched.store(stopW, toByteOffset: 64)
+  let sch = RawPtr.alloc(bytes: 32, align: 8)
+  sch.store(stopR, toByteOffset: 0)
+  sch.store(1179647, toByteOffset: 8)
+  sch.store(0, toByteOffset: 16)
+  sch.store(RawPtr.null, toByteOffset: 24)
+  RawPtr.kevent(kq: kq, changes: sch, nchanges: 1, events: RawPtr.null, nevents: 0)
+
+  let acc = RawPtr.alloc(bytes: 8, align: 8)
+  acc.atomicStore(0, toByteOffset: 0)
+  let body = RawPtr.ofFunc(pollBody)
+
+  // One pipe per fiber; remember the write-ends so main can trigger readiness.
+  let wfds = RawPtr.alloc(bytes: 8 * n, align: 8)
+  var i = 0
+  while i < n {
+    let fds = RawPtr.alloc(bytes: 8, align: 8)
+    RawPtr.pipe(fds: fds)
+    let both: Int = fds.load(fromByteOffset: 0)
+    let rfd = both % 4294967296
+    let wfd = both / 4294967296
+    wfds.store(wfd, toByteOffset: 8 * i)
+    let a = RawPtr.alloc(bytes: 32, align: 8)
+    a.store(sched, toByteOffset: 0)
+    a.store(rfd, toByteOffset: 8)
+    a.store(i + 1, toByteOffset: 16)
+    a.store(acc, toByteOffset: 24)
+    fiberSpawn(sched, body, a)
+    i = i + 1
+  }
+
+  // Start carriers + the poller thread.
+  let handles = RawPtr.alloc(bytes: 8 * carriers, align: 8)
+  var c = 0
+  while c < carriers {
+    let ctx = RawPtr.alloc(bytes: 168, align: 16)
+    let carg = RawPtr.alloc(bytes: 16, align: 8)
+    carg.store(sched, toByteOffset: 0)
+    carg.store(ctx, toByteOffset: 8)
+    let h = handles.advanced(by: 8 * c)
+    h.threadCreate(entry: RawPtr.ofFunc(carrierMain), arg: carg)
+    c = c + 1
+  }
+  let ph = RawPtr.alloc(bytes: 8, align: 8)
+  ph.threadCreate(entry: RawPtr.ofFunc(pollerMain), arg: sched)
+
+  // Give the fibers time to register + park, then make each pipe readable by writing its id.
+  let t0 = RawPtr.monotonicNanos()
+  var now = t0
+  while now - t0 < 30000000 {                     // ~30 ms
+    now = RawPtr.monotonicNanos()
+  }
+  var j = 0
+  while j < n {
+    let wfd: Int = wfds.load(fromByteOffset: 8 * j)
+    let msg = RawPtr.alloc(bytes: 8, align: 8)
+    msg.store(j + 1, toByteOffset: 0)             // the byte = this fiber's id
+    RawPtr.writeFd(fd: wfd, buf: msg, count: 1)
+    j = j + 1
+  }
+
+  var k = 0
+  while k < carriers {
+    let h = handles.advanced(by: 8 * k)
+    h.threadJoin()
+    k = k + 1
+  }
+  ph.threadJoin()
+
+  let sum: Int = acc.atomicLoad(fromByteOffset: 0)
+  print(sum)                                       // 36
+  print("\n")
+}

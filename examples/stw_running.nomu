@@ -1,0 +1,32 @@
+// Task 128.3.2 — self-hosted stop-the-world over actively-running mutators. Two workers spin in a busy
+// loop (hitting back-edge safepoint polls) holding a live Box across the loop; while they run, the forced
+// STW coordinator (NOMU_STW_SELFHOST) stops the world — each running worker parks at its next poll with a
+// user-frame anchor captured by the C poll shim — and runs the self-hosted pcsp walk (rtWalkFrom) over the
+// live-fiber registry, recovering {111, 222} with no libunwind. The C-plan STW (libunwind) on the same
+// shape is the differential oracle.
+class Box {
+  var v: Int
+}
+
+fun spin(n: Int) -> Int {
+  var i = 0
+  var acc = 0
+  while i < n {
+    acc = acc + (i % 7)
+    i = i + 1
+  }
+  return acc
+}
+
+fun worker(id: Int) -> Int {
+  let a = Box(v: id)
+  let j = spin(400000000)             // long busy loop; the STW stops it mid-loop at a back-edge poll
+  return a.v + (j % 1)                // a is live across the loop (used here)
+}
+
+fun main() {
+  spawn let x = worker(111)
+  spawn let y = worker(222)
+  print(x + y)                        // 333 — joins the workers (keeps main alive while they spin)
+  print("\n")
+}

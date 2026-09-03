@@ -306,6 +306,7 @@ public indirect enum ExprKind {
     case box(value: NOIRExpr, interfaces: [String])       // M5 A1.4/A1.5b: wrap a conformer as `any I` / `any A & B`
     case arrayLit(elements: [NOIRExpr])                   // [a, b, c] — build an Array<T>; `type` is `.array(T)` (M6)
     case index(base: NOIRExpr, idx: NOIRExpr)               // a[i] — array subscript read; `type` is the element T (M6)
+    case funcRef(name: String)                              // the C-ABI code address of a top-level non-capturing `fun` as a `RawPtr` (task 128.2, RawPtr.ofFunc). A runtime-tier primitive for handing an entry point to the asm floor / pthread_create; not first-class functions (task 128 note).
 }
 
 public struct NOIRArg {

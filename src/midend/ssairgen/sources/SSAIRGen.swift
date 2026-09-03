@@ -61,7 +61,7 @@ struct ModuleContext {
     }
 }
 
-public func lowerToSSAIR(_ module: NOIRModule) -> SSAGenResult {
+public func lowerToSSAIR(_ module: NOIRModule, subsetFuncs: Set<String> = []) -> SSAGenResult {
     let diags = DiagnosticSink()
     var structFields: [String: [NOIRField]] = [:]
     var classFields: [String: [NOIRField]] = [:]
@@ -95,16 +95,16 @@ public func lowerToSSAIR(_ module: NOIRModule) -> SSAGenResult {
     for decl in module.decls {
         switch decl {
         case .funcDecl(let f):
-            let lowerer = FunctionLowerer(diags: diags, ctx: ctx, sink: sink)
+            let lowerer = FunctionLowerer(diags: diags, ctx: ctx, sink: sink, subsetFuncs: subsetFuncs)
             if let fn = lowerer.lower(f) { functions.append(fn) }
-        case .structDecl(let s): lowerMethods(s.name, .struct_, s.methods, ctx, diags, sink, &functions)
-        case .enumDecl(let e):   lowerMethods(e.name, .enum_, e.methods, ctx, diags, sink, &functions)
-        case .classDecl(let c):  lowerMethods(c.name, .class_, c.methods, ctx, diags, sink, &functions)
+        case .structDecl(let s): lowerMethods(s.name, .struct_, s.methods, ctx, diags, sink, subsetFuncs, &functions)
+        case .enumDecl(let e):   lowerMethods(e.name, .enum_, e.methods, ctx, diags, sink, subsetFuncs, &functions)
+        case .classDecl(let c):  lowerMethods(c.name, .class_, c.methods, ctx, diags, sink, subsetFuncs, &functions)
         case .actorDecl(let a):
             // Each `on`-handler lowers like a mutating method with an actor (reference) `self`.
             let handlers = a.handlers.map { NOIRFunc(name: $0.name, params: $0.params, returnType: $0.returnType,
                                                      body: $0.body, isMutating: true, span: $0.span) }
-            lowerMethods(a.name, .actor_, handlers, ctx, diags, sink, &functions)
+            lowerMethods(a.name, .actor_, handlers, ctx, diags, sink, subsetFuncs, &functions)
         }
     }
     functions += sink.lifted   // the lifted closure bodies
@@ -134,9 +134,9 @@ private func field(_ f: NOIRField) -> SSAField { SSAField(name: f.name, type: f.
 
 private func lowerMethods(_ typeName: String, _ kind: NamedKind, _ methods: [NOIRFunc],
                           _ ctx: ModuleContext, _ diags: DiagnosticSink, _ sink: ClosureSink,
-                          _ out: inout [SSAFunction]) {
+                          _ subsetFuncs: Set<String>, _ out: inout [SSAFunction]) {
     for m in methods {
-        let lowerer = FunctionLowerer(diags: diags, ctx: ctx, sink: sink)
+        let lowerer = FunctionLowerer(diags: diags, ctx: ctx, sink: sink, subsetFuncs: subsetFuncs)
         if let fn = lowerer.lowerMethod(typeName: typeName, kind: kind, m) { out.append(fn) }
     }
 }
@@ -189,8 +189,8 @@ private func collectUsesStmt(_ stmt: NOIRStmt, _ bound: inout Set<String>, _ use
 
 private func collectUsesExpr(_ e: NOIRExpr, _ bound: Set<String>, _ used: inout [String]) {
     switch e.kind {
-    case .intLit, .doubleLit, .boolLit, .stringLit:
-        break
+    case .intLit, .doubleLit, .boolLit, .stringLit, .funcRef:
+        break                              // funcRef names a top-level function, not a captured local
     case .varRef(let n):
         if !bound.contains(n) { used.append(n) }
     case .fieldAccess(let base, _):
@@ -226,6 +226,7 @@ final class FunctionLowerer {
     private let diags: DiagnosticSink
     private let ctx: ModuleContext
     private let sink: ClosureSink
+    private let subsetFuncs: Set<String>   // task 149 — runtime-subset designation, by source name
 
     // Block storage under construction. A block is terminated once `term` is set; further statements
     // in a straight-line list are then skipped (dead).
@@ -272,10 +273,11 @@ final class FunctionLowerer {
     private struct SelfCtx { let typeName: String; let kind: NamedKind; let fields: [NOIRField] }
     private var currentSelf: SelfCtx?
 
-    init(diags: DiagnosticSink, ctx: ModuleContext, sink: ClosureSink) {
+    init(diags: DiagnosticSink, ctx: ModuleContext, sink: ClosureSink, subsetFuncs: Set<String> = []) {
         self.diags = diags
         self.ctx = ctx
         self.sink = sink
+        self.subsetFuncs = subsetFuncs
         self.lastSpan = Span(startOffset: 0, endOffset: 0, map: nil)
     }
 
@@ -340,7 +342,8 @@ final class FunctionLowerer {
         let blocks = finalize(returnType: f.returnType)
         if diags.hasErrors { return nil }
         return SSAFunction(name: name, params: params, returnType: f.returnType,
-                           blocks: blocks, isMutating: f.isMutating, span: f.span)
+                           blocks: blocks, isMutating: f.isMutating, span: f.span,
+                           noSafepoint: subsetFuncs.contains(f.name))
     }
 
     // MARK: Builder primitives
@@ -520,7 +523,7 @@ final class FunctionLowerer {
 
         // Lift `spawn:N(env) -> resultType { return value }`.
         let startName = "spawn:\(id)"
-        let child = FunctionLowerer(diags: diags, ctx: ctx, sink: sink)
+        let child = FunctionLowerer(diags: diags, ctx: ctx, sink: sink, subsetFuncs: subsetFuncs)
         let body = [NOIRStmt(kind: .ret(value), span: span)]
         if let lifted = child.lowerClosureBody(name: startName, envType: envType,
                                                captures: caps.map { ($0.name, $0.value.type) },
@@ -673,6 +676,12 @@ final class FunctionLowerer {
 
         case .closure(let params, let body):
             return lowerClosure(params: params, body: body, type: e.type, span: e.span)
+
+        case .funcRef(let name):
+            // A top-level function's C-ABI code address as a RawPtr (task 128.2). No operands; the egress
+            // resolves the symbol. A runtime-tier primitive (the asm floor / pthread_create entry), not
+            // first-class functions.
+            return emit(.funcAddr(name), e.type, e.span)
         }
     }
 

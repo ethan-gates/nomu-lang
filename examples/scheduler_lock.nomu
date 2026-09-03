@@ -1,0 +1,359 @@
+// Task 128.1.4 · MT-safe run queue under a self-hosted futex mutex + the lock-handoff park protocol,
+// written in Nomu over the scheduler substrate (raw memory + atomics + the futex + the asm context
+// switch). This is the 128.1.3 single-carrier scheduler with one mechanism added: a single scheduler
+// lock (`Mutex`, a 3-state futex word) held across every fiber↔scheduler switch, so the run queue is
+// safe for multiple producers/consumers and a waker can never re-queue a fiber whose context is still
+// saving (the lost-wakeup / re-queue-mid-save race — concurrency.md §2 "lock-coupled park"). Still exercised single-carrier here
+// (the lock is uncontended, so the futex slow path never fires); 128.1.5 puts a second OS thread on the
+// queue where the lock actually contends.
+//
+// The lock protocol (mirrors the C `rt_queue_mu` handoff):
+//   • the scheduler switches into a fiber with the lock HELD;
+//   • a fiber releases it only after switch-in (mutexUnlock at the resume point), then runs lock-free;
+//   • to suspend, a fiber re-acquires the lock and switches back to the carrier while holding it, so its
+//     context is fully saved before any other context (which must hold the same lock to enqueue) can
+//     make it runnable.
+// So the lock is continuously held across the carrier↔fiber boundary; user fiber bodies run with it free.
+//
+// Off-heap layouts (byte offsets):
+//   Sched (40B):  0 carrierCtx · 8 runq-head · 16 runq-tail · 24 current · 32 mutex-word
+//   Fiber (240B): 0..167 context buffer · 168 state · 176 next · 184 entry · 192 arg
+//                 · 200 sched · 208 stackBase · 216 result · 224 joiner
+//   state: 0 ready · 1 running · 2 parked · 3 done
+//   mutex-word: 0 unlocked · 1 locked (no waiters) · 2 locked (waiters may exist)
+//
+// Four scenarios, one line each:
+//   1. three fibers each add to a shared accumulator; run to completion → 6      (queue under the lock)
+//   2. a park/unpark handoff between two fibers                          → 111    (lock-coupled park)
+//   3. join: one fiber computes a value, another joins and reads it      → 42     (join under the lock)
+//   4. a parking-heavy relay: two fibers bounce a token 1000 rounds each  → 2000   (park stress)
+// Checked by tools/scheduler-lock.sh.
+
+// ---- Mutex: a 3-state futex word (Drepper "mutex1"). Uncontended fast path is a single CAS; the
+// slow path parks in the kernel on the futex. `m` is the address of an 8-byte word (low 32 bits are the
+// futex value the kernel compares). Subset-legal — only atomics + the futex. ----
+
+fun mutexLock(m: RawPtr) {
+  var c: Int = m.atomicCas(0, 1, atByteOffset: 0)      // 0 → 1: take the uncontended lock
+  if c != 0 {
+    if c != 2 {
+      c = m.atomicExchange(2, atByteOffset: 0)         // mark contended, learn the prior state
+    }
+    while c != 0 {
+      m.futexWait(expected: 2, timeoutMicros: 0)       // 0 = wait indefinitely
+      c = m.atomicExchange(2, atByteOffset: 0)
+    }
+  }
+}
+
+fun mutexUnlock(m: RawPtr) {
+  let prev: Int = m.atomicExchange(0, atByteOffset: 0) // release
+  if prev == 2 {
+    m.futexWake(all: false)                            // waiters possible → wake one
+  }
+}
+
+// ---- run queue (intrusive singly-linked, head at 8 / tail at 16). Only ever touched with the scheduler
+// lock held, so the plain stores are safe. ----
+
+fun enqueue(sched: RawPtr, fib: RawPtr) {
+  fib.store(RawPtr.null, toByteOffset: 176)
+  let tail: RawPtr = sched.load(fromByteOffset: 16)
+  if tail.isNull {
+    sched.store(fib, toByteOffset: 8)
+    sched.store(fib, toByteOffset: 16)
+  } else {
+    tail.store(fib, toByteOffset: 176)
+    sched.store(fib, toByteOffset: 16)
+  }
+}
+
+fun dequeue(sched: RawPtr) -> RawPtr {
+  let h: RawPtr = sched.load(fromByteOffset: 8)
+  if h.isNull {
+    return h
+  }
+  let nx: RawPtr = h.load(fromByteOffset: 176)
+  sched.store(nx, toByteOffset: 8)
+  if nx.isNull {
+    sched.store(RawPtr.null, toByteOffset: 16)
+  }
+  h.store(RawPtr.null, toByteOffset: 176)
+  return h
+}
+
+// The carrier loop: hold the lock, switch into each ready fiber with it held; regain control (still
+// holding it) when the fiber parks or completes; take the next. Drops the lock only when the queue drains.
+fun schedRun(sched: RawPtr) {
+  mutexLock(sched.advanced(by: 32))
+  var go = true
+  while go {
+    let fib = dequeue(sched)
+    if fib.isNull {
+      go = false
+    } else {
+      sched.store(fib, toByteOffset: 24)
+      fib.store(1, toByteOffset: 168)
+      let carrierCtx: RawPtr = sched.load(fromByteOffset: 0)
+      carrierCtx.ctxSwitchTo(fib)          // switch in holding the lock; resumes here holding it
+    }
+  }
+  mutexUnlock(sched.advanced(by: 32))
+}
+
+// The fiber trampoline (every fiber's seeded entry). It resumes with the lock held (the carrier switched
+// in holding it), so it releases the lock before running the user body, then re-acquires it to record
+// completion and switch back to the carrier — the same "release after switch-in, hold across the save"
+// shape as park.
+fun fiberMain(fib: RawPtr) -> RawPtr {
+  let sched: RawPtr = fib.load(fromByteOffset: 200)
+  mutexUnlock(sched.advanced(by: 32))      // release after switch-in
+  let entry: RawPtr = fib.load(fromByteOffset: 184)
+  let arg: RawPtr = fib.load(fromByteOffset: 192)
+  let res = entry.callEntry(arg)           // user body, lock-free
+  mutexLock(sched.advanced(by: 32))        // re-acquire to complete
+  fib.store(res, toByteOffset: 216)
+  fib.store(3, toByteOffset: 168)
+  let joiner: RawPtr = fib.load(fromByteOffset: 224)
+  if joiner.isNull {
+  } else {
+    unparkLocked(sched, joiner)            // already holding the lock
+  }
+  let carrierCtx: RawPtr = sched.load(fromByteOffset: 0)
+  fib.ctxSwitchTo(carrierCtx)              // switch back holding the lock
+  return fib
+}
+
+// Allocate + seed a fresh fiber (stack, handle, fiberInit); leaves state/queue to the caller.
+fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+  let stack = RawPtr.alloc(bytes: 65536, align: 16)
+  let stackTop = stack.advanced(by: 65536)
+  let fib = RawPtr.alloc(bytes: 240, align: 16)
+  fib.store(0, toByteOffset: 168)
+  fib.store(RawPtr.null, toByteOffset: 176)
+  fib.store(entry, toByteOffset: 184)
+  fib.store(arg, toByteOffset: 192)
+  fib.store(sched, toByteOffset: 200)
+  fib.store(stack, toByteOffset: 208)
+  fib.store(RawPtr.null, toByteOffset: 216)
+  fib.store(RawPtr.null, toByteOffset: 224)
+  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberMain), arg: fib)
+  return fib
+}
+
+// Spawn runnable: enqueue under the lock (a producer, so it takes the lock like any other).
+fun fiberSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+  let fib = fiberNew(sched, entry, arg)
+  mutexLock(sched.advanced(by: 32))
+  fib.store(0, toByteOffset: 168)
+  enqueue(sched, fib)
+  mutexUnlock(sched.advanced(by: 32))
+  return fib
+}
+
+// Spawn parked: created but not enqueued (state parked). Becomes runnable only on the first unpark. Used
+// by the relay stress so exactly one of the two fibers is runnable at any moment.
+fun fiberSpawnParked(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+  let fib = fiberNew(sched, entry, arg)
+  fib.store(2, toByteOffset: 168)
+  return fib
+}
+
+// Suspend the current fiber (caller already holds the lock): mark parked, switch to the carrier while
+// holding the lock (so the save completes before any waker can re-queue us), and release the lock when
+// we are switched back in.
+fun parkLocked(sched: RawPtr) {
+  let fib: RawPtr = sched.load(fromByteOffset: 24)
+  fib.store(2, toByteOffset: 168)
+  let carrierCtx: RawPtr = sched.load(fromByteOffset: 0)
+  fib.ctxSwitchTo(carrierCtx)              // save context holding the lock; switch to carrier
+  mutexUnlock(sched.advanced(by: 32))      // resumed → release after switch-in
+}
+
+// Suspend the current fiber (caller does not hold the lock): acquire it, then park lock-coupled.
+fun park(sched: RawPtr) {
+  mutexLock(sched.advanced(by: 32))
+  parkLocked(sched)
+}
+
+fun unparkLocked(sched: RawPtr, fib: RawPtr) {
+  fib.store(0, toByteOffset: 168)
+  enqueue(sched, fib)
+}
+
+fun unpark(sched: RawPtr, fib: RawPtr) {
+  mutexLock(sched.advanced(by: 32))
+  unparkLocked(sched, fib)
+  mutexUnlock(sched.advanced(by: 32))
+}
+
+// Await another fiber: hold the lock across the state check and joiner registration so a concurrent
+// completion cannot slip a wakeup between them, then park lock-coupled. Returns the target's result.
+fun joinFiber(sched: RawPtr, target: RawPtr) -> RawPtr {
+  mutexLock(sched.advanced(by: 32))
+  let st: Int = target.load(fromByteOffset: 168)
+  if st == 3 {
+    mutexUnlock(sched.advanced(by: 32))
+  } else {
+    let me: RawPtr = sched.load(fromByteOffset: 24)
+    target.store(me, toByteOffset: 224)
+    parkLocked(sched)                      // releases the lock when we resume
+  }
+  return target.load(fromByteOffset: 216)
+}
+
+// ---- fiber bodies (not subset; run through callEntry) ----
+
+fun addBody(arg: RawPtr) -> RawPtr {
+  let accP: RawPtr = arg.load(fromByteOffset: 0)
+  let amt: Int = arg.load(fromByteOffset: 8)
+  let cur: Int = accP.load(fromByteOffset: 0)
+  accP.store(cur + amt, toByteOffset: 0)
+  return RawPtr.null
+}
+
+fun parkBody(arg: RawPtr) -> RawPtr {
+  let accP: RawPtr = arg.load(fromByteOffset: 0)
+  let sched: RawPtr = arg.load(fromByteOffset: 8)
+  let c1: Int = accP.load(fromByteOffset: 0)
+  accP.store(c1 + 10, toByteOffset: 0)
+  park(sched)
+  let c2: Int = accP.load(fromByteOffset: 0)
+  accP.store(c2 + 100, toByteOffset: 0)
+  return RawPtr.null
+}
+
+fun unparkBody(arg: RawPtr) -> RawPtr {
+  let accP: RawPtr = arg.load(fromByteOffset: 0)
+  let sched: RawPtr = arg.load(fromByteOffset: 8)
+  let other: RawPtr = arg.load(fromByteOffset: 16)
+  let c: Int = accP.load(fromByteOffset: 0)
+  accP.store(c + 1, toByteOffset: 0)
+  unpark(sched, other)
+  return RawPtr.null
+}
+
+fun computeBody(arg: RawPtr) -> RawPtr {
+  let r = RawPtr.alloc(bytes: 8, align: 8)
+  r.store(42, toByteOffset: 0)
+  return r
+}
+
+fun joinBody(arg: RawPtr) -> RawPtr {
+  let accP: RawPtr = arg.load(fromByteOffset: 0)
+  let sched: RawPtr = arg.load(fromByteOffset: 8)
+  let target: RawPtr = arg.load(fromByteOffset: 16)
+  let res: RawPtr = joinFiber(sched, target)
+  let v: Int = res.load(fromByteOffset: 0)
+  let cur: Int = accP.load(fromByteOffset: 0)
+  accP.store(cur + v, toByteOffset: 0)
+  return RawPtr.null
+}
+
+// Relay body: for `rounds` iterations, add 1, hand the token to the partner (unpark it), then park to
+// wait for the token back. arg: [0] acc · [8] sched · [16] partner handle · [24] rounds.
+fun relayBody(arg: RawPtr) -> RawPtr {
+  let accP: RawPtr = arg.load(fromByteOffset: 0)
+  let sched: RawPtr = arg.load(fromByteOffset: 8)
+  let other: RawPtr = arg.load(fromByteOffset: 16)
+  let rounds: Int = arg.load(fromByteOffset: 24)
+  var i = 0
+  while i < rounds {
+    let cur: Int = accP.load(fromByteOffset: 0)
+    accP.store(cur + 1, toByteOffset: 0)
+    unpark(sched, other)
+    park(sched)
+    i = i + 1
+  }
+  return RawPtr.null
+}
+
+fun newSched() -> RawPtr {
+  let sched = RawPtr.alloc(bytes: 40, align: 8)
+  let carrierCtx = RawPtr.alloc(bytes: 168, align: 16)
+  sched.store(carrierCtx, toByteOffset: 0)
+  sched.store(RawPtr.null, toByteOffset: 8)
+  sched.store(RawPtr.null, toByteOffset: 16)
+  sched.store(RawPtr.null, toByteOffset: 24)
+  sched.store(0, toByteOffset: 32)              // mutex-word: unlocked
+  return sched
+}
+
+fun main() {
+  // Scenario 1 — three fibers each add to a shared accumulator.
+  let s1 = newSched()
+  let acc1 = RawPtr.alloc(bytes: 8, align: 8)
+  acc1.store(0, toByteOffset: 0)
+  let body = RawPtr.ofFunc(addBody)
+  let a1 = RawPtr.alloc(bytes: 16, align: 8)
+  a1.store(acc1, toByteOffset: 0)
+  a1.store(1, toByteOffset: 8)
+  let a2 = RawPtr.alloc(bytes: 16, align: 8)
+  a2.store(acc1, toByteOffset: 0)
+  a2.store(2, toByteOffset: 8)
+  let a3 = RawPtr.alloc(bytes: 16, align: 8)
+  a3.store(acc1, toByteOffset: 0)
+  a3.store(3, toByteOffset: 8)
+  fiberSpawn(s1, body, a1)
+  fiberSpawn(s1, body, a2)
+  fiberSpawn(s1, body, a3)
+  schedRun(s1)
+  let total1: Int = acc1.load(fromByteOffset: 0)
+  print(total1)
+  print("\n")
+
+  // Scenario 2 — park/unpark handoff. P adds 10 then parks; Q adds 1 then unparks P; P resumes, adds 100.
+  let s2 = newSched()
+  let acc2 = RawPtr.alloc(bytes: 8, align: 8)
+  acc2.store(0, toByteOffset: 0)
+  let pArg = RawPtr.alloc(bytes: 16, align: 8)
+  pArg.store(acc2, toByteOffset: 0)
+  pArg.store(s2, toByteOffset: 8)
+  let pFib = fiberSpawn(s2, RawPtr.ofFunc(parkBody), pArg)
+  let qArg = RawPtr.alloc(bytes: 24, align: 8)
+  qArg.store(acc2, toByteOffset: 0)
+  qArg.store(s2, toByteOffset: 8)
+  qArg.store(pFib, toByteOffset: 16)
+  fiberSpawn(s2, RawPtr.ofFunc(unparkBody), qArg)
+  schedRun(s2)
+  let total2: Int = acc2.load(fromByteOffset: 0)
+  print(total2)
+  print("\n")
+
+  // Scenario 3 — join. C computes 42; D joins C and adds the result to the accumulator.
+  let s3 = newSched()
+  let acc3 = RawPtr.alloc(bytes: 8, align: 8)
+  acc3.store(0, toByteOffset: 0)
+  let cFib = fiberSpawn(s3, RawPtr.ofFunc(computeBody), RawPtr.null)
+  let dArg = RawPtr.alloc(bytes: 24, align: 8)
+  dArg.store(acc3, toByteOffset: 0)
+  dArg.store(s3, toByteOffset: 8)
+  dArg.store(cFib, toByteOffset: 16)
+  fiberSpawn(s3, RawPtr.ofFunc(joinBody), dArg)
+  schedRun(s3)
+  let total3: Int = acc3.load(fromByteOffset: 0)
+  print(total3)
+  print("\n")
+
+  // Scenario 4 — parking-heavy relay. A starts runnable, B starts parked; they bounce a token, each
+  // adding 1 per round. 1000 rounds each → 2000 park/unpark cycles across the lock-coupled path.
+  let s4 = newSched()
+  let acc4 = RawPtr.alloc(bytes: 8, align: 8)
+  acc4.store(0, toByteOffset: 0)
+  let aArg = RawPtr.alloc(bytes: 32, align: 8)
+  let bArg = RawPtr.alloc(bytes: 32, align: 8)
+  aArg.store(acc4, toByteOffset: 0)
+  aArg.store(s4, toByteOffset: 8)
+  aArg.store(1000, toByteOffset: 24)
+  bArg.store(acc4, toByteOffset: 0)
+  bArg.store(s4, toByteOffset: 8)
+  bArg.store(1000, toByteOffset: 24)
+  let aFib = fiberSpawn(s4, RawPtr.ofFunc(relayBody), aArg)
+  let bFib = fiberSpawnParked(s4, RawPtr.ofFunc(relayBody), bArg)
+  aArg.store(bFib, toByteOffset: 16)
+  bArg.store(aFib, toByteOffset: 16)
+  schedRun(s4)
+  let total4: Int = acc4.load(fromByteOffset: 0)
+  print(total4)
+  print("\n")
+}

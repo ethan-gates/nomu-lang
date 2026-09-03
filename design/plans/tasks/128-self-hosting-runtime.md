@@ -76,9 +76,88 @@ while moving location, then change the algorithm inside the self-hosted runtime 
 The parts this task owns directly (the delegated prerequisites 125/149/150/127 keep their own numbers):
 
 - **128.1 — M:N scheduler in Nomu.** Replace the C/pthread scheduler (run queue, carriers, fibers,
-  safepoints) with a self-hosted one under the 149 subset.
+  safepoints) with a self-hosted one under the 149 subset. **Full plan:
+  [`internals/selfhosted-scheduler.md`](../../internals/selfhosted-scheduler.md).** Two framing decisions
+  (agreed with Ethan): **full scheduler now** (replace the entire C scheduler before returning to GenImmix,
+  not a minimal substrate) and **raw syscalls + atomics** (no pthread/libc floor; the aggressive end of
+  `runtime.md` §4's no-libc question). Climbed as a rung ladder, `NOMU_SCHED=nomu`-selectable, C scheduler
+  as the differential oracle — the same method as the GC ladder (150):
+  - **128.1.1** — atomics + raw-syscall substrate (the scheduler's analog of 125): atomic intrinsics,
+    thread create / futex / clock / poller / TLS. On macOS each OS entry is a `libSystem` extern emitted by
+    codegen (not an `svc` stub — Darwin's raw syscall ABI is unstable; the `svc` floor is Linux-only, plan
+    §3.3). Also lands 149's poll-suppression slice (pull-forward, plan §4). *Codegen-only substrate —
+    complete:* atomics, poll-suppression, the monotonic clock (`RawPtr.monotonicNanos()`), and the futex
+    (`RawPtr.futexWait`/`futexWake` → `__ulock_*`) are built and green. Raw thread-create + the two-thread
+    futex ping-pong moved to 128.1.2 (they couple to the asm floor / carrier callback).
+  - **128.1.2** — single-fiber context round-trip (the `rtSwitch`/`rtFiberInit` asm floor) + carrier
+    thread-create (`pthread_create`, the stable macOS floor — not raw `bsdthread_create`) and the
+    two-thread futex ping-pong. *Core built:* the Nomu-driven fiber round-trip (`tools/fiberswitch.sh`)
+    and the two-thread ping-pong (`tools/pingpong.sh`), on the `RawPtr.ofFunc` function-address primitive
+    (a runtime-tier code pointer; full first-class functions are deferred to
+    [152](152-first-class-functions.md)) plus `ctxSwitchTo`/`fiberInit`/`threadCreate`/`threadJoin`.
+    *Remaining:* the run queue proper (128.1.3) and a formal diff against the C `swapcontext` oracle.
+  - **128.1.3** — single-carrier run queue + spawn / park / unpark / join. *Built:* a Nomu scheduler loop
+    over the substrate (intrusive run queue, `fiberSpawn`, the `fiberMain` completion trampoline, `park` /
+    `unpark` / `joinFiber`), subset-legal, on the new `RawPtr.callEntry` indirect-call primitive. Three
+    scenarios green — spawn/run/complete, park/unpark, join (`tools/scheduler.sh`). Deferred: freeing
+    fiber handles/stacks (128.1.6), permit/lock-coupled park (128.1.4), a formal C-oracle byte-diff.
+  - **128.1.4** — mutex over futex + MT-safe run queue + lock-handoff park. *Built:* a self-hosted `Mutex`
+    (3-state futex word, Drepper "mutex1") is the single scheduler lock; the run queue moves under it, and
+    the lock-coupled park protocol (`concurrency.md` §2, M6 6.4) is threaded through every fiber↔scheduler
+    switch — held across the switch, released after switch-in, re-acquired to suspend, so no waker re-queues
+    a fiber mid-save. Added `RawPtr.atomicExchange` (the mutex swap). Four scenarios green incl. a 2000-cycle
+    parking-heavy relay (`tools/scheduler-lock.sh`), subset-legal, GC-independent, watchdogged. Still
+    single-carrier (uncontended); real contention arrives at 128.1.5.
+  - **128.1.5** — multi-carrier + idle sleep + cross-thread wake. *Built (wake-on-push half):* N carrier
+    OS threads (`threadCreate`) drain one shared MT-safe queue; an idle carrier sleeps in `futexWait` on a
+    wake-generation word and is woken when a producer bumps it + `futexWake`s; an atomic outstanding-fiber
+    counter drives a stop broadcast for clean shutdown. First rung where the mutex genuinely contends
+    (main vs carriers → the `__ulock_wait` slow path). Sum-of-atomic-accumulator = 600 across 4 carriers,
+    NoGC-only, looped + watchdogged (`tools/scheduler-mc.sh`). *Deferred to after 128.1.6:* cross-thread
+    fiber PARK/UNPARK (self-park needs thread-local `rt_current`), where the M6 6.4 race reproduces.
+  - **128.1.6** — carrier-local state (TLS) + live-fiber registry. *Built:* `rt_current` in a
+    `_Thread_local` slot (macOS floor; `RawPtr.tlsGet`/`tlsSet`) gives an argument-free `park()`, which
+    unblocks the cross-thread park/unpark stress deferred from 128.1.5 — 16 token-pair rings × 4 carriers
+    with a **lock-coupled hand-off** (make partner runnable + park self under one lock hold), budget
+    claimed exactly once (=2000), clean 300× (`tools/scheduler-tls.sh`); the M6 6.4 race reproduced and
+    closed. The intrusive live-fiber registry (O(1) insert/remove, iterate) is built + tested in isolation
+    (`tools/fiber-registry.sh`); 128.3.2 drives its iteration from a real STW.
+  - **128.1.7** — wakeup feeders: timer heap + I/O poller. *Built (both):* a Nomu min-heap + timer thread
+    (deadlines woke in order, `tools/scheduler-timer.sh`) and a kqueue poller thread (8 fibers parked on fd
+    readiness, unparked via kevent udata, `tools/scheduler-poller.sh`), each with the 6.4 handoff spanning
+    feeder ↔ scheduler and a self-pipe / futex for shutdown. New substrate: `RawPtr.kqueue`/`kevent`/`pipe`/
+    `readFd`/`writeFd` (libSystem externs). Blocking-syscall offload stays deferred.
+  - **128.1.8** — actor mailbox + mailbox-fiber pool. *Built:* self-hosted `actorSend` + MT-safe FIFO
+    mailbox + global scheduled-mailbox queue + the single-drain invariant + a capped pool of reusable
+    mailbox fibers (free-list park, dispatch-or-create-to-cap) + drain-to-quiescence shutdown
+    (`examples/scheduler_actor.nomu`, `tools/scheduler-actor.sh`). 8 actors × 50 msgs drained FIFO by ≤4
+    reused fibers, handled=400 errors=0, clean 250×. The drain loop is plain Nomu (off-heap messages, no
+    GC roots to track, unlike the codegen-emitted C loop). The M6 pthread-mutex actor is retired.
+  - **128.1.9** — integration: the self-hosted scheduler runs real user programs behind `NOMU_SCHED=nomu`.
+    *Built.* The 128.1.x rungs each proved one mechanism as a standalone NoGC-only fixture that builds its
+    own raw carriers; none was yet the process scheduler for a GC-registered user program. This rung
+    consolidates the machinery (mutex, MT run queue, carriers + idle wake, `rt_current` TLS, lock-coupled
+    park, timer heap + timer thread, actor mailbox + capped mailbox-fiber pool) into one canonical scheduler
+    in `src/stdlib/runtime.nomu` (the runtime-subset prelude) — `rtSched*` helpers + C-callable `nomuSched*`
+    entries under a canonical Sched(256B)/Fiber(288B) layout — and makes `fiber_spawn` / `spawn_join` /
+    `rt_sleep_ms` / `rt_actor_send` / `rt_mailbox_pop` and `main` dispatch on an `rt_sched_plan` global
+    (`NOMU_SCHED=nomu` vs the default C path, codegen unchanged). Real user programs run on self-hosted
+    carrier pthreads that poll at real safepoints; the actor drain reuses the codegen-emitted
+    `nomu_actor_drain` as the mailbox-fiber body (weak fallback for actor-less programs). Scope (option C):
+    **NoGC** — a real stop-the-world over these carriers saving a Nomu-readable context is 128.3.2; GC
+    coupling here is just lazy per-carrier mutator binding (`rt_gc_alloc`). Diffed against the C scheduler
+    on real spawn/join, sleep, and actor programs at 1 and 4 carriers (`tools/sched-integration.sh`, green);
+    all 23 pre-existing drivers stay green. The kqueue poller + live-fiber registry are not consolidated yet
+    (no NoGC user surface for the poller; the registry lands with 128.3.2, which drives its STW iteration).
+
+  Terminal rung is **128.3.2** (below) — the STW-over-all-mutators integration that unblocks GenImmix,
+  driven over the production carriers 128.1.9 wires in.
 - **128.2 — Per-arch bootstrap assembly floor.** The irreducible asm: context switch, thread/TLS/stack
-  setup, the entry sequence before collector + scheduler are live.
+  setup, the entry sequence before collector + scheduler are live. *Built (arm64):* `rtSwitch` +
+  `rtFiberInit` + trampoline in `src/runtime/embedded/rtasm_arm64.s`, embedded in nomuc and archived into
+  `libnomuruntime.a`, isolation-tested via a C round-trip harness reached as `RawPtr.asmSelfTest()`
+  (`tools/asmswitch.sh`). x86-64 deferred (no x86 machine yet); `rtTLSGet`/`svc rtSyscall` not yet needed
+  on the macOS path.
 - **128.3 — Full-runtime root-scanning integration (inherited from 150).** The GC ladder proves the
   collector's marking/tracing/fingerprint and the current-stack pcsp walk hosted on the existing C
   scheduler (150.2, `selfhosted-gc.md` §9). The remaining root-scanning pieces couple to the
@@ -109,9 +188,21 @@ The parts this task owns directly (the delegated prerequisites 125/149/150/127 k
       before `main` reads it (`examples/sched_root.nomu` + `tools/sched-root.sh`). With this, root scanning is
       complete for all three source shapes buildable now — live stack, saved/parked context, and global —
       leaving only 128.3.2 (STW-over-all-mutators integration, blocked on 128.1).
-  - **128.3.2 — STW-over-all-mutators walk integration.** Drive the self-hosted walk at a real
-    stop-the-world across every live mutator (each running carrier's saved safepoint context + carrier
-    enumeration), standing in for the C libunwind walk the MMTk binding calls today. Needs 128.1.
+  - **128.3.2 — STW-over-all-mutators walk integration.** *Built.* A real stop-the-world across the
+    128.1.9 self-hosted carriers, each stopped mutator's roots recovered by the self-hosted pcsp walk
+    (`rtWalkFrom`) with no libunwind — standing in for the C libunwind walk the MMTk binding calls today.
+    The anchor for the walk is the **user frame** (where the return address is a statepoint `rtWalkFrom` can
+    match), captured in the C dispatch shims (`spawn_join`/`rt_sleep_ms`/`__nomu_gc_poll_slow`) via
+    `__builtin_return_address(0)`/`__builtin_frame_address(0)+16` — a direct immediate-caller read, the same
+    caller-frame math `rtCollectRoots` uses, not libunwind/CFI. A running mutator is stopped at a safepoint
+    poll (`nomuSchedSafepoint`, fiber state 4); the STW handshake is a request flag + ack-count-vs-carrier-
+    total + resume futex in the `Sched`, driven by a plain coordinator thread. `nomuSchedWalkParked`
+    iterates the live-fiber registry (128.1.6, consolidated here) and walks each stopped fiber's anchor.
+    Forced-STW smoke `tools/stw-selfhost.sh`: busy-loop workers stopped mid-run + a sleep-parked fiber both
+    recover `{111,222}` at 2 and 4 carriers, matching the C libunwind STW oracle (`NOMU_GC_STW_SMOKE`); dead
+    roots excluded. All 25 drivers green. A live MMTk collection driving this STW (and moving-GC pointer
+    fix-up) is 150.4. With this, the scheduler self-host (128.1) is complete and GenImmix (150.4) can land
+    on the self-hosted scheduler.
 
 ## Refs
 

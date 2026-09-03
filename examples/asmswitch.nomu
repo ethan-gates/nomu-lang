@@ -1,0 +1,10 @@
+// Task 128.2 · asm floor — context-switch isolation test. `RawPtr.asmSelfTest()` drives the arm64
+// context switch (rtSwitch / rtFiberInit) through a full round-trip: seed a fresh fiber, switch into it,
+// the fiber records its argument and switches back to the caller. It returns 1 when the round-trip
+// preserved everything (the fiber ran, on its own stack, with its argument intact) and control returned
+// cleanly to `main`. This exercises the floor in isolation before any scheduler rides it
+// (selfhosted-scheduler.md §6). Expected output: 1. Checked by tools/asmswitch.sh.
+fun main() {
+  print(RawPtr.asmSelfTest())
+  print("\n")
+}

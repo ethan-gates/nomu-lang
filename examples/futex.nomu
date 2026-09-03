@@ -1,0 +1,46 @@
+// Task 128.1.1 · scheduler substrate — futex (macOS __ulock_wait / __ulock_wake, the libSystem futex
+// floor; no C-runtime shim). Single-threaded here: it proves the syscall binding and the value-check
+// contract without a second thread (the real sleep→wake ping-pong between two OS threads rides
+// thread-create). The kernel compares the 32-bit word at the address against `expected`, so the clock
+// (RawPtr.monotonicNanos) tells the two paths apart:
+//   • mismatch (word ≠ expected) → returns at once, no sleep.       (hundreds digit)
+//   • match (word = expected)    → blocks up to the timeout.        (tens digit)
+//   • wake with no waiter        → returns without faulting.        (ones digit)
+// `futexProbe` runs entirely on the substrate primitives (raw memory + atomics + clock + futex), so it is
+// runtime-subset-legal — tools/futex.sh builds it under `--runtime-subset`. `main` prints its result code.
+// The word lives in an off-heap RawPtr slot; its low 32 bits (little-endian) hold the futex state.
+// Expected output: 111. Checked by tools/futex.sh.
+fun futexProbe() -> Int {
+  let word = RawPtr.alloc(bytes: 8, align: 8)
+  var code = 0
+
+  // Path 1 — the word (5) does not equal `expected` (999), so the wait returns immediately.
+  word.atomicStore(5, toByteOffset: 0)
+  let a1 = RawPtr.monotonicNanos()
+  word.futexWait(expected: 999, timeoutMicros: 1000000)
+  let a2 = RawPtr.monotonicNanos()
+  if a2 - a1 < 50000000 {              // < 50 ms — a prompt return, no kernel sleep
+    code = code + 100
+  }
+
+  // Path 2 — the word (7) equals `expected` (7), so the wait blocks until the 200 ms timeout.
+  word.atomicStore(7, toByteOffset: 0)
+  let b1 = RawPtr.monotonicNanos()
+  word.futexWait(expected: 7, timeoutMicros: 200000)
+  let b2 = RawPtr.monotonicNanos()
+  if b2 - b1 >= 100000000 {            // ≥ 100 ms — it actually slept in the kernel
+    code = code + 10
+  }
+
+  // Path 3 — waking a word with no waiter returns without faulting (reaching here proves it).
+  word.futexWake(all: false)
+  code = code + 1
+
+  word.free()
+  return code
+}
+
+fun main() {
+  print(futexProbe())
+  print("\n")
+}

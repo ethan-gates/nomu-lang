@@ -30,6 +30,36 @@ extern void nomu_gc_write_barrier_post(void* mutator, void* src, void* slot, voi
 extern void nomu_gc_report_stats(void);   // M6 · 6.3.2 — footprint report (NOMU_GC_STATS)
 extern void nomu_gc_force_collect(void* mutator); // task 150 rung 2 — force one GC (mark-verify oracle)
 
+// ---- Scheduler plan selector (task 128.1.9) ----
+// Two schedulers are linked: the C/pthread scheduler below (default, the differential oracle) and the
+// self-hosted Nomu scheduler in the runtime prelude (src/stdlib/runtime.nomu), selected by NOMU_SCHED=nomu.
+// A run binds exactly one — never co-resident (selfhosted-scheduler.md §1). The Nomu entry points are
+// Nomu functions, so codegen names them `nomu_fn_<name>`; fiber_spawn / spawn_join / main dispatch to them
+// when the Nomu plan is selected, leaving codegen untouched.
+enum { RT_SCHED_C = 0, RT_SCHED_NOMU = 1 };
+static int rt_sched_plan = RT_SCHED_C;
+void* rt_nomu_sched = NULL;               // the opaque Nomu Sched handle (nomuSchedNew), bound at boot;
+                                          // non-static so codegen's `RawPtr.schedHandle()` (__schedHandle) can load it
+extern void* nomu_fn_nomuSchedNew(void);
+extern void* nomu_fn_nomuSchedSpawn(void* sched, void* entry, void* arg);
+extern void* nomu_fn_nomuSchedJoin(void* sched, void* target, void* anchorSp, void* anchorPc);
+extern void  nomu_fn_nomuSchedBoot(void* sched, void* entryFn, int64_t ncarriers, void* drainFn);
+extern int64_t nomu_fn_nomuSchedSleep(void* sched, int64_t ms, void* anchorSp, void* anchorPc);
+
+// The user-frame anchor for the self-hosted STW walk (task 128.3.2). A C dispatch shim is the immediate
+// callee of the user code that parks (sleep/join) or polls, so __builtin_return_address(0) is the user
+// function's return address — a statepoint the pcsp walk (rtWalkFrom) matches — and the caller's SP is
+// __builtin_frame_address(0)+16 on arm64 (past this shim's saved {fp,lr}), the same caller-frame math
+// rtCollectRoots uses. A direct immediate-caller read; no libunwind/CFI.
+#define RT_USER_ANCHOR(sp_var, pc_var) \
+    void* pc_var = __builtin_return_address(0); \
+    void* sp_var = (void*)((char*)__builtin_frame_address(0) + 16)
+extern void  nomu_fn_nomuSchedActorSend(void* sched, void* mailbox, void* msg);
+extern void* nomu_fn_nomuSchedMailboxPop(void* sched, void* mailbox);
+extern void  nomu_fn_nomuSchedSafepoint(void* sched, void* anchorSp, void* anchorPc);   // task 128.3.2
+extern int64_t nomu_fn_nomuSchedWalkParked(void* sched, void* outBuf, int64_t cap);      // task 128.3.2
+extern int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);            // libSystem futex
+
 // One MMTk mutator per carrier thread (Q1). Bound lazily on the thread's first allocation; a fiber
 // migrating carriers allocates against whichever carrier it currently runs on (thread-local storage
 // gives the per-carrier split for free). MMTk mutators are not shared across threads.
@@ -371,6 +401,11 @@ static void rt_fiber_trampoline(void) {
 }
 
 Fiber* fiber_spawn(void* (*fn)(void*), void* arg) {
+    if (rt_sched_plan == RT_SCHED_NOMU) {
+        // Nomu plan: the returned handle is the Nomu scheduler's opaque fiber pointer, which spawn_join
+        // passes straight back to nomuSchedJoin (codegen treats it as an opaque Fiber*).
+        return (Fiber*)nomu_fn_nomuSchedSpawn(rt_nomu_sched, (void*)fn, arg);
+    }
     Fiber* f = (Fiber*)calloc(1, sizeof(Fiber));
     f->stack = (char*)malloc(RT_STACK_SIZE);
     f->fn = fn;
@@ -423,6 +458,10 @@ static void* rt_carrier_entry(void* _) {
 }
 
 void* spawn_join(SpawnHandle* h) {
+    if (rt_sched_plan == RT_SCHED_NOMU) {
+        RT_USER_ANCHOR(sp, pc);
+        return nomu_fn_nomuSchedJoin(rt_nomu_sched, (void*)h->fiber, sp, pc);
+    }
     pthread_mutex_lock(&rt_queue_mu);
     if (h->fiber->status != FIBER_DONE) {
         h->fiber->joiner = rt_current;
@@ -489,7 +528,11 @@ static int rt_mbfiber_count = 0;
 // inside the handler), which C code can't. Codegen's `nomu_actor_drain(mailbox)` loops over
 // rt_mailbox_pop → `msg->thunk(msg)` until the mailbox is empty. The C side here manages the pool and
 // provides the non-safepoint-spanning `rt_mailbox_pop` primitive below.
-extern void nomu_actor_drain(void* mailbox);
+// Codegen emits the real nomu_actor_drain only for programs that use actors; an actor-less program
+// dead-strips the whole send/drain subgraph. main() passes its address to the Nomu scheduler boot
+// unconditionally, so a weak fallback definition here keeps the symbol defined either way. The codegen
+// strong definition overrides this stub when present; the stub is never called without an actor send.
+__attribute__((weak)) void nomu_actor_drain(void* mailbox) { (void)mailbox; }
 
 // Remove and return the head of the scheduled-mailbox queue (FIFO), or NULL if empty. Caller holds
 // rt_queue_mu. The returned mailbox stays `scheduled` — the caller is now its drainer.
@@ -562,6 +605,9 @@ static void rt_mailbox_dispatch(void) {
 // fresh drain. No safepoint/allocation inside → GC cannot move `mailbox` across this call, so
 // codegen's tracked mailbox pointer stays valid. Called from codegen's `nomu_actor_drain`.
 void* rt_mailbox_pop(void* mailbox) {
+    if (rt_sched_plan == RT_SCHED_NOMU) {
+        return nomu_fn_nomuSchedMailboxPop(rt_nomu_sched, mailbox);
+    }
     NomuMailbox* mb = (NomuMailbox*)mailbox;
     pthread_mutex_lock(&rt_queue_mu);
     NomuMsg* msg = mb->mb_head;
@@ -586,6 +632,10 @@ void* rt_mailbox_pop(void* mailbox) {
 // reachable via the mailbox chain (mb_head/tail/next all GC-scanned); the barriers keep the moving
 // GC's remembered set honest across the stores.
 void rt_actor_send(void* mailbox_, void* msg_) {
+    if (rt_sched_plan == RT_SCHED_NOMU) {
+        nomu_fn_nomuSchedActorSend(rt_nomu_sched, mailbox_, msg_);
+        return;
+    }
     NomuMailbox* mb = (NomuMailbox*)mailbox_;
     NomuMsg* msg = (NomuMsg*)msg_;
     pthread_mutex_lock(&rt_queue_mu);
@@ -716,6 +766,10 @@ static void nomu_gc_smoke_parked(void); // M6 · 6.2.2 — defined below (parked
 static void nomu_gc_smoke_sched(void);  // task 128.3.1 — defined below (scheduler-root oracle)
 
 int64_t rt_sleep_ms(int64_t ms) {
+    if (rt_sched_plan == RT_SCHED_NOMU) {
+        RT_USER_ANCHOR(sp, pc);
+        return nomu_fn_nomuSchedSleep(rt_nomu_sched, ms, sp, pc);
+    }
     // M8.4.3 smoke (env-gated, inert otherwise): `sleep` is a safepoint (this call is a statepoint),
     // so at entry the caller's live GC roots are recorded. Walk them before parking the fiber.
     if (getenv("NOMU_GC_SMOKE")) {
@@ -957,6 +1011,15 @@ static unw_context_t* gc_carrier_context(void* carrier_tls) {
 // recorded at its return address; capturing the carrier's context here lets the collector unwind from
 // the poll frame to those roots. Then the carrier parks until the world resumes. Not `gc-leaf`.
 void __nomu_gc_poll_slow(void) {
+    if (rt_sched_plan == RT_SCHED_NOMU) {
+        // Self-hosted STW (task 128.3.2): capture the user-frame anchor here — poll_slow is the immediate
+        // callee of the user code at the poll site, so its return address is a statepoint the pcsp walk
+        // matches — and hand it to the Nomu scheduler, which parks this fiber at the safepoint until resume.
+        // No libunwind: the anchor is a direct caller-frame read and the walk is self-hosted (rtWalkFrom).
+        RT_USER_ANCHOR(sp, pc);
+        nomu_fn_nomuSchedSafepoint(rt_nomu_sched, sp, pc);
+        return;
+    }
     unw_context_t ctx;
     unw_getcontext(&ctx);
     rt_carrier_park_for_stw(&ctx);
@@ -1257,10 +1320,75 @@ static void* __rt_main_entry(void* _) {
     return NULL;
 }
 
+// Forced self-hosted stop-the-world smoke (task 128.3.2, env NOMU_STW_SELFHOST). Drives a real STW over
+// the self-hosted scheduler's carriers and runs the self-hosted root walk (rtWalkFrom over the live-fiber
+// registry), retiring the C libunwind carrier crossing. The C nomu_gc_stop_the_world above is the
+// differential oracle (it walks the same program's roots via libunwind under the C plan). This coordinator
+// is a plain thread, not a fiber, so it never polls/parks itself. Sched field offsets mirror runtime.nomu.
+static int64_t rt_stw_ld(int off)  { return __atomic_load_n((int64_t*)((char*)rt_nomu_sched + off), __ATOMIC_SEQ_CST); }
+static void    rt_stw_st(int off, int64_t v) { __atomic_store_n((int64_t*)((char*)rt_nomu_sched + off), v, __ATOMIC_SEQ_CST); }
+
+static void* rt_stw_selfhost_thread(void* _) {
+    struct timespec warmup = {0, 40 * 1000 * 1000}; nanosleep(&warmup, NULL); // let the program get going
+    int rounds = 3;
+    for (int r = 0; r < rounds; r++) {
+        int64_t ncarriers = rt_stw_ld(160);
+        // Request the stop: raise both the poll trigger (read by the inlined safepoint) and the Nomu
+        // handshake request, then wake idle carriers so they reach the ack path promptly.
+        rt_stw_st(136, 1);          // stw-request
+        __nomu_stop_world = 1;
+        __atomic_fetch_add((int64_t*)((char*)rt_nomu_sched + 24), 1, __ATOMIC_SEQ_CST); // bump wake-gen
+        __ulock_wake(0x01000101, (char*)rt_nomu_sched + 24, 0);                          // wake all idle carriers
+        // Wait until every carrier has acked (all mutators stopped at a safepoint / parked).
+        while (rt_stw_ld(144) < ncarriers) {
+            struct timespec s = {0, 500 * 1000}; nanosleep(&s, NULL);
+        }
+        // World stopped: run the self-hosted walk over every parked/stopped fiber's anchor.
+        void** buf = (void**)malloc(sizeof(void*) * 1024);
+        int64_t nr = nomu_fn_nomuSchedWalkParked(rt_nomu_sched, buf, 1024);
+        fprintf(stderr, "nomu-stw-selfhost: round %d nroots %lld\n", r, (long long)nr);
+        for (int64_t i = 0; i < nr; i++) {
+            int64_t v = ((int64_t*)buf[i])[1];   // class { i64 header, i64 v } → the Int at offset 8
+            fprintf(stderr, "STW-ROOT %lld\n", (long long)v);
+        }
+        free(buf);
+        // Resume the world: reset the ack, clear the request, and wake the parked carriers.
+        rt_stw_st(144, 0);
+        rt_stw_st(136, 0);
+        __nomu_stop_world = 0;
+        __atomic_fetch_add((int64_t*)((char*)rt_nomu_sched + 152), 1, __ATOMIC_SEQ_CST); // bump stw-gen
+        __ulock_wake(0x01000101, (char*)rt_nomu_sched + 152, 0);                          // wake parked carriers
+        struct timespec between = {0, 25 * 1000 * 1000}; nanosleep(&between, NULL);
+    }
+    return NULL;
+}
+
 int main(void) {
     nomu_gc_init(1ULL << 30); // M6 · 6.1.1 — init MMTk (NoGC, 1 GiB reserved) before any allocation
     if (getenv("NOMU_GC_TYPEMAPS")) {
         nomu_gc_dump_typemaps(); // 6.1.3 map-walk self-check
+    }
+    const char* sched_env = getenv("NOMU_SCHED");
+    if (sched_env && strcmp(sched_env, "nomu") == 0) {
+        rt_sched_plan = RT_SCHED_NOMU;
+    }
+    if (rt_sched_plan == RT_SCHED_NOMU) {
+        // Self-hosted scheduler (task 128.1.9). Its carriers are ordinary pthreads that run real user code
+        // and bind an MMTk mutator lazily on first allocation (rt_gc_alloc), the same as the C carriers.
+        // NoGC scope: no stop-the-world over these carriers yet (128.3.2). The timer/poller feeders are not
+        // consolidated into the Nomu scheduler yet, so this path serves spawn/join programs.
+        int nc = 4;
+        const char* nc_env = getenv("NOMU_CARRIERS");
+        if (nc_env) { int v = atoi(nc_env); if (v >= 1) nc = v; }
+        rt_nomu_sched = nomu_fn_nomuSchedNew();
+        if (getenv("NOMU_STW_SELFHOST")) {   // 128.3.2 forced-STW smoke: coordinate a real STW + self-hosted walk
+            pthread_t __stw_sh; pthread_create(&__stw_sh, NULL, rt_stw_selfhost_thread, NULL); pthread_detach(__stw_sh);
+        }
+        nomu_fn_nomuSchedBoot(rt_nomu_sched, (void*)__rt_main_entry, (int64_t)nc, (void*)nomu_actor_drain);
+        if (getenv("NOMU_GC_STATS") || getenv("NOMU_GC_STATS_LIVE")) {
+            nomu_gc_report_stats();
+        }
+        return 0;
     }
 #ifdef __APPLE__
     rt_kq = kqueue();

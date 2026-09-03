@@ -119,6 +119,12 @@ public indirect enum SSAInstKind {
     // itself stays heap this slice — a stack-promoted env hits the `p1` env-param addrspace wall, a
     // scoped follow-up like `spawn:N`). Set only by `StackPromotion`; ssairgen always emits `false`.
     case makeClosure(funcName: String, env: SSAValue?, onStack: Bool)
+
+    // The C-ABI code address of a top-level non-capturing function, as an addrspace(0) raw pointer (task
+    // 128.2, `RawPtr.ofFunc`). Unlike `makeClosure` (a managed `{header, fn, env}` box), this is the bare
+    // function pointer the asm floor / `pthread_create` call — a runtime-tier primitive, not first-class
+    // functions. No SSA operands; the target is named by symbol.
+    case funcAddr(String)
 }
 
 // A call site. `typeArgs` is non-empty only for a residual generic call the mono pass left dynamic.
@@ -200,11 +206,17 @@ public struct SSAFunction {
     public var blocks: [SSABlock]
     public let isMutating: Bool
     public let span: Span
+    // Task 149 runtime-subset — the resolved `noSafepoint` property (runtime-subset.md §3). A runtime
+    // function runs where a compiler-inserted safepoint poll would be self-referential (it may execute
+    // during a stop-the-world), so codegen elides the loop-header poll for it (SSAIRToLLVM). Seeded from
+    // the subset designation at SSAIR gen; false for ordinary user code.
+    public let noSafepoint: Bool
 
     public init(name: String, params: [SSAValue], returnType: Type,
-                blocks: [SSABlock], isMutating: Bool, span: Span) {
+                blocks: [SSABlock], isMutating: Bool, span: Span, noSafepoint: Bool = false) {
         self.name = name; self.params = params; self.returnType = returnType
         self.blocks = blocks; self.isMutating = isMutating; self.span = span
+        self.noSafepoint = noSafepoint
     }
 }
 

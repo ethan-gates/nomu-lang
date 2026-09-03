@@ -1,0 +1,44 @@
+// Task 128.3.2 spike — self-hosted STW root walk over the 128.1.9 scheduler, no libunwind. `worker` builds
+// two live class objects and one dead one, then parks at `sleep(200)` holding the live pair across the
+// safepoint. Under NOMU_SCHED=nomu the sleep shim captured worker's user-frame anchor (a statepoint return
+// address) into its fiber; while it is parked, `main` reaches the scheduler handle and runs
+// `nomuSchedWalkParked`, which iterates the live-fiber registry and runs the self-hosted pcsp walk
+// (rtWalkFrom) from each parked fiber's anchor. Expected recovered set: {111, 222}; the dead 999 is
+// excluded. The C-plan run of walk_parked.nomu (libunwind) is the differential oracle for the same shape.
+class Box {
+  var v: Int
+}
+
+fun worker() -> Int {
+  let a = Box(v: 111)
+  let b = Box(v: 222)
+  let dead = Box(v: 999)              // used only below — dead at the park
+  print(dead.v)                       // 999 (dead's last use)
+  print("\n")
+  sleep(200)                          // park holding a, b live across the safepoint
+  return a.v + b.v                    // 333
+}
+
+fun main() {
+  spawn let r = worker()              // worker runs and parks at its sleep(200)
+  sleep(10)                           // let worker park
+
+  let sched = RawPtr.schedHandle()
+  let buf = RawPtr.alloc(bytes: 512, align: 8)
+  let nr = nomuSchedWalkParked(sched, buf, 64)
+  print("nroots ")
+  print(nr)
+  print("\n")
+  var i = 0
+  while i < nr {
+    let root: RawPtr = buf.load(fromByteOffset: i * 8)
+    let v: Int = root.load(fromByteOffset: 8)
+    print("PARKED-ROOT ")
+    print(v)
+    print("\n")
+    i = i + 1
+  }
+  buf.free()
+  print(r)                            // 333 — joins worker
+  print("\n")
+}

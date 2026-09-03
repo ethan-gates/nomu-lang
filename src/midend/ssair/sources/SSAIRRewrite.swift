@@ -7,7 +7,7 @@ import ast
 
 public func remapOperands(_ kind: SSAInstKind, _ f: (SSAValue) -> SSAValue) -> SSAInstKind {
     switch kind {
-    case .constInt, .constDouble, .constBool, .constString, .alloc, .stackAlloc:
+    case .constInt, .constDouble, .constBool, .constString, .alloc, .stackAlloc, .funcAddr:
         return kind
     case .binary(let op, let a, let b):
         return .binary(op, f(a), f(b))

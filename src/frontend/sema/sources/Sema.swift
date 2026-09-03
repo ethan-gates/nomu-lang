@@ -1866,6 +1866,14 @@ public struct Sema {
         return v
     }
 
+    private mutating func ptrArg(_ e: Expr, _ ctx: String, _ what: String) -> NOIRExpr {
+        let v = checkExpr(e)
+        if v.type != .rawPtr, v.type != .error {
+            diags.error("\(ctx): \(what) must be a 'RawPtr', got '\(v.type)'", at: v.span)
+        }
+        return v
+    }
+
     // Build a NOIR call to a codegen intrinsic (`__rawAlloc` etc.); the result type is carried on the
     // node so codegen reads the element type from it (e.g. a typed load).
     private func ptrIntrinsic(_ name: String, _ result: Type, _ args: [NOIRExpr], _ span: Span) -> NOIRExpr {
@@ -1976,6 +1984,13 @@ public struct Sema {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return ptrIntrinsic("__gcSchedHead", .rawPtr, [], span)
+        // Task 128.3.2: the self-hosted scheduler's Sched handle (`rt_nomu_sched`), bound at boot under
+        // NOMU_SCHED=nomu (null under the C plan). Lets a driver run the self-hosted STW walk.
+        case "schedHandle":
+            guard checkArgLabels(args, [], "RawPtr.schedHandle", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__schedHandle", .rawPtr, [], span)
         // The self-hosted Immix space descriptor (task 150 rung 3): the codegen-internal global
         // `__nomu_selfhost_space` the alloc seam lazily creates under NOMU_GC_PLAN=nomu. Null under other
         // plans (MMTk allocates). The self-hosted tracer reads it to mark lines in the space objects live in.
@@ -1984,6 +1999,104 @@ public struct Sema {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return ptrIntrinsic("__gcSelfhostSpace", .rawPtr, [], span)
+        // Scheduler substrate — raw OS clock (task 128.1.1). Monotonic time in nanoseconds, the primitive
+        // under the scheduler's timer heap. It reaches the OS directly (macOS: the libSystem entry
+        // `clock_gettime_nsec_np`; selfhosted-scheduler.md §3.3), bypassing the C-runtime shim — a step
+        // toward retiring the C floor (128 goal 1). gc-leaf: no managed heap, no alloc, subset-legal.
+        case "monotonicNanos":
+            guard checkArgLabels(args, [], "RawPtr.monotonicNanos", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__sysMonotonicNanos", .int, [], span)
+        // Asm-floor isolation self-test (task 128.2). Drives the per-arch context switch (rtSwitch /
+        // rtFiberInit) through a seed → switch-in → switch-back round-trip and returns 1 if the fiber ran
+        // with its argument intact, else 0 (0 also on an arch with no asm floor yet). The isolation check
+        // the design calls for before any scheduler rides the floor.
+        case "asmSelfTest":
+            guard checkArgLabels(args, [], "RawPtr.asmSelfTest", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__sysAsmSelfTest", .int, [], span)
+        // Carrier-local slot for the self-hosted scheduler (task 128.1.6): the running fiber handle
+        // (`rt_current`). `RawPtr.tlsGet()` reads it, `RawPtr.tlsSet(v)` writes it. Backed by a
+        // `_Thread_local` word in the embedded floor (core.c), so a fiber that self-parks can find itself
+        // without threading its handle through user code. Subset-legal (`__sys`).
+        case "tlsGet":
+            guard checkArgLabels(args, [], "RawPtr.tlsGet", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__sysTlsGet", .rawPtr, [], span)
+        case "tlsSet":
+            guard checkArgLabels(args, [nil], "RawPtr.tlsSet", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let v = checkExpr(args[0].value)
+            if v.type != .rawPtr, v.type != .error {
+                diags.error("RawPtr.tlsSet expects a 'RawPtr', got '\(v.type)'", at: v.span)
+            }
+            return ptrIntrinsic("__sysTlsSet", .void, [v], span)
+        // I/O poller substrate (task 128.1.7): the macOS kqueue floor + the fds a poller test drives to
+        // readiness. All libSystem externs (selfhosted-scheduler.md §3.3), subset-legal (`__sys`). fds and
+        // event/change buffers are raw memory; fd numbers and counts are Int.
+        case "kqueue":
+            guard checkArgLabels(args, [], "RawPtr.kqueue", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__sysKqueue", .int, [], span)      // int kqueue(void)
+        case "kevent":
+            guard checkArgLabels(args, ["kq", "changes", "nchanges", "events", "nevents"], "RawPtr.kevent", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let kq = intArg(args[0].value, "RawPtr.kevent", "kq")
+            let changes = ptrArg(args[1].value, "RawPtr.kevent", "changes")
+            let nch = intArg(args[2].value, "RawPtr.kevent", "nchanges")
+            let events = ptrArg(args[3].value, "RawPtr.kevent", "events")
+            let nev = intArg(args[4].value, "RawPtr.kevent", "nevents")
+            return ptrIntrinsic("__sysKevent", .int, [kq, changes, nch, events, nev], span)
+        case "pipe":
+            guard checkArgLabels(args, ["fds"], "RawPtr.pipe", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__sysPipe", .int, [ptrArg(args[0].value, "RawPtr.pipe", "fds")], span)  // int pipe(int fds[2])
+        case "writeFd":
+            guard checkArgLabels(args, ["fd", "buf", "count"], "RawPtr.writeFd", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let wfd = intArg(args[0].value, "RawPtr.writeFd", "fd")
+            let wbuf = ptrArg(args[1].value, "RawPtr.writeFd", "buf")
+            let wcnt = intArg(args[2].value, "RawPtr.writeFd", "count")
+            return ptrIntrinsic("__sysWrite", .int, [wfd, wbuf, wcnt], span)
+        case "readFd":
+            guard checkArgLabels(args, ["fd", "buf", "count"], "RawPtr.readFd", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let rfd = intArg(args[0].value, "RawPtr.readFd", "fd")
+            let rbuf = ptrArg(args[1].value, "RawPtr.readFd", "buf")
+            let rcnt = intArg(args[2].value, "RawPtr.readFd", "count")
+            return ptrIntrinsic("__sysRead", .int, [rfd, rbuf, rcnt], span)
+        // The C-ABI code address of a top-level, non-capturing function as a RawPtr (task 128.2). A
+        // runtime-tier primitive for handing an entry point to the asm floor (rtFiberInit) or
+        // pthread_create — deliberately not first-class functions (task 128 note: full first-class
+        // functions/closures for user code are a later, separate language step). The argument must name a
+        // top-level `fun (_: RawPtr) -> RawPtr` — the carrier/fiber-entry ABI (a bare pointer, no env).
+        case "ofFunc":
+            guard args.count == 1, args[0].label == nil else {
+                diags.error("RawPtr.ofFunc takes one argument: a top-level function name", at: span)
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            guard case .ident(let fname, _) = args[0].value else {
+                diags.error("RawPtr.ofFunc expects a bare top-level function name, e.g. 'RawPtr.ofFunc(carrierMain)'", at: span)
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            guard let sig = funcs[fname] else {
+                diags.error("no top-level function named '\(fname)'", at: span)
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            guard sig.generics.isEmpty, sig.params == [.rawPtr], sig.ret == .rawPtr else {
+                diags.error("RawPtr.ofFunc requires a non-generic 'fun \(fname)(_: RawPtr) -> RawPtr'", at: span)
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return NOIRExpr(type: .rawPtr, span: span, kind: .funcRef(name: fname))
         default:
             diags.error("type 'RawPtr' has no static method '\(method)'", at: span)
             return NOIRExpr(type: .error, span: span, kind: .intLit(0))
@@ -2023,6 +2136,131 @@ public struct Sema {
             }
             let off = intArg(args[0].value, "RawPtr.load", "fromByteOffset")
             return ptrIntrinsic("__rawLoad", elem, [recv, off], span)
+        // Atomics (task 128.1.1, scheduler substrate). i64 sequentially-consistent ops over a RawPtr slot
+        // — the primitive under the MT-safe run queue, STW flags, and futex words. Int-width only for now.
+        case "atomicLoad":
+            guard checkArgLabels(args, ["fromByteOffset"], "RawPtr.atomicLoad", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let off = intArg(args[0].value, "RawPtr.atomicLoad", "fromByteOffset")
+            return ptrIntrinsic("__atomicLoad", .int, [recv, off], span)
+        case "atomicStore":
+            guard checkArgLabels(args, [nil, "toByteOffset"], "RawPtr.atomicStore", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let value = intArg(args[0].value, "RawPtr.atomicStore", "value")
+            let off = intArg(args[1].value, "RawPtr.atomicStore", "toByteOffset")
+            return ptrIntrinsic("__atomicStore", .void, [recv, value, off], span)
+        // Compare-and-swap: returns the value read (the old word). The caller compares it to `expected` to
+        // learn whether the swap took, the standard CAS-loop shape.
+        case "atomicCas":
+            guard checkArgLabels(args, [nil, nil, "atByteOffset"], "RawPtr.atomicCas", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let expc = intArg(args[0].value, "RawPtr.atomicCas", "expected")
+            let desr = intArg(args[1].value, "RawPtr.atomicCas", "desired")
+            let coff = intArg(args[2].value, "RawPtr.atomicCas", "atByteOffset")
+            return ptrIntrinsic("__atomicCas", .int, [recv, expc, desr, coff], span)
+        // Fetch-and-add: returns the previous value.
+        case "atomicFetchAdd":
+            guard checkArgLabels(args, [nil, "atByteOffset"], "RawPtr.atomicFetchAdd", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let delta = intArg(args[0].value, "RawPtr.atomicFetchAdd", "delta")
+            let aoff = intArg(args[1].value, "RawPtr.atomicFetchAdd", "atByteOffset")
+            return ptrIntrinsic("__atomicFetchAdd", .int, [recv, delta, aoff], span)
+        case "atomicExchange":
+            guard checkArgLabels(args, [nil, "atByteOffset"], "RawPtr.atomicExchange", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let newv = intArg(args[0].value, "RawPtr.atomicExchange", "value")
+            let xoff = intArg(args[1].value, "RawPtr.atomicExchange", "atByteOffset")
+            return ptrIntrinsic("__atomicExchange", .int, [recv, newv, xoff], span)
+        // Asm-floor context switch (task 128.2). The receiver is the *from* context buffer (≥168 bytes,
+        // the saved callee-saved set); `to` is the context to resume. Saves the current registers into the
+        // receiver and jumps into `to` (rtSwitch). Subset-legal (`__sys`).
+        case "ctxSwitchTo":
+            guard checkArgLabels(args, [nil], "RawPtr.ctxSwitchTo", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let to = checkExpr(args[0].value)
+            if to.type != .rawPtr, to.type != .error {
+                diags.error("RawPtr.ctxSwitchTo expects a 'RawPtr' context buffer, got '\(to.type)'", at: to.span)
+            }
+            return ptrIntrinsic("__sysCtxSwitch", .void, [recv, to], span)
+        // Seed a fresh fiber's context buffer (the receiver) so the first switch into it lands in the
+        // trampoline running `entry(arg)` on `stackTop` (rtFiberInit). `entry` is a code address from
+        // RawPtr.ofFunc; `stackTop` and `arg` are raw pointers.
+        case "fiberInit":
+            guard checkArgLabels(args, ["stackTop", "entry", "arg"], "RawPtr.fiberInit", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let stackTop = checkExpr(args[0].value)
+            let entry = checkExpr(args[1].value)
+            let arg = checkExpr(args[2].value)
+            for (v, n) in [(stackTop, "stackTop"), (entry, "entry"), (arg, "arg")] where v.type != .rawPtr && v.type != .error {
+                diags.error("RawPtr.fiberInit '\(n)' must be a 'RawPtr', got '\(v.type)'", at: v.span)
+            }
+            return ptrIntrinsic("__sysFiberInit", .void, [recv, stackTop, entry, arg], span)
+        // Carrier thread create (task 128.2). The receiver is a slot holding the thread handle
+        // (`pthread_t`, ≥8 bytes). Starts `entry(arg)` on a new OS thread via pthread_create (the stable
+        // macOS floor, §3.3). `entry` is a `(RawPtr) -> RawPtr` address from RawPtr.ofFunc. Returns 0 on
+        // success (else the error number).
+        case "threadCreate":
+            guard checkArgLabels(args, ["entry", "arg"], "RawPtr.threadCreate", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let entry = checkExpr(args[0].value)
+            let arg = checkExpr(args[1].value)
+            for (v, n) in [(entry, "entry"), (arg, "arg")] where v.type != .rawPtr && v.type != .error {
+                diags.error("RawPtr.threadCreate '\(n)' must be a 'RawPtr', got '\(v.type)'", at: v.span)
+            }
+            return ptrIntrinsic("__sysThreadCreate", .int, [recv, entry, arg], span)
+        // Join the thread whose handle this slot holds (pthread_join). Blocks until it exits; returns 0 on
+        // success. The receiver is the same slot passed to threadCreate.
+        case "threadJoin":
+            guard checkArgLabels(args, [], "RawPtr.threadJoin", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ptrIntrinsic("__sysThreadJoin", .int, [recv], span)
+        // Call through a code address with the fiber-entry ABI `(RawPtr) -> RawPtr` (task 128.1.3). The
+        // receiver is a function address (from RawPtr.ofFunc); this invokes it with `arg` and returns its
+        // result. The scheduler's fiber trampoline uses it to run a fiber's user entry through the stored
+        // pointer. An indirect call — the subset closure check does not see a named non-subset callee, so a
+        // subset scheduler may run a non-subset fiber body across this boundary.
+        case "callEntry":
+            guard checkArgLabels(args, [nil], "RawPtr.callEntry", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let a = checkExpr(args[0].value)
+            if a.type != .rawPtr, a.type != .error {
+                diags.error("RawPtr.callEntry expects a 'RawPtr' argument, got '\(a.type)'", at: a.span)
+            }
+            return ptrIntrinsic("__sysCallEntry", .rawPtr, [recv, a], span)
+        // Futex (task 128.1.1, scheduler substrate) — the address of a memory word a carrier sleeps on and
+        // is woken from, the primitive under mutex/condvar and idle-carrier sleep. macOS: the libSystem
+        // entries __ulock_wait / __ulock_wake (selfhosted-scheduler.md §3.3), no C-runtime shim. gc-leaf,
+        // subset-legal (the `__sys` prefix). The receiver is the futex word's address.
+        // `futexWait(expected:, timeoutMicros:)`: sleep only while the word still equals `expected` (the
+        // kernel re-checks atomically, closing the check-then-sleep race); a mismatch returns at once, a
+        // match blocks up to the timeout. Returns the raw result (≥ 0 ok; < 0 a negated errno).
+        case "futexWait":
+            guard checkArgLabels(args, ["expected", "timeoutMicros"], "RawPtr.futexWait", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let expc = intArg(args[0].value, "RawPtr.futexWait", "expected")
+            let tmo = intArg(args[1].value, "RawPtr.futexWait", "timeoutMicros")
+            return ptrIntrinsic("__sysFutexWait", .int, [recv, expc, tmo], span)
+        // `futexWake(all:)`: wake one waiter (lock handoff) or all (STW broadcast). Returns the raw result.
+        case "futexWake":
+            guard checkArgLabels(args, ["all"], "RawPtr.futexWake", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let all = checkExpr(args[0].value)
+            if all.type != .bool, all.type != .error {
+                diags.error("RawPtr.futexWake expects a Bool 'all' argument, got '\(all.type)'", at: all.span)
+            }
+            return ptrIntrinsic("__sysFutexWake", .int, [recv, all], span)
         case "eq":
             guard checkArgLabels(args, [nil], "RawPtr.eq", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
@@ -2143,6 +2381,8 @@ public struct Sema {
     private func subsetAllows(_ name: String) -> Bool {
         if name.hasPrefix("__raw") || name.hasPrefix("__ptr") { return true }   // 125 raw memory (gc-leaf)
         if name.hasPrefix("__gc") { return true }                               // GC introspection reads (gc-leaf, task 150 rung 2)
+        if name.hasPrefix("__atomic") { return true }                           // atomics (gc-leaf, scheduler substrate, task 128.1.1)
+        if name.hasPrefix("__sys") { return true }                              // raw OS entries — clock/futex/thread (gc-leaf, scheduler substrate, task 128.1.1)
         if Builtins.cLeaf.contains(name) { return true }                        // pure C leaves
         switch name {
         case "__int_double_double", "__double_int_int", "__int_uint8_uint8", "__uint8_int_int": return true

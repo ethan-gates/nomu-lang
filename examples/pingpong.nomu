@@ -1,0 +1,52 @@
+// Task 128.1.2 · two-thread futex ping-pong. Closes the part of the futex story the single-threaded
+// 128.1.1 test could not cover: a real cross-thread sleep → wake. `main` creates a second OS thread
+// (pthread_create) running the Nomu function `worker` (reached via RawPtr.ofFunc), then blocks in
+// futexWait on a word that is still 0. `worker` waits ~30 ms so main is genuinely asleep, sets the word
+// to 1, and wakes it. main then observes the word, joins, and checks three invariants encoded as digits:
+//   hundreds — the word holds 1 (the child's store is visible)
+//   tens     — the child ran to completion (its witness)
+//   ones     — main was actually asleep until woken (its wait blocked ≥ 10 ms of the child's ~30 ms delay)
+// `worker` is runtime-subset (raw memory + atomics + clock + futex only), so it carries no safepoint poll
+// on the raw thread. All memory is off-heap. Expected output: 111. Checked by tools/pingpong.sh.
+fun worker(cb: RawPtr) -> RawPtr {
+  let start = RawPtr.monotonicNanos()
+  var now = start
+  while now - start < 30000000 {           // ~30 ms, so main is parked in futexWait before we wake it
+    now = RawPtr.monotonicNanos()
+  }
+  cb.atomicStore(1, toByteOffset: 0)        // set the futex word
+  cb.futexWake(all: false)                  // wake the sleeper
+  cb.store(7, toByteOffset: 8)              // witness: the worker ran to completion
+  return cb
+}
+
+fun main() {
+  let cb = RawPtr.alloc(bytes: 16, align: 8)
+  let handle = RawPtr.alloc(bytes: 8, align: 8)
+  cb.atomicStore(0, toByteOffset: 0)
+  cb.store(0, toByteOffset: 8)
+
+  let t0 = RawPtr.monotonicNanos()
+  handle.threadCreate(entry: RawPtr.ofFunc(worker), arg: cb)
+  cb.futexWait(expected: 0, timeoutMicros: 2000000)   // sleep until the worker wakes us (2 s backstop)
+  let t1 = RawPtr.monotonicNanos()
+  handle.threadJoin()
+
+  let word: Int = cb.atomicLoad(fromByteOffset: 0)
+  let witness: Int = cb.load(fromByteOffset: 8)
+  var code = 0
+  if word == 1 {
+    code = code + 100
+  }
+  if witness == 7 {
+    code = code + 10
+  }
+  if t1 - t0 >= 10000000 {
+    code = code + 1
+  }
+  print(code)
+  print("\n")
+
+  handle.free()
+  cb.free()
+}

@@ -19,10 +19,16 @@ Designation sources (both feed the same `subsetFuncs` set, resolved in the drive
 - **`--runtime-subset=<names>`** — an ad-hoc compiler input, kept for designating functions outside the
   prelude (tests, experiments).
 
-**Deferred to later slices:** the codegen-site guards (write-barrier / safepoint-poll suppression in
-subset code), the `nosplit fun` keyword (bounded stack, staged behind
-[104](../plans/tasks/104-fiber-stack-strategy.md)), and folding the file designation into module
-membership when [100](../plans/tasks/100-modules.md) lands.
+**Built (poll-suppression).** The safepoint-poll codegen guard (§4). The resolved `noSafepoint` property
+rides from the subset designation to the backend (`SSAFunction.noSafepoint`, seeded in `lowerToSSAIR` from
+the designated set), and `SSAIRToLLVM` elides the loop-header `__nomu_poll` for a subset function. This is
+the guard the self-hosted scheduler loop needs (128.1.1): the loop runs during a stop-the-world, so a poll
+there would recurse. Verified in emitted machine code (`tools/subset-poll.sh`).
+
+**Deferred to later slices:** the write-barrier codegen guard (inert today — subset code works over
+`addrspace(0)` raw memory, which has no managed store to barrier), the `nostackgrow fun` keyword (bounded
+stack, staged behind [104](../plans/tasks/104-fiber-stack-strategy.md)), and folding the file designation
+into module membership when [100](../plans/tasks/100-modules.md) lands.
 
 **API scope.** The surface is **module-default subset + a narrow per-function keyword refinement**
 (surface A, Decided with Ethan). The runtime tier is designated subset-by-default so the module-wide
@@ -75,7 +81,7 @@ The four constraints split by grain, which is what shapes the surface:
 
 - **Module-wide (three):** no implicit GC allocation, no write barrier, no compiler-inserted safepoint.
   These hold for the whole collector/scheduler tier uniformly. — the module default carries them.
-- **Narrow (one):** nosplit / bounded stack applies to a subset of the subset (signal / STW / stack-
+- **Narrow (one):** bounded stack (`nostackgrow`) applies to a subset of the subset (signal / STW / stack-
   growth-path functions) and depends on 104. — the per-function keyword carries it.
 
 ## 3. The surface (A)
@@ -87,16 +93,29 @@ build / module level rather than in source: the runtime tier is a known, privile
 compiled with the subset default on. (The module system that will own this cleanly is undesigned,
 `modules.md`; the interim is a designated file set / compiler input. — **Open**, tracked there.)
 
-**Per-function refinement — a keyword modifier.** The nosplit constraint is spelled as a keyword before
-`fun`:
+**Per-function refinement — bare keywords on the preceding line (Decided).** A narrow constraint is
+spelled as a descriptive keyword on the line immediately before `fun`, so `fun` keeps the start of its own
+line (the `fun`-begins-its-line rule, `syntax.md` §2):
 
 ```
-nosplit fun collectMinor() { … }
+nostackgrow
+fun rtSwitch(from RawPtr, to RawPtr) { … }
 ```
 
-It fits the existing `fun`-declaration grammar (the `fun`-begins-its-line rule, `syntax.md` §2), adds no
-attribute sublanguage, and appears only in privileged runtime code. Spelling is **Leaning** until the
-first nosplit function is written.
+- **`nostackgrow`** is the bounded-stack constraint (Go's `nosplit`; renamed because the word should state
+  what it guarantees — `nosplit` names a mechanism, not the promise). It is the only narrow marker today;
+  the module default carries the other three constraints, so most runtime code carries no marker. Depends
+  on 104 (inert until stacks grow).
+- Previous-line placement keeps stacking readable if a second narrow marker is ever added — each sits on
+  its own line, and the orthogonal internal set (below) means a function needing two carries two lines.
+
+**Bare keywords, not an attribute grammar (Decided).** No sigil, no `@name` sublanguage. The markers are
+**contextual and runtime-only** — recognized as keywords only inside the designated runtime tier, plain
+identifiers in ordinary user code, so they cannot appear in or leak into the user surface. A general
+`@`-attribute facility was weighed and set aside: it is the reserved path for the day a genuine
+*user-facing* compiler hint needs one, and each such case is first weighed against whether inference, the
+type system, or comptime (140/141) can already carry the intent — the discrete-marker vehicle is the last
+resort, gated to the narrowest audience. The runtime markers do not require it.
 
 **The internal model — a per-function property set.** Subset-ness is represented inside the compiler as a
 **resolved property set per function** (`{noAlloc, noBarrier, noSafepoint, nosplit}`), *seeded* by module
@@ -118,7 +137,10 @@ Two layers, both reading the resolved property set (§3):
 - **Codegen-site guards (backstop).** At each of the four emission points, codegen consults the enclosing
   function's property set. A `noSafepoint` / suppressed poll is *elided*; an implicit `rt_alloc` or
   `__nomu_write_barrier` that the closure check somehow admitted is a hard error at the emission point.
-  The two layers agree; the guard is the belt to the closure check's suspenders.
+  The two layers agree; the guard is the belt to the closure check's suspenders. **Built:** the
+  safepoint-poll elision — `SSAFunction.noSafepoint` (seeded in `lowerToSSAIR` from the designated set)
+  makes `SSAIRToLLVM` skip the loop-header `__nomu_poll`. The write-barrier elision is inert today (subset
+  code holds no managed store to barrier) and the hard-error backstops are not yet wired.
 
 Diagnostics surface as ordinary Sema-level errors (the property set is known before codegen).
 

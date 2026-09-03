@@ -172,7 +172,7 @@ private func flat(_ e: NOIRExpr) -> String? {
 
 private func children(_ e: NOIRExpr) -> [(slot: String, expr: NOIRExpr)] {
     switch e.kind {
-    case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .closure:
+    case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .closure, .funcRef:
         return []
     case .fieldAccess(let base, _):
         return [("base", base)]
@@ -215,6 +215,7 @@ private func head(_ e: NOIRExpr) -> String {
     case .arrayLit(let elements):  return "arrayLit [\(elements.count)]"
     case .index:                   return "index"
     case .staticCall(let t, let m, _): return "staticCall \(t).\(m)"
+    case .funcRef(let name):       return "funcRef \(name)"
     }
 }
 

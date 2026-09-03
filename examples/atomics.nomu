@@ -1,0 +1,44 @@
+// Task 128.1.1 · scheduler substrate — atomics smoke test. Exercises the i64 seq-cst atomic ops
+// (atomicStore / atomicLoad / atomicFetchAdd / atomicCas / atomicExchange) over an off-heap RawPtr slot,
+// single-threaded and deterministic. Concurrency enters at 128.1.5; here we only prove the codegen lowers
+// correctly and the values round-trip. atomicFetchAdd, atomicCas, and atomicExchange return the *previous*
+// word (atomicExchange, the futex-mutex xchg, was added for the 128.1.4 self-hosted Mutex).
+// Expected output: 100 / 100 / 105 / 105 / 200 / 200 / 200 / 200 / 55. Checked by tools/atomics.sh.
+fun main() {
+  let p = RawPtr.alloc(bytes: 16, align: 8)
+
+  p.atomicStore(100, toByteOffset: 0)
+  let a = p.atomicLoad(fromByteOffset: 0)
+  print(a)                                   // 100
+  print("\n")
+
+  let old1 = p.atomicFetchAdd(5, atByteOffset: 0)
+  print(old1)                                // 100 (previous value)
+  print("\n")
+  let b = p.atomicLoad(fromByteOffset: 0)
+  print(b)                                   // 105
+  print("\n")
+
+  let old2 = p.atomicCas(105, 200, atByteOffset: 0)   // 105 == current → swap takes
+  print(old2)                                // 105 (word read)
+  print("\n")
+  let c = p.atomicLoad(fromByteOffset: 0)
+  print(c)                                   // 200
+  print("\n")
+
+  let old3 = p.atomicCas(999, 7, atByteOffset: 0)     // 999 != current → swap does not take
+  print(old3)                                // 200 (word read; value unchanged)
+  print("\n")
+  let d = p.atomicLoad(fromByteOffset: 0)
+  print(d)                                   // 200
+  print("\n")
+
+  let old4 = p.atomicExchange(55, atByteOffset: 0)    // unconditional swap → 55
+  print(old4)                                // 200 (previous word)
+  print("\n")
+  let ex = p.atomicLoad(fromByteOffset: 0)
+  print(ex)                                  // 55
+  print("\n")
+
+  p.free()
+}
