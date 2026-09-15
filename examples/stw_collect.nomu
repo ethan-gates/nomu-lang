@@ -1,0 +1,44 @@
+// Task 150.3.9 — a real evacuating Immix collection driven at a stop-the-world over the self-hosted
+// scheduler. `worker` allocates 500 dead Boxes (garbage) then holds one live Box (111) across a long busy
+// loop. While it runs, the forced-collect coordinator (NOMU_STW_COLLECT) stops the world and runs a
+// force-all evacuating collection over the self-hosted Immix space: the live Box moves to fresh to-space,
+// the worker's stack slot is fixed up in place, and the garbage blocks are reclaimed. The worker resumes
+// and reads the (moved) Box → 111. Output is unchanged vs MMTk/NoGC (moving is transparent) — the
+// fixup-correctness proof. Run with NOMU_SCHED=nomu NOMU_GC_PLAN=nomu NOMU_STW_COLLECT=1 NOMU_NO_ESCAPE=1.
+class Box {
+  var v: Int
+}
+
+fun spin(n: Int) -> Int {
+  var i = 0
+  var acc = 0
+  while i < n {
+    acc = acc + (i % 7)
+    i = i + 1
+  }
+  return acc
+}
+
+fun makeGarbage(n: Int) -> Int {
+  var i = 0
+  var s = 0
+  while i < n {
+    let g = Box(v: i)          // dead after this iteration — reclaimed by the collection
+    s = s + g.v
+    i = i + 1
+  }
+  return s
+}
+
+fun worker() -> Int {
+  let keep = Box(v: 111)       // live across the collection — force-all moves it; its stack slot is fixed up
+  let g = makeGarbage(500)
+  let j = spin(400000000)      // stay running so a collection fires mid-worker
+  return keep.v + (g % 1) + (j % 1)
+}
+
+fun main() {
+  spawn let x = worker()
+  print(x)                     // 111 — keep survived the move and its slot was fixed up
+  print("\n")
+}

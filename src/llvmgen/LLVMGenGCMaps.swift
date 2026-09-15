@@ -68,6 +68,18 @@ extension LLVMGen {
         return id
     }
 
+    // Type-id for a spawn-result box `{ header, result… }` (150.3.13). A completed fiber's result rides in a
+    // heap box at fib+216 until the joiner reads it; the self-hosted STW walk roots that slot, so the box must
+    // be a proper GC object the moving collector can relocate — a header plus the result's managed-pointer map
+    // (shifted past slot 0). A managed result is scanned so it survives + is fixed up too. One shape per result
+    // type; the set is small, so a fresh map per call is fine.
+    func spawnBoxTypeId(_ t: Type) -> UInt64 {
+        var offsets: [Int32] = []
+        collectManagedOffsets(t, baseSlot: 1, into: &offsets)   // result at slot 1 (header is slot 0)
+        let slots = 1 + slotCount(t)
+        return registerMap(offsets, sizeBytes: Int32(slots * 8))
+    }
+
     // The shared type-id for every mailbox object `{ header, mb_head, mb_tail, scheduled, sched_next }`:
     // mb_head (8), mb_tail (16), sched_next (32) are managed pointers (scanned). 40 bytes.
     func mailboxTypeIdValue() -> UInt64 {

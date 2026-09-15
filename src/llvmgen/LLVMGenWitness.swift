@@ -91,13 +91,14 @@ extension LLVMGen {
     // takes it directly; a by-value method loads the concrete value out of it.
     func bridgeThunkSelf(_ payload: LLVMValueRef, _ type: String, _ c: Callable) -> LLVMValueRef? {
         if c.selfByPointer {
-            // A class/actor impl takes the managed object pointer directly. A struct/enum mutating
-            // impl takes an addrspace(0) pointer to a stack-ABI value, so cast the heap box down.
+            // A class/actor impl takes the managed object pointer directly. A struct/enum mutating impl
+            // takes an addrspace(0) pointer to a stack-ABI value, so cast the value slot (past the box
+            // header) down.
             if classMap[type] != nil || actorMap[type] != nil { return payload }
-            return toUnmanaged(payload)
+            return toUnmanaged(payloadValue(payload))
         }
         guard let st = selfLLVMType(type) else { return nil }
-        return LLVMBuildLoad2(b, st, payload, "self")
+        return LLVMBuildLoad2(b, st, payloadValue(payload), "self")   // value payload: value is past the header
     }
 
     // A uniform-signature thunk `ret(ptr self, params…)` wrapping the concrete impl: it bridges
@@ -151,7 +152,10 @@ extension LLVMGen {
         let payload = LLVMGetParam(fn, 0)!
 
         if let info = aggInfo(type), let pos = info.fields.firstIndex(where: { $0.name == p.name }) {
-            let addr = structGEP(info.ty, payload, fieldLLVMIndex(info.kind, pos))
+            // A struct value payload's fields start past the box's 8-byte header; a class payload is the
+            // object itself (header at 0, handled by fieldLLVMIndex's +1).
+            let base = info.kind == .classRef ? payload : payloadValue(payload)
+            let addr = structGEP(info.ty, base, fieldLLVMIndex(info.kind, pos))
             if setter {
                 storeField(payload, addr, LLVMGetParam(fn, 1)!)
                 LLVMBuildRetVoid(b)
@@ -215,11 +219,23 @@ extension LLVMGen {
         case .named(_, .class_), .named(_, .actor_):
             return v
         default:
-            let bytes = max(slotCount(t) * 8, 8)
+            // A value payload is a proper GC object `{ header, value }`: type-id header at offset 0, value
+            // at offset 8, carrying the value's managed-pointer map (the 150.3.13 pattern — the `{header,
+            // value}` shape spawnBoxTypeId already registers). Header-less, a moving collection reads the
+            // value's first word as a bogus type-id and mis-scans/mis-copies the payload. Readers reach the
+            // value at payload+8 (payloadValue, used by bridgeThunkSelf and propThunk).
+            let bytes = (1 + slotCount(t)) * 8
             let p = rtAllocManaged(LLVMConstInt(i64, UInt64(bytes), 0))
-            LLVMBuildStore(b, v, p)
+            writeTypeIdHeaderRaw(p, spawnBoxTypeId(t))
+            LLVMBuildStore(b, v, payloadValue(p))
             return p
         }
+    }
+
+    // The value slot of a value-payload box (`{ header, value }`) — the byte past the 8-byte header. Only
+    // value (struct/enum) payloads carry this header; a class/actor payload is the object itself.
+    func payloadValue(_ payload: LLVMValueRef) -> LLVMValueRef {
+        gepByte(payload, LLVMConstInt(i64, 8, 0))
     }
 
     // An `any I` value is a managed pointer to a heap `{ i8ptr witness, p1 payload }` box (8.4.1):

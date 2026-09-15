@@ -91,7 +91,11 @@ public indirect enum SSAInstKind {
     // in `env`; `binding` keys the egress-owned fiber handle so `spawnJoin` can await it. Void: the
     // handle is not an SSA value (it is a raw runtime fiber pointer).
     case spawn(binding: Int, startFn: String, env: SSAValue?, resultType: Type)
-    case spawnJoin(binding: Int, resultType: Type)         // await a spawned fiber and read its boxed result (idempotent)
+    // await a spawned fiber and read its boxed result (idempotent). `final` marks the structured scope-exit
+    // join (joinSpawns): under the self-hosted collecting GC it is the point where the fiber's result box
+    // stops being needed, so the runtime drops the fiber from the live-fiber registry. Intermediate reads
+    // (`final == false`) leave it registered so the box stays rooted until the last read (150.3.13).
+    case spawnJoin(binding: Int, resultType: Type, final: Bool)
 
     // By-value aggregates (struct / enum). These never heap-allocate, so escape analysis ignores
     // them; a value flows as a first-class SSA aggregate and its members are read by projection.

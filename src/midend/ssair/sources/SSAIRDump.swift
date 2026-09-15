@@ -95,7 +95,7 @@ private func renderKind(_ kind: SSAInstKind) -> String {
         return "send \(val(recv)).\(h)(\(list(args)))"
     case .spawn(let binding, let startFn, let env, _):
         return "spawn #\(binding) \(startFn)" + (env.map { " env \(val($0))" } ?? "")
-    case .spawnJoin(let binding, _):           return "spawnJoin #\(binding)"
+    case .spawnJoin(let binding, _, let fin):  return "spawnJoin #\(binding)" + (fin ? " final" : "")
 
     case .makeStruct(let t, let fields):       return "makeStruct \(t)(\(list(fields)))"
     case .makeEnum(let t, let ci, let fields): return "makeEnum \(t)#\(ci)(\(list(fields)))"

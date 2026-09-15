@@ -49,7 +49,7 @@ void   rt_print_double(double x);   // M6 stdlib — print a Double: shortest ro
 int64_t rt_sleep_ms(int64_t ms);
 String  rt_read_line(int fd);
 Fiber*  fiber_spawn(void* (*fn)(void*), void* arg);
-void*   spawn_join(SpawnHandle* h);
+void*   spawn_join(SpawnHandle* h, int64_t final);   // final: structured scope-exit join (150.3.13)
 
 // ---- Actor mutex (opaque, heap-allocated) — C backend only ----
 // The C backend inlines a `pthread_mutex_t` in the actor struct; it has no portable layout for the

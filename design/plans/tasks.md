@@ -122,6 +122,7 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 | 145 | [Monomorphization cost model](tasks/145-monomorphization-cost.md) | Infra | S | evaluate |
 | 146 | [Author the `language/` contract tier](tasks/146-language-contract-tier.md) | Infra | M | in-progress |
 | 147 | [Compiler cleanups (bucket)](tasks/147-compiler-cleanups.md) | Infra | S | ready-to-build |
+| 153 | [Lexical scoping of locals in SSAIRGen](tasks/153-ssairgen-lexical-scoping.md) | Infra | M | ready-to-build — crash sub-case fixed (`bind` clears cross-kind); shadow-leak open |
 
 ## ► Decide-early flags (carried from `deferred.md`)
 

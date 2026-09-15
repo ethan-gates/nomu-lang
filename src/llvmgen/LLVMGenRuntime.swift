@@ -277,9 +277,9 @@ extension LLVMGen {
     }
 
     // The self-hosted allocation slow path (task 150): route allocation at the Nomu Immix allocator in the
-    // runtime prelude (`rtImmixNew` / `rtImmixAlloc`, rung 3 increment 150.3.2). On first call it creates
-    // one Immix space and caches its descriptor in `__nomu_selfhost_space`; each call bumps a chunk within
-    // the current 32 KiB block (refilling from the block pool on overflow) and produces the managed object
+    // runtime prelude (`rtImmixNew` / `rtTlabAlloc`). On first call it creates one Immix space and caches its
+    // descriptor in `__nomu_selfhost_space`; each call bumps within the carrier's per-carrier TLAB (150.3.10.1,
+    // refilling a whole block from the shared pool under the space lock on overflow) and produces the managed object
     // via `ptrtoint`→`inttoptr` to `p1` — the same integer→`p1` step the fast path uses, which
     // `RewriteStatepointsForGC` accepts as a fresh GC base (no `addrspacecast`, no intrinsic). The block
     // memory is fresh-zeroed by `rt_raw_alloc` and never reused while non-collecting, so the object is
@@ -301,7 +301,7 @@ extension LLVMGen {
         }()
         // The runtime prelude is always compiled in, so its allocator functions are declared. Guard
         // defensively: a missing prelude falls back to a null return rather than a codegen crash.
-        guard let immixNew = callables["f:rtImmixNew"], let immixAlloc = callables["f:rtImmixAlloc"] else {
+        guard let immixNew = callables["f:rtImmixNew"], let tlabAlloc = callables["f:rtTlabAlloc"] else {
             withStubBody(fn) { LLVMBuildRet(b, LLVMConstPointerNull(p1)) }
             selfhostAllocFn = (fn, ty)
             return selfhostAllocFn!
@@ -310,27 +310,101 @@ extension LLVMGen {
         withStubBody(fn) {
             let size = LLVMGetParam(fn, 0)!
             let entryBB = LLVMGetInsertBlock(b)!
+            let lockBB = LLVMAppendBasicBlockInContext(ctx, fn, "space.lock")!
             let mkBB = LLVMAppendBasicBlockInContext(ctx, fn, "space.mk")!
+            let unlockBB = LLVMAppendBasicBlockInContext(ctx, fn, "space.unlock")!
             let useBB = LLVMAppendBasicBlockInContext(ctx, fn, "space.use")!
+            // The Immix space is a process singleton, created on the first self-hosted allocation. Multiple
+            // carriers race that first allocation (150.3.10.1), so creation is guarded by double-checked
+            // locking: an acquire-load fast path, and a C mutex around the create with a release store, so a
+            // carrier that observes a non-null space also observes the fully-initialized descriptor (arm64).
             let space0 = LLVMBuildLoad2(b, i8ptr, gSpace, "space")!
-            let isNull = LLVMBuildICmp(b, LLVMIntEQ, space0, LLVMConstPointerNull(i8ptr), "space.null")!
-            LLVMBuildCondBr(b, isNull, mkBB, useBB)
+            LLVMSetOrdering(space0, LLVMAtomicOrderingAcquire)
+            LLVMSetAlignment(space0, 8)
+            let isNull0 = LLVMBuildICmp(b, LLVMIntEQ, space0, LLVMConstPointerNull(i8ptr), "space.null0")!
+            LLVMBuildCondBr(b, isNull0, lockBB, useBB)
+            LLVMPositionBuilderAtEnd(b, lockBB)
+            let lk = runtimeFn("rt_selfhost_space_lock_acquire", ret: voidTy, params: [], varArg: false)
+            _ = buildCall(lk.0, lk.1, [])
+            let space1 = LLVMBuildLoad2(b, i8ptr, gSpace, "space.l")!   // re-check under the lock
+            let isNull1 = LLVMBuildICmp(b, LLVMIntEQ, space1, LLVMConstPointerNull(i8ptr), "space.null1")!
+            LLVMBuildCondBr(b, isNull1, mkBB, unlockBB)
             LLVMPositionBuilderAtEnd(b, mkBB)
             let made = buildCall(immixNew.fn, immixNew.ty, [numBlocks])!
-            LLVMBuildStore(b, made, gSpace)
+            let st = LLVMBuildStore(b, made, gSpace)!
+            LLVMSetOrdering(st, LLVMAtomicOrderingRelease)
+            LLVMSetAlignment(st, 8)
+            LLVMBuildBr(b, unlockBB)
+            LLVMPositionBuilderAtEnd(b, unlockBB)
+            let spaceL = LLVMBuildPhi(b, i8ptr, "space.lp")!   // PHI first (top of block), then release
+            var lvals: [LLVMValueRef?] = [space1, made]
+            var lblks: [LLVMBasicBlockRef?] = [lockBB, mkBB]
+            lvals.withUnsafeMutableBufferPointer { vp in
+                lblks.withUnsafeMutableBufferPointer { bp in
+                    LLVMAddIncoming(spaceL, vp.baseAddress, bp.baseAddress, 2)
+                }
+            }
+            let ul = runtimeFn("rt_selfhost_space_lock_release", ret: voidTy, params: [], varArg: false)
+            _ = buildCall(ul.0, ul.1, [])
             LLVMBuildBr(b, useBB)
             LLVMPositionBuilderAtEnd(b, useBB)
             let space = LLVMBuildPhi(b, i8ptr, "space.p")!
-            var avals: [LLVMValueRef?] = [space0, made]
-            var ablks: [LLVMBasicBlockRef?] = [entryBB, mkBB]
+            var avals: [LLVMValueRef?] = [space0, spaceL]
+            var ablks: [LLVMBasicBlockRef?] = [entryBB, unlockBB]
             avals.withUnsafeMutableBufferPointer { vp in
                 ablks.withUnsafeMutableBufferPointer { bp in
                     LLVMAddIncoming(space, vp.baseAddress, bp.baseAddress, 2)
                 }
             }
-            let raw = buildCall(immixAlloc.fn, immixAlloc.ty, [space, size])!
-            let addr = LLVMBuildPtrToInt(b, raw, i64, "raw.i")!
-            let obj = LLVMBuildIntToPtr(b, addr, p1, "obj")!
+            // Multi-carrier (150.3.10.1): bind this carrier's _Thread_local TLAB. rt_self_tlab_get returns a
+            // plain runtime pointer (not a managed p1).
+            let tlabGet = runtimeFn("rt_self_tlab_get", ret: i8ptr, params: [], varArg: false)
+            let tlab = buildCall(tlabGet.0, tlabGet.1, [])!
+            // Inline TLAB bump fast path (150.3.10.2): load the carrier's private cursor/limit and bump within
+            // the current hole with no call and no lock — the self-hosted analogue of the MMTk fast path above.
+            // cursor/limit (@0/@8) are heap-relative byte offsets; `need` is the 8-aligned request. A hole never
+            // spans more than one 32 KiB block, so a large-object request (need > block) can never satisfy
+            // `cursor + need <= limit` and falls to the slow call, which routes it to LOS — no inline LOS check.
+            // On a hit the object address is heapBaseInt (@40) + cursor, produced as inttoptr→p1 (a fresh GC
+            // base the rewrite pass accepts). A miss (hole exhausted or large object) calls rtTlabAlloc, which
+            // refills under the space lock or routes to LOS, exactly as before.
+            let bumpBB = LLVMAppendBasicBlockInContext(ctx, fn, "tlab.bump")!
+            let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "tlab.slow")!
+            let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "tlab.done")!
+            let cur = LLVMBuildLoad2(b, i64, tlab, "tlab.cur")!
+            let lim = LLVMBuildLoad2(b, i64, gepByte(tlab, LLVMConstInt(i64, 8, 0)), "tlab.lim")!
+            let need = LLVMBuildAnd(b, LLVMBuildAdd(b, size, LLVMConstInt(i64, 7, 0), "sz+7"),
+                                    LLVMConstInt(i64, ~UInt64(7), 0), "need")!
+            let newCur = LLVMBuildAdd(b, cur, need, "tlab.new")!
+            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntULE, newCur, lim, "tlab.fits"), bumpBB, slowBB)
+            LLVMPositionBuilderAtEnd(b, bumpBB)
+            LLVMBuildStore(b, newCur, tlab)
+            let heapBaseInt = LLVMBuildLoad2(b, i64, gepByte(space, LLVMConstInt(i64, 40, 0)), "heapbaseint")!
+            let fastObj = LLVMBuildIntToPtr(b, LLVMBuildAdd(b, heapBaseInt, cur, "obj.off"), p1, "obj.fast")!
+            LLVMBuildBr(b, doneBB)
+            LLVMPositionBuilderAtEnd(b, slowBB)
+            // Capture the user-frame anchor for a synchronous collection at OOM (150.3.11). __nomu_selfhost_alloc
+            // is the immediate callee of user code, so returnaddress(0) is the user statepoint PC and
+            // frameaddress(0)+16 is the user frame's SP (the RT_USER_ANCHOR convention). Passed to rtTlabAlloc,
+            // which hands them to the OOM path so the STW walk finds this in-flight allocation's roots.
+            let frameAddr = runtimeFn("llvm.frameaddress.p0", ret: i8ptr, params: [i32], varArg: false)
+            let retAddr = runtimeFn("llvm.returnaddress.p0", ret: i8ptr, params: [i32], varArg: false)
+            let fp = buildCall(frameAddr.0, frameAddr.1, [LLVMConstInt(i32, 0, 0)])!
+            let anchorSp = gepByte(fp, LLVMConstInt(i64, 16, 0))
+            let ra = buildCall(retAddr.0, retAddr.1, [LLVMConstInt(i32, 0, 0)])!
+            let anchorPc = LLVMBuildPtrToInt(b, ra, i64, "anchor.pc")!
+            let raw = buildCall(tlabAlloc.fn, tlabAlloc.ty, [tlab, space, size, anchorSp, anchorPc])!
+            let slowObj = LLVMBuildIntToPtr(b, LLVMBuildPtrToInt(b, raw, i64, "raw.i"), p1, "obj.slow")!
+            LLVMBuildBr(b, doneBB)
+            LLVMPositionBuilderAtEnd(b, doneBB)
+            let obj = LLVMBuildPhi(b, p1, "obj")!
+            var ovals: [LLVMValueRef?] = [fastObj, slowObj]
+            var oblks: [LLVMBasicBlockRef?] = [bumpBB, slowBB]
+            ovals.withUnsafeMutableBufferPointer { vp in
+                oblks.withUnsafeMutableBufferPointer { bp in
+                    LLVMAddIncoming(obj, vp.baseAddress, bp.baseAddress, 2)
+                }
+            }
             LLVMBuildRet(b, obj)
         }
         selfhostAllocFn = (fn, ty)

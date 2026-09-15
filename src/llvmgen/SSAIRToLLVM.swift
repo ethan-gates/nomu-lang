@@ -346,8 +346,8 @@ final class SSAIRToLLVM {
             _ = e.emitActorSend(actorName, handler, val(receiver), args.map { val($0) }, span)
         case .spawn(let binding, let startFn, let env, let resultType):
             lowerSpawn(binding: binding, startFn: startFn, env: env, resultType: resultType, span: span)
-        case .spawnJoin(let binding, let resultType):
-            lowerSpawnJoin(inst, binding: binding, resultType: resultType, span: span)
+        case .spawnJoin(let binding, let resultType, let fin):
+            lowerSpawnJoin(inst, binding: binding, resultType: resultType, final: fin, span: span)
 
         case .makeStruct(let t, let fields):
             define(inst, makeStruct(t, fields, span))
@@ -1166,9 +1166,13 @@ final class SSAIRToLLVM {
         e.withStubBody(thunk) {
             let envArg = LLVMGetParam(thunk, 0)!   // addr0 void* — matches `spawn:N`'s addr0 env param
             let r = e.buildCall(start.fn, start.ty, [envArg])!
-            let bytes = max(e.slotCount(resultType) * 8, 8)
-            let box = e.rtAllocManaged(LLVMConstInt(e.i64, UInt64(bytes), 0))
-            e.storeField(box, box, r)
+            // A proper typed box { header, result } (150.3.13): the header lets a moving collection relocate
+            // the box, which the self-hosted STW walk roots at fib+216 until the join; its pointer map scans a
+            // managed result so that survives + is fixed up too. Result lives after the 8-byte header.
+            let slots = 1 + e.slotCount(resultType)
+            let box = e.rtAllocManaged(LLVMConstInt(e.i64, UInt64(slots * 8), 0))
+            e.writeTypeIdHeaderRaw(box, e.spawnBoxTypeId(resultType))
+            e.storeField(box, e.gepByte(box, LLVMConstInt(e.i64, 8, 0)), r)
             LLVMBuildRet(b, e.toUnmanaged(box))
         }
         let (spawn, sty) = e.runtimeFn("fiber_spawn", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr], varArg: false)
@@ -1180,12 +1184,15 @@ final class SSAIRToLLVM {
         spawnHandles[binding] = handleSlot
     }
 
-    private func lowerSpawnJoin(_ inst: SSAInst, binding: Int, resultType: Type, span: Span) {
+    private func lowerSpawnJoin(_ inst: SSAInst, binding: Int, resultType: Type, final: Bool, span: Span) {
         guard let handleSlot = spawnHandles[binding] else { return }
-        let (sj, sty) = e.runtimeFn("spawn_join", ret: e.i8ptr, params: [e.i8ptr], varArg: false)
-        let box = e.buildCall(sj, sty, [handleSlot])!
+        // `final` (the structured scope-exit join) tells the runtime to drop the fiber from the live-fiber
+        // registry after reading the result — the point its result box stops being rooted (150.3.13).
+        let (sj, sty) = e.runtimeFn("spawn_join", ret: e.i8ptr, params: [e.i8ptr, e.i64], varArg: false)
+        let box = e.buildCall(sj, sty, [handleSlot, LLVMConstInt(e.i64, final ? 1 : 0, 0)])!
         if let result = inst.result, let rt = ty(resultType, span) {
-            values[result.id] = LLVMBuildLoad2(b, rt, box, "spawn.res")
+            let payload = e.gepByte(box, LLVMConstInt(e.i64, 8, 0))   // result after the 8-byte header (150.3.13)
+            values[result.id] = LLVMBuildLoad2(b, rt, payload, "spawn.res")
         }
     }
 }

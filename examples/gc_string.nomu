@@ -1,0 +1,35 @@
+// Task 150.3.12.2 — String buffers survive a self-hosted moving collection. A String is a value
+// `{ i8ptr data, i64 len }`; `concat` allocates the `data` buffer through the immortal seam
+// (`rt_alloc_immortal`), non-moving memory that must outlive a moving GC. `main` grows one String by
+// repeated `concat` (a fresh immortal buffer each time) while over-allocating garbage Boxes far past the
+// 256 MiB heap, forcing collections while the String is live, and folds a content hash of the String on
+// every iteration — reading back through the immortal buffer. If the self-hosted collector moved, swept,
+// or mis-scanned an immortal buffer, the hash would diverge from MMTk or the readback would fault.
+//
+// The immortal buffers live off-heap relative to the self-hosted Immix space, so the evacuator's off-heap
+// guard leaves them in place and the self-hosted sweep never touches them — the interim immortal path
+// (MMTk immortal space) holds under NOMU_RUNTIME=selfhost. The folded hash is content-deterministic, so it
+// is checksum-identical to MMTk NoGC. Run with NOMU_NO_ESCAPE=1 so the garbage Boxes are real heap objects.
+class Box {
+  var v: Int
+}
+
+fun main() {
+  var acc = ""
+  var i = 0
+  var checksum = 0
+  while i < 3000 {
+    acc = concat(acc, "x")          // grow the String → a fresh immortal buffer per concat
+    // Garbage to drive collection: 3000 × 8192 × 16 B ≈ 393 MiB ≫ the 256 MiB heap.
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 8192 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+    checksum = checksum + acc.hash   // read back through the (immortal) buffer; must survive the collection
+    i = i + 1
+  }
+  print(checksum)
+  print("\n")
+}

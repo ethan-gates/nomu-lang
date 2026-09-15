@@ -204,6 +204,39 @@ The parts this task owns directly (the delegated prerequisites 125/149/150/127 k
     fix-up) is 150.4. With this, the scheduler self-host (128.1) is complete and GenImmix (150.4) can land
     on the self-hosted scheduler.
 
+- **128.4 — Unify the self-hosted runtime surface (one lever).** *Built.* `NOMU_RUNTIME` is resolved in C
+  at the top of `main` (before `nomu_gc_init`): `selfhost` promotes the scheduler (`rt_sched_plan =
+  RT_SCHED_NOMU`) and stores the `__nomu_runtime_selfhost` byte that `nomu_gc_init` reads to route allocation
+  at the Nomu allocator. A self-hosted allocator auto-promotes the scheduler; pinning `NOMU_SCHED=c` with a
+  self-hosted allocator aborts with a message (the forbidden quadrant is closed). `NOMU_SCHED` /
+  `NOMU_GC_PLAN` remain the oracle overrides. Verified: `NOMU_RUNTIME=selfhost` reproduces `NOMU_SCHED=nomu
+  NOMU_GC_PLAN=nomu` on `gc_pressure` (94950 + repeated collections); `NOMU_GC_PLAN=nomu` alone auto-promotes;
+  the forbidden combo aborts (rc 134); native default stays MMTk; all 27 drivers green. Until
+  150.3.9 the scheduler (`NOMU_SCHED`) and allocator (`NOMU_GC_PLAN`) were independent selectors, validly
+  exercised in isolation (the scheduler was brought up on MMTk NoGC). Collecting-on-scheduler couples them:
+  the self-hosted collector's STW handshake, pcsp root walk, and slot fixup all live in the scheduler
+  machinery, so **self-hosted GC requires the self-hosted scheduler** (the reverse does not hold — the
+  scheduler runs on MMTk). Two co-equal user levers therefore expose one incoherent combination. This phase
+  collapses the user-facing surface to a single lever and pins the supported matrix.
+  - *One product lever.* A `NOMU_RUNTIME={native,selfhost}` umbrella (default `native` for now). `selfhost`
+    turns on the self-hosted scheduler + self-hosted allocator + collector as one unit. Product docs name only
+    `NOMU_RUNTIME`.
+  - *Decomposed selectors demoted to oracle overrides.* `NOMU_SCHED` / `NOMU_GC_PLAN` survive as the
+    differential-test harness surface (we diff against MMTk and the C scheduler until MMTk retirement, after
+    150.4). They are documented as internal oracle knobs, not co-equal product levers.
+  - *Enumerated support matrix — three configs supported, one forbidden:*
+    - (C sched, MMTk) — the joint differential oracle.
+    - (Nomu sched, MMTk NoGC) — the scheduler-isolation oracle (bisect a scheduler bug from an allocator bug).
+    - (Nomu sched, Nomu GC) — the product runtime; what `NOMU_RUNTIME=selfhost` selects; eventually the default.
+    - (C sched, Nomu GC) — **forbidden.** Collection needs the Nomu STW/root-walk. Setting the allocator
+      self-hosted auto-promotes the scheduler to self-hosted (or errors if the harness pinned `NOMU_SCHED=c`).
+  - *One carrier-boot path.* Fold the scheduler-carrier boot and the allocator's per-carrier binding into a
+    single "boot a carrier in the self-hosted runtime" path, so the 150.3.10 per-carrier TLAB hangs off one
+    boot site rather than two independently-gated ones. This is why 128.4 precedes 150.3.10.
+  - *Making `selfhost` the default* (retiring the `native` lever) waits for the self-hosted runtime to reach
+    feature parity — multi-carrier allocation (150.3.10), the production pressure path (150.3.11), and broader
+    roots (150.3.12) — and ultimately MMTk retirement after 150.4.
+
 ## Refs
 
 deferred.md "Self-hosting the runtime"; `runtime.md` (scheduler, safepoints, mutator);

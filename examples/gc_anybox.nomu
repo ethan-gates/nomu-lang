@@ -1,0 +1,54 @@
+// Task 150.3.12.3 — `any I` value-payload boxes survive a self-hosted moving collection. Boxing a value
+// type as `any I` copies the value into a heap payload; that payload is now a proper GC object
+// `{ header, value }` (a real type-id + the value's managed-pointer map), so a moving collection reads a
+// valid type-id and relocates it with the correct size. Header-less (pre-fix), the collector read the
+// value's first word (here `x`) as a bogus type-id: an out-of-range id clamps to size 0 and the box is
+// copied as 0 bytes, while a small in-range id copies the wrong size or scans wrong offsets as pointers —
+// so under a force-all evacuation the boxed value came back corrupted or the tracer faulted.
+//
+// `items` keeps 64 boxed Pt values live while garbage over-allocation forces defrag collections that
+// relocate payloads; dispatching `total()` afterward reads each Pt back through the (relocated) payload.
+// Each Pt k has x=k, y=k+100, so total = 2k+100; the grand total over k = 0..63 is 10432 — deterministic
+// and checksum-identical to MMTk NoGC. Run with NOMU_NO_ESCAPE=1 so the boxes are real heap objects.
+interface Metric {
+    fun total() -> Int
+}
+struct Pt: Metric {
+    var x: Int
+    var y: Int
+    fun total() -> Int {
+        return x + y
+    }
+}
+class Box {
+    var v: Int
+}
+fun main() {
+    var items: Array<any Metric> = []
+    var k = 0
+    while k < 64 {
+        let p = Pt(x: k, y: k + 100)
+        let m: any Metric = p
+        items.append(m)
+        k = k + 1
+    }
+    // Garbage to force collection while the boxed Pt values are live: 2000 × 8192 × 16 B ≈ 262 MiB.
+    var i = 0
+    while i < 2000 {
+        var junk: Array<Box> = []
+        var g = 0
+        while g < 8192 {
+            junk.append(Box(v: g))
+            g = g + 1
+        }
+        i = i + 1
+    }
+    var total = 0
+    var j = 0
+    while j < 64 {
+        total = total + items[j].total()
+        j = j + 1
+    }
+    print(total)                     // 10432
+    print("\n")
+}

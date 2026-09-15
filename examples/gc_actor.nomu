@@ -1,0 +1,60 @@
+// Task 150.3.12.1 — the actor scheduled-mailbox queue as a GC root under a moving collection.
+//
+// `blast` creates many short-lived Worker actors. Each gets `nMsgs` fire-and-forget `add` messages and a
+// final `report`, then its handle is dropped at the end of the loop iteration — so from that point the
+// actor, its mailbox, and every queued message are reachable ONLY through the scheduler's scheduled-mailbox
+// queue (head sched+80, chain via sched_next, tail sched+88). With one carrier the sends all run before any
+// drain, so the whole backlog of mailboxes sits on that queue while the drain begins.
+//
+// Each `add` handler allocates a throwaway sliding window of Boxes (garbage the moment the handler returns),
+// so draining the backlog over-allocates far past the 256 MiB heap and forces repeated collections WHILE
+// later workers' mailboxes are still queued. Those queued mailboxes carry live messages whose `self`
+// receiver and `v` arg must survive each collection — the exact thing 150.3.12.1 roots. Absent the queue
+// root, a collection mid-drain reclaims/moves a queued mailbox and its messages, and the surviving actors'
+// sums diverge (or the program faults on a stale pointer).
+//
+// Each Worker sums the values it receives; `report` prints `tag sum`. The per-actor add sequence is fixed
+// (0..nMsgs-1 by single-drain FIFO), so every sum is deterministic and independent of GC and scheduling —
+// checksum-identical to MMTk NoGC. Run with NOMU_NO_ESCAPE=1 so the garbage Boxes are real heap objects.
+class Box {
+  var v: Int
+}
+
+actor Worker {
+  var sum: Int = 0
+  on add(v: Int) {
+    sum = sum + v
+    // Throwaway garbage: a sliding window of Boxes that escapes into `xs`, then dies at handler return.
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 256 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+  }
+  on report(tag: Int) {
+    print(tag)
+    print(" ")
+    print(sum)
+    print("\n")
+  }
+}
+
+fun blast(nActors: Int, nMsgs: Int) {
+  var a = 0
+  while a < nActors {
+    let w = Worker()
+    var i = 0
+    while i < nMsgs {
+      w.add(v: i)
+      i = i + 1
+    }
+    w.report(tag: a)     // FIFO after the adds → prints this actor's sum once its mailbox drains
+    a = a + 1
+    // w is dropped here: the mailbox + its queued messages live only on the scheduled queue now.
+  }
+}
+
+fun main() {
+  blast(2000, 50)        // 2000 actors × (50 adds × 256 garbage Boxes) ≈ 400 MiB ≫ 256 MiB heap
+}

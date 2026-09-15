@@ -1,0 +1,31 @@
+// Heap-pressure-triggered self-hosted Immix collection on the Nomu scheduler. A single fiber keeps a
+// sliding window of 100 live Boxes in an array while allocating millions of Boxes — far more than the
+// 256 MiB self-hosted heap — so the overwritten Boxes become garbage. Under NOMU_GC_PRESSURE the GC
+// thread collects when the heap fills (a defrag collection at a scheduler STW), relocating the survivors,
+// fixing up the array buffer's element pointers and the root, and reclaiming the garbage — so the program
+// survives and its checksum matches MMTk NoGC. Without collection the heap would exhaust.
+class Box {
+  var v: Int
+}
+
+fun main() {
+  var xs: Array<Box> = []
+  var w = 0
+  while w < 100 {
+    xs.append(Box(v: 0))
+    w = w + 1
+  }
+  var i = 0
+  while i < 40000000 {                 // 40M × 16 B = 640 MiB ≫ 256 MiB heap → repeated collection
+    xs[i % 100] = Box(v: i)            // overwrite → old Box garbage; new Box escapes into the buffer
+    i = i + 1
+  }
+  var sum = 0
+  var j = 0
+  while j < 100 {
+    sum = sum + xs[j].v                // reads through the relocated buffer + relocated Box pointers
+    j = j + 1
+  }
+  print(sum % 100000)
+  print("\n")
+}

@@ -373,7 +373,7 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
 // function's own body to make its live caller spill its roots at the call statepoint (selfhosted-gc.md §9).
 // A saved-context anchor carries no such dependency — its frame's roots were already spilled at the fiber's
 // park/safepoint — so factoring the loop here is sound; only rtCollectRoots must keep it inline.
-fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int) -> Int {
+fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitSlots: Int) -> Int {
   let base = RawPtr.gcStackmapBase()
   let nfuncs = rtU32(base, 4)
   let nconsts = rtU32(base, 8)
@@ -421,7 +421,13 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int) -> In
               let rootNull = root.eq(RawPtr.null)
               if !rootNull {
                 if n < cap {
-                  outBuf.store(root, toByteOffset: n * 8)
+                  // emitSlots != 0: store the slot ADDRESS (a moving collection rewrites it in place with
+                  // the forwarded pointer); else store the root VALUE (for counting / non-moving scans).
+                  if emitSlots != 0 {
+                    outBuf.store(slotPtr, toByteOffset: n * 8)
+                  } else {
+                    outBuf.store(root, toByteOffset: n * 8)
+                  }
                   n = n + 1
                 }
               }
@@ -458,7 +464,7 @@ fun rtScanParkedFibers(outBuf: RawPtr, cap: Int) -> Int {
   while i < nf {
     let sp: RawPtr = anchors.load(fromByteOffset: i * 16)
     let pc: Int = anchors.load(fromByteOffset: i * 16 + 8)
-    n = rtWalkFrom(sp, pc, outBuf, n, cap)
+    n = rtWalkFrom(sp, pc, outBuf, n, cap, 0)
     i = i + 1
   }
   anchors.free()
@@ -473,11 +479,11 @@ fun rtScanParkedFibers(outBuf: RawPtr, cap: Int) -> Int {
 // (§10.2, Decided), one byte per entry, over the reserved heap range. Entry value 0 is the initial state
 // (block FREE / line unmarked), and rt_raw_alloc zero-fills, so the fresh tables start correct.
 //
-// Space descriptor (120 bytes):
+// Space descriptor (128 bytes):
 //   { heapBase: RawPtr @0, numBlocks: Int @8, lineTable: RawPtr @16, blockTable: RawPtr @24,
 //     freeCursor: Int @32, heapBaseInt: Int @40, allocCursor: Int @48, allocLimit: Int @56,
 //     losHead: RawPtr @64, allocBlock: Int @72, allocLine: Int @80, freeList: RawPtr @88,
-//     freeListTop: Int @96, scanBlock: Int @104, defragTable: RawPtr @112 }.
+//     freeListTop: Int @96, scanBlock: Int @104, defragTable: RawPtr @112, poolLock: Int @120 }.
 // allocCursor/allocLimit are heap-relative byte offsets bounding the current hole (0/0 → refill). freeCursor
 // bumps never-used blocks. allocBlock/allocLine track the block being filled + its next line to scan for
 // holes (allocBlock −1 = none). freeList is a stack of reclaimed empty block indices (freeListTop entries).
@@ -486,6 +492,12 @@ fun rtScanParkedFibers(outBuf: RawPtr, cap: Int) -> Int {
 // fragmentation histogram the defrag trigger (150.3.8) selects evacuation sources from (§10.6). Block state
 // byte: 0 FREE, 1 RECYCLABLE, 2 UNAVAILABLE, 3 DEFRAG_SOURCE (transient: a block selected for evacuation this
 // collection, overwritten by the sweep). Line mark byte: 0 unmarked, 1 marked.
+//
+// Multi-carrier split (150.3.10.1): mutators allocate through per-carrier TLABs, not this descriptor. The
+// allocCursor/allocLimit/allocBlock/allocLine fields above are the *collector's* single-threaded copy
+// allocator (evacuation to-space), run only under STW. The shared block pool (freeCursor/freeList/freeListTop/
+// scanBlock) and the large-object list (losHead) are pulled under poolLock @120 — a 3-state futex mutex
+// (rtSchedMutexLockAt). The per-carrier bump fast path takes no lock.
 
 // Reserve a heap of `numBlocks` 32 KiB blocks + its side tables; return the space descriptor.
 fun rtImmixNew(numBlocks: Int) -> RawPtr {
@@ -497,7 +509,7 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   let blockTable = RawPtr.alloc(bytes: numBlocks, align: 8)
   let freeList = RawPtr.alloc(bytes: numBlocks * 8, align: 8)
   let defragTable = RawPtr.alloc(bytes: numBlocks, align: 8)
-  let ctl = RawPtr.alloc(bytes: 120, align: 8)
+  let ctl = RawPtr.alloc(bytes: 128, align: 8)
   ctl.store(heap, toByteOffset: 0)
   ctl.store(numBlocks, toByteOffset: 8)
   ctl.store(lineTable, toByteOffset: 16)
@@ -514,6 +526,7 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   ctl.store(0, toByteOffset: 96)     // freeListTop
   ctl.store(0, toByteOffset: 104)    // scanBlock
   ctl.store(defragTable, toByteOffset: 112)  // per-block last-sweep live-line count (defrag histogram)
+  ctl.store(0, toByteOffset: 120)            // poolLock (150.3.10.1): shared-pool + LOS futex mutex, unlocked
   return ctl
 }
 
@@ -728,6 +741,164 @@ fun rtImmixAlloc(space: RawPtr, n: Int) -> RawPtr {
       done = true
     } else {
       let ok = rtNextHole(space, need)
+      if !ok {
+        result = RawPtr.null
+        done = true
+      }
+    }
+  }
+  return result
+}
+
+// ---- Multi-carrier allocation (task 150 · 150.3.10.1) ----
+// Each carrier owns a 32-byte TLAB { allocCursor@0, allocLimit@8, allocBlock@16, allocLine@24 } and bumps
+// within it privately (no lock). The shared block pool and large-object list are pulled under the space's
+// poolLock (@120). Mirrors Go's mcache/mcentral and MMTk's per-mutator TLABs. The TLAB is bound _Thread_local
+// per carrier in the C runtime (rt_self_tlab_get) and registered in a table the collector resets at
+// end-of-collection (evacuation may relocate a carrier's current block).
+
+// Synchronous collection at true OOM (task 150.3.11). rtImmixRefill calls this when the shared pool has no
+// block left. It parks this carrier at its alloc-site anchor so the stop-the-world walk finds the in-flight
+// allocation's roots (the anchor is the user frame that called the alloc seam — the seam's immediate caller,
+// a statepoint rtWalkFrom matches), initiates a stop-the-world, signals the GC coordinator (a plain pthread)
+// to run a defrag collection, and waits for it to finish; then reports whether the collection reclaimed space
+// so the refill can retry. Returns false when there is no self-hosted scheduler (no collector) or the
+// collection freed nothing (a genuine out-of-memory — the heap is full of live data). The coordinator resets
+// this carrier's TLAB before resuming it (rt_tlab_reset_all under STW), so the caller re-reads the TLAB.
+//
+// The park mirrors nomuSchedSafepoint exactly: under the scheduler lock, set the user-frame anchor and the
+// fiber state (safepoint-stopped, 4), then switch to the carrier context. The carrier loop then acks the STW
+// (rtSchedStwParkCarrier) and waits, and switches back into this fiber on resume — so the ack accounting,
+// state discipline, and stack-save are the proven poll-site machinery, not an ad-hoc in-place block. The one
+// addition is initiating the STW: the first carrier into OOM sets the stw-request (sched+136) under the lock
+// and wakes the coordinator; because 136 is set before this fiber parks, the carrier's `while 136 != 0` wait
+// cannot race ahead of the request. Concurrent OOMs coalesce (only the first initiates; the rest just park).
+fun rtSelfhostOom(anchorSp: RawPtr, anchorPc: Int) -> Bool {
+  let sched = RawPtr.schedHandle()
+  if sched.isNull {
+    return false
+  }
+  let self = RawPtr.tlsGet()
+  rtSchedSetAnchor(self, anchorSp, anchorPc)      // user-frame anchor for the STW walk (128.3.2 machinery)
+  rtSchedLock(sched)
+  if sched.atomicLoad(fromByteOffset: 136) == 0 {
+    sched.atomicStore(1, toByteOffset: 136)       // initiate the stop-the-world (this carrier is the initiator)
+    sched.atomicStore(1, toByteOffset: 168)       // signal the GC coordinator to run the collection
+    sched.advanced(by: 168).futexWake(all: false)
+  }
+  self.store(4, toByteOffset: 168)                // safepoint-stopped; the carrier acks + waits, then resumes us
+  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
+  self.ctxSwitchTo(carrierCtx)
+  rtSchedUnlock(sched)
+  // Retry-worthy iff the heap is not completely full after the collection: any free block suffices for a
+  // non-LOS allocation (a hole is at most one block). Checking `> 0` rather than a before/after delta avoids
+  // a false OOM when a concurrent carrier grabs the reclaimed blocks first — genuine OOM is a heap that a full
+  // collection left with zero free blocks (a live set the size of the heap).
+  let availAfter = nomuGcSpaceAvail()
+  return availAfter > 0
+}
+
+// Refill the carrier's TLAB with the next hole big enough for `need` bytes, pulling blocks from the shared
+// pool under poolLock. The hole scan matches rtNextHole (skips live lines so recyclable-block holes are
+// respected) but runs on the TLAB's private block/line/cursor/limit. Whole-block-per-carrier: a fresh block
+// is pulled on block exhaustion; cross-carrier hole sharing is deferred (150.3.10.2). On block exhaustion it
+// triggers a synchronous collection at the alloc-site anchor and retries (150.3.11); returns false only on a
+// genuine OOM (a collection that reclaimed nothing).
+fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+  rtSchedMutexLockAt(space.advanced(by: 120))
+  var done = false
+  var result = false
+  while !done {
+    let ab: Int = tlab.load(fromByteOffset: 16)
+    if ab < 0 {
+      let nb = rtNextAllocBlock(space)
+      if nb < 0 {
+        // Pool exhausted → synchronous collection at true OOM (150.3.11). Release the pool lock (the collector
+        // runs under STW; parking while holding it would be wrong), trigger + wait, then re-acquire and retry
+        // the loop (which re-reads the TLAB the collection reset). A collection that freed nothing is genuine
+        // OOM: stop with result = false.
+        rtSchedMutexUnlockAt(space.advanced(by: 120))
+        let progressed = rtSelfhostOom(anchorSp, anchorPc)
+        rtSchedMutexLockAt(space.advanced(by: 120))
+        if !progressed {
+          done = true
+        }
+      } else {
+        tlab.store(nb, toByteOffset: 16)
+        tlab.store(0, toByteOffset: 24)
+      }
+    } else {
+      let al: Int = tlab.load(fromByteOffset: 24)
+      if al >= 128 {
+        tlab.store(-1, toByteOffset: 16)       // block exhausted → pull another next iteration
+      } else {
+        let firstLine = ab * 128
+        let gi = firstLine + al
+        if rtLineMarked(space, gi) == 1 {
+          tlab.store(al + 1, toByteOffset: 24)
+        } else {
+          var e = al
+          var run = true
+          while run {
+            if e >= 128 {
+              run = false
+            } else {
+              let ge = firstLine + e
+              if rtLineMarked(space, ge) == 1 {
+                run = false
+              } else {
+                e = e + 1
+              }
+            }
+          }
+          tlab.store(e, toByteOffset: 24)       // advance past this run
+          let runLines = e - al
+          let holeBytes = runLines * 256
+          if holeBytes >= need {
+            let startOff = ab * 32768 + al * 256
+            let endOff = ab * 32768 + e * 256
+            tlab.store(startOff, toByteOffset: 0)
+            tlab.store(endOff, toByteOffset: 8)
+            done = true
+            result = true
+          }
+        }
+      }
+    }
+  }
+  rtSchedMutexUnlockAt(space.advanced(by: 120))
+  return result
+}
+
+// Allocate `n` bytes for a carrier via its TLAB (150.3.10.1). Private bump within the TLAB's current hole (no
+// lock); on overflow refill from the shared pool under poolLock. Objects larger than a block route to the
+// shared large-object space, also under the lock. Returns a RawPtr into the heap (or a LOS chunk), or
+// RawPtr.null on heap exhaustion. This is the mutator alloc target the codegen self-hosted-alloc seam routes
+// to; the collector's own copy allocator keeps using rtImmixAlloc on the descriptor bump state (single-thread,
+// under STW).
+fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
+  let bumped = n + 7
+  let need = bumped / 8 * 8
+  if need > 32768 {
+    rtSchedMutexLockAt(space.advanced(by: 120))
+    let los = rtLosAlloc(space, need)          // larger than a block → shared large-object space (off-heap malloc)
+    rtSchedMutexUnlockAt(space.advanced(by: 120))
+    return los
+  }
+  var done = false
+  var result = RawPtr.null
+  while !done {
+    let cur: Int = tlab.load(fromByteOffset: 0)
+    let lim: Int = tlab.load(fromByteOffset: 8)
+    if cur + need <= lim {
+      let heap: RawPtr = space.load(fromByteOffset: 0)
+      result = heap.advanced(by: cur)
+      tlab.store(cur + need, toByteOffset: 0)
+      done = true
+    } else {
+      // On overflow refill from the pool; a true-OOM refill triggers a synchronous collection at the alloc-site
+      // anchor and retries (150.3.11), returning false only on genuine OOM.
+      let ok = rtImmixRefill(space, tlab, need, anchorSp, anchorPc)
       if !ok {
         result = RawPtr.null
         done = true
@@ -1489,6 +1660,143 @@ fun rtImmixEvacCollect(space: RawPtr, root: RawPtr) -> RawPtr {
   return newRoot
 }
 
+// ---- Whole-heap collection over a multi-mutator root-slot set (driven at a scheduler STW) ----
+// The multi-root generalisation of rtImmixEvacCollect: the 128.3.2 STW walk hands a set of root SLOT
+// addresses (every stopped mutator's live stack roots), and this evacuates the whole live graph and rewrites
+// each slot in place with its survivor's forwarded address — the moving-collection fixup on the stopped
+// mutator stacks. Force-all (every used block a source), so it is a maximal-move stress of the fixup path;
+// the fragmentation-selective version rides the defrag trigger below. Correct across shared subgraphs and
+// duplicate slots via the forwarded-bit guard in rtEvacuate (a second slot reaching an already-moved object
+// gets its forwarding pointer). Runs with the world stopped, so the raw root pointers are stable.
+fun rtImmixCollectRoots(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
+  rtClearAllLines(space)
+  let fc: Int = space.load(fromByteOffset: 32)
+  var bi = 0
+  while bi < fc {
+    rtSetBlockState(space, bi, 3)             // every used block is an evacuation source (force-all)
+    bi = bi + 1
+  }
+  space.store(0, toByteOffset: 96)            // free list empty — to-space is fresh (never-used) blocks only
+  rtSetupCopyAllocator(space)
+  var i = 0
+  while i < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
+    let old: RawPtr = slot.load(fromByteOffset: 0)
+    let oldNull = old.eq(RawPtr.null)
+    if !oldNull {
+      let new = rtImmixEvacMark(space, old)   // evacuate this root's reachable graph (shared state across calls)
+      slot.store(new, toByteOffset: 0)        // fix up the root slot on the stopped mutator's stack
+    }
+    i = i + 1
+  }
+  rtImmixSweepBlocks(space)
+  rtImmixSweepLos(space)
+  var j = 0
+  while j < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
+    let r: RawPtr = slot.load(fromByteOffset: 0)
+    let rNull = r.eq(RawPtr.null)
+    if !rNull {
+      rtImmixUnmark(r)                        // clear object mark bits for the next collection
+    }
+    j = j + 1
+  }
+  rtResetAllocator(space)
+  return nslots
+}
+
+// The defrag variant over a root-slot set — the general collector generalised to many mutators. Sources
+// are chosen by fragmentation within the copy reserve (rtSelectDefragSources), so it never runs out of
+// to-space and is non-moving when the heap is near-full — the collection to run under heap pressure, where
+// force-all cannot (no free blocks for to-space). Only source-block roots move; their slots are fixed up.
+fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
+  let nSources = rtSelectDefragSources(space)
+  rtClearAllLines(space)
+  rtSetupCopyAllocator(space)
+  var i = 0
+  while i < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
+    let old: RawPtr = slot.load(fromByteOffset: 0)
+    let oldNull = old.eq(RawPtr.null)
+    if !oldNull {
+      let new = rtImmixEvacMark(space, old)
+      slot.store(new, toByteOffset: 0)
+    }
+    i = i + 1
+  }
+  rtImmixSweepBlocks(space)
+  rtImmixSweepLos(space)
+  var j = 0
+  while j < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
+    let r: RawPtr = slot.load(fromByteOffset: 0)
+    let rNull = r.eq(RawPtr.null)
+    if !rNull {
+      rtImmixUnmark(r)
+    }
+    j = j + 1
+  }
+  rtResetAllocator(space)
+  return nSources
+}
+
+// Drive a self-hosted collection at an STW: walk every stopped mutator's root SLOTS and run the evacuating
+// collection over the self-hosted Immix space (NOMU_GC_PLAN=nomu). `forceAll != 0` moves every live object
+// (a maximal-move fixup stress, needs free to-space); else the defrag collector (heap-pressure-safe). Called
+// by the STW coordinator with the world stopped. Returns the number of roots processed (0 off the self-hosted
+// GC plan — the space is null under MMTk/NoGC).
+fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
+  let space = RawPtr.gcSelfhostSpace()
+  let spaceNull = space.eq(RawPtr.null)
+  if spaceNull {
+    return 0
+  }
+  let cap = 8192
+  let slots = RawPtr.alloc(bytes: cap * 8, align: 8)
+  let ns = nomuSchedWalkSlots(sched, slots, cap)
+  if forceAll != 0 {
+    rtImmixCollectRoots(space, slots, ns)
+  } else {
+    rtImmixCollectRootsDefrag(space, slots, ns)
+  }
+  slots.free()
+  return ns
+}
+
+// Force-all collection (the maximal-move fixup smoke).
+fun nomuSchedStwCollect(sched: RawPtr) -> Int {
+  return nomuSchedStwCollectPlan(sched, 1)
+}
+
+// Defrag collection (the heap-pressure path).
+fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
+  return nomuSchedStwCollectPlan(sched, 0)
+}
+
+// Available empty blocks in the self-hosted Immix space (never-used + reclaimed-free) — the heap-pressure
+// gauge the GC-trigger thread polls. Returns -1 when the self-hosted space does not exist (MMTk/NoGC plan).
+fun nomuGcSpaceAvail() -> Int {
+  let space = RawPtr.gcSelfhostSpace()
+  let spaceNull = space.eq(RawPtr.null)
+  if spaceNull {
+    return -1
+  }
+  let nb: Int = space.load(fromByteOffset: 8)
+  let fc: Int = space.load(fromByteOffset: 32)
+  let flTop: Int = space.load(fromByteOffset: 96)
+  return nb - fc + flTop
+}
+
+// Total blocks in the self-hosted Immix space (for the trigger threshold). 0 when it does not exist.
+fun nomuGcSpaceBlocks() -> Int {
+  let space = RawPtr.gcSelfhostSpace()
+  let spaceNull = space.eq(RawPtr.null)
+  if spaceNull {
+    return 0
+  }
+  return space.load(fromByteOffset: 8)
+}
+
 // ---- Copy reserve + defrag trigger — the general collector (task 150 · rung 3, 150.3.8) ----
 // The defrag trigger replaces force-all: only fragmented blocks are evacuated, and only as many as fresh
 // to-space can absorb (the copy reserve). Fragmentation is read from defragTable — each block's live-line
@@ -1608,6 +1916,7 @@ fun rtScanSchedRoot(outBuf: RawPtr, n0: Int, cap: Int) -> Int {
 //                 · 80 mbox-sched-head · 88 mbox-sched-tail · 96 active-drains · 104 mbfiber-free
 //                 · 112 mbfiber-count · 120 drain-fn-ptr (nomu_actor_drain) · 128 registry-head
 //                 · 136 stw-request · 144 stw-ack · 152 stw-gen · 160 ncarriers   (STW handshake, 128.3.2)
+//                 · 168 gc-request   (OOM initiator → GC coordinator signal, 150.3.11)
 //   Timer entry (16B): 0 expiry-ns · 8 fiber
 //   Mailbox (ABI, runtime.h): 0 header · 8 mb_head · 16 mb_tail · 24 scheduled · 32 sched_next
 //   Message (ABI, runtime.h): 0 header · 8 next · 16 thunk · 24 self · args…
@@ -1869,7 +2178,9 @@ fun rtSchedFiberMain(fib: RawPtr) -> RawPtr {
   rtSchedLock(sched)
   fib.store(res, toByteOffset: 216)
   fib.store(3, toByteOffset: 168)
-  rtSchedRegRemove(sched, fib)          // done fibers hold no roots; drop from the registry
+  // Stay in the live-fiber registry (150.3.13): the result box at fib+216 is a managed object reachable only
+  // from here until the joiner reads it, so the STW walk must keep rooting it. The final (scope-exit) join
+  // drops the fiber from the registry once the box is no longer needed.
   let joiner: RawPtr = fib.load(fromByteOffset: 224)
   if joiner.isNull {
   } else {
@@ -2054,9 +2365,17 @@ fun rtSchedRegInsert(sched: RawPtr, fib: RawPtr) {
     head.store(fib, toByteOffset: 248)        // old head's prev = fib
   }
   sched.store(fib, toByteOffset: 128)
+  fib.store(1, toByteOffset: 280)             // registered = 1 (150.3.13: gate for idempotent remove)
 }
 
+// Idempotent: a fiber's structured scope-exit join may finalize it more than once (nested scopes re-run
+// joinSpawns over the same binding), so removing an already-removed fiber is a no-op (150.3.13).
 fun rtSchedRegRemove(sched: RawPtr, fib: RawPtr) {
+  let reg: Int = fib.load(fromByteOffset: 280)
+  if reg == 0 {
+    return
+  }
+  fib.store(0, toByteOffset: 280)
   let prev: RawPtr = fib.load(fromByteOffset: 248)
   let next: RawPtr = fib.load(fromByteOffset: 240)
   if prev.isNull {
@@ -2112,7 +2431,7 @@ fun nomuSchedSafepoint(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
 // walk). Appends roots into outBuf; returns the count. Skips running fibers (their roots are the caller's
 // live stack, reached differently) and fibers with no anchor. Caller has stopped the world (all target
 // fibers parked at a safepoint), so the registry + anchors are stable.
-fun nomuSchedWalkParked(sched: RawPtr, outBuf: RawPtr, cap: Int) -> Int {
+fun nomuSchedWalkRoots(sched: RawPtr, outBuf: RawPtr, cap: Int, emitSlots: Int) -> Int {
   var n = 0
   var cur: RawPtr = sched.load(fromByteOffset: 128)
   while cur.isNull == false {
@@ -2124,12 +2443,68 @@ fun nomuSchedWalkParked(sched: RawPtr, outBuf: RawPtr, cap: Int) -> Int {
       let sp: RawPtr = cur.load(fromByteOffset: 264)
       if sp.isNull == false {
         let pc: Int = cur.load(fromByteOffset: 272)
-        n = rtWalkFrom(sp, pc, outBuf, n, cap)
+        n = rtWalkFrom(sp, pc, outBuf, n, cap, emitSlots)
+      }
+    }
+    if st == 3 {
+      // Completed spawn fiber awaiting join (150.3.13): its result is a managed box at fib+216, reachable
+      // only through this slot until the joiner reads it. Root it — slot mode emits the slot address (a
+      // moving collection rewrites it in place with the box's forwarded pointer), value mode emits the box.
+      let box: RawPtr = cur.load(fromByteOffset: 216)
+      if box.isNull == false {
+        if n < cap {
+          if emitSlots != 0 {
+            outBuf.store(cur.advanced(by: 216), toByteOffset: n * 8)
+          } else {
+            outBuf.store(box, toByteOffset: n * 8)
+          }
+          n = n + 1
+        }
       }
     }
     cur = cur.load(fromByteOffset: 240)
   }
+  // The scheduled-mailbox queue root. Under the self-hosted scheduler the queue head/tail live
+  // in this Sched (sched+80 / sched+88), not the C rt_sched_head that rtScanSchedRoot reads — so the STW
+  // walk must root them here or a collection mid-drain reclaims/moves every queued mailbox (and each
+  // message's `self` receiver + args). Mailbox and message objects carry real type-id pointer maps
+  // (mailboxTypeIdValue: mb_head/mb_tail/sched_next; the message type-id: next/self/args), so rooting the
+  // head propagates through the whole chain — the tracer follows sched_next between scheduled mailboxes and
+  // mb_head→next through each message, evacuating and fixing every managed slot. Slot mode also fixes the
+  // off-heap tail pointer (sched+88): it is Sched state reached through no object's pointer map, so a move
+  // would leave it dangling into reclaimed from-space (nomuSchedActorSend reads it on the next enqueue).
+  let mboxHead: RawPtr = sched.load(fromByteOffset: 80)
+  if mboxHead.isNull == false {
+    if n < cap {
+      if emitSlots != 0 {
+        outBuf.store(sched.advanced(by: 80), toByteOffset: n * 8)
+      } else {
+        outBuf.store(mboxHead, toByteOffset: n * 8)
+      }
+      n = n + 1
+    }
+    if emitSlots != 0 {
+      let mboxTail: RawPtr = sched.load(fromByteOffset: 88)
+      if mboxTail.isNull == false {
+        if n < cap {
+          outBuf.store(sched.advanced(by: 88), toByteOffset: n * 8)
+          n = n + 1
+        }
+      }
+    }
+  }
   return n
+}
+
+// Value mode (root object addresses) — for the STW root-recovery smoke / oracle diff.
+fun nomuSchedWalkParked(sched: RawPtr, outBuf: RawPtr, cap: Int) -> Int {
+  return nomuSchedWalkRoots(sched, outBuf, cap, 0)
+}
+
+// Slot mode (root slot addresses) — for a moving collection, which rewrites each slot with the survivor's
+// forwarded address.
+fun nomuSchedWalkSlots(sched: RawPtr, outBuf: RawPtr, cap: Int) -> Int {
+  return nomuSchedWalkRoots(sched, outBuf, cap, 1)
 }
 
 // ---- C-callable entry points (symbols nomu_fn_nomuSched*; runtime.c dispatches to these) ----
@@ -2159,6 +2534,7 @@ fun nomuSchedNew() -> RawPtr {
   sched.store(0, toByteOffset: 144)                      // stw-ack
   sched.store(0, toByteOffset: 152)                      // stw-gen
   sched.store(0, toByteOffset: 160)                      // ncarriers (set at boot)
+  sched.store(0, toByteOffset: 168)                      // gc-request  (OOM→coordinator signal, 150.3.11)
   return sched
 }
 
@@ -2197,21 +2573,29 @@ fun nomuSchedSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
 
 // Await a fiber and return its result. Called from within the joining fiber, which parks lock-coupled
 // (identifying itself via rt_current) if the target has not completed.
-fun nomuSchedJoin(sched: RawPtr, target: RawPtr, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
+fun nomuSchedJoin(sched: RawPtr, target: RawPtr, anchorSp: RawPtr, anchorPc: Int, final: Int) -> RawPtr {
   rtSchedLock(sched)
   let st: Int = target.load(fromByteOffset: 168)
   if st == 3 {
-    rtSchedUnlock(sched)
+    // already done — fall through holding the lock
   } else {
     let me = RawPtr.tlsGet()
     rtSchedSetAnchor(me, anchorSp, anchorPc)   // user-frame anchor for the STW walk (128.3.2)
     target.store(me, toByteOffset: 224)
     me.store(2, toByteOffset: 168)
     let carrierCtx: RawPtr = me.load(fromByteOffset: 232)
-    me.ctxSwitchTo(carrierCtx)
-    rtSchedUnlock(sched)
+    me.ctxSwitchTo(carrierCtx)                 // resumes here holding the lock (lock-coupled)
   }
-  return target.load(fromByteOffset: 216)
+  // The world is stopped for collection only at safepoints; this runs the join body lock-held without a
+  // safepoint, so the box read + registry drop are atomic w.r.t. a collection (150.3.13). `final` (the
+  // structured scope-exit join) drops the fiber now that its box is no longer needed; the returned box roots
+  // itself on the joiner's stack across the caller's load. Removal is idempotent (rtSchedRegRemove).
+  let res: RawPtr = target.load(fromByteOffset: 216)
+  if final != 0 {
+    rtSchedRegRemove(sched, target)
+  }
+  rtSchedUnlock(sched)
+  return res
 }
 
 // Fire-and-forget send: enqueue `msg` on `mailbox` (runtime.h ABI offsets) and return. On the 0→1

@@ -190,7 +190,144 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
     threshold value, a spill-based selection order) ride on the histogram.
   - *First cut is single-carrier + `gcForceCollect`-driven on deterministic fixtures;* multi-mutator STW
     that drives it in a concurrent program is [128.3.2](128-self-hosting-runtime.md), after the scheduler.
-- **150.4 — GenImmix.** Nursery + write barrier + remembered set. **After the scheduler self-host (128.1).**
+  - 150.3.9 — whole-program moving collection on the self-hosted scheduler. **Built (forced trigger,
+    single-carrier).** The bridge from [128.3.2](128-self-hosting-runtime.md) (STW + self-hosted root
+    recovery) to a collecting GC: the STW walk now emits root **slot** addresses (`rtWalkFrom` gained an
+    `emitSlots` mode; `nomuSchedWalkSlots`), and `rtImmixCollectRoots` runs the evacuator over that slot set
+    — the multi-root generalisation of `rtImmixEvacCollect`, force-all, rewriting each slot in place with its
+    survivor's forwarded address (the moving fixup on the stopped mutator stacks). Shared subgraphs and
+    duplicate slots resolve through the `rtEvacuate` forwarded-bit guard. Driven by the forced-collect
+    coordinator (`NOMU_STW_COLLECT`) at the 128.3.2 STW, over the self-hosted Immix space
+    (`RawPtr.gcSelfhostSpace()`, requires `NOMU_GC_PLAN=nomu` + `NOMU_SCHED=nomu`). Proof is transparency: a
+    force-all move relocates every live object, so a wrong slot fixup would resume the mutator on a stale
+    pointer into reclaimed space; instead the program prints the MMTk/NoGC value.
+    `examples/stw_collect.nomu` + `tools/stw-collect.sh` (a live Box relocated across the collection, its
+    stack slot fixed up, the worker resumes and reads it → 111, output-identical to MMTk over 15 runs). This
+    is the first time the Nomu collector reclaims memory at a whole-program STW on the Nomu scheduler.
+    - *Heap-pressure auto-trigger.* **Built.** A GC thread (`NOMU_GC_PRESSURE`) polls the self-hosted heap's
+      free-block count (`nomuGcSpaceAvail`) and, when it drops below the reserve, drives a **defrag**
+      collection (`rtImmixCollectRootsDefrag` / `nomuSchedStwCollectDefrag`) at the same STW handshake —
+      defrag, not force-all, because a near-full heap has no free to-space, and defrag is non-moving when
+      full. The mutator stops at its next back-edge safepoint poll (a clean user statepoint), so collection
+      lands between allocations and the roots are walkable. `examples/gc_pressure.nomu` +
+      `tools/gc-pressure.sh`: a fiber allocates 640 MiB (a 100-Box sliding window live, the rest garbage) on
+      the 256 MiB heap and survives via repeated collections, checksum-identical to MMTk NoGC — which also
+      exercises internal-pointer fixup (the array buffer's element pointers relocate). Trigger reserve
+      defaults to 1/8 of the heap (`NOMU_GC_TRIGGER_RESERVE` overrides).
+  - 150.3.10 — multi-carrier-safe self-hosted allocator (per-carrier TLABs). **Built** (150.3.10.1 + 150.3.10.2). The current
+    self-hosted allocator bumps the shared Immix space cursor (`allocCursor`/`allocLimit`, descriptor @48/@56)
+    with no synchronisation, so concurrent carriers race — 150.3.9 runs single-carrier for this reason. The fix
+    mirrors Go's mcache/mcentral (and MMTk's per-mutator TLABs): move the per-hole bump state
+    (`allocCursor`/`allocLimit`/`allocBlock`/`allocLine`) out of the shared descriptor into a per-carrier TLAB;
+    keep the block pool (`freeCursor`/`freeList`/`scanBlock`/`losHead`) shared behind a space lock. Lands after
+    [128.4](128-self-hosting-runtime.md) (one carrier-boot path), so the TLAB binds off a single self-hosted
+    carrier boot. Two sub-phases so a correctness bug and a codegen-perf bug can't hide in one change:
+    - 150.3.10.1 — *call-through correctness split.* **Built.** Per-carrier 32-byte TLAB
+      `{ allocCursor@0, allocLimit@8, allocBlock@16, allocLine@24 }`, bound `_Thread_local` per carrier in the
+      C runtime (`rt_self_tlab_get`, shaped like the MMTk `rt_mutator` lazy bind) and registered in a table.
+      `rtTlabAlloc` bumps privately; `rtImmixRefill` pulls a whole block from the shared pool under a new space
+      lock (descriptor @120, the `rtSchedMutexLockAt` futex mutex); LOS shares that lock. The descriptor's
+      `allocCursor/allocLimit/allocBlock/allocLine` (@48/@56/@72/@80) become the collector's single-threaded
+      copy-allocator state. The collector resets every registered TLAB at end-of-collection (`rt_tlab_reset_all`
+      in the C STW coordinators, since evacuation may relocate a carrier's current block). The seam
+      (`__nomu_selfhost_alloc`) loads the TLAB and calls `rtTlabAlloc` (still a call — inline bump is 150.3.10.2).
+      Also closed a latent race the split exposed: the seam's lazy creation of the process-singleton Immix space
+      (`__nomu_selfhost_space`) was unguarded, so concurrent carriers each built their own 256 MiB heap — now
+      double-checked locking around the create (`rt_selfhost_space_lock_*` + an acquire/release global). Proof:
+      `tools/gc-concurrent.sh` (`examples/gc_concurrent.nomu`) runs four fibers allocating concurrently on 2/4/8
+      carriers, checksum-identical to MMTk NoGC; `gc-pressure.sh` and `stw-collect.sh` extended to 1/2/4 carriers
+      (single allocating fiber) exercise the TLAB reset. All 28 drivers green. With 150.3.13 landed,
+      `gc-concurrent.sh` runs the collecting form — four fibers over-allocating 384 MiB on the 256 MiB heap,
+      allocating concurrently through repeated collections, checksum-identical to MMTk.
+    - 150.3.10.2 — *inlined bump fast path.* **Built.** The TLAB bump is emitted inline in the
+      `__nomu_selfhost_alloc` IR (`LLVMGenRuntime.swift` `nomuSelfhostAlloc`): load cursor/limit (@0/@8),
+      `need = (size+7)&~7`, `newCur = cur+need`, compare `newCur <= limit`, store the cursor, and form the
+      object as `heapBaseInt(@40) + cur` via inttoptr→p1 (a fresh GC base). Only the overflow edge calls
+      `rtTlabAlloc` (which refills under the space lock or routes to LOS). A hole never spans more than one
+      32 KiB block, so a large-object request can never pass the `newCur <= limit` test — it takes the miss
+      edge and LOS is handled there, needing no inline check. Disassembly confirms ~10 instructions (the
+      cursor/limit load fuses to one `ldp`), a call only on miss — the self-hosted analogue of the MMTk fast
+      path. The self-hosted analogue of the MMTk-side [133](133-fiber-pinned-mutator-cache.md) mutator-cache
+      perf work. Verified against MMTk (all 28 drivers green; `gc-concurrent` at 2/4/8 carriers, with and
+      without collection, 0 mismatches across heavy stress).
+  - 150.3.11 — pressure trigger as the default/production path. **Built.** Collection is now the default
+    self-hosted trigger, fired synchronously when an allocating mutator hits true OOM (rtImmixRefill finds no
+    block), no `NOMU_GC_PRESSURE` needed. The refill's block-exhaustion path calls `rtSelfhostOom`, which
+    parks the mutator at its alloc-site anchor and drives a collection, then retries the refill; it returns
+    false (genuine OOM) only when a full collection leaves the heap with zero free blocks. The anchor is
+    captured in the alloc seam (`__nomu_selfhost_alloc`, the immediate callee of user code) via
+    `llvm.returnaddress`/`frameaddress`+16 — the RT_USER_ANCHOR convention — and threaded through
+    `rtTlabAlloc`→`rtImmixRefill`→`rtSelfhostOom`, so the STW walk finds the in-flight allocation's roots.
+    The park mirrors `nomuSchedSafepoint` exactly (under the scheduler lock: set anchor + state, switch to the
+    carrier context; the carrier acks the STW and resumes off the stw-gen bump) — reusing the proven poll-site
+    ack/state/stack machinery rather than an ad-hoc in-place block, which is what makes concurrent OOM correct.
+    The OOM'ing carrier *initiates* the STW: the first into OOM sets stw-request (sched+136) under the lock and
+    signals a dedicated GC coordinator pthread (`rt_gc_sync_thread`, sched+168 gc-request) which runs the same
+    handshake + defrag collection as the poller; concurrent OOMs coalesce (only the first initiates). Started
+    by default whenever the self-hosted allocator is active and no explicit GC-driver knob is set; the polling
+    `NOMU_GC_PRESSURE` collector and the `NOMU_STW_COLLECT` smoke survive as oracle overrides. New driver
+    `tools/gc-oom.sh` proves it: an over-allocating program (and the four-fiber concurrent allocator) survives
+    at 1/2/4/8 carriers, checksum-identical to MMTk, with collections firing only at true OOM. All 29 drivers +
+    unit tests green.
+  - 150.3.12 — broader root coverage. **Built** (150.3.12.1–.3). Beyond stack roots + fiber-result boxes,
+    general programs (actors, strings, `any I` value boxes) now survive a real collection: the actor
+    scheduled-mailbox queue is rooted, String immortal buffers hold across a collection, and value-payload
+    boxes carry a real header + map. Drivers `tools/gc-actor.sh`, `gc-string.sh`, `gc-anybox.sh`.
+    - 150.3.12.1 — actor scheduled-mailbox queue root. **Built.** Under the self-hosted scheduler the
+      scheduled-mailbox queue lives in the Nomu `Sched` (head at `sched+80`, tail at `sched+88`), not the C
+      `rt_sched_head` that `rtScanSchedRoot` reads — so a collection mid-drain reclaimed/moved every queued
+      mailbox and each message's `self` receiver + args. `nomuSchedWalkRoots` now roots the queue: it emits the
+      head (object in value mode, `&sched+80` in slot mode) and, in slot mode, the off-heap tail slot
+      `&sched+88`. Mailbox and message objects carry real type-id pointer maps (`mailboxTypeIdValue`:
+      mb_head/mb_tail/sched_next; the per-handler message type-id: next/self/args), so rooting the head
+      propagates the evacuation + slot fixup through the whole chain; the tail slot is fixed because it is
+      Sched state reached through no object's pointer map. Verified by `tools/gc-actor.sh`.
+    - 150.3.12.2 — immortal-space / String buffers. **Built (interim path confirmed).** String data buffers
+      (`rt_alloc_immortal` → `rt_str_concat` / `rt_read_line`) are non-moving. The interim MMTk-immortal path
+      holds under `NOMU_RUNTIME=selfhost`: the buffers live off-heap relative to the self-hosted Immix space,
+      so `rtEvacuate`'s off-heap guard (addr < base / ≥ heapEnd → return unchanged) leaves them in place and
+      the sweep never touches them — a String reads back intact across a collection. `tools/gc-string.sh`
+      (`examples/gc_string.nomu`): a String-heavy program folds a content hash identical to MMTk NoGC while
+      collections fire at true OOM, single- and multi-carrier. Routing immortal allocations to the self-hosted
+      LOS is deferred to the MMTk-retirement pass (a self-host-purity item, not a correctness gap now).
+    - 150.3.12.3 — header + pointer map for witness value-payload boxes (the 150.3.13 follow-up folded here).
+      **Built.** `boxPayload` (`LLVMGenWitness.swift`) allocated `any I` value payloads header-less
+      (`rtAllocManaged`, value at offset 0), so a moving collection read the value's first word as a bogus
+      type-id and mis-copied/mis-scanned the payload (an out-of-range id clamps to size 0 → a 0-byte copy; a
+      small in-range id copies the wrong size or scans wrong offsets). The fix applies the 150.3.13 pattern:
+      the payload is now `{ header, value }` — a real type-id (`spawnBoxTypeId`, the `{header, value}` shape)
+      with the value's managed-pointer map, value at offset 8. The witness ABI's offset-0 `self` contract was
+      the wrinkle: the three value-payload readers now reach the value at payload+8 via a `payloadValue`
+      helper — `bridgeThunkSelf` (by-value load and the by-pointer `toUnmanaged`), `propThunk`'s stored-field
+      GEP. Class/actor payloads (already headered objects) are unchanged. `tools/gc-anybox.sh`
+      (`examples/gc_anybox.nomu`): 64 boxed value structs survive collections under default block-on-OOM and
+      force-all evacuation, read back identical to MMTk (10432); pre-fix the same program crashed/emptied
+      under a moving collection. The witness suite (interfaces/composition/opaque/refinement/extensions) is
+      output-unchanged. *Adjacent limitation left in place:* a value type with a managed field boxed as
+      `any I` trips `RewriteStatepointsForGC` ("FCA unimplemented") — a GC pointer nested in a first-class
+      aggregate crossing a statepoint — a pre-existing constraint (the `makeAnyBox` comment names it), not
+      introduced here; the test uses plain-scalar value structs to stay clear of it.
+  - 150.3.13 — fiber-result-box roots. **Built** (correctness bug found verifying 150.3.10.1: multi-fiber
+    programs corrupted under collection). `spawn let a = worker()` compiles the fiber body to box its result in
+    a managed GC object at `fib+216` (off-heap scheduler memory). The bug had two layers. (1) *Rooting:* that
+    slot was never a GC root — the STW walk (`nomuSchedWalkRoots`) scans fiber *stacks* via anchors, and
+    `rtSchedFiberMain` dropped the fiber from the live-fiber registry on completion — so between a fiber
+    completing and its joiner reading the result, the box had no root and a collection (driven by sibling
+    fibers allocating) reclaimed/moved it. (2) *Typing:* the result box (`lowerSpawn`) was allocated header-less
+    (`rtAllocManaged(slots*8)`, result at offset 0), so once rooted the moving collector read the result value
+    as a bogus type-id and mis-evacuated it whenever the box landed in a defrag-source block (the residual
+    flake). The fix addresses both: the fiber stays in the registry after completion and the walk emits
+    `fib+216` as a root slot (rooted + fixed-up in place); a per-result-type `spawnBoxTypeId` gives the box a
+    real header + pointer map (`{ header, result }`, result at offset 8), so the collector relocates it and
+    scans a managed result too; and a `final` flag on `spawnJoin` (the structured scope-exit join) drops the
+    fiber from the registry once the box is no longer read (`rtSchedRegRemove` made idempotent; intermediate
+    reads leave it registered). Repro that now passes: four `spawn let` workers over-allocating 384 MiB under
+    `NOMU_GC_PRESSURE` at 1/2/4/8 carriers, checksum-identical to MMTk across the previously-flaky trigger
+    reserves (`tools/gc-concurrent.sh`, now the collecting form). All 28 drivers + unit tests green.
+    Follow-up (resolved in 150.3.12.3): value-payload boxes in the witness path (`boxPayload`,
+    `LLVMGenWitness.swift`) were header-less the same way and mis-evacuated under a moving collection.
+- **150.4 — GenImmix.** Nursery + write barrier + remembered set. **After the scheduler self-host (128.1),
+  on the 150.3.9 whole-program collector.**
 - Then [127 LXR](127-lxr-collector.md): reclamation swapped to RC-primary, on 150.3's region machinery.
 
 ## Refs

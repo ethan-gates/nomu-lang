@@ -29,6 +29,10 @@ extern void* nomu_gc_alloc_immortal(void* mutator, size_t size, size_t align);
 extern void nomu_gc_write_barrier_post(void* mutator, void* src, void* slot, void* target);
 extern void nomu_gc_report_stats(void);   // M6 · 6.3.2 — footprint report (NOMU_GC_STATS)
 extern void nomu_gc_force_collect(void* mutator); // task 150 rung 2 — force one GC (mark-verify oracle)
+// Resolved self-hosted-allocator intent (task 128.4). Written once here before nomu_gc_init; read there to
+// pick the NoGC plan and route allocation at the Nomu allocator. Rust-side AtomicU8; a single non-concurrent
+// byte store from C is layout-compatible.
+extern unsigned char __nomu_runtime_selfhost;
 
 // ---- Scheduler plan selector (task 128.1.9) ----
 // Two schedulers are linked: the C/pthread scheduler below (default, the differential oracle) and the
@@ -42,7 +46,7 @@ void* rt_nomu_sched = NULL;               // the opaque Nomu Sched handle (nomuS
                                           // non-static so codegen's `RawPtr.schedHandle()` (__schedHandle) can load it
 extern void* nomu_fn_nomuSchedNew(void);
 extern void* nomu_fn_nomuSchedSpawn(void* sched, void* entry, void* arg);
-extern void* nomu_fn_nomuSchedJoin(void* sched, void* target, void* anchorSp, void* anchorPc);
+extern void* nomu_fn_nomuSchedJoin(void* sched, void* target, void* anchorSp, void* anchorPc, int64_t final);
 extern void  nomu_fn_nomuSchedBoot(void* sched, void* entryFn, int64_t ncarriers, void* drainFn);
 extern int64_t nomu_fn_nomuSchedSleep(void* sched, int64_t ms, void* anchorSp, void* anchorPc);
 
@@ -58,7 +62,12 @@ extern void  nomu_fn_nomuSchedActorSend(void* sched, void* mailbox, void* msg);
 extern void* nomu_fn_nomuSchedMailboxPop(void* sched, void* mailbox);
 extern void  nomu_fn_nomuSchedSafepoint(void* sched, void* anchorSp, void* anchorPc);   // task 128.3.2
 extern int64_t nomu_fn_nomuSchedWalkParked(void* sched, void* outBuf, int64_t cap);      // task 128.3.2
+extern int64_t nomu_fn_nomuSchedStwCollect(void* sched);            // self-hosted evacuating collection at STW
+extern int64_t nomu_fn_nomuSchedStwCollectDefrag(void* sched);      // defrag variant (heap-pressure path)
+extern int64_t nomu_fn_nomuGcSpaceAvail(void);                      // free blocks in the self-hosted heap
+extern int64_t nomu_fn_nomuGcSpaceBlocks(void);                     // total blocks in the self-hosted heap
 extern int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);            // libSystem futex
+extern int __ulock_wait(uint32_t operation, void* addr, uint64_t value, uint32_t timeout_us);   // libSystem futex wait
 
 // One MMTk mutator per carrier thread (Q1). Bound lazily on the thread's first allocation; a fiber
 // migrating carriers allocates against whichever carrier it currently runs on (thread-local storage
@@ -66,6 +75,50 @@ extern int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);   
 // Exported (not `static`) so the §6.6 codegen-inlined alloc fast path can read the current carrier's
 // mutator as a thread-local global; null until the carrier's first allocation binds it (→ slow path).
 _Thread_local void* rt_mutator = NULL;
+
+// ---- Self-hosted allocator TLABs (task 150 · 150.3.10.1) ----
+// Each carrier owns a 32-byte TLAB { allocCursor@0, allocLimit@8, allocBlock@16, allocLine@24 } the codegen
+// self-hosted-alloc seam bumps within (rtTlabAlloc); on overflow it refills from the shared Immix pool under
+// the space lock. Bound lazily on the carrier's first self-hosted allocation, exactly like rt_mutator above.
+// Registered in a table so the collector can reset every carrier's TLAB at end-of-collection (evacuation may
+// relocate a carrier's current block; the reset drops the stale hole so the next alloc refills).
+_Thread_local void* rt_self_tlab = NULL;
+#define RT_TLAB_MAX 256
+static void* rt_tlab_table[RT_TLAB_MAX];
+static int rt_tlab_count = 0;
+static pthread_mutex_t rt_tlab_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Return this carrier's TLAB, binding + registering it on first use (cursor/limit 0 and allocBlock = −1 so
+// the first allocation refills). The codegen seam calls this, then rtTlabAlloc(tlab, space, size).
+void* rt_self_tlab_get(void) {
+    if (!rt_self_tlab) {
+        int64_t* t = (int64_t*)calloc(1, 32);
+        t[2] = -1;                    // allocBlock @16 = none (cursor/limit 0/0 force a refill)
+        pthread_mutex_lock(&rt_tlab_lock);
+        if (rt_tlab_count < RT_TLAB_MAX) { rt_tlab_table[rt_tlab_count++] = t; }
+        pthread_mutex_unlock(&rt_tlab_lock);
+        rt_self_tlab = t;
+    }
+    return rt_self_tlab;
+}
+
+// Reset every carrier's TLAB after a collection. Called under STW (all carriers stopped at safepoints, none
+// in rt_self_tlab_get), so the table read needs no lock: drop the current hole (cursor = limit = 0) and
+// current block (allocBlock = −1) so the next allocation refills from the post-collection pool. Required
+// because evacuation may have relocated a carrier's current block.
+void rt_tlab_reset_all(void) {
+    for (int i = 0; i < rt_tlab_count; i++) {
+        int64_t* t = (int64_t*)rt_tlab_table[i];
+        t[0] = 0; t[1] = 0; t[2] = -1; t[3] = 0;
+    }
+}
+
+// Guards the one-time creation of the self-hosted Immix space (150.3.10.1). The alloc seam does
+// double-checked locking around it: multiple carriers race the first self-hosted allocation, and without
+// this each would build its own 256 MiB heap and corrupt the shared descriptor.
+static pthread_mutex_t rt_selfhost_space_lock = PTHREAD_MUTEX_INITIALIZER;
+void rt_selfhost_space_lock_acquire(void) { pthread_mutex_lock(&rt_selfhost_space_lock); }
+void rt_selfhost_space_lock_release(void) { pthread_mutex_unlock(&rt_selfhost_space_lock); }
 
 // ---- Allocation seam ----
 // Routed through MMTk (NoGC): bump-allocate on the carrier's mutator. MMTk returns raw memory, so we
@@ -457,10 +510,13 @@ static void* rt_carrier_entry(void* _) {
     return NULL;
 }
 
-void* spawn_join(SpawnHandle* h) {
+// `final` (150.3.13): the structured scope-exit join, at which the self-hosted scheduler drops the fiber
+// from the live-fiber registry (its result box is no longer needed). Intermediate reads pass 0. The C
+// scheduler has no such registry, so it ignores `final`.
+void* spawn_join(SpawnHandle* h, int64_t final) {
     if (rt_sched_plan == RT_SCHED_NOMU) {
         RT_USER_ANCHOR(sp, pc);
-        return nomu_fn_nomuSchedJoin(rt_nomu_sched, (void*)h->fiber, sp, pc);
+        return nomu_fn_nomuSchedJoin(rt_nomu_sched, (void*)h->fiber, sp, pc, final);
     }
     pthread_mutex_lock(&rt_queue_mu);
     if (h->fiber->status != FIBER_DONE) {
@@ -1363,14 +1419,171 @@ static void* rt_stw_selfhost_thread(void* _) {
     return NULL;
 }
 
+// Forced self-hosted COLLECTION smoke (env NOMU_STW_COLLECT). Same STW handshake as
+// rt_stw_selfhost_thread, but instead of only walking roots it drives a real evacuating Immix collection
+// over the self-hosted space (nomuSchedStwCollect): every stopped mutator's root slots are collected, the
+// live graph is evacuated, and each slot is fixed up in place before resume. Requires NOMU_GC_PLAN=nomu
+// (the Immix space) and NOMU_SCHED=nomu (the carriers). The program's output must be unchanged (moving is
+// transparent), which is the fixup-correctness proof.
+static void* rt_stw_collect_thread(void* _) {
+    struct timespec warmup = {0, 40 * 1000 * 1000}; nanosleep(&warmup, NULL);
+    int rounds = 3;
+    for (int r = 0; r < rounds; r++) {
+        int64_t ncarriers = rt_stw_ld(160);
+        rt_stw_st(136, 1);
+        __nomu_stop_world = 1;
+        __atomic_fetch_add((int64_t*)((char*)rt_nomu_sched + 24), 1, __ATOMIC_SEQ_CST);
+        __ulock_wake(0x01000101, (char*)rt_nomu_sched + 24, 0);
+        while (rt_stw_ld(144) < ncarriers) {
+            struct timespec s = {0, 500 * 1000}; nanosleep(&s, NULL);
+        }
+        int64_t nr = nomu_fn_nomuSchedStwCollect(rt_nomu_sched);
+        rt_tlab_reset_all();   // 150.3.10.1 — evacuation may have moved a carrier's block; refill on resume
+        fprintf(stderr, "nomu-stw-collect: round %d fixed %lld roots\n", r, (long long)nr);
+        rt_stw_st(144, 0);
+        rt_stw_st(136, 0);
+        __nomu_stop_world = 0;
+        __atomic_fetch_add((int64_t*)((char*)rt_nomu_sched + 152), 1, __ATOMIC_SEQ_CST);
+        __ulock_wake(0x01000101, (char*)rt_nomu_sched + 152, 0);
+        struct timespec between = {0, 25 * 1000 * 1000}; nanosleep(&between, NULL);
+    }
+    return NULL;
+}
+
+// Heap-pressure-triggered self-hosted collection (env NOMU_GC_PRESSURE). A persistent GC thread polls the
+// self-hosted Immix space's free-block count; when it drops below the reserve it drives a defrag collection
+// at the STW (the same handshake), reclaiming garbage so an over-allocating program survives instead of
+// exhausting the heap. The mutator stops at its next back-edge safepoint poll (a clean user statepoint), so
+// its roots are walkable — collection happens between allocations, not mid-allocation. Requires
+// NOMU_GC_PLAN=nomu (the space) and NOMU_SCHED=nomu (the carriers); single-carrier for now (the self-hosted
+// allocator is not yet multi-carrier-safe). Reserve defaults to 1/8 of the heap; NOMU_GC_TRIGGER_RESERVE
+// overrides it (in blocks) so a test can trigger earlier.
+static void* rt_gc_pressure_thread(void* _) {
+    while (nomu_fn_nomuGcSpaceBlocks() == 0) {           // wait for the space + program to come up
+        if (rt_stw_ld(40) != 0) return NULL;
+        struct timespec s = {0, 1 * 1000 * 1000}; nanosleep(&s, NULL);
+    }
+    int64_t nb = nomu_fn_nomuGcSpaceBlocks();
+    int64_t reserve = nb / 8;
+    const char* env = getenv("NOMU_GC_TRIGGER_RESERVE");
+    if (env) { long v = atol(env); if (v > 0) reserve = v; }
+    int dbg = getenv("NOMU_GC_DEBUG_PRESSURE") != NULL;
+    int collections = 0;
+    for (;;) {
+        if (rt_stw_ld(40) != 0) break;                  // scheduler quiescent → program done
+        int64_t avail = nomu_fn_nomuGcSpaceAvail();
+        if (avail < 0) break;
+        if (avail >= reserve) {
+            struct timespec s = {0, 300 * 1000}; nanosleep(&s, NULL);
+            continue;
+        }
+        int64_t ncarriers = rt_stw_ld(160);
+        rt_stw_st(136, 1);
+        __nomu_stop_world = 1;
+        __atomic_fetch_add((int64_t*)((char*)rt_nomu_sched + 24), 1, __ATOMIC_SEQ_CST);
+        __ulock_wake(0x01000101, (char*)rt_nomu_sched + 24, 0);
+        while (rt_stw_ld(144) < ncarriers) {
+            if (rt_stw_ld(40) != 0) break;              // program finished mid-wait — stop waiting
+            struct timespec s = {0, 200 * 1000}; nanosleep(&s, NULL);
+        }
+        int64_t nr = nomu_fn_nomuSchedStwCollectDefrag(rt_nomu_sched);
+        rt_tlab_reset_all();   // 150.3.10.1 — evacuation may have moved a carrier's block; refill on resume
+        collections++;
+        if (dbg) {
+            int64_t after = nomu_fn_nomuGcSpaceAvail();
+            fprintf(stderr, "nomu-gc-pressure: collection %d, %lld roots, avail %lld -> %lld\n",
+                    collections, (long long)nr, (long long)avail, (long long)after);
+        }
+        rt_stw_st(144, 0);
+        rt_stw_st(136, 0);
+        __nomu_stop_world = 0;
+        __atomic_fetch_add((int64_t*)((char*)rt_nomu_sched + 152), 1, __ATOMIC_SEQ_CST);
+        __ulock_wake(0x01000101, (char*)rt_nomu_sched + 152, 0);
+    }
+    if (dbg) fprintf(stderr, "nomu-gc-pressure: exit after %d collections\n", collections);
+    return NULL;
+}
+
+// Synchronous block-on-OOM GC coordinator (task 150.3.11) — the default self-hosted GC trigger. Unlike
+// rt_gc_pressure_thread (which polls a headroom reserve), this blocks until an allocating mutator hits true
+// OOM (rtImmixRefill finds no block). The OOM'ing carrier initiates the STW itself — it sets stw-request (+136)
+// under the scheduler lock, parks at its alloc-site anchor, and signals this coordinator via gc-request (+168).
+// This thread then runs the same handshake as the pressure poller: set stop_world, wake carriers to park + ack,
+// wait for all acks, run the defrag collection, and resume the world. The parked carriers (including the OOM
+// initiator's) resume off the stw-gen bump (+152), exactly as in the poll-site path. A plain pthread (the STW
+// coordinator must not be a fiber).
+static void* rt_gc_sync_thread(void* _) {
+    while (nomu_fn_nomuGcSpaceBlocks() == 0) {           // wait for the space + program to come up
+        if (rt_stw_ld(40) != 0) return NULL;
+        struct timespec s = {0, 1 * 1000 * 1000}; nanosleep(&s, NULL);
+    }
+    int dbg = getenv("NOMU_GC_DEBUG_PRESSURE") != NULL;
+    int collections = 0;
+    for (;;) {
+        // Block until a mutator requests a collection (gc-request @168) or the program ends.
+        while (rt_stw_ld(168) == 0) {
+            if (rt_stw_ld(40) != 0) {
+                if (dbg) fprintf(stderr, "nomu-gc-sync: exit after %d collections\n", collections);
+                return NULL;
+            }
+            __ulock_wait(0x01000101, (char*)rt_nomu_sched + 168, 0, 1000);   // ~1ms backstop, re-checks the flag
+        }
+        rt_stw_st(168, 0);                               // consume the request (136 already set by the initiator)
+        int64_t ncarriers = rt_stw_ld(160);
+        __nomu_stop_world = 1;
+        __atomic_fetch_add((int64_t*)((char*)rt_nomu_sched + 24), 1, __ATOMIC_SEQ_CST);
+        __ulock_wake(0x01000101, (char*)rt_nomu_sched + 24, 0);              // wake carriers to poll + ack
+        while (rt_stw_ld(144) < ncarriers) {
+            if (rt_stw_ld(40) != 0) break;               // program finished mid-wait
+            struct timespec s = {0, 200 * 1000}; nanosleep(&s, NULL);
+        }
+        int64_t nr = nomu_fn_nomuSchedStwCollectDefrag(rt_nomu_sched);
+        rt_tlab_reset_all();   // 150.3.10.1 — evacuation may have moved a carrier's block; refill on resume
+        collections++;
+        if (dbg) {
+            int64_t after = nomu_fn_nomuGcSpaceAvail();
+            fprintf(stderr, "nomu-gc-sync: collection %d, %lld roots, avail -> %lld\n",
+                    collections, (long long)nr, (long long)after);
+        }
+        rt_stw_st(144, 0);
+        rt_stw_st(136, 0);
+        __nomu_stop_world = 0;
+        __atomic_fetch_add((int64_t*)((char*)rt_nomu_sched + 152), 1, __ATOMIC_SEQ_CST);
+        __ulock_wake(0x01000101, (char*)rt_nomu_sched + 152, 0);             // resume parked carriers (incl. initiator)
+    }
+}
+
 int main(void) {
+    // Resolve the one product lever before GC init (task 128.4). NOMU_RUNTIME={native,selfhost} is the umbrella;
+    // selfhost turns on the self-hosted scheduler + allocator + collector together. The decomposed NOMU_SCHED /
+    // NOMU_GC_PLAN survive as differential-oracle overrides (we diff against MMTk + the C scheduler until MMTk
+    // retirement). Resolution happens before nomu_gc_init because the Rust GC plan is chosen there.
+    const char* runtime_env = getenv("NOMU_RUNTIME");
+    const char* sched_env = getenv("NOMU_SCHED");
+    const char* gc_plan_env = getenv("NOMU_GC_PLAN");
+    int runtime_selfhost = runtime_env && strcmp(runtime_env, "selfhost") == 0;
+    // Allocator self-hosted iff the umbrella selects it or the harness pinned NOMU_GC_PLAN=nomu.
+    int selfhost_alloc = runtime_selfhost || (gc_plan_env && strcmp(gc_plan_env, "nomu") == 0);
+    // Scheduler self-hosted iff the umbrella selects it or the harness pinned NOMU_SCHED=nomu.
+    int selfhost_sched = runtime_selfhost || (sched_env && strcmp(sched_env, "nomu") == 0);
+    // The forbidden quadrant: a self-hosted allocator needs the Nomu stop-the-world/root-walk, so it
+    // auto-promotes the scheduler. If the harness explicitly pinned the C scheduler, that pairing cannot
+    // collect — abort rather than run an incoherent runtime.
+    if (selfhost_alloc) {
+        if (sched_env && strcmp(sched_env, "c") == 0) {
+            fprintf(stderr, "nomu: (C scheduler, self-hosted allocator) is unsupported — collection needs the "
+                            "self-hosted stop-the-world. Unset NOMU_SCHED=c or use NOMU_RUNTIME=selfhost.\n");
+            abort();
+        }
+        selfhost_sched = 1;
+        __nomu_runtime_selfhost = 1; // nomu_gc_init reads this to route allocation at the Nomu allocator
+    }
+    if (selfhost_sched) {
+        rt_sched_plan = RT_SCHED_NOMU;
+    }
     nomu_gc_init(1ULL << 30); // M6 · 6.1.1 — init MMTk (NoGC, 1 GiB reserved) before any allocation
     if (getenv("NOMU_GC_TYPEMAPS")) {
         nomu_gc_dump_typemaps(); // 6.1.3 map-walk self-check
-    }
-    const char* sched_env = getenv("NOMU_SCHED");
-    if (sched_env && strcmp(sched_env, "nomu") == 0) {
-        rt_sched_plan = RT_SCHED_NOMU;
     }
     if (rt_sched_plan == RT_SCHED_NOMU) {
         // Self-hosted scheduler (task 128.1.9). Its carriers are ordinary pthreads that run real user code
@@ -1383,6 +1596,19 @@ int main(void) {
         rt_nomu_sched = nomu_fn_nomuSchedNew();
         if (getenv("NOMU_STW_SELFHOST")) {   // 128.3.2 forced-STW smoke: coordinate a real STW + self-hosted walk
             pthread_t __stw_sh; pthread_create(&__stw_sh, NULL, rt_stw_selfhost_thread, NULL); pthread_detach(__stw_sh);
+        }
+        if (getenv("NOMU_STW_COLLECT")) {    // forced-collect smoke: real evacuating Immix collection at the STW
+            pthread_t __stw_c; pthread_create(&__stw_c, NULL, rt_stw_collect_thread, NULL); pthread_detach(__stw_c);
+        }
+        if (getenv("NOMU_GC_PRESSURE")) {    // heap-pressure-triggered collection: a GC thread collects when the heap fills
+            pthread_t __gc_p; pthread_create(&__gc_p, NULL, rt_gc_pressure_thread, NULL); pthread_detach(__gc_p);
+        }
+        // Default self-hosted GC trigger (150.3.11): a synchronous block-on-OOM coordinator. Started whenever
+        // the self-hosted allocator is active and no explicit GC-driver knob is set (the smoke/oracle threads
+        // above drive collection their own way). It stays idle until a mutator hits true OOM.
+        int gc_driver_env = getenv("NOMU_STW_SELFHOST") || getenv("NOMU_STW_COLLECT") || getenv("NOMU_GC_PRESSURE");
+        if (selfhost_alloc && !gc_driver_env) {
+            pthread_t __gc_s; pthread_create(&__gc_s, NULL, rt_gc_sync_thread, NULL); pthread_detach(__gc_s);
         }
         nomu_fn_nomuSchedBoot(rt_nomu_sched, (void*)__rt_main_entry, (int64_t)nc, (void*)nomu_actor_drain);
         if (getenv("NOMU_GC_STATS") || getenv("NOMU_GC_STATS_LIVE")) {

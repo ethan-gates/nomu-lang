@@ -75,6 +75,14 @@ pub static __nomu_barrier_active: AtomicU8 = AtomicU8::new(0);
 #[unsafe(no_mangle)]
 pub static __nomu_selfhosted_alloc: AtomicU8 = AtomicU8::new(0);
 
+// The resolved product-runtime intent (task 128.4). C parses the umbrella `NOMU_RUNTIME` lever and stores 1
+// here before calling `nomu_gc_init` when the self-hosted allocator is selected. `nomu_gc_init` reads it to
+// choose the NoGC plan and route allocation at the Nomu allocator, so the harness need not set the decomposed
+// `NOMU_GC_PLAN` oracle knob. Written once from C before any concurrent access; read once at init. `u8` for a
+// trivial C-ABI byte, same as `__nomu_selfhosted_alloc`.
+#[unsafe(no_mangle)]
+pub static __nomu_runtime_selfhost: AtomicU8 = AtomicU8::new(0);
+
 // The generational unlog-bit side-metadata layout, exported for the codegen-inlined barrier fast path
 // so it computes the bit address without hardcoding MMTk's constants (they update here if MMTk's layout
 // changes). For object `o` (log_num_of_bits = 0, i.e. 1 bit/region):
@@ -600,6 +608,12 @@ pub extern "C" fn nomu_gc_init(heap_bytes: usize) {
         // `nomu` (task 150): allocation is self-hosted; MMTk is initialized NoGC and left idle as the
         // diff oracle. The seam reads `__nomu_selfhosted_alloc` to route allocation at the Nomu allocator.
         Ok("nomu") => {
+            __nomu_selfhosted_alloc.store(1, Ordering::Relaxed);
+            PlanSelector::NoGC
+        }
+        // No explicit `NOMU_GC_PLAN`: the `NOMU_RUNTIME=selfhost` umbrella (resolved in C, task 128.4) routes
+        // allocation at the Nomu allocator. An explicit `NOMU_GC_PLAN` above always wins as the oracle override.
+        Err(_) if __nomu_runtime_selfhost.load(Ordering::Relaxed) != 0 => {
             __nomu_selfhosted_alloc.store(1, Ordering::Relaxed);
             PlanSelector::NoGC
         }

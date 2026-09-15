@@ -489,7 +489,7 @@ final class FunctionLowerer {
     private func joinSpawns(from base: Int) {
         guard base < activeSpawns.count else { return }
         for id in activeSpawns[base...].reversed() {
-            if let rt = spawnResultTypes[id] { _ = emit(.spawnJoin(binding: id, resultType: rt), rt, lastSpan) }
+            if let rt = spawnResultTypes[id] { _ = emit(.spawnJoin(binding: id, resultType: rt, final: true), rt, lastSpan) }
         }
     }
 
@@ -829,7 +829,7 @@ final class FunctionLowerer {
     // result type (needed for a self-field read).
     private func readVar(_ name: String, _ span: Span, fieldType: Type = .void) -> SSAValue? {
         if let binding = spawnBindings[name], let rt = spawnResultTypes[binding] {
-            return emit(.spawnJoin(binding: binding, resultType: rt), rt, span)   // reading a spawn joins it
+            return emit(.spawnJoin(binding: binding, resultType: rt, final: false), rt, span)   // reading a spawn joins it (intermediate; leaves it registered)
         }
         if let slot = slots[name] { return emit(.load(slot), slot.type, span) }
         if varType[name] != nil { return read(name, curId) }
@@ -1028,11 +1028,19 @@ final class FunctionLowerer {
     // Bind a name to a freshly-produced value. An aggregate goes into a new stack slot (store the
     // value in); a scalar (or reference) is tracked by SSA construction.
     private func bind(_ name: String, _ value: SSAValue, _ span: Span) {
+        // A fresh binding replaces any earlier one of the SAME NAME by kind. Locals are name-keyed here
+        // (no lexical-scope stack yet), so a name reused across sibling scopes as a different kind —
+        // aggregate `let w = Wrap(...)` in one block, scalar `var w = 0` in another — would otherwise keep
+        // the stale aggregate slot, and `readVar` (which prefers `slots`) would load a Wrap for the scalar
+        // `w`, emitting a type-mismatched compare. Clearing the opposite kind makes the latest binding win.
+        // (This does not give correct lexical shadowing of an *outer* still-live binding — tracked separately.)
         if isAggregate(value.type) {
             let slot = entryStackAlloc(value.type)
             emitVoid(.store(addr: slot, value: value), span)
             slots[name] = slot
+            varType[name] = nil
         } else {
+            slots[name] = nil
             write(name, curId, value)
         }
     }
