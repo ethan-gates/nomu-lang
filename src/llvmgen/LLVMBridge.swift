@@ -32,7 +32,8 @@ private func cgStage<T>(_ phase: String, _ name: String, _ onStage: StageSink?, 
 /// it with the runtime `.a`). Returns nil on success, else a `file:line:col`-prefixed error.
 /// `optimize` selects the release (`default<O2>`) pipeline over the debug default (8.5.3).
 public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = false,
-                       subsetFuncs: Set<String> = [], onStage: StageSink? = nil) -> String? {
+                       subsetFuncs: Set<String> = [], onStage: StageSink? = nil,
+                       emitLLVMTo: String? = nil, stopAfterEgress: Bool = false) -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
@@ -77,6 +78,12 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
         print("LLVM Module Verification Failed:\n\(message)")
         return "LLVM: module failed verification"
     }
+    // The egress module as emitted, before the optimization/statepoint pipeline — the artifact
+    // `--emit-llvm` captures (a stable golden for backend refactors; `--stop=llvm` halts here).
+    if let llpath = emitLLVMTo {
+        llpath.withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }
+    }
+    if stopAfterEgress { return nil }
     return emitModuleObject(mod, to: path, optimize: optimize, onStage: onStage)
 }
 

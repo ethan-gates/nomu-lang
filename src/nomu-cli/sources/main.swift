@@ -17,7 +17,8 @@ for arg in CommandLine.arguments.dropFirst() {
               --emit-ast         also emit the parsed AST (<name>.ast)
               --emit-noir        also emit NOIR, the Nomu typed IR (<name>.noir)
               --emit-ssair       also emit SSAIR, the optimizer IR (<name>.ssair)
-              --stop=STAGE       halt after STAGE (ast | noir | ssair | binary); default binary
+              --emit-llvm        also emit LLVM IR from the egress, pre-opt (<name>.ll)
+              --stop=STAGE       halt after STAGE (ast | noir | ssair | llvm | binary); default binary
               -O, --release      optimize (LLVM -O2); default is a debug build
               -h, --help         show this help
             """)
@@ -25,6 +26,7 @@ for arg in CommandLine.arguments.dropFirst() {
     case "--emit-ast":         options.ast = true
     case "--emit-noir":        options.noir = true
     case "--emit-ssair":       options.ssair = true
+    case "--emit-llvm":        options.llvm = true
     case "-O", "--release":    options.optimize = true
     case let a where a.hasPrefix("--runtime-subset="):
         let names = String(a.dropFirst("--runtime-subset=".count)).split(separator: ",").map(String.init)
@@ -34,9 +36,10 @@ for arg in CommandLine.arguments.dropFirst() {
         case "ast":     options.stopAt = .ast
         case "noir":    options.stopAt = .noir
         case "ssair":   options.stopAt = .ssair
+        case "llvm":    options.stopAt = .llvm
         case "binary":  options.stopAt = .binary
         case let s:
-            fputs("error: unknown stage '\(s)' for --stop (expected ast, noir, ssair, or binary)\n", stderr)
+            fputs("error: unknown stage '\(s)' for --stop (expected ast, noir, ssair, llvm, or binary)\n", stderr)
             exit(1)
         }
     default:

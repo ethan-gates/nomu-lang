@@ -152,7 +152,8 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     // Backend (M8): lower the typed IR via LLVM's C API → object → link with the runtime .a.
     // (The C backend was the differential oracle through 8.2 and was retired at the 8.2 exit.)
     emitLLVMBinary(monoModule, stem: stem, buildRoot: buildRoot, optimize: options.optimize,
-                   subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames), timings: timings)
+                   subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames), timings: timings,
+                   emitLLVM: options.llvm || options.stopAt == .llvm, stopAfterLLVM: options.stopAt == .llvm)
     timings.report()
 }
 
@@ -224,18 +225,23 @@ private func prependPrelude(_ program: Program) -> (Program, Set<String>) {
 // path). Everything LLVM stays behind `emitHelloWorldObject` in LLVMBridge — this only orchestrates
 // object → .a → link.
 private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: String, optimize: Bool,
-                            subsetFuncs: Set<String>, timings: Timings) {
+                            subsetFuncs: Set<String>, timings: Timings,
+                            emitLLVM: Bool = false, stopAfterLLVM: Bool = false) {
     let objPath = stem + ".o"
     // The LLVM path (SSAIR gen + passes, IR egress, LLVM opt, object emit) reports its sub-stages up
     // through the `StageSink`, so the timing table's `ssair`/`llvm` phases break down rather than
-    // showing one opaque `codegen` bucket.
+    // showing one opaque `codegen` bucket. `--emit-llvm` writes the egress module (pre-opt) to
+    // `<stem>.ll`; `--stop=llvm` writes it and skips object emission + linking.
     let err = emitObject(module, to: objPath, optimize: optimize, subsetFuncs: subsetFuncs,
-                         onStage: { timings.record(phase: $0, name: $1, seconds: $2) })
+                         onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
+                         emitLLVMTo: emitLLVM ? stem + ".ll" : nil, stopAfterEgress: stopAfterLLVM)
     if let err = err {
         fputs("error: \(err)\n", stderr)
         timings.report()
         exit(1)
     }
+    if emitLLVM { print(stem + ".ll") }
+    if stopAfterLLVM { return }
     let archive = timings.measure("runtime", "archive") { cachedRuntimeArchive(buildRoot: buildRoot) }
     guard let archive = archive else { timings.report(); exit(1) }
 

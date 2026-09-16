@@ -20,7 +20,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 capture() {
   local out=$1
   mkdir -p "$out"
-  rm -f "$out"/*.noir(N) "$out"/*.ssair(N)
+  rm -f "$out"/*.noir(N) "$out"/*.ssair(N) "$out"/*.ll(N)
   echo "building nomuc (opt)..."
   # Release build: ~80MB and much faster startup than the fastbuild binary, which
   # matters because startup dominates each invocation. Resolve the binary via cquery
@@ -28,18 +28,19 @@ capture() {
   bazel build //:nomuc -c opt >/dev/null 2>&1 || { echo "build failed"; exit 1; }
   local NOMUC=$ROOT/$(bazel cquery --output=files //:nomuc -c opt 2>/dev/null)
   [[ -x "$NOMUC" ]] || { echo "nomuc not found at $NOMUC"; exit 1; }
-  # Doing both emits in one run and running files in parallel amortizes startup.
-  # `--stop=ssair` writes NOIR before the codegen-fatal check, so an erroring file
-  # still yields its .noir.
+  # All emits in one run, files in parallel, amortizes startup. `--stop=llvm` writes NOIR before the
+  # codegen-fatal check (so an erroring file still yields its .noir), SSAIR for clean files, and the
+  # egress LLVM IR (pre-opt) for clean files — halting before object emission + linking to stay fast.
   local jobs=${NOMU_GOLDEN_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}
-  rm -f "$ROOT"/build/examples/*.noir(N) "$ROOT"/build/examples/*.ssair(N)
+  rm -f "$ROOT"/build/examples/*.noir(N) "$ROOT"/build/examples/*.ssair(N) "$ROOT"/build/examples/*.ll(N)
   print -l "$ROOT"/examples/*.nomu \
-    | xargs -P "$jobs" -I{} "$NOMUC" --emit-noir --emit-ssair --stop=ssair {} >/dev/null 2>&1
+    | xargs -P "$jobs" -I{} "$NOMUC" --emit-noir --emit-ssair --emit-llvm --stop=llvm {} >/dev/null 2>&1
   local n=0
   for f in "$ROOT"/examples/*.nomu; do
     local name=${f:t:r}
     [[ -f "$ROOT/build/examples/$name.noir"  ]] && cp "$ROOT/build/examples/$name.noir"  "$out/$name.noir"
     [[ -f "$ROOT/build/examples/$name.ssair" ]] && cp "$ROOT/build/examples/$name.ssair" "$out/$name.ssair"
+    [[ -f "$ROOT/build/examples/$name.ll"    ]] && cp "$ROOT/build/examples/$name.ll"    "$out/$name.ll"
     n=$((n + 1))
   done
   echo "captured IR for $n examples into $out ($(ls "$out" | wc -l | tr -d ' ') artifacts)"

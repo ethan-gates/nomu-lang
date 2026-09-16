@@ -328,26 +328,26 @@ final class SSAIRToLLVM {
         case .fieldAddr(let base, let idx):
             define(inst, fieldSlotAddr(base, idx, span))
         case .elementAddr(let base, let index):
-            define(inst, elementAddr(base, index, inst.result!.type, span))
+            define(inst, EgressArrays.elementAddr(self, base, index, inst.result!.type, span))
         case .arrayLen(let arr):
             define(inst, LLVMBuildLoad2(b, e.i64, e.gepByte(val(arr), LLVMConstInt(e.i64, 8, 0)), "arr.len"))
         case .boundscheck(let index, let length):
-            emitBoundscheck(val(index), val(length))
+            EgressArrays.emitBoundscheck(self, val(index), val(length))
 
         case .call(let call):
             lowerCall(call, inst: inst, span: span)
 
         case .mailboxInit(let obj):
-            lowerMailboxInit(obj, span)
+            EgressConcurrency.lowerMailboxInit(self, obj, span)
         case .actorSend(let receiver, let handler, let args):
             guard case .named(let actorName, _) = receiver.type else {
                 e.fail("7.2.3: actorSend on a non-actor receiver", span); return
             }
             _ = e.emitActorSend(actorName, handler, val(receiver), args.map { val($0) }, span)
         case .spawn(let binding, let startFn, let env, let resultType):
-            lowerSpawn(binding: binding, startFn: startFn, env: env, resultType: resultType, span: span)
+            EgressConcurrency.lowerSpawn(self, binding: binding, startFn: startFn, env: env, resultType: resultType, span: span)
         case .spawnJoin(let binding, let resultType, let fin):
-            lowerSpawnJoin(inst, binding: binding, resultType: resultType, final: fin, span: span)
+            EgressConcurrency.lowerSpawnJoin(self, inst, binding: binding, resultType: resultType, final: fin, span: span)
 
         case .makeStruct(let t, let fields):
             define(inst, makeStruct(t, fields, span))
@@ -363,9 +363,9 @@ final class SSAIRToLLVM {
         case .box(let value, let interfaces, let onStack):
             define(inst, lowerBox(value, interfaces, onStack, span))
         case .arrayLit(let elements, let elem):
-            define(inst, lowerArrayLit(elements, elem, span))
+            define(inst, EgressArrays.lowerArrayLit(self, elements, elem, span))
         case .makeClosure(let funcName, let env, let onStack):
-            define(inst, makeClosure(funcName, env, onStack, span))
+            define(inst, EgressConcurrency.makeClosure(self, funcName, env, onStack, span))
         case .funcAddr(let name):
             // The bare C-ABI code pointer of a top-level function (task 128.2, RawPtr.ofFunc). The
             // callable's `fn` is a `ptr` already usable as an addrspace(0) RawPtr (the closure/spawn
@@ -634,14 +634,14 @@ final class SSAIRToLLVM {
 
     private func lowerDirectCall(_ name: String, _ args: [SSAValue], resultType: Type, span: Span) -> LLVMValueRef? {
         switch name {
-        case "print":    return emitPrint(args, span)
-        case "putByte":  return emitPutByte(args, span)
-        case "concat":   return emitConcat(args, span)
-        case "sleep":    return emitSleep(args, span)
-        case "readLine": return emitReadLine()
+        case "print":    return EgressBuiltins.emitPrint(self, args, span)
+        case "putByte":  return EgressBuiltins.emitPutByte(self, args, span)
+        case "concat":   return EgressBuiltins.emitConcat(self, args, span)
+        case "sleep":    return EgressBuiltins.emitSleep(self, args, span)
+        case "readLine": return EgressBuiltins.emitReadLine(self)
         case "__array_count_int": return LLVMBuildLoad2(b, e.i64, e.gepByte(val(args[0]), LLVMConstInt(e.i64, 8, 0)), "arr.count")
-        case "__arraySet":    return emitArraySet(args, span)
-        case "__arrayAppend": return emitArrayAppend(args, span)
+        case "__arraySet":    return EgressArrays.emitArraySet(self, args, span)
+        case "__arrayAppend": return EgressArrays.emitArrayAppend(self, args, span)
         // Unsafe raw memory (task 125). RawPtr / Ptr<T> are addrspace(0) i8ptr words; load/store/advance
         // are plain addrspace(0) memory ops (no barrier, never a GC root), alloc/free hit the raw floor.
         case "__rawAlloc":
@@ -913,9 +913,9 @@ final class SSAIRToLLVM {
         case "__uint64_int_int":        return val(args[0])
         case "__uint8_uint64_uint64":   return LLVMBuildZExt(b, val(args[0]), e.i64, "u82u64")
         case "__uint64_uint8_uint8":    return LLVMBuildTrunc(b, val(args[0]), e.i8, "u642u8")
-        case "__void_timemonotonic_int": return emitTimeMonotonic(args, span)
+        case "__void_timemonotonic_int": return EgressBuiltins.emitTimeMonotonic(self, args, span)
         default:
-            if Builtins.cLeaf.contains(name) { return emitCLeaf(name, args) }
+            if Builtins.cLeaf.contains(name) { return EgressBuiltins.emitCLeaf(self, name, args) }
             // A user free function or a method symbol — resolve the declared callable.
             let key = name.hasPrefix("m:") ? name : "f:\(name)"
             if let c = e.callables[key] {
@@ -958,241 +958,4 @@ final class SSAIRToLLVM {
         return LLVMConstInt(e.i64, 0, 0)
     }
 
-    // MARK: - Builtins (over already-lowered operands)
-
-    private func emitPrint(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
-        guard let arg = args.first else { e.fail("7.2.3: print expects one argument", span); return nil }
-        let value = val(arg)
-        let (fn, pty) = e.runtimeFn("printf", ret: e.i32, params: [e.i8ptr], varArg: true)
-        switch arg.type {
-        case .int:
-            return e.buildCall(fn, pty, [e.intFormat(), value])
-        case .double:
-            let (pf, pfty) = e.runtimeFn("rt_print_double", ret: e.voidTy, params: [e.f64], varArg: false)
-            return e.buildCall(pf, pfty, [value])
-        case .uint8:
-            return e.buildCall(fn, pty, [e.intFormat(), LLVMBuildZExt(b, value, e.i64, "u82i")])
-        case .uint64:
-            return e.buildCall(fn, pty, [e.uintFormat(), value])
-        case .bool:
-            return e.buildCall(fn, pty, [e.intFormat(), LLVMBuildZExt(b, value, e.i64, "b2i")])
-        case .string:
-            let data = LLVMBuildExtractValue(b, value, 0, "data")
-            let len = LLVMBuildExtractValue(b, value, 1, "len")
-            let len32 = LLVMBuildTrunc(b, len, e.i32, "len32")
-            return e.buildCall(fn, pty, [e.strFormat(), len32, data])
-        default:
-            e.fail("7.2.3: print supports Int, UInt8, Double, Bool, or String", span); return nil
-        }
-    }
-
-    // putByte(b): write one raw byte to stdout via libc `putchar`. Output is libc-buffered (block- or
-    // line-buffered) and flushed on normal program exit; no explicit flush primitive is exposed.
-    private func emitPutByte(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
-        guard let arg = args.first else { e.fail("putByte expects one argument", span); return nil }
-        let (fn, fty) = e.runtimeFn("putchar", ret: e.i32, params: [e.i32], varArg: false)
-        let c = LLVMBuildZExt(b, val(arg), e.i32, "byte")
-        return e.buildCall(fn, fty, [c])
-    }
-
-    private func emitTimeMonotonic(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
-        let (fn, pty) = e.runtimeFn("__void_timemonotonic_int", ret: e.i64, params: [], varArg: false)
-        return e.buildCall(fn, pty, [])
-    }
-
-    private func emitConcat(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
-        guard args.count == 2 else { e.fail("7.2.3: concat expects two arguments", span); return nil }
-        let (fn, fty) = e.runtimeFn("rt_str_concat", ret: e.strTy, params: [e.strTy, e.strTy], varArg: false)
-        return e.buildCall(fn, fty, [val(args[0]), val(args[1])])
-    }
-
-    private func emitSleep(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
-        guard let arg = args.first else { e.fail("7.2.3: sleep expects one argument", span); return nil }
-        let (fn, fty) = e.runtimeFn("rt_sleep_ms", ret: e.i64, params: [e.i64], varArg: false)
-        return e.buildCall(fn, fty, [val(arg)])
-    }
-
-    private func emitReadLine() -> LLVMValueRef? {
-        let (fn, fty) = e.runtimeFn("rt_read_line", ret: e.strTy, params: [e.i32], varArg: false)
-        return e.buildCall(fn, fty, [LLVMConstInt(e.i32, 0, 0)])
-    }
-
-    private func emitCLeaf(_ name: String, _ args: [SSAValue]) -> LLVMValueRef? {
-        let sig = Builtins.signature(name)
-        let paramTys = ([sig.receiver] + sig.params).map { cType($0) }
-        let retIsBool = sig.ret == .bool
-        let retTy = retIsBool ? e.i64 : cType(sig.ret)
-        let (fn, fty) = e.runtimeFn(name, ret: retTy, params: paramTys, varArg: false)
-        guard let r = e.buildCall(fn, fty, args.map { val($0) }) else { return nil }
-        return retIsBool ? LLVMBuildTrunc(b, r, e.i1, "b") : r
-    }
-
-    private func cType(_ t: Type) -> LLVMTypeRef {
-        switch t {
-        case .string: return e.strTy
-        case .double: return e.f64
-        case .bool:   return e.i1
-        default:      return e.i64
-        }
-    }
-
-    // MARK: - Arrays
-
-    private func lowerArrayLit(_ elements: [SSAValue], _ elem: Type, _ span: Span) -> LLVMValueRef? {
-        let stride = e.arrayElemStride(elem)
-        let n = elements.count
-        let handle = e.rtAllocManaged(LLVMConstInt(e.i64, 24, 0))
-        LLVMBuildStore(b, LLVMConstInt(e.i64, e.arrayHandleTypeId(), 0), handle)
-        LLVMBuildStore(b, LLVMConstInt(e.i64, UInt64(n), 0), e.gepByte(handle, LLVMConstInt(e.i64, 8, 0)))
-        let buf = e.rtAllocManaged(LLVMConstInt(e.i64, UInt64(16 + n * stride), 0))
-        LLVMBuildStore(b, LLVMConstInt(e.i64, e.arrayBufTypeId(elem), 0), buf)
-        LLVMBuildStore(b, LLVMConstInt(e.i64, UInt64(n), 0), e.gepByte(buf, LLVMConstInt(e.i64, 8, 0)))
-        for (i, el) in elements.enumerated() {
-            e.storeField(buf, e.gepByte(buf, LLVMConstInt(e.i64, UInt64(16 + i * stride), 0)), val(el))
-        }
-        e.storeField(handle, e.gepByte(handle, LLVMConstInt(e.i64, 16, 0)), buf)
-        return handle
-    }
-
-    // The bounds-check trap sequence (`index UGE length` → `rt_bounds_trap` → unreachable); on return
-    // the builder sits in the in-bounds continuation.
-    private func emitBoundscheck(_ idx: LLVMValueRef, _ len: LLVMValueRef) {
-        guard let fn = e.currentFn else { return }
-        let oob = LLVMBuildICmp(b, LLVMIntUGE, idx, len, "arr.oob")!
-        let trapBB = LLVMAppendBasicBlockInContext(ctx, fn, "arr.trap")!
-        let okBB = LLVMAppendBasicBlockInContext(ctx, fn, "arr.ok")!
-        LLVMBuildCondBr(b, oob, trapBB, okBB)
-        LLVMPositionBuilderAtEnd(b, trapBB)
-        let (trap, tty) = e.runtimeFn("rt_bounds_trap", ret: e.voidTy, params: [e.i64, e.i64], varArg: false)
-        _ = e.buildCall(trap, tty, [idx, len])
-        LLVMBuildUnreachable(b)
-        LLVMPositionBuilderAtEnd(b, okBB)
-    }
-
-    private func elementAddr(_ handle: SSAValue, _ index: SSAValue, _ elemType: Type, _ span: Span) -> LLVMValueRef {
-        let buf = LLVMBuildLoad2(b, e.p1, e.gepByte(val(handle), LLVMConstInt(e.i64, 16, 0)), "arr.buf")!
-        let stride = LLVMConstInt(e.i64, UInt64(e.arrayElemStride(elemType)), 0)
-        let off = LLVMBuildAdd(b, LLVMConstInt(e.i64, 16, 0), LLVMBuildMul(b, val(index), stride, "arr.mul"), "arr.off")!
-        return e.gepByte(buf, off)
-    }
-
-    private func emitArraySet(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
-        guard args.count == 3 else { e.fail("7.2.3: __arraySet expects 3 args", span); return nil }
-        let handle = val(args[0]), idxV = val(args[1]), value = val(args[2])
-        let len = LLVMBuildLoad2(b, e.i64, e.gepByte(handle, LLVMConstInt(e.i64, 8, 0)), "arr.len")!
-        emitBoundscheck(idxV, len)
-        let buf = LLVMBuildLoad2(b, e.p1, e.gepByte(handle, LLVMConstInt(e.i64, 16, 0)), "arr.buf")!
-        let stride = LLVMConstInt(e.i64, UInt64(e.arrayElemStride(args[2].type)), 0)
-        let off = LLVMBuildAdd(b, LLVMConstInt(e.i64, 16, 0), LLVMBuildMul(b, idxV, stride, "arr.mul"), "arr.off")!
-        e.storeField(buf, e.gepByte(buf, off), value)
-        return LLVMConstInt(e.i64, 0, 0)
-    }
-
-    private func emitArrayAppend(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
-        guard args.count == 2, let fn = e.currentFn else { e.fail("7.2.3: __arrayAppend expects 2 args", span); return nil }
-        let elem = args[1].type
-        let handle = val(args[0]), value = val(args[1])
-        let stride = e.arrayElemStride(elem)
-        let strideV = LLVMConstInt(e.i64, UInt64(stride), 0)
-        let len = LLVMBuildLoad2(b, e.i64, e.gepByte(handle, LLVMConstInt(e.i64, 8, 0)), "app.len")!
-        let buf0 = LLVMBuildLoad2(b, e.p1, e.gepByte(handle, LLVMConstInt(e.i64, 16, 0)), "app.buf")!
-        let cap = LLVMBuildLoad2(b, e.i64, e.gepByte(buf0, LLVMConstInt(e.i64, 8, 0)), "app.cap")!
-        let full = LLVMBuildICmp(b, LLVMIntUGE, len, cap, "app.full")!
-        let growBB = LLVMAppendBasicBlockInContext(ctx, fn, "app.grow")!
-        let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "app.cont")!
-        LLVMBuildCondBr(b, full, growBB, contBB)
-
-        LLVMPositionBuilderAtEnd(b, growBB)
-        let isZero = LLVMBuildICmp(b, LLVMIntEQ, cap, LLVMConstInt(e.i64, 0, 0), "app.cap0")!
-        let dbl = LLVMBuildMul(b, cap, LLVMConstInt(e.i64, 2, 0), "app.dbl")!
-        let newCap = LLVMBuildSelect(b, isZero, LLVMConstInt(e.i64, 4, 0), dbl, "app.newcap")!
-        let newBytes = LLVMBuildAdd(b, LLVMConstInt(e.i64, 16, 0), LLVMBuildMul(b, newCap, strideV, "app.nb"), "app.bytes")!
-        let newBuf = e.rtAllocManaged(newBytes)
-        LLVMBuildStore(b, LLVMConstInt(e.i64, e.arrayBufTypeId(elem), 0), newBuf)
-        LLVMBuildStore(b, newCap, e.gepByte(newBuf, LLVMConstInt(e.i64, 8, 0)))
-        let copyBytes = LLVMBuildMul(b, len, strideV, "app.copy")!
-        let (memcpy, mty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
-        _ = e.buildCall(memcpy, mty, [e.toUnmanaged(e.gepByte(newBuf, LLVMConstInt(e.i64, 16, 0))),
-                                      e.toUnmanaged(e.gepByte(buf0, LLVMConstInt(e.i64, 16, 0))), copyBytes])
-        e.storeField(handle, e.gepByte(handle, LLVMConstInt(e.i64, 16, 0)), newBuf)
-        LLVMBuildBr(b, contBB)
-
-        LLVMPositionBuilderAtEnd(b, contBB)
-        let buf = LLVMBuildLoad2(b, e.p1, e.gepByte(handle, LLVMConstInt(e.i64, 16, 0)), "app.buf2")!
-        let off = LLVMBuildAdd(b, LLVMConstInt(e.i64, 16, 0), LLVMBuildMul(b, len, strideV, "app.mul"), "app.off")!
-        e.storeField(buf, e.gepByte(buf, off), value)
-        LLVMBuildStore(b, LLVMBuildAdd(b, len, LLVMConstInt(e.i64, 1, 0), "app.inc"), e.gepByte(handle, LLVMConstInt(e.i64, 8, 0)))
-        return LLVMConstInt(e.i64, 0, 0)
-    }
-
-    // MARK: - Actors, closures, spawn
-
-    private func lowerMailboxInit(_ obj: SSAValue, _ span: Span) {
-        guard case .named(let name, _) = obj.type, let at = e.actorType(name) else {
-            e.fail("7.2.3: mailboxInit on a non-actor", span); return
-        }
-        let mailbox = e.rtAllocManaged(LLVMConstInt(e.i64, 40, 0))
-        e.writeTypeIdHeaderRaw(mailbox, e.mailboxTypeIdValue())
-        e.storeField(val(obj), e.structGEP(at, val(obj), e.actorMailboxIndex(name)), mailbox)
-    }
-
-    // A closure value is a managed `{ i64 header, i8ptr fn, p1 env }` object (the env carries the
-    // captures, built separately as a class object). Same shape as an `any` box (one managed field at
-    // byte 16), so it reuses the any-box type-id for GC scanning.
-    private func makeClosure(_ funcName: String, _ env: SSAValue?, _ onStack: Bool, _ span: Span) -> LLVMValueRef? {
-        guard let c = e.callables["f:\(funcName)"] else { e.fail("7.2.3: unknown closure body '\(funcName)'", span); return nil }
-        let cloTy = e.structTy([e.i64, e.i8ptr, e.p1])
-        // A non-escaping closure object lives on the stack (EA 7.3): an entry alloca in place of the
-        // managed heap object. Same `{header, fn, env}` layout, so the indirect-call GEPs are unchanged;
-        // the env field stays `p1` (the env object itself is still heap this slice). `storeField` sees
-        // an addrspace(0) base and emits a plain store (no barrier, I7); SROA then scalar-replaces the
-        // slot so its managed env field becomes a statepoint-tracked root (I5).
-        let obj: LLVMValueRef = onStack ? e.entryAlloca(cloTy, "clo") : e.rtAllocManaged(LLVMConstInt(e.i64, 24, 0))
-        LLVMBuildStore(b, LLVMConstInt(e.i64, e.anyBoxTypeId(), 0), e.structGEP(cloTy, obj, 0))
-        LLVMBuildStore(b, c.fn, e.structGEP(cloTy, obj, 1))
-        let envVal = env != nil ? val(env!) : LLVMConstNull(e.p1)
-        e.storeField(obj, e.structGEP(cloTy, obj, 2), envVal)
-        return obj
-    }
-
-    // Start `startFn(env)` on a fiber. The lifted `spawn:N(env: envClass) -> R` returns its result
-    // directly, but the runtime's fiber routine ABI is `i8ptr(i8ptr)`, so wrap it in a per-spawn thunk
-    // that re-manages the env pointer, calls the lifted body, boxes the result, and returns the box.
-    private func lowerSpawn(binding: Int, startFn: String, env: SSAValue?, resultType: Type, span: Span) {
-        guard let start = e.callables["f:\(startFn)"], let resTy = ty(resultType, span) else {
-            e.fail("7.2.3: unknown spawn body '\(startFn)'", span); return
-        }
-        let (thunk, _) = e.emitFunction("nomu_spawnthunk_\(binding)", ret: e.i8ptr, params: [e.i8ptr])
-        e.withStubBody(thunk) {
-            let envArg = LLVMGetParam(thunk, 0)!   // addr0 void* — matches `spawn:N`'s addr0 env param
-            let r = e.buildCall(start.fn, start.ty, [envArg])!
-            // A proper typed box { header, result } (150.3.13): the header lets a moving collection relocate
-            // the box, which the self-hosted STW walk roots at fib+216 until the join; its pointer map scans a
-            // managed result so that survives + is fixed up too. Result lives after the 8-byte header.
-            let slots = 1 + e.slotCount(resultType)
-            let box = e.rtAllocManaged(LLVMConstInt(e.i64, UInt64(slots * 8), 0))
-            e.writeTypeIdHeaderRaw(box, e.spawnBoxTypeId(resultType))
-            e.storeField(box, e.gepByte(box, LLVMConstInt(e.i64, 8, 0)), r)
-            LLVMBuildRet(b, e.toUnmanaged(box))
-        }
-        let (spawn, sty) = e.runtimeFn("fiber_spawn", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr], varArg: false)
-        let envArg = env != nil ? e.toUnmanaged(val(env!)) : LLVMConstNull(e.i8ptr)
-        let fiber = e.buildCall(spawn, sty, [thunk, envArg])!
-        _ = resTy
-        let handleSlot = e.entryAlloca(e.spawnHandleTy, "spawn.h")
-        LLVMBuildStore(b, fiber, e.structGEP(e.spawnHandleTy, handleSlot, 0))
-        spawnHandles[binding] = handleSlot
-    }
-
-    private func lowerSpawnJoin(_ inst: SSAInst, binding: Int, resultType: Type, final: Bool, span: Span) {
-        guard let handleSlot = spawnHandles[binding] else { return }
-        // `final` (the structured scope-exit join) tells the runtime to drop the fiber from the live-fiber
-        // registry after reading the result — the point its result box stops being rooted (150.3.13).
-        let (sj, sty) = e.runtimeFn("spawn_join", ret: e.i8ptr, params: [e.i8ptr, e.i64], varArg: false)
-        let box = e.buildCall(sj, sty, [handleSlot, LLVMConstInt(e.i64, final ? 1 : 0, 0)])!
-        if let result = inst.result, let rt = ty(resultType, span) {
-            let payload = e.gepByte(box, LLVMConstInt(e.i64, 8, 0))   // result after the 8-byte header (150.3.13)
-            values[result.id] = LLVMBuildLoad2(b, rt, payload, "spawn.res")
-        }
-    }
 }

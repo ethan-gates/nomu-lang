@@ -12,8 +12,8 @@ scope:
 | File | Start | Now |
 |---|---|---|
 | `frontend/sema/sources/Sema.swift` | 3099 | 556 (done) |
-| `midend/ssairgen/sources/SSAIRGen.swift` | 1311 | — |
-| `llvmgen/SSAIRToLLVM.swift` | 1198 | — |
+| `midend/ssairgen/sources/SSAIRGen.swift` | 1311 | 106 (split by type; FunctionLowerer.swift 1093) |
+| `llvmgen/SSAIRToLLVM.swift` | 1198 | 961 (leaf families peeled; Calls/Values remain) |
 | `frontend/parse/sources/Parser.swift` | 1060 | — |
 
 ## Why
@@ -128,13 +128,45 @@ is done.
 
 ### 154.2 — SSAIRGen.swift (1311)
 
-Not started. Same generation-vs-passes lens: separate NOIR→SSAIR generation from SSAIR→SSAIR
-passes; extract capability clusters around the core lowering walk.
+The gen/passes split is already done at the module level — SSAIR→SSAIR passes live in the separate
+`ssairpasses` module, so `SSAIRGen.swift` was pure generation.
+
+**Split by top-level type (done, golden-`IDENTICAL` + ssairgen tests green).** 1311 → four files:
+- `SSAIRGen.swift` (106) — the module driver: `SSAGenResult`, `lowerToSSAIR`, `field`/`lowerMethods`.
+- `ModuleContext.swift` (42) — the type-layout lookup tables (field/case index, method lookup).
+- `ClosureConversion.swift` (88) — `ClosureSink` + free-variable collection (`collectUses*`, widened
+  to `internal` for the cross-file caller).
+- `FunctionLowerer.swift` (1093) — the per-function lowering walk + its SSA-cleanup helpers
+  (`removeTrivialParams`/`edgeArgs`/`removeEdgeArg`/`substitute`, kept `private` in-file).
+
+**Remaining (optional): peel FunctionLowerer's method clusters.** It's a `class`, so the split path is
+capability `enum`s over the `FunctionLowerer` reference (`Statements`, `Expressions`, `Aggregates`,
+`Switch`, `Finalization`) — the NOIRGen pattern, but by reference (no `inout`, no exclusivity work).
+Keep the scope-map core (`read`/`write`/`readRecursive`/`bind`/`readVar`/`slots`/`varType`/`currentDef`)
+in `FunctionLowerer.swift`: **task 153** (lexical-scoping fix) edits exactly that machinery, so leaving
+it in one place keeps the 153 diff local. Extracting the *callers* of those primitives is safe.
 
 ### 154.3 — SSAIRToLLVM.swift (1198)
 
-Not started. LLVM emission; likely splits by IR construct family (values/aggregates/control
-flow/intrinsics) around the emit driver.
+**Verification harness (done).** The backend had no golden — `ir-golden.sh` stopped at SSAIR. Added
+`--emit-llvm` (writes `<stem>.ll`, the egress module *pre-optimization* via `LLVMPrintModuleToFile`)
+and `--stop=llvm` (halt after the egress, before object emit/link), wired through `EmitOptions`/CLI/
+`Driver`/`emitObject`. `ir-golden.sh` now captures `.noir`/`.ssair`/`.ll` (284 artifacts; 94 `.ll` for
+the clean-compiling examples). The baseline was refreshed to include `.ll` after confirming the flag
+is inert for `.noir`/`.ssair`.
+
+**Leaf families peeled (done, golden-`IDENTICAL` incl. `.ll` + tests-green).** `SSAIRToLLVM.swift` is a
+single 1198-line `final class`, so — like `FunctionLowerer` — the split path is capability `enum`s over
+the class *reference* (no `inout`; a class is shared mutable). The shared emitter is reached as `g.e`,
+operands as `g.val`, the builder as `g.b`. 1198 → 961, three files:
+- `EgressBuiltins.swift` (90) — `print`/`putByte`/`concat`/`sleep`/`readLine`/`time_monotonic` + C-leaf.
+- `EgressArrays.swift` (101) — array handle layout, literal, bounds-check, `__arraySet`/`__arrayAppend`.
+- `EgressConcurrency.swift` (83) — actor mailbox init, closure object, `spawn`/join.
+
+**Remaining (optional):** the Calls family (`lowerCall`/`lowerDirectCall` ~300 lines/`lowerStoredAccessor`)
+and the Values/aggregates family (`lowerBinary`/`lowerAlloc`/`fieldSlotAddr`/`makeStruct`/`makeEnum`/
+`extractPayload`/`lowerBox`). Extracting both drops the core to ~430 (dispatch skeleton: state, entry,
+declaration, body, instructions, terminators). Same `enum`-over-reference pattern.
 
 ### 154.4 — Parser.swift (1060)
 
@@ -161,7 +193,8 @@ of two shapes), not the line count.
 
 ## Refs
 
-- `tools/ir-golden.sh` — the golden-IR verification harness.
+- `tools/ir-golden.sh` — the golden-IR verification harness (`.noir`/`.ssair`/`.ll`). Backend refactors
+  are covered by the `.ll` snapshots via `--emit-llvm --stop=llvm` (the egress module, pre-optimization).
 - `frontend/sema/sources/` is grouped by stage: `core/` (Sema oracle + driver + `TypeResolution`),
   `gen/` (the NOIR-generation walk `NOIRGen` + its capability helpers `EnumConstruction`,
   `GenericInference`, `PointerIntrinsics`, `TypeChecks`, `Builtins`, `InterfaceModel`, `Shareability`),
