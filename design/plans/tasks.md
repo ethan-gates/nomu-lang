@@ -123,6 +123,7 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 | 146 | [Author the `language/` contract tier](tasks/146-language-contract-tier.md) | Infra | M | in-progress |
 | 147 | [Compiler cleanups (bucket)](tasks/147-compiler-cleanups.md) | Infra | S | ready-to-build |
 | 153 | [Lexical scoping of locals in SSAIRGen](tasks/153-ssairgen-lexical-scoping.md) | Infra | M | ready-to-build — crash sub-case fixed (`bind` clears cross-kind); shadow-leak open |
+| 154 | [Source-tree decomposition (large-file grokkability)](tasks/154-source-tree-decomposition.md) | Infra | L | in-progress — 154.1 Sema underway (3099→2002, 5 capabilities extracted, golden-verified); 154.2 SSAIRGen / 154.3 SSAIRToLLVM / 154.4 Parser pending |
 
 ## ► Decide-early flags (carried from `deferred.md`)
 
