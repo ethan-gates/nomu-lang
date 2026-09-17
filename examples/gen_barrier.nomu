@@ -1,0 +1,48 @@
+// Task 150 · rung 4 (GenImmix), increment 150.4.2 — self-hosted log-bit table + write-barrier activation.
+// Under NOMU_GC_PLAN=nomu the alloc seam arms the object-remembering barrier at space creation: it points the
+// inline fast path's globals (__nomu_barrier_active / __nomu_logbit_base / __nomu_logbit_log_region) at the
+// descriptor's log-bit side table, and the C seam routes the slow path to the Nomu remembering routine
+// (rtGcRemember), which fills this carrier's mod-buffer (the remembered set, selfhosted-gc.md §11.2/§11.3).
+// Still non-collecting — the minor GC that drains the buffer is 150.4.3; here the buffer just fills.
+//
+// The table starts all-logged (bit 0), so young objects never trip the barrier. To exercise a real old→young
+// store non-collecting, the fixture simulates a promotion: rtSetUnlogged marks `h` mature (the exact bit the
+// 150.4.3 promotion will set), then a store of a fresh (young) Box into mature `h` is the cross-generation
+// pointer the barrier must remember. Compiled with NOMU_NO_ESCAPE=1 so the objects are real heap objects.
+//
+// Checks (expected output 1 / 1 / 1 / 3):
+//   1. the remembered set is empty before the store,
+//   2. the old→young store remembered the mature object once (the barrier fired + the slow path appended),
+//   3. a second store to the same object elided the slow path (the log bit was cleared on the first),
+//   4. the computation reads back through the barrier.
+class Box {
+  var v: Int
+}
+class Holder {
+  var item: Box
+  var tag: Int
+}
+fun main() {
+  let h = Holder(item: Box(v: 1), tag: 7)   // first managed allocation: creates the space + arms the barrier
+  // The space + mod-buffer exist only after the first managed allocation, so read them here.
+  let space = RawPtr.gcSelfhostSpace()
+  let mb = RawPtr.gcSelfModBuf()
+  let c0 = rtModBufCount(mb)                 // 0 — nothing remembered yet (h is young; construction did not log)
+
+  rtSetUnlogged(space, addrOf(h))            // simulate promotion: h is now mature (unlogged)
+  h.item = Box(v: 2)                         // mature h → young Box: the barrier fires and remembers h
+  let mid = h.item.v                         // 2 — force the first store live
+  let c1 = rtModBufCount(mb)                 // 1 — the remembered set grew by exactly one
+
+  h.item = Box(v: 3)                         // second store to h: h's log bit is now clear → fast path elides
+  let c2 = rtModBufCount(mb)                 // 1 — still one; the slow path did not run again
+
+  print(c0 == 0)
+  print("\n")
+  print(c1 == 1 && mid == 2)
+  print("\n")
+  print(c2 == 1)
+  print("\n")
+  print(h.item.v)                            // 3
+  print("\n")
+}

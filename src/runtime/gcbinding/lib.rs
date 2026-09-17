@@ -94,6 +94,17 @@ pub static __nomu_logbit_base: AtomicUsize = AtomicUsize::new(0);
 #[unsafe(no_mangle)]
 pub static __nomu_logbit_log_region: AtomicU8 = AtomicU8::new(0);
 
+// Heap-range guard for the inline barrier fast path (task 150.4.2). MMTk's log-bit side metadata covers the
+// whole address space, so under an MMTk plan the guard must never trip — the range is set to [0, MAX] at
+// init and the fast path indexes the table for every object. The self-hosted plan's log-bit table covers
+// only its Immix heap, so its alloc seam overrides this with that heap's range; a store into an off-heap
+// object (self-hosted LOS or immortal String buffer) then skips the barrier rather than indexing out of
+// bounds. Remembering off-heap old→young stores under the self-hosted plan is a later increment.
+#[unsafe(no_mangle)]
+pub static __nomu_logbit_heap_lo: AtomicUsize = AtomicUsize::new(0);
+#[unsafe(no_mangle)]
+pub static __nomu_logbit_heap_hi: AtomicUsize = AtomicUsize::new(0);
+
 // §6.6.1 — the bump-pointer fast-path layout for the codegen-inlined `__nomu_gc_alloc`. The
 // per-carrier mutator holds a `{ cursor, limit }` `BumpPointer` at `__nomu_bump_offset` bytes for the
 // Default semantics (same shape across NoGC/Immix/GenImmix; MMTk `AllocatorInfo::BumpPointer`).
@@ -687,6 +698,10 @@ pub extern "C" fn nomu_gc_init(heap_bytes: usize) {
         mmtk().get_plan().constraints().needs_log_bit as u8,
         Ordering::Relaxed,
     );
+    // MMTk's side metadata is global, so the inline fast path's heap-range guard must never trip under an
+    // MMTk plan (task 150.4.2). The self-hosted plan's alloc seam narrows this to its Immix heap range.
+    __nomu_logbit_heap_lo.store(0, Ordering::Relaxed);
+    __nomu_logbit_heap_hi.store(usize::MAX, Ordering::Relaxed);
     // Publish the unlog-bit side-metadata layout for the inlined fast path (Step B).
     if let mmtk::util::metadata::MetadataSpec::OnSide(spec) =
         <VMObjectModel as ObjectModel<NomuVM>>::GLOBAL_LOG_BIT_SPEC.as_spec()

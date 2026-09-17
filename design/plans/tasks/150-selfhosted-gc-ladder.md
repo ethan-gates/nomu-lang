@@ -1,10 +1,10 @@
 # Self-hosted GC bring-up ladder (NoGC → mark-verify → Immix → GenImmix)
 
 **Avenue:** Risk (the core bet) · **Type/Lifecycle:** `runtime · in-progress` (runtime + GC + backend) ·
-**Size:** XL · **Status:** 150.3 (Immix) complete as a hosted collector (150.3.1–150.3.8: substrate,
-allocator, LOS, line marking, sweep, forwarding, evacuation + fixup, copy-reserve/defrag trigger); the
-ladder pauses here for the scheduler self-host (128.1) before GenImmix (150.4). Full-runtime root-scanning
-integration (multi-mutator STW) handed to [128](128-self-hosting-runtime.md) (128.3) ·
+**Size:** XL · **Status:** 150.3 (Immix) complete as a whole-program moving collector on the self-hosted
+scheduler (150.3.1–150.3.13); **150.4 (GenImmix) is the current rung** — nursery + write barrier +
+remembered set, design locked in `selfhosted-gc.md` §11 (see the 150.4 subtask entry). Full-runtime
+root-scanning integration (multi-mutator STW) landed via [128](128-self-hosting-runtime.md) (128.3) ·
 **Source:** distilled from [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
 
 The ladder's rungs are the subtasks: **150.1** NoGC, **150.2** mark-verify, **150.3** Immix, **150.4**
@@ -88,9 +88,14 @@ Immix is a real functioning collector (reclaims + moves), so it is a natural pau
 turns to the scheduler half ([128.1](128-self-hosting-runtime.md)) before GenImmix, because GenImmix's
 STW-over-all-mutators root scan ([128.3.2](128-self-hosting-runtime.md)) reads every carrier's saved
 safepoint context (the self-hosted scheduler's machinery) and the generational barrier co-designs with the
-carrier path. Order: **150.3 → 128.1 → 150.4 → retire MMTk → 127**. Immix runs hosted on the existing C
-scheduler; GenImmix lands on the self-hosted one. MMTk retires as the production collector once self-hosted
-GenImmix matches its oracle (kept as a test oracle: `selfhosted-gc.md` §7, Open).
+carrier path. Order: **150.3 → 128.1 → 150.4 → perf-benchmark vs MMTk → retire MMTk → 127**. Immix runs
+hosted on the existing C scheduler; GenImmix lands on the self-hosted one. MMTk retires as the production
+collector once self-hosted GenImmix (a) matches its oracle for correctness and (b) is benchmarked competitive
+against MMTk GenImmix — throughput, GC pause distribution, and heap footprint on the GC-heavy fixtures (and
+ideally a larger workload). The benchmark must run **before** retirement, while both collectors are live and
+selectable (`NOMU_GC_PLAN=nomu` vs the MMTk plan) — retiring MMTk removes the perf baseline. If the
+self-hosted collector is behind, that is tuning work (or an LXR argument), not a retirement blocker, but the
+numbers should be recorded first. MMTk is kept as a test oracle after retirement (`selfhosted-gc.md` §7, Open).
 
 ## Why this shape
 
@@ -326,8 +331,141 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
     reserves (`tools/gc-concurrent.sh`, now the collecting form). All 28 drivers + unit tests green.
     Follow-up (resolved in 150.3.12.3): value-payload boxes in the witness path (`boxPayload`,
     `LLVMGenWitness.swift`) were header-less the same way and mis-evacuated under a moving collection.
-- **150.4 — GenImmix.** Nursery + write barrier + remembered set. **After the scheduler self-host (128.1),
-  on the 150.3.9 whole-program collector.**
+- **150.4 — GenImmix.** Nursery + write barrier + remembered set, on the 150.3.9 whole-program collector
+  (the scheduler self-host it rides on is in place). **Current rung.** Design `selfhosted-gc.md` §11.
+  Decisions locked: a **bounded copying nursery** (true GenImmix — StickyImmix's in-place young generation is
+  off-ladder, its oracle would be MMTk StickyImmix); **object-remembering** barrier reusing the inline
+  `__nomu_write_barrier` fast path with a self-hosted log-bit table + slow path; **per-carrier mod-buffers**
+  for the remembered set; **promote-all** minor collection (whole nursery is one generation). Oracle is MMTk
+  GenImmix (`NOMU_GC_PLAN=genimmix`, already the default MMTk plan). Five increments, each diffed against it:
+  - 150.4.1 — nursery substrate. **Built.** Descriptor grew to 144 bytes (`nurseryReserve@128`,
+    `nurseryUsed@136`); block-state 4 = `NURSERY`. A mutator TLAB refill tags each *clean* block it pulls
+    (free/never-used, state 0) `NURSERY` and counts it in `nurseryUsed` — a reused RECYCLABLE block holds
+    mature survivors and stays mature. The reserve is 1/4 of the pool (2048 blocks); the sweep resets
+    `nurseryUsed` (a collection empties the nursery). Non-collecting: no minor GC yet, so the reserve bound is
+    unenforced and the existing collector treats `NURSERY` as any used block (sweep overwrites its state,
+    defrag-select includes it, evac skips non-source). Introspection `rtNurseryBlocksUsed` /
+    `rtNurseryReserve`. `examples/gen_nursery.nomu` + `tools/gen-nursery.sh` (young allocation tagged +
+    counted, equals the blocks handed out, bounded by the reserve). All 33 drivers + gen-nursery + gc-gen
+    (MMTk GenImmix oracle) + unit tests green.
+  - 150.4.2 — self-hosted log-bit table + barrier activation under `NOMU_GC_PLAN=nomu`; Nomu slow path fills
+    per-carrier mod-buffers. **Built.** A log-bit side table on the space descriptor (`logbitTable@144`,
+    descriptor grew 144→152) holds one *unlogged* bit per 8-byte region (log_region = 3, matching MMTk's
+    granularity so the inline fast path — `__nomu_write_barrier` — reads it verbatim). The alloc seam arms the
+    barrier globals at space creation (`__nomu_barrier_active=1`, `__nomu_logbit_base`/`log_region` pointed at
+    the table so absolute-address indexing lands in it); a new heap-range guard (`__nomu_logbit_heap_lo/hi`,
+    full range [0,MAX) under MMTk, the Immix range under self-host) lets the shared fast path skip off-heap
+    (LOS / immortal) objects the self-hosted table does not cover. The C seam (`rt_gc_write_barrier`) routes to
+    a Nomu remembering routine (`rtGcRemember`) under `__nomu_selfhosted_alloc`: it re-tests the log bit (the
+    actor/mailbox path calls the seam directly, bypassing the inline test), clears it, and appends the object to
+    this carrier's mod-buffer — a growable per-carrier append buffer bound in the C runtime
+    (`rt_self_modbuf_get`), reset at end-of-collection (`rt_modbuf_reset_all`) beside `rt_tlab_reset_all`. The
+    table starts all-logged, so young objects never trip the barrier and the whole suite is unchanged
+    (remembered set empty while non-collecting). `examples/gen_barrier.nomu` + `tools/gen-barrier.sh` exercise
+    it non-collecting: a `rtSetUnlogged` hook simulates promotion, then an old→young store fires the barrier
+    and appends once (1), a second store to the same object elides the slow path (1), the computation reads
+    back. All 33 drivers + gen-nursery + gen-barrier + gc-gen (MMTk GenImmix oracle) + unit tests green.
+  - 150.4.3 — minor collection: nursery-full STW, stack roots + drained mod-buffer as roots, promote-all
+    evacuation nursery→mature, reset nursery + log bits. **Built — first generational collection.**
+    `rtImmixCollectMinor` (`runtime.nomu`) turns the NURSERY blocks into evacuation sources and promotes every
+    survivor into fresh mature Immix via the reused `rtEvacuate`/forwarding record: the root set is the stopped
+    mutator's stack slots plus the drained per-carrier remembered set (`RawPtr.gcDrainModBufs` →
+    `rt_modbuf_drain`), and the trace is Cheney over *promoted objects only* — the mature space is never
+    scanned, so a mature→young pointer survives solely because the barrier remembered it. Promoted + remembered
+    objects are re-marked unlogged so their next mutation is caught; the emptied nursery blocks are reclaimed
+    whole (the mature space is not swept). Fires when the nursery reaches its reserve
+    (`rtImmixRefill` → `rtSelfhostMinorGc` parks the mutator; the STW coordinator reads a collection-kind flag
+    at sched+176 and runs `nomuSchedStwCollectMinor` instead of the defrag major). The trigger is opt-in via
+    `NOMU_NURSERY_RESERVE` (blocks; 0 = disabled) — until the minor collector is robust across every object
+    type and multi-carrier (150.4.5), the default path stays major-only at OOM, so the whole existing suite is
+    unchanged. `examples/gen_minor.nomu` + `tools/gen-minor.sh`: a sliding-window allocator drives ~48 real
+    minor GCs; a Holder promoted to mature then pointed at a fresh nursery Box survives via the remembered set,
+    checksum-identical to MMTk GenImmix (42 / 4242 / window checksum). All drivers + unit tests green.
+    *Deferred:* minor/major escalation on mature pressure / failed promotion → 150.4.4; mature-garbage reclaim
+    (promote-all leaks mature garbage until a major) → 150.4.4; multi-carrier remset + the full suite under the
+    minor collector → 150.4.5.
+  - 150.4.4 — minor/major interplay + trigger policy: mature pressure and failed promotions escalate to the
+    existing full defrag collector. **Built.** At a nursery-full trigger `rtImmixRefill` compares the free
+    mature blocks (`nomuGcSpaceAvail`) against a floor — the worst-case promotion (the whole nursery,
+    `minorTrigger` blocks) plus a fragmentation margin, raised by `NOMU_MATURE_FLOOR` (the mature-pressure knob)
+    when set higher. Below the floor it escalates to a full defrag major (`rtSelfhostOom`, collection kind 0)
+    instead of a minor (`rtSelfhostMinorGc`, kind 1); the major reclaims mature garbage and collects the
+    nursery, so one check covers both failed promotion (mature has no headroom for the promotions) and mature
+    pressure (dead mature objects a minor never reclaims). The defrag major is heap-pressure-safe (it selects
+    sources within the copy reserve), so it runs even when the minor could not place its promotions. Under the
+    generational trigger the major re-establishes the log-bit invariant post-collection
+    (`rtImmixCollectRootsDefragGen`): after a full collection every survivor is mature and the nursery is empty,
+    so the whole log-bit table is wiped to logged (`rtClearLogTable` — freed regions hold future young objects
+    that must never trip the barrier) and every live survivor is set unlogged in the final unmark walk
+    (`rtGenUnmarkAndUnlog`) so the next minor's barrier catches its cross-generation stores. A stale unlogged
+    bit on a freed region would falsely remember a young object (the minor treats a remembered object as mature
+    and non-moving — corruption); a missing unlog on a survivor would silently drop a mature→young pointer in
+    the next minor. The pre-150.4.4 path (no `NOMU_NURSERY_RESERVE`) runs the plain defrag unchanged, so the
+    existing suite is byte-identical. `examples/gen_major.nomu` + `tools/gen-major.sh`: under a tiny reserve +
+    `NOMU_MATURE_FLOOR`, a sliding-window allocator drives ~128 minor GCs interleaved with ~18 major GCs; a
+    cross-generation store made *after* majors have fired survives (proving the post-major log bits are
+    re-armed), checksum-identical to MMTk GenImmix (77 / 4242 / 94950). The trigger stays opt-in (env-gated);
+    flipping it on by default + the full suite + multi-carrier is 150.4.5.
+  - 150.4.5 — full-suite + multi-carrier correctness under the minor collector; then flip generational on by
+    default. **In progress.** Grounding (150.4.4 done): forcing the generational trigger on
+    (`NOMU_NURSERY_RESERVE` set) crashes `gc-anybox` / `gc-string` / `gc-actor` right after the first minor —
+    the minor reclaims nursery blocks *whole*, so a single missed managed slot dangles (the defrag major
+    survives the same gap because it sweeps by line marks and keeps any block with a live neighbour). Broken
+    into:
+    - 150.4.5.1 — object-type coverage, single carrier: fix the minor's scan/promote for `any` existentials,
+      String immortal buffers, and actor mailboxes. **Done (bar the LOS gap in 150.4.5.1.1).**
+      - *Root cause 1 (fixed): the self-hosted allocator never re-zeroed reused memory.* Its zero-init contract
+        held only while non-collecting (fresh-mmap heap); once collection reused a block, an over-allocated
+        array buffer's unwritten tail `[len, cap)` carried the previous occupant's bytes, which the tracer
+        (scanning by `cap`) read as pointers and dereferenced. The defrag major dodged it on timing (fires
+        rarely, at OOM, on pre-sized arrays); the frequent minor hit it at once. Fix: bulk-zero every reclaimed
+        hole on acquire in `rtImmixRefill` (new `RawPtr.zeroBytes` → `memset`, a `__raw*` runtime-subset
+        primitive), matching Immix/MMTk/Go/Java/.NET — every GC'd runtime zeroes reclaimed memory. Plus
+        hardening: `rtEvacuate` range-checks before dereferencing, so a stray word can never fault the
+        collector. gc-anybox / gc-string pass generational single-carrier; the full existing GC suite stays
+        green (the zeroing is validated on the non-generational path too).
+      - *Root cause 2 (fixed): runtime-internal stores bypassed the write barrier.* The actor mailbox/message
+        enqueue (`nomuSchedActorSend`/`nomuSchedMailboxPop`, runtime-subset code) uses raw `__rawStore`s, which
+        are gc-leaf and do not emit the inline barrier. A young message appended to a mature mailbox is missed
+        by the next minor: the sched-queue root only reaches *young* mailboxes (the minor's root-forward never
+        rescans a mature object — mature→young pointers live in the remembered set, not a root re-walk), and the
+        `sched_next` chain the root walk relies on the tracer to follow stops at the first mature mailbox. Fix:
+        a `rtRememberStore(obj)` slow path (fetch the carrier mod-buffer → `rtGcRemember`, which remembers only
+        a mature in-heap object; a cheap no-op off the generational plan) called after each runtime store that
+        links a young managed pointer into a maybe-mature object — mb_head/mb_tail, the prior tail message's
+        next, `sched_next`, and the popped-head re-link. gc-actor passes generational single-carrier down to
+        reserve 8 (was: lost output ≥~250 actors, crash at reserve 64), deterministic across runs.
+      - **Result: gc-anybox / gc-string / gc-actor all green generational single-carrier; full 26-driver suite +
+        unit tests green, no regressions.** 150.4.5.1 done bar the LOS/immortal remset gap below.
+    - 150.4.5.1.1 — large-object-space remembered set. **Done.** A large object (an Array buffer >32 KiB) lives
+      off-heap: never in the nursery, never moved, no write-barrier log bit. A young object stored into it is a
+      mature→young pointer the inline barrier's heap-range guard skips and the remembered set never captures
+      (the Array handle forwards `bufptr`, but the collector does not follow an off-heap pointer into the
+      nursery). Fix: the minor treats every live LOS object as an old root — a fourth root source in
+      `rtImmixCollectMinor` walks the `losHead` chain and `rtMinorScanObj`s each object for young referents
+      (immortal String buffers hold no managed pointers, so they need no scanning and are not on the list; a
+      dead-but-unswept LOS object conservatively keeps its young referents alive until the next major). Proof:
+      `examples/gc_los_gen.nomu` + `tools/gen-los.sh` — a young Box stored into a mature ~48 KiB LOS buffer,
+      reachable only through the off-heap buffer, survives repeated minors (777); confirmed to read garbage
+      (789823) with the LOS scan disabled, so the fixture genuinely exercises the gap. Checksum-identical to
+      MMTk GenImmix.
+    - 150.4.5.2 — multi-carrier remset correctness: the per-carrier mod-buffer drain machinery exists; validate
+      it under concurrent mutation. **Done — the machinery is already correct across carriers; no collector
+      changes needed.** The barrier's per-carrier mod-buffer append is lock-free (each carrier writes only its
+      own buffer); `nomuSchedActorSend`/`Pop` are runtime-subset (no-safepoint), so their store→remember is
+      atomic w.r.t. an STW another carrier triggers; the log-bit clear is non-atomic but conservative under
+      races (a lost clear only keeps an object remembered-eligible, and a remembered object is rescanned in full
+      regardless of which carrier logged it, so no store's remembering is lost); the drain runs at STW with all
+      carriers parked. Verified: `gc_concurrent` checksum-identical to MMTk at 1/2/4/8 carriers, and a new
+      self-checking actor fixture (`examples/gc_actor_mc.nomu` — `report` prints only on a wrong sum, so the
+      pass condition is empty output, robust to concurrent-`print` interleaving) shows no cross-generation
+      message lost across many runs at 1/2/4/8 carriers. Driver: `tools/gen-multicarrier.sh`. *Note:* the
+      original `gc_actor` per-actor prints garble line structure under >1 carrier (two `report`s interleaving
+      stdout, e.g. `1225`+`728` → `1225728`); that is an output-interleaving artifact of unsynchronized `print`,
+      not a GC fault — `gc-actor.sh` only ever ran self-hosted at a single carrier, so it never surfaced.
+    - 150.4.5.3 — flip generational on by default under `NOMU_RUNTIME=selfhost` (descriptor carries the default
+      reserve, the trigger reads it, env demoted to an override); full suite green, opt-in gating retired.
+      Reserve/floor knobs internalize here (feeds task 157).
 - Then [127 LXR](127-lxr-collector.md): reclamation swapped to RC-primary, on 150.3's region machinery.
 
 ## Refs

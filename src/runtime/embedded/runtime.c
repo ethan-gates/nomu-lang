@@ -34,6 +34,24 @@ extern void nomu_gc_force_collect(void* mutator); // task 150 rung 2 — force o
 // byte store from C is layout-compatible.
 extern unsigned char __nomu_runtime_selfhost;
 
+// Nonzero once nomu_gc_init has routed allocation at the self-hosted Nomu allocator (NOMU_GC_PLAN=nomu / the
+// selfhost umbrella). Rust-side AtomicU8; read here to route the write barrier at the self-hosted remembering
+// path (task 150.4.2) instead of MMTk's post-barrier.
+extern unsigned char __nomu_selfhosted_alloc;
+
+// Nursery reserve override in blocks (task 150.4.3, env NOMU_NURSERY_RESERVE). 0 = the default (1/4 of the
+// pool). Set once from the env in main() before any allocation; rtImmixNew reads it (RawPtr.gcNurseryReserve)
+// when it creates the space. A small value forces frequent minor GCs so a test exercises the generational
+// collector deterministically. Non-static so the codegen intrinsic can load it.
+int64_t __nomu_nursery_reserve = 0;
+
+// Mature-pressure floor in blocks (task 150.4.4, env NOMU_MATURE_FLOOR). 0 = default (the minor/major driver
+// falls back to the worst-case-promotion bound). When free mature blocks fall below it, a nursery-full trigger
+// escalates to a full defrag major instead of a minor (rtImmixRefill reads it via RawPtr.gcMatureFloor). A
+// large value forces majors to interleave with minors so a test exercises the escalation path deterministically.
+// Non-static so the codegen intrinsic can load it.
+int64_t __nomu_mature_floor = 0;
+
 // ---- Scheduler plan selector (task 128.1.9) ----
 // Two schedulers are linked: the C/pthread scheduler below (default, the differential oracle) and the
 // self-hosted Nomu scheduler in the runtime prelude (src/stdlib/runtime.nomu), selected by NOMU_SCHED=nomu.
@@ -64,6 +82,7 @@ extern void  nomu_fn_nomuSchedSafepoint(void* sched, void* anchorSp, void* ancho
 extern int64_t nomu_fn_nomuSchedWalkParked(void* sched, void* outBuf, int64_t cap);      // task 128.3.2
 extern int64_t nomu_fn_nomuSchedStwCollect(void* sched);            // self-hosted evacuating collection at STW
 extern int64_t nomu_fn_nomuSchedStwCollectDefrag(void* sched);      // defrag variant (heap-pressure path)
+extern int64_t nomu_fn_nomuSchedStwCollectMinor(void* sched);       // minor (generational) collection (150.4.3)
 extern int64_t nomu_fn_nomuGcSpaceAvail(void);                      // free blocks in the self-hosted heap
 extern int64_t nomu_fn_nomuGcSpaceBlocks(void);                     // total blocks in the self-hosted heap
 extern int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);            // libSystem futex
@@ -111,6 +130,63 @@ void rt_tlab_reset_all(void) {
         int64_t* t = (int64_t*)rt_tlab_table[i];
         t[0] = 0; t[1] = 0; t[2] = -1; t[3] = 0;
     }
+}
+
+// ---- Per-carrier write-barrier mod-buffers (task 150.4.2, §11.3) ----
+// Each carrier owns a growable mod-buffer { count@0, cap@8, storage@16 } — the remembered set the barrier
+// slow path (rtGcRemember) appends mutated mature objects to. Bound lazily per carrier and registered in a
+// table so the collector resets every buffer at end-of-collection (rt_modbuf_reset_all), mirroring the TLAB.
+// The Nomu side (rtModBufAppend) does the growth + append; C only binds, registers, and resets.
+_Thread_local void* rt_self_modbuf = NULL;
+#define RT_MODBUF_MAX 256
+static void* rt_modbuf_table[RT_MODBUF_MAX];
+static int rt_modbuf_count = 0;
+static pthread_mutex_t rt_modbuf_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Return this carrier's mod-buffer, binding + registering it on first use. Initial capacity 4096 object
+// slots; rtModBufAppend doubles it on overflow (freeing the old storage), updating storage@16 + cap@8.
+void* rt_self_modbuf_get(void) {
+    if (!rt_self_modbuf) {
+        int64_t* m = (int64_t*)calloc(1, 24);
+        int64_t cap = 4096;
+        m[0] = 0;                             // count @0
+        m[1] = cap;                           // cap @8
+        m[2] = (int64_t)calloc((size_t)cap, 8); // storage @16
+        pthread_mutex_lock(&rt_modbuf_lock);
+        if (rt_modbuf_count < RT_MODBUF_MAX) { rt_modbuf_table[rt_modbuf_count++] = m; }
+        pthread_mutex_unlock(&rt_modbuf_lock);
+        rt_self_modbuf = m;
+    }
+    return rt_self_modbuf;
+}
+
+// Reset every carrier's mod-buffer after a collection (count = 0; keep the grown storage + cap). Called under
+// STW alongside rt_tlab_reset_all — the remembered set is drained by the collection, so it starts empty for
+// the next cycle. No lock: all carriers are stopped at safepoints, none in rt_self_modbuf_get.
+void rt_modbuf_reset_all(void) {
+    for (int i = 0; i < rt_modbuf_count; i++) {
+        int64_t* m = (int64_t*)rt_modbuf_table[i];
+        m[0] = 0;
+    }
+}
+
+// Drain every carrier's mod-buffer into `outBuf` (the minor GC's remembered set, task 150.4.3): copy each
+// carrier's remembered object pointers (up to `cap` total), reset every buffer's count, and return the total.
+// Called under STW by the minor collector (via RawPtr.gcDrainModBufs), so the table read needs no lock. The
+// drain both collects and resets, so the coordinator does not also call rt_modbuf_reset_all.
+int64_t rt_modbuf_drain(void* outBuf, int64_t cap) {
+    int64_t* out = (int64_t*)outBuf;
+    int64_t total = 0;
+    for (int i = 0; i < rt_modbuf_count; i++) {
+        int64_t* m = (int64_t*)rt_modbuf_table[i];
+        int64_t cnt = m[0];
+        int64_t* storage = (int64_t*)m[2];
+        for (int64_t j = 0; j < cnt && total < cap; j++) {
+            out[total++] = storage[j];
+        }
+        m[0] = 0;   // reset — the remembered set is consumed by this collection
+    }
+    return total;
 }
 
 // Guards the one-time creation of the self-hosted Immix space (150.3.10.1). The alloc seam does
@@ -173,7 +249,18 @@ void rt_gc_force_collect(void) {
 // `rt_mutator` is always bound here: a store into a managed object means that object was allocated on
 // this carrier's (or some carrier's) mutator, and any carrier that ran Nomu code has bound one — but
 // bind lazily anyway to be safe against a store before this thread's first allocation.
+extern void nomu_fn_rtGcRemember(void* modbuf, void* obj);   // self-hosted remembering (150.4.2)
+
 void rt_gc_write_barrier(void* obj, void* slot, void* val) {
+    // Self-hosted GenImmix (task 150.4.2): remember the mutated object in this carrier's mod-buffer instead of
+    // MMTk. rtGcRemember re-tests the object's log bit (the inline fast path already tested it, but the
+    // actor/mailbox path below calls this seam directly, bypassing that test) so only mature objects are
+    // remembered; it no-ops before the space exists. slot/val are unused here — the remembered set is object-
+    // remembering (rescan the object's slots at the minor GC), so it records only the source object.
+    if (__nomu_selfhosted_alloc) {
+        nomu_fn_rtGcRemember(rt_self_modbuf_get(), obj);
+        return;
+    }
     if (!rt_mutator) {
         rt_mutator = nomu_gc_bind_mutator((void*)pthread_self());
     }
@@ -1439,6 +1526,7 @@ static void* rt_stw_collect_thread(void* _) {
         }
         int64_t nr = nomu_fn_nomuSchedStwCollect(rt_nomu_sched);
         rt_tlab_reset_all();   // 150.3.10.1 — evacuation may have moved a carrier's block; refill on resume
+        rt_modbuf_reset_all(); // 150.4.2 — the collection drains the remembered set; start empty next cycle
         fprintf(stderr, "nomu-stw-collect: round %d fixed %lld roots\n", r, (long long)nr);
         rt_stw_st(144, 0);
         rt_stw_st(136, 0);
@@ -1488,6 +1576,7 @@ static void* rt_gc_pressure_thread(void* _) {
         }
         int64_t nr = nomu_fn_nomuSchedStwCollectDefrag(rt_nomu_sched);
         rt_tlab_reset_all();   // 150.3.10.1 — evacuation may have moved a carrier's block; refill on resume
+        rt_modbuf_reset_all(); // 150.4.2 — the collection drains the remembered set; start empty next cycle
         collections++;
         if (dbg) {
             int64_t after = nomu_fn_nomuGcSpaceAvail();
@@ -1529,6 +1618,7 @@ static void* rt_gc_sync_thread(void* _) {
             __ulock_wait(0x01000101, (char*)rt_nomu_sched + 168, 0, 1000);   // ~1ms backstop, re-checks the flag
         }
         rt_stw_st(168, 0);                               // consume the request (136 already set by the initiator)
+        int64_t kind = rt_stw_ld(176);                   // collection kind: 1 = minor (nursery full), 0 = major/defrag (OOM)
         int64_t ncarriers = rt_stw_ld(160);
         __nomu_stop_world = 1;
         __atomic_fetch_add((int64_t*)((char*)rt_nomu_sched + 24), 1, __ATOMIC_SEQ_CST);
@@ -1537,13 +1627,23 @@ static void* rt_gc_sync_thread(void* _) {
             if (rt_stw_ld(40) != 0) break;               // program finished mid-wait
             struct timespec s = {0, 200 * 1000}; nanosleep(&s, NULL);
         }
-        int64_t nr = nomu_fn_nomuSchedStwCollectDefrag(rt_nomu_sched);
-        rt_tlab_reset_all();   // 150.3.10.1 — evacuation may have moved a carrier's block; refill on resume
+        int64_t nr;
+        if (kind == 1) {
+            // Minor (generational) collection (150.4.3): promote the nursery, using the drained remembered set.
+            nr = nomu_fn_nomuSchedStwCollectMinor(rt_nomu_sched);
+            rt_tlab_reset_all();   // the reclaimed nursery blocks moved out from under the carriers' TLABs
+            // No rt_modbuf_reset_all — the minor collection's drain already reset the mod-buffers.
+        } else {
+            nr = nomu_fn_nomuSchedStwCollectDefrag(rt_nomu_sched);
+            rt_tlab_reset_all();   // 150.3.10.1 — evacuation may have moved a carrier's block; refill on resume
+            rt_modbuf_reset_all(); // 150.4.2 — the collection drains the remembered set; start empty next cycle
+        }
+        rt_stw_st(176, 0);                               // reset the kind for the next request
         collections++;
         if (dbg) {
             int64_t after = nomu_fn_nomuGcSpaceAvail();
-            fprintf(stderr, "nomu-gc-sync: collection %d, %lld roots, avail -> %lld\n",
-                    collections, (long long)nr, (long long)after);
+            fprintf(stderr, "nomu-gc-sync: collection %d (%s), %lld roots, avail -> %lld\n",
+                    collections, kind == 1 ? "minor" : "major", (long long)nr, (long long)after);
         }
         rt_stw_st(144, 0);
         rt_stw_st(136, 0);
@@ -1561,6 +1661,11 @@ int main(void) {
     const char* runtime_env = getenv("NOMU_RUNTIME");
     const char* sched_env = getenv("NOMU_SCHED");
     const char* gc_plan_env = getenv("NOMU_GC_PLAN");
+    // Nursery reserve override (task 150.4.3): rtImmixNew reads this when it creates the self-hosted space.
+    { const char* nr = getenv("NOMU_NURSERY_RESERVE"); if (nr) { long v = atol(nr); if (v > 0) __nomu_nursery_reserve = v; } }
+    // Mature-pressure floor override (task 150.4.4): rtImmixRefill reads it to escalate a nursery-full trigger
+    // to a full defrag major once free mature blocks fall below it.
+    { const char* mf = getenv("NOMU_MATURE_FLOOR"); if (mf) { long v = atol(mf); if (v > 0) __nomu_mature_floor = v; } }
     int runtime_selfhost = runtime_env && strcmp(runtime_env, "selfhost") == 0;
     // Allocator self-hosted iff the umbrella selects it or the harness pinned NOMU_GC_PLAN=nomu.
     int selfhost_alloc = runtime_selfhost || (gc_plan_env && strcmp(gc_plan_env, "nomu") == 0);
@@ -1605,7 +1710,8 @@ int main(void) {
         }
         // Default self-hosted GC trigger (150.3.11): a synchronous block-on-OOM coordinator. Started whenever
         // the self-hosted allocator is active and no explicit GC-driver knob is set (the smoke/oracle threads
-        // above drive collection their own way). It stays idle until a mutator hits true OOM.
+        // above drive collection their own way). It stays idle until a mutator requests a collection — either a
+        // minor GC when the nursery reserve fills (150.4.3) or a major/defrag at true OOM (150.3.11).
         int gc_driver_env = getenv("NOMU_STW_SELFHOST") || getenv("NOMU_STW_COLLECT") || getenv("NOMU_GC_PRESSURE");
         if (selfhost_alloc && !gc_driver_env) {
             pthread_t __gc_s; pthread_create(&__gc_s, NULL, rt_gc_sync_thread, NULL); pthread_detach(__gc_s);

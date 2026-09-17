@@ -1,0 +1,35 @@
+// Task 150 · rung 4 (GenImmix), increment 150.4.1 — nursery substrate. Under NOMU_GC_PLAN=nomu every
+// mutator allocation draws from a per-carrier TLAB; a clean block the TLAB pulls (free/never-used) is tagged
+// NURSERY — the minor GC's from-space (selfhosted-gc.md §11.1) — and counted in nurseryUsed. This increment
+// lands the tagging + bounded-reserve accounting non-collecting: no minor GC yet (150.4.3), so the nursery
+// only grows.
+//
+// Compiled with NOMU_NO_ESCAPE=1 so the Boxes are real heap objects. Checks: young allocation lands in the
+// nursery (nurseryUsed > 0, and equals the blocks handed out — before any collection every block is young),
+// the nursery is bounded (reserve = 1/4 of the 8192-block pool = 2048, and this fill stays well under it),
+// and the computation reads back. Expected output: 1 / 1 / 1 / 199990000.
+class Box {
+  var v: Int
+}
+fun main() {
+  var sum = 0
+  var i = 0
+  while i < 20000 {
+    let junk = Box(v: i)          // young garbage: dead after this iteration, fills nursery blocks
+    sum = sum + junk.v
+    i = i + 1
+  }
+  // The self-hosted space is created lazily on the first managed allocation, so read it after the loop.
+  let space = RawPtr.gcSelfhostSpace()
+  let nu = rtNurseryBlocksUsed(space)
+  let used = rtImmixBlocksUsed(space)
+  let reserve = rtNurseryReserve(space)
+  print(nu > 0)                   // 1 — young objects landed in NURSERY-tagged blocks
+  print("\n")
+  print(nu == used)               // 1 — before any collection, every block handed out is young (nursery)
+  print("\n")
+  print(nu < reserve)             // 1 — the fill stayed under the bounded nursery reserve (2048 blocks)
+  print("\n")
+  print(sum)                      // 0 + 1 + … + 19999 = 199990000
+  print("\n")
+}

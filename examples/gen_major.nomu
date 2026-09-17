@@ -1,0 +1,61 @@
+// Task 150 · rung 4 (GenImmix), increment 150.4.4 — minor/major interplay + trigger policy. Under
+// NOMU_GC_PLAN=nomu a small nursery reserve fires frequent minor GCs, and a mature-pressure floor
+// (NOMU_MATURE_FLOOR) makes a nursery-full trigger escalate to a full defrag major once free mature blocks run
+// low (rtImmixRefill → rtSelfhostOom → the STW coordinator runs the generational defrag major). A minor never
+// reclaims dead mature objects, so promote-all leaks mature garbage every cycle; the major reclaims it, so the
+// two collectors interleave (selfhosted-gc.md §11.4).
+//
+// The correctness this proves that the minor alone cannot: a cross-generation pointer created AFTER a major
+// still survives. `h` is a Holder promoted to mature by early minors; a major then reclaims mature garbage,
+// collecting `h`'s whole graph and re-establishing the log-bit invariant (every survivor unlogged, freed
+// regions logged). The second store `h.item = Box(v: 77)` — made after majors have fired — is an old→young
+// store the barrier must still remember because the major left `h` unlogged. If the post-major log bits were
+// wrong, the fresh young Box(77) (reachable only through mature `h`) would be dropped by the next minor and the
+// final read would be wrong.
+//
+// The sliding window of 100 live Boxes forces real allocation (each new Box escapes into `xs`, the overwritten
+// one becomes garbage), so the nursery fills and both collections fire on allocation count — deterministic and
+// independent of program speed. The same fixture runs unchanged under MMTk GenImmix (the differential oracle:
+// it ignores the env and drives its own generational collection). Compiled with NOMU_NO_ESCAPE=1 so the
+// objects are real heap objects. Prints 77 / 4242 / a window checksum iff the interplay is sound.
+class Box {
+  var v: Int
+}
+class Holder {
+  var item: Box
+  var tag: Int
+}
+fun fill(xs: Array<Box>, from: Int, n: Int) {
+  var i = from
+  let end = from + n
+  while i < end {
+    xs[i % 100] = Box(v: i)   // real allocation; the old Box becomes garbage, the new one escapes into xs
+    i = i + 1
+  }
+}
+fun main() {
+  let h = Holder(item: Box(v: 0), tag: 4242)
+  var xs: Array<Box> = []
+  var w = 0
+  while w < 100 {
+    xs.append(Box(v: 0))
+    w = w + 1
+  }
+  fill(xs, 0, 400000)         // minors promote `h` + the window; majors fire once mature fills with garbage
+  h.item = Box(v: 42)         // cross-generation store; remembered, promoted at the next minor
+  fill(xs, 400000, 800000)    // more minors + majors; the young Box survives iff `h` was remembered + preserved
+  h.item = Box(v: 77)         // second cross-generation store AFTER majors — proves post-major log bits re-armed
+  fill(xs, 800000, 1200000)   // more minors; Box(77) survives only if the major left `h` unlogged
+  var sum = 0
+  var j = 0
+  while j < 100 {
+    sum = sum + xs[j].v       // reads through the promoted buffer + promoted Box pointers
+    j = j + 1
+  }
+  print(h.item.v)             // 77 — the post-major cross-generation store was tracked and the object promoted
+  print("\n")
+  print(h.tag)                // 4242 — the mature object itself survived every major intact
+  print("\n")
+  print(sum % 100000)         // window checksum — identical under MMTk GenImmix and the self-hosted collector
+  print("\n")
+}

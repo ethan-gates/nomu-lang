@@ -183,6 +183,42 @@ enum PointerIntrinsics {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return s.ptrIntrinsic("__gcSelfhostSpace", .rawPtr, [], span)
+        // This carrier's write-barrier mod-buffer (task 150.4.2): the growable remembered-set append buffer
+        // bound _Thread_local in the C runtime (rt_self_modbuf_get). Lets a fixture read the remembered count
+        // (rtModBufCount) to check the barrier filled it. Same no-arg shape as gcSelfhostSpace.
+        case "gcSelfModBuf":
+            guard checkArgLabels(&s, args, [], "RawPtr.gcSelfModBuf", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__gcSelfModBuf", .rawPtr, [], span)
+        // The nursery-reserve override in blocks (task 150.4.3, env NOMU_NURSERY_RESERVE): 0 = default (1/4 of
+        // the pool). rtImmixNew reads it at space creation. A gc-leaf pure read of the C global.
+        case "gcNurseryReserve":
+            guard checkArgLabels(&s, args, [], "RawPtr.gcNurseryReserve", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__gcNurseryReserve", .int, [], span)
+        // The mature-pressure floor in blocks (task 150.4.4, env NOMU_MATURE_FLOOR): when free mature blocks
+        // fall below it a nursery-full trigger escalates to a full defrag major instead of a minor. 0 = default
+        // (the minor/major driver uses the worst-case-promotion bound). A gc-leaf pure read of the C global.
+        case "gcMatureFloor":
+            guard checkArgLabels(&s, args, [], "RawPtr.gcMatureFloor", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__gcMatureFloor", .int, [], span)
+        // Drain every carrier's write-barrier mod-buffer into `outBuf` (task 150.4.3): the minor GC's
+        // remembered set. Copies each remembered object pointer (up to `cap`), resets the buffers, and
+        // returns the total count. Same shape as gcParkedAnchors.
+        case "gcDrainModBufs":
+            guard checkArgLabels(&s, args, [nil, nil], "RawPtr.gcDrainModBufs", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let outBuf = NOIRGen.checkExpr(&s, args[0].value)
+            if outBuf.type != .error, outBuf.type != .rawPtr {
+                s.diags.error("RawPtr.gcDrainModBufs expects a RawPtr buffer, got '\(outBuf.type)'", at: outBuf.span)
+            }
+            let cap = intArg(&s, args[1].value, "RawPtr.gcDrainModBufs", "cap")
+            return s.ptrIntrinsic("__gcDrainModBufs", .int, [outBuf, cap], span)
         // Scheduler substrate — raw OS clock (task 128.1.1). Monotonic time in nanoseconds, the primitive
         // under the scheduler's timer heap. It reaches the OS directly (macOS: the libSystem entry
         // `clock_gettime_nsec_np`; selfhosted-scheduler.md §3.3), bypassing the C-runtime shim — a step
@@ -312,6 +348,16 @@ enum PointerIntrinsics {
             }
             let off = intArg(&s, args[1].value, "RawPtr.store", "toByteOffset")
             return s.ptrIntrinsic("__rawStore", .void, [recv, value, off], span)
+        // Bulk-zero `n` bytes from this pointer — a `memset(self, 0, n)` (task 150.4.5.1). The self-hosted
+        // allocator hands out reused heap holes whose bytes are stale from the previous occupant; zeroing the
+        // hole restores the zero-init contract the collector relies on (an over-allocated array buffer's
+        // unwritten tail must read null, so the tracer never scans stale words as pointers).
+        case "zeroBytes":
+            guard checkArgLabels(&s, args, [nil], "RawPtr.zeroBytes", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let n = intArg(&s, args[0].value, "RawPtr.zeroBytes", "n")
+            return s.ptrIntrinsic("__rawZeroBytes", .void, [recv, n], span)
         case "load":
             guard checkArgLabels(&s, args, ["fromByteOffset"], "RawPtr.load", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))

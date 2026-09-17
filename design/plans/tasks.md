@@ -124,6 +124,9 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 | 147 | [Compiler cleanups (bucket)](tasks/147-compiler-cleanups.md) | Infra | S | ready-to-build |
 | 153 | [Lexical scoping of locals in SSAIRGen](tasks/153-ssairgen-lexical-scoping.md) | Infra | M | ready-to-build — crash sub-case fixed (`bind` clears cross-kind); shadow-leak open |
 | 154 | [Source-tree decomposition (large-file grokkability)](tasks/154-source-tree-decomposition.md) | Infra | L | in-progress — 154.1 Sema underway (3099→2002, 5 capabilities extracted, golden-verified); 154.2 SSAIRGen / 154.3 SSAIRToLLVM / 154.4 Parser pending |
+| 155 | [Integration-suite harness (one entry, rich output, source-declared env)](tasks/155-integration-suite-harness.md) | Infra | L | needs-design (build-soon) — replaces 64 ad-hoc `tools/*.sh`; parallel by default (5.5× measured), env baked into fixtures, per-case compile+run perf |
+| 156 | [Differential stage-diffing (`nomuc-diff` vs a git-ref baseline)](tasks/156-differential-stage-diffing.md) | Infra | L | needs-design (build-soon) — every pipeline stage differentiable against a baseline ref; refactor-fearlessly proof; systematizes `tools/ir-golden.sh`; builds on 142 + 155 |
+| 157 | [Env-var audit — collapse the `NOMU_*` surface](tasks/157-env-var-audit.md) | Infra | M | needs-design — ~2 dozen `NOMU_*` vars grew unchecked; internalize/remove nearly all, one product lever (`NOMU_RUNTIME`), codegen flags → `--flags`, test knobs → 155 fixtures; ties to 155 + 150.4.5 |
 
 ## ► Decide-early flags (carried from `deferred.md`)
 

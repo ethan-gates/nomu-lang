@@ -655,6 +655,12 @@ final class SSAIRToLLVM {
         case "__rawStore":
             LLVMBuildStore(b, val(args[1]), e.gepByte(val(args[0]), val(args[2])))
             return LLVMConstInt(e.i64, 0, 0)
+        case "__rawZeroBytes":
+            // memset(self, 0, n) — bulk-zero a reused heap hole (task 150.4.5.1).
+            let (mfn, mfty) = e.runtimeFn("memset", ret: e.i8ptr, params: [e.i8ptr, e.i32, e.i64], varArg: false)
+            let z = LLVMBuildTrunc(b, LLVMConstInt(e.i64, 0, 0), e.i32, "zero.byte")
+            _ = e.buildCall(mfn, mfty, [val(args[0]), z, val(args[1])])
+            return LLVMConstInt(e.i64, 0, 0)
         case "__rawLoad":
             guard let lt = ty(resultType, span) else { return nil }
             return LLVMBuildLoad2(b, lt, e.gepByte(val(args[0]), val(args[1])), "raw.load")
@@ -874,6 +880,27 @@ final class SSAIRToLLVM {
                 return ng
             }()
             return LLVMBuildLoad2(b, e.i8ptr, g, "gc.selfhostspace")
+        case "__gcSelfModBuf":
+            // Task 150.4.2: this carrier's write-barrier mod-buffer (rt_self_modbuf_get, binding + registering
+            // it on first use). A plain runtime call — the buffer is a raw addrspace(0) control block.
+            let (fn, fty) = e.runtimeFn("rt_self_modbuf_get", ret: e.i8ptr, params: [], varArg: false)
+            return e.buildCall(fn, fty, [])
+        case "__gcDrainModBufs":
+            // Task 150.4.3: drain every carrier's mod-buffer into outBuf (the minor GC's remembered set),
+            // resetting the buffers; returns the count. A runtime call over the C-side buffer registry.
+            let (fn, fty) = e.runtimeFn("rt_modbuf_drain", ret: e.i64, params: [e.i8ptr, e.i64], varArg: false)
+            return e.buildCall(fn, fty, [val(args[0]), val(args[1])])
+        case "__gcNurseryReserve":
+            // Task 150.4.3: load the C global `__nomu_nursery_reserve` (the env-set nursery reserve in blocks,
+            // 0 = default). rtImmixNew reads it at space creation. Same direct-extern-load shape as __gcSchedHead.
+            let g = LLVMGetNamedGlobal(e.mod, "__nomu_nursery_reserve") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_nursery_reserve")
+            return LLVMBuildLoad2(b, e.i64, g, "gc.nurseryreserve")
+        case "__gcMatureFloor":
+            // Task 150.4.4: load the C global `__nomu_mature_floor` (the env-set mature-pressure floor in
+            // blocks, 0 = default). rtImmixRefill reads it to pick minor vs. major. Same direct-extern-load
+            // shape as __gcNurseryReserve.
+            let g = LLVMGetNamedGlobal(e.mod, "__nomu_mature_floor") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_mature_floor")
+            return LLVMBuildLoad2(b, e.i64, g, "gc.maturefloor")
         case "__gcTypeCount":
             let g = LLVMGetNamedGlobal(e.mod, "nomu_gc_typemap_count") ?? LLVMAddGlobal(e.mod, e.i64, "nomu_gc_typemap_count")
             return LLVMBuildLoad2(b, e.i64, g, "gc.tcount")

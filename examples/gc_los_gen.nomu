@@ -1,0 +1,41 @@
+// Task 150.4.5.1.1 — the large-object-space remembered-set gap. A large Array<Box> buffer (>32 KiB) is a
+// large object: allocated off-heap (never in the nursery, never moved) and carrying no write-barrier log bit.
+// A young Box stored into it is a mature-off-heap→young pointer the barrier's heap-range guard skips and the
+// remembered set never captures. The minor GC must treat every live LOS object as an old root and scan it for
+// young referents, or the young Box — reachable ONLY through the off-heap buffer (the Array handle forwards
+// bufptr but the collector does not follow an off-heap pointer into the nursery) — is reclaimed.
+//
+// `big` holds 6000 Boxes → a ~48 KiB buffer in the large-object space. `big[0]` is overwritten with a fresh
+// young Box(777); then a sliding-window allocator drives many minor GCs. Without the LOS root scan the young
+// Box(777) is lost and the final read is wrong. Prints 777 iff the LOS remembered-set path is sound.
+// Checksum-identical under MMTk GenImmix. Run with NOMU_NO_ESCAPE=1 so the Boxes are real heap objects.
+class Box {
+  var v: Int
+}
+fun fill(xs: Array<Box>, from: Int, n: Int) {
+  var i = from
+  let end = from + n
+  while i < end {
+    xs[i % 100] = Box(v: i)
+    i = i + 1
+  }
+}
+fun main() {
+  var big: Array<Box> = []
+  var b = 0
+  while b < 6000 {
+    big.append(Box(v: 0))
+    b = b + 1
+  }
+  var xs: Array<Box> = []
+  var w = 0
+  while w < 100 {
+    xs.append(Box(v: 0))
+    w = w + 1
+  }
+  fill(xs, 0, 200000)          // early minors: promote the window; `big`'s buffer is LOS from birth
+  big[0] = Box(v: 777)         // young Box into the mature off-heap LOS buffer — the barrier skips this store
+  fill(xs, 200000, 600000)     // more minors: Box(777) survives only via the LOS root scan
+  print(big[0].v)              // 777
+  print("\n")
+}

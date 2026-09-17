@@ -331,6 +331,33 @@ extension LLVMGen {
             LLVMBuildCondBr(b, isNull1, mkBB, unlockBB)
             LLVMPositionBuilderAtEnd(b, mkBB)
             let made = buildCall(immixNew.fn, immixNew.ty, [numBlocks])!
+            // Arm the object-remembering write barrier for the self-hosted plan (task 150.4.2). The inline
+            // fast path (`__nomu_write_barrier`) reads three globals MMTk owns under its plans; under
+            // NOMU_GC_PLAN=nomu the self-hosted init owns them. Point them at the descriptor's log-bit table
+            // (@144) with a base that makes the fast path's absolute-address indexing (`(objInt>>3)>>3 + base`)
+            // land in the table: `base = tableInt − (heapBaseInt>>6)`. log_region = 3 (one bit per 8-byte
+            // region — matching the Nomu accessors and MMTk's global unlog-bit granularity). Set once here,
+            // under the space-creation lock, after the first managed allocation — so it stays 0 (nomu_gc_init's
+            // NoGC default) until then, keeping the barrier inert for a non-self-hosted run.
+            let i8t = LLVMInt8TypeInContext(ctx)!
+            let tableInt = LLVMBuildLoad2(b, i64, gepByte(made, LLVMConstInt(i64, 144, 0)), "logbit.table")!
+            let heapBaseForBarrier = LLVMBuildLoad2(b, i64, gepByte(made, LLVMConstInt(i64, 40, 0)), "logbit.heapbase")!
+            let baseOff = LLVMBuildLShr(b, heapBaseForBarrier, LLVMConstInt(i64, 6, 0), "logbit.baseoff")!
+            let logbitBase = LLVMBuildSub(b, tableInt, baseOff, "logbit.base.v")!
+            let gLogBase = LLVMGetNamedGlobal(mod, "__nomu_logbit_base") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_base")!
+            let gLogRegion = LLVMGetNamedGlobal(mod, "__nomu_logbit_log_region") ?? LLVMAddGlobal(mod, i8t, "__nomu_logbit_log_region")!
+            let gActive = LLVMGetNamedGlobal(mod, "__nomu_barrier_active") ?? LLVMAddGlobal(mod, i8t, "__nomu_barrier_active")!
+            // Narrow the inline fast path's heap-range guard to this Immix heap: [heapBase, heapBase + 256 MiB)
+            // (8192 × 32 KiB). A store into an off-heap object (self-hosted LOS / immortal buffer) skips the
+            // barrier — the log-bit table covers only this range.
+            let gLo = LLVMGetNamedGlobal(mod, "__nomu_logbit_heap_lo") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_heap_lo")!
+            let gHi = LLVMGetNamedGlobal(mod, "__nomu_logbit_heap_hi") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_heap_hi")!
+            let heapHi = LLVMBuildAdd(b, heapBaseForBarrier, LLVMConstInt(i64, 8192 * 32768, 0), "logbit.heaphi")!
+            LLVMBuildStore(b, logbitBase, gLogBase)
+            LLVMBuildStore(b, LLVMConstInt(i8t, 3, 0), gLogRegion)
+            LLVMBuildStore(b, LLVMConstInt(i8t, 1, 0), gActive)
+            LLVMBuildStore(b, heapBaseForBarrier, gLo)
+            LLVMBuildStore(b, heapHi, gHi)
             let st = LLVMBuildStore(b, made, gSpace)!
             LLVMSetOrdering(st, LLVMAtomicOrderingRelease)
             LLVMSetAlignment(st, 8)
@@ -422,19 +449,34 @@ extension LLVMGen {
         markGCLeaf(fn)
         addAlwaysInline(fn)
         let rtBarrier = runtimeFn("rt_gc_write_barrier", ret: voidTy, params: [i8ptr, i8ptr, i8ptr], varArg: false)
-        let gActive = LLVMAddGlobal(mod, i8, "__nomu_barrier_active")!
-        let gBase = LLVMAddGlobal(mod, i64, "__nomu_logbit_base")!
-        let gRegion = LLVMAddGlobal(mod, i8, "__nomu_logbit_log_region")!
+        // Get-or-add: the self-hosted alloc seam (`nomuSelfhostAlloc`) arms these same globals at space
+        // creation and may have minted them first — share them rather than emitting a renamed duplicate.
+        let gActive = LLVMGetNamedGlobal(mod, "__nomu_barrier_active") ?? LLVMAddGlobal(mod, i8, "__nomu_barrier_active")!
+        let gBase = LLVMGetNamedGlobal(mod, "__nomu_logbit_base") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_base")!
+        let gRegion = LLVMGetNamedGlobal(mod, "__nomu_logbit_log_region") ?? LLVMAddGlobal(mod, i8, "__nomu_logbit_log_region")!
+        let gLo = LLVMGetNamedGlobal(mod, "__nomu_logbit_heap_lo") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_heap_lo")!
+        let gHi = LLVMGetNamedGlobal(mod, "__nomu_logbit_heap_hi") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_heap_hi")!
         withStubBody(fn) {
             let obj = LLVMGetParam(fn, 0)!, slot = LLVMGetParam(fn, 1)!, val = LLVMGetParam(fn, 2)!
             LLVMBuildStore(b, val, slot)   // *slot = val (barrier is post-store)
             let onBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.on")!
+            let inRangeBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.inrange")!
             let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.slow")!
             let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.done")!
             let active = LLVMBuildLoad2(b, i8, gActive, "bar.active")
             LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, active, LLVMConstInt(i8, 0, 0), "bar.on?"), onBB, doneBB)
             LLVMPositionBuilderAtEnd(b, onBB)
             let objInt = LLVMBuildPtrToInt(b, obj, i64, "obj.int")
+            // Heap-range guard: the log-bit table only covers [heap_lo, heap_hi). Under MMTk this is [0, MAX)
+            // (its side metadata is global), so the guard never trips; under the self-hosted plan it is the
+            // Immix heap range, so a store into an off-heap object (LOS / immortal) skips the barrier rather
+            // than indexing the table out of bounds.
+            let lo = LLVMBuildLoad2(b, i64, gLo, "heap.lo")
+            let hi = LLVMBuildLoad2(b, i64, gHi, "heap.hi")
+            let below = LLVMBuildICmp(b, LLVMIntULT, objInt, lo, "obj.below")
+            let above = LLVMBuildICmp(b, LLVMIntUGE, objInt, hi, "obj.above")
+            LLVMBuildCondBr(b, LLVMBuildOr(b, below, above, "obj.oob"), doneBB, inRangeBB)
+            LLVMPositionBuilderAtEnd(b, inRangeBB)
             let logR = LLVMBuildZExt(b, LLVMBuildLoad2(b, i8, gRegion, "logR8"), i64, "logR")
             let region = LLVMBuildLShr(b, objInt, logR, "region")
             let baseV = LLVMBuildLoad2(b, i64, gBase, "logbit.base")

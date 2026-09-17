@@ -479,11 +479,12 @@ fun rtScanParkedFibers(outBuf: RawPtr, cap: Int) -> Int {
 // (§10.2, Decided), one byte per entry, over the reserved heap range. Entry value 0 is the initial state
 // (block FREE / line unmarked), and rt_raw_alloc zero-fills, so the fresh tables start correct.
 //
-// Space descriptor (128 bytes):
+// Space descriptor (152 bytes):
 //   { heapBase: RawPtr @0, numBlocks: Int @8, lineTable: RawPtr @16, blockTable: RawPtr @24,
 //     freeCursor: Int @32, heapBaseInt: Int @40, allocCursor: Int @48, allocLimit: Int @56,
 //     losHead: RawPtr @64, allocBlock: Int @72, allocLine: Int @80, freeList: RawPtr @88,
-//     freeListTop: Int @96, scanBlock: Int @104, defragTable: RawPtr @112, poolLock: Int @120 }.
+//     freeListTop: Int @96, scanBlock: Int @104, defragTable: RawPtr @112, poolLock: Int @120,
+//     nurseryReserve: Int @128, nurseryUsed: Int @136, logbitTable: RawPtr @144 }.
 // allocCursor/allocLimit are heap-relative byte offsets bounding the current hole (0/0 → refill). freeCursor
 // bumps never-used blocks. allocBlock/allocLine track the block being filled + its next line to scan for
 // holes (allocBlock −1 = none). freeList is a stack of reclaimed empty block indices (freeListTop entries).
@@ -491,7 +492,27 @@ fun rtScanParkedFibers(outBuf: RawPtr, cap: Int) -> Int {
 // list. defragTable is a per-block side table holding each block's live-line count from the last sweep — the
 // fragmentation histogram the defrag trigger (150.3.8) selects evacuation sources from (§10.6). Block state
 // byte: 0 FREE, 1 RECYCLABLE, 2 UNAVAILABLE, 3 DEFRAG_SOURCE (transient: a block selected for evacuation this
-// collection, overwritten by the sweep). Line mark byte: 0 unmarked, 1 marked.
+// collection, overwritten by the sweep), 4 NURSERY (a clean block handed to a mutator TLAB — young objects
+// only; the minor collection's from-space, 150.4). Line mark byte: 0 unmarked, 1 marked.
+//
+// Generational layer (task 150 · rung 4, GenImmix, §11). nurseryReserve bounds the nursery to a fixed
+// fraction of the pool (a bounded copying nursery — the minor GC promotes all survivors to mature and
+// recycles the nursery blocks). nurseryUsed counts NURSERY blocks acquired since the last collection; a
+// collection empties the nursery, so the sweep resets it to 0. A mutator TLAB refill tags each *clean* block
+// it pulls (free/never-used, block-state 0) NURSERY — a reused RECYCLABLE block holds mature survivors and
+// stays mature. 150.4.1 lands this substrate non-collecting (no minor GC yet, so the reserve bound is not
+// enforced); the minor-collection driver keying off the NURSERY tag is 150.4.3.
+//
+// logbitTable @144 (task 150 · 150.4.2) is the self-hosted log-bit side table for the object-remembering
+// write barrier (§11.2), one bit per 8-byte region (log_region = 3, matching MMTk's global unlog-bit
+// granularity so the inline fast path — `__nomu_write_barrier`, LLVMGenRuntime.swift — reads it verbatim).
+// A bit is 1 when the object is *unlogged* (mature, needs remembering on its first mutation) and 0 when
+// logged (young objects, and mature objects already remembered this cycle). The table starts all-0
+// (rt_raw_alloc zero-fills): young objects never trip the barrier. Promotion sets the unlogged bit (150.4.3);
+// 150.4.2 sets it only via the rtSetUnlogged test hook. The alloc seam arms the barrier globals
+// (__nomu_barrier_active / __nomu_logbit_base / __nomu_logbit_log_region) at space creation so absolute-
+// address indexing lands in this table (LLVMGenRuntime.swift `nomuSelfhostAlloc`). The barrier slow path
+// (rtGcRemember) clears the bit and appends the object to the carrier's mod-buffer (the remembered set).
 //
 // Multi-carrier split (150.3.10.1): mutators allocate through per-carrier TLABs, not this descriptor. The
 // allocCursor/allocLimit/allocBlock/allocLine fields above are the *collector's* single-threaded copy
@@ -509,7 +530,10 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   let blockTable = RawPtr.alloc(bytes: numBlocks, align: 8)
   let freeList = RawPtr.alloc(bytes: numBlocks * 8, align: 8)
   let defragTable = RawPtr.alloc(bytes: numBlocks, align: 8)
-  let ctl = RawPtr.alloc(bytes: 128, align: 8)
+  // Log-bit side table (150.4.2): one bit per 8-byte region = one byte per 64 heap bytes = 512 bytes per
+  // 32 KiB block, plus a word of slack for the top-of-heap boundary index. Zero-filled → all objects logged.
+  let logbitTable = RawPtr.alloc(bytes: numBlocks * 512 + 64, align: 8)
+  let ctl = RawPtr.alloc(bytes: 152, align: 8)
   ctl.store(heap, toByteOffset: 0)
   ctl.store(numBlocks, toByteOffset: 8)
   ctl.store(lineTable, toByteOffset: 16)
@@ -527,6 +551,9 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   ctl.store(0, toByteOffset: 104)    // scanBlock
   ctl.store(defragTable, toByteOffset: 112)  // per-block last-sweep live-line count (defrag histogram)
   ctl.store(0, toByteOffset: 120)            // poolLock (150.3.10.1): shared-pool + LOS futex mutex, unlocked
+  ctl.store(numBlocks / 4, toByteOffset: 128) // nurseryReserve (150.4): bounded copying nursery, 1/4 of the pool
+  ctl.store(0, toByteOffset: 136)            // nurseryUsed: NURSERY blocks acquired since the last collection
+  ctl.store(logbitTable, toByteOffset: 144)  // logbitTable (150.4.2): write-barrier log-bit side table
   return ctl
 }
 
@@ -798,6 +825,33 @@ fun rtSelfhostOom(anchorSp: RawPtr, anchorPc: Int) -> Bool {
   return availAfter > 0
 }
 
+// Trigger a minor (generational) collection when the nursery reserve is exhausted (task 150.4.3). Mirrors
+// rtSelfhostOom's park exactly — the mutator parks at its alloc-site anchor and the GC coordinator runs the
+// collection — but sets the collection-kind flag (sched+176 = 1) so the coordinator runs a minor GC
+// (nomuSchedStwCollectMinor) rather than a major/defrag. Returns false when there is no self-hosted scheduler
+// (no collector — the reserve stays unenforced, as in 150.4.1); else true (a minor GC always empties the
+// nursery). The coordinator resets this carrier's TLAB before resuming it, so the caller re-reads the TLAB.
+fun rtSelfhostMinorGc(anchorSp: RawPtr, anchorPc: Int) -> Bool {
+  let sched = RawPtr.schedHandle()
+  if sched.isNull {
+    return false
+  }
+  let self = RawPtr.tlsGet()
+  rtSchedSetAnchor(self, anchorSp, anchorPc)
+  rtSchedLock(sched)
+  if sched.atomicLoad(fromByteOffset: 136) == 0 {
+    sched.atomicStore(1, toByteOffset: 176)       // collection kind = minor (the coordinator reads this)
+    sched.atomicStore(1, toByteOffset: 136)       // initiate the stop-the-world
+    sched.atomicStore(1, toByteOffset: 168)       // signal the GC coordinator
+    sched.advanced(by: 168).futexWake(all: false)
+  }
+  self.store(4, toByteOffset: 168)                // safepoint-stopped; the carrier acks + waits, then resumes us
+  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
+  self.ctxSwitchTo(carrierCtx)
+  rtSchedUnlock(sched)
+  return true
+}
+
 // Refill the carrier's TLAB with the next hole big enough for `need` bytes, pulling blocks from the shared
 // pool under poolLock. The hole scan matches rtNextHole (skips live lines so recyclable-block holes are
 // respected) but runs on the TLAB's private block/line/cursor/limit. Whole-block-per-carrier: a fresh block
@@ -811,7 +865,44 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
   while !done {
     let ab: Int = tlab.load(fromByteOffset: 16)
     if ab < 0 {
-      let nb = rtNextAllocBlock(space)
+      // Nursery-full → minor GC before handing out another young block (150.4.3, §11.1). The trigger threshold
+      // is NOMU_NURSERY_RESERVE (RawPtr.gcNurseryReserve, in blocks); 0 = disabled, so by default the nursery
+      // grows unbounded and only a major/defrag collection fires at OOM (the pre-150.4.3 path — the whole
+      // suite runs the mature collector until the minor collector is robust across every object type and
+      // multi-carrier, which is 150.4.5). When enabled, promote the nursery once it reaches the threshold,
+      // but only when a scheduler exists to run the STW. After a minor GC nurseryUsed is 0 and the TLAB is
+      // reset, so the loop retries and gets a fresh nursery block.
+      let minorTrigger: Int = RawPtr.gcNurseryReserve()
+      let nurseryNow: Int = space.load(fromByteOffset: 136)
+      var didGc = false
+      if minorTrigger > 0 && nurseryNow >= minorTrigger {
+        // Minor vs. major (150.4.4, §11.4). A minor promotes the whole nursery into mature; when mature lacks
+        // headroom the copy allocator would return null mid-promotion (a null stored into a slot — corruption),
+        // and a minor never reclaims dead mature objects, so mature fills over time. When the free mature blocks
+        // fall below a floor, run a full defrag major instead — it reclaims mature garbage and collects the
+        // nursery, so it handles both failed promotion and mature pressure. The floor is the worst-case
+        // promotion (the whole nursery, minorTrigger blocks) plus a fragmentation margin, raised by
+        // NOMU_MATURE_FLOOR (the mature-pressure knob) when set higher. The defrag major is heap-pressure-safe
+        // (it selects sources within the copy reserve), so it runs even when the minor could not place its
+        // promotions.
+        let avail = nomuGcSpaceAvail()
+        var floor = minorTrigger + minorTrigger        // 2× the reserve: promotion headroom + fragmentation margin
+        let matureFloor = RawPtr.gcMatureFloor()
+        if matureFloor > floor {
+          floor = matureFloor
+        }
+        rtSchedMutexUnlockAt(space.advanced(by: 120))
+        if avail < floor {
+          didGc = rtSelfhostOom(anchorSp, anchorPc)     // escalate → major (collection kind 0)
+        } else {
+          didGc = rtSelfhostMinorGc(anchorSp, anchorPc) // minor (collection kind 1)
+        }
+        rtSchedMutexLockAt(space.advanced(by: 120))
+      }
+      if didGc {
+        done = false                       // retry: nursery emptied, TLAB reset — get a fresh block next pass
+      } else {
+        let nb = rtNextAllocBlock(space)
       if nb < 0 {
         // Pool exhausted → synchronous collection at true OOM (150.3.11). Release the pool lock (the collector
         // runs under STW; parking while holding it would be wrong), trigger + wait, then re-acquire and retry
@@ -824,8 +915,17 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
           done = true
         }
       } else {
+        // 150.4: a clean block (FREE/never-used, state 0) handed to a mutator holds only young objects, so
+        // tag it NURSERY (the minor GC's from-space) and count it against the nursery. A reused RECYCLABLE
+        // block (state 1) holds mature survivors from a prior sweep, so it stays mature (untagged).
+        if rtBlockState(space, nb) == 0 {
+          rtSetBlockState(space, nb, 4)
+          let nu: Int = space.load(fromByteOffset: 136)
+          space.store(nu + 1, toByteOffset: 136)
+        }
         tlab.store(nb, toByteOffset: 16)
         tlab.store(0, toByteOffset: 24)
+      }
       }
     } else {
       let al: Int = tlab.load(fromByteOffset: 24)
@@ -857,6 +957,12 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
           if holeBytes >= need {
             let startOff = ab * 32768 + al * 256
             let endOff = ab * 32768 + e * 256
+            // Bulk-zero the hole before handing it to the carrier (150.4.5.1). A reclaimed block/line holds the
+            // previous occupant's bytes; the self-hosted allocator (unlike the fresh-mmap NoGC path) reuses it,
+            // so an over-allocated array buffer's unwritten tail would otherwise carry stale words the tracer
+            // reads as pointers. Zeroing on acquire restores the zero-init contract, matching Immix/MMTk.
+            let heap: RawPtr = space.load(fromByteOffset: 0)
+            heap.advanced(by: startOff).zeroBytes(endOff - startOff)
             tlab.store(startOff, toByteOffset: 0)
             tlab.store(endOff, toByteOffset: 8)
             done = true
@@ -906,6 +1012,165 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
     }
   }
   return result
+}
+
+// ---- Write barrier: log-bit table + per-carrier mod-buffers (task 150 · 150.4.2, §11.2/§11.3) ----
+// The object-remembering barrier reuses the inline fast path (`__nomu_write_barrier`, LLVMGenRuntime.swift):
+// it region-shifts the object address, tests its log bit, and on the first mutation of an *unlogged* (mature)
+// object calls the slow path here. These accessors index the log-bit side table (descriptor @144) with the
+// exact region math the fast path uses so the two agree on which bit: byte = objInt/64 − heapBaseInt/64
+// (relative to the table start; the fast path folds the heapBaseInt term into __nomu_logbit_base), bit =
+// (objInt/8) mod 8. Bit 1 = unlogged (mature, remember on mutation), 0 = logged. Nomu has no bitwise ops, so
+// powers of two are built by doubling and a single bit is read/set/cleared arithmetically.
+
+// 2^n for n in 0..7 (the bit position within a log-bit byte).
+fun rtPow2(n: Int) -> Int {
+  var v = 1
+  var i = 0
+  while i < n {
+    v = v * 2
+    i = i + 1
+  }
+  return v
+}
+
+// The log-bit byte index (into logbitTable) for `obj`.
+fun rtLogByteIndex(space: RawPtr, obj: RawPtr) -> Int {
+  let base: Int = space.load(fromByteOffset: 40)   // heapBaseInt
+  let a = obj.toInt()
+  return a / 64 - base / 64
+}
+
+// The bit position (0..7) of `obj`'s log bit within its byte.
+fun rtLogBitPos(obj: RawPtr) -> Int {
+  let r = obj.toInt() / 8
+  return r - r / 8 * 8
+}
+
+// Read `obj`'s log bit: 1 = unlogged (mature, needs remembering), 0 = logged.
+fun rtLogBit(space: RawPtr, obj: RawPtr) -> Int {
+  let tbl: RawPtr = space.load(fromByteOffset: 144)
+  let byte: UInt8 = tbl.load(fromByteOffset: rtLogByteIndex(space, obj))
+  let mask = rtPow2(rtLogBitPos(obj))
+  let v = byte.int / mask
+  return v - v / 2 * 2
+}
+
+// Set `obj`'s log bit to 1 (unlogged/mature). Idempotent. The 150.4.2 test hook simulates promotion; 150.4.3
+// calls the equivalent on every object it promotes so post-promotion cross-generation stores are remembered.
+fun rtSetUnlogged(space: RawPtr, obj: RawPtr) {
+  if rtLogBit(space, obj) == 1 {
+    return
+  }
+  let tbl: RawPtr = space.load(fromByteOffset: 144)
+  let bi = rtLogByteIndex(space, obj)
+  let byte: UInt8 = tbl.load(fromByteOffset: bi)
+  tbl.store((byte.int + rtPow2(rtLogBitPos(obj))).uint8, toByteOffset: bi)
+}
+
+// Clear `obj`'s log bit to 0 (logged). Idempotent.
+fun rtClearLogged(space: RawPtr, obj: RawPtr) {
+  if rtLogBit(space, obj) == 0 {
+    return
+  }
+  let tbl: RawPtr = space.load(fromByteOffset: 144)
+  let bi = rtLogByteIndex(space, obj)
+  let byte: UInt8 = tbl.load(fromByteOffset: bi)
+  tbl.store((byte.int - rtPow2(rtLogBitPos(obj))).uint8, toByteOffset: bi)
+}
+
+// Reset the whole log-bit table to logged (0) — every 8-byte region unmarked (150.4.4). Used post-major to
+// wipe stale unlogged bits before re-establishing them per surviving object: after a full collection every
+// live object is mature and the nursery is empty, so freed regions (future young objects) must read logged so
+// they never trip the barrier, and only the survivors are then set unlogged. The table is numBlocks*512 bytes
+// (one bit per 8-byte region); zero it a machine word at a time.
+fun rtClearLogTable(space: RawPtr) {
+  let nb: Int = space.load(fromByteOffset: 8)
+  let tbl: RawPtr = space.load(fromByteOffset: 144)
+  let words = nb * 64                        // numBlocks*512 bytes / 8
+  var i = 0
+  while i < words {
+    tbl.store(0, toByteOffset: i * 8)
+    i = i + 1
+  }
+}
+
+// The per-carrier mod-buffer (the remembered set, §11.3) is a growable append buffer { count: Int @0,
+// cap: Int @8, storage: RawPtr @16 } bound _Thread_local per carrier in the C runtime (rt_self_modbuf_get),
+// registered in a table the collector resets at end-of-collection (rt_modbuf_reset_all). storage holds `cap`
+// eight-byte object slots. Append is lock-free — each carrier owns its buffer and only its own thread appends.
+
+fun rtModBufCount(mb: RawPtr) -> Int {
+  return mb.load(fromByteOffset: 0)
+}
+
+// Append `obj` to the mod-buffer, doubling storage on overflow.
+fun rtModBufAppend(mb: RawPtr, obj: RawPtr) {
+  var count: Int = mb.load(fromByteOffset: 0)
+  let cap: Int = mb.load(fromByteOffset: 8)
+  if count >= cap {
+    let newCap = cap * 2
+    let old: RawPtr = mb.load(fromByteOffset: 16)
+    let fresh = RawPtr.alloc(bytes: newCap * 8, align: 8)
+    var i = 0
+    while i < count {
+      let p: RawPtr = old.load(fromByteOffset: i * 8)
+      fresh.store(p, toByteOffset: i * 8)
+      i = i + 1
+    }
+    mb.store(fresh, toByteOffset: 16)
+    mb.store(newCap, toByteOffset: 8)
+    old.free()
+  }
+  let storage: RawPtr = mb.load(fromByteOffset: 16)
+  storage.store(obj, toByteOffset: count * 8)
+  mb.store(count + 1, toByteOffset: 0)
+}
+
+// The barrier slow path (§11.2). Called from the C write-barrier seam (rt_gc_write_barrier) under
+// NOMU_GC_PLAN=nomu with the carrier's mod-buffer and the mutated object. The inline fast path already tested
+// the log bit, but the actor/mailbox path (runtime.c) calls the seam directly, bypassing that test, so
+// re-check here: a logged (young, bit 0) object contributes nothing to the remembered set. On an unlogged
+// (mature) object, mark it logged so subsequent stores elide the slow path, then remember it — the minor GC
+// (150.4.3) rescans each remembered object's managed slots, forwarding any nursery referent.
+fun rtGcRemember(mb: RawPtr, obj: RawPtr) {
+  let space = RawPtr.gcSelfhostSpace()
+  if space.isNull {
+    return          // no managed allocation yet → no space, nothing to remember
+  }
+  // Off-heap objects (LOS / immortal buffers) have no log bit in the table, which covers only the Immix heap.
+  // The inline fast path skips them via its heap-range guard, but the actor/mailbox path calls this directly,
+  // so guard here too — indexing the table with an off-heap address would read out of bounds.
+  let base: Int = space.load(fromByteOffset: 40)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let a = obj.toInt()
+  if a < base {
+    return
+  }
+  if a >= base + nb * 32768 {
+    return
+  }
+  if rtLogBit(space, obj) == 0 {
+    return          // young / already-remembered → nothing to do
+  }
+  rtClearLogged(space, obj)
+  rtModBufAppend(mb, obj)
+}
+
+// Remember `obj` after a runtime-internal store of a young managed pointer into it (task 150.4.5.1). Runtime
+// code that links managed objects — the scheduler's mailbox/message enqueue — stores through gc-leaf raw
+// stores (`__rawStore`), which do not emit the inline write barrier, so a mature object that gains a young
+// referent would be missed by the next minor GC (the minor never rescans mature objects reached through a
+// root; it finds mature→young pointers only via the remembered set). This is the barrier slow path for those
+// stores: it fetches this carrier's mod-buffer and routes to rtGcRemember, which re-tests the log bit and
+// remembers only a mature (unlogged) in-heap object. A cheap no-op off the self-hosted generational plan (the
+// log table is all-logged, so rtGcRemember returns early) and for young targets.
+fun rtRememberStore(obj: RawPtr) {
+  let mb = RawPtr.gcSelfModBuf()
+  if mb.isNull {
+    return
+  }
+  rtGcRemember(mb, obj)
 }
 
 // ---- Line marking (task 150 · rung 3, increment 150.3.4) ----
@@ -1298,6 +1563,7 @@ fun rtImmixSweepBlocks(space: RawPtr) {
     }
     bi = bi + 1
   }
+  space.store(0, toByteOffset: 136)          // 150.4: a collection empties the nursery — reset nurseryUsed
 }
 
 // Reclaim the large-object space: walk the LOS list, free every unmarked (dead) chunk, and relink the marked
@@ -1374,6 +1640,71 @@ fun rtImmixUnmark(root: RawPtr) {
   work.free()
 }
 
+// Clear the header mark bit across the live set from `root` and, in the same walk, set every in-heap survivor
+// unlogged (150.4.4). The generational post-major pass: after the log-bit table has been wiped to logged
+// (rtClearLogTable), this walk re-establishes the unlog invariant — every mature survivor is unlogged so the
+// next minor's write barrier catches its cross-generation stores. Structure mirrors rtImmixUnmark (the header
+// mark dedups the graph so each object is visited once); the only addition is the guarded rtSetUnlogged.
+// Off-heap survivors (LOS/immortal) have no log bit and are skipped — the barrier's heap-range guard skips
+// them too, so their cross-generation stores are out of scope until the LOS remset (150.4.5).
+fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
+  let base: Int = space.load(fromByteOffset: 40)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let heapEnd = base + nb * 32768
+  let cap = 1048576
+  let work = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var top = 0
+  if rtUnmarkIfMarked(root) {
+    work.store(root, toByteOffset: 0)
+    top = 1
+  }
+  while top > 0 {
+    top = top - 1
+    let obj: RawPtr = work.load(fromByteOffset: top * 8)
+    let a = obj.toInt()
+    if a >= base {
+      if a < heapEnd {
+        rtSetUnlogged(space, obj)          // in-heap survivor → mature, remember its future young stores
+      }
+    }
+    let tid = rtObjTypeId(obj)
+    let kind = RawPtr.gcTypeKind(tid)
+    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    if kind == 0 {
+      var i = 0
+      while i < nptr {
+        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let child: RawPtr = obj.load(fromByteOffset: off)
+        if rtUnmarkIfMarked(child) {
+          work.store(child, toByteOffset: top * 8)
+          top = top + 1
+        }
+        i = i + 1
+      }
+    } else {
+      let ecap: Int = obj.load(fromByteOffset: 8)
+      let stride = RawPtr.gcTypeStride(tid)
+      var e = 0
+      while e < ecap {
+        let elemBase = 16 + e * stride
+        var i = 0
+        while i < nptr {
+          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let at = elemBase + off
+          let child: RawPtr = obj.load(fromByteOffset: at)
+          if rtUnmarkIfMarked(child) {
+            work.store(child, toByteOffset: top * 8)
+            top = top + 1
+          }
+          i = i + 1
+        }
+        e = e + 1
+      }
+    }
+  }
+  work.free()
+}
+
 // One non-moving collection from `root`: clear line marks, mark the live set, reclaim by block and by LOS
 // chunk, unmark, then reset the allocator so the next allocation reuses reclaimed + recyclable space. The
 // heap shrinks: dead blocks return to the pool and dead LOS chunks are freed.
@@ -1398,6 +1729,17 @@ fun rtImmixBlocksUsed(space: RawPtr) -> Int {
 // Reclaimed empty blocks currently on the free list (set by the last sweep).
 fun rtImmixFreeBlocks(space: RawPtr) -> Int {
   return space.load(fromByteOffset: 96)
+}
+
+// NURSERY blocks acquired since the last collection (150.4 nursery-substrate introspection).
+fun rtNurseryBlocksUsed(space: RawPtr) -> Int {
+  return space.load(fromByteOffset: 136)
+}
+
+// The bounded nursery's block reserve — the max nursery blocks the minor GC (150.4.3) will allow before
+// triggering a collection (150.4 §11.1).
+fun rtNurseryReserve(space: RawPtr) -> Int {
+  return space.load(fromByteOffset: 128)
 }
 
 // ---- Forwarding word + copy primitive (task 150 · rung 3, increment 150.3.6) ----
@@ -1513,9 +1855,9 @@ fun rtCheckPayloadWord() -> Int {
 // its forwarding pointer; a non-candidate (LOS/off-heap, or in a non-source block) is returned unchanged and
 // marked in place by the caller.
 fun rtEvacuate(space: RawPtr, obj: RawPtr) -> RawPtr {
-  if rtIsForwarded(obj) {
-    return rtForwardingPointer(obj)
-  }
+  // Range-check before any dereference (150.4.5.1 hardening): an off-heap value — a real LOS/immortal object,
+  // or a stale/wild word — is returned unchanged without reading its header. LOS objects never move; a wild
+  // word must not fault the collector or be misread as a forwarding record.
   let base: Int = space.load(fromByteOffset: 40)
   let nb: Int = space.load(fromByteOffset: 8)
   let heapEnd = base + nb * 32768
@@ -1525,6 +1867,9 @@ fun rtEvacuate(space: RawPtr, obj: RawPtr) -> RawPtr {
   }
   if a >= heapEnd {
     return obj
+  }
+  if rtIsForwarded(obj) {
+    return rtForwardingPointer(obj)
   }
   let d = a - base
   let bi = d / 32768
@@ -1740,6 +2085,203 @@ fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> In
   return nSources
 }
 
+// The generational major (150.4.4, §11.4): rtImmixCollectRootsDefrag plus a post-collection pass that
+// re-establishes the log-bit invariant. A major escalated from a nursery-full trigger (mature pressure or a
+// promotion that would fail) collects the whole heap — nursery blocks participate as ordinary blocks, so
+// rtImmixSweepBlocks resets their state and nurseryUsed@136. After it, every live object is mature and the
+// nursery is empty; the log-bit table still holds stale unlogged bits at the old (now freed) addresses of
+// moved survivors, which future young objects would inherit and wrongly trip the barrier — the minor treats
+// a remembered object as mature and non-moving, so a young object in the remembered set corrupts the next
+// minor. Wipe the whole table to logged, then set every surviving object unlogged (rtGenUnmarkAndUnlog, which
+// also clears the header marks the walk would otherwise leave), so freed regions read logged and only mature
+// survivors trip the barrier. A missing unlog on a survivor would silently drop a mature→young pointer in the
+// next minor; a stale unlog on a freed region would falsely remember a young object. Only the driver differs
+// from the non-generational defrag — this path runs solely under NOMU_NURSERY_RESERVE (the minor is enabled).
+fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
+  let nSources = rtSelectDefragSources(space)
+  rtClearAllLines(space)
+  rtSetupCopyAllocator(space)
+  var i = 0
+  while i < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
+    let old: RawPtr = slot.load(fromByteOffset: 0)
+    let oldNull = old.eq(RawPtr.null)
+    if !oldNull {
+      let new = rtImmixEvacMark(space, old)
+      slot.store(new, toByteOffset: 0)
+    }
+    i = i + 1
+  }
+  rtImmixSweepBlocks(space)
+  rtImmixSweepLos(space)
+  rtClearLogTable(space)                       // wipe stale unlogged bits; freed regions read logged
+  var j = 0
+  while j < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
+    let r: RawPtr = slot.load(fromByteOffset: 0)
+    let rNull = r.eq(RawPtr.null)
+    if !rNull {
+      rtGenUnmarkAndUnlog(space, r)            // unmark + set every survivor unlogged (mature)
+    }
+    j = j + 1
+  }
+  rtResetAllocator(space)
+  return nSources
+}
+
+// ---- Minor collection — the generational young-space collector (task 150 · 150.4.3, §11.4) ----
+// A minor GC evacuates only the nursery (from-space = the NURSERY blocks) into mature Immix, promoting every
+// survivor (promote-all, Appel-style). Its root set is the stack roots plus the drained remembered set (the
+// per-carrier mod-buffers the write barrier filled) — the mature space is never scanned, which is the whole
+// point of the barrier: mature→young pointers are reached through the remembered set, not a mature-heap walk.
+// The mature space is not swept. Reuses rtEvacuate + the forwarding record (§10.8): a NURSERY block is turned
+// into a DEFRAG_SOURCE (state 3) so rtEvacuate copies its objects, and the copy allocator draws fresh mature
+// (non-nursery) blocks, so every survivor is promoted. Emptied nursery blocks are reclaimed whole.
+
+// Forward one managed slot at `fieldAddr` for a minor GC: evacuate the referent (copies it to mature iff it is
+// a nursery source), rewrite the slot in place, and record a freshly-promoted object in `promoted` (the Cheney
+// queue + the post-fixup list). Returns the updated promoted count. A mature/off-heap referent is unchanged
+// and not recorded — a minor GC never scans the mature space.
+fun rtMinorForward(space: RawPtr, fieldAddr: RawPtr, promoted: RawPtr, count: Int) -> Int {
+  let old: RawPtr = fieldAddr.load(fromByteOffset: 0)
+  let oldNull = old.eq(RawPtr.null)
+  if oldNull {
+    return count
+  }
+  let new = rtEvacuate(space, old)
+  let moved = !new.eq(old)
+  if moved {
+    fieldAddr.store(new, toByteOffset: 0)      // fix the slot to the survivor's mature address
+    if rtTryMarkBare(new) {
+      promoted.store(new, toByteOffset: count * 8)
+      return count + 1                          // first visit → enqueue for scanning + post-fixup
+    }
+  }
+  return count
+}
+
+// Scan one object's managed slots for a minor GC, forwarding each young referent (rtMinorForward). Used for
+// the remembered mature objects (find their young children) and, via the Cheney queue, for the promoted
+// objects (a promoted object may still point at other nursery objects). Returns the updated promoted count.
+fun rtMinorScanObj(space: RawPtr, obj: RawPtr, promoted: RawPtr, count0: Int) -> Int {
+  var count = count0
+  let tid = rtObjTypeId(obj)
+  let kind = RawPtr.gcTypeKind(tid)
+  let nptr = RawPtr.gcTypeNumPtrs(tid)
+  if kind == 0 {
+    var i = 0
+    while i < nptr {
+      let off = RawPtr.gcTypePtrOffset(tid, i)
+      count = rtMinorForward(space, obj.advanced(by: off), promoted, count)
+      i = i + 1
+    }
+  } else {
+    let ecap: Int = obj.load(fromByteOffset: 8)
+    let stride = RawPtr.gcTypeStride(tid)
+    var e = 0
+    while e < ecap {
+      let elemBase = 16 + e * stride
+      var i = 0
+      while i < nptr {
+        let off = RawPtr.gcTypePtrOffset(tid, i)
+        count = rtMinorForward(space, obj.advanced(by: elemBase + off), promoted, count)
+        i = i + 1
+      }
+      e = e + 1
+    }
+  }
+  return count
+}
+
+// One minor collection (§11.4). `slotBuf`/`nslots` are the stopped mutators' stack root SLOTS (fixed up in
+// place); `remBuf`/`nrem` are the drained remembered set (mature objects the barrier logged). Promote every
+// live nursery object into mature Immix, rewrite each slot to its survivor, reclaim the emptied nursery blocks,
+// and re-establish the log bits (promoted + remembered objects are unlogged so their next mutation is caught).
+// The mature space is neither scanned nor swept. Returns the number of objects promoted.
+fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: RawPtr, nrem: Int) -> Int {
+  // From-space = the NURSERY blocks; turn each into a DEFRAG_SOURCE so rtEvacuate copies its objects.
+  let fc: Int = space.load(fromByteOffset: 32)
+  var bi = 0
+  while bi < fc {
+    if rtBlockState(space, bi) == 4 {
+      rtSetBlockState(space, bi, 3)
+    }
+    bi = bi + 1
+  }
+  rtSetupCopyAllocator(space)                    // to-space = fresh mature (non-nursery) blocks only
+  let cap = 1048576
+  let promoted = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var count = 0
+  // Root source 1 — stack slots. A young root is promoted + its slot fixed up; a mature root is left alone.
+  var s = 0
+  while s < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: s * 8)
+    count = rtMinorForward(space, slot, promoted, count)
+    s = s + 1
+  }
+  // Root source 2 — the remembered set: scan each logged mature object's slots for young referents, then
+  // re-unlog it so a store into it next cycle is remembered again.
+  var r = 0
+  while r < nrem {
+    let robj: RawPtr = remBuf.load(fromByteOffset: r * 8)
+    let robjNull = robj.eq(RawPtr.null)
+    if !robjNull {
+      count = rtMinorScanObj(space, robj, promoted, count)
+      rtSetUnlogged(space, robj)
+    }
+    r = r + 1
+  }
+  // Root source 3 — the large-object space (150.4.5.1.1). LOS objects are off-heap (never in the nursery, never
+  // moved) and carry no log bit, so the write barrier's heap-range guard skips stores into them and the
+  // remembered set never captures a mature LOS→young pointer (e.g. a large Array<class> that gains a young
+  // element). Treat every live LOS object as an old root: scan its managed slots for young referents each
+  // minor. The mature Immix space still relies on the barrier + remembered set; only the barrier-less off-heap
+  // space is scanned wholesale. Immortal buffers (String bytes) hold no managed pointers, so they need no
+  // scanning and are not on this list. A dead-but-unswept LOS object keeps its young referents alive until the
+  // next major sweeps it — conservative, not incorrect.
+  var los: RawPtr = space.load(fromByteOffset: 64)
+  var losNull = los.eq(RawPtr.null)
+  while !losNull {
+    let losObj = los.advanced(by: 8)                 // object starts after the link word (rtLosAlloc)
+    count = rtMinorScanObj(space, losObj, promoted, count)
+    los = los.load(fromByteOffset: 0)                // next LOS node
+    losNull = los.eq(RawPtr.null)
+  }
+  // Cheney: scan each promoted object for further nursery referents (its young children promote too).
+  var scan = 0
+  while scan < count {
+    let obj: RawPtr = promoted.load(fromByteOffset: scan * 8)
+    scan = scan + 1
+    count = rtMinorScanObj(space, obj, promoted, count)
+  }
+  // Clear each promoted object's transient mark bit and set its unlog bit — it is mature now, so a future
+  // store of a young object into it must be remembered.
+  var p = 0
+  while p < count {
+    let obj: RawPtr = promoted.load(fromByteOffset: p * 8)
+    let un = rtUnmarkIfMarked(obj)
+    rtSetUnlogged(space, obj)
+    p = p + 1
+  }
+  // Reclaim the emptied nursery blocks (every live object promoted out) onto the free list; mature blocks are
+  // left untouched (not swept).
+  let fl: RawPtr = space.load(fromByteOffset: 88)
+  var bj = 0
+  while bj < fc {
+    if rtBlockState(space, bj) == 3 {
+      rtSetBlockState(space, bj, 0)
+      let top: Int = space.load(fromByteOffset: 96)
+      fl.store(bj, toByteOffset: top * 8)
+      space.store(top + 1, toByteOffset: 96)
+    }
+    bj = bj + 1
+  }
+  space.store(0, toByteOffset: 136)              // the nursery is empty again
+  rtResetAllocator(space)
+  promoted.free()
+  return count
+}
+
 // Drive a self-hosted collection at an STW: walk every stopped mutator's root SLOTS and run the evacuating
 // collection over the self-hosted Immix space (NOMU_GC_PLAN=nomu). `forceAll != 0` moves every live object
 // (a maximal-move fixup stress, needs free to-space); else the defrag collector (heap-pressure-safe). Called
@@ -1757,7 +2299,14 @@ fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
   if forceAll != 0 {
     rtImmixCollectRoots(space, slots, ns)
   } else {
-    rtImmixCollectRootsDefrag(space, slots, ns)
+    // Under the generational trigger (NOMU_NURSERY_RESERVE > 0) a defrag major is also the minor/major
+    // escalation target (150.4.4), so re-establish the log-bit invariant post-collection; the pre-150.4.4
+    // path (no minor) runs the plain defrag unchanged so the existing suite is byte-identical.
+    if RawPtr.gcNurseryReserve() > 0 {
+      rtImmixCollectRootsDefragGen(space, slots, ns)
+    } else {
+      rtImmixCollectRootsDefrag(space, slots, ns)
+    }
   }
   slots.free()
   return ns
@@ -1771,6 +2320,29 @@ fun nomuSchedStwCollect(sched: RawPtr) -> Int {
 // Defrag collection (the heap-pressure path).
 fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
   return nomuSchedStwCollectPlan(sched, 0)
+}
+
+// Drive a minor (generational) collection at an STW (task 150.4.3): the stopped mutators' stack root slots
+// plus the drained per-carrier remembered set (the write barrier's mod-buffers) are the root set; the nursery
+// is promoted into mature Immix. Returns the number of objects promoted (0 off the self-hosted GC plan). The
+// drain (RawPtr.gcDrainModBufs) both collects and resets the mod-buffers, so the coordinator does not also
+// reset them; it does reset the mutator TLABs (their nursery blocks were reclaimed).
+fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
+  let space = RawPtr.gcSelfhostSpace()
+  let spaceNull = space.eq(RawPtr.null)
+  if spaceNull {
+    return 0
+  }
+  let cap = 8192
+  let slots = RawPtr.alloc(bytes: cap * 8, align: 8)
+  let ns = nomuSchedWalkSlots(sched, slots, cap)
+  let remCap = 1048576
+  let rem = RawPtr.alloc(bytes: remCap * 8, align: 8)
+  let nrem = RawPtr.gcDrainModBufs(rem, remCap)
+  let n = rtImmixCollectMinor(space, slots, ns, rem, nrem)
+  rem.free()
+  slots.free()
+  return n
 }
 
 // Available empty blocks in the self-hosted Immix space (never-used + reclaimed-free) — the heap-pressure
@@ -1917,6 +2489,7 @@ fun rtScanSchedRoot(outBuf: RawPtr, n0: Int, cap: Int) -> Int {
 //                 · 112 mbfiber-count · 120 drain-fn-ptr (nomu_actor_drain) · 128 registry-head
 //                 · 136 stw-request · 144 stw-ack · 152 stw-gen · 160 ncarriers   (STW handshake, 128.3.2)
 //                 · 168 gc-request   (OOM initiator → GC coordinator signal, 150.3.11)
+//                 · 176 gc-kind      (collection kind for the coordinator: 1 minor, 0 major/defrag, 150.4.3)
 //   Timer entry (16B): 0 expiry-ns · 8 fiber
 //   Mailbox (ABI, runtime.h): 0 header · 8 mb_head · 16 mb_tail · 24 scheduled · 32 sched_next
 //   Message (ABI, runtime.h): 0 header · 8 next · 16 thunk · 24 self · args…
@@ -2609,8 +3182,10 @@ fun nomuSchedActorSend(sched: RawPtr, mailbox: RawPtr, msg: RawPtr) {
     mailbox.store(msg, toByteOffset: 8)               // mb_head = msg
   } else {
     tail.store(msg, toByteOffset: 8)                  // mb_tail->next = msg
+    rtRememberStore(tail)                             // young msg stored into a maybe-mature tail message
   }
   mailbox.store(msg, toByteOffset: 16)                // mb_tail = msg
+  rtRememberStore(mailbox)                            // young msg stored into mb_head/mb_tail of a maybe-mature mailbox
   let sch: Int = mailbox.load(fromByteOffset: 24)     // scheduled
   if sch == 0 {
     mailbox.store(1, toByteOffset: 24)
@@ -2620,7 +3195,8 @@ fun nomuSchedActorSend(sched: RawPtr, mailbox: RawPtr, msg: RawPtr) {
       sched.store(mailbox, toByteOffset: 80)
       sched.store(mailbox, toByteOffset: 88)
     } else {
-      stail.store(mailbox, toByteOffset: 32)
+      stail.store(mailbox, toByteOffset: 32)           // stail->sched_next = mailbox
+      rtRememberStore(stail)                           // maybe-young mailbox linked into a maybe-mature stail
       sched.store(mailbox, toByteOffset: 88)
     }
     sched.atomicFetchAdd(1, atByteOffset: 96)          // active-drains++
@@ -2651,6 +3227,8 @@ fun nomuSchedMailboxPop(sched: RawPtr, mailbox: RawPtr) -> RawPtr {
   mailbox.store(nx, toByteOffset: 8)                  // mb_head = next
   if nx.isNull {
     mailbox.store(RawPtr.null, toByteOffset: 16)      // mb_tail = null
+  } else {
+    rtRememberStore(mailbox)                          // re-linked head (maybe young) into a maybe-mature mailbox
   }
   rtSchedUnlock(sched)
   return msg

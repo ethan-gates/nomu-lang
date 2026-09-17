@@ -1,0 +1,56 @@
+// Task 150 · rung 4 (GenImmix), increment 150.4.3 — minor (generational) collection. Under
+// NOMU_GC_PLAN=nomu the nursery fills to its reserve and a minor GC fires (rtImmixRefill → rtSelfhostMinorGc
+// → the STW coordinator runs nomuSchedStwCollectMinor): the nursery is promoted into mature Immix using the
+// stopped mutator's stack roots plus the drained write-barrier remembered set (selfhosted-gc.md §11.4). The
+// mature space is never scanned — a mature→young pointer survives only because the barrier remembered it.
+//
+// A sliding window of 100 live Boxes in an array `xs` forces real allocation (each new Box escapes into the
+// buffer; the overwritten one becomes garbage), so the nursery actually fills and minor GCs fire. `h` is a
+// Holder promoted to mature by an early minor; then a fresh (nursery) Box is stored into mature `h.item` —
+// the exact cross-generation pointer the write barrier must remember. The second allocation phase drives more
+// minor GCs; without the remembered set the young Box (reachable only from mature `h`) would be reclaimed and
+// the final read would be wrong. Prints 42 / 4242 / a window checksum iff the generational collector is sound.
+//
+// The nursery reserve is set small via NOMU_NURSERY_RESERVE (the driver) so minor GCs fire on allocation
+// count, not wall clock — deterministic and independent of program speed. The same fixture runs unchanged
+// under MMTk GenImmix (the differential oracle: MMTk ignores the env and drives its own generational
+// collection). Compiled with NOMU_NO_ESCAPE=1 so the objects are real heap objects.
+class Box {
+  var v: Int
+}
+class Holder {
+  var item: Box
+  var tag: Int
+}
+fun fill(xs: Array<Box>, from: Int, n: Int) {
+  var i = from
+  let end = from + n
+  while i < end {
+    xs[i % 100] = Box(v: i)   // real allocation; the old Box becomes garbage, the new one escapes into xs
+    i = i + 1
+  }
+}
+fun main() {
+  let h = Holder(item: Box(v: 0), tag: 4242)
+  var xs: Array<Box> = []
+  var w = 0
+  while w < 100 {
+    xs.append(Box(v: 0))
+    w = w + 1
+  }
+  fill(xs, 0, 400000)       // early minor GCs promote `h` and the live window to the mature space
+  h.item = Box(v: 42)       // mature `h` now points at a fresh nursery Box — the barrier remembers `h`
+  fill(xs, 400000, 400000)  // more minor GCs: the young Box survives only if `h` was remembered
+  var sum = 0
+  var j = 0
+  while j < 100 {
+    sum = sum + xs[j].v     // reads through the promoted buffer + promoted Box pointers
+    j = j + 1
+  }
+  print(h.item.v)           // 42 — the post-promotion store was tracked and the young object promoted
+  print("\n")
+  print(h.tag)              // 4242 — the mature object itself survived intact
+  print("\n")
+  print(sum % 100000)       // window checksum — identical under MMTk GenImmix and the self-hosted minor GC
+  print("\n")
+}

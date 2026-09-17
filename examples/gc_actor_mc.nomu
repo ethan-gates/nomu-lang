@@ -1,0 +1,44 @@
+// Task 150.4.5.2 — multi-carrier remembered-set correctness, concurrency-safe check. Same shape as
+// gc_actor, but `report` prints only on a WRONG sum, so the pass condition is empty output regardless of
+// how concurrent handlers on different carriers interleave stdout (per-actor prints in gc_actor garble the
+// line structure under multiple carriers, which is an output-interleaving artifact, not a GC fault).
+class Box {
+  var v: Int
+}
+actor Worker {
+  var sum: Int = 0
+  on add(v: Int) {
+    sum = sum + v
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 256 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+  }
+  on report(tag: Int) {
+    if sum != 1225 {
+      print("BAD ")
+      print(tag)
+      print(" ")
+      print(sum)
+      print("\n")
+    }
+  }
+}
+fun blast(nActors: Int, nMsgs: Int) {
+  var a = 0
+  while a < nActors {
+    let wk = Worker()
+    var i = 0
+    while i < nMsgs {
+      wk.add(v: i)
+      i = i + 1
+    }
+    wk.report(tag: a)
+    a = a + 1
+  }
+}
+fun main() {
+  blast(2000, 50)
+}
