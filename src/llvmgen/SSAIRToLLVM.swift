@@ -661,6 +661,11 @@ final class SSAIRToLLVM {
             let z = LLVMBuildTrunc(b, LLVMConstInt(e.i64, 0, 0), e.i32, "zero.byte")
             _ = e.buildCall(mfn, mfty, [val(args[0]), z, val(args[1])])
             return LLVMConstInt(e.i64, 0, 0)
+        case "__rawCopyBytes":
+            // memcpy(self, from, n) — copy a raw byte range (grow the minor promotion queue). Non-overlapping.
+            let (cfn, cfty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
+            _ = e.buildCall(cfn, cfty, [val(args[0]), val(args[1]), val(args[2])])
+            return LLVMConstInt(e.i64, 0, 0)
         case "__rawLoad":
             guard let lt = ty(resultType, span) else { return nil }
             return LLVMBuildLoad2(b, lt, e.gepByte(val(args[0]), val(args[1])), "raw.load")
@@ -901,6 +906,11 @@ final class SSAIRToLLVM {
             // shape as __gcNurseryReserve.
             let g = LLVMGetNamedGlobal(e.mod, "__nomu_mature_floor") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_mature_floor")
             return LLVMBuildLoad2(b, e.i64, g, "gc.maturefloor")
+        case "__gcExternalDriver":
+            // Load the C global `__nomu_gc_ext_driver` (nonzero when an external STW driver owns collection so
+            // the default minor coordinator is not running). rtGenReserve gates generational off on it.
+            let g = LLVMGetNamedGlobal(e.mod, "__nomu_gc_ext_driver") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_gc_ext_driver")
+            return LLVMBuildLoad2(b, e.i64, g, "gc.extdriver")
         case "__gcTypeCount":
             let g = LLVMGetNamedGlobal(e.mod, "nomu_gc_typemap_count") ?? LLVMAddGlobal(e.mod, e.i64, "nomu_gc_typemap_count")
             return LLVMBuildLoad2(b, e.i64, g, "gc.tcount")

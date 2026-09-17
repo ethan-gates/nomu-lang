@@ -557,6 +557,30 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   return ctl
 }
 
+// The active nursery reserve (150.4.5.3): the generational minor trigger in blocks, and the predicate for
+// "generational active" (> 0). Generational is on by default — the reserve is the descriptor's default
+// (numBlocks/4, stored at ctl+128 by rtImmixNew) unless the NOMU_NURSERY_RESERVE dev/test override is set: a
+// positive value overrides the reserve; a negative value disables generational (returns 0 → major-only, the
+// pre-generational path). Both the nursery-full trigger in rtImmixRefill and the gen-defrag gate in
+// nomuSchedStwCollectPlan resolve through here so they share one predicate.
+fun rtGenReserve(space: RawPtr) -> Int {
+  // An external STW driver (NOMU_STW_SELFHOST / NOMU_STW_COLLECT / NOMU_GC_PRESSURE) replaces the default
+  // minor/OOM coordinator with its own collection thread, so the generational minor trigger has no coordinator
+  // to service its request — firing it would park a carrier forever. Defer: generational off under any external
+  // driver (that driver is the whole collection mechanism).
+  if RawPtr.gcExternalDriver() != 0 {
+    return 0
+  }
+  let env: Int = RawPtr.gcNurseryReserve()
+  if env > 0 {
+    return env
+  }
+  if env < 0 {
+    return 0
+  }
+  return space.load(fromByteOffset: 128)
+}
+
 // The base address of block `bi`.
 fun rtBlockAddr(space: RawPtr, bi: Int) -> RawPtr {
   let heap: RawPtr = space.load(fromByteOffset: 0)
@@ -866,13 +890,13 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
     let ab: Int = tlab.load(fromByteOffset: 16)
     if ab < 0 {
       // Nursery-full → minor GC before handing out another young block (150.4.3, §11.1). The trigger threshold
-      // is NOMU_NURSERY_RESERVE (RawPtr.gcNurseryReserve, in blocks); 0 = disabled, so by default the nursery
-      // grows unbounded and only a major/defrag collection fires at OOM (the pre-150.4.3 path — the whole
-      // suite runs the mature collector until the minor collector is robust across every object type and
-      // multi-carrier, which is 150.4.5). When enabled, promote the nursery once it reaches the threshold,
-      // but only when a scheduler exists to run the STW. After a minor GC nurseryUsed is 0 and the TLAB is
-      // reset, so the loop retries and gets a fresh nursery block.
-      let minorTrigger: Int = RawPtr.gcNurseryReserve()
+      // is the active nursery reserve (rtGenReserve, in blocks): the descriptor default (numBlocks/4) by
+      // default — generational is on (150.4.5.3) — overridable/disable-able via NOMU_NURSERY_RESERVE. A zero
+      // trigger means disabled (the pre-generational path: the nursery grows unbounded and only a major/defrag
+      // collection fires at OOM). Promote the nursery once it reaches the threshold, but only when a scheduler
+      // exists to run the STW. After a minor GC nurseryUsed is 0 and the TLAB is reset, so the loop retries and
+      // gets a fresh nursery block.
+      let minorTrigger: Int = rtGenReserve(space)
       let nurseryNow: Int = space.load(fromByteOffset: 136)
       var didGc = false
       if minorTrigger > 0 && nurseryNow >= minorTrigger {
@@ -2142,7 +2166,7 @@ fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) ->
 // a nursery source), rewrite the slot in place, and record a freshly-promoted object in `promoted` (the Cheney
 // queue + the post-fixup list). Returns the updated promoted count. A mature/off-heap referent is unchanged
 // and not recorded — a minor GC never scans the mature space.
-fun rtMinorForward(space: RawPtr, fieldAddr: RawPtr, promoted: RawPtr, count: Int) -> Int {
+fun rtMinorForward(space: RawPtr, fieldAddr: RawPtr, q: RawPtr, count: Int) -> Int {
   let old: RawPtr = fieldAddr.load(fromByteOffset: 0)
   let oldNull = old.eq(RawPtr.null)
   if oldNull {
@@ -2153,17 +2177,39 @@ fun rtMinorForward(space: RawPtr, fieldAddr: RawPtr, promoted: RawPtr, count: In
   if moved {
     fieldAddr.store(new, toByteOffset: 0)      // fix the slot to the survivor's mature address
     if rtTryMarkBare(new) {
-      promoted.store(new, toByteOffset: count * 8)
-      return count + 1                          // first visit → enqueue for scanning + post-fixup
+      rtQueuePush(q, count, new)               // first visit → enqueue for scanning + post-fixup (grows if full)
+      return count + 1
     }
   }
   return count
 }
 
+// The promotion queue is a growable dynamic array behind a stable 2-word handle {base @0, cap @8}: a minor's
+// promotion count is bounded only by the nursery's live objects, which grows with the nursery reserve, so a
+// fixed array can overflow (a large nursery promoting many survivors). Region/block collectors (Immix, G1,
+// MMTk) use growable work stacks for the same reason. `q` is passed by value into the scan helpers, so growth
+// must not move the value the callers hold — the handle stays put; only the buffer it points at is realloc'd.
+// The buffer is malloc-backed (rt_raw_alloc), off the GC heap, so growth during the STW never re-enters
+// collection. Doubling keeps the amortized cost O(1) and grows rare (starts at 64Ki entries).
+fun rtQueuePush(q: RawPtr, count: Int, obj: RawPtr) {
+  var base: RawPtr = q.load(fromByteOffset: 0)
+  let cap: Int = q.load(fromByteOffset: 8)
+  if count >= cap {
+    let newCap = cap + cap
+    let newBase = RawPtr.alloc(bytes: newCap * 8, align: 8)
+    newBase.copyBytes(from: base, byteCount: count * 8)
+    base.free()
+    q.store(newBase, toByteOffset: 0)
+    q.store(newCap, toByteOffset: 8)
+    base = newBase
+  }
+  base.store(obj, toByteOffset: count * 8)
+}
+
 // Scan one object's managed slots for a minor GC, forwarding each young referent (rtMinorForward). Used for
 // the remembered mature objects (find their young children) and, via the Cheney queue, for the promoted
 // objects (a promoted object may still point at other nursery objects). Returns the updated promoted count.
-fun rtMinorScanObj(space: RawPtr, obj: RawPtr, promoted: RawPtr, count0: Int) -> Int {
+fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
   var count = count0
   let tid = rtObjTypeId(obj)
   let kind = RawPtr.gcTypeKind(tid)
@@ -2172,7 +2218,7 @@ fun rtMinorScanObj(space: RawPtr, obj: RawPtr, promoted: RawPtr, count0: Int) ->
     var i = 0
     while i < nptr {
       let off = RawPtr.gcTypePtrOffset(tid, i)
-      count = rtMinorForward(space, obj.advanced(by: off), promoted, count)
+      count = rtMinorForward(space, obj.advanced(by: off), q, count)
       i = i + 1
     }
   } else {
@@ -2184,7 +2230,7 @@ fun rtMinorScanObj(space: RawPtr, obj: RawPtr, promoted: RawPtr, count0: Int) ->
       var i = 0
       while i < nptr {
         let off = RawPtr.gcTypePtrOffset(tid, i)
-        count = rtMinorForward(space, obj.advanced(by: elemBase + off), promoted, count)
+        count = rtMinorForward(space, obj.advanced(by: elemBase + off), q, count)
         i = i + 1
       }
       e = e + 1
@@ -2209,14 +2255,20 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
     bi = bi + 1
   }
   rtSetupCopyAllocator(space)                    // to-space = fresh mature (non-nursery) blocks only
-  let cap = 1048576
-  let promoted = RawPtr.alloc(bytes: cap * 8, align: 8)
+  // Promotion queue: a growable dynamic array behind a stable 2-word handle {base @0, cap @8}. rtQueuePush
+  // doubles the buffer when full, so a minor promoting more than the initial capacity grows instead of
+  // overflowing. Starts small (64Ki entries = 512 KiB) — most minors promote little; a large-survivor minor
+  // grows to the nursery-bounded worst case. The queue is malloc-backed (off the GC heap).
+  let cap0 = 65536
+  let q = RawPtr.alloc(bytes: 16, align: 8)
+  q.store(RawPtr.alloc(bytes: cap0 * 8, align: 8), toByteOffset: 0)
+  q.store(cap0, toByteOffset: 8)
   var count = 0
   // Root source 1 — stack slots. A young root is promoted + its slot fixed up; a mature root is left alone.
   var s = 0
   while s < nslots {
     let slot: RawPtr = slotBuf.load(fromByteOffset: s * 8)
-    count = rtMinorForward(space, slot, promoted, count)
+    count = rtMinorForward(space, slot, q, count)
     s = s + 1
   }
   // Root source 2 — the remembered set: scan each logged mature object's slots for young referents, then
@@ -2226,7 +2278,7 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
     let robj: RawPtr = remBuf.load(fromByteOffset: r * 8)
     let robjNull = robj.eq(RawPtr.null)
     if !robjNull {
-      count = rtMinorScanObj(space, robj, promoted, count)
+      count = rtMinorScanObj(space, robj, q, count)
       rtSetUnlogged(space, robj)
     }
     r = r + 1
@@ -2243,22 +2295,24 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
   var losNull = los.eq(RawPtr.null)
   while !losNull {
     let losObj = los.advanced(by: 8)                 // object starts after the link word (rtLosAlloc)
-    count = rtMinorScanObj(space, losObj, promoted, count)
+    count = rtMinorScanObj(space, losObj, q, count)
     los = los.load(fromByteOffset: 0)                // next LOS node
     losNull = los.eq(RawPtr.null)
   }
   // Cheney: scan each promoted object for further nursery referents (its young children promote too).
   var scan = 0
   while scan < count {
-    let obj: RawPtr = promoted.load(fromByteOffset: scan * 8)
+    let qbase: RawPtr = q.load(fromByteOffset: 0)
+    let obj: RawPtr = qbase.load(fromByteOffset: scan * 8)
     scan = scan + 1
-    count = rtMinorScanObj(space, obj, promoted, count)
+    count = rtMinorScanObj(space, obj, q, count)
   }
   // Clear each promoted object's transient mark bit and set its unlog bit — it is mature now, so a future
   // store of a young object into it must be remembered.
   var p = 0
+  let qbaseFix: RawPtr = q.load(fromByteOffset: 0)   // growth is done; the buffer no longer moves
   while p < count {
-    let obj: RawPtr = promoted.load(fromByteOffset: p * 8)
+    let obj: RawPtr = qbaseFix.load(fromByteOffset: p * 8)
     let un = rtUnmarkIfMarked(obj)
     rtSetUnlogged(space, obj)
     p = p + 1
@@ -2278,7 +2332,9 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
   }
   space.store(0, toByteOffset: 136)              // the nursery is empty again
   rtResetAllocator(space)
-  promoted.free()
+  let qbaseFree: RawPtr = q.load(fromByteOffset: 0)   // free the (possibly grown) buffer, then the handle
+  qbaseFree.free()
+  q.free()
   return count
 }
 
@@ -2299,10 +2355,10 @@ fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
   if forceAll != 0 {
     rtImmixCollectRoots(space, slots, ns)
   } else {
-    // Under the generational trigger (NOMU_NURSERY_RESERVE > 0) a defrag major is also the minor/major
-    // escalation target (150.4.4), so re-establish the log-bit invariant post-collection; the pre-150.4.4
-    // path (no minor) runs the plain defrag unchanged so the existing suite is byte-identical.
-    if RawPtr.gcNurseryReserve() > 0 {
+    // When generational is active (rtGenReserve > 0 — the default) a defrag major is also the minor/major
+    // escalation target (150.4.4), so re-establish the log-bit invariant post-collection; when disabled
+    // (NOMU_NURSERY_RESERVE negative) the plain defrag runs unchanged (the pre-generational path).
+    if rtGenReserve(space) > 0 {
       rtImmixCollectRootsDefragGen(space, slots, ns)
     } else {
       rtImmixCollectRootsDefrag(space, slots, ns)

@@ -2,9 +2,12 @@
 
 **Avenue:** Risk (the core bet) · **Type/Lifecycle:** `runtime · in-progress` (runtime + GC + backend) ·
 **Size:** XL · **Status:** 150.3 (Immix) complete as a whole-program moving collector on the self-hosted
-scheduler (150.3.1–150.3.13); **150.4 (GenImmix) is the current rung** — nursery + write barrier +
-remembered set, design locked in `selfhosted-gc.md` §11 (see the 150.4 subtask entry). Full-runtime
-root-scanning integration (multi-mutator STW) landed via [128](128-self-hosting-runtime.md) (128.3) ·
+scheduler (150.3.1–150.3.13); **150.4 (GenImmix) complete** — nursery + write barrier + remembered set,
+generational on by default, full suite green single- and multi-carrier against the MMTk GenImmix oracle
+(design in `selfhosted-gc.md` §11). Correctness-complete, unbenchmarked; MMTk stays live as the baseline
+until the perf-benchmark step (horizon "after GenImmix" run-up). Full-runtime root-scanning integration
+(multi-mutator STW) landed via [128](128-self-hosting-runtime.md) (128.3). **Next: perf-benchmark vs MMTk
+(GC packaging [158] + observability [159] land there), then MMTk retirement, then 127 LXR.** ·
 **Source:** distilled from [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
 
 The ladder's rungs are the subtasks: **150.1** NoGC, **150.2** mark-verify, **150.3** Immix, **150.4**
@@ -463,9 +466,24 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
       original `gc_actor` per-actor prints garble line structure under >1 carrier (two `report`s interleaving
       stdout, e.g. `1225`+`728` → `1225728`); that is an output-interleaving artifact of unsynchronized `print`,
       not a GC fault — `gc-actor.sh` only ever ran self-hosted at a single carrier, so it never surfaced.
-    - 150.4.5.3 — flip generational on by default under `NOMU_RUNTIME=selfhost` (descriptor carries the default
-      reserve, the trigger reads it, env demoted to an override); full suite green, opt-in gating retired.
-      Reserve/floor knobs internalize here (feeds task 157).
+    - 150.4.5.3 — flip generational on by default. **Done.** The descriptor's default reserve (`numBlocks/4`)
+      is the active trigger via `rtGenReserve(space)`; `NOMU_NURSERY_RESERVE` demoted to a dev override (positive
+      = set the reserve, negative = disable). Flipping the default surfaced two latent bugs the forced-reserve
+      tests never hit, both fixed:
+      - *Promotion-queue overflow (crash).* `rtImmixCollectMinor`'s Cheney/promotion queue was a fixed
+        1,048,576-entry array; a large-nursery minor promoting more (gc-anybox: 257 dead LOS `Array<Box>` buffers
+        scanned as roots → ~2.1M promoted) overran it → segfault in `rtMinorScanObj`. Fix: a growable dynamic
+        array behind a stable 2-word handle `{base, cap}`, doubled on fill (`rtQueuePush` + new
+        `RawPtr.copyBytes`/`__rawCopyBytes` → memcpy). Fixed gc-anybox + gc-string.
+      - *External-STW-driver deadlock.* With generational default-on, the nursery-full minor trigger posts a
+        request to the default coordinator (`rt_gc_sync_thread`), which boot does not start when an external
+        driver (`NOMU_GC_PRESSURE`/`NOMU_STW_*`) is set — so the carrier parks forever. **Interim fix:**
+        `rtGenReserve` returns 0 (generational off) when an external driver is active (`RawPtr.gcExternalDriver`
+        → `__nomu_gc_ext_driver`). A workaround; the structural fix is the packaged trigger protocol in task
+        [158](158-gc-packaging.md), which removes the gate. Fixed gc-pressure + gc-concurrent.
+      Full suite green single- and multi-carrier (bazel + 20 GC/gen drivers). Reserve/floor knobs internalize
+      here (feeds task 157); the GC-lever share of that + the deadlock's structural fix move to
+      [158](158-gc-packaging.md), with collector observability in [159](159-gc-observability.md).
 - Then [127 LXR](127-lxr-collector.md): reclamation swapped to RC-primary, on 150.3's region machinery.
 
 ## Refs

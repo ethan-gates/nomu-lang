@@ -191,8 +191,9 @@ enum PointerIntrinsics {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return s.ptrIntrinsic("__gcSelfModBuf", .rawPtr, [], span)
-        // The nursery-reserve override in blocks (task 150.4.3, env NOMU_NURSERY_RESERVE): 0 = default (1/4 of
-        // the pool). rtImmixNew reads it at space creation. A gc-leaf pure read of the C global.
+        // The nursery-reserve override in blocks (env NOMU_NURSERY_RESERVE): 0 = unset (use the descriptor
+        // default, 1/4 of the pool — generational on); positive overrides the reserve; negative disables
+        // generational. rtGenReserve resolves it against the descriptor. A gc-leaf pure read of the C global.
         case "gcNurseryReserve":
             guard checkArgLabels(&s, args, [], "RawPtr.gcNurseryReserve", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
@@ -206,6 +207,14 @@ enum PointerIntrinsics {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return s.ptrIntrinsic("__gcMatureFloor", .int, [], span)
+        // Nonzero when an external STW driver (NOMU_STW_SELFHOST / NOMU_STW_COLLECT / NOMU_GC_PRESSURE) owns
+        // collection, so the default minor coordinator is not running. rtGenReserve returns 0 in that case so
+        // the generational minor trigger doesn't park a carrier on a coordinator that never runs. Pure read.
+        case "gcExternalDriver":
+            guard checkArgLabels(&s, args, [], "RawPtr.gcExternalDriver", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__gcExternalDriver", .int, [], span)
         // Drain every carrier's write-barrier mod-buffer into `outBuf` (task 150.4.3): the minor GC's
         // remembered set. Copies each remembered object pointer (up to `cap`), resets the buffers, and
         // returns the total count. Same shape as gcParkedAnchors.
@@ -358,6 +367,15 @@ enum PointerIntrinsics {
             }
             let n = intArg(&s, args[0].value, "RawPtr.zeroBytes", "n")
             return s.ptrIntrinsic("__rawZeroBytes", .void, [recv, n], span)
+        // memcpy(self, from, byteCount) — copy a raw byte range. Used to grow the minor collector's promotion
+        // queue (alloc a larger buffer, copy the live prefix over). Non-overlapping.
+        case "copyBytes":
+            guard checkArgLabels(&s, args, ["from", "byteCount"], "RawPtr.copyBytes", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let src = ptrArg(&s, args[0].value, "RawPtr.copyBytes", "from")
+            let cn = intArg(&s, args[1].value, "RawPtr.copyBytes", "byteCount")
+            return s.ptrIntrinsic("__rawCopyBytes", .void, [recv, src, cn], span)
         case "load":
             guard checkArgLabels(&s, args, ["fromByteOffset"], "RawPtr.load", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))

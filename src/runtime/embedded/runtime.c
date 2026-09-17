@@ -39,10 +39,12 @@ extern unsigned char __nomu_runtime_selfhost;
 // path (task 150.4.2) instead of MMTk's post-barrier.
 extern unsigned char __nomu_selfhosted_alloc;
 
-// Nursery reserve override in blocks (task 150.4.3, env NOMU_NURSERY_RESERVE). 0 = the default (1/4 of the
-// pool). Set once from the env in main() before any allocation; rtImmixNew reads it (RawPtr.gcNurseryReserve)
-// when it creates the space. A small value forces frequent minor GCs so a test exercises the generational
-// collector deterministically. Non-static so the codegen intrinsic can load it.
+// Nursery reserve override in blocks (env NOMU_NURSERY_RESERVE), a dev/test override of the default-on
+// generational trigger. 0 = unset → use the descriptor's default reserve (1/4 of the pool); a positive value
+// overrides the reserve (a small value forces frequent minor GCs so a test exercises the generational collector
+// deterministically); a negative value disables generational entirely (major-only, the pre-generational path).
+// Set once from the env in main() before any allocation; rtGenReserve resolves it against the descriptor.
+// Non-static so the codegen intrinsic can load it.
 int64_t __nomu_nursery_reserve = 0;
 
 // Mature-pressure floor in blocks (task 150.4.4, env NOMU_MATURE_FLOOR). 0 = default (the minor/major driver
@@ -51,6 +53,13 @@ int64_t __nomu_nursery_reserve = 0;
 // large value forces majors to interleave with minors so a test exercises the escalation path deterministically.
 // Non-static so the codegen intrinsic can load it.
 int64_t __nomu_mature_floor = 0;
+
+// Set when an external STW driver (NOMU_STW_SELFHOST / NOMU_STW_COLLECT / NOMU_GC_PRESSURE) owns collection,
+// so the default minor/OOM coordinator (rt_gc_sync_thread) is not started. The generational minor trigger
+// parks a carrier and waits for that coordinator to service its request; with no coordinator running it would
+// deadlock, so rtGenReserve returns 0 (generational off) when this is set — the external driver is the whole
+// collection mechanism. Read via RawPtr.gcExternalDriver.
+int64_t __nomu_gc_ext_driver = 0;
 
 // ---- Scheduler plan selector (task 128.1.9) ----
 // Two schedulers are linked: the C/pthread scheduler below (default, the differential oracle) and the
@@ -1661,8 +1670,9 @@ int main(void) {
     const char* runtime_env = getenv("NOMU_RUNTIME");
     const char* sched_env = getenv("NOMU_SCHED");
     const char* gc_plan_env = getenv("NOMU_GC_PLAN");
-    // Nursery reserve override (task 150.4.3): rtImmixNew reads this when it creates the self-hosted space.
-    { const char* nr = getenv("NOMU_NURSERY_RESERVE"); if (nr) { long v = atol(nr); if (v > 0) __nomu_nursery_reserve = v; } }
+    // Nursery reserve override: a dev/test override of the default-on generational trigger (rtGenReserve reads
+    // it). Positive = override the reserve; negative = disable generational (major-only); 0/unset = descriptor default.
+    { const char* nr = getenv("NOMU_NURSERY_RESERVE"); if (nr) { long v = atol(nr); if (v != 0) __nomu_nursery_reserve = v; } }
     // Mature-pressure floor override (task 150.4.4): rtImmixRefill reads it to escalate a nursery-full trigger
     // to a full defrag major once free mature blocks fall below it.
     { const char* mf = getenv("NOMU_MATURE_FLOOR"); if (mf) { long v = atol(mf); if (v > 0) __nomu_mature_floor = v; } }
@@ -1713,6 +1723,7 @@ int main(void) {
         // above drive collection their own way). It stays idle until a mutator requests a collection — either a
         // minor GC when the nursery reserve fills (150.4.3) or a major/defrag at true OOM (150.3.11).
         int gc_driver_env = getenv("NOMU_STW_SELFHOST") || getenv("NOMU_STW_COLLECT") || getenv("NOMU_GC_PRESSURE");
+        __nomu_gc_ext_driver = gc_driver_env ? 1 : 0;   // generational defers to an external STW driver (rtGenReserve)
         if (selfhost_alloc && !gc_driver_env) {
             pthread_t __gc_s; pthread_create(&__gc_s, NULL, rt_gc_sync_thread, NULL); pthread_detach(__gc_s);
         }

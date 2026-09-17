@@ -66,8 +66,9 @@ the work turns to the scheduler half (128.1), for two reasons that make the inte
 GenImmix's stop-the-world over all mutators (128.3.2) reads every running carrier's saved safepoint
 context, which is the self-hosted scheduler's machinery; and the generational write barrier co-designs
 with the mutator/carrier path. So the order is **Immix (150.3) → scheduler self-host (128.1) → GenImmix
-(150.4) → retire MMTk → LXR (127)**. Immix runs hosted on the existing C scheduler in the meantime;
-GenImmix lands on the self-hosted one.
+(150.4) → test harness (155) → modules (100) → GC benchmarking → retire MMTk → LXR (127)**. Immix runs
+hosted on the existing C scheduler in the meantime; GenImmix lands on the self-hosted one. The four steps
+after GenImmix are their own ordered run-up, below.
 
 ## Later under self-hosting — the scheduler + bootstrap floor
 
@@ -76,10 +77,43 @@ GenImmix lands on the self-hosted one.
   GenImmix** (the interleave above). The GC ladder runs hosted alongside the existing runtime through
   Immix; the bootstrap floor pairs with self-hosting the scheduler.
   [104 fiber stacks](tasks/104-fiber-stack-strategy.md) rides that later work.
-- **MMTk retires after self-hosted GenImmix.** With GenImmix reclaiming + moving generationally in Nomu
-  and matching the MMTk GenImmix oracle, the MMTk/Rust collector is removed as the production path (kept as
-  a test oracle is a separate open question, `selfhosted-gc.md` §7). LXR (127) then proceeds inside the
-  self-hosted runtime.
+- **MMTk retires after a four-step run-up, not immediately after GenImmix.** GenImmix reclaiming + moving
+  generationally in Nomu and matching the oracle is the entry to the run-up, below — MMTk stays live as the
+  benchmarking baseline until step 3.
+
+## After GenImmix — the ordered run-up to MMTk removal
+
+Once self-hosted GenImmix lands and matches the MMTk GenImmix oracle, four steps run in order before MMTk
+is removed. This ordering moves modules **earlier** than the previous plan implied — the language's bet is
+proven programmer surfaces over unproven memory internals, and modules are the surface the stdlib and the
+compile pipeline both now want.
+
+1. **Test harness ([155](tasks/155-integration-suite-harness.md)) first.** The integration suite is 60+
+   hand-rolled `tools/*.sh` scripts driven by a copy-pasted loop, with per-run env duplicated by hand — the
+   source of silent-green hazards and the lever-interaction confusion the GenImmix bring-up hit repeatedly.
+   It is the primary feedback loop for every step below, so a single-entry, parallel, source-declared-env
+   harness pays for itself immediately across modules, benchmarking, and the removal pass.
+2. **Modules ([100](tasks/100-modules.md)) — needed sooner than later.** A proven programmer surface the
+   language leans on to make the unproven-runtime bet approachable. It also unblocks demand-driven prelude
+   emission (the ~1.7s/compile prelude re-emit the harness measures, [136](tasks/136-incremental-compilation.md))
+   and the real, extensible `Array`/`String` stdlib types ([120](tasks/120-stdlib-core.md)/[121](tasks/121-string-utf8-model.md)).
+3. **GC benchmarking.** Benchmark self-hosted GenImmix against MMTk GenImmix — mutator throughput, GC pause
+   distribution, peak footprint — while **both plans are live** (`selfhosted-gc.md` §7); retiring MMTk first
+   removes the baseline. This is also where **GC packaging ([158](tasks/158-gc-packaging.md))** lands — the
+   trigger mechanism formalized carefully, so it hosts several memory models without biasing any of them.
+   What is **shared** is the trigger→request protocol
+   (a typed request carrying the collection kind and whether it needs a stop-the-world or a concurrent
+   assist, plus the safepoint/park contract) and one invariant: the active plan's coordinator services every
+   trigger that plan can raise (the GenImmix bring-up deadlocked when a trigger posted to a coordinator that
+   was not running). What is **per-plan** is the coordinator itself: GenImmix, non-generational Immix, and
+   simple mark-sweep are stop-the-world tracing collectors and can share an STW coordinator, while LXR is
+   mostly-concurrent and brings its own — so the mechanism never forces a concurrent collector into an STW
+   pause shape. Each plan is then benchmarked on its native coordinator, which is the apples-to-apples
+   comparison the language's memory-model experiment needs. The throughput/pause/footprint numbers come from
+   **GC observability ([159](tasks/159-gc-observability.md))**, built alongside — structured per-collection
+   stats, phase tracing, and pause timing (the durable form of the debug scaffold the GenImmix bring-up needed).
+4. **MMTk removal**, then [127 LXR](tasks/127-lxr-collector.md) proceeds inside the self-hosted runtime
+   (keeping MMTk as a test-only oracle is a separate open question, `selfhosted-gc.md` §7).
 
 ## In parallel — frontend + stdlib, independent of the runtime work
 
