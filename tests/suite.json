@@ -1,0 +1,221 @@
+{
+  "computed_order": ["stw-collect", "gc-anybox", "gen-minor", "gc-stress-evac", "gc-stress", "gc-string", "gc-pressure", "scheduler-mc", "gc-concurrent", "scheduler-timer", "scheduler-poller", "gen-major", "immix-sweep", "immix-evac", "pingpong", "futex-subset", "scheduler-lock-evac", "scalar-carried", "fiberswitch", "immix-region", "escape-nonleaf-evac", "immix-defrag", "arr-gc-evac", "gen-nursery", "scheduler-tls", "immix-los", "typed-ptr-evac", "fiber-registry-evac", "scheduler-actor", "atomics-evac", "gen-los", "immix-forward", "raw-struct-evac", "raw-mem", "gen-barrier", "immix-alloc-self", "immix-region-evac", "sysclock-evac", "gc-gen-self", "subset-ok", "scheduler-lock", "typed-ptr", "scheduler-evac", "rt-prelude-evac", "bump-alloc", "immix-line-mark", "scalar-carried-evac", "futex", "asmswitch-evac", "selfhost-alloc-self", "immix-los-self", "gc-gen", "escape-nonleaf", "raw-struct", "fiberswitch-evac", "rt-prelude", "arr-gc", "atomics", "bump-alloc-evac", "immix-alloc", "sysclock", "raw-mem-evac", "scheduler", "asmswitch", "fiber-registry", "selfhost-alloc", "sysclock-subset", "subset-bad"],
+  "defaults": { "timeout_sec": 60, "compile_timeout_sec": 120, "iterations": 1, "carriers": [1], "heavy": false },
+  "cases": [
+
+    { "name": "gc-anybox", "fixture": "examples/gc_anybox.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_RUNTIME": "selfhost", "NOMU_GC_DEBUG_PRESSURE": "1" },
+      "expect": { "stdout": "10432\n" }, "iterations": 6,
+      "stderr_match": [ { "pattern": "nomu-gc-sync: collection", "min": 1 } ] },
+
+    { "name": "gc-string", "fixture": "examples/gc_string.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_RUNTIME": "selfhost", "NOMU_GC_DEBUG_PRESSURE": "1" },
+      "expect": { "stdout_file": "tests/expected/gc_string.txt" },
+      "carriers": [1, 2, 4], "iterations": 4, "weight": 4,
+      "stderr_match": [ { "pattern": "nomu-gc-sync: collection", "min": 1 } ] },
+
+    { "name": "gen-minor", "fixture": "examples/gen_minor.nomu",
+      "run_env": { "NOMU_RUNTIME": "selfhost", "NOMU_GC_PLAN": "nomu", "NOMU_SCHED": "nomu", "NOMU_NURSERY_RESERVE": "8" },
+      "expect": { "stdout": "42\n4242\n94950\n" }, "iterations": 5 },
+
+    { "name": "gen-major", "fixture": "examples/gen_major.nomu",
+      "run_env": { "NOMU_RUNTIME": "selfhost", "NOMU_GC_PLAN": "nomu", "NOMU_SCHED": "nomu",
+                   "NOMU_NURSERY_RESERVE": "8", "NOMU_MATURE_FLOOR": "8176", "NOMU_GC_DEBUG_PRESSURE": "1" },
+      "expect": { "stdout": "77\n4242\n94950\n" }, "iterations": 5,
+      "stderr_match": [ { "pattern": "(minor)", "min": 10 }, { "pattern": "(major)", "min": 2 } ] },
+
+    { "name": "gc-pressure", "fixture": "examples/gc_pressure.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_SCHED": "nomu", "NOMU_GC_PLAN": "nomu", "NOMU_GC_PRESSURE": "1",
+                   "NOMU_GC_TRIGGER_RESERVE": "4096", "NOMU_GC_DEBUG_PRESSURE": "1" },
+      "expect": { "stdout": "94950\n" }, "carriers": [1, 2, 4], "iterations": 8, "weight": 4,
+      "stderr_match": [ { "pattern": "nomu-gc-pressure: collection", "min": 2 } ] },
+
+    { "name": "gc-concurrent", "fixture": "examples/gc_concurrent.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_RUNTIME": "selfhost", "NOMU_GC_PRESSURE": "1",
+                   "NOMU_GC_TRIGGER_RESERVE": "6144", "NOMU_GC_DEBUG_PRESSURE": "1" },
+      "expect": { "stdout": "392320\n" }, "carriers": [1, 2, 4, 8], "iterations": 4, "weight": 8,
+      "stderr_match": [ { "pattern": "nomu-gc-pressure: collection", "min": 2 } ] },
+
+    { "name": "gen-los", "fixture": "examples/gc_los_gen.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_RUNTIME": "selfhost", "NOMU_GC_PLAN": "nomu", "NOMU_SCHED": "nomu", "NOMU_NURSERY_RESERVE": "32" },
+      "expect": { "stdout": "777\n" }, "carriers": [1], "iterations": 5 },
+
+    { "name": "stw-collect", "fixture": "examples/stw_collect.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_SCHED": "nomu", "NOMU_GC_PLAN": "nomu", "NOMU_STW_COLLECT": "1" },
+      "expect": { "stdout": "111\n" }, "carriers": [1, 2, 4], "iterations": 15, "weight": 4,
+      "stderr_match": [ { "pattern": "nomu-stw-collect: round 0 fixed", "min": 1 } ] },
+
+    { "name": "arr-gc", "fixture": "examples/arr_gc.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "200\n19900\n" }, "carriers": [] },
+    { "name": "arr-gc-evac", "fixture": "examples/arr_gc.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "200\n19900\n" }, "carriers": [] },
+
+    { "name": "atomics", "fixture": "examples/atomics.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" },
+      "expect": { "stdout": "100\n100\n105\n105\n200\n200\n200\n200\n55\n" }, "carriers": [] },
+    { "name": "atomics-evac", "fixture": "examples/atomics.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" },
+      "expect": { "stdout": "100\n100\n105\n105\n200\n200\n200\n200\n55\n" }, "carriers": [] },
+
+    { "name": "bump-alloc", "fixture": "examples/bump_alloc.nomu",
+      "compile_args": ["--runtime-subset=bumpNew,bumpAlloc"],
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "42\n99\n1\n1\n" }, "carriers": [] },
+    { "name": "bump-alloc-evac", "fixture": "examples/bump_alloc.nomu",
+      "compile_args": ["--runtime-subset=bumpNew,bumpAlloc"],
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "42\n99\n1\n1\n" }, "carriers": [] },
+
+    { "name": "escape-nonleaf", "fixture": "examples/escape_nonleaf.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "12345\n7\n4999950000\n" }, "carriers": [] },
+    { "name": "escape-nonleaf-evac", "fixture": "examples/escape_nonleaf.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "12345\n7\n4999950000\n" }, "carriers": [] },
+
+    { "name": "fiber-registry", "fixture": "examples/fiber_registry.nomu",
+      "compile_args": ["--runtime-subset=regInsert,regRemove,regCount,regSum"],
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "5 15\n4 12\n3 7\n2 6\n" }, "carriers": [] },
+    { "name": "fiber-registry-evac", "fixture": "examples/fiber_registry.nomu",
+      "compile_args": ["--runtime-subset=regInsert,regRemove,regCount,regSum"],
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "5 15\n4 12\n3 7\n2 6\n" }, "carriers": [] },
+
+    { "name": "fiberswitch", "fixture": "examples/fiberswitch.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "42\n" }, "carriers": [] },
+    { "name": "fiberswitch-evac", "fixture": "examples/fiberswitch.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "42\n" }, "carriers": [] },
+
+    { "name": "asmswitch", "fixture": "examples/asmswitch.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "1\n" }, "carriers": [] },
+    { "name": "asmswitch-evac", "fixture": "examples/asmswitch.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "1\n" }, "carriers": [] },
+
+    { "name": "gc-stress", "fixture": "examples/gc_stress.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "42\n7\n42\n499500\n" }, "carriers": [] },
+    { "name": "gc-stress-evac", "fixture": "examples/gc_stress.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "1024" }, "expect": { "stdout": "42\n7\n42\n499500\n" }, "carriers": [] },
+
+    { "name": "immix-region", "fixture": "examples/immix_region.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "1\n1\n2\n261\n5\n2\n1\n0\n1\n0\n0\n1\n" }, "carriers": [] },
+    { "name": "immix-region-evac", "fixture": "examples/immix_region.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "1\n1\n2\n261\n5\n2\n1\n0\n1\n0\n0\n1\n" }, "carriers": [] },
+
+    { "name": "raw-mem", "fixture": "examples/raw_mem.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "42\n7\n99\n255\n" }, "carriers": [] },
+    { "name": "raw-mem-evac", "fixture": "examples/raw_mem.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "42\n7\n99\n255\n" }, "carriers": [] },
+
+    { "name": "raw-struct", "fixture": "examples/raw_struct.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "123\n456\n123\n1\n0\n1\n0\n" }, "carriers": [] },
+    { "name": "raw-struct-evac", "fixture": "examples/raw_struct.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "123\n456\n123\n1\n0\n1\n0\n" }, "carriers": [] },
+
+    { "name": "rt-prelude", "fixture": "examples/rt_prelude.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "7\n11\n1\n" }, "carriers": [] },
+    { "name": "rt-prelude-evac", "fixture": "examples/rt_prelude.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "7\n11\n1\n" }, "carriers": [] },
+
+    { "name": "scalar-carried", "fixture": "examples/scalar_carried_nonleaf.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "12345\n50\n99950000\n" }, "carriers": [] },
+    { "name": "scalar-carried-evac", "fixture": "examples/scalar_carried_nonleaf.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "12345\n50\n99950000\n" }, "carriers": [] },
+
+    { "name": "typed-ptr", "fixture": "examples/typed_ptr.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "10\n20\n30\n30\n7\n" }, "carriers": [] },
+    { "name": "typed-ptr-evac", "fixture": "examples/typed_ptr.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "10\n20\n30\n30\n7\n" }, "carriers": [] },
+
+    { "name": "sysclock", "fixture": "examples/sysclock.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "1\n1\n" }, "carriers": [] },
+    { "name": "sysclock-evac", "fixture": "examples/sysclock.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "1\n1\n" }, "carriers": [] },
+    { "name": "sysclock-subset", "fixture": "examples/sysclock.nomu", "compile_args": ["--runtime-subset=elapsed"],
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "1\n1\n" }, "carriers": [] },
+
+    { "name": "immix-alloc", "fixture": "examples/immix_alloc.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "12497500\n42\n7\n" }, "carriers": [] },
+    { "name": "immix-alloc-self", "fixture": "examples/immix_alloc.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "12497500\n42\n7\n" }, "carriers": [] },
+
+    { "name": "immix-los", "fixture": "examples/immix_los.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "5000\n12497500\n4999\n" }, "carriers": [] },
+    { "name": "immix-los-self", "fixture": "examples/immix_los.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "5000\n12497500\n4999\n" }, "carriers": [] },
+
+    { "name": "gc-gen", "fixture": "examples/gc_gen.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "42\n4242\n" }, "carriers": [] },
+    { "name": "gc-gen-self", "fixture": "examples/gc_gen.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_HEAP": "2000000" }, "expect": { "stdout": "42\n4242\n" }, "carriers": [] },
+
+    { "name": "selfhost-alloc", "fixture": "examples/selfhost_gc.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "42\n7\n100\n" }, "carriers": [] },
+    { "name": "selfhost-alloc-self", "fixture": "examples/selfhost_gc.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "42\n7\n100\n" }, "carriers": [] },
+
+    { "name": "immix-defrag", "fixture": "examples/immix_defrag.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "1\n1\n1000\n1\n1\n" }, "carriers": [], "iterations": 2 },
+    { "name": "immix-evac", "fixture": "examples/immix_evac.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "1\n1\n111\n1\n1\n" }, "carriers": [], "iterations": 2 },
+    { "name": "immix-forward", "fixture": "examples/immix_forward.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "12345\n1\n1\n0\n0\n" }, "carriers": [], "iterations": 2 },
+    { "name": "immix-line-mark", "fixture": "examples/immix_line_mark.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "TOTAL 52\nLINECHECK 0\nLINES>0 1\n" }, "carriers": [], "iterations": 2 },
+    { "name": "immix-sweep", "fixture": "examples/immix_sweep.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "1\n1\n111\n222\n2\n" }, "carriers": [], "iterations": 2 },
+
+    { "name": "gen-barrier", "fixture": "examples/gen_barrier.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "1\n1\n1\n3\n" }, "carriers": [], "iterations": 2 },
+    { "name": "gen-nursery", "fixture": "examples/gen_nursery.nomu", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "1\n1\n1\n199990000\n" }, "carriers": [], "iterations": 2 },
+
+    { "name": "scheduler", "fixture": "examples/scheduler.nomu",
+      "compile_args": ["--runtime-subset=enqueue,dequeue,schedRun,fiberMain,fiberSpawn,park,unpark,joinFiber"],
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "6\n111\n42\n" }, "carriers": [] },
+    { "name": "scheduler-evac", "fixture": "examples/scheduler.nomu",
+      "compile_args": ["--runtime-subset=enqueue,dequeue,schedRun,fiberMain,fiberSpawn,park,unpark,joinFiber"],
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "6\n111\n42\n" }, "carriers": [] },
+
+    { "name": "scheduler-lock", "fixture": "examples/scheduler_lock.nomu",
+      "compile_args": ["--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,schedRun,fiberMain,fiberNew,fiberSpawn,fiberSpawnParked,park,parkLocked,unpark,unparkLocked,joinFiber"],
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "6\n111\n42\n2000\n" }, "carriers": [] },
+    { "name": "scheduler-lock-evac", "fixture": "examples/scheduler_lock.nomu",
+      "compile_args": ["--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,schedRun,fiberMain,fiberNew,fiberSpawn,fiberSpawnParked,park,parkLocked,unpark,unparkLocked,joinFiber"],
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "6\n111\n42\n2000\n" }, "carriers": [] },
+
+    { "name": "scheduler-mc", "fixture": "examples/scheduler_mc.nomu",
+      "compile_args": ["--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,fiberNew,fiberSpawn,fiberMain,schedLoop,carrierMain"],
+      "expect": { "stdout": "600\n" }, "carriers": [], "iterations": 30, "weight": 3 },
+
+    { "name": "scheduler-poller", "fixture": "examples/scheduler_poller.nomu",
+      "compile_args": ["--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,signalStop,fiberNew,fiberSpawn,unpark,waitReadable,fiberMain,schedLoop,carrierMain,pollerMain"],
+      "expect": { "stdout": "36\n" }, "carriers": [], "iterations": 30, "weight": 3 },
+
+    { "name": "scheduler-timer", "fixture": "examples/scheduler_timer.nomu",
+      "compile_args": ["--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,wakeTimer,signalStop,heapSwap,timerPush,timerPopMin,fiberNew,fiberSpawn,unpark,fiberSleep,fiberMain,schedLoop,carrierMain,timerMain"],
+      "expect": { "stdout": "1\n2\n3\n4\n" }, "carriers": [], "iterations": 8, "weight": 3 },
+
+    { "name": "scheduler-tls", "fixture": "examples/scheduler_tls.nomu",
+      "compile_args": ["--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,fiberNew,handOff,unpark,fiberMain,schedLoop,carrierMain,ringBody"],
+      "expect": { "stdout": "2000\n" }, "carriers": [], "iterations": 40, "weight": 3 },
+
+    { "name": "scheduler-actor", "fixture": "examples/scheduler_actor.nomu",
+      "compile_args": ["--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,signalStop,schedMbPush,schedMbPop,mailboxFiberNew,mailboxDispatch,actorSend,mailboxPop,mailboxDrain,mailboxFiberMain,schedLoop,carrierMain"],
+      "expect": { "stdout": "400\n0\n" }, "carriers": [], "iterations": 40, "weight": 3 },
+
+    { "name": "futex", "fixture": "examples/futex.nomu",
+      "expect": { "stdout": "111\n" }, "carriers": [] },
+    { "name": "futex-subset", "fixture": "examples/futex.nomu", "compile_args": ["--runtime-subset=futexProbe"],
+      "expect": { "stdout": "111\n" }, "carriers": [] },
+
+    { "name": "pingpong", "fixture": "examples/pingpong.nomu", "compile_args": ["--runtime-subset=worker"],
+      "expect": { "stdout": "111\n" }, "carriers": [], "iterations": 10, "weight": 2 },
+
+    { "name": "subset-ok", "fixture": "examples/subset_ok.nomu", "compile_args": ["--runtime-subset=carve,advance"],
+      "expect": { "stdout": "42\n" }, "carriers": [] },
+    { "name": "subset-bad", "fixture": "examples/subset_bad.nomu", "compile_args": ["--runtime-subset=bad"],
+      "compile": { "expect_error": "may not allocate a 'Box'" } }
+
+  ]
+}

@@ -1,18 +1,17 @@
 #!/bin/zsh
-# One-off (150.4.5.3): run the GC/generational driver scripts in parallel to verify generational-on-by-default.
-# Each dedicated script carries the correct env + oracle for its fixture. The block-on-OOM scripts (gc-anybox,
-# gc-string, gc-pressure, gc-gen, gc-stress, ...) run selfhost with NO reserve knob, so they now exercise the
-# default-on generational path — the "did it only pass because it was major-only?" cases. The gen-* scripts
-# force a small reserve (the positive override path). Runs P-wide via xargs; per-script timeout catches hangs.
+# Generational-on-by-default check. The bulk of the GC/gen drivers now live in the integration
+# manifest (tests/suite.json) and run via compiler-test; this script runs that suite, then the
+# few GC tail scripts not yet ported (root-set / contrast / sorted-count cases). Per-script
+# timeout catches hangs.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 OUT=/tmp/gen-default-suite
 
+# Tail scripts still living in tools/ (see tools/README.md for why each is unported).
 SCRIPTS=(
-  gc-anybox gc-string gc-pressure gc-gen gc-stress gc-concurrent
   gc-actor gc-actor-teardown gc-smoke gc-smoke-stw gc-smoke-parked gc-smoke-tier gc-t6-stw gc-oom
-  gen-minor gen-nursery gen-barrier gen-major gen-los gen-multicarrier
+  gen-multicarrier
 )
 CAP=240   # per-script hard timeout (s); a generational trigger loop would otherwise hang forever
 
@@ -33,11 +32,15 @@ run_one() {
 # Child worker invocation — must NOT touch the shared $OUT dir (only the parent resets it, below).
 if [[ "${1:-}" == "--one" ]]; then CAP=$2; run_one "$3"; exit 0; fi
 
-# Parent: reset the log dir once, then fan out.
+# Parent: the manifest suite first, then the tail scripts fanned out.
 rm -rf "$OUT"; mkdir -p "$OUT"
 export ROOT OUT
+echo "=== manifest suite (compiler-test) ==="
+bazel-bin/src/compiler-test/compiler-test tests/suite.json --enable 'gc-*,gen-*,immix-*,stw-*,selfhost-*'
+mrc=$?
+echo "=== tail scripts ==="
 printf '%s\n' "${SCRIPTS[@]}" | xargs -P 6 -I{} zsh "$0" --one "$CAP" {} | sort | tee "$OUT/summary.txt"
 echo "==="
 bad=$(grep -cE '^(FAIL|HANG)' "$OUT/summary.txt")
-echo "failures=$bad  (logs in $OUT)"
-exit $bad
+echo "manifest rc=$mrc  tail failures=$bad  (logs in $OUT)"
+exit $(( bad + (mrc != 0) ))

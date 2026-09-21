@@ -1,0 +1,11 @@
+load("@rules_swift//swift:swift.bzl", "swift_binary")
+
+# compiler-test — the integration-suite harness (task 155). A zero-dependency Swift tool: standard
+# library + Foundation (JSON, Process env, DispatchQueue) + Darwin (posix_spawn for the
+# process-group-isolated, timeout-bounded runs). One command compiles and runs whole-program
+# fixtures from a JSON manifest. Design: design/plans/tasks/155-integration-suite-harness.md.
+swift_binary(
+    name = "compiler-test",
+    srcs = glob(["sources/*.swift"]),
+    visibility = ["//visibility:public"],
+)
