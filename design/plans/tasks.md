@@ -106,7 +106,11 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 
 | # | Task | Avenue | Size | Status |
 | --- | --- | --- | --- | --- |
-| 100 | [Modules + multi-file compilation](tasks/100-modules.md) | Infra | XL | needs-design (► decide-early: model fork before M10) |
+| 100 | [Modules + multi-file compilation](tasks/100-modules.md) | Infra | XL | designed — contract in [`language/modules.md`](../language/modules.md); surface settled + compilation fork resolved (separate compilation, module = CU, witness baseline + flag-driven specialization dial, bespoke-binary `.nmi`/`.bir`, single-binary `compile`/`build`/`run`/`test`/`query`). Build on go-ahead; release threshold → 145 |
+| 160 | [Resource embedding (compile-time embed + explicit manifest include)](tasks/160-resource-embedding.md) | Usability | M | needs-design — split from 100; native-embed model, explicit manifest `include` lean |
+| 161 | [Test framework — case designation + runner](tasks/161-test-framework.md) | Usability | M | needs-design — module-level test identity settled in 100; `@test` case marking, runner, assertions open |
+| 162 | [Interface / IR serialization format — optimization](tasks/162-interface-serialization-opt.md) | Infra | M | needs-design — v1 bespoke binary decided in 100; zero-copy/mmap, interning, varint, lazy reads deferred here |
+| 163 | [Manifest format — JSON → YAML](tasks/163-manifest-yaml.md) | Usability | S | needs-design — JSON ships first (dependency-free in Swift); switch to a human-friendly YAML/StrictYAML/KDL later |
 | 136 | [Incremental compilation](tasks/136-incremental-compilation.md) | Infra | L | needs-design |
 | 137 | [Tooling — query server / LSP / formatter (M10)](tasks/137-tooling-lsp-formatter.md) | Usability | L | needs-design |
 | 138 | [Debugger (M11)](tasks/138-debugger.md) | Usability | L | needs-design |

@@ -19,7 +19,11 @@ cases streaming above; batch sorted output off a TTY). Weighted packing + LPT cu
 concern: `Ctx` (args/paths/manifest/selection), `CompileCache`, `CaseRunner`, `Suite` (pool + report),
 `Ordering`, `Progress`, `Spawn`. The tail (~28 scripts: precise root-set assertions,
 compiler-artifact inspection, perf/corpus matrices) stays in `tools/` by decision — a different testing layer or
-needs a richer assertion; see `tools/README.md`. Phase 2 (perf/CI output) pending. Key forks resolved:
+needs a richer assertion; see `tools/README.md`. **Parked here, waiting on GC observability ([159](159-gc-observability.md))** —
+that work unblocks the tail port (structured stats for the root-set assertions) and the configurable
+release/debug mode. Phase 2 deferred by decision: the perf-regression gate is not worth building while upcoming
+changes carry intentional (sometimes slower) perf shifts, and live-output level 3 is a nice-to-have we don't
+need. Key forks resolved:
 zero-dependency Swift runner, central JSON manifest, MVP-first phasing (see "Decisions" + "Plan"). ·
 **Source:** grounded during 150.4.2 — the suite is 64 hand-rolled `tools/*.sh`, run by a copy-pasted
 serial shell loop, with per-invocation env flags duplicated by hand.
@@ -109,7 +113,9 @@ and matrix runs exist ad hoc. This task folds them into one harness.
   debug-only diagnostics all interact with optimization. Enumerate those release/debug × observability
   interactions when 159 is designed, then wire the chosen knobs here (a case may need to pin a mode, or run
   under both). Until then: release preferred, `COMPILER_TEST_NOMUC` overrides.
-- **Perf output + gate.** Per-case compile+run timing, slowest-N lists, machine-readable results for CI, and
+- **Perf output + gate.** _(Deferred by decision — a regression gate fights the intentional, sometimes-slower
+  perf shifts in upcoming changes; revisit once the runtime stabilizes.)_ Per-case compile+run timing, slowest-N
+  lists, machine-readable results for CI, and
   a recorded baseline that warns (or fails) on regression. Ties to the prelude-re-emit floor
   ([136](136-incremental-compilation.md)) — where a demand-driven-emission win would show up. Deferred; the
   MVP has no `--json` (every run reads the manifest).
@@ -119,8 +125,8 @@ and matrix runs exist ad hoc. This task folds them into one harness.
   the batch sorted report drives output. Shows a compile phase then a run phase (Phase A builds all fixtures
   before any run). All writes go through one FileHandle under a lock so the status line and streamed lines
   never corrupt each other. State comes from the existing transitions: dispatch, `gate.acquire`, `runCase`
-  return. Remaining (level 3): a ~150 ms ticker showing per-case elapsed time (so a slow case like
-  `stw-collect` shows progress, not a frozen line), and the slowest-N summary — folds in with the perf work.
+  return. Remaining (level 3, _not needed now_): a ~150 ms ticker showing per-case elapsed time (so a slow case
+  like `stw-collect` shows progress, not a frozen line), and the slowest-N summary — folds in with the perf work.
 
 ## Plan — phased (MVP first)
 

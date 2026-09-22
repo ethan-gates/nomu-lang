@@ -14,6 +14,13 @@ Adjacent to [macros](140-macros.md) (both are compile-time facilities) and to co
 the const-generics fork in [SIMD](126-simd.md)). Whether `comptime` subsumes or complements those is an
 open design question.
 
+**Conditional compilation lands here (lean, from the modules design).** Platform/arch/build-mode
+gating is intended to be a use-case of `comptime` — platform facts are comptime values and ordinary
+`if` at comptime prunes branches (Zig model) — rather than a `#[cfg]`-style declaration-attribute
+surface or a Go-style filename convention. Both of those alternatives are rejected: attribute
+proliferation and filename-based gating are both disliked. Design the target/platform facts as
+comptime-visible values when this is built.
+
 ## Refs
 
 deferred.md "Post-M9 backlog" (`comptime`); [macros](140-macros.md), [SIMD](126-simd.md) (const generics).

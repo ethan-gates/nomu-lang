@@ -52,6 +52,11 @@ Surface decisions that belong to a subsystem live with that subsystem, so the sy
 - **Interfaces** (`interface`, `extension`, `any`, `&`) — `interfaces.md`. Keyword spellings there are tentative.
 - **Closures** (trailing-closure syntax, `$0`/`$1` shorthand, capture lists) — `concurrency.md` §6, surface **Decided (2026-07-16)**, Swift-shaped, frontend-adjustable without semantic impact.
 - **Concurrency keywords** — the "shareable" spelling and actor/spawn surface are open (`concurrency.md`).
+- **Modules, packages, visibility** — `../language/modules.md`. Visibility prefix modifiers
+  `private`/`internal`/`package`/`public` on declarations (`internal` = unmarked default); imports
+  `import foo`, `import foo/bar`, `import foo as baz`, `import pkg/…` (`pkg` = current package),
+  `public import` (re-export), `test import` (white-box test access); path separator `/`,
+  lowercase-identifier path components. — **Decided.**
 - **Operators** — the shipped set and its precedence:
   - Arithmetic `+ - * / %`, comparison `== != < > <= >=`, bitwise `& | ^`, shift `<< >>`, prefix `- ! ~`.
   - Precedence, loosest to tightest: comparison < `|` < `^` < `&` < shift < additive < multiplicative < prefix < postfix. Bitwise and shift bind **tighter** than comparison (Go-style), so `x & mask == 0` reads as `(x & mask) == 0`.
