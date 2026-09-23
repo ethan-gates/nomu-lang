@@ -54,6 +54,15 @@ public enum TopDecl {
     case extensionDecl(ExtensionDecl)
 }
 
+// A declaration's reach across the module system (modules.md §visibility). `private` is
+// file-scoped (visible only in its own file); `internal` — the default — is module-scoped.
+// `package`/`public` arrive with the multi-module surface (task 100.2). Written as a contextual
+// prefix modifier, so the words stay usable as identifiers.
+public enum Visibility {
+    case `private`    // visible in its file only
+    case `internal`   // visible in its module (default)
+}
+
 // An interface (M5 A1; interfaces.md §1). Its body holds method requirements — a bare
 // signature is mandatory, a signature with a body is an overridable default — and
 // property requirements (`var x: T { get }` / `{ get set }`, accessor-shaped, never
@@ -63,10 +72,11 @@ public struct InterfaceDecl {
     public let refines: [Conformance]   // M5 A1.5: base interfaces (`interface B: A`)
     public let methods: [InterfaceMethod]
     public let properties: [InterfacePropertyReq]
+    public let visibility: Visibility
     public let span: Span
 
-    public init(name: String, refines: [Conformance], methods: [InterfaceMethod], properties: [InterfacePropertyReq], span: Span) {
-        self.name = name; self.refines = refines; self.methods = methods; self.properties = properties; self.span = span
+    public init(name: String, refines: [Conformance], methods: [InterfaceMethod], properties: [InterfacePropertyReq], visibility: Visibility = .internal, span: Span) {
+        self.name = name; self.refines = refines; self.methods = methods; self.properties = properties; self.visibility = visibility; self.span = span
     }
 }
 
@@ -142,10 +152,11 @@ public struct StructDecl {
     public let properties: [ComputedProperty]   // M5 A1: computed properties (get / get-set)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
     public let conformances: [Conformance]   // M5 A1.3: interfaces this type conforms to
+    public let visibility: Visibility
     public let span: Span
 
-    public init(name: String, generics: [GenericParam], fields: [VarField], properties: [ComputedProperty], methods: [FuncDecl], conformances: [Conformance], span: Span) {
-        self.name = name; self.generics = generics; self.fields = fields; self.properties = properties; self.methods = methods; self.conformances = conformances; self.span = span
+    public init(name: String, generics: [GenericParam], fields: [VarField], properties: [ComputedProperty], methods: [FuncDecl], conformances: [Conformance], visibility: Visibility = .internal, span: Span) {
+        self.name = name; self.generics = generics; self.fields = fields; self.properties = properties; self.methods = methods; self.conformances = conformances; self.visibility = visibility; self.span = span
     }
 }
 
@@ -192,10 +203,11 @@ public struct EnumDecl {
     public let properties: [ComputedProperty]   // M5 A1: computed properties (enums store nothing)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
     public let conformances: [Conformance]   // M5 A1.3: interfaces this type conforms to
+    public let visibility: Visibility
     public let span: Span
 
-    public init(name: String, generics: [GenericParam], cases: [EnumCaseDecl], properties: [ComputedProperty], methods: [FuncDecl], conformances: [Conformance], span: Span) {
-        self.name = name; self.generics = generics; self.cases = cases; self.properties = properties; self.methods = methods; self.conformances = conformances; self.span = span
+    public init(name: String, generics: [GenericParam], cases: [EnumCaseDecl], properties: [ComputedProperty], methods: [FuncDecl], conformances: [Conformance], visibility: Visibility = .internal, span: Span) {
+        self.name = name; self.generics = generics; self.cases = cases; self.properties = properties; self.methods = methods; self.conformances = conformances; self.visibility = visibility; self.span = span
     }
 }
 
@@ -216,10 +228,11 @@ public struct ClassDecl {
     public let properties: [ComputedProperty]   // M5 A1: computed properties (get / get-set)
     public let methods: [FuncDecl]   // T3: read-only instance methods (`fun` members)
     public let conformances: [Conformance]   // M5 A1.3: interfaces this type conforms to
+    public let visibility: Visibility
     public let span: Span
 
-    public init(name: String, generics: [GenericParam], fields: [VarField], properties: [ComputedProperty], methods: [FuncDecl], conformances: [Conformance], span: Span) {
-        self.name = name; self.generics = generics; self.fields = fields; self.properties = properties; self.methods = methods; self.conformances = conformances; self.span = span
+    public init(name: String, generics: [GenericParam], fields: [VarField], properties: [ComputedProperty], methods: [FuncDecl], conformances: [Conformance], visibility: Visibility = .internal, span: Span) {
+        self.name = name; self.generics = generics; self.fields = fields; self.properties = properties; self.methods = methods; self.conformances = conformances; self.visibility = visibility; self.span = span
     }
 }
 
@@ -228,10 +241,11 @@ public struct ActorDecl {
     public let fields: [ActorField]
     public let handlers: [OnHandler]
     public let conformances: [Conformance]   // M5 A1.3: parsed, but actor conformance is rejected (parked)
+    public let visibility: Visibility
     public let span: Span
 
-    public init(name: String, fields: [ActorField], handlers: [OnHandler], conformances: [Conformance], span: Span) {
-        self.name = name; self.fields = fields; self.handlers = handlers; self.conformances = conformances; self.span = span
+    public init(name: String, fields: [ActorField], handlers: [OnHandler], conformances: [Conformance], visibility: Visibility = .internal, span: Span) {
+        self.name = name; self.fields = fields; self.handlers = handlers; self.conformances = conformances; self.visibility = visibility; self.span = span
     }
 }
 
@@ -265,10 +279,11 @@ public struct FuncDecl {
     public let returnType: TypeRef?
     public let body: Block
     public let isStatic: Bool             // `static fun` — a type-associated function, no `self` receiver
+    public let visibility: Visibility
     public let span: Span
 
-    public init(name: String, generics: [GenericParam], params: [Param], returnType: TypeRef?, body: Block, isStatic: Bool = false, span: Span) {
-        self.name = name; self.generics = generics; self.params = params; self.returnType = returnType; self.body = body; self.isStatic = isStatic; self.span = span
+    public init(name: String, generics: [GenericParam], params: [Param], returnType: TypeRef?, body: Block, isStatic: Bool = false, visibility: Visibility = .internal, span: Span) {
+        self.name = name; self.generics = generics; self.params = params; self.returnType = returnType; self.body = body; self.isStatic = isStatic; self.visibility = visibility; self.span = span
     }
 }
 

@@ -375,6 +375,7 @@ enum NOIRGen {
                 return checkExpr(&s, .member(.ident("self", span: span), name, span: span))
             }
             if let sig = s.funcs[name] {
+                s.checkVisible(name, sig.visibility, declaredIn: sig.declFile, at: span)
                 return NOIRExpr(type: .function(params: sig.params, ret: sig.ret), span: span, kind: .varRef(name))
             }
             s.diags.error("undefined name '\(name)'", at: span)
@@ -390,6 +391,7 @@ enum NOIRGen {
             // Qualified no-payload enum construction: `EnumType.case` / `EnumType<Args>.case`.
             // (A payload case used bare falls through buildEnumInit as a wrong-arity error.)
             if let (typeName, explicit) = s.typeNameAndArgs(base), s.lookup(typeName) == nil, s.enums[typeName] != nil {
+                if let (vis, file) = s.typeVisibility(typeName) { s.checkVisible(typeName, vis, declaredIn: file, at: span) }
                 return EnumConstruction.buildEnumInit(&s, typeName, field, [], explicit: explicit, expected: expected, at: span)
             }
             // Pointer static properties (task 125): `RawPtr.null`, `Ptr<T>.null`.
@@ -837,12 +839,14 @@ enum NOIRGen {
             }
             // Construction of a generic type — infer the type arguments from the fields (M5 5.2.3).
             if s.genericArity(name) != nil {
+                if let (vis, file) = s.typeVisibility(name) { s.checkVisible(name, vis, declaredIn: file, at: span) }
                 return GenericInference.checkGenericConstruct(&s, name, args, at: span)
             }
             // Construction: TypeName(...) for struct/class/actor. Thread each field's declared type
             // in as the expected type of its argument (matched by label, else by position), so a
             // literal adopts a `UInt8`/`Double` field and a real mismatch is a clean diagnostic.
             if let k = s.kindOf(name), k != .enum_ {
+                if let (vis, file) = s.typeVisibility(name) { s.checkVisible(name, vis, declaredIn: file, at: span) }
                 let fields = s.constructorFields(name)
                 let irArgs = args.enumerated().map { (i, a) -> NOIRArg in
                     let exp: Type? = fields.flatMap { fs in
@@ -858,6 +862,7 @@ enum NOIRGen {
             }
             // Named function / non-print builtin.
             if let sig = s.funcs[name] {
+                s.checkVisible(name, sig.visibility, declaredIn: sig.declFile, at: span)
                 if !sig.generics.isEmpty {
                     let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr(&s, $0.value)) }
                     return GenericInference.checkGenericCall(&s, name, sig, irArgs, at: span, expected: expected)

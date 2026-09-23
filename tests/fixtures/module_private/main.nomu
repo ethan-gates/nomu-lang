@@ -1,0 +1,5 @@
+// Negative: `secret` is `private` to secret.nomu, so this cross-file call is a visibility error.
+
+fun main() {
+    print(secret())
+}

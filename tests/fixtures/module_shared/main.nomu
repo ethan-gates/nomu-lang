@@ -1,0 +1,10 @@
+// One module, three files, one shared namespace: `main` calls `area` (geometry.nomu) and
+// `doubled` (util.nomu) with no import.
+
+fun main() {
+    let p = Point(x: 3, y: 4)
+    print(area(p))         // 12  — type + fun from geometry.nomu
+    print("\n")
+    print(doubled(21))     // 42  — fun from util.nomu
+    print("\n")
+}

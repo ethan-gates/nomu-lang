@@ -30,7 +30,7 @@ final class CompileCache {
                 let stem = ctx.fixtureStem(job.fixture)
                 progress.start(stem)
                 let r = runProcess(path: ctx.nomuc,
-                                   args: job.compileArgs + [ctx.fixturePath(job.fixture)],
+                                   args: job.compileArgs + ctx.compileInputs(job.fixture),
                                    env: job.compileEnv, timeout: job.compileTimeout)
                 let res = CompileResult(ok: r.succeeded, timedOut: r.timedOut, stderr: r.stderr, duration: r.duration)
                 self.lock.lock(); self.results[job.compileKey] = res; self.lock.unlock()

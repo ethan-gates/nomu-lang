@@ -1,0 +1,5 @@
+// `doubled` is module-visible; `twice` is `private`, reachable only inside this file.
+
+fun doubled(n: Int) -> Int { return twice(n) }
+
+private fun twice(n: Int) -> Int { return n + n }

@@ -1,0 +1,8 @@
+// Module-visible type and function (the `internal` default — no modifier needed).
+
+struct Point {
+    var x: Int
+    var y: Int
+}
+
+fun area(p: Point) -> Int { return p.x * p.y }

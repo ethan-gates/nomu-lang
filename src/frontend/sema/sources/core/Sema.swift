@@ -71,7 +71,14 @@ public struct Sema {
     struct CallSite { let callee: String; let receiverMutable: Bool; let span: Span }
     var methodCallSites: [CallSite] = []
 
-    struct FnSig { let params: [Type]; let ret: Type; var generics: [GenericParam] = [] }
+    // `visibility`/`declFile` carry the module-visibility facts (task 100.1.2): a `private`
+    // function is reachable only from the file that declares it. Prelude and builtin entries keep
+    // the `.internal` default, so a cross-file check never fires on them.
+    struct FnSig {
+        let params: [Type]; let ret: Type; var generics: [GenericParam] = []
+        var visibility: Visibility = .internal
+        var declFile: String = ""
+    }
 
     // M5 5.2.2: the bounds of each generic type parameter in scope (`T` → its interfaces),
     // so a requirement call on a `.typeParam` receiver dispatches through the right witness.
@@ -125,6 +132,9 @@ public struct Sema {
     // MARK: - Global collection
 
     private mutating func collectGlobals() {
+        // Phase 1 — register every type name. A module is one namespace with no declaration
+        // order (task 100.1): a function signature may name a type declared later, or in another
+        // file, so all type names must be known before any signature is resolved.
         for decl in program.decls {
             switch decl {
             case .structDecl(let s): structs[s.name] = s
@@ -132,15 +142,19 @@ public struct Sema {
             case .classDecl(let c):  classes[c.name] = c
             case .actorDecl(let a):  actors[a.name]  = a
             case .interfaceDecl(let i): interfaces[i.name] = i; interfaceBases[i.name] = i.refines
-            case .funcDecl(let f):
-                let saved = genericScope; genericScope = Set(f.generics.map(\.name))
-                funcs[f.name] = FnSig(params: f.params.map { resolve($0.type) },
-                                      ret: resolve(f.returnType, opaqueOwner: "fn:\(f.name)"),
-                                      generics: f.generics)
-                genericScope = saved
-            case .extensionDecl:
-                break   // merged into its target before Sema (M4.12)
+            case .funcDecl, .extensionDecl:
+                break   // functions in phase 2 below; extensions merged before Sema (M4.12)
             }
+        }
+        // Phase 2 — resolve function signatures against the now-complete type table.
+        for decl in program.decls {
+            guard case .funcDecl(let f) = decl else { continue }
+            let saved = genericScope; genericScope = Set(f.generics.map(\.name))
+            funcs[f.name] = FnSig(params: f.params.map { resolve($0.type) },
+                                  ret: resolve(f.returnType, opaqueOwner: "fn:\(f.name)"),
+                                  generics: f.generics,
+                                  visibility: f.visibility, declFile: f.span.file)
+            genericScope = saved
         }
         // Computed-property tables need the type dicts above populated first (a property
         // type may name any user type), so register them in a second pass.
@@ -243,11 +257,33 @@ public struct Sema {
                     diags.error("interface type '\(ref.name)' must be written as 'any \(ref.name)' or 'some \(ref.name)'", at: ref.span)
                     return .error
                 }
+                if let (vis, file) = typeVisibility(ref.name) {
+                    checkVisible(ref.name, vis, declaredIn: file, at: ref.span)
+                }
                 return .named(ref.name, k)
             }
             diags.error("unknown type '\(ref.name)'", at: ref.span)
             return .error
         }
+    }
+
+    // Task 100.1.2 — module visibility. A `private` symbol is reachable only from the file that
+    // declares it; a reference from any other file is an error. `internal` (the default) is
+    // module-wide, so it never trips here. (`package`/`public` tiers arrive with task 100.2.)
+    func checkVisible(_ name: String, _ visibility: Visibility, declaredIn declFile: String, at span: Span) {
+        if visibility == .private, declFile != span.file {
+            diags.error("'\(name)' is private to its file and is not visible here", at: span)
+        }
+    }
+
+    // The declared visibility and origin file of a user type, or nil for a builtin / unknown name.
+    func typeVisibility(_ name: String) -> (Visibility, String)? {
+        if let d = structs[name] { return (d.visibility, d.span.file) }
+        if let d = enums[name]   { return (d.visibility, d.span.file) }
+        if let d = classes[name] { return (d.visibility, d.span.file) }
+        if let d = actors[name]  { return (d.visibility, d.span.file) }
+        if let d = interfaces[name] { return (d.visibility, d.span.file) }
+        return nil
     }
 
     // The number of type parameters of a declared type, or nil if it isn't generic (M5 5.2.1).

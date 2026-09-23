@@ -34,6 +34,11 @@ public struct EmitOptions {
     // rules (no implicit GC alloc / heap construct / non-subset call). A compiler input standing in for
     // module membership until the module system (task 100) lands. Set by `--runtime-subset=a,b`.
     public var subsetFuncs: Set<String> = []
+    // `-o <path>` — the output binary path. Artifacts derive from it (`<path>.o`, `<path>.ll`, …); its
+    // parent directory is created. When nil, the path is derived from the primary source's location
+    // under `build/`. The driver builds the file list; a module's identity/output name is given, not
+    // inferred from a filename.
+    public var outputPath: String? = nil
 
     public init() {}
 }

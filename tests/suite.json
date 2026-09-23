@@ -1,5 +1,5 @@
 {
-  "computed_order": ["stw-collect", "gc-anybox", "gen-minor", "gc-stress-evac", "gc-stress", "gc-string", "gc-pressure", "scheduler-mc", "gc-concurrent", "scheduler-timer", "scheduler-poller", "gen-major", "immix-sweep", "immix-evac", "pingpong", "futex-subset", "scheduler-lock-evac", "scalar-carried", "fiberswitch", "immix-region", "escape-nonleaf-evac", "immix-defrag", "arr-gc-evac", "gen-nursery", "scheduler-tls", "immix-los", "typed-ptr-evac", "fiber-registry-evac", "scheduler-actor", "atomics-evac", "gen-los", "immix-forward", "raw-struct-evac", "raw-mem", "gen-barrier", "immix-alloc-self", "immix-region-evac", "sysclock-evac", "gc-gen-self", "subset-ok", "scheduler-lock", "typed-ptr", "scheduler-evac", "rt-prelude-evac", "bump-alloc", "immix-line-mark", "scalar-carried-evac", "futex", "asmswitch-evac", "selfhost-alloc-self", "immix-los-self", "gc-gen", "escape-nonleaf", "raw-struct", "fiberswitch-evac", "rt-prelude", "arr-gc", "atomics", "bump-alloc-evac", "immix-alloc", "sysclock", "raw-mem-evac", "scheduler", "asmswitch", "fiber-registry", "selfhost-alloc", "sysclock-subset", "subset-bad"],
+  "computed_order": ["stw-collect", "gc-anybox", "module-shared", "gc-stress-evac", "gc-stress", "gc-string", "gc-pressure", "scheduler-mc", "gc-concurrent", "scheduler-timer", "gen-minor", "scheduler-poller", "futex-subset", "gen-major", "immix-defrag", "scalar-carried-evac", "gen-los", "fiber-registry-evac", "immix-evac", "rt-prelude", "pingpong", "gc-gen", "arr-gc-evac", "sysclock-subset", "atomics-evac", "sysclock-evac", "immix-line-mark", "immix-sweep", "gen-barrier", "immix-forward", "gen-nursery", "scheduler-lock-evac", "immix-alloc", "subset-ok", "raw-struct", "immix-los", "scheduler-tls", "scheduler-actor", "fiberswitch", "immix-region-evac", "bump-alloc", "scheduler", "escape-nonleaf", "asmswitch", "raw-mem", "selfhost-alloc", "arr-gc", "escape-nonleaf-evac", "futex", "rt-prelude-evac", "typed-ptr-evac", "immix-los-self", "gc-gen-self", "raw-struct-evac", "scalar-carried", "bump-alloc-evac", "typed-ptr", "fiberswitch-evac", "scheduler-evac", "scheduler-lock", "asmswitch-evac", "raw-mem-evac", "selfhost-alloc-self", "immix-region", "fiber-registry", "atomics", "sysclock", "immix-alloc-self", "module-dup", "module-private", "subset-bad"],
   "defaults": { "timeout_sec": 60, "compile_timeout_sec": 120, "iterations": 1, "carriers": [1], "heavy": false },
   "cases": [
 
@@ -215,7 +215,14 @@
     { "name": "subset-ok", "fixture": "examples/subset_ok.nomu", "compile_args": ["--runtime-subset=carve,advance"],
       "expect": { "stdout": "42\n" }, "carriers": [] },
     { "name": "subset-bad", "fixture": "examples/subset_bad.nomu", "compile_args": ["--runtime-subset=bad"],
-      "compile": { "expect_error": "may not allocate a 'Box'" } }
+      "compile": { "expect_error": "may not allocate a 'Box'" } },
+
+    { "name": "module-shared", "fixture": "tests/fixtures/module_shared",
+      "expect": { "stdout": "12\n42\n" }, "carriers": [] },
+    { "name": "module-private", "fixture": "tests/fixtures/module_private",
+      "compile": { "expect_error": "is private to its file" } },
+    { "name": "module-dup", "fixture": "tests/fixtures/module_dup",
+      "compile": { "expect_error": "duplicate function 'label'" } }
 
   ]
 }

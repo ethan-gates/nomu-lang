@@ -10,49 +10,79 @@ import ssairgen
 import embedded
 import LLVMBridge
 
-public func compile(path: String, options: EmitOptions = EmitOptions()) {
-    guard let source = try? String(contentsOfFile: path, encoding: .utf8) else {
-        fputs("error: cannot read '\(path)'\n", stderr)
+public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
+    guard let primary = paths.first else {
+        fputs("error: no source files given\n", stderr)
         exit(1)
+    }
+
+    // A module is one or more files; read them all up front. The N=1 case is a single file,
+    // unchanged. Output location and timing header key off the first (primary) file.
+    var sources: [(path: String, text: String)] = []
+    for path in paths {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+            fputs("error: cannot read '\(path)'\n", stderr)
+            exit(1)
+        }
+        sources.append((path, text))
     }
 
     // Per-stage timing; reported to stderr on the way out (success or error).
     let timings = Timings()
-    timings.file = path
+    timings.file = paths.count == 1 ? primary : "\(paths.count) files"
     timings.optimize = options.optimize
-    timings.bytes = source.utf8.count
+    timings.bytes = sources.reduce(0) { $0 + $1.text.utf8.count }
     // The backend egress is the SSAIR tier (the sole path since M7.7 retired the NOIR tree-walk);
     // named in the timing header for context.
     timings.egress = "ssair"
 
     // Lexer and parser share one sink and collect errors rather than exiting on the first
-    // (the no-crash contract — frontend/README.md P0); the driver is the exit boundary.
+    // (the no-crash contract — frontend/README.md P0); the driver is the exit boundary. Each file
+    // is lexed and parsed on its own SourceMap (so spans stay file-accurate), then the modules'
+    // declarations merge into one program — the module's shared namespace.
     let parseDiags = DiagnosticSink()
-    let tokens = timings.measure("parse", "lex") { () -> [Token] in
-        var lexer = Lexer(source, file: path, diagnostics: parseDiags)
-        return lexer.tokenize()
+    var mergedDecls: [TopDecl] = []
+    var tokenCount = 0
+    for src in sources {
+        let tokens = timings.measure("parse", "lex") { () -> [Token] in
+            var lexer = Lexer(src.text, file: src.path, diagnostics: parseDiags)
+            return lexer.tokenize()
+        }
+        tokenCount += tokens.count
+        let parsed = timings.measure("parse", "parse") { () -> Program in
+            var parser = Parser(tokens, diagnostics: parseDiags)
+            return parser.parse()
+        }
+        mergedDecls += parsed.decls
     }
-    timings.tokens = tokens.count
+    timings.tokens = tokenCount
 
-    var program = timings.measure("parse", "parse") { () -> Program in
-        var parser = Parser(tokens, diagnostics: parseDiags)
-        return parser.parse()
-    }
+    var program = Program(decls: mergedDecls)
 
     // Resolve the output location up front — every artifact lands under
     // <project-root>/build/, mirroring the source's path relative to the root (the
     // nearest ancestor holding a `nomu.yaml` marker, else the source's own directory).
-    let input = URL(fileURLWithPath: path).standardizedFileURL
+    let input = URL(fileURLWithPath: primary).standardizedFileURL
     let root = projectRoot(for: input)
-    let outputDir = outputDirectory(for: input, root: root)
     let buildRoot = root.appendingPathComponent("build").path
+    // The artifact stem: `-o <path>` gives it explicitly (its parent is created); otherwise it mirrors
+    // the primary source's path under `build/`. All artifacts append an extension to the stem, and the
+    // binary is the stem itself.
+    let stem: String
+    let outputDir: String
+    if let out = options.outputPath {
+        stem = out
+        outputDir = URL(fileURLWithPath: out).deletingLastPathComponent().path
+    } else {
+        outputDir = outputDirectory(for: input, root: root)
+        stem = outputDir + "/" + input.deletingPathExtension().lastPathComponent
+    }
     do {
         try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
     } catch {
         fputs("error: failed to create output dir '\(outputDir)': \(error)\n", stderr)
         exit(1)
     }
-    let stem = outputDir + "/" + input.deletingPathExtension().lastPathComponent
 
     // AST stage. Emit flags write a build/ artifact and report its path (the "emit"
     // style, like --emit-c) — nothing goes to stdout. --emit-ast writes the raw user
@@ -68,6 +98,16 @@ public func compile(path: String, options: EmitOptions = EmitOptions()) {
     // later phases would report noise. Report the collected diagnostics and stop here.
     if parseDiags.hasErrors {
         fputs(parseDiags.render() + "\n", stderr)
+        timings.report()
+        exit(1)
+    }
+
+    // Duplicate-symbol detection across the module's files (task 100.1.3) — before the prelude is
+    // prepended, so it sees only the module's own declarations.
+    let dupDiags = DiagnosticSink()
+    timings.measure("noir", "duplicates") { checkDuplicates(program, into: dupDiags) }
+    if dupDiags.hasErrors {
+        fputs(dupDiags.render() + "\n", stderr)
         timings.report()
         exit(1)
     }

@@ -2,13 +2,21 @@ import Foundation
 import driver
 
 var options = EmitOptions()
-var file: String? = nil
+var files: [String] = []
+var expectingOutputPath = false
 
 for arg in CommandLine.arguments.dropFirst() {
+    if expectingOutputPath {
+        options.outputPath = arg
+        expectingOutputPath = false
+        continue
+    }
     switch arg {
     case "--help", "-h":
         print("""
-            usage: nomuc [options] <file.nomu>
+            usage: nomuc [options] <file.nomu> [more.nomu ...]
+
+            Multiple files compile as one module, sharing a namespace.
 
             Emit flags are additive — each writes an artifact under build/ and reports
             its path; the binary is still produced unless --stop halts the pipeline.
@@ -20,6 +28,7 @@ for arg in CommandLine.arguments.dropFirst() {
               --emit-llvm        also emit LLVM IR from the egress, pre-opt (<name>.ll)
               --stop=STAGE       halt after STAGE (ast | noir | ssair | llvm | binary); default binary
               -O, --release      optimize (LLVM -O2); default is a debug build
+              -o PATH            output binary path (artifacts derive from it); default under build/
               -h, --help         show this help
             """)
         exit(0)
@@ -28,6 +37,9 @@ for arg in CommandLine.arguments.dropFirst() {
     case "--emit-ssair":       options.ssair = true
     case "--emit-llvm":        options.llvm = true
     case "-O", "--release":    options.optimize = true
+    case "-o":                 expectingOutputPath = true
+    case let a where a.hasPrefix("-o="):
+        options.outputPath = String(a.dropFirst("-o=".count))
     case let a where a.hasPrefix("--runtime-subset="):
         let names = String(a.dropFirst("--runtime-subset=".count)).split(separator: ",").map(String.init)
         options.subsetFuncs.formUnion(names)
@@ -47,13 +59,18 @@ for arg in CommandLine.arguments.dropFirst() {
             fputs("error: unknown flag '\(arg)'\n", stderr)
             exit(1)
         }
-        file = arg
+        files.append(arg)
     }
 }
 
-guard let path = file else {
-    fputs("usage: nomuc [options] <file.nomu>\n", stderr)
+guard !expectingOutputPath else {
+    fputs("error: -o requires a path argument\n", stderr)
     exit(1)
 }
 
-compile(path: path, options: options)
+guard !files.isEmpty else {
+    fputs("usage: nomuc [options] <file.nomu> [more.nomu ...]\n", stderr)
+    exit(1)
+}
+
+compile(paths: files, options: options)

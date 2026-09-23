@@ -49,6 +49,25 @@ struct Ctx {
         ((fixture as NSString).lastPathComponent as NSString).deletingPathExtension
     }
 
+    // A fixture that is a directory is one module (1 dir == 1 module): the harness passes its `.nomu`
+    // files as the file list. A file fixture is a single-file module.
+    func isModuleDir(_ fixture: String) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: fixturePath(fixture), isDirectory: &isDir) && isDir.boolValue
+    }
+    // The module's source files, sorted for a deterministic command (and stable compile key).
+    func moduleSources(_ fixture: String) -> [String] {
+        let dir = fixturePath(fixture)
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        return entries.filter { $0.hasSuffix(".nomu") }.sorted().map { dir + "/" + $0 }
+    }
+    // The compiler input arguments for a fixture: a module directory expands to an explicit `-o <bin>`
+    // plus its source files; a single-file fixture is just its path.
+    func compileInputs(_ fixture: String) -> [String] {
+        isModuleDir(fixture) ? ["-o", binaryPath(fixture)] + moduleSources(fixture)
+                             : [fixturePath(fixture)]
+    }
+
     static func fromArgs() -> Ctx {
         let argv = Array(CommandLine.arguments.dropFirst())
         var configArg: String? = nil

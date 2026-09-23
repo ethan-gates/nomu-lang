@@ -31,19 +31,34 @@ public struct Parser {
     // Returns nil when the current token starts no declaration: the token is reported and
     // recovery skips to the next declaration boundary, so later decls still parse.
     private mutating func parseTopDecl() -> TopDecl? {
+        let vis = parseVisibility()
         switch currentKind {
-        case .kwStruct: return .structDecl(parseStructDecl())
-        case .kwEnum:   return .enumDecl(parseEnumDecl())
-        case .kwClass:  return .classDecl(parseClassDecl())
-        case .kwActor:  return .actorDecl(parseActorDecl())
-        case .kwInterface: return .interfaceDecl(parseInterfaceDecl())
-        case .kwExtension: return .extensionDecl(parseExtensionDecl())
-        case .kwFunc:   return .funcDecl(parseFuncDecl())
+        case .kwStruct: return .structDecl(parseStructDecl(vis ?? .internal))
+        case .kwEnum:   return .enumDecl(parseEnumDecl(vis ?? .internal))
+        case .kwClass:  return .classDecl(parseClassDecl(vis ?? .internal))
+        case .kwActor:  return .actorDecl(parseActorDecl(vis ?? .internal))
+        case .kwInterface: return .interfaceDecl(parseInterfaceDecl(vis ?? .internal))
+        case .kwExtension:
+            // An extension declares no new symbol — it adds members to an existing type — so a
+            // visibility modifier has nothing to bind to.
+            if vis != nil { error("visibility modifier is not allowed on an extension") }
+            return .extensionDecl(parseExtensionDecl())
+        case .kwFunc:   return .funcDecl(parseFuncDecl(vis ?? .internal))
         default:
             error("expected top-level declaration, got \(currentKind)")
             recover(to: Self.declStart)
             return nil
         }
+    }
+
+    // An optional `private` / `internal` prefix on a top-level declaration (modules.md §visibility).
+    // Contextual — recognized only when a declaration keyword follows — so the words remain usable
+    // as ordinary identifiers. Returns nil when no modifier is present.
+    private mutating func parseVisibility() -> Visibility? {
+        guard case .ident(let s) = currentKind, s == "private" || s == "internal",
+              Self.declStart.contains(peek()) else { return nil }
+        advance()
+        return s == "private" ? .private : .internal
     }
 
     // Tokens that begin a top-level declaration — the resync set for declaration recovery.
@@ -90,7 +105,7 @@ public struct Parser {
         return params
     }
 
-    private mutating func parseStructDecl() -> StructDecl {
+    private mutating func parseStructDecl(_ visibility: Visibility = .internal) -> StructDecl {
         let start = currentSpan
         expect(.kwStruct)
         let name = expectIdent()
@@ -122,10 +137,10 @@ public struct Parser {
         }
         expect(.rBrace)
         return StructDecl(name: name, generics: generics, fields: fields, properties: properties, methods: methods,
-                          conformances: conformances, span: spanFrom(start))
+                          conformances: conformances, visibility: visibility, span: spanFrom(start))
     }
 
-    private mutating func parseEnumDecl() -> EnumDecl {
+    private mutating func parseEnumDecl(_ visibility: Visibility = .internal) -> EnumDecl {
         let start = currentSpan
         expect(.kwEnum)
         let name = expectIdent()
@@ -161,7 +176,7 @@ public struct Parser {
         }
         expect(.rBrace)
         return EnumDecl(name: name, generics: generics, cases: cases, properties: properties, methods: methods,
-                        conformances: conformances, span: spanFrom(start))
+                        conformances: conformances, visibility: visibility, span: spanFrom(start))
     }
 
     private mutating func parseEnumCaseDecl() -> EnumCaseDecl {
@@ -182,7 +197,7 @@ public struct Parser {
         return EnumCaseDecl(name: name, fields: fields, span: spanFrom(start))
     }
 
-    private mutating func parseClassDecl() -> ClassDecl {
+    private mutating func parseClassDecl(_ visibility: Visibility = .internal) -> ClassDecl {
         let start = currentSpan
         expect(.kwClass)
         let name = expectIdent()
@@ -211,7 +226,7 @@ public struct Parser {
         }
         expect(.rBrace)
         return ClassDecl(name: name, generics: generics, fields: fields, properties: properties, methods: methods,
-                         conformances: conformances, span: spanFrom(start))
+                         conformances: conformances, visibility: visibility, span: spanFrom(start))
     }
 
     // A plain extension `extension T { … }` whose body holds only `fun` members.
@@ -261,7 +276,7 @@ public struct Parser {
     //     var name: String { get }         // read-only property requirement
     //     var count: Int { get set }       // settable property requirement
     // }
-    private mutating func parseInterfaceDecl() -> InterfaceDecl {
+    private mutating func parseInterfaceDecl(_ visibility: Visibility = .internal) -> InterfaceDecl {
         let start = currentSpan
         expect(.kwInterface)
         let name = expectIdent()
@@ -285,7 +300,7 @@ public struct Parser {
             if pos == before { advance() }   // stray boundary token (e.g. `case`/`on`): force progress
         }
         expect(.rBrace)
-        return InterfaceDecl(name: name, refines: refines, methods: methods, properties: properties, span: spanFrom(start))
+        return InterfaceDecl(name: name, refines: refines, methods: methods, properties: properties, visibility: visibility, span: spanFrom(start))
     }
 
     // A method requirement: a signature, optionally followed by a `{ … }` default body.
@@ -326,7 +341,7 @@ public struct Parser {
         return false
     }
 
-    private mutating func parseActorDecl() -> ActorDecl {
+    private mutating func parseActorDecl(_ visibility: Visibility = .internal) -> ActorDecl {
         let start = currentSpan
         expect(.kwActor)
         let name = expectIdent()
@@ -349,10 +364,10 @@ public struct Parser {
         }
         expect(.rBrace)
         return ActorDecl(name: name, fields: fields, handlers: handlers,
-                         conformances: conformances, span: spanFrom(start))
+                         conformances: conformances, visibility: visibility, span: spanFrom(start))
     }
 
-    private mutating func parseFuncDecl() -> FuncDecl {
+    private mutating func parseFuncDecl(_ visibility: Visibility = .internal) -> FuncDecl {
         let start = currentSpan
         // `static fun …` — a type-associated function with no `self`. The modifier is only
         // meaningful inside a type body; a stray top-level `static` never reaches here (the
@@ -367,7 +382,7 @@ public struct Parser {
             returnType = parseTypeRef()
         }
         let body = parseBlock()
-        return FuncDecl(name: name, generics: generics, params: params, returnType: returnType, body: body, isStatic: isStatic, span: spanFrom(start))
+        return FuncDecl(name: name, generics: generics, params: params, returnType: returnType, body: body, isStatic: isStatic, visibility: visibility, span: spanFrom(start))
     }
 
     // MARK: - Fields and params

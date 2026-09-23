@@ -1,0 +1,6 @@
+// Negative: `label` is defined here and in b.nomu. One module, one namespace → a duplicate
+// collision (there is no overloading).
+
+fun label(n: Int) -> Int { return n }
+
+fun main() { print(label(1)) }

@@ -73,7 +73,11 @@ Smallest step from today's single-CU.
   (module) distinction.
 - 100.1.3 — Duplicate-symbol detection across a module's files (collision = error; overloads distinct).
 - 100.1.4 — Merged module flows through the existing whole-program pipeline unchanged.
-- 100.1.5 (tests) — Multi-file module fixtures in the integration suite.
+- 100.1.5 (tests) — Multi-file module fixtures in the integration suite, added as **directory
+  fixtures** (a fixture directory = one module; the harness passes its `.nomu` files as the file list,
+  with an explicit `-o` binary path). The existing flat `examples/` fixtures stay single-file for now.
+  Migrating the whole suite so that every fixture is its own directory (**1 dir == 1 module**) is
+  deferred until directory-as-module exists (100.2.1+); tracked under 100.3.8.
 - *Foundation exists:* the driver's `prependPrelude` already parses multiple sources (`core.nomu`,
   `runtime.nomu`) into separate `Program`s and merges their decls into the user program. 100.1
   generalizes that merge from "2 fixed preludes + 1 user file" to "N user files as one module," adding
@@ -138,7 +142,9 @@ Package structure and the usable tool, build still whole-program internally.
   - *Open sub-decision (build-time):* whether each `core` **function** is ambient or explicit-import/
     `unsafe`-gated (types are ambient; low-level fns lean gated, cf. Rust `core::intrinsics`).
 - 100.3.8 (tests) — Package builds; multiple bins; `run`/`test`; seal enforcement; init order;
-  implicit-`core` visibility and single-definition of core symbols.
+  implicit-`core` visibility and single-definition of core symbols. **Migrate the integration suite to
+  1 dir == 1 module** — reorganize the flat `examples/` fixtures so each is its own module directory,
+  once directory-as-module (100.2.1) makes the rule real.
 - *Deliverable:* `nomuc build/run/test` on a manifest'd package with multiple bins.
 
 ### 100.4 — Separate compilation (witness baseline)

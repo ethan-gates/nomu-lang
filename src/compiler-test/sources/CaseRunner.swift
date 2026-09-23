@@ -29,7 +29,7 @@ struct CaseRunner {
 
     func run(_ c: ResolvedCase, compile: CompileResult) -> CaseResult {
         let bin = ctx.binaryPath(c.fixture)
-        let fixArg = ctx.fixturePath(c.fixture)
+        let fixArg = ctx.compileInputs(c.fixture).joined(separator: " ")
         let compileArgsStr = c.compileArgs.joined(separator: " ")
         let compileRepro = "\(envPrefix(c.compileEnv)) \(ctx.nomuc) \(compileArgsStr) \(fixArg)"
             .replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespaces)
