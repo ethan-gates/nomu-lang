@@ -10,14 +10,16 @@ public final class TypeRef {
     public let existentialOf: [String]?   // set for `any I` / `any A & B` — the interface names (M5 A1.4/A1.5b)
     public let opaqueOf: [String]?        // set for `some I` / `some A & B` — the interface names (M5 A3)
     public let genericArgs: [TypeRef]?    // set for an applied generic type `Box<Int>` (M5 5.2.1)
+    public let qualifier: String?         // set for a module-qualified type `util.Point` (task 100.2.3.2)
     public let span: Span
 
-    public init(name: String, fn: FnType? = nil, existentialOf: [String]? = nil, opaqueOf: [String]? = nil, genericArgs: [TypeRef]? = nil, span: Span) {
+    public init(name: String, fn: FnType? = nil, existentialOf: [String]? = nil, opaqueOf: [String]? = nil, genericArgs: [TypeRef]? = nil, qualifier: String? = nil, span: Span) {
         self.name = name
         self.fn = fn
         self.existentialOf = existentialOf
         self.opaqueOf = opaqueOf
         self.genericArgs = genericArgs
+        self.qualifier = qualifier
         self.span = span
     }
 }
@@ -36,9 +38,74 @@ public struct FnType {
 
 public struct Program {
     public let decls: [TopDecl]
+    public let imports: [ImportDecl]   // per-file imports (task 100.2); file identity via each span
 
-    public init(decls: [TopDecl]) {
+    public init(decls: [TopDecl], imports: [ImportDecl] = []) {
         self.decls = decls
+        self.imports = imports
+    }
+}
+
+// Per-origin identity for an imported symbol (task 100.2.3.2). Two modules may export the same name, so
+// on the consumer side an imported symbol is keyed by `origin@name` (origin = the producer module's
+// relative path) — unique even under a name collision. Resolution rewrites a user reference (bare when
+// unambiguous, or qualified `mod.name`) to this key; codegen decodes it back to the producer's mangled
+// symbol. `@` cannot appear in a Nomu identifier or module path component, so the split is unambiguous.
+public enum ExternalName {
+    public static func encode(origin: String, name: String) -> String { origin + "@" + name }
+    public static func decode(_ key: String) -> (origin: String, name: String)? {
+        guard let at = key.firstIndex(of: "@") else { return nil }
+        return (String(key[key.startIndex..<at]), String(key[key.index(after: at)...]))
+    }
+    public static func isEncoded(_ key: String) -> Bool { key.contains("@") }
+}
+
+// One source file's parse result within a module (task 100.2.3.1). A module is represented as its files
+// rather than a single concatenated `Program`, so per-file imports survive: a module shares one symbol
+// namespace across its files, but **imports are file-scoped** (Go's model). `.decls`/`.imports` mirror
+// `Program`, so the module-wide passes can still operate on the union view (`files.flatMap(\.decls)`).
+public struct SourceFile {
+    public let path: String
+    public let decls: [TopDecl]
+    public let imports: [ImportDecl]
+
+    public init(path: String, decls: [TopDecl], imports: [ImportDecl]) {
+        self.path = path
+        self.decls = decls
+        self.imports = imports
+    }
+}
+
+// A per-file import (modules.md §Imports; syntax.md §3). Imports form a block at the top of the file.
+// `import pkg/util/parse` is first-party (the `pkg` root = the importing file's own package);
+// `import foo` / `import foo/bar` names an external package's root module or a submodule. `as` renames
+// the local qualifier only; `public import` re-exports; `test import` widens test-module access.
+// Conditional imports (task 141) will later wrap these in a comptime block within the same section.
+public enum ImportRoot: Equatable {
+    case pkg                  // `pkg/…` — the importing file's own package
+    case package_(String)     // `foo/…` — an external package named `foo`
+}
+
+public struct ImportDecl {
+    public let root: ImportRoot
+    public let path: [String]     // components after the root: `pkg/util/parse` → ["util", "parse"]
+    public let alias: String?     // `as bar` — renames the local qualifier
+    public let isPublic: Bool     // `public import` — re-export into this module's public API
+    public let isTest: Bool       // `test import` — white-box access for a test module
+    public let span: Span
+
+    public init(root: ImportRoot, path: [String], alias: String?, isPublic: Bool, isTest: Bool, span: Span) {
+        self.root = root; self.path = path; self.alias = alias
+        self.isPublic = isPublic; self.isTest = isTest; self.span = span
+    }
+
+    // The imported module's leaf name — the bare qualifier at use sites (`net.Client` → "net"),
+    // overridden by an alias.
+    public var leafName: String {
+        if let alias { return alias }
+        if let last = path.last { return last }
+        if case .package_(let name) = root { return name }
+        return "pkg"
     }
 }
 
@@ -54,13 +121,18 @@ public enum TopDecl {
     case extensionDecl(ExtensionDecl)
 }
 
-// A declaration's reach across the module system (modules.md §visibility). `private` is
-// file-scoped (visible only in its own file); `internal` — the default — is module-scoped.
-// `package`/`public` arrive with the multi-module surface (task 100.2). Written as a contextual
-// prefix modifier, so the words stay usable as identifiers.
-public enum Visibility {
-    case `private`    // visible in its file only
-    case `internal`   // visible in its module (default)
+// A declaration's reach across the module system (modules.md §visibility), widest last. `private` is
+// file-scoped; `internal` — the default — is module-scoped; `package` reaches every module in the
+// package; `public` is the module's external API. Written as a contextual prefix modifier, so the
+// words stay usable as identifiers. `rank` orders the tiers for consistency checks (a symbol may not
+// expose one of lesser reach in its public/package signature).
+public enum Visibility: Int, Comparable {
+    case `private` = 0    // visible in its file only
+    case `internal` = 1   // visible in its module (default)
+    case `package` = 2    // visible to every module in the package
+    case `public` = 3     // visible externally — the module API
+
+    public static func < (a: Visibility, b: Visibility) -> Bool { a.rawValue < b.rawValue }
 }
 
 // An interface (M5 A1; interfaces.md §1). Its body holds method requirements — a bare

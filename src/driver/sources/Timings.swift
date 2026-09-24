@@ -15,6 +15,7 @@ public final class Timings {
 
     // Context filled in as it becomes known; printed in the header.
     public var file = ""
+    public var package = ""   // the package identity (manifest name, or the default)
     public var optimize = false
     public var bytes = 0
     public var tokens = 0
@@ -48,6 +49,7 @@ public final class Timings {
         var out = "── nomu timings ───────────────────────────\n"
         let name = (file as NSString).lastPathComponent
         out += "  file:      \(name)  (\(bytes) bytes, \(tokens) tokens)\n"
+        out += "  package:   \(package)\n"
         out += "  egress:    \(egress)\n"
         out += "  optimize:  \(optimize ? "yes" : "no")\n"
 

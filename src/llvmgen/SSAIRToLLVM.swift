@@ -98,8 +98,11 @@ final class SSAIRToLLVM {
                 methods: [], span: agg.span)
         }
 
-        guard let mainFn = module.functions.first(where: { $0.name == "main" }) else { return }
-        e.setupDebugInfo(sourceFile: mainFn.span.file)
+        // A library module has no `main`; debug info still needs a source file, so fall back to the first
+        // function's. Only the entry object requires `main` (checked by the driver via `loweredMain`).
+        if let anyFn = module.functions.first(where: { $0.name == "main" }) ?? module.functions.first {
+            e.setupDebugInfo(sourceFile: anyFn.span.file)
+        }
 
         for f in module.functions { declareFunction(f) }
         for f in module.functions {
@@ -107,7 +110,7 @@ final class SSAIRToLLVM {
             defineFunction(f)
         }
 
-        e.emitTypeMaps()
+        if e.emitsTypeMaps { e.emitTypeMaps() }
         if let dib = e.di {
             LLVMDIBuilderFinalize(dib)
             LLVMDisposeDIBuilder(dib)
@@ -122,9 +125,11 @@ final class SSAIRToLLVM {
     // (closures/spawn routines are `f:clo:N` / `f:spawn:N`); methods and actor handlers key
     // `m:<type>:<method>` — matching the `.direct`/`.witness` call names ssairgen emits.
     private func keyAndSelf(_ f: SSAFunction) -> (key: String, selfType: String?, byPointer: Bool, symbol: String) {
+        // The origin qualifier is the module this function is *defined* in (task 100.4); it must match
+        // the on-demand declaration in `LLVMGenCallables`, which derives it the same way from the file.
+        let qualifier = e.definitionQualifier(forFile: f.span.file)
         guard f.name.hasPrefix("m:") else {
-            let symbol = f.name == "main" ? "nomu_main" : "nomu_fn_\(sanitize(f.name))"
-            return ("f:\(f.name)", nil, false, symbol)
+            return ("f:\(f.name)", nil, false, Mangle.free(f.name, qualifier: qualifier))
         }
         let rest = f.name.dropFirst(2)
         let colon = rest.firstIndex(of: ":")!
@@ -133,13 +138,9 @@ final class SSAIRToLLVM {
         let isActor = e.actorMap[type] != nil
         let isReference = e.classMap[type] != nil || isActor
         let byPointer = isReference || f.isMutating
-        let sanitized = method.replacingOccurrences(of: ".", with: "_")
-        let symbol = isActor ? "nomu_on_\(type)_\(sanitized)" : "nomu_m_\(type)_\(sanitized)"
+        let symbol = isActor ? Mangle.actorHandler(type, method, qualifier: qualifier)
+                             : Mangle.method(type, method, qualifier: qualifier)
         return ("m:\(f.name.dropFirst(2))", type, byPointer, symbol)
-    }
-
-    private func sanitize(_ s: String) -> String {
-        String(s.map { $0 == ":" || $0 == "." ? "_" : $0 })
     }
 
     // Create the LLVM function for `f` and register it in `callables` with the ABI-correct signature —
@@ -173,6 +174,9 @@ final class SSAIRToLLVM {
         if f.name.hasPrefix("spawn:"), !paramTys.isEmpty { paramTys[0] = e.i8ptr }
         let (fn, fnTy) = e.emitFunction(symbol, ret: retTy, params: paramTys,
                                         debug: (f.name, f.span.begin.line))
+        // Prelude functions are compiled into every module's object (interim, task 100.3.7); weak
+        // linkage lets the linker fold the duplicate definitions to one.
+        if e.weakOriginFiles.contains(f.span.file) { LLVMSetLinkage(fn, LLVMWeakODRLinkage) }
         let dummy = NOIRFunc(name: f.name, params: [], returnType: f.returnType,
                              body: [], isMutating: f.isMutating, span: f.span)
         e.callables[key] = Callable(fn: fn, ty: fnTy, ir: dummy,
@@ -957,6 +961,28 @@ final class SSAIRToLLVM {
             let key = name.hasPrefix("m:") ? name : "f:\(name)"
             if let c = e.callables[key] {
                 return e.buildCall(c.fn, c.ty, args.map { val($0) })
+            }
+            // A function imported from a dependency (task 100.4.2): declared here as an external symbol
+            // (no body), resolved at link against the dependency's object. Signature comes from the call.
+            if e.externalFuncNames.contains(name) {
+                guard let retTy = ty(resultType, span) else { return nil }
+                var paramTys: [LLVMTypeRef] = []
+                for a in args { guard let t = ty(a.type, span) else { return nil }; paramTys.append(t) }
+                // An imported function's callee name is its per-origin identity `origin@name`
+                // (task 100.2.3.2); decode it to the producer's mangled symbol so this external
+                // declaration matches the definition the dependency emitted.
+                let symbol: String
+                if let (origin, bare) = ExternalName.decode(name) {
+                    symbol = Mangle.free(bare, qualifier: Mangle.qualifier(module: origin.split(separator: "/").map(String.init)))
+                } else {
+                    symbol = Mangle.free(name)
+                }
+                let (fn, fnTy) = e.emitFunction(symbol, ret: retTy, params: paramTys)
+                e.callables[key] = Callable(fn: fn, ty: fnTy,
+                                            ir: NOIRFunc(name: name, params: [], returnType: resultType,
+                                                         body: [], isMutating: false, span: span),
+                                            selfType: nil, selfByPointer: false)
+                return e.buildCall(fn, fnTy, args.map { val($0) })
             }
             // A property accessor `m:Type:prop.get`/`.set` with no method body is a stored-field
             // requirement — ssairgen devirtualized it to a direct call; lower it to a field access.

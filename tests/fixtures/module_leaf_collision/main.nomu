@@ -1,0 +1,8 @@
+// Negative (task 100.2.3.2): both imports have leaf `util`, so the qualifier `util` is ambiguous.
+import pkg/x/util
+import pkg/y/util
+
+fun main() {
+    print(xu())
+    print("\n")
+}

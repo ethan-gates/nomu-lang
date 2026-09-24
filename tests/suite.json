@@ -1,5 +1,5 @@
 {
-  "computed_order": ["stw-collect", "gc-anybox", "module-shared", "gc-stress-evac", "gc-stress", "gc-string", "gc-pressure", "scheduler-mc", "gc-concurrent", "scheduler-timer", "gen-minor", "scheduler-poller", "futex-subset", "gen-major", "immix-defrag", "scalar-carried-evac", "gen-los", "fiber-registry-evac", "immix-evac", "rt-prelude", "pingpong", "gc-gen", "arr-gc-evac", "sysclock-subset", "atomics-evac", "sysclock-evac", "immix-line-mark", "immix-sweep", "gen-barrier", "immix-forward", "gen-nursery", "scheduler-lock-evac", "immix-alloc", "subset-ok", "raw-struct", "immix-los", "scheduler-tls", "scheduler-actor", "fiberswitch", "immix-region-evac", "bump-alloc", "scheduler", "escape-nonleaf", "asmswitch", "raw-mem", "selfhost-alloc", "arr-gc", "escape-nonleaf-evac", "futex", "rt-prelude-evac", "typed-ptr-evac", "immix-los-self", "gc-gen-self", "raw-struct-evac", "scalar-carried", "bump-alloc-evac", "typed-ptr", "fiberswitch-evac", "scheduler-evac", "scheduler-lock", "asmswitch-evac", "raw-mem-evac", "selfhost-alloc-self", "immix-region", "fiber-registry", "atomics", "sysclock", "immix-alloc-self", "module-dup", "module-private", "subset-bad"],
+  "computed_order": ["stw-collect", "gc-anybox", "gen-nursery", "gc-stress-evac", "module-collision-resolve", "gc-stress", "gc-string", "gc-pressure", "gen-los", "gen-major", "scheduler-mc", "gc-concurrent", "gen-minor", "scheduler-timer", "scheduler-poller", "immix-defrag", "pingpong", "immix-forward", "asmswitch", "atomics-evac", "gc-gen", "immix-region-evac", "scheduler-lock", "module-qualified", "escape-nonleaf", "escape-nonleaf-evac", "immix-alloc-self", "immix-line-mark", "immix-los", "bump-alloc", "futex-subset", "fiberswitch", "immix-evac", "subset-ok", "typed-ptr-evac", "module-reexport", "scheduler-tls", "fiber-registry-evac", "selfhost-alloc-self", "module-shared", "raw-mem", "scheduler-actor", "scheduler", "gen-barrier", "scalar-carried", "sysclock", "immix-sweep", "sysclock-subset", "rt-prelude-evac", "bump-alloc-evac", "raw-struct-evac", "arr-gc", "scalar-carried-evac", "futex", "fiberswitch-evac", "selfhost-alloc", "immix-los-self", "gc-gen-self", "arr-gc-evac", "fiber-registry", "raw-struct", "sysclock-evac", "atomics", "asmswitch-evac", "raw-mem-evac", "immix-region", "scheduler-evac", "scheduler-lock-evac", "typed-ptr", "immix-alloc", "rt-prelude", "module-collision", "module-dup", "module-leaf-collision", "module-perfile-import", "module-private", "module-visibility", "subset-bad"],
   "defaults": { "timeout_sec": 60, "compile_timeout_sec": 120, "iterations": 1, "carriers": [1], "heavy": false },
   "cases": [
 
@@ -222,7 +222,21 @@
     { "name": "module-private", "fixture": "tests/fixtures/module_private",
       "compile": { "expect_error": "is private to its file" } },
     { "name": "module-dup", "fixture": "tests/fixtures/module_dup",
-      "compile": { "expect_error": "duplicate function 'label'" } }
+      "compile": { "expect_error": "duplicate function 'label'" } },
+    { "name": "module-visibility", "fixture": "tests/fixtures/module_visibility",
+      "compile": { "expect_error": "exposes internal type 'Hidden'" } },
+    { "name": "module-reexport", "fixture": "tests/fixtures/module_reexport",
+      "expect": { "stdout": "50\n" }, "carriers": [] },
+    { "name": "module-perfile-import", "fixture": "tests/fixtures/module_perfile_import",
+      "compile": { "expect_error": "not imported in this file" } },
+    { "name": "module-qualified", "fixture": "tests/fixtures/module_qualified",
+      "expect": { "stdout": "45\n" }, "carriers": [] },
+    { "name": "module-collision", "fixture": "tests/fixtures/module_collision",
+      "compile": { "expect_error": "exported by more than one imported module" } },
+    { "name": "module-leaf-collision", "fixture": "tests/fixtures/module_leaf_collision",
+      "compile": { "expect_error": "share the qualifier" } },
+    { "name": "module-collision-resolve", "fixture": "tests/fixtures/module_collision_resolve",
+      "expect": { "stdout": "33\n" }, "carriers": [] }
 
   ]
 }

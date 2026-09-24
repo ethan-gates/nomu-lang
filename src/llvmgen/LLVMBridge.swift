@@ -33,7 +33,10 @@ private func cgStage<T>(_ phase: String, _ name: String, _ onStage: StageSink?, 
 /// `optimize` selects the release (`default<O2>`) pipeline over the debug default (8.5.3).
 public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = false,
                        subsetFuncs: Set<String> = [], onStage: StageSink? = nil,
-                       emitLLVMTo: String? = nil, stopAfterEgress: Bool = false) -> String? {
+                       emitLLVMTo: String? = nil, stopAfterEgress: Bool = false,
+                       requireMain: Bool = true, externalFuncNames: Set<String> = [],
+                       weakOriginFiles: Set<String> = [], emitTypeMaps: Bool = true,
+                       homeQualifier: String = "") -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
@@ -67,9 +70,14 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
     let violations = pipeline.run(&ssaModule, stem: path, onStage: onStage)
     if let first = violations.first { return "SSAIR verify: \(first)" }
     let egress = SSAIRToLLVM(ctx: ctx, mod: mod)
+    egress.e.externalFuncNames = externalFuncNames
+    egress.e.weakOriginFiles = weakOriginFiles
+    egress.e.emitsTypeMaps = emitTypeMaps
+    egress.e.homeQualifier = homeQualifier
     cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: module) }
     if let err = egress.error { return err }
-    guard egress.loweredMain else { return "LLVM: no `main` function to lower" }
+    // The entry object must have `main`; a library object need not.
+    if requireMain, !egress.loweredMain { return "LLVM: no `main` function to lower" }
 
     var errorMessage: UnsafeMutablePointer<CChar>! = nil
     let verifyRC = cgStage("llvm", "verify", onStage) { LLVMVerifyModule(mod, LLVMReturnStatusAction, &errorMessage) }

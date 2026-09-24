@@ -8,10 +8,15 @@ import support
 public struct SemaResult {
     public let module: NOIRModule
     public let diagnostics: DiagnosticSink
+    public var externalFuncNames: Set<String> = []   // imported functions; codegen declares, not defines
 }
 
 public struct Sema {
     let program: Program
+    // Declarations imported from a dependency's `.nmi` (task 100.4.2): their signatures/layouts are
+    // registered so references resolve, but their bodies are never lowered — they are defined in the
+    // dependency's own object and reached by external linkage.
+    let externalDecls: [TopDecl]
     let diags = DiagnosticSink()
     private let subsetFuncs: Set<String>   // task 149 — functions compiled under the runtime-subset rules
 
@@ -78,7 +83,24 @@ public struct Sema {
         let params: [Type]; let ret: Type; var generics: [GenericParam] = []
         var visibility: Visibility = .internal
         var declFile: String = ""
+        var isExternal: Bool = false   // imported from a dependency's `.nmi`; reached by external linkage
     }
+
+    // Names of functions imported from a dependency (registered from `externalDecls`); codegen emits a
+    // declaration for these, not a definition.
+    var externalFuncNames: Set<String> = []
+
+    // Per-file import scope (tasks 100.2.3.1/100.2.3.2). Imports are file-scoped: an imported (external)
+    // symbol is bare-visible only in a file that imports its origin module (directly or via a re-export).
+    // `fileVisibleModules[file]` = the module paths a file may reference bare; `fileQualifiers[file][q]` =
+    // the modules a qualifier `q` (a module leaf or `as`-alias) addresses in that file, for qualified
+    // access `q.name`; `moduleFuncs[modulePath]` / `moduleTypes[modulePath]` = the function / type names a
+    // module exports. Imported declarations arrive pre-encoded as `origin@name` (their own tables are
+    // therefore collision-free); `resolveExternal` maps a user reference to that key.
+    var fileVisibleModules: [String: Set<String>] = [:]
+    var fileQualifiers: [String: [String: Set<String>]] = [:]
+    var moduleFuncs: [String: Set<String>] = [:]
+    var moduleTypes: [String: Set<String>] = [:]
 
     // M5 5.2.2: the bounds of each generic type parameter in scope (`T` → its interfaces),
     // so a requirement call on a `.typeParam` receiver dispatches through the right witness.
@@ -92,9 +114,18 @@ public struct Sema {
     // built once after global collection; discharges `<shared T>` bounds at call sites.
     private var shareChecker = Shareability(lookup: { _ in nil })
 
-    public init(_ program: Program, subsetFuncs: Set<String> = []) {
+    public init(_ program: Program, externalDecls: [TopDecl] = [], subsetFuncs: Set<String> = [],
+                fileVisibleModules: [String: Set<String>] = [:],
+                fileQualifiers: [String: [String: Set<String>]] = [:],
+                moduleFuncs: [String: Set<String>] = [:],
+                moduleTypes: [String: Set<String>] = [:]) {
         self.program = program
+        self.externalDecls = externalDecls
         self.subsetFuncs = subsetFuncs
+        self.fileVisibleModules = fileVisibleModules
+        self.fileQualifiers = fileQualifiers
+        self.moduleFuncs = moduleFuncs
+        self.moduleTypes = moduleTypes
     }
 
     public mutating func check() -> SemaResult {
@@ -113,6 +144,16 @@ public struct Sema {
             if isGenericType(decl) { decls.append(NOIRGen.lowerGenericDecl(&self, decl)); continue }
             decls.append(NOIRGen.lowerDecl(&self, decl))
         }
+        // Imported (external) types are lowered for their layout — codegen needs the aggregate shape to
+        // construct values and access fields. Imported functions are not lowered; they are external
+        // declarations resolved at link (task 100.4.2).
+        for decl in externalDecls {
+            switch decl {
+            case .structDecl, .enumDecl, .classDecl, .actorDecl:
+                decls.append(NOIRGen.lowerDecl(&self, decl))
+            default: break
+            }
+        }
         // `static fun` members lowered as free functions, emitted alongside the type decls.
         decls.append(contentsOf: pendingStaticFuncs)
 
@@ -126,7 +167,7 @@ public struct Sema {
             diags.error("cannot call mutating method on an immutable value — the receiver must be a 'var'", at: site.span)
         }
         checkRuntimeSubset(mutation.module, designated: subsetFuncs, into: diags)
-        return SemaResult(module: mutation.module, diagnostics: diags)
+        return SemaResult(module: mutation.module, diagnostics: diags, externalFuncNames: externalFuncNames)
     }
 
     // MARK: - Global collection
@@ -146,6 +187,18 @@ public struct Sema {
                 break   // functions in phase 2 below; extensions merged before Sema (M4.12)
             }
         }
+        // Imported (external) type declarations register their names/layouts identically — a consumer
+        // uses an imported type by value, so it needs the layout, not a symbol.
+        for decl in externalDecls {
+            switch decl {
+            case .structDecl(let s): structs[s.name] = s
+            case .enumDecl(let e):   enums[e.name]   = e
+            case .classDecl(let c):  classes[c.name] = c
+            case .actorDecl(let a):  actors[a.name]  = a
+            case .interfaceDecl(let i): interfaces[i.name] = i; interfaceBases[i.name] = i.refines
+            default: break
+            }
+        }
         // Phase 2 — resolve function signatures against the now-complete type table.
         for decl in program.decls {
             guard case .funcDecl(let f) = decl else { continue }
@@ -156,9 +209,21 @@ public struct Sema {
                                   visibility: f.visibility, declFile: f.span.file)
             genericScope = saved
         }
+        // Imported (external) functions: register the signature so calls resolve, and mark them
+        // external so codegen emits a declaration rather than a definition (linked from the dependency).
+        for decl in externalDecls {
+            guard case .funcDecl(let f) = decl else { continue }
+            let saved = genericScope; genericScope = Set(f.generics.map(\.name))
+            funcs[f.name] = FnSig(params: f.params.map { resolve($0.type) },
+                                  ret: resolve(f.returnType, opaqueOwner: "fn:\(f.name)"),
+                                  generics: f.generics,
+                                  visibility: f.visibility, declFile: f.span.file, isExternal: true)
+            externalFuncNames.insert(f.name)
+            genericScope = saved
+        }
         // Computed-property tables need the type dicts above populated first (a property
         // type may name any user type), so register them in a second pass.
-        for decl in program.decls {
+        for decl in program.decls + externalDecls {
             switch decl {
             case .structDecl(let s): NOIRGen.registerProps(&self, s.name, s.properties, generics: s.generics)
             case .enumDecl(let e):   NOIRGen.registerProps(&self, e.name, e.properties, generics: e.generics)
@@ -220,6 +285,16 @@ public struct Sema {
     // types and let/var bindings supply an owner).
     func resolve(_ ref: TypeRef?, selfAs: Type? = nil, opaqueOwner: String? = nil) -> Type {
         guard let ref else { return .void }
+        // Module-qualified type `util.Point` (task 100.2.3.2): resolve the qualifier + name to the type's
+        // per-origin identity, then resolve that identity as the concrete type.
+        if let q = ref.qualifier {
+            switch resolveExternal(ref.name, qualifier: q, kind: .type, at: ref.span) {
+            case .notExternal: diags.error("'\(q)' is not an imported module in this file", at: ref.span); return .error
+            case .error: return .error
+            case .key(let k): return resolve(TypeRef(name: k, genericArgs: ref.genericArgs, span: ref.span),
+                                             selfAs: selfAs, opaqueOwner: opaqueOwner)
+            }
+        }
         if let ifaces = ref.existentialOf {   // `any I` / `any A & B` (M5 A1.4/A1.5b)
             return TypeResolution.resolveExistential(self, ifaces, at: ref.span)
         }
@@ -250,6 +325,14 @@ public struct Sema {
         case "RawPtr": return .rawPtr    // task 125 — untyped unmanaged address
         case "Void":   return .void
         default:
+            // A bare name that resolves to an imported type → its per-origin identity, resolved
+            // concretely (task 100.2.3.2). `notExternal` = same-module type or builtin — fall through.
+            switch resolveExternal(ref.name, qualifier: nil, kind: .type, at: ref.span) {
+            case .error: return .error
+            case .key(let k): return resolve(TypeRef(name: k, genericArgs: ref.genericArgs, span: ref.span),
+                                             selfAs: selfAs, opaqueOwner: opaqueOwner)
+            case .notExternal: break
+            }
             if let k = kindOf(ref.name) {
                 // A bare interface name isn't a usable type — `any I` / `some I` (later
                 // slices) make the erasure explicit (interfaces.md §4.4).
@@ -267,6 +350,17 @@ public struct Sema {
         }
     }
 
+    // A bare name that is not a same-module symbol may be an imported one: resolve it to its per-origin
+    // identity (task 100.2.3.2). Probes type then function so the right kind's diagnostics fire (a type
+    // takes precedence — `Point(...)` is construction), without a spurious wrong-kind error.
+    func externalKeyForBare(_ name: String, at span: Span) -> ExternalResolution {
+        let inScope = fileVisibleModules[span.file] ?? []
+        if inScope.contains(where: { moduleTypes[$0]?.contains(name) == true }) {
+            return resolveExternal(name, qualifier: nil, kind: .type, at: span)
+        }
+        return resolveExternal(name, qualifier: nil, kind: .function, at: span)
+    }
+
     // Task 100.1.2 — module visibility. A `private` symbol is reachable only from the file that
     // declares it; a reference from any other file is an error. `internal` (the default) is
     // module-wide, so it never trips here. (`package`/`public` tiers arrive with task 100.2.)
@@ -274,6 +368,45 @@ public struct Sema {
         if visibility == .private, declFile != span.file {
             diags.error("'\(name)' is private to its file and is not visible here", at: span)
         }
+    }
+
+    // The kind of symbol a use site expects, so a name is resolved against the right export table.
+    enum ExternalKind { case function, type }
+    // The outcome of resolving a (possibly qualified) reference to a symbol's per-origin identity.
+    enum ExternalResolution { case notExternal, error, key(String) }
+
+    // Task 100.2.3.1/100.2.3.2 — resolve a user reference to an imported symbol's per-origin identity
+    // (`origin@name`), applying per-file import scoping and collision rules. Bare: exactly one in-scope
+    // module must export it (zero and it is same-module/builtin → `notExternal`, or external-but-not-
+    // imported → error; two or more → ambiguous, qualify). Qualified `q.name`: `q` must be a module
+    // qualifier in this file addressing exactly one module exporting `name`. Only real user files carry a
+    // scope; synthetic (interface-reconstructed) and prelude spans have none and never resolve external.
+    func resolveExternal(_ name: String, qualifier q: String?, kind: ExternalKind, at span: Span) -> ExternalResolution {
+        let exports = (kind == .function) ? moduleFuncs : moduleTypes
+        if let q = q {
+            guard let mods = fileQualifiers[span.file]?[q] else { return .notExternal }
+            let exporters = mods.filter { exports[$0]?.contains(name) == true }.sorted()
+            if exporters.isEmpty {
+                diags.error("module '\(q)' has no \(kind == .function ? "function" : "type") '\(name)'", at: span); return .error
+            }
+            if exporters.count > 1 {
+                diags.error("'\(name)' via '\(q)' is exported by more than one re-exported module (\(exporters.map { "pkg/\($0)" }.joined(separator: ", ")))", at: span); return .error
+            }
+            return .key(ExternalName.encode(origin: exporters[0], name: name))
+        }
+        guard let inScope = fileVisibleModules[span.file] else { return .notExternal }
+        let exporters = inScope.filter { exports[$0]?.contains(name) == true }.sorted()
+        if exporters.count == 1 { return .key(ExternalName.encode(origin: exporters[0], name: name)) }
+        if exporters.count > 1 {
+            let hint = exporters[0].split(separator: "/").last.map(String.init) ?? exporters[0]
+            diags.error("'\(name)' is exported by more than one imported module (\(exporters.map { "pkg/\($0)" }.joined(separator: ", "))) — qualify it (e.g. \(hint).\(name))", at: span)
+            return .error
+        }
+        if let owner = exports.first(where: { $0.value.contains(name) })?.key {
+            diags.error("'\(name)' is defined in module 'pkg/\(owner)' but not imported in this file", at: span)
+            return .error
+        }
+        return .notExternal
     }
 
     // The declared visibility and origin file of a user type, or nil for a builtin / unknown name.

@@ -1,0 +1,7 @@
+public fun util_val() -> Int {
+    return 42
+}
+public struct Point {
+    let x: Int
+    let y: Int
+}

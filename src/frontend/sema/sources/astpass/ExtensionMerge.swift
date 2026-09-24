@@ -67,7 +67,7 @@ private struct ExtensionMerger {
                 break   // folded into its target above, or reported invalid
             }
         }
-        return Program(decls: out)
+        return Program(decls: out, imports: program.imports)
     }
 
     // Report extensions whose target can't be extended. Valid targets (struct/enum/

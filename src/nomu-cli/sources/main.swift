@@ -25,6 +25,7 @@ for arg in CommandLine.arguments.dropFirst() {
               --emit-ast         also emit the parsed AST (<name>.ast)
               --emit-noir        also emit NOIR, the Nomu typed IR (<name>.noir)
               --emit-ssair       also emit SSAIR, the optimizer IR (<name>.ssair)
+              --emit-nmi         also emit the module's public interface (<name>.nmi)
               --emit-llvm        also emit LLVM IR from the egress, pre-opt (<name>.ll)
               --stop=STAGE       halt after STAGE (ast | noir | ssair | llvm | binary); default binary
               -O, --release      optimize (LLVM -O2); default is a debug build
@@ -35,6 +36,7 @@ for arg in CommandLine.arguments.dropFirst() {
     case "--emit-ast":         options.ast = true
     case "--emit-noir":        options.noir = true
     case "--emit-ssair":       options.ssair = true
+    case "--emit-nmi":         options.nmi = true
     case "--emit-llvm":        options.llvm = true
     case "-O", "--release":    options.optimize = true
     case "-o":                 expectingOutputPath = true

@@ -24,6 +24,7 @@ public struct EmitOptions {
     public var ast = false       // --emit-ast: emit the parsed AST (<name>.ast)
     public var noir = false      // --emit-noir: emit NOIR (<name>.noir)
     public var ssair = false     // --emit-ssair: emit SSAIR, the optimizer IR (<name>.ssair)
+    public var nmi = false        // --emit-nmi: emit the module's public interface (<name>.nmi), task 100.4.1
     public var llvm = false      // --emit-llvm: emit LLVM IR as emitted by the egress, pre-opt (<name>.ll)
     public var stopAt: Stage = .binary
     // 8.5.3 — LLVM optimization level. Default (debug) runs the minimal `mem2reg`/`sroa` the

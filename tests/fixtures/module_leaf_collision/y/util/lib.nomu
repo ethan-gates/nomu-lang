@@ -1,0 +1,3 @@
+public fun yu() -> Int {
+    return 8
+}

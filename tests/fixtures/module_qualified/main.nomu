@@ -1,0 +1,9 @@
+// Qualified access (task 100.2.3.2): reach an imported function, type, and constructor through the
+// module leaf — in a call, a type position, and construction.
+import pkg/util
+
+fun main() {
+    let p: util.Point = util.Point(x: 3, y: 0)
+    print(util.util_val() + p.x)
+    print("\n")
+}

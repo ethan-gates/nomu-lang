@@ -19,12 +19,59 @@ public struct Parser {
     }
 
     public mutating func parse() -> Program {
+        let imports = parseImports()
         var decls: [TopDecl] = []
         while !check(.eof) {
             if let decl = parseTopDecl() { decls.append(decl) }
         }
-        return Program(decls: decls)
+        return Program(decls: decls, imports: imports)
     }
+
+    // Parse a single standalone type reference (task 100.4.2 — reconstructing a type from `.nmi` text).
+    public mutating func parseStandaloneType() -> TypeRef { parseTypeRef() }
+
+    // MARK: - Imports
+
+    // The top-of-file import block (task 100.2; modules.md §Imports). Imports must precede all
+    // declarations — a misplaced `import` is caught in parseTopDecl. Each form: `import PATH`,
+    // `import PATH as NAME`, prefixed by `public`/`test`. PATH is `/`-separated identifiers; a leading
+    // `pkg` marks a first-party (same-package) import, any other leading identifier names an external
+    // package.
+    private mutating func parseImports() -> [ImportDecl] {
+        var out: [ImportDecl] = []
+        while let imp = parseOneImport() { out.append(imp) }
+        return out
+    }
+
+    // Recognizes an import at the current position (`import`, `public import`, `test import`) and
+    // parses it; returns nil when the current token starts no import.
+    private mutating func parseOneImport() -> ImportDecl? {
+        let start = currentSpan
+        var isPublic = false, isTest = false
+        if isContextual("public"), peekIsContextual("import") { advance(); isPublic = true }
+        else if isContextual("test"), peekIsContextual("import") { advance(); isTest = true }
+        guard isContextual("import") else { return nil }
+        advance()   // consume `import`
+
+        // The leading identifier is the root: `pkg` (this package) or an external package name.
+        // Subsequent `/`-separated identifiers are the module path within that root.
+        let first = expectIdent()
+        let root: ImportRoot = (first == "pkg") ? .pkg : .package_(first)
+        var path: [String] = []
+        while eat(.slash) { path.append(expectIdent()) }
+
+        var alias: String? = nil
+        if isContextual("as") { advance(); alias = expectIdent() }
+
+        return ImportDecl(root: root, path: path, alias: alias, isPublic: isPublic, isTest: isTest,
+                          span: spanFrom(start))
+    }
+
+    private func isContextual(_ word: String) -> Bool {
+        if case .ident(let s) = currentKind, s == word { return true }
+        return false
+    }
+    private func peekIsContextual(_ word: String) -> Bool { peek() == .ident(word) }
 
     // MARK: - Top-level declarations
 
@@ -45,6 +92,12 @@ public struct Parser {
             return .extensionDecl(parseExtensionDecl())
         case .kwFunc:   return .funcDecl(parseFuncDecl(vis ?? .internal))
         default:
+            if isContextual("import") || (isContextual("public") && peekIsContextual("import"))
+                || (isContextual("test") && peekIsContextual("import")) {
+                error("imports must appear at the top of the file, before any declaration")
+                _ = parseOneImport()   // consume it so recovery continues past the stray import
+                return nil
+            }
             error("expected top-level declaration, got \(currentKind)")
             recover(to: Self.declStart)
             return nil
@@ -55,11 +108,14 @@ public struct Parser {
     // Contextual — recognized only when a declaration keyword follows — so the words remain usable
     // as ordinary identifiers. Returns nil when no modifier is present.
     private mutating func parseVisibility() -> Visibility? {
-        guard case .ident(let s) = currentKind, s == "private" || s == "internal",
+        guard case .ident(let s) = currentKind, let vis = Self.visibilityWords[s],
               Self.declStart.contains(peek()) else { return nil }
         advance()
-        return s == "private" ? .private : .internal
+        return vis
     }
+
+    private static let visibilityWords: [String: Visibility] =
+        ["private": .private, "internal": .internal, "package": .package, "public": .public]
 
     // Tokens that begin a top-level declaration — the resync set for declaration recovery.
     private static let declStart: Set<TokenKind> =
@@ -541,7 +597,16 @@ public struct Parser {
             let ret = parseTypeRef()
             return TypeRef(name: renderFnType(params, ret), fn: FnType(params: params, ret: ret), span: spanFrom(start))
         }
-        let name = expectIdent()
+        var name = expectIdent()
+        // Module-qualified type `util.Point` / `alias.Point` (task 100.2.3.2): a `.` then a type name
+        // after the head identifier names the module the type comes from. Type positions have no other
+        // meaning for `.`, so this is unambiguous.
+        var qualifier: String? = nil
+        if check(.dot), case .ident = peek() {
+            advance()   // `.`
+            qualifier = name
+            name = expectIdent()
+        }
         // Applied generic type `Box<Int>` / `Map<String, Int>` (M5 5.2.1). Angle brackets are
         // generic only in type position (decided, 5.0.6), so a `<` here is unambiguous.
         if check(.lt) {
@@ -549,9 +614,9 @@ public struct Parser {
             expect(.lt)
             repeat { args.append(parseTypeRef()) } while eat(.comma)
             expect(.gt)
-            return TypeRef(name: name, genericArgs: args, span: spanFrom(start))   // `name` is the base; args carry the arguments
+            return TypeRef(name: name, genericArgs: args, qualifier: qualifier, span: spanFrom(start))   // `name` is the base; args carry the arguments
         }
-        return TypeRef(name: name, span: spanFrom(start))
+        return TypeRef(name: name, qualifier: qualifier, span: spanFrom(start))
     }
 
     private func renderFnType(_ params: [TypeRef], _ ret: TypeRef?) -> String {
@@ -1072,4 +1137,14 @@ public struct Parser {
         while !check(.eof) && !sync.contains(currentKind) { advance() }
         panicking = false
     }
+}
+
+// Reconstruct a type reference from its textual form (used to load `.nmi` types; task 100.4.2).
+// Returns nil on a parse error.
+public func parseTypeText(_ source: String) -> TypeRef? {
+    let diags = DiagnosticSink()
+    var lexer = Lexer(source, file: "<iface-type>", diagnostics: diags)
+    var parser = Parser(lexer.tokenize(), diagnostics: diags)
+    let t = parser.parseStandaloneType()
+    return diags.hasErrors ? nil : t
 }

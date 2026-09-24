@@ -1,0 +1,11 @@
+// Two modules export the same names `greet` and `Val`; qualification resolves each to its own module's
+// distinct symbol/layout (task 100.2.3.2). a.greet=1, b.greet=2, a.Val.n=10, b.Val.n=20 -> 33.
+import pkg/a
+import pkg/b
+
+fun main() {
+    let av: a.Val = a.Val(n: 10)
+    let bv: b.Val = b.Val(n: 20)
+    print(a.greet() + b.greet() + av.n + bv.n)
+    print("\n")
+}

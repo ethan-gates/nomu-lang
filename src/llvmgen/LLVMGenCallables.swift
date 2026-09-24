@@ -11,11 +11,19 @@ import LLVM_C
 // so they live here in the shared emitter. Body definition (the tree-walk) stays on each egress —
 // `NOIRToLLVM.defineBody` today, its SSAIR analog later.
 extension LLVMGen {
+    // The mangling qualifier for a symbol *defined* in this module (task 100.4). A prelude/runtime
+    // function keeps a bare name (its file is in `weakOriginFiles`, and the C runtime pins those); any
+    // other definition carries the module's `homeQualifier`. The definition and every on-demand
+    // declaration of the same function route through here, so they agree.
+    func definitionQualifier(forFile file: String) -> String {
+        weakOriginFiles.contains(file) ? "" : homeQualifier
+    }
+
     func declareFree(_ name: String) {
         let key = "f:\(name)"
         guard callables[key] == nil, let f = funcMap[name] else { return }
-        let llvmName = name == "main" ? "nomu_main" : "nomu_fn_\(name)"
-        declareCallable(key: key, llvmName: llvmName, ir: f, selfType: nil, selfByPointer: false)
+        declareCallable(key: key, llvmName: Mangle.free(name, qualifier: definitionQualifier(forFile: f.span.file)),
+                        ir: f, selfType: nil, selfByPointer: false)
     }
 
     func declareMethod(_ typeName: String, _ method: String) {
@@ -25,11 +33,10 @@ extension LLVMGen {
             fail("8.2.3: unknown method '\(typeName).\(method)'", Span(startOffset: -1, endOffset: -1, map: nil))
             return
         }
-        let sanitized = method.replacingOccurrences(of: ".", with: "_")
         // A class is a reference type: `self` is always the object pointer. A struct/enum passes
         // `self` by pointer only when the method mutates it.
         let byPointer = classMap[typeName] != nil || f.isMutating
-        declareCallable(key: key, llvmName: "nomu_m_\(typeName)_\(sanitized)",
+        declareCallable(key: key, llvmName: Mangle.method(typeName, method, qualifier: definitionQualifier(forFile: f.span.file)),
                         ir: f, selfType: typeName, selfByPointer: byPointer)
     }
 
@@ -44,7 +51,7 @@ extension LLVMGen {
         }
         let f = NOIRFunc(name: h.name, params: h.params, returnType: h.returnType,
                        body: h.body, isMutating: true, span: h.span)
-        declareCallable(key: key, llvmName: "nomu_on_\(actorName)_\(handler)",
+        declareCallable(key: key, llvmName: Mangle.actorHandler(actorName, handler, qualifier: definitionQualifier(forFile: f.span.file)),
                         ir: f, selfType: actorName, selfByPointer: true)
     }
 

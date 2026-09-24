@@ -66,6 +66,23 @@ final class LLVMGen {
     var callables: [String: Callable] = [:]
     var pending: [String] = []
 
+    // Separate compilation (task 100.4.2). `externalFuncNames` are functions imported from a
+    // dependency: a call to one emits an external declaration, resolved at link. `weakOriginFiles` are
+    // source files whose functions get weak (COMDAT-folded) linkage — the interim fix for the prelude
+    // being compiled into every module's object (proper fix: prelude-as-packages, task 100.3.7).
+    var externalFuncNames: Set<String> = []
+    var weakOriginFiles: Set<String> = []
+    // Module-path mangling (task 100.4). `homeQualifier` prefixes every symbol this module *defines*
+    // (empty for the entry/root module → bare names). An imported function's callee name is its
+    // per-origin identity (`origin@name`, task 100.2.3.2); the external-call site decodes it to the
+    // producer's mangled symbol. Prelude/runtime functions (source file in `weakOriginFiles`) stay bare —
+    // the C runtime pins those names.
+    var homeQualifier: String = ""
+    // The GC type-map globals are single extern tables the C runtime reads by name, so only one object
+    // may define them (the entry). Dependency objects skip the definition and reference it externally.
+    // (Interim: cross-module type-ids/type-map unification is a later separate-compilation task.)
+    var emitsTypeMaps = true
+
     // The LLVM function currently being emitted into (its entry block is where allocas land). Set per
     // body/thunk by whichever egress is emitting; saved/restored across nested thunk emission.
     var currentFn: LLVMValueRef?

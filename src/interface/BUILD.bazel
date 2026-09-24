@@ -1,0 +1,18 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# Module interface artifacts (`.nmi`): the body-free public surface a consumer compiles against.
+# Textual to start (bespoke binary is task 162), over a subset of the interface. See
+# design/plans/tasks/100-modules.md (100.4.1).
+swift_library(
+    name = "interface",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "interface",
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/modules"],
+    visibility = ["//visibility:public"],
+)
+
+swift_test(
+    name = "interface_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = [":interface"],
+)

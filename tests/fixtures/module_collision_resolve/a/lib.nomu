@@ -1,0 +1,4 @@
+public fun greet() -> Int { return 1 }
+public struct Val {
+    let n: Int
+}

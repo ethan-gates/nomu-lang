@@ -1,0 +1,7 @@
+// main imports only mid, yet calls util_val — reached through mid's `public import pkg/util`.
+import pkg/mid
+
+fun main() {
+    print(util_val() + mid_val())
+    print("\n")
+}

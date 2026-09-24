@@ -1,0 +1,5 @@
+// Negative (task 100.2.3.1): imports are file-scoped. other.nomu uses util_val without importing
+// pkg/util itself, so it is out of scope here even though main.nomu imports it in the same module.
+fun other() -> Int {
+    return util_val()
+}

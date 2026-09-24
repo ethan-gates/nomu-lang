@@ -378,6 +378,15 @@ enum NOIRGen {
                 s.checkVisible(name, sig.visibility, declaredIn: sig.declFile, at: span)
                 return NOIRExpr(type: .function(params: sig.params, ret: sig.ret), span: span, kind: .varRef(name))
             }
+            // An imported function referenced by value (task 100.2.3.2): resolve to its per-origin key.
+            switch s.resolveExternal(name, qualifier: nil, kind: .function, at: span) {
+            case .error: return NOIRExpr(type: .error, span: span, kind: .varRef(name))
+            case .key(let k):
+                if let sig = s.funcs[k] {
+                    return NOIRExpr(type: .function(params: sig.params, ret: sig.ret), span: span, kind: .varRef(k))
+                }
+            case .notExternal: break
+            }
             s.diags.error("undefined name '\(name)'", at: span)
             return NOIRExpr(type: .error, span: span, kind: .varRef(name))
 
@@ -397,6 +406,17 @@ enum NOIRGen {
             // Pointer static properties (task 125): `RawPtr.null`, `Ptr<T>.null`.
             if let (tn, explicit) = s.typeNameAndArgs(base), s.lookup(tn) == nil, tn == "RawPtr" || tn == "Ptr" {
                 return PointerIntrinsics.checkPointerStaticMember(&s, tn, explicit, field, span)
+            }
+            // Module-qualified value reference (task 100.2.3.2): `mod.fn` / `alias.fn`, where `mod` is an
+            // imported module qualifier in this file. Resolves to the function's per-origin key.
+            if case .ident(let q, _) = base, s.lookup(q) == nil, s.kindOf(q) == nil, s.fileQualifiers[span.file]?[q] != nil {
+                switch s.resolveExternal(field, qualifier: q, kind: .function, at: span) {
+                case .error: return NOIRExpr(type: .error, span: span, kind: .varRef(field))
+                case .key(let k): return checkExpr(&s, .ident(k, span: span), expected: expected)
+                case .notExternal:
+                    s.diags.error("module '\(q)' has no member '\(field)'", at: span)
+                    return NOIRExpr(type: .error, span: span, kind: .varRef(field))
+                }
             }
             let b = checkExpr(&s, base)
             // Pointer instance properties (task 125): `p.isNull`.
@@ -653,6 +673,24 @@ enum NOIRGen {
             return NOIRExpr(type: ret, span: span,
                           kind: .call(callee: irVar("\(tn).\(name)", calleeType, span), args: irArgs, typeArgs: []))
         }
+        // Module-qualified call (task 100.2.3.2): `mod.name(args)` / `mod.Type(args)`, where `mod` is an
+        // imported module qualifier in this file. Resolves `name` to its per-origin key (a type takes
+        // precedence — `mod.Type(...)` is construction) and re-dispatches on the key.
+        if case .member(let base, let field, _) = callee, case .ident(let q, _) = base,
+           s.lookup(q) == nil, s.kindOf(q) == nil, let mods = s.fileQualifiers[span.file]?[q] {
+            // Probe the kind without erroring (a type takes precedence — `mod.Type(...)` is construction),
+            // then resolve to the per-origin key and re-dispatch.
+            let kind: Sema.ExternalKind? = mods.contains { s.moduleTypes[$0]?.contains(field) == true } ? .type
+                : (mods.contains { s.moduleFuncs[$0]?.contains(field) == true } ? .function : nil)
+            guard let kind = kind else {
+                s.diags.error("module '\(q)' has no member '\(field)'", at: span)
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            switch s.resolveExternal(field, qualifier: q, kind: kind, at: span) {
+            case .key(let k): return checkCall(&s, callee: .ident(k, span: span), args: args, span: span, expected: expected)
+            case .error, .notExternal: return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+        }
         // `Type.member(...)` on a user type that is not a static method: a targeted diagnostic
         // instead of falling through to "undefined name 'Type'" (the type name is not a value).
         if case .member(let base, let name, _) = callee,
@@ -836,6 +874,17 @@ enum NOIRGen {
                     s.diags.error("addrOf expects a heap (reference-type) object, got '\(a.type)'", at: span)
                 }
                 return s.ptrIntrinsic("__gcObjAddr", .rawPtr, [a], span)
+            }
+            // A bare name that is not a same-module type/function may be imported (task 100.2.3.2):
+            // rewrite it to its per-origin identity so the construction/call below resolves the right
+            // module's symbol (and reports a not-imported / ambiguous / no-such-member error otherwise).
+            var name = name
+            if s.kindOf(name) == nil, s.funcs[name] == nil, s.genericArity(name) == nil {
+                switch s.externalKeyForBare(name, at: span) {
+                case .key(let k): name = k
+                case .error: return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+                case .notExternal: break
+                }
             }
             // Construction of a generic type — infer the type arguments from the fields (M5 5.2.3).
             if s.genericArity(name) != nil {

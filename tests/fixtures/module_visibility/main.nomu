@@ -1,0 +1,15 @@
+// Negative (task 100.2.5): a `public` function may not expose a lesser-visibility type in its
+// signature. `Hidden` is `internal`, so it cannot appear in the module's public API — the returned
+// type could not be carried in the module's interface.
+
+internal struct Hidden {
+    let n: Int
+}
+
+public fun leak() -> Hidden {
+    return Hidden(n: 7)
+}
+
+fun main() {
+    print(leak().n)
+}

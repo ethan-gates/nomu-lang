@@ -1,0 +1,8 @@
+// Negative (task 100.2.3.2): `greet` is exported by both a and b, so a bare use is ambiguous.
+import pkg/a
+import pkg/b
+
+fun main() {
+    print(greet())
+    print("\n")
+}

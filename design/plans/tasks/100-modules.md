@@ -63,6 +63,18 @@ Sequencing principle: **land the whole language surface on the existing whole-pr
 isolates the one hard re-architecture (separate compilation) and keeps every phase shippable and
 green. Bazel is dropped from this plan (design stays RE-ready; see scope).
 
+**Sequencing revision — separate compilation up front.** The multi-module surface is being built
+directly on separate compilation rather than on a whole-program-merge intermediate. Merging modules
+into one namespace was rejected as a scaffold: a module must only ever see another module's public
+interface, never a shared namespace. So after multi-file (100.1) and import parsing (100.2.2), the
+order becomes: **visibility tiers → minimal package manifest (package identity) → module-path mangling
+→ `.nmi` emission on a single module → consume `.nmi` for a two-module separate build.** The `.nmi`
+starts as a **textual** interface (bespoke binary is a later optimization, task 162) over a **subset**
+(non-generic public functions + public types with layouts; generics, conformances, and
+mutating/shareability facts layer in after the basic two-module link works). Module discovery + the
+acyclic graph (100.2.1) stay; the interim whole-program merge is removed when the two-module separate
+build lands.
+
 ### 100.1 — Multi-file within a module
 
 Multiple `.nomu` files in one directory compiled as one module with the implicit shared namespace.
@@ -93,10 +105,56 @@ The full import/visibility surface, still compiled whole-program (all modules, o
   enforcement.
 - 100.2.2 — Import syntax + parsing: `import path`, `import path as alias`, `pkg/…`; per-file scope.
 - 100.2.3 — Cross-module resolution: whole-module wildcard-bare, leaf-name qualifier, alias, sealed
-  transitivity; bare-name collision → qualify, leaf collision → alias (diagnostics).
-- 100.2.4 — `public import` re-export (resolution + republish into public API).
+  transitivity; bare-name collision → qualify, leaf collision → alias (diagnostics). Split into a
+  representation refactor and the resolution built on it:
+  - 100.2.3.1 — **Module representation refactor. Done.** A module is now `[SourceFile]` (path + decls +
+    imports; `ast/AST.swift`) instead of a flattened `Program`, so per-file imports survive; the
+    module-wide passes take the union view (`files.flatMap(\.decls)`). Sema builds one module-wide symbol
+    table across the files (shared namespace, unchanged) and records a **per-file import scope**
+    (`fileVisibleModules` + `externalSymbolModule`, built by the driver's `fileScopes`, following each
+    import's re-export closure). `Sema.checkImported` gates every imported (external) symbol at its use
+    site — function references/calls (`NOIRGen`), type positions (`resolve`), and construction — so an
+    imported symbol is bare-visible only in a file that imports its origin module; a use elsewhere errors
+    ("defined in module 'pkg/X' but not imported in this file"). Same-module symbols stay global.
+    Synthetic (interface-reconstructed) decls carry no file and are exempt. Tests:
+    `tests/fixtures/module_perfile_import`. This is Go's model (package = shared namespace, imports
+    file-scoped) and sets up cleaner diagnostics + later per-file incrementality.
+  - 100.2.3.2 — **Cross-module resolution. Done.** Built on the per-file scope from 100.2.3.1.
+    - *Wildcard-bare + qualified access* — bare when unambiguous; leaf-name qualifier + `as`-alias
+      (`mod.name`, `alias.name`) for functions, construction, and value references, and for **type
+      positions** (`let p: util.Point` — `TypeRef` gained a `qualifier`, the parser accepts a dotted
+      type ref). Resolved through `Sema.resolveExternal` / `.member` handling against the file's qualifier
+      bindings. Tests: `module_qualified`.
+    - *Collision resolution by qualification* (the modules.md purpose) — imported symbols carry a
+      **per-origin identity** `origin@name` (`ast/ExternalName`): the driver rewrites external decls to it
+      (functions and types, including type refs to a module's own types), Sema resolves a user reference
+      (bare-unambiguous or qualified) to that key, and codegen decodes a function's key to the producer's
+      mangled symbol (a type's key is just a distinct layout key). So two modules exporting the same name
+      coexist and `a.greet`/`b.greet` (and `a.Val`/`b.Val`, distinct layouts) resolve correctly. Bare use
+      of a colliding name → error (qualify it); leaf-name collision (two imports sharing a qualifier) →
+      error suggesting an alias (`reportLeafCollisions`). This replaced the flat symbol table for
+      externals and retired the old per-name `externalOrigin` mangling map. Tests: `module_collision`
+      (bare error), `module_leaf_collision` (leaf error), `module_collision_resolve` (funcs + types
+      resolved distinctly), plus `module_reexport`/`module_perfile_import` unchanged.
+    - Type-directed clash resolution (Swift-style) stays deferred (the "leaning" model; depends on cheap
+      inference). Sealed/cross-package rules are not live (100.3.3.1).
+- 100.2.4 — `public import` re-export (resolution + republish into public API). **Done:** a module's
+  `.nmi` records its `public import` edges (`reexports: [InterfaceRef]`, package + module path); a
+  consumer follows them transitively (`visibleModules` in the driver), unioning each re-exported
+  module's public surface into its own external decls, with each symbol keeping its **origin module's**
+  mangling qualifier — so a re-exported call links to the true producer, not the re-exporter. Resolution
+  is interface-mediated (the edge travels in the `.nmi`, so a downstream sees it without the
+  re-exporter's source). Test: `tests/fixtures/module_reexport` (main → mid → util). Re-export name
+  collisions across imports fold into cross-module resolution/diagnostics (100.2.3 / 100.2.8).
 - 100.2.5 — Visibility tiers `private`/`internal`/`package`/`public`, defaults, derived module
-  publicness; enforced across boundaries.
+  publicness; enforced across boundaries. **Done for the single-package surface:** only `public` reaches
+  a `.nmi` (so `internal`/`private` are invisible across a module by construction), and a
+  signature-consistency pass (`sema/astpass/VisibilityCheck.swift`, run pre-prelude beside
+  `checkDuplicates`) rejects a `public`/`package` declaration that exposes a lesser-visibility type in
+  its signature — the `.nmi` well-formedness guard. **Deferred to multi-package:** `package` reaching
+  same-package siblings (excluded from the `.nmi` today, so it behaves like `internal` across a module),
+  seal enforcement, and denying a foreign package a `package` symbol — none is exercisable until
+  cross-package linkage exists. That cross-boundary half is tracked as **100.3.3.1**.
 - 100.2.6 — Mangling: encode real package + relative module path, replacing the implied `main`
   (generic-arg encoding already present). Mangling is currently **spread** (9-encoding in
   `midend/sources/Monomorphize.swift`; `nomu_` construction across `llvmgen/*`); **consolidate it into
@@ -110,9 +168,21 @@ The full import/visibility surface, still compiled whole-program (all modules, o
 Package structure and the usable tool, build still whole-program internally.
 
 - 100.3.1 — Manifest in **JSON** (dependency-free in the Swift host; switch to YAML later,
-  [163](163-manifest-yaml.md)) + schema: name, version, `sealed`, `bin`, tests (deps later).
+  [163](163-manifest-yaml.md)) + schema: name, version, `sealed`, `bin`, tests (deps later). Interim
+  file name `pkg.json`; root still marked by `nomu.yaml` (both subject to change). A minimal
+  name-only manifest already loads (separate-compilation-first reorder); absent → default package
+  `main`. **Open policy:** keep open requiring a manifest and erroring when absent (drop the default)
+  once the fixtures/tooling assume one — decide when the whole suite migrates to 1 dir == 1 module.
 - 100.3.2 — Package boundary (manifest presence); workspace (root + members); package identity.
 - 100.3.3 — Seal enforcement (sealed module not importable outside package; symbols capped at package).
+  - 100.3.3.1 — **`package`-tier visibility across the package boundary** (the multi-package half of
+    100.2.5, deferred there until cross-package linkage exists). Today only `public` reaches a `.nmi`,
+    so a `package` symbol behaves like `internal` across a module — wrong once siblings compile
+    separately. When multi-package lands: emit `package` symbols into the `.nmi` **tagged with their
+    visibility**, have a consumer admit a `package` (or sealed) symbol only when it shares the producer's
+    package (deny it to a foreign package with a clear diagnostic), and fold package identity into the
+    mangling qualifier (the pending item noted in §100.4). The single-package signature-consistency
+    guard (100.2.5) already stands; this closes the cross-boundary half.
 - 100.3.4 — Entry points: `main` detection, `bin` declarations, root-`main` shorthand;
   declarations-only enforcement; ordered-eager global init in module-topological order.
 - 100.3.5 — Single-binary driver: `compile`/`build`/`run`/`test`/`query`; compile-logic-as-library;
@@ -150,6 +220,25 @@ Package structure and the usable tool, build still whole-program internally.
 ### 100.4 — Separate compilation (witness baseline)
 
 The architectural shift: module = compilation unit, compiled against interfaces, incremental.
+
+**Status (separate-compilation-first reorder):** 100.4.1 (`.nmi`, textual/subset) and the core of 100.4.2
+are built — the driver compiles each module to its own object in topological order, a consumer resolves
+and links against a dependency's serialized interface (import-scoped, public-only; non-public symbols
+are invisible by construction), and objects link into the binary. Module-path mangling is in: a
+dependency's symbols carry its module-path qualifier (`nomu_fn_<path>_<name>`, etc.), a consumer derives
+the same qualifier from the interface's `modulePath`, and the entry module plus the C-ABI prelude/runtime
+symbols stay bare (nothing imports the entry; the C runtime pins the prelude names). Two carried-forward
+**interims**:
+- **Weak prelude linkage.** The prelude is still prepended to every module, so its functions get
+  `WeakODR` linkage to fold the per-object duplicates. Proper fix: prelude-as-packages (100.3.7).
+- **Entry-only GC type maps.** The `nomu_gc_typemap_*` tables are single extern globals the C runtime
+  reads, so only the entry object emits them; dependency objects reference them externally. A
+  dependency's own heap types are therefore not yet in the map — needs **cross-module type-id / type-map
+  unification** (new sub-item under this milestone) before GC-traced types cross a module boundary.
+- **Package identity not yet in the qualifier.** The qualifier encodes the relative module path but not
+  the package name, since cross-package linkage (external-package deps via manifest aliases) is not live
+  yet. Package identity folds into `Mangle.qualifier` when that lands; today every module sits in one
+  implied package, so the module path alone is collision-safe.
 
 - 100.4.1 — `.nmi` generation: contents (signatures, type layouts, generic signatures + bounds,
   conformances, witness/value-witness layouts + GC trace metadata, mutating-ness/shareability) +

@@ -1,0 +1,7 @@
+// main.nomu imports util; the sibling other.nomu (same module) does not.
+import pkg/util
+
+fun main() {
+    print(util_val())
+    print("\n")
+}

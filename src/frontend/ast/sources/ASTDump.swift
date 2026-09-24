@@ -3,10 +3,23 @@ import support
 
 public func dumpAST(_ program: Program) -> String {
     var lines: [String] = ["Program"]
+    for imp in program.imports {
+        appendImport(imp, ind: "  ", into: &lines)
+    }
     for decl in program.decls {
         appendTopDecl(decl, ind: "  ", into: &lines)
     }
     return lines.joined(separator: "\n")
+}
+
+private func appendImport(_ imp: ImportDecl, ind: String, into lines: inout [String]) {
+    let root: String = { if case .package_(let n) = imp.root { return n } else { return "pkg" } }()
+    let full = ([root] + imp.path).joined(separator: "/")
+    var s = "Import \(full)"
+    if let alias = imp.alias { s += " as \(alias)" }
+    if imp.isPublic { s += " [public]" }
+    if imp.isTest { s += " [test]" }
+    lines.append(ind + s)
 }
 
 // MARK: - Top-level declarations

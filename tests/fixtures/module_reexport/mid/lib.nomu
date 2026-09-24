@@ -1,0 +1,7 @@
+// `public import` re-exports util's public API as part of mid's own (task 100.2.4), so a consumer of
+// mid sees `util_val` without importing util directly.
+public import pkg/util
+
+public fun mid_val() -> Int {
+    return 8
+}

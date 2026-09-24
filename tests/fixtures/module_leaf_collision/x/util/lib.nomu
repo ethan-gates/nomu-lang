@@ -1,0 +1,3 @@
+public fun xu() -> Int {
+    return 7
+}
