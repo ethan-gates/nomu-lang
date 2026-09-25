@@ -276,71 +276,110 @@ void rt_gc_write_barrier(void* obj, void* slot, void* val) {
     nomu_gc_write_barrier_post(rt_mutator, obj, slot, val);
 }
 
-// ---- GC pointer maps (M6 · 6.1.3) ----
-// Codegen emits these per program: `_data` = each type-id's `[count, off…]` concatenated,
-// `_index[id]` = that id's start in `_data`, `_count` = number of type-ids (see Lowering.swift).
-extern const int32_t nomu_gc_typemap_data[];
-extern const int32_t nomu_gc_typemap_index[];
-extern const int64_t nomu_gc_typemap_count;
-// Parallel per-type-id total object byte size (M6 · 6.2.4): `_sizes[id]` = the fixed size of every
-// object of that type (header included). Codegen emits it beside the pointer maps.
-extern const int32_t nomu_gc_typemap_sizes[];
-// Parallel per-type-id kind + array element stride (M6 stdlib · Slice 4): `_kind[id]` is 0 for a
-// fixed-size object, 1 for a variable-size array buffer; `_stride[id]` is one element's byte size for
-// an array buffer (0 otherwise). Lets the collector size/scan a buffer from its `cap`/`len`.
-extern const int32_t nomu_gc_typemap_kind[];
-extern const int32_t nomu_gc_typemap_stride[];
+// ---- GC type descriptors (task 100.4.7: link-time offset-as-id) ----
+// Every module emits a fixed-size descriptor per heap type into `__DATA,__nomu_descs` (weak, so
+// cross-module duplicates fold at link), with the variable managed-offset map out of line in
+// `__DATA,__nomu_ptrmaps`. A type-id is a descriptor's byte offset from the section start — a
+// link-resolved symbol difference stamped into object headers and VWTs — so separately compiled
+// modules never collide on id values and a dependency's types are present at the same section the
+// collector reads here. The record layout matches the codegen `gcDescType` (backend.md §4).
+typedef struct {
+    int32_t size;        // fixed object byte size (header included); 0 for an array buffer
+    int32_t stride;      // array element byte size; 0 for a fixed object
+    int32_t kind;        // 0 = fixed, 1 = array buffer
+    int32_t nptr;        // number of managed-pointer offsets in the out-of-line map
+    int32_t ptrmap_off;  // byte offset of this type's [off…] array within __nomu_ptrmaps
+    int32_t pad;
+} nomu_gc_desc;
+
+#define NOMU_GC_DESC_SIZE ((unsigned long)sizeof(nomu_gc_desc))
+
+static const uint8_t* gc_descs_base = NULL;
+static unsigned long   gc_descs_size = 0;
+static const uint8_t* gc_ptrmaps_base = NULL;
+static int gc_desc_inited = 0;
+
+static void nomu_gc_desc_init(void) {
+    if (gc_desc_inited) {
+        return;
+    }
+    gc_desc_inited = 1;
+#ifdef __APPLE__
+    unsigned long sz = 0;
+    gc_descs_base = getsectiondata(&_mh_execute_header, "__DATA", "__nomu_descs", &sz);
+    gc_descs_size = gc_descs_base ? sz : 0;
+    unsigned long psz = 0;
+    gc_ptrmaps_base = getsectiondata(&_mh_execute_header, "__DATA", "__nomu_ptrmaps", &psz);
+#endif
+}
+
+// The descriptor at byte offset `type_id`, or NULL if the offset is out of the section (a bug — every
+// live object carries a codegen-stamped offset). Lazily resolves the section bases on first use.
+static inline const nomu_gc_desc* gc_desc_at(uint64_t type_id) {
+    if (!gc_desc_inited) {
+        nomu_gc_desc_init();
+    }
+    if (!gc_descs_base || type_id + NOMU_GC_DESC_SIZE > gc_descs_size) {
+        return NULL;
+    }
+    return (const nomu_gc_desc*)(gc_descs_base + type_id);
+}
+
+// The number of descriptors = section size / record size (task 100.4.7 replaces the compile-time dense
+// count). The self-hosted collector sizes its per-type histograms from this; iteration steps by the
+// record size to recover each type-id (see `rtTryMark` / `rtCheckPayloadWord`, runtime.nomu).
+uint64_t nomu_gc_typecount(void) {
+    if (!gc_desc_inited) {
+        nomu_gc_desc_init();
+    }
+    return NOMU_GC_DESC_SIZE ? (uint64_t)(gc_descs_size / NOMU_GC_DESC_SIZE) : 0;
+}
 
 // Managed-field byte offsets for a type-id (NULL if out of range); *out_count receives the count.
 // The binding's `scan_object` and the self-check below both walk objects through this.
 const int32_t* nomu_gc_typemap(uint64_t type_id, int32_t* out_count) {
-    if (type_id >= (uint64_t)nomu_gc_typemap_count) {
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    if (!d) {
         *out_count = 0;
         return NULL;
     }
-    const int32_t* entry = &nomu_gc_typemap_data[nomu_gc_typemap_index[type_id]];
-    *out_count = entry[0];
-    return entry + 1;
+    *out_count = d->nptr;
+    return (const int32_t*)(gc_ptrmaps_base + (unsigned)d->ptrmap_off);
 }
 
-// Total object byte size for a type-id (M6 · 6.2.4). The binding's `ObjectModel::get_current_size`
-// reads this to size an object for copying — every object of a given type-id is this fixed size.
-// Returns 0 for an out-of-range id (a bug: every live object carries a codegen-assigned id).
+// Total object byte size for a type-id. The binding's `ObjectModel::get_current_size` reads this to
+// size an object for copying — every object of a given type-id is this fixed size.
 uint64_t nomu_gc_typesize(uint64_t type_id) {
-    if (type_id >= (uint64_t)nomu_gc_typemap_count) {
-        return 0;
-    }
-    return (uint64_t)nomu_gc_typemap_sizes[type_id];
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    return d ? (uint64_t)d->size : 0;
 }
 
-// Object kind for a type-id (M6 stdlib · Slice 4): 0 = fixed-size, 1 = variable-size array buffer.
-// The binding's `get_current_size`/`scan_object` branch on this.
+// Object kind for a type-id: 0 = fixed-size, 1 = variable-size array buffer.
 int32_t nomu_gc_typekind(uint64_t type_id) {
-    if (type_id >= (uint64_t)nomu_gc_typemap_count) {
-        return 0;
-    }
-    return nomu_gc_typemap_kind[type_id];
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    return d ? d->kind : 0;
 }
 
-// Array element byte stride for an array-buffer type-id (M6 stdlib · Slice 4). 0 for a fixed type.
+// Array element byte stride for an array-buffer type-id. 0 for a fixed type.
 uint64_t nomu_gc_typestride(uint64_t type_id) {
-    if (type_id >= (uint64_t)nomu_gc_typemap_count) {
-        return 0;
-    }
-    return (uint64_t)nomu_gc_typemap_stride[type_id];
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    return d ? (uint64_t)d->stride : 0;
 }
 
 // Map-walk self-check (6.1 exit): dump every type's pointer map. Gated by NOMU_GC_TYPEMAPS so it is
 // off for normal runs; a test compiles a program with known types and diffs this against expectation.
+// Iterates descriptor offsets (0, record_size, 2·record_size, …), the offset itself being the type-id.
 static void nomu_gc_dump_typemaps(void) {
-    fprintf(stderr, "typemaps: %lld\n", (long long)nomu_gc_typemap_count);
-    for (int64_t id = 0; id < nomu_gc_typemap_count; id++) {
-        int32_t n;
-        const int32_t* offs = nomu_gc_typemap((uint64_t)id, &n);
-        fprintf(stderr, "  type %lld: %llu bytes, %d managed [",
-                (long long)id, (unsigned long long)nomu_gc_typesize((uint64_t)id), n);
-        for (int32_t i = 0; i < n; i++) {
-            fprintf(stderr, "%s%d", i ? " " : "", offs[i]);
+    uint64_t n = nomu_gc_typecount();
+    fprintf(stderr, "typemaps: %llu\n", (unsigned long long)n);
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t id = i * NOMU_GC_DESC_SIZE;
+        int32_t np;
+        const int32_t* offs = nomu_gc_typemap(id, &np);
+        fprintf(stderr, "  type %llu: %llu bytes, %d managed [",
+                (unsigned long long)id, (unsigned long long)nomu_gc_typesize(id), np);
+        for (int32_t k = 0; k < np; k++) {
+            fprintf(stderr, "%s%d", k ? " " : "", offs[k]);
         }
         fprintf(stderr, "]\n");
     }

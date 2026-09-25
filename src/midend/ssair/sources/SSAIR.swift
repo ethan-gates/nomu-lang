@@ -215,12 +215,18 @@ public struct SSAFunction {
     // during a stop-the-world), so codegen elides the loop-header poll for it (SSAIRToLLVM). Seeded from
     // the subset designation at SSAIR gen; false for ordinary user code.
     public let noSafepoint: Bool
+    // Residual type parameters + bounds for an **erased** public generic (task 100.4.3.3): empty for a
+    // monomorphized function (mono substitutes them away). The backend reads the bounds to lay out the
+    // hidden PWT parameters (one per (type parameter, bound)) and to dispatch a requirement call on a
+    // `.typeParam` receiver through the matching PWT (backend.md §4).
+    public let generics: [NOIRGenericParam]
 
     public init(name: String, params: [SSAValue], returnType: Type,
-                blocks: [SSABlock], isMutating: Bool, span: Span, noSafepoint: Bool = false) {
+                blocks: [SSABlock], isMutating: Bool, span: Span, noSafepoint: Bool = false,
+                generics: [NOIRGenericParam] = []) {
         self.name = name; self.params = params; self.returnType = returnType
         self.blocks = blocks; self.isMutating = isMutating; self.span = span
-        self.noSafepoint = noSafepoint
+        self.noSafepoint = noSafepoint; self.generics = generics
     }
 }
 

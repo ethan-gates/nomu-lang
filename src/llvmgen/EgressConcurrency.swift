@@ -33,7 +33,7 @@ enum EgressConcurrency {
         // an addrspace(0) base and emits a plain store (no barrier, I7); SROA then scalar-replaces the
         // slot so its managed env field becomes a statepoint-tracked root (I5).
         let obj: LLVMValueRef = onStack ? g.e.entryAlloca(cloTy, "clo") : g.e.rtAllocManaged(LLVMConstInt(g.e.i64, 24, 0))
-        LLVMBuildStore(g.b, LLVMConstInt(g.e.i64, g.e.anyBoxTypeId(), 0), g.e.structGEP(cloTy, obj, 0))
+        LLVMBuildStore(g.b, g.e.descOffsetHeader(g.e.anyBoxTypeId()), g.e.structGEP(cloTy, obj, 0))
         LLVMBuildStore(g.b, c.fn, g.e.structGEP(cloTy, obj, 1))
         let envVal = env != nil ? g.val(env!) : LLVMConstNull(g.e.p1)
         g.e.storeField(obj, g.e.structGEP(cloTy, obj, 2), envVal)

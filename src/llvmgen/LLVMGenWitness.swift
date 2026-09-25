@@ -87,6 +87,129 @@ extension LLVMGen {
         return g
     }
 
+    // The erased-path witness table for `type: iface` (task 100.4.3.3.3): the same slot layout as
+    // `witnessInstance`, but each method/property slot holds an **erased** thunk whose self-ABI is a
+    // value-buffer pointer (addrspace 0, value at offset 0) rather than a heap box. A consumer threads
+    // this table into a cross-module bounded generic call; the producer's erased body dispatches through
+    // it with the buffer it holds. The `any I` table is left untouched, so its dispatch is unchanged.
+    func witnessInstanceErased(_ type: String, _ iface: String) -> LLVMValueRef? {
+        let key = "\(type)::\(iface)::erased"
+        if let g = witnessErasedGlobals[key] { return g }
+        guard let idef = interfaceDefs[iface] else {
+            fail("8.2.5: unknown interface '\(iface)'", zeroSpan); return nil
+        }
+        let wt = witnessType(iface)
+        let g = LLVMAddGlobal(mod, wt, "wte_\(type)_\(iface)")!
+        LLVMSetLinkage(g, LLVMInternalLinkage)
+        LLVMSetGlobalConstant(g, 1)
+        witnessErasedGlobals[key] = g   // cache before recursion into base witnesses
+
+        var vals: [LLVMValueRef?] = []
+        for m in idef.methods {
+            guard let thunk = methodThunkErased(type, iface, m) else { return nil }
+            vals.append(thunk)
+        }
+        for p in idef.properties {
+            guard let getT = propThunkErased(type, iface, p, setter: false) else { return nil }
+            vals.append(getT)
+            if p.isSettable {
+                guard let setT = propThunkErased(type, iface, p, setter: true) else { return nil }
+                vals.append(setT)
+            }
+        }
+        for base in idef.bases {
+            guard let bw = witnessInstanceErased(type, base) else { return nil }
+            vals.append(bw)
+        }
+        vals.append(LLVMConstPointerNull(i8ptr))   // type_witness (reserved)
+        LLVMSetInitializer(g, constStruct(wt, vals))
+        return g
+    }
+
+    // Bridge an erased thunk's value-buffer pointer (the value at offset 0, no box header) to the impl's
+    // `self` (task 100.4.3.3.3). POD value-type conformers only — a by-value method loads the value, a
+    // mutating one takes the buffer pointer directly. A class/actor conformer is non-POD and is rejected
+    // at the consumer's call site (the POD guardrail), so it never reaches here.
+    func bridgeErasedThunkSelf(_ valuePtr: LLVMValueRef, _ type: String, _ c: Callable) -> LLVMValueRef? {
+        if classMap[type] != nil || actorMap[type] != nil {
+            fail("100.4.3.3.3: erased requirement dispatch on a class/actor conformer is not yet supported (non-POD; awaits the GC trace map, 100.4.3.6/100.4.7)", zeroSpan)
+            return nil
+        }
+        if c.selfByPointer {
+            return valuePtr   // mutating value method: the impl takes an addrspace(0) pointer to the value
+        }
+        guard let st = selfLLVMType(type) else { return nil }
+        return LLVMBuildLoad2(b, st, valuePtr, "self")   // value at offset 0
+    }
+
+    // A uniform value-buffer-self thunk `ret(ptr self, params…)` for the erased path — the counterpart of
+    // `methodThunk`, differing only in that `self` is a value-buffer pointer (offset 0) rather than a box.
+    func methodThunkErased(_ type: String, _ iface: String, _ m: NOIRMethodReq) -> LLVMValueRef? {
+        if case .existential = m.ret {
+            fail("100.4.3.3.3: a covariant-Self requirement in a cross-module bounded generic is not yet supported", zeroSpan)
+            return nil
+        }
+        guard let retTy = llvmType(m.ret, zeroSpan) else { return nil }
+        var paramTys: [LLVMTypeRef] = [i8ptr]   // self — value-buffer pointer (addrspace 0)
+        for pt in m.params {
+            guard let t = llvmType(pt, zeroSpan) else { return nil }
+            paramTys.append(t)
+        }
+        let sname = m.name.replacingOccurrences(of: ".", with: "_")
+        let (fn, _) = emitFunction("wte_\(type)_\(iface)_\(sname)", ret: retTy, params: paramTys)
+
+        let saved = beginThunk(fn)
+        defer { endThunk(saved) }
+
+        declareMethod(type, m.name)
+        guard let c = callables["m:\(type):\(m.name)"] else { return nil }
+        guard let selfArg = bridgeErasedThunkSelf(LLVMGetParam(fn, 0)!, type, c) else { return nil }
+        var callArgs: [LLVMValueRef?] = [selfArg]
+        for i in 0..<m.params.count { callArgs.append(LLVMGetParam(fn, UInt32(i + 1))) }
+        guard let result = buildCall(c.fn, c.ty, callArgs) else { return nil }
+        if m.ret == .void { LLVMBuildRetVoid(b) } else { LLVMBuildRet(b, result) }
+        return fn
+    }
+
+    // The property counterpart of `methodThunkErased` — value-buffer self (offset 0). A stored-field-backed
+    // requirement is a direct load/store; a computed one routes through the concrete accessor.
+    func propThunkErased(_ type: String, _ iface: String, _ p: NOIRPropReq, setter: Bool) -> LLVMValueRef? {
+        guard let propTy = llvmType(p.type, zeroSpan) else { return nil }
+        var paramTys: [LLVMTypeRef] = [i8ptr]   // self — value-buffer pointer (addrspace 0)
+        if setter { paramTys.append(propTy) }
+        let slot = setter ? "\(p.name)_set" : "\(p.name)_get"
+        let (fn, _) = emitFunction("wte_\(type)_\(iface)_\(slot)",
+                                   ret: setter ? voidTy : propTy, params: paramTys)
+        let saved = beginThunk(fn)
+        defer { endThunk(saved) }
+        let valuePtr = LLVMGetParam(fn, 0)!
+
+        if let info = aggInfo(type), let pos = info.fields.firstIndex(where: { $0.name == p.name }) {
+            if info.kind == .classRef {
+                fail("100.4.3.3.3: erased property dispatch on a class conformer is not yet supported (non-POD)", zeroSpan)
+                return nil
+            }
+            let addr = structGEP(info.ty, valuePtr, fieldLLVMIndex(info.kind, pos))   // value at offset 0
+            if setter {
+                LLVMBuildStore(b, LLVMGetParam(fn, 1)!, addr)
+                LLVMBuildRetVoid(b)
+            } else {
+                LLVMBuildRet(b, LLVMBuildLoad2(b, propTy, addr, "fld"))
+            }
+            return fn
+        }
+
+        let accessor = "\(p.name).\(setter ? "set" : "get")"
+        declareMethod(type, accessor)
+        guard let c = callables["m:\(type):\(accessor)"] else { return nil }
+        guard let selfArg = bridgeErasedThunkSelf(valuePtr, type, c) else { return nil }
+        var callArgs: [LLVMValueRef?] = [selfArg]
+        if setter { callArgs.append(LLVMGetParam(fn, 1)) }
+        let result = buildCall(c.fn, c.ty, callArgs)
+        if setter { LLVMBuildRetVoid(b) } else { LLVMBuildRet(b, result!) }
+        return fn
+    }
+
     // Bridge a thunk's `payload` pointer to the impl's `self`: a by-pointer (mutating/class) method
     // takes it directly; a by-value method loads the concrete value out of it.
     func bridgeThunkSelf(_ payload: LLVMValueRef, _ type: String, _ c: Callable) -> LLVMValueRef? {
@@ -249,7 +372,7 @@ extension LLVMGen {
     // root). Default `false` — the NOIR oracle + covariant-Self thunk keep the heap box.
     func makeAnyBox(_ witness: LLVMValueRef, _ payload: LLVMValueRef, onStack: Bool = false) -> LLVMValueRef {
         let box: LLVMValueRef = onStack ? entryAlloca(anyBoxTy, "box") : rtAllocManaged(LLVMConstInt(i64, 24, 0))
-        LLVMBuildStore(b, LLVMConstInt(i64, anyBoxTypeId(), 0), structGEP(anyBoxTy, box, 0)) // header
+        LLVMBuildStore(b, descOffsetHeader(anyBoxTypeId()), structGEP(anyBoxTy, box, 0)) // header
         storeField(box, structGEP(anyBoxTy, box, 1), witness)   // witness (addrspace 0) → plain store
         storeField(box, structGEP(anyBoxTy, box, 2), payload)   // payload (managed) → write barrier (heap box only)
         return box
@@ -278,6 +401,25 @@ extension LLVMGen {
         var paramTys: [LLVMTypeRef] = [p1]   // self/payload — the managed box pointer (addrspace 1)
         paramTys.append(contentsOf: argTys)
         var callArgs: [LLVMValueRef?] = [payload]
+        for v in argVals { callArgs.append(v) }
+        return buildCall(fnPtr, fnType(retTy, paramTys), callArgs)
+    }
+
+    // The erased-generic counterpart of `witnessDispatch` (task 100.4.3.3.3; backend.md §4): the witness
+    // table is the PWT pointer passed to an erased body, and `self` is the value-buffer pointer
+    // (addrspace 0), not a heap box. The slot holds an **erased** thunk (`witnessInstanceErased`) whose
+    // self-ABI is that value pointer, so the two agree without touching the existential (`any I`) path.
+    func witnessDispatchErased(pwt: LLVMValueRef, iface: String, method: String, selfPtr: LLVMValueRef,
+                               argVals: [LLVMValueRef], argTys: [LLVMTypeRef], resultType: Type,
+                               span: Span) -> LLVMValueRef? {
+        let slot = method.replacingOccurrences(of: ".", with: "_")
+        let idx = witnessSlotIndex(iface, slot)
+        guard idx >= 0 else { fail("8.2.5: no witness slot '\(slot)' in '\(iface)'", span); return nil }
+        let fnPtr = LLVMBuildLoad2(b, i8ptr, structGEP(witnessType(iface), pwt, idx), "slot")!
+        guard let retTy = llvmType(resultType, span) else { return nil }
+        var paramTys: [LLVMTypeRef] = [i8ptr]   // self — a value-buffer pointer (addrspace 0)
+        paramTys.append(contentsOf: argTys)
+        var callArgs: [LLVMValueRef?] = [selfPtr]
         for v in argVals { callArgs.append(v) }
         return buildCall(fnPtr, fnType(retTy, paramTys), callArgs)
     }

@@ -35,6 +35,7 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
                        subsetFuncs: Set<String> = [], onStage: StageSink? = nil,
                        emitLLVMTo: String? = nil, stopAfterEgress: Bool = false,
                        requireMain: Bool = true, externalFuncNames: Set<String> = [],
+                       externalGenericSigs: [String: ExternalGenericSig] = [:],
                        weakOriginFiles: Set<String> = [], emitTypeMaps: Bool = true,
                        homeQualifier: String = "") -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
@@ -71,6 +72,7 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
     if let first = violations.first { return "SSAIR verify: \(first)" }
     let egress = SSAIRToLLVM(ctx: ctx, mod: mod)
     egress.e.externalFuncNames = externalFuncNames
+    egress.e.externalGenericSigs = externalGenericSigs
     egress.e.weakOriginFiles = weakOriginFiles
     egress.e.emitsTypeMaps = emitTypeMaps
     egress.e.homeQualifier = homeQualifier

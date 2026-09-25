@@ -34,4 +34,44 @@ final class InterfaceRoundTripTests: XCTestCase {
         ])
         XCTAssertEqual(serialize(iface), serialize(iface))
     }
+
+    // The full surface (task 100.4.1) round-trips: generic + method-bearing types, enums with labelled
+    // payloads, interfaces with method/property requirements, and generic free functions with bounds.
+    func testFullSurfaceRoundTrip() {
+        let iface = ModuleInterface(
+            package: "std",
+            modulePath: ["std"],
+            types: [
+                InterfaceType(keyword: "class", name: "Box",
+                    generics: [InterfaceGeneric(name: "T", bounds: ["Eq"], isShared: false)],
+                    fields: [InterfaceField(name: "value", type: "T", isMutable: true)],
+                    properties: [InterfaceProperty(name: "isEmpty", type: "Bool", isSettable: false)],
+                    methods: [InterfaceFunc(name: "get", params: [], ret: "T"),
+                              InterfaceFunc(name: "make", generics: [], params: [], ret: "Box<T>", isStatic: true)],
+                    conformances: ["Eq"]),
+            ],
+            enums: [
+                InterfaceEnum(name: "Option",
+                    generics: [InterfaceGeneric(name: "T", bounds: [], isShared: false)],
+                    cases: [InterfaceCase(name: "some", fields: [InterfaceField(name: "value", type: "T", isMutable: false)]),
+                            InterfaceCase(name: "none", fields: [])],
+                    methods: [InterfaceFunc(name: "isSome", params: [], ret: "Bool")]),
+            ],
+            interfaces: [
+                InterfaceProtocol(name: "Eq", refines: ["Base"],
+                    methods: [InterfaceMethodReq(name: "eq",
+                        params: [InterfaceParam(label: "other", name: "other", type: "Self")],
+                        ret: "Bool", isStatic: false, hasDefault: false)],
+                    properties: [InterfaceProperty(name: "id", type: "Int", isSettable: true)]),
+            ],
+            functions: [
+                InterfaceFunc(name: "map",
+                    generics: [InterfaceGeneric(name: "U", bounds: ["Eq", "Ord"], isShared: true)],
+                    params: [InterfaceParam(label: "x", name: "x", type: "U")], ret: "U"),
+            ])
+
+        let parsed = parseInterface(serialize(iface))
+        XCTAssertEqual(parsed, iface)
+        XCTAssertEqual(serialize(iface), serialize(iface))
+    }
 }

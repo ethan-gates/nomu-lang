@@ -1,0 +1,6 @@
+// A public generic function in a dependency module. The consumer imports it and calls it at a
+// concrete type through the erased witness-passing ABI — the producer compiled `id` once behind
+// hidden VWT / result-buffer parameters (task 100.4.3.4; ABI in internals/backend.md §4).
+public fun id<T>(x: T) -> T {
+    return x
+}

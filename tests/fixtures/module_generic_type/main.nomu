@@ -1,0 +1,15 @@
+// Import generic types from a dependency and use them at concrete instantiations (task 100.4.3.1).
+// `Box<Int>` and `Opt<Int>` are monomorphized locally by this module from the imported templates.
+import pkg/util
+
+fun main() {
+    let bi = Box(value: 42)
+    print(bi.value)              // 42
+
+    let o: Opt<Int> = .some(value: 7)
+    switch o {
+    case .some(let v): print(v)  // 7
+    case .none:        print(0)
+    }
+    print("\n")
+}

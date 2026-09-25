@@ -61,6 +61,10 @@ extension LLVMGen {
             let u = concreteUnderlying(t)
             if case .opaque = u { fail("8.2.5: opaque type with no known underlying", span); return nil }
             return llvmType(u, span)                 // `some I` is unboxed — the concrete underlying's type
+        case .typeParam:
+            return i8ptr   // an erased generic body holds a `T` value indirectly — a ptr to a caller-allocated VWT-sized buffer (backend.md §4)
+        case .generic:
+            return i8ptr   // a residual composed generic (`Box<T>`) in an erased body is likewise held by buffer; mono names concrete instantiations, so only residual ones reach here (task 100.4.3.3.4)
         default:
             fail("8.2.4: unsupported type '\(t)'", span)
             return nil

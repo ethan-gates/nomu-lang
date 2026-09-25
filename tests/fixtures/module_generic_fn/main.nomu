@@ -1,0 +1,10 @@
+// Call an imported generic function across a module boundary. `id` is compiled once (erased) in the
+// dependency; this module threads the VWT for its concrete `Int` argument and reads the result back
+// from a caller-allocated buffer (task 100.4.3.4).
+import pkg/lib
+
+fun main() {
+    let n = id(42)
+    print(n)        // 42
+    print("\n")
+}

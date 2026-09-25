@@ -123,10 +123,12 @@ fun rtTryMark(obj: RawPtr, counts: RawPtr, fp: RawPtr) -> Bool {
   if hi > 0 {
     return false
   }
-  let tid = h                              // unmarked ⇒ high bits zero ⇒ header == type-id
+  let tid = h                              // unmarked ⇒ high bits zero ⇒ header == type-id (desc offset)
   let marked = h + 4294967296
   obj.store(marked, toByteOffset: 0)
-  let slot = tid * 8
+  // `counts` is a dense per-type histogram sized by gcTypeCount(); a type-id is a descriptor byte
+  // offset (task 100.4.7), so its ordinal is the offset divided by the 24-byte record size.
+  let slot = tid / 24 * 8
   let c: Int = counts.load(fromByteOffset: slot)
   counts.store(c + 1, toByteOffset: slot)
   let oh = rtObjHash(obj, tid)
@@ -1851,9 +1853,12 @@ fun rtCheckPayloadWord() -> Int {
   var bad = 0
   var t = 0
   while t < tcount {
-    let kind = RawPtr.gcTypeKind(t)
+    // gcTypeCount() is the descriptor count; a type-id is a descriptor byte offset (task 100.4.7),
+    // so ordinal `t` maps to offset `t * 24` (the record size) for the accessor reads.
+    let off = t * 24
+    let kind = RawPtr.gcTypeKind(off)
     if kind == 0 {
-      let sz = RawPtr.gcTypeSize(t)
+      let sz = RawPtr.gcTypeSize(off)
       if sz < 16 {
         bad = bad + 1
       }

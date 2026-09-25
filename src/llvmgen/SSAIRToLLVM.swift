@@ -33,6 +33,112 @@ final class SSAIRToLLVM {
     var pendingIncomings: [(phi: LLVMValueRef, pred: LLVMBasicBlockRef, arg: SSAValue)] = []
     var spawnHandles: [Int: LLVMValueRef] = [:]    // spawn binding id → its handle alloca
 
+    // Erased generic ABI (backend.md §4), set in `defineFunction` for an erased generic (non-empty
+    // `generics`) and read when lowering its body. `curVWTParams` maps a type-parameter name to its VWT
+    // pointer parameter; `curPWTParams` maps "T::iface" to the PWT pointer parameter for that bound
+    // (used to dispatch a requirement call on a `.typeParam` receiver); `curSretParam` is the
+    // caller-allocated result buffer; `curReturnVWT` is the VWT for the returned type parameter (sizing
+    // the move memcpy). All empty/nil for a normal (fully-concrete) function.
+    var curVWTParams: [String: LLVMValueRef] = [:]
+    var curPWTParams: [String: LLVMValueRef] = [:]
+    var curSretParam: LLVMValueRef?
+    var curReturnType: Type?   // an erased function's return type (mentions a type parameter); sizes the `ret` move
+
+    // The erased ABI's PWT parameters (backend.md §4), in fixed order: one per (type parameter, bound),
+    // type parameters in declaration order and bounds name-sorted — the identical order the producer
+    // declares and the consumer threads, so they line up across the boundary.
+    private func erasedPWTs(_ f: SSAFunction) -> [(param: String, iface: String)] {
+        f.generics.flatMap { gp in gp.bounds.sorted().map { (gp.name, $0) } }
+    }
+
+    // Derived-VWT layout (task 100.4.3.3.4; backend.md §4). The value layout is the uniform 8-byte-slot
+    // model, so a composed type's size is the sum of its fields' sizes with no alignment padding, and a
+    // field's offset is the running sum of the sizes before it. A type parameter's size is read from its
+    // VWT (runtime); a concrete type's from its static slot count. Enums are deferred (their tagged
+    // layout differs); only struct-composed types are synthesized here.
+    private func erasedTypeSize(_ t: Type, _ span: Span) -> LLVMValueRef? {
+        switch t {
+        case .typeParam(let name):
+            guard let vwt = curVWTParams[name] else {
+                e.fail("100.4.3.3.4: no VWT for type parameter '\(name)'", span); return nil
+            }
+            let sizeField = e.structGEP(e.valueWitnessType(), vwt, 0)
+            let s32 = LLVMBuildLoad2(b, e.i32, sizeField, "vwtsize")
+            return LLVMBuildZExt(b, s32, e.i64, "vwtsize64")
+        case .generic(let base, let args):
+            if let s = e.structMap[base] {
+                let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
+                var total = LLVMConstInt(e.i64, 0, 0)!
+                for f in s.fields {
+                    guard let fs = erasedTypeSize(substType(f.type, subst), span) else { return nil }
+                    total = LLVMBuildAdd(b, total, fs, "sz")!
+                }
+                return total
+            }
+            if let en = e.enumMap[base] {
+                // Tagged layout: one tag word, then a payload region sized to the largest case (task
+                // 100.4.3.3.4). Each case's payload size is a prefix sum of its field sizes; the max is a
+                // runtime select chain, since a `T`-carrying case's size is only known via the VWT.
+                let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
+                var maxPayload = LLVMConstInt(e.i64, 0, 0)!
+                for c in en.cases {
+                    var caseSize = LLVMConstInt(e.i64, 0, 0)!
+                    for f in c.fields {
+                        guard let fs = erasedTypeSize(substType(f.type, subst), span) else { return nil }
+                        caseSize = LLVMBuildAdd(b, caseSize, fs, "csz")!
+                    }
+                    let bigger = LLVMBuildICmp(b, LLVMIntUGT, caseSize, maxPayload, "big")!
+                    maxPayload = LLVMBuildSelect(b, bigger, caseSize, maxPayload, "maxpl")!
+                }
+                return LLVMBuildAdd(b, LLVMConstInt(e.i64, 8, 0), maxPayload, "enumsz")!   // tag + payload
+            }
+            e.fail("100.4.3.3.4: no layout for generic '\(base)'", span); return nil
+        default:
+            return LLVMConstInt(e.i64, UInt64(e.slotCount(t) * 8), 0)
+        }
+    }
+
+    // The runtime byte offset of field `fieldIndex` in a struct-composed generic — the running sum of
+    // the sizes of the fields before it (8-byte-slot model, no padding).
+    private func erasedFieldOffset(_ composed: Type, _ fieldIndex: Int, _ span: Span) -> LLVMValueRef? {
+        guard case .generic(let base, let args) = composed, let s = e.structMap[base] else {
+            return LLVMConstInt(e.i64, 0, 0)
+        }
+        let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
+        var off = LLVMConstInt(e.i64, 0, 0)!
+        for j in 0..<min(fieldIndex, s.fields.count) {
+            guard let fs = erasedTypeSize(substType(s.fields[j].type, subst), span) else { return nil }
+            off = LLVMBuildAdd(b, off, fs, "off")!
+        }
+        return off
+    }
+
+    // The runtime byte offset of payload field `fieldIndex` of case `caseIndex` in an erased generic
+    // enum: past the tag word (offset 8), then the running sum of the case's prior field sizes.
+    private func erasedEnumPayloadOffset(_ base: String, _ args: [Type], _ caseIndex: Int, _ fieldIndex: Int, _ span: Span) -> LLVMValueRef? {
+        guard let en = e.enumMap[base], caseIndex < en.cases.count else { return LLVMConstInt(e.i64, 8, 0) }
+        let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
+        let fields = en.cases[caseIndex].fields
+        var off = LLVMConstInt(e.i64, 8, 0)!   // past the tag word
+        for j in 0..<min(fieldIndex, fields.count) {
+            guard let fs = erasedTypeSize(substType(fields[j].type, subst), span) else { return nil }
+            off = LLVMBuildAdd(b, off, fs, "poff")!
+        }
+        return off
+    }
+
+    // Substitute a composed type's template type-parameter names with its actual arguments.
+    private func substType(_ t: Type, _ s: [String: Type]) -> Type {
+        switch t {
+        case .typeParam(let p): return s[p] ?? t
+        case .generic(let b, let a): return .generic(base: b, args: a.map { substType($0, s) })
+        case .array(let e): return .array(substType(e, s))
+        case .ptr(let e): return .ptr(substType(e, s))
+        case .function(let ps, let r): return .function(params: ps.map { substType($0, s) }, ret: substType(r, s))
+        default: return t
+        }
+    }
+
     var loweredMain = false
     var error: String? { e.error }
 
@@ -110,7 +216,17 @@ final class SSAIRToLLVM {
             defineFunction(f)
         }
 
-        if e.emitsTypeMaps { e.emitTypeMaps() }
+        // Value-witness tables for monomorphized generic value-type instantiations (task 100.4.3.2;
+        // instantiation names carry `<…>`). The erased path (100.4.3.3+) additionally emits VWTs on
+        // demand for the concrete type arguments at call sites; emitting the module's generic value types
+        // here exercises the VWT capability (unreferenced ones dead-strip).
+        for name in e.structMap.keys.sorted() where name.contains("<") { e.valueWitness(.named(name, .struct_)) }
+        for name in e.enumMap.keys.sorted() where name.contains("<") { e.valueWitness(.named(name, .enum_)) }
+
+        // The link-time offset-as-id descriptor section (task 100.4.7): every module emits its own
+        // types' descriptors, weak duplicates folding at link — so a dependency's heap types are all
+        // present at the section the runtime reads via `getsectiondata`.
+        e.emitDescriptors()
         if let dib = e.di {
             LLVMDIBuilderFinalize(dib)
             LLVMDisposeDIBuilder(dib)
@@ -143,12 +259,39 @@ final class SSAIRToLLVM {
         return ("m:\(f.name.dropFirst(2))", type, byPointer, symbol)
     }
 
+    // Distinct residual type-parameter names in a function's signature, in first-appearance order
+    // (params then return). Non-empty ⇒ the function is an **erased** generic (backend.md §4): mono
+    // substitutes every type parameter away in a monomorphized decl, so a residual `.typeParam` only
+    // survives in a public generic's erased copy (100.4.3.3).
+    private func signatureTypeParams(_ f: SSAFunction) -> [String] {
+        var out: [String] = []
+        for p in f.params { collectTypeParams(p.type, into: &out) }
+        collectTypeParams(f.returnType, into: &out)
+        return out
+    }
+
+    private func collectTypeParams(_ t: Type, into out: inout [String]) {
+        switch t {
+        case .typeParam(let p): if !out.contains(p) { out.append(p) }
+        case .generic(_, let args): for a in args { collectTypeParams(a, into: &out) }
+        case .array(let e): collectTypeParams(e, into: &out)
+        case .ptr(let e): collectTypeParams(e, into: &out)
+        case .function(let ps, let r): for p in ps { collectTypeParams(p, into: &out) }; collectTypeParams(r, into: &out)
+        default: break
+        }
+    }
+
+    private func mentionsTypeParam(_ t: Type) -> Bool {
+        var tmp: [String] = []; collectTypeParams(t, into: &tmp); return !tmp.isEmpty
+    }
+
     // Create the LLVM function for `f` and register it in `callables` with the ABI-correct signature —
     // the self ABI (by-pointer for a class/actor/mutating receiver, else by value) mirrors
     // `declareCallable`, so a witness/actor thunk built later dispatches through a matching signature.
     private func declareFunction(_ f: SSAFunction) {
         let (key, selfType, byPointer, symbol) = keyAndSelf(f)
         if e.callables[key] != nil { return }
+        if !f.generics.isEmpty { declareErasedFunction(f, key: key, symbol: symbol); return }
         guard let retTy = ty(f.returnType, f.span) else { return }
         var paramTys: [LLVMTypeRef] = []
         var rest = f.params
@@ -183,18 +326,69 @@ final class SSAIRToLLVM {
                                     selfType: selfType, selfByPointer: byPointer)
     }
 
+    // Declare a public generic's **erased** copy under the witness-passing ABI (backend.md §4). Hidden
+    // leading parameters, in the fixed order: (1) one VWT pointer per type parameter, in declaration
+    // order; (2) one PWT pointer per (type parameter, bound), bounds name-sorted; (3) a result buffer
+    // (sret-style) when the return type mentions a type parameter. Then the value parameters, each
+    // `.typeParam`-typed one passed indirectly as a `ptr` to a caller-allocated buffer. A method
+    // (`m:` prefix) with residual type parameters would also need self handling — not reached, since
+    // only free generic functions are emitted erased today.
+    private func declareErasedFunction(_ f: SSAFunction, key: String, symbol: String) {
+        let returnsTP = mentionsTypeParam(f.returnType)
+        var paramTys: [LLVMTypeRef] = []
+        for _ in f.generics { paramTys.append(e.i8ptr) }        // (1) VWT pointer per type parameter
+        for _ in erasedPWTs(f) { paramTys.append(e.i8ptr) }     // (2) PWT pointer per (type parameter, bound)
+        if returnsTP { paramTys.append(e.i8ptr) }               // (3) result buffer (sret)
+        for p in f.params {                                     // value parameters (a `T` value is a ptr)
+            guard let t = ty(p.type, f.span) else { return }
+            paramTys.append(t)
+        }
+        let retTy: LLVMTypeRef
+        if returnsTP {
+            retTy = e.voidTy
+        } else {
+            guard let r = ty(f.returnType, f.span) else { return }
+            retTy = r
+        }
+        let (fn, fnTy) = e.emitFunction(symbol, ret: retTy, params: paramTys,
+                                        debug: (f.name, f.span.begin.line))
+        if e.weakOriginFiles.contains(f.span.file) { LLVMSetLinkage(fn, LLVMWeakODRLinkage) }
+        let dummy = NOIRFunc(name: f.name, params: [], returnType: f.returnType,
+                             body: [], isMutating: f.isMutating, span: f.span)
+        e.callables[key] = Callable(fn: fn, ty: fnTy, ir: dummy, selfType: nil, selfByPointer: false)
+    }
+
     // MARK: - Body
 
     private func defineFunction(_ f: SSAFunction) {
         let (key, _, _, _) = keyAndSelf(f)
         guard let c = e.callables[key] else { return }
         values = [:]; blockMap = [:]; blocksById = [:]; spawnHandles = [:]; pendingIncomings.removeAll(keepingCapacity: true)
+        curVWTParams = [:]; curPWTParams = [:]; curSretParam = nil; curReturnType = nil
         curFnName = f.name
         e.currentFn = c.fn
 
-        // Function parameters map to the LLVM parameters by position (the SSA param order — self first
-        // for a method — matches the declared signature).
-        for (i, p) in f.params.enumerated() { values[p.id] = LLVMGetParam(c.fn, UInt32(i)) }
+        // An erased generic's value parameters sit past the hidden leading parameters — VWT pointers,
+        // then PWT pointers, then an sret result buffer if the return mentions a type parameter
+        // (backend.md §4). Map the VWTs/PWTs (for requirement dispatch) and the sret + returned type
+        // parameter's VWT (so `ret` can lower the move as a VWT-sized memcpy).
+        if !f.generics.isEmpty {
+            let returnsTP = mentionsTypeParam(f.returnType)
+            let vwtCount = f.generics.count
+            let pwts = erasedPWTs(f)
+            let leading = vwtCount + pwts.count + (returnsTP ? 1 : 0)
+            for (i, gp) in f.generics.enumerated() { curVWTParams[gp.name] = LLVMGetParam(c.fn, UInt32(i)) }
+            for (i, pw) in pwts.enumerated() { curPWTParams["\(pw.param)::\(pw.iface)"] = LLVMGetParam(c.fn, UInt32(vwtCount + i)) }
+            for (i, p) in f.params.enumerated() { values[p.id] = LLVMGetParam(c.fn, UInt32(leading + i)) }
+            if returnsTP {
+                curSretParam = LLVMGetParam(c.fn, UInt32(vwtCount + pwts.count))
+                curReturnType = f.returnType   // the `ret` move sizes it via the derived VWT
+            }
+        } else {
+            // Function parameters map to the LLVM parameters by position (the SSA param order — self first
+            // for a method — matches the declared signature).
+            for (i, p) in f.params.enumerated() { values[p.id] = LLVMGetParam(c.fn, UInt32(i)) }
+        }
 
         e.enterDebugScope(c.fn, line: f.span.begin.line)
 
@@ -360,7 +554,11 @@ final class SSAIRToLLVM {
         case .extractField(let base, let idx):
             define(inst, LLVMBuildExtractValue(b, val(base), UInt32(idx), "fld"))
         case .enumTag(let base):
-            define(inst, LLVMBuildExtractValue(b, val(base), 0, "tag"))
+            if case .generic = base.type {
+                define(inst, LLVMBuildLoad2(b, e.i64, val(base), "etag"))   // tag word at offset 0 of the buffer
+            } else {
+                define(inst, LLVMBuildExtractValue(b, val(base), 0, "tag"))
+            }
         case .extractPayload(let base, let caseIndex, let fieldIndex):
             define(inst, extractPayload(base, caseIndex, fieldIndex, inst.result!.type, span))
 
@@ -405,7 +603,20 @@ final class SSAIRToLLVM {
                 LLVMAddCase(sw, LLVMConstInt(e.i64, UInt64(bitPattern: Int64(c.value)), 1), blockMap[c.target])
             }
         case .ret(let v):
-            if let v = v { LLVMBuildRet(b, val(v)) } else { LLVMBuildRetVoid(b) }
+            if let sret = curSretParam, let rt = curReturnType, let v = v {
+                // Erased return: move the value buffer into the caller's result buffer (backend.md §4),
+                // sized by the return type's derived VWT (a bare `T`, or a composed `Box<T>` summed from
+                // its field VWTs). A move is a memcpy — the source is not read again after return, so the
+                // trivial (POD) inline memcpy is sound without the indirect `move` witness.
+                guard let size64 = erasedTypeSize(rt, term.span) else { return }
+                let (memcpy, mty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
+                _ = e.buildCall(memcpy, mty, [sret, val(v), size64])
+                LLVMBuildRetVoid(b)
+            } else if let v = v {
+                LLVMBuildRet(b, val(v))
+            } else {
+                LLVMBuildRetVoid(b)
+            }
         case .unreachable:
             LLVMBuildUnreachable(b)
         }
@@ -512,6 +723,13 @@ final class SSAIRToLLVM {
     // The address of field `idx` in `base`. A struct base (a `stackAlloc` slot) GEPs at field index;
     // a class/actor/env base (a managed object pointer) GEPs past the object header (index+1).
     private func fieldSlotAddr(_ base: SSAValue, _ idx: Int, _ span: Span) -> LLVMValueRef? {
+        // A residual composed generic (`Box<T>`) is held as an opaque buffer (task 100.4.3.3.4): the
+        // field slot is the buffer pointer offset by the field's derived-VWT byte offset (0 for the
+        // first field; the running sum of prior field sizes otherwise, computed from the VWTs).
+        if case .generic = base.type {
+            guard let off = erasedFieldOffset(base.type, idx, span) else { return nil }
+            return e.gepByte(val(base), off)
+        }
         guard case .named(let name, let kind) = base.type else {
             e.fail("7.2.3: fieldAddr on a non-nominal base", span); return nil
         }
@@ -531,6 +749,27 @@ final class SSAIRToLLVM {
     }
 
     private func makeStruct(_ t: Type, _ fields: [SSAValue], _ span: Span) -> LLVMValueRef? {
+        // A residual composed generic (`Box<T>`) is built into a derived-VWT-sized stack buffer: each
+        // field is copied to its offset — a VWT-sized memcpy for a type-parameter/composed field (held
+        // by buffer), a plain store for a concrete scalar field (task 100.4.3.3.4).
+        if case .generic(let base, let args) = t, let s = e.structMap[base] {
+            guard let size = erasedTypeSize(t, span) else { return nil }
+            let buf = LLVMBuildArrayAlloca(b, e.i8, size, "erased.box")!
+            let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
+            for (i, f) in s.fields.enumerated() where i < fields.count {
+                guard let off = erasedFieldOffset(t, i, span) else { return nil }
+                let dst = e.gepByte(buf, off)
+                let ft = substType(f.type, subst)
+                if mentionsTypeParam(ft) {
+                    guard let fsize = erasedTypeSize(ft, span) else { return nil }
+                    let (memcpy, mty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
+                    _ = e.buildCall(memcpy, mty, [dst, val(fields[i]), fsize])
+                } else {
+                    LLVMBuildStore(b, val(fields[i]), dst)
+                }
+            }
+            return buf
+        }
         guard case .named(let name, _) = t, let st = e.structType(name) else {
             e.fail("7.2.3: makeStruct of non-struct", span); return nil
         }
@@ -543,6 +782,27 @@ final class SSAIRToLLVM {
 
     // Build an enum value `{ i64 tag, [P x i64] payload }` in a temp slot, then load the aggregate.
     private func makeEnum(_ t: Type, _ caseIndex: Int, _ fields: [SSAValue], _ span: Span) -> LLVMValueRef? {
+        // A residual composed generic enum (`Opt<T>`) is built into a derived-VWT-sized stack buffer: the
+        // tag word at offset 0, then each payload field copied to its offset (task 100.4.3.3.4).
+        if case .generic(let base, let args) = t, let en = e.enumMap[base], caseIndex < en.cases.count {
+            guard let size = erasedTypeSize(t, span) else { return nil }
+            let buf = LLVMBuildArrayAlloca(b, e.i8, size, "erased.enum")!
+            LLVMBuildStore(b, LLVMConstInt(e.i64, UInt64(caseIndex), 0), buf)   // tag (i64) at offset 0
+            let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
+            for (i, f) in en.cases[caseIndex].fields.enumerated() where i < fields.count {
+                guard let off = erasedEnumPayloadOffset(base, args, caseIndex, i, span) else { return nil }
+                let dst = e.gepByte(buf, off)
+                let ft = substType(f.type, subst)
+                if mentionsTypeParam(ft) {
+                    guard let fsize = erasedTypeSize(ft, span) else { return nil }
+                    let (memcpy, mty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
+                    _ = e.buildCall(memcpy, mty, [dst, val(fields[i]), fsize])
+                } else {
+                    LLVMBuildStore(b, val(fields[i]), dst)
+                }
+            }
+            return buf
+        }
         guard case .named(let name, _) = t, let et = e.enumType(name),
               let en = e.enumMap[name] else { e.fail("7.2.3: makeEnum of non-enum", span); return nil }
         let slot = e.entryAlloca(et, "enum")
@@ -560,6 +820,15 @@ final class SSAIRToLLVM {
     // Read a payload field of an enum *value*: spill it, GEP the case struct over the payload region.
     private func extractPayload(_ base: SSAValue, _ caseIndex: Int, _ fieldIndex: Int,
                                 _ fieldType: Type, _ span: Span) -> LLVMValueRef? {
+        // A residual composed generic enum (`Opt<T>`) held by buffer: the payload field is at its
+        // derived offset past the tag; a `T` field yields a buffer pointer, a concrete field a load.
+        if case .generic(let genBase, let args) = base.type {
+            guard let off = erasedEnumPayloadOffset(genBase, args, caseIndex, fieldIndex, span) else { return nil }
+            let ptr = e.gepByte(val(base), off)
+            if mentionsTypeParam(fieldType) { return ptr }
+            guard let fty = ty(fieldType, span) else { return nil }
+            return LLVMBuildLoad2(b, fty, ptr, "pl")
+        }
         guard case .named(let name, _) = base.type, let et = e.enumType(name),
               let en = e.enumMap[name], let cst = e.caseStructType(name, en.cases[caseIndex]),
               let fty = ty(fieldType, span) else { e.fail("7.2.3: extractPayload on non-enum", span); return nil }
@@ -592,10 +861,32 @@ final class SSAIRToLLVM {
     private func lowerCall(_ call: SSACall, inst: SSAInst, span: Span) {
         switch call.kind {
         case .direct(let name):
-            if let v = lowerDirectCall(name, call.args, resultType: inst.result?.type ?? .void, span: span) {
+            if let v = lowerDirectCall(name, call.args, typeArgs: call.typeArgs,
+                                       resultType: inst.result?.type ?? .void, span: span) {
                 define(inst, v)
             }
         case .witness(let receiver, let interface, let method):
+            // Erased requirement dispatch (task 100.4.3.3.3): the receiver is a `.typeParam` value held
+            // by buffer, and the witness table is the PWT parameter passed for that bound (backend.md
+            // §4) — dispatch through it with the value-buffer pointer as self, rather than the boxed
+            // existential path below.
+            if case .typeParam(let tp) = receiver.type {
+                guard let pwt = curPWTParams["\(tp)::\(interface)"] else {
+                    e.fail("100.4.3.3.3: no witness parameter for '\(tp): \(interface)'", span); return
+                }
+                var argVals: [LLVMValueRef] = []
+                var argTys: [LLVMTypeRef] = []
+                for a in call.args {
+                    guard let t = ty(a.type, span) else { return }
+                    argTys.append(t); argVals.append(val(a))
+                }
+                if let v = e.witnessDispatchErased(pwt: pwt, iface: interface, method: method, selfPtr: val(receiver),
+                                                   argVals: argVals, argTys: argTys,
+                                                   resultType: inst.result?.type ?? .void, span: span) {
+                    define(inst, v)
+                }
+                return
+            }
             let box = val(receiver)
             let witnessPtr: LLVMValueRef
             if case .composition(let ifaces) = receiver.type {
@@ -636,7 +927,7 @@ final class SSAIRToLLVM {
         }
     }
 
-    private func lowerDirectCall(_ name: String, _ args: [SSAValue], resultType: Type, span: Span) -> LLVMValueRef? {
+    private func lowerDirectCall(_ name: String, _ args: [SSAValue], typeArgs: [Type] = [], resultType: Type, span: Span) -> LLVMValueRef? {
         switch name {
         case "print":    return EgressBuiltins.emitPrint(self, args, span)
         case "putByte":  return EgressBuiltins.emitPutByte(self, args, span)
@@ -916,8 +1207,10 @@ final class SSAIRToLLVM {
             let g = LLVMGetNamedGlobal(e.mod, "__nomu_gc_ext_driver") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_gc_ext_driver")
             return LLVMBuildLoad2(b, e.i64, g, "gc.extdriver")
         case "__gcTypeCount":
-            let g = LLVMGetNamedGlobal(e.mod, "nomu_gc_typemap_count") ?? LLVMAddGlobal(e.mod, e.i64, "nomu_gc_typemap_count")
-            return LLVMBuildLoad2(b, e.i64, g, "gc.tcount")
+            // The number of descriptors = `__nomu_descs` section size / record size, resolved at run
+            // time from the linked section (task 100.4.7); no compile-time dense count exists.
+            let (fn, fty) = e.runtimeFn("nomu_gc_typecount", ret: e.i64, params: [], varArg: false)
+            return e.buildCall(fn, fty, [])
         case "__gcTypeSize":
             let (fn, fty) = e.runtimeFn("nomu_gc_typesize", ret: e.i64, params: [e.i64], varArg: false)
             return e.buildCall(fn, fty, [val(args[0])])
@@ -957,6 +1250,15 @@ final class SSAIRToLLVM {
         case "__void_timemonotonic_int": return EgressBuiltins.emitTimeMonotonic(self, args, span)
         default:
             if Builtins.cLeaf.contains(name) { return EgressBuiltins.emitCLeaf(self, name, args) }
+            // An imported *generic* function (task 100.4.3.4): call it through the erased witness-passing
+            // ABI to the producer's compiled-once symbol, threading the VWTs for the concrete type
+            // arguments — rather than the by-value signature below. Checked before the `callables`
+            // fast-path: `emitErasedExternalCall` caches the declaration under this key, so a second call
+            // to the same generic must still route here to marshal its args (not a raw by-value call).
+            if let sig = e.externalGenericSigs[name] {
+                return emitErasedExternalCall(name, sig: sig, args: args, typeArgs: typeArgs,
+                                              resultType: resultType, span: span)
+            }
             // A user free function or a method symbol — resolve the declared callable.
             let key = name.hasPrefix("m:") ? name : "f:\(name)"
             if let c = e.callables[key] {
@@ -989,6 +1291,106 @@ final class SSAIRToLLVM {
             if let v = lowerStoredAccessor(name, args, span) { return v }
             e.fail("7.2.3: unknown call target '\(name)'", span); return nil
         }
+    }
+
+    // Call an imported generic function through the erased witness-passing ABI (task 100.4.3.4;
+    // backend.md §4) — the caller half of `declareErasedFunction`. The producer compiled the generic
+    // once behind hidden leading parameters; here the consumer threads the VWTs for its concrete type
+    // arguments, boxes each `.typeParam` value into a stack buffer, and reads the result back from a
+    // caller-allocated result buffer.
+    private func emitErasedExternalCall(_ name: String, sig: ExternalGenericSig, args: [SSAValue],
+                                        typeArgs: [Type], resultType: Type, span: Span) -> LLVMValueRef? {
+        guard typeArgs.count == sig.generics.count, args.count == sig.params.count else {
+            e.fail("100.4.3.4: erased call of '\(name)' has \(typeArgs.count) type arg(s) / \(args.count) value arg(s), signature wants \(sig.generics.count) / \(sig.params.count)", span)
+            return nil
+        }
+        let returnsTP = mentionsTypeParam(sig.ret)
+
+        // The PWT arguments (task 100.4.3.3.3): one per (type parameter, bound), bounds name-sorted —
+        // the identical order the producer declares. Each is the concrete type argument's erased witness
+        // table for that bound. A bounded type argument must be POD (pointer-free): the erased buffer's
+        // GC trace map isn't wired yet (100.4.3.6/100.4.7), so a non-POD conformer can't cross soundly.
+        var pwtConformers: [(type: String, iface: String)] = []
+        for (i, bounds) in sig.bounds.enumerated() {
+            guard bounds.isEmpty || { if case .named = typeArgs[i] { return true } else { return false } }() else {
+                e.fail("100.4.3.3.3: cross-module bounded generic needs a nominal type argument, got '\(typeArgs[i])'", span)
+                return nil
+            }
+            for iface in bounds.sorted() {
+                var offsets: [Int32] = []
+                e.collectManagedOffsets(typeArgs[i], baseSlot: 0, into: &offsets)
+                guard offsets.isEmpty else {
+                    e.fail("100.4.3.3.3: cross-module generic over a non-POD type '\(typeArgs[i])' awaits the GC trace map (100.4.3.6/100.4.7); only pointer-free type arguments cross the erased boundary today", span)
+                    return nil
+                }
+                guard case .named(let tn, _) = typeArgs[i] else { return nil }
+                pwtConformers.append((tn, iface))
+            }
+        }
+
+        // The erased signature, matching the producer's `declareErasedFunction`: a VWT pointer per type
+        // parameter, then a PWT pointer per (type parameter, bound), then a result buffer when the return
+        // mentions a type parameter, then the value parameters (a `.typeParam` one indirect as a buffer
+        // pointer; a concrete one by value).
+        var paramTys: [LLVMTypeRef] = []
+        for _ in sig.generics { paramTys.append(e.i8ptr) }
+        for _ in pwtConformers { paramTys.append(e.i8ptr) }
+        if returnsTP { paramTys.append(e.i8ptr) }
+        for p in sig.params {
+            if mentionsTypeParam(p) { paramTys.append(e.i8ptr) }
+            else { guard let t = ty(p, span) else { return nil }; paramTys.append(t) }
+        }
+        let fnRetTy: LLVMTypeRef = returnsTP ? e.voidTy : (ty(resultType, span) ?? e.voidTy)
+
+        // The producer's erased symbol — its qualified name with no type-argument suffix — decoded from
+        // the callee's per-origin identity `origin@bare` (task 100.2.3.2), so this matches the definition.
+        let symbol: String
+        if let (origin, bare) = ExternalName.decode(name) {
+            symbol = Mangle.free(bare, qualifier: Mangle.qualifier(module: origin.split(separator: "/").map(String.init)))
+        } else {
+            symbol = Mangle.free(name)
+        }
+        let key = "f:\(name)"
+        let fn: LLVMValueRef, fnTy: LLVMTypeRef
+        if let c = e.callables[key] { fn = c.fn; fnTy = c.ty }
+        else {
+            let declared = e.emitFunction(symbol, ret: fnRetTy, params: paramTys)
+            e.callables[key] = Callable(fn: declared.fn, ty: declared.ty,
+                                        ir: NOIRFunc(name: name, params: [], returnType: resultType,
+                                                     body: [], isMutating: false, span: span),
+                                        selfType: nil, selfByPointer: false)
+            fn = declared.fn; fnTy = declared.ty
+        }
+
+        var callArgs: [LLVMValueRef?] = []
+        for t in typeArgs { callArgs.append(e.valueWitness(t)) }
+        for pw in pwtConformers {
+            guard let w = e.witnessInstanceErased(pw.type, pw.iface) else { return nil }
+            callArgs.append(w)
+        }
+        var resultBuf: LLVMValueRef? = nil
+        if returnsTP {
+            guard let rt = ty(resultType, span) else { return nil }
+            let buf = e.entryAlloca(rt, "erased.ret")
+            resultBuf = buf
+            callArgs.append(buf)
+        }
+        for (i, p) in sig.params.enumerated() {
+            let v = val(args[i])
+            if mentionsTypeParam(p) {
+                guard let at = ty(args[i].type, span) else { return nil }
+                let buf = e.entryAlloca(at, "erased.arg")
+                LLVMBuildStore(b, v, buf)
+                callArgs.append(buf)
+            } else {
+                callArgs.append(v)
+            }
+        }
+        let call = e.buildCall(fn, fnTy, callArgs)
+        if returnsTP, let rt = ty(resultType, span), let buf = resultBuf {
+            return LLVMBuildLoad2(b, rt, buf, "erased.res")
+        }
+        return call
     }
 
     // A stored-field-backed property accessor `m:Type:prop.get` / `m:Type:prop.set` reached as a direct

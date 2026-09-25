@@ -1247,7 +1247,7 @@ enum NOIRGen {
         let ret = s.resolve(f.returnType, opaqueOwner: "fn:\(f.name)")
         let body = withMethodScope(&s, selfType: nil, fields: [], params: params, returnType: ret, f.body)
         let irGenerics = f.generics.map { NOIRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name), isShared: $0.isShared) }
-        return NOIRFunc(name: f.name, generics: irGenerics, params: params, returnType: ret, body: body, isMutating: false, span: f.span)
+        return NOIRFunc(name: f.name, generics: irGenerics, params: params, returnType: ret, body: body, isMutating: false, visibility: f.visibility, span: f.span)
     }
 
     static func lowerActor(_ s: inout Sema, _ a: ActorDecl) -> NOIRActor {

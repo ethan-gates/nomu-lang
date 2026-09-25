@@ -209,16 +209,18 @@ public struct NOIRFunc {
     public let returnType: Type       // .void if none declared
     public let body: [NOIRStmt]
     public let isMutating: Bool       // inferred: a method that mutates `self` (M4.11); false for free functions
+    public let visibility: Visibility // a public generic function is also emitted erased (cross-module witness dispatch); internal generics stay monomorphized-only
     public let span: Span
 
     public init(name: String, generics: [NOIRGenericParam] = [], params: [NOIRParam], returnType: Type,
-                body: [NOIRStmt], isMutating: Bool, span: Span) {
+                body: [NOIRStmt], isMutating: Bool, visibility: Visibility = .internal, span: Span) {
         self.name = name
         self.generics = generics
         self.params = params
         self.returnType = returnType
         self.body = body
         self.isMutating = isMutating
+        self.visibility = visibility
         self.span = span
     }
 }

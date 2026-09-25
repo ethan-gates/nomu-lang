@@ -245,12 +245,158 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
   bespoke-binary serialization (deterministic, name-sorted, body-free).
 - 100.4.2 — Per-module compile against deps' `.nmi` (not source); codegen emits external references.
 - 100.4.3 — Cross-module generics via witness dispatch (reuse the witness baseline; no cross-module
-  specialization yet).
+  specialization yet). **Scoped below.**
+
+  *Goal / boundary.* Debug-mode witness baseline: a public generic function / type / method is compiled
+  **once** in its producer and called across a module boundary through runtime witnesses, no body
+  shipped. Intra-module generics keep monomorphizing in debug; the erased path is emitted for public
+  generics at module edges. Cross-module *specialization* (reading `.bir`, the `--mono` dial, COMDAT
+  fold) is 100.5, out of scope here. This is the first case where a generic is called without its body
+  present — today a residual generic requirement reaching codegen is a hard error
+  (`FunctionLowerer` "not resolved by monomorphization").
+
+  *Representation — Decided: value-witness tables (Swift's model, and the `modules.md` baseline).* Each
+  type parameter `T` carries type metadata (size / align + a **value-witness table**: copy / move /
+  destroy) and one **protocol witness table** per bound (`T: I`). A `T` value lives in a caller-provided
+  stack buffer sized from the VWT and is copied / moved / destroyed through VWT calls — no forced heap
+  boxing. Requirement calls dispatch through the interface witness tables already built in
+  `llvmgen/LLVMGenWitness.swift` (mature for existentials — slot layout, per-conformance globals,
+  `witnessDispatch`, uniform-self thunks; reused here). A VWT is emitted at the instantiation site (the
+  consumer, for its concrete type arguments) from layout the consumer already has; the producer's erased
+  function only receives witness pointers, so this needs little beyond the interface surface 100.4.1
+  already carries. **The concrete ABI — VWT layout, the witness-argument calling convention, indirect
+  value passing, erased-symbol mangling — is pinned in [`../../internals/backend.md`](../../internals/backend.md) §4.**
+  (The rejected alternative — reuse the existential heap box for every erased `T` — was
+  smaller to build but heap-allocates every value in debug, enlarges the GC surface, and diverges from
+  the documented value-witness baseline; release perf is identical either way via the 100.5 dial, so the
+  box shortcut bought only build speed at the cost of a later rework.)
+
+  - 100.4.3.1 — Consumer sees imported generics. **Done for generic types.** `interfaceToDecls`
+    reconstructs imported generic struct/class/enum decls (with generics + bounds); `Sema` routes an
+    imported generic type through `lowerGenericDecl` so the consumer monomorphizes its layout locally
+    from the interface (no body crosses the boundary — a type has none). Fixture `module_generic_type`
+    (imports `Box<T>` + `Opt<T>`, constructs/matches at `Int`) compiles and runs. **Deferred to the
+    erased path (100.4.3.2–.4):** generic *functions* (a body-free reconstruction would let mono clone an
+    empty body, so they stay skipped) and *methods* on imported generic types.
+  - 100.4.3.2 — Value-witness ABI. **Done (emit side).** `llvmgen/LLVMGenValueWitness.swift` defines the
+    VWT struct type and an on-demand cached per-concrete-type emitter (`vwt_<type>`, internal constant):
+    real `size`/`align` from the value layout, a POD flag set when the type holds no managed pointers
+    (memcpy copy/move + no-op destroy under the tracing GC), null copy/move/destroy pointers (trivial
+    path), and `type_id` a placeholder filled by 100.4.7.4. Monomorphized generic value-type
+    instantiations are emitted at finalization; verified via `--emit-llvm` (`vwt_Box<Int>` = size 8 POD,
+    `vwt_Opt<Int>` = size 16 POD). **Consumed by 100.4.3.3** (the erased body reads size/flags to buffer
+    and memcpy `T`); representing an opaque `T` as a caller-provided buffer is that lowering step.
+  - 100.4.3.3 — Erased generic-function lowering: lower a function with residual `.typeParam` through
+    NOIR → SSAIR → LLVM — `T` params / locals / returns as VWT-driven opaque buffers, requirement calls
+    via protocol witness dispatch, copy / move / destroy via VWT — and retire the "must be
+    monomorphized" hard-error for the erased case. **Large, cross-cutting (NOIR + mono + backend);
+    extracted to the working doc `100.4.3.3.md` at the project root** (full context + the residual-
+    `.typeParam` blast radius). Decomposition there:
+    - 100.4.3.3.1 — `NOIRFunc` carries visibility; mono emits an erased copy of each public generic
+      function (type params retained, witness/VWT params added) under the bare erased symbol.
+    - 100.4.3.3.2 — backend lowers a move-only erased body (residual `.typeParam` → opaque buffer, `T`
+      return → sret, moves → VWT-sized memcpy). Target: `public fun id<T>(x: T) -> T` emits IR-verified
+      erased code, producer-side. First milestone.
+    - 100.4.3.3.3 — requirement dispatch for bounded `T` via the PWT. **Done, POD-scoped, end-to-end.**
+      Producer: `declareErasedFunction` adds a PWT parameter per (type parameter, bound) after the VWTs
+      (bounds name-sorted); a requirement call on a `.typeParam` receiver lowers to a witness call
+      (`FunctionLowerer` resolves the bound declaring the method) that the backend dispatches through the
+      PWT parameter with the value buffer as self (`witnessDispatchErased`). Consumer: `interfaceToDecls`
+      reconstructs imported interfaces; `buildIRInterfaces` includes them so codegen has the slot layout;
+      the call threads a **value-buffer-self** witness table (`witnessInstanceErased` — dedicated erased
+      thunks, so the `any I` box-self path is untouched, protecting release dynamic-dispatch perf). Self-ABI
+      chosen as **Option 3** (separate erased thunks) over unifying the existential thunk, on GC-soundness
+      and hot-path-perf grounds. **POD guardrail:** a non-POD type argument is a clear compile error until
+      the GC trace map lands (100.4.3.6/100.4.7.4) — the erased buffer isn't yet scannable, so only
+      pointer-free type arguments cross soundly. Fixture `module_generic_bound` (`total<T: Sized>`,
+      conformer `Point` with the impl in the consumer). Deferred within .3.3.3: class/actor conformers
+      (non-POD), covariant-`Self` requirements, and importing a conformer whose method impls live in the
+      producer (needs producer-exported witness tables).
+    - 100.4.3.3.4 — `T`-field access / constructing `T`-containing values. **Done for struct-composed POD
+      types, end-to-end** (field read, construction, composed return). Mono emits each generic type
+      **template** (type parameters retained, methods stripped) so an erased body has a composed
+      `.generic` receiver's layout; `llvmType(.generic)` is an opaque buffer. **Derived-VWT synthesis**
+      (backend.md §4 open item, now built): the value layout is the uniform 8-byte-slot model, so a
+      composed type's size is the sum of its field sizes and a field's offset is the running prefix sum —
+      each field size a runtime VWT load for a `T` field, a static slot count for a concrete one
+      (`erasedTypeSize` / `erasedFieldOffset`). A field read GEPs the buffer by the derived offset; a `ret`
+      of a composed value memcpys the derived size to the sret buffer; construction allocates a
+      derived-sized buffer and copies each field to its offset. Fixtures `module_generic_field` (`Box<T>` +
+      `unwrap`) and `module_generic_compose` (`Pair<T>` + `make` construction/return + `snd` non-first
+      field). **Also fixed:** an erased-call fast-path bug — a second call to the same imported generic hit
+      the `callables` cache and lowered as a raw by-value call; the `externalGenericSigs` check now precedes
+      the cache. **Enum-composed erased types done too** (`Opt<T>`): the tagged buffer layout is a tag word
+      plus a payload sized to the largest case (a runtime max over the cases' derived sizes); construction
+      stamps the tag and copies the payload, `enumTag`/`extractPayload`/`switch` read the tag and payload
+      fields at their derived offsets, and a composed enum return memcpys the derived size. Fixtures
+      `module_generic_field`/`_compose`/`_enum`. **Deferred:** the GC-trace of a non-POD opaque `T` (couples
+      100.4.7 — the POD guardrail holds until then).
+  - 100.4.3.4 — Witness-argument ABI: pass each type parameter's metadata / VWT plus one protocol witness
+    table per bound as hidden leading parameters; the producer emits the compiled-once erased symbol, the
+    consumer emits the external call threading the witnesses for its concrete type arguments. **Done for
+    the move-only, unbounded case.** `interfaceToDecls` reconstructs imported generic functions (external,
+    body-free) so a consumer's call type-checks; Sema carries their signatures out as `ExternalGenericSig`;
+    the SSAIR→LLVM egress lowers a call to one through the erased ABI — a VWT global per concrete type
+    argument, a result buffer when the return mentions a type parameter, and each `.typeParam` value boxed
+    into a stack buffer, reading the result back after the call. Fixture `module_generic_fn` (imports
+    `id<T>`, calls at `Int`) compiles and runs, matching the whole-program result. **Deferred:** a **bounded**
+    type parameter's PWT arguments + requirement dispatch (pairs with 100.4.3.3.3), and `T`-field / `T`-value
+    construction across the boundary (pairs with 100.4.3.3.4).
+  - 100.4.3.5 — Generic methods on imported generic types (`Option.isSome()` across a boundary) — method
+    erasure atop 100.4.3.3.
+  - 100.4.3.6 — GC-trace of an opaque `T`: the type metadata / VWT carries the per-type GC trace map so a
+    tracing / moving collector scans an erased `T`'s stack buffer and heap copies. **Couples with
+    100.4.7** (cross-module type-id / type-map unification) — the same GC work from two sides; build
+    together.
+  - 100.4.3.7 (tests) — cross-module generic function, generic type, and generic method; erased output
+    matches the whole-program mono golden (same observable result).
+
+  *Residual-`.typeParam` blast radius* (the sites erased lowering must handle) is extracted to the
+  working doc **`100.4.3.3.md`** at the project root, alongside the 100.4.3.3 decomposition.
 - 100.4.4 — Link separate per-module objects + runtime.
 - 100.4.5 — Driver incremental cache: content-addressed per-module keying; interface byte-stability;
   skip unchanged modules; rebuild on interface change.
 - 100.4.6 (tests) — Incremental (body edit doesn't rebuild dependents); interface stability;
   separate-compile output matches the whole-program golden.
+- 100.4.7 — Cross-module GC type-id / type-map unification: a dependency module's heap types get stable
+  cross-module type-ids and contribute to the `nomu_gc_typemap_*` tables, so a GC-traced type crossing a
+  module boundary is scanned (closes the entry-only GC-type-map interim). Prerequisite for the full
+  prelude module; see the mini-horizon under 100.5. **Scoped below.**
+
+  *The problem, three facets.* (1) Type-ids are a **per-module dense counter from 0**
+  (`typeId(forHeapType:)` = `UInt64(typeMaps.count)`, `llvmgen/LLVMGenGCMaps.swift`), so separately-compiled
+  modules collide on id values. (2) The maps are single flat extern-global arrays
+  (`nomu_gc_typemap_data`/`index`/`sizes`/`kind`/`stride`/`count`) emitted by **exactly one object** — the
+  entry (`emitTypeMaps: false` for deps) — so a dependency's heap types never enter them. (3) The runtime
+  indexes those arrays **densely by `type_id`** (`nomu_gc_typemap(id)` bounds-checks against
+  `…_count`, `runtime.c`), and the id is stamped into the object header, where the bit budget gives it
+  only **32 bits** (mark = bit 32, forwarded = bit 33; `stdlib/runtime.nomu`) — so a global id must stay a
+  small dense integer, ruling out a 64-bit content hash or a descriptor address in the header.
+
+  *Decision — link-time offset-as-id (Go's `typeOff` model).* Each module emits its heap types'
+  **fixed-size descriptors** (`{ size, align, kind, flags, ptrmap_off }`, variable pointer-map out of
+  line) into one aggregated linker section, as COMDAT/weak symbols so duplicates fold to one. The
+  header's 32-bit type-id field holds the descriptor's **section offset** (`&desc − __start`, a
+  link-resolved symbol difference); the GC reads metadata in place at `section_base + offset`. No
+  id-numbering pass, no id→metadata tables, no per-object id namespace. *Why:* per-module compiles stay
+  hermetic — all whole-program work is confined to the link (the same mechanism as a cross-module call),
+  so it does not break Bazel — and a symbol-difference offset is PIE-clean; the rejected dense-id and
+  two-level `(module_id, local_id)` schemes both need whole-graph analysis *before* per-module codegen.
+  Fixed-size descriptors keep a dense ordinal derivable (`offset / record_size`) if anything later needs
+  one.
+
+  - 100.4.7.1 — Type descriptors: emit a fixed-size descriptor per heap type into the aggregated section
+    (COMDAT/weak), pointer-map out of line; retire the per-module dense counter and the single-object
+    flat-array emission (`emitTypeMaps`, `emitTypeMaps: false` for deps).
+  - 100.4.7.2 — Header stamp + GC read: the header holds `&desc − __start`; the GC resolves
+    `section_base + offset` and reads the descriptor in place.
+  - 100.4.7.3 — Cross-module + shared types: a consumer stamping an imported (or locally-instantiated
+    generic) type references the producer's descriptor symbol, resolved at link; shared descriptors
+    (prelude, shared instantiations) fold by symbol (couples 100.4.3.6).
+  - 100.4.7.4 — VWT `type_id` becomes the same descriptor offset (shared with 100.4.3, backend.md §4).
+  - 100.4.7.5 (tests) — a GC-traced heap type defined in a dependency, and a generic instantiation
+    crossing the boundary, are scanned / relocated correctly under forced GC (the `Tn` obligations,
+    `ssair.md`).
 - *Deliverable:* editing a module body doesn't rebuild its dependents. (Cross-module generics are
   witness-dispatched here; perf restored in 100.5.)
 
@@ -259,13 +405,72 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
 Restore monomorphized performance under separate compilation via the flag-driven dial.
 
 - 100.5.1 — `.bir` body-IR serialization (bespoke, keyed by generic id).
-- 100.5.2 — `--mono` flag + mode defaults (debug=none, release=specialize-all); flag in the cache key.
+- 100.5.2 — `--mono` flag + mode defaults (debug=none, release=a specialization spectrum along the
+  dial, not a guarantee of full monomorphization — the erased witness path can still run in release,
+  so its performance is a release-mode property); flag in the cache key.
 - 100.5.3 — Cross-module specialization: consuming module reads deps' `.bir`, specializes its used
   instances; call sites dispatch specialized vs witness.
 - 100.5.4 — Link-fold duplicate instances (COMDAT/weak symbols).
 - 100.5.5 (tests) — Release perf parity with whole-program mono (golden/perf); debug-fast and
   release-specialized both correct.
 - *Deliverable:* release recovers monomorphized performance; debug stays fast and incremental.
+
+### Mini-horizon — the full prelude module (100.3.7 dependency chain)
+
+**Goal:** `core`/`runtime`/`std` become real packages compiled once and referenced via the
+external-symbol path; `prependPrelude` + WeakODR retire; runtime-subset moves onto module membership
+(task 149). Reaching it needs the deferred half of the interface, the erased generic path, and the
+GC-map interim closed. This overlay sequences existing phases toward that one goal; it does not add
+work outside task 100.
+
+Where the prerequisites stand today: the witness *execution* path exists only for existentials (`any I`
+is a heap-boxed `{witness, payload}`, dispatched via `call .witness` in `FunctionLowerer`); generic
+**functions** are always monomorphized (`Monomorphize` specializes every instantiation, and
+`FunctionLowerer` errors if a static requirement survives to codegen). The `.nmi` is the non-generic
+subset (`interfaceToDecls` reconstructs everything as `generics: []`, no enums/methods/conformances).
+GC type maps are entry-only. So the goal is gated, in this order:
+
+1. **Complete 100.4.1 — the full `.nmi`.** Extend interface emit + the (de)serializer to carry enums,
+   methods (including on generic types), generic signatures + bounds, conformances, witness /
+   value-witness layouts, per-type GC trace metadata, and the mutating-ness / shareability facts. The
+   contract a consumer must see to use prelude generics. Prerequisite for both items below.
+
+   *Pinned conventions (internal ABI, no language surface):*
+   - **Witness-slot order.** An interface's requirement slots are keyed `name` (method), `name.get` /
+     `name.set` (property accessor) — the same keys `ModuleContext.interfaceSlots` already uses — and
+     the witness-table index is those keys in lexicographic order. The `.nmi` records the requirements
+     name-sorted; both producer and consumer derive the identical order from that one rule.
+   - **Member export.** A public type exports all of its members (methods, computed properties, enum
+     cases). A private helper method on a public type is the refinement case, left for later.
+   - **Determinism.** Enums, interfaces, methods, properties, conformances are name-sorted; generic
+     parameters, enum cases, and fields keep declared order (position / discriminant / layout are
+     significant).
+   *Deferred out of this step:* per-type layout + GC pointer-map (semantic layout info; couples with
+   100.4.7) and the mutating-ness / shareability contract facts (gate 100.4.5, not the prelude). This
+   step carries the declaration/signature surface; consuming generics across a boundary is 100.4.3.
+2. **100.4.3 — cross-module generics via witness dispatch.** Build the erased generic-function path: a
+   `fun f<T: I>` lowered once to take a witness dictionary + a value-witness table for `T` (size /
+   align / copy / move / destroy) and dispatch `T`'s requirements through it, instead of being
+   monomorphized away. Reuse the existential `.witness` execution machinery; the new ABI piece is
+   value-witnesses for stack `T`. Debug default = witnesses at module edges; specialization stays the
+   100.5 dial. This is what lets `Option`/`Result` live in a compiled-once `std`.
+3. **100.4.7 (new) — cross-module GC type-id / type-map unification.** Close the entry-only GC-type-map
+   interim: a dependency (and prelude) module's heap types get stable cross-module type-ids and
+   contribute to the `nomu_gc_typemap_*` tables, so a GC-traced type crossing a module boundary is
+   scanned. Couples with the value-witness GC-trace metadata from step 1/2, and also fixes plain
+   non-generic dependency heap types (independent of 100.4.3).
+4. **100.3.7 — prelude as packages (full), the goal.** With 1–3 in place: `core` (ambient built-in
+   types + intrinsics / FFI leaves), `runtime` (privileged, subset-by-module-membership — the task 149
+   designation swap), and `std` (`Option`/`Result`/helpers + the curated auto-imported prelude subset)
+   become real packages compiled once, referenced via the external path. Retire `prependPrelude` +
+   WeakODR. `core`-function gating (ambient vs `unsafe`) stays deferred — no new keyword surface without
+   agreement.
+
+**Dependency graph:** 100.4.1 → {100.4.3, 100.4.7} → 100.3.7. Steps 2 and 3 are coupled through
+GC-trace metadata and can be built together. Partial fallback (if the goal is deferred): the
+non-generic prelude surface — the `rt*` runtime functions plus `abs`/`max`/`min`, `Time`/`SimpleRNG`
+methods — can move to compiled-once packages on the existing external path now, keeping `Option`/`Result`
+ambient, which retires WeakODR for everything except generic instantiations.
 
 ### Source organization
 

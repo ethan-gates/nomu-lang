@@ -357,6 +357,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
                    subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames), timings: timings,
                    emitLLVM: options.llvm || options.stopAt == .llvm, stopAfterLLVM: options.stopAt == .llvm,
                    extraObjects: depObjects, externalFuncNames: semaResult.externalFuncNames,
+                   externalGenericSigs: semaResult.externalGenericSigs,
                    weakOriginFiles: preludeFiles)
     timings.report()
 }
@@ -512,6 +513,7 @@ private func compileDependency(files: [SourceFile], module: ModuleID, externalDe
     let err = emitObject(monoModule, to: objPath, optimize: options.optimize,
                          subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames),
                          requireMain: false, externalFuncNames: semaResult.externalFuncNames,
+                         externalGenericSigs: semaResult.externalGenericSigs,
                          weakOriginFiles: weakFiles, emitTypeMaps: false,
                          homeQualifier: Mangle.qualifier(module: module.components))
     if let err = err { fputs("error: \(err)\n", stderr); return nil }
@@ -526,6 +528,7 @@ private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: Strin
                             subsetFuncs: Set<String>, timings: Timings,
                             emitLLVM: Bool = false, stopAfterLLVM: Bool = false,
                             extraObjects: [String] = [], externalFuncNames: Set<String> = [],
+                            externalGenericSigs: [String: ExternalGenericSig] = [:],
                             weakOriginFiles: Set<String> = []) {
     let objPath = stem + ".o"
     // The LLVM path (SSAIR gen + passes, IR egress, LLVM opt, object emit) reports its sub-stages up
@@ -535,7 +538,8 @@ private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: Strin
     let err = emitObject(module, to: objPath, optimize: optimize, subsetFuncs: subsetFuncs,
                          onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
                          emitLLVMTo: emitLLVM ? stem + ".ll" : nil, stopAfterEgress: stopAfterLLVM,
-                         externalFuncNames: externalFuncNames, weakOriginFiles: weakOriginFiles)
+                         externalFuncNames: externalFuncNames, externalGenericSigs: externalGenericSigs,
+                         weakOriginFiles: weakOriginFiles)
     if let err = err {
         fputs("error: \(err)\n", stderr)
         timings.report()

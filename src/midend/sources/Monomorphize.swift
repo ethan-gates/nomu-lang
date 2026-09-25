@@ -8,11 +8,17 @@ import support
 // It walks the module from its concrete roots (non-generic funcs, `main`), discovers
 // generic instantiations — `.call` type arguments and `.generic` types — to a
 // worklist/fixpoint, and **clones each generic decl with its type parameters replaced
-// by concrete types**, dropping the `generics` list. The result is a fully-concrete
-// `NOIRModule`: no `.typeParam`, no `.generic`, no witness parameters in the specialized
-// decls. Codegen then emits direct calls / inline fields / no boxing through its
-// existing concrete paths — a requirement call whose receiver is now concrete simply
-// isn't taken by codegen's `.typeParam` witness-dispatch branch, so it devirtualizes.
+// by concrete types**, dropping the `generics` list. The specialized decls are
+// fully-concrete: no `.typeParam`, no `.generic`, no witness parameters. Codegen then
+// emits direct calls / inline fields / no boxing through its existing concrete paths —
+// a requirement call whose receiver is now concrete simply isn't taken by codegen's
+// `.typeParam` witness-dispatch branch, so it devirtualizes.
+//
+// The one exception: a **public** generic function is additionally emitted **erased**
+// (type parameters retained, under its bare symbol) so a consumer module can call it
+// through runtime witnesses. Its residual `.typeParam` survives into codegen, which
+// lowers it to a VWT-driven opaque buffer (cross-module generics; generics.md §6,
+// backend.md §4). Internal generics stay monomorphized-only.
 //
 // `any I` is left untouched (inherently dynamic — the explicit erasure opt-in), so the
 // witness tables / conformances / interfaces ride through unchanged.
@@ -66,6 +72,27 @@ private final class Monomorphizer {
         while !funcWork.isEmpty || !typeWork.isEmpty {
             while let w = funcWork.popLast() { specializeFunc(w.base, w.args) }
             while let w = typeWork.popLast() { specializeType(w.base, w.args) }
+        }
+        // A public generic function is also emitted **erased**, under its bare symbol, so a
+        // consumer module can call it through runtime witnesses (the debug baseline; the
+        // call-site witness-argument ABI is 100.4.3.4). Type parameters are retained: residual
+        // `.typeParam` survives into codegen, which lowers it to a VWT-driven opaque buffer.
+        // Gated to public — internal generics stay monomorphized-only (emitted above).
+        for decl in module.decls {
+            if case .funcDecl(let f) = decl, !f.generics.isEmpty, f.visibility == .public {
+                out.append(.funcDecl(f))
+            }
+        }
+        // An erased body may hold a composed generic value (`Box<T>`) by buffer and access its fields
+        // (task 100.4.3.3.4). Emit each generic type **template** (type parameters retained, methods
+        // stripped — generic-type methods are 100.4.3.5) so codegen has the field layout for such a
+        // `.generic` receiver. Its concrete LLVM struct type is never built (erased bodies hold it as an
+        // opaque buffer and index fields by VWT-derived offset), so a `T` field needs no concrete shape.
+        for (name, s) in genericStructs {
+            out.append(.structDecl(NOIRStruct(name: name, generics: s.generics, fields: s.fields, methods: [], span: s.span)))
+        }
+        for (name, e) in genericEnums {
+            out.append(.enumDecl(NOIREnum(name: name, generics: e.generics, cases: e.cases, methods: [], span: e.span)))
         }
         return NOIRModule(decls: out, interfaces: module.interfaces, conformances: module.conformances,
                         composites: module.composites, opaqueUnderlyings: module.opaqueUnderlyings)

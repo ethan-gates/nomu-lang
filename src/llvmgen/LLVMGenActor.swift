@@ -61,7 +61,8 @@ extension LLVMGen {
             collectManagedOffsets(p.type, baseSlot: slot, into: &offsets)
             slot += slotCount(p.type)
         }
-        let id = registerMap(offsets, sizeBytes: Int32(slot * 8))
+        let id = registerMap(offsets, sizeBytes: Int32(slot * 8),
+                             symbol: descSymbol("msg_\(actorName)_\(h.name)"), foldable: true)
         messageTypeIds[key] = id
         return id
     }

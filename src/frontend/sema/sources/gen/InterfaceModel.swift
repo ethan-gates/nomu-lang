@@ -64,7 +64,10 @@ enum InterfaceModel {
     // The interfaces' requirement surface, resolved to types, for witness-table layout.
     static func buildIRInterfaces(_ s: borrowing Sema) -> [NOIRInterface] {
         var out: [NOIRInterface] = []
-        for decl in s.program.decls {
+        // Own-module and imported interfaces both need a witness-table surface here: a consumer that
+        // conforms its own type to an imported interface and dispatches through it (task 100.4.3.3.3)
+        // needs the imported interface's slot layout in codegen's `interfaceDefs`.
+        for decl in s.program.decls + s.externalDecls {
             guard case .interfaceDecl(let i) = decl else { continue }
             // A non-covariant-`Self` (constraint-only) interface can't be `any I`, so it gets no
             // witness table. A covariant-only interface *does* — each `-> Self` requirement's slot

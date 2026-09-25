@@ -1,0 +1,15 @@
+// Composed generic values across a module boundary (task 100.4.3.3.4, derived-VWT layout). `make`
+// constructs a `Pair<T>` (buffer sized from T's VWT) and returns it (composed sret); `snd` reads the
+// second field at its VWT-derived offset. Compiled once (erased) here; the consumer threads T's VWT.
+public struct Pair<T> {
+    var first: T
+    var second: T
+}
+
+public fun make<T>(a: T, b: T) -> Pair<T> {
+    return Pair(first: a, second: b)
+}
+
+public fun snd<T>(p: Pair<T>) -> T {
+    return p.second
+}

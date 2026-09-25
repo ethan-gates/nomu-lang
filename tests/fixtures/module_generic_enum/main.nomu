@@ -1,0 +1,9 @@
+import pkg/lib
+
+fun main() {
+    print(getOr(wrapOpt(5), 0))   // 5
+    print("\n")
+    let n: Opt<Int> = .none
+    print(getOr(n, 9))            // 9
+    print("\n")
+}

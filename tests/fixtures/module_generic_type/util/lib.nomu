@@ -1,0 +1,10 @@
+// Public generic types in a dependency module (task 100.4.3.1). The consumer imports them and
+// monomorphizes their layout locally from the `.nmi` — no body crosses the boundary (a type has none).
+public struct Box<T> {
+    let value: T
+}
+
+public enum Opt<T> {
+    case some(value: T)
+    case none
+}

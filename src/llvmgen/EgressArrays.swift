@@ -16,10 +16,10 @@ enum EgressArrays {
         let stride = g.e.arrayElemStride(elem)
         let n = elements.count
         let handle = g.e.rtAllocManaged(LLVMConstInt(g.e.i64, 24, 0))
-        LLVMBuildStore(g.b, LLVMConstInt(g.e.i64, g.e.arrayHandleTypeId(), 0), handle)
+        LLVMBuildStore(g.b, g.e.descOffsetHeader(g.e.arrayHandleTypeId()), handle)
         LLVMBuildStore(g.b, LLVMConstInt(g.e.i64, UInt64(n), 0), g.e.gepByte(handle, LLVMConstInt(g.e.i64, 8, 0)))
         let buf = g.e.rtAllocManaged(LLVMConstInt(g.e.i64, UInt64(16 + n * stride), 0))
-        LLVMBuildStore(g.b, LLVMConstInt(g.e.i64, g.e.arrayBufTypeId(elem), 0), buf)
+        LLVMBuildStore(g.b, g.e.descOffsetHeader(g.e.arrayBufTypeId(elem)), buf)
         LLVMBuildStore(g.b, LLVMConstInt(g.e.i64, UInt64(n), 0), g.e.gepByte(buf, LLVMConstInt(g.e.i64, 8, 0)))
         for (i, el) in elements.enumerated() {
             g.e.storeField(buf, g.e.gepByte(buf, LLVMConstInt(g.e.i64, UInt64(16 + i * stride), 0)), g.val(el))
@@ -82,7 +82,7 @@ enum EgressArrays {
         let newCap = LLVMBuildSelect(g.b, isZero, LLVMConstInt(g.e.i64, 4, 0), dbl, "app.newcap")!
         let newBytes = LLVMBuildAdd(g.b, LLVMConstInt(g.e.i64, 16, 0), LLVMBuildMul(g.b, newCap, strideV, "app.nb"), "app.bytes")!
         let newBuf = g.e.rtAllocManaged(newBytes)
-        LLVMBuildStore(g.b, LLVMConstInt(g.e.i64, g.e.arrayBufTypeId(elem), 0), newBuf)
+        LLVMBuildStore(g.b, g.e.descOffsetHeader(g.e.arrayBufTypeId(elem)), newBuf)
         LLVMBuildStore(g.b, newCap, g.e.gepByte(newBuf, LLVMConstInt(g.e.i64, 8, 0)))
         let copyBytes = LLVMBuildMul(g.b, len, strideV, "app.copy")!
         let (memcpy, mty) = g.e.runtimeFn("memcpy", ret: g.e.i8ptr, params: [g.e.i8ptr, g.e.i8ptr, g.e.i64], varArg: false)

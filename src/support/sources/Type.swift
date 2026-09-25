@@ -54,3 +54,20 @@ extension Type: CustomStringConvertible {
         }
     }
 }
+
+// The signature of an imported generic function (task 100.4.3.4; ABI in internals/backend.md §4): its
+// type-parameter names in declaration order, the interface bounds per type parameter (parallel to
+// `generics`), its (possibly `.typeParam`-carrying) parameter types, and its return type. A consumer
+// emits a call through the erased witness-passing ABI — a VWT pointer per type parameter, then a PWT
+// pointer per (type parameter, bound) with bounds in sorted order, then a result buffer when the return
+// mentions a type parameter, then the value parameters (a `.typeParam` one passed by buffer pointer).
+public struct ExternalGenericSig {
+    public let generics: [String]
+    public let bounds: [[String]]
+    public let params: [Type]
+    public let ret: Type
+    public init(generics: [String], bounds: [[String]], params: [Type], ret: Type) {
+        self.generics = generics; self.bounds = bounds; self.params = params; self.ret = ret
+    }
+    public var bounded: Bool { bounds.contains { !$0.isEmpty } }
+}

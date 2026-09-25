@@ -71,6 +71,9 @@ final class LLVMGen {
     // source files whose functions get weak (COMDAT-folded) linkage — the interim fix for the prelude
     // being compiled into every module's object (proper fix: prelude-as-packages, task 100.3.7).
     var externalFuncNames: Set<String> = []
+    // Imported generic functions (task 100.4.3.4): a call emits the erased witness-passing ABI to the
+    // producer's compiled-once symbol, keyed by the callee's per-origin identity.
+    var externalGenericSigs: [String: ExternalGenericSig] = [:]
     var weakOriginFiles: Set<String> = []
     // Module-path mangling (task 100.4). `homeQualifier` prefixes every symbol this module *defines*
     // (empty for the entry/root module → bare names). An imported function's callee name is its
@@ -96,8 +99,18 @@ final class LLVMGen {
     var witnessSlotsCache: [String: [String]] = [:]
     var witnessTypes: [String: LLVMTypeRef] = [:]
     var witnessGlobals: [String: LLVMValueRef] = [:]
+    // Erased-path witness instances (task 100.4.3.3.3): value-buffer-self thunks for a conformer threaded
+    // into a cross-module bounded generic call, keyed `type::iface::erased`. Distinct from the `any I`
+    // table above so the existential dispatch stays untouched.
+    var witnessErasedGlobals: [String: LLVMValueRef] = [:]
     var compositeTypes: [String: LLVMTypeRef] = [:]
     var compositeGlobals: [String: LLVMValueRef] = [:]
+
+    // Value-witness tables (task 100.4.3.2; ABI in internals/backend.md §4). `valueWitnessTy` is the
+    // shared VWT struct type; `valueWitnessGlobals` caches the per-concrete-type instance, keyed by the
+    // type's description. Built lazily on demand (an erased generic body / call site references one).
+    var valueWitnessTy: LLVMTypeRef?
+    var valueWitnessGlobals: [String: LLVMValueRef] = [:]
 
     // M6 · 6.4 actor mailbox. `msgPrefixTypeRef` is the shared message prefix; `messageTypes`/
     // `messageTypeIds` are the per-handler message struct + its type-id; `actorThunks` the per-handler
@@ -126,7 +139,13 @@ final class LLVMGen {
     var typeSizes: [Int32] = []
     var typeKinds: [Int32] = []
     var typeStrides: [Int32] = []
+    // Parallel to `typeMaps`: each registered type's stable descriptor symbol (`nomu_gc_desc_*`) and
+    // whether it folds across modules (weak `linkonce_odr`) or is a program-local shape (`internal`).
+    // Drives the link-time offset-as-id descriptor section (task 100.4.7); the flat tables above are
+    // the interim representation, retired once the runtime reads descriptors.
+    var typeSymbols: [(name: String, foldable: Bool)] = []
     var arrayBufMapIds: [String: UInt64] = [:]   // element-type description → array-buffer type-id
+    var valueDescIds: [String: UInt64] = [:]     // type description → value-layout descriptor id (VWT type_id, 100.4.7.4)
     var anyBoxMapId: UInt64?                      // one shared map for every `any I` box (payload at byte 16)
     var arrayHandleMapId: UInt64?                 // one shared type-id for every Array handle (bufptr at byte 16)
     var mailboxTypeId: UInt64?                    // one shared type-id for every mailbox object

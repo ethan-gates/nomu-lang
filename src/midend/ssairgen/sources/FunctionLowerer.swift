@@ -54,6 +54,10 @@ final class FunctionLowerer {
     // (a slot for a value receiver, a scalar pointer for a class receiver).
     private struct SelfCtx { let typeName: String; let kind: NamedKind; let fields: [NOIRField] }
     private var currentSelf: SelfCtx?
+    // The enclosing function's type parameters + bounds (empty unless it is an erased public generic,
+    // task 100.4.3.3): used to resolve a requirement call on a `.typeParam` receiver to the bound that
+    // declares the method, so it lowers to a witness dispatch.
+    private var currentGenerics: [NOIRGenericParam] = []
 
     init(diags: DiagnosticSink, ctx: ModuleContext, sink: ClosureSink, subsetFuncs: Set<String> = []) {
         self.diags = diags
@@ -64,6 +68,7 @@ final class FunctionLowerer {
     }
 
     func lower(_ f: NOIRFunc) -> SSAFunction? {
+        currentGenerics = f.generics
         let params = beginFunction(f)
         return finishFunction(f, params: params, name: f.name)
     }
@@ -125,7 +130,7 @@ final class FunctionLowerer {
         if diags.hasErrors { return nil }
         return SSAFunction(name: name, params: params, returnType: f.returnType,
                            blocks: blocks, isMutating: f.isMutating, span: f.span,
-                           noSafepoint: subsetFuncs.contains(f.name))
+                           noSafepoint: subsetFuncs.contains(f.name), generics: f.generics)
     }
 
     // MARK: Builder primitives
@@ -557,6 +562,14 @@ final class FunctionLowerer {
             return lowerWitnessCall(receiver: receiver, interface: ctx.compositionOwner(ifaces, method),
                                     method: method, args: args, type: type, span: span)
         }
+        // A requirement call on a bounded type parameter `T: I` in an erased body (task 100.4.3.3.3):
+        // dispatch through the bound whose interface declares the method — the backend routes it to the
+        // PWT parameter for that (T, I). The abstract witness call carries the type-param receiver value.
+        if case .typeParam(let tp) = receiver.type,
+           let gp = currentGenerics.first(where: { $0.name == tp }),
+           let bound = gp.bounds.first(where: { ctx.interfaceDeclares($0, method) }) {
+            return lowerWitnessCall(receiver: receiver, interface: bound, method: method, args: args, type: type, span: span)
+        }
         // `some I` devirtualizes to its concrete underlying.
         var recvType = receiver.type
         if case .opaque(_, let owner) = recvType, let u = ctx.opaqueUnderlyings[owner] { recvType = u }
@@ -659,6 +672,16 @@ final class FunctionLowerer {
     // A stored-field read. A struct base is a value → `extractField`; a class/actor base is a managed
     // pointer → `fieldAddr` + `load`.
     private func lowerFieldRead(base: NOIRExpr, field: String, type: Type, span: Span) -> SSAValue? {
+        // A residual composed generic (`Box<T>`) in an erased body is held by buffer (task 100.4.3.3.4).
+        // Field access yields a buffer pointer to the field's bytes — the backend GEPs by the field's
+        // offset (offset 0 for the first field; a later field's VWT-derived offset is deferred). The T
+        // value the field holds is itself represented by that buffer pointer.
+        if case .generic(let baseName, _) = base.type {
+            guard let idx = ctx.fieldIndex(baseName, .struct_, field), let baseV = lowerExpr(base) else {
+                fail("field access '\(field)' on generic '\(baseName)'", span); return nil
+            }
+            return emit(.fieldAddr(base: baseV, fieldIndex: idx), type, span)
+        }
         guard case .named(let typeName, let kind) = base.type,
               let idx = ctx.fieldIndex(typeName, kind, field) else {
             fail("field access on a non-aggregate '\(field)'", span); return nil
@@ -686,6 +709,23 @@ final class FunctionLowerer {
     // declared order, matched to the labelled constructor arguments (or, for an actor field, its
     // declared initializer).
     private func lowerConstruct(typeName: String, args: [NOIRArg], type: Type, span: Span) -> SSAValue? {
+        // Constructing a residual composed generic (`Box<T>`) in an erased body: build the field values
+        // in declared order (from the type template's layout) and emit `makeStruct` over the `.generic`
+        // type — the backend allocates a derived-VWT-sized buffer and copies each field to its offset
+        // (task 100.4.3.3.4). Enum construction (`Opt.some(x)`) is deferred (tagged layout).
+        if case .generic(let base, _) = type {
+            guard let fields = ctx.fields(base, .struct_) else {
+                fail("100.4.3.3.4: constructing generic '\(base)' in an erased body is deferred (only struct-composed types are synthesized; enums pending)", span); return nil
+            }
+            var vals: [SSAValue] = []
+            for f in fields {
+                guard let arg = args.first(where: { $0.label == f.name }), let v = lowerExpr(arg.value) else {
+                    fail("missing field '\(f.name)' constructing '\(base)'", span); return nil
+                }
+                vals.append(v)
+            }
+            return emit(.makeStruct(type, fields: vals), type, span)
+        }
         guard case .named(_, let kind) = type else { fail("cannot construct '\(typeName)'", span); return nil }
 
         if kind == .actor_ {
@@ -896,9 +936,12 @@ final class FunctionLowerer {
     // block per arm (exhaustive upstream, so the default is `unreachable`). Each arm extracts its
     // payload fields off the subject value and lowers its body, branching to a shared merge block.
     private func lowerSwitch(_ sw: NOIRSwitch, _ span: Span) {
-        guard case .named(let enumName, .enum_) = sw.subject.type, ctx.enumCases[enumName] != nil else {
-            fail("switch subject must be a concrete enum", sw.subject.span); return
-        }
+        // A concrete enum (`.named`) or a residual composed generic enum (`.generic`, in an erased body —
+        // task 100.4.3.3.4) held by buffer; both key their case table by the enum's declared name.
+        let enumName: String
+        if case .named(let n, .enum_) = sw.subject.type, ctx.enumCases[n] != nil { enumName = n }
+        else if case .generic(let base, _) = sw.subject.type, ctx.enumCases[base] != nil { enumName = base }
+        else { fail("switch subject must be an enum", sw.subject.span); return }
         guard let subjVal = lowerExpr(sw.subject) else { return }
         let tag = emit(.enumTag(subjVal), .int, span)
 

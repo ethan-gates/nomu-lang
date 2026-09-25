@@ -1,0 +1,13 @@
+// A public generic function is emitted **erased** — type parameters retained, a `T` value held by
+// VWT-sized opaque buffer — so a consumer module can call it through runtime witnesses (task
+// 100.4.3.3; ABI in internals/backend.md §4). This module has no caller yet (the call-site
+// witness-argument ABI is 100.4.3.4), so the erased `id` is exercised producer-side: it is emitted
+// and passes the pipeline's LLVM verifier at compile time. `main` prints a fixed value; the point of
+// the case is that compiling the erased body succeeds.
+public fun id<T>(x: T) -> T {
+    return x
+}
+
+fun main() {
+    print("42\n")
+}

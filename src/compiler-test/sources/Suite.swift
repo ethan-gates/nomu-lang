@@ -48,24 +48,43 @@ final class Suite {
     }
 
     // Dispatch the run matrix across the pool. Returns false if the suite-level deadline fires.
+    //
+    // Each case's lane is acquired **before** it is dispatched — not inside the async block.
+    // `DispatchQueue.global().async` eagerly spins up a worker thread for every block that then blocks,
+    // so acquiring inside would leave N blocked threads and, past libdispatch's worker soft limit
+    // (~80), starve the pool: the running cases can't get a thread for their own pipe I/O / timeout
+    // timer, never release a lane, and the whole run deadlocks. Acquiring first bounds live async
+    // blocks to the pool capacity regardless of case count; the unreached tail is the "queue", held
+    // back by the producer parking in `acquire`. Admission is then strictly LPT-ordered.
+    //
+    // The producer runs off the calling thread so the `group.wait` deadline backstop still fires even
+    // if the producer parks in `acquire` (a wedged case that never releases a lane). A held enter/leave
+    // pair spans the whole dispatch loop so `wait` cannot observe a momentarily-empty group between
+    // dispatches and return early.
     private func runPhase(_ selected: [ResolvedCase]) -> Bool {
         let runner = CaseRunner(ctx: ctx)
         let group = DispatchGroup()
         progress.beginPhase("running", total: selected.count)
-        for c in selected {
-            let weight = max(1, c.weight)
-            DispatchQueue.global().async(group: group) {
-                self.gate.acquire(weight); defer { self.gate.release(weight) }
-                self.progress.start(c.name)
-                let r = runner.run(c, compile: self.cache.result(for: c.compileKey))
-                self.resultsLock.lock(); self.results.append(r); self.resultsLock.unlock()
-                // On a TTY, stream each case as it finishes (above the live status line). Off a TTY the
-                // batch report prints a sorted, deterministic list at the end instead.
-                if self.progress.interactive {
-                    self.progress.logLine(r.line())
-                    for line in r.detail { self.progress.logLine(line) }
+        group.enter()
+        DispatchQueue.global().async {
+            defer { group.leave() }
+            for c in selected {
+                let weight = max(1, c.weight)
+                self.gate.acquire(weight)
+                group.enter()
+                DispatchQueue.global().async {
+                    defer { group.leave(); self.gate.release(weight) }
+                    self.progress.start(c.name)
+                    let r = runner.run(c, compile: self.cache.result(for: c.compileKey))
+                    self.resultsLock.lock(); self.results.append(r); self.resultsLock.unlock()
+                    // On a TTY, stream each case as it finishes (above the live status line). Off a TTY the
+                    // batch report prints a sorted, deterministic list at the end instead.
+                    if self.progress.interactive {
+                        self.progress.logLine(r.line())
+                        for line in r.detail { self.progress.logLine(line) }
+                    }
+                    self.progress.finishCase(c.name, r.status)
                 }
-                self.progress.finishCase(c.name, r.status)
             }
         }
         let backstop = DispatchTime.now() + .milliseconds(Int(ctx.deadline * 1000))

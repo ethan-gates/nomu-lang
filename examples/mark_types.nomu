@@ -17,8 +17,11 @@ class Node {
 // Dump every registered type-id's (size, managed-offset map), one line each, read entirely from Nomu.
 fun dumpTypes() {
   let count = RawPtr.gcTypeCount()
-  var id = 0
-  while id < count {
+  var ord = 0
+  while ord < count {
+    // A type-id is a descriptor byte offset (task 100.4.7); ordinal `ord` maps to `ord * 24` (the
+    // record size), matching the C NOMU_GC_TYPEMAPS dump the differential diffs against.
+    let id = ord * 24
     let size = RawPtr.gcTypeSize(id)
     let nptr = RawPtr.gcTypeNumPtrs(id)
     print("TYPE ")
@@ -35,7 +38,7 @@ fun dumpTypes() {
       i = i + 1
     }
     print("\n")
-    id = id + 1
+    ord = ord + 1
   }
 }
 

@@ -174,7 +174,7 @@ private final class MutationAnalyzer {
         func ann(_ typeName: String, _ ms: [NOIRFunc]) -> [NOIRFunc] {
             ms.map { m in
                 NOIRFunc(name: m.name, generics: m.generics, params: m.params, returnType: m.returnType, body: m.body,
-                       isMutating: mutating.contains(methodKey(typeName, m.name)), span: m.span)
+                       isMutating: mutating.contains(methodKey(typeName, m.name)), visibility: m.visibility, span: m.span)
             }
         }
         let decls: [NOIRDecl] = module.decls.map { decl in

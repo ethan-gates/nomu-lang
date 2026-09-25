@@ -1,0 +1,10 @@
+// A public generic wrapper type and a function reading its `T` field, compiled once (erased) in this
+// dependency. The consumer builds a concrete `Box<Int>` and passes it by buffer; the erased `unwrap`
+// reads the field at its VWT-derived offset (offset 0 here) into the result buffer (task 100.4.3.3.4).
+public struct Box<T> {
+    var value: T
+}
+
+public fun unwrap<T>(b: Box<T>) -> T {
+    return b.value
+}

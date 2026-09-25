@@ -9,6 +9,7 @@ public struct SemaResult {
     public let module: NOIRModule
     public let diagnostics: DiagnosticSink
     public var externalFuncNames: Set<String> = []   // imported functions; codegen declares, not defines
+    public var externalGenericSigs: [String: ExternalGenericSig] = [:]   // imported generic funcs (task 100.4.3.4)
 }
 
 public struct Sema {
@@ -90,6 +91,10 @@ public struct Sema {
     // declaration for these, not a definition.
     var externalFuncNames: Set<String> = []
 
+    // Signatures of imported *generic* functions (task 100.4.3.4): codegen emits a call through the
+    // erased witness-passing ABI to the producer's compiled-once symbol.
+    var externalGenericSigs: [String: ExternalGenericSig] = [:]
+
     // Per-file import scope (tasks 100.2.3.1/100.2.3.2). Imports are file-scoped: an imported (external)
     // symbol is bare-visible only in a file that imports its origin module (directly or via a re-export).
     // `fileVisibleModules[file]` = the module paths a file may reference bare; `fileQualifiers[file][q]` =
@@ -149,7 +154,12 @@ public struct Sema {
         // declarations resolved at link (task 100.4.2).
         for decl in externalDecls {
             switch decl {
-            case .structDecl, .enumDecl, .classDecl, .actorDecl:
+            case .structDecl, .enumDecl, .classDecl:
+                // An imported *generic* type lowers through the same generic path as an own-module one
+                // (task 100.4.3.1), so the consumer monomorphizes its layout locally from the interface.
+                if isGenericType(decl) { decls.append(NOIRGen.lowerGenericDecl(&self, decl)) }
+                else { decls.append(NOIRGen.lowerDecl(&self, decl)) }
+            case .actorDecl:
                 decls.append(NOIRGen.lowerDecl(&self, decl))
             default: break
             }
@@ -167,7 +177,8 @@ public struct Sema {
             diags.error("cannot call mutating method on an immutable value — the receiver must be a 'var'", at: site.span)
         }
         checkRuntimeSubset(mutation.module, designated: subsetFuncs, into: diags)
-        return SemaResult(module: mutation.module, diagnostics: diags, externalFuncNames: externalFuncNames)
+        return SemaResult(module: mutation.module, diagnostics: diags, externalFuncNames: externalFuncNames,
+                          externalGenericSigs: externalGenericSigs)
     }
 
     // MARK: - Global collection
@@ -214,11 +225,18 @@ public struct Sema {
         for decl in externalDecls {
             guard case .funcDecl(let f) = decl else { continue }
             let saved = genericScope; genericScope = Set(f.generics.map(\.name))
-            funcs[f.name] = FnSig(params: f.params.map { resolve($0.type) },
-                                  ret: resolve(f.returnType, opaqueOwner: "fn:\(f.name)"),
+            let extParams = f.params.map { resolve($0.type) }
+            let extRet = resolve(f.returnType, opaqueOwner: "fn:\(f.name)")
+            funcs[f.name] = FnSig(params: extParams, ret: extRet,
                                   generics: f.generics,
                                   visibility: f.visibility, declFile: f.span.file, isExternal: true)
             externalFuncNames.insert(f.name)
+            if !f.generics.isEmpty {
+                externalGenericSigs[f.name] = ExternalGenericSig(
+                    generics: f.generics.map(\.name),
+                    bounds: f.generics.map { $0.bounds.map(\.name) },
+                    params: extParams, ret: extRet)
+            }
             genericScope = saved
         }
         // Computed-property tables need the type dicts above populated first (a property

@@ -1,0 +1,7 @@
+import pkg/lib
+
+fun main() {
+    let b = Box(value: 42)
+    print(unwrap(b))   // 42
+    print("\n")
+}

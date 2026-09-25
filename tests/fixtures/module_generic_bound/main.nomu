@@ -1,0 +1,17 @@
+// Conform a local (POD) type to an imported interface and pass it to an imported bounded generic. The
+// consumer emits a value-buffer witness table for `Point: Sized` and threads it, plus the VWT for
+// `Point`, into the erased `total`; the requirement call dispatches back through that table (100.4.3.3.3).
+import pkg/lib
+
+struct Point: Sized {
+    var x: Int
+    var y: Int
+    fun size() -> Int {
+        return x + y
+    }
+}
+
+fun main() {
+    print(total(Point(x: 1, y: 2)))   // 3
+    print("\n")
+}

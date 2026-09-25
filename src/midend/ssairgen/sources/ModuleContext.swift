@@ -39,4 +39,10 @@ struct ModuleContext {
     func compositionOwner(_ ifaces: [String], _ method: String) -> String {
         ifaces.first { interfaceSlots[$0]?.contains(method) ?? false } ?? ifaces.first ?? "?"
     }
+
+    // Whether `iface` declares a requirement named `method` (task 100.4.3.3.3): picks the bound of a
+    // type parameter that a requirement call on a `.typeParam` receiver dispatches through.
+    func interfaceDeclares(_ iface: String, _ method: String) -> Bool {
+        interfaceSlots[iface]?.contains(method) ?? false
+    }
 }

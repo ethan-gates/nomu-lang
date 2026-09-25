@@ -1,0 +1,10 @@
+// A public generic function with an interface bound, compiled once (erased) in this dependency. A
+// requirement call on the bounded type parameter dispatches through the protocol witness table the
+// consumer threads for its concrete type argument (task 100.4.3.3.3; ABI in internals/backend.md §4).
+public interface Sized {
+    fun size() -> Int
+}
+
+public fun total<T: Sized>(x: T) -> Int {
+    return x.size()
+}
