@@ -1,0 +1,21 @@
+// Pass a non-POD `T` (a class, reachable through the erased argument buffer and the producer's internal
+// `Box<T>`) into `holdBoxed`, which composes it into a buffer and holds it across a force-all
+// evacuation. The returned value reads the box's own copy of the pointer; it is 222 only if that copy
+// was fixed up in place by the typed-root walk (task 100.4.3.6).
+import pkg/lib
+
+class Obj {
+    var v: Int
+}
+
+fun run() -> Int {
+    let keep = Obj(v: 222)
+    let r = holdBoxed(keep)
+    return r.v
+}
+
+fun main() {
+    spawn let x = run()
+    print(x)
+    print("\n")
+}

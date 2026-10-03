@@ -1,0 +1,25 @@
+// A non-POD `T` composed into a producer-internal buffer, held across a moving GC (task 100.4.3.6 —
+// producer-internal composed buffers). `holdBoxed` is compiled once (erased) here; it *constructs* a
+// `Box<T>` from its argument and holds it across a long spin. The `Box`'s copy of the managed pointer
+// lives in an opaque `erased.box` buffer the stackmap can't see, so without registering that buffer's
+// `T`-component as a typed GC root, the forced evacuation would relocate the object but leave the box's
+// copy dangling — `return b.value` would then read a moved-from address.
+public struct Box<T> {
+    var value: T
+}
+
+public fun spin(n: Int) -> Int {
+    var i = 0
+    var acc = 0
+    while i < n {
+        acc = acc + (i % 7)
+        i = i + 1
+    }
+    return acc
+}
+
+public fun holdBoxed<T>(x: T) -> T {
+    let b = Box(value: x)
+    let j = spin(400000000)
+    return b.value
+}

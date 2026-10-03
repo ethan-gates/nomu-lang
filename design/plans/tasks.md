@@ -111,6 +111,7 @@ matters, lives in the horizon (`horizon.md`), not here. Drill-down inside a task
 | 161 | [Test framework — case designation + runner](tasks/161-test-framework.md) | Usability | M | needs-design — module-level test identity settled in 100; `@test` case marking, runner, assertions open |
 | 162 | [Interface / IR serialization format — optimization](tasks/162-interface-serialization-opt.md) | Infra | M | needs-design — v1 bespoke binary decided in 100; zero-copy/mmap, interning, varint, lazy reads deferred here |
 | 163 | [Manifest format — JSON → YAML](tasks/163-manifest-yaml.md) | Usability | S | needs-design — JSON ships first (dependency-free in Swift); switch to a human-friendly YAML/StrictYAML/KDL later |
+| 164 | [Formal inference stage + post-inference `.nmi`](tasks/164-formal-inference-stage.md) | Infra | L | needs-design → build-soon — inference as a first-class stage (gen → inference → transforms → verify); fact store + call-graph fixpoint; `.nmi` emitted once after inference, sectioned; precedes 100.4.5; task B is its first slice |
 | 136 | [Incremental compilation](tasks/136-incremental-compilation.md) | Infra | L | needs-design |
 | 137 | [Tooling — query server / LSP / formatter (M10)](tasks/137-tooling-lsp-formatter.md) | Usability | L | needs-design |
 | 138 | [Debugger (M11)](tasks/138-debugger.md) | Usability | L | needs-design |

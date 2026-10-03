@@ -10,7 +10,7 @@
 
 - **Reference types are GC-managed.** Backend is MMTk (generational Immix to start; an LXR-style reference-counting collector as the footprint endgame — a collector swap, not a language change). Cycles are collected automatically; there is no `weak`/`unowned`, no refcount in the surface, no manual break.
 - **Value types are copied**, laid out inline. Escape analysis keeps non-escaping objects off the heap (invisible optimization).
-- **Memory is invisible.** No `shared` keyword, no region/uniqueness analysis, no `send`-for-memory. The programmer does not annotate memory.
+- **Memory is invisible.** No `shared` keyword, no region/uniqueness annotations, no `send`-for-memory. The programmer does not annotate memory. (Uniqueness is inferred as an invisible perf optimization, like escape — §6.3 — never an annotation.)
 - **Performance** comes from value types + escape analysis + monomorphized generics, plus a quality collector — the same recipe as C# with Native AOT, not from manual memory control.
 - **Memory safety is total** — no use-after-free, no dangling, no cycle leaks.
 - **Data-race freedom is a separate axis.** A tracing GC preserves heap integrity, not application-level consistency: two tasks mutating a shared object still race the *data*. Preventing that is the concurrency model (§7 and `concurrency.md`), not the collector's job.
@@ -143,6 +143,10 @@ Ties to generics.
 
 **Continuation contingency.** The **continuation** token (`concurrency.md` §3) is a linear value whose single consumption is `resume` — one feature, two clients (resource cleanup + continuations), part of the case for building it. Its **compile-time** resume-once/must-resume guarantee is contingent on linear types landing; until then (and across the FFI boundary always) resume-once is **runtime-checked**, so nothing is blocked by deferring the design.
 
+### 6.3 Uniqueness and in-place mutation — Decided (perf fact)
+
+Uniqueness/aliasing is inferred as a **best-effort perf fact**, in the escape-analysis mold (§6.1): invisible, never affecting correctness, falling back to a copy when it cannot prove uniqueness. It is distinct from the region/uniqueness **safety mechanism** the pivot retired (§3) — this is an optimization, not a reclamation or safety scheme, and the programmer annotates nothing. Its job is in-place mutation / copy elision for COW value types (`Array`, `String`, `Dict`), move-instead-of-copy for a uniquely-held value dead after its last use, and write-barrier elision for an unaliased object. Because concluding "unique" wrongly would corrupt a value another holder can see, the analysis assumes aliased unless it proves uniqueness, and the in-place path is taken only on a proof. Under LXR a runtime refcount check is the dynamic fallback and static uniqueness elides it; under tracing (GenImmix) static uniqueness is the primary lever. Design and the two forms (last-use/move, and buffer uniqueness for in-place mutation) live in `plans/tasks/164-formal-inference-stage.md`; the COW stdlib types that consume it are the deferred `Array` design (§6.1).
+
 ---
 
 ## 7. Concurrency — race-free by construction (the shareability rule)
@@ -171,6 +175,7 @@ The target is **Swift-class performance**. The recipe: value types with inline l
 
 - **Deterministic resource cleanup** — `defer` is Decided (§6.2); linear / non-copyable resource types are deferred (task `plans/tasks/101-defer-linear-types.md`).
 - **Collector choice over time** — when to move from generational Immix to the LXR-style RC collector for footprint (§3).
+- **Reference uniqueness / aliasing as a perf fact** — Decided (§6.3): adopted as a best-effort, invisible optimization fact (in-place mutation, copy elision, move), distinct from the ARC-era uniqueness *safety mechanism* the pivot retired (§3). Forms and design in `plans/tasks/164-formal-inference-stage.md`.
 - **Concurrency safety details** — spelling ("shareable" vs "sendable"), the shared-mutable primitive, shareable-closure syntax (§7; full list in `concurrency.md`).
 - **Access control × binding forms** — what changes under `public`/`internal`; publicly-immutable/privately-mutable fields. Homed in `modules.md` (stub).
 - **Performance realization** — escape analysis, inline value layout, monomorphization, MMTk integration (precise stack maps, barriers, object model). Compiler work, invisible to the surface (`backend.md`).

@@ -1,0 +1,18 @@
+// Hold a dependency-defined managed graph (`Holder` → `Inner`) live across `churn`, which allocates
+// enough heap garbage to drive evacuations under `NOMU_GC_STRESS`. Each collection must relocate the
+// live `Holder` and `Inner` and fix up the interior `inner` slot, reading this dependency's descriptors
+// across the module boundary. The post-churn reads (`h.inner.v` = 12345, `h.tag` = 7) print the same
+// under the moving collector as under nogc only if those descriptors resolve correctly; a mis-resolved
+// size or pointer map would copy the wrong bytes or leave `inner` pointing at moved-from space.
+import pkg/lib
+
+fun main() {
+    let h = makeHolder(12345, 7)
+    let c = churn(100000)   // printed below so the allocating call is observed (not DCE'd)
+    print(h.inner.v)   // 12345 — the dependency-defined graph survived + relocated
+    print("\n")
+    print(h.tag)       // 7
+    print("\n")
+    print(c)           // 4999950000
+    print("\n")
+}

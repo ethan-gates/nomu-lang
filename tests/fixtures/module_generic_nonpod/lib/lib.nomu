@@ -1,0 +1,19 @@
+// Holds an erased, non-POD `T` across a long busy loop. Under a forced stop-the-world evacuation the
+// value is reachable only through the caller's opaque `T` buffer — a typed GC root (task 100.4.3.6):
+// the collection must find the managed pointer inside the buffer via the VWT's descriptor and fix it
+// up, or `return x` yields a stale (moved-from) address. `T` is erased — compiled once here — so the
+// trace rides the value-witness table rather than a monomorphized layout.
+fun spin(n: Int) -> Int {
+    var i = 0
+    var acc = 0
+    while i < n {
+        acc = acc + (i % 7)
+        i = i + 1
+    }
+    return acc
+}
+
+public fun hold<T>(x: T) -> T {
+    let j = spin(400000000)
+    return x
+}

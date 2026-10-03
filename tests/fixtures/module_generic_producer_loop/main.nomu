@@ -1,0 +1,20 @@
+// Hold a producer-internal `Box<T>` reconstructed each loop iteration across repeated force-all
+// evacuations. The result reads the box's own copy of the managed pointer; it is 222 only if that copy
+// was fixed up in place and the per-iteration push/pop of the typed root kept the shadow chain acyclic.
+import pkg/lib
+
+class Obj {
+    var v: Int
+}
+
+fun run() -> Int {
+    let keep = Obj(v: 222)
+    let r = loopHold(keep, 60)
+    return r.v
+}
+
+fun main() {
+    spawn let x = run()
+    print(x)
+    print("\n")
+}

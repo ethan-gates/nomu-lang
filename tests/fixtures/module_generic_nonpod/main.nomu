@@ -1,0 +1,23 @@
+// A non-POD type argument crossing an erased generic boundary, scanned under a moving GC (task
+// 100.4.3.6 — lifts the POD guardrail). `hold` is compiled once (erased) in the dependency; this
+// module calls it at `T = Box`, a managed pointer. `keep` is dead in this frame after the call, so the
+// Box is reachable only through the erased argument buffer. While `hold` spins, the forced-collect
+// coordinator evacuates the whole heap: the trace follows the typed root into the buffer, moves the
+// Box, and fixes up the pointer in place, so the returned value reads 111 (unchanged vs non-moving).
+import pkg/lib
+
+class Box {
+    var v: Int
+}
+
+fun run() -> Int {
+    let keep = Box(v: 111)
+    let r = hold(keep)
+    return r.v
+}
+
+fun main() {
+    spawn let x = run()
+    print(x)
+    print("\n")
+}

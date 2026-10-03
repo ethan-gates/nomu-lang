@@ -1,0 +1,16 @@
+// Non-generic instance methods on imported types, called across a module boundary (task 100.4.3.5
+// increment A). The bodies live here; the consumer resolves `p.sum()` / `c.doubled()` against the
+// reconstructed (body-free) method signatures and links the call to the producer's symbol. Covers a
+// value (struct) receiver — by-value `self` — and a reference (class) receiver — pointer `self` — plus
+// a method taking an argument.
+public struct Pt {
+    var x: Int
+    var y: Int
+    fun sum() -> Int { return x + y }
+    fun scaled(by: Int) -> Int { return (x + y) * by }
+}
+
+public class Counter {
+    var n: Int
+    fun doubled() -> Int { return n + n }
+}

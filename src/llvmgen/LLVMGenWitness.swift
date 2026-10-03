@@ -127,13 +127,20 @@ extension LLVMGen {
     }
 
     // Bridge an erased thunk's value-buffer pointer (the value at offset 0, no box header) to the impl's
-    // `self` (task 100.4.3.3.3). POD value-type conformers only — a by-value method loads the value, a
-    // mutating one takes the buffer pointer directly. A class/actor conformer is non-POD and is rejected
-    // at the consumer's call site (the POD guardrail), so it never reaches here.
+    // `self` (task 100.4.3.3.3). Value-type conformers (struct/enum, POD or not) — a by-value method loads
+    // the value, a mutating one takes the buffer pointer directly. A class conformer's value buffer holds
+    // the managed object reference at offset 0, so `self` is that reference loaded as `p1` (the impl takes
+    // the object pointer, like `bridgeThunkSelf`'s class path). The GC-trace of a non-POD value buffer — a
+    // class reference, or managed fields inside a struct — is handled at the call site (the typed-root
+    // registration, task 100.4.3.6). An actor conformer uses the same reference ABI, but synchronous
+    // requirement dispatch on an actor across the erased boundary is untested, so reject it here.
     func bridgeErasedThunkSelf(_ valuePtr: LLVMValueRef, _ type: String, _ c: Callable) -> LLVMValueRef? {
-        if classMap[type] != nil || actorMap[type] != nil {
-            fail("100.4.3.3.3: erased requirement dispatch on a class/actor conformer is not yet supported (non-POD; awaits the GC trace map, 100.4.3.6/100.4.7)", zeroSpan)
+        if actorMap[type] != nil {
+            fail("100.4.3.3.3: erased requirement dispatch on an actor conformer is not yet supported", zeroSpan)
             return nil
+        }
+        if classMap[type] != nil {
+            return LLVMBuildLoad2(b, p1, valuePtr, "self")   // buffer holds the object reference at offset 0
         }
         if c.selfByPointer {
             return valuePtr   // mutating value method: the impl takes an addrspace(0) pointer to the value
@@ -185,13 +192,14 @@ extension LLVMGen {
         let valuePtr = LLVMGetParam(fn, 0)!
 
         if let info = aggInfo(type), let pos = info.fields.firstIndex(where: { $0.name == p.name }) {
-            if info.kind == .classRef {
-                fail("100.4.3.3.3: erased property dispatch on a class conformer is not yet supported (non-POD)", zeroSpan)
-                return nil
-            }
-            let addr = structGEP(info.ty, valuePtr, fieldLLVMIndex(info.kind, pos))   // value at offset 0
+            // A value conformer's fields are inline at offset 0 of the buffer; a class conformer's buffer
+            // holds the object reference, so load it first and GEP the object (past its header). A setter
+            // on a class field goes through the barriered `storeField`.
+            let base = info.kind == .classRef ? LLVMBuildLoad2(b, p1, valuePtr, "self")! : valuePtr
+            let addr = structGEP(info.ty, base, fieldLLVMIndex(info.kind, pos))
             if setter {
-                LLVMBuildStore(b, LLVMGetParam(fn, 1)!, addr)
+                if info.kind == .classRef { storeField(base, addr, LLVMGetParam(fn, 1)!) }
+                else { LLVMBuildStore(b, LLVMGetParam(fn, 1)!, addr) }
                 LLVMBuildRetVoid(b)
             } else {
                 LLVMBuildRet(b, LLVMBuildLoad2(b, propTy, addr, "fld"))

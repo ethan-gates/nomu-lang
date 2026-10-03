@@ -1,0 +1,25 @@
+// A class conformer (non-POD) of an imported interface, passed to an imported bounded generic and held
+// across a moving GC (task 100.4.3.3.3 / 100.4.3.6 — the class-conformer self-ABI). The erased `holdGet`
+// holds the `Cell` reference in its `T` buffer across a force-all evacuation, then dispatches `get()`
+// through the consumer's value-buffer witness table. The buffer is a typed GC root, so the reference is
+// fixed up in place; the dispatch loads the relocated object and reads 333.
+import pkg/lib
+
+class Cell: Valued {
+    var n: Int
+    fun get() -> Int {
+        return n
+    }
+}
+
+fun run() -> Int {
+    let c = Cell(n: 333)
+    let r = holdGet(c)
+    return r
+}
+
+fun main() {
+    spawn let x = run()
+    print(x)
+    print("\n")
+}

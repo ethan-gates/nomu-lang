@@ -65,6 +65,15 @@ extension LLVMGen {
         if di != nil { LLVMSetCurrentDebugLocation2(b, savedLoc) }
     }
 
+    // Reference a Nomu prelude function (`nomu_fn_*`) by its mangled name: use the existing definition
+    // (the whole-program CU compiles the prelude) or forward-declare it, matching the known signature.
+    // Unlike `emitFunction`, this never creates a duplicate when the symbol already exists.
+    func preludeFn(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef]) -> (LLVMValueRef, LLVMTypeRef) {
+        let ty = fnType(ret, params, varArg: false)
+        if let f = LLVMGetNamedFunction(mod, name) { return (f, ty) }
+        return (LLVMAddFunction(mod, name, ty)!, ty)
+    }
+
     func runtimeFn(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef], varArg: Bool)
         -> (LLVMValueRef, LLVMTypeRef)
     {

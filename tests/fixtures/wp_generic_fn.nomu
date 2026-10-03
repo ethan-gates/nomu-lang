@@ -1,0 +1,13 @@
+// Whole-program (single-module) twin of `module_generic_fn`: `id<T>` is monomorphized in this one
+// module rather than compiled erased and called across a boundary. Asserting the same output as
+// `module-generic-fn` is the 100.4.3.7 differential for a generic function — erased cross-module
+// lowering must produce the same observable result as whole-program monomorphization.
+fun id<T>(x: T) -> T {
+    return x
+}
+
+fun main() {
+    let n = id(42)
+    print(n)        // 42
+    print("\n")
+}

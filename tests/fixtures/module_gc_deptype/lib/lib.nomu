@@ -1,0 +1,36 @@
+// A managed heap type defined and allocated in a dependency, scanned / relocated across the module
+// boundary under a moving GC (tasks 100.4.7.3 / 100.4.7.5). `Holder` and its managed child `Inner` get
+// their GC descriptors emitted into this module's object; `makeHolder` and `churn` reference them from
+// here. The consumer holds a `Holder` live across `churn`, which allocates enough heap garbage to drive
+// evacuations, so the collector must resolve this dependency's descriptors across the boundary — the
+// object sizes for the copy and `Holder`'s pointer map for the `inner` slot fixup — or a post-collection
+// field read yields a moved-from address.
+public class Inner {
+    var v: Int
+}
+
+public class Holder {
+    var inner: Inner
+    var tag: Int
+}
+
+public fun makeHolder(a: Int, b: Int) -> Holder {
+    return Holder(inner: Inner(v: a), tag: b)
+}
+
+fun sink(x: Inner) -> Int {
+    return x.v
+}
+
+// Allocates heap garbage (each `Inner` escapes into `sink`) to drive GC-stress collections while the
+// caller's `Holder` stays live.
+public fun churn(n: Int) -> Int {
+    var acc = 0
+    var i = 0
+    while i < n {
+        let g = Inner(v: i)
+        acc = acc + sink(g)
+        i = i + 1
+    }
+    return acc
+}

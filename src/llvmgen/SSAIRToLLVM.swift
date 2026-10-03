@@ -44,6 +44,26 @@ final class SSAIRToLLVM {
     var curSretParam: LLVMValueRef?
     var curReturnType: Type?   // an erased function's return type (mentions a type parameter); sizes the `ret` move
 
+    // Producer-internal typed GC roots (task 100.4.3.6). When an erased body *constructs* a composed
+    // value with a `T` field (`makeStruct`/`makeEnum` → `erased.box`/`erased.enum`), that `T` lives in an
+    // opaque byte buffer the stackmap can't see into, so the buffer's `T`-component must be registered on
+    // the fiber's shadow stack for as long as the composed value is live — else a collection while it is
+    // live across an allocation would strand or dangle the managed pointers inside it. `curProducerSave`
+    // is the shadow-top captured in the erased prologue (nil when the frame constructs no such value); the
+    // epilogue `rtShadowPopTo`s it before every `ret`, so the frame's pushes unwind on any exit. A POD `T`
+    // is registered too — its VWT descriptor reports no managed pointers, so the walk expands it to
+    // nothing (correct, a little redundant).
+    //
+    // Loop constructions (hazard (b) in the milestone doc) use a loop-scoped save: each loop header saves
+    // the shadow-top into `headerSaveSlot[header]`, and every back-edge `rtShadowPopTo`s that save before
+    // branching, so an iteration's pushes are cleared before the next iteration re-pushes the same
+    // entry-hoisted nodes — without the pop the re-push would make a node's `prev` point at itself.
+    // `curBackEdges` maps a block to the header it back-branches to.
+    var curProducerSave: LLVMValueRef?
+    var curBackEdges: [Int: Int] = [:]
+    var headerSaveSlot: [Int: LLVMValueRef] = [:]
+    var curBlockId: Int = -1
+
     // The erased ABI's PWT parameters (backend.md §4), in fixed order: one per (type parameter, bound),
     // type parameters in declaration order and bounds name-sorted — the identical order the producer
     // declares and the consumer threads, so they line up across the boundary.
@@ -365,6 +385,7 @@ final class SSAIRToLLVM {
         guard let c = e.callables[key] else { return }
         values = [:]; blockMap = [:]; blocksById = [:]; spawnHandles = [:]; pendingIncomings.removeAll(keepingCapacity: true)
         curVWTParams = [:]; curPWTParams = [:]; curSretParam = nil; curReturnType = nil
+        curProducerSave = nil; curBackEdges = [:]; headerSaveSlot = [:]; curBlockId = -1
         curFnName = f.name
         e.currentFn = c.fn
 
@@ -406,6 +427,19 @@ final class SSAIRToLLVM {
             }
         }
 
+        // Producer-internal typed-root prologue (task 100.4.3.6): if this erased frame constructs a
+        // composed `T`-carrying value, capture the shadow-top at entry so the epilogue can unwind exactly
+        // the frame's own pushes. Emitted once, at the end of the entry block (after its φs, before its
+        // body), so the saved value dominates every `ret`. A per-header save slot (entry alloca) is set up
+        // for the loop-scoped unwind; the stores land when the header block is lowered.
+        if !f.generics.isEmpty, let entry = f.blocks.first, frameBuildsRegistrableComposite(f) {
+            for be in backEdges(f) { curBackEdges[be.from] = be.to }
+            LLVMPositionBuilderAtEnd(b, blockMap[entry.id])
+            let save = e.preludeFn("nomu_fn_rtShadowSave", ret: e.i8ptr, params: [])
+            curProducerSave = e.buildCall(save.0, save.1, [])
+            for h in Set(curBackEdges.values) { headerSaveSlot[h] = e.entryAlloca(e.i8ptr, "loopshadow.save") }
+        }
+
         // Pass B — lower each block's instructions and terminator. A GC safepoint poll goes at the top
         // of every loop header (a back-edge target): a poll-free loop can't be paused by a
         // stop-the-world collector, so the mutator must reach a safepoint on every back-edge (D3). The
@@ -422,6 +456,12 @@ final class SSAIRToLLVM {
             if headers.contains(blk.id) {
                 e.setDebugLoc(blk.insts.first?.span ?? blk.terminator.span)
                 e.emitSafepointPoll()
+            }
+            // Loop-scoped typed-root save (task 100.4.3.6): record the shadow-top on entry to this loop
+            // header, so the back-edge can restore it and clear the iteration's producer pushes.
+            if let slot = headerSaveSlot[blk.id] {
+                let save = e.preludeFn("nomu_fn_rtShadowSave", ret: e.i8ptr, params: [])
+                LLVMBuildStore(b, e.buildCall(save.0, save.1, []), slot)
             }
             lowerBlock(blk)
             if error != nil { return }
@@ -469,7 +509,103 @@ final class SSAIRToLLVM {
         }
     }
 
+    // The back-edges of a function (task 100.4.3.6): edges `from → to` where `to` is on the DFS recursion
+    // stack, i.e. a loop header. The producer typed-root unwind restores the shadow-top at each of these.
+    private func backEdges(_ f: SSAFunction) -> [(from: Int, to: Int)] {
+        var succ: [Int: [Int]] = [:]
+        for blk in f.blocks { succ[blk.id] = successorIds(blk.terminator) }
+        guard let entry = f.blocks.first?.id else { return [] }
+        var edges: [(from: Int, to: Int)] = []
+        var state: [Int: Int] = [:]   // 0/absent = unvisited, 1 = on stack, 2 = done
+        var stack: [(node: Int, next: Int)] = [(entry, 0)]
+        state[entry] = 1
+        while let top = stack.last {
+            let succs = succ[top.node] ?? []
+            if top.next < succs.count {
+                stack[stack.count - 1].next += 1
+                let s = succs[top.next]
+                switch state[s] ?? 0 {
+                case 0: state[s] = 1; stack.append((s, 0))
+                case 1: edges.append((top.node, s))
+                default: break
+                }
+            } else {
+                state[top.node] = 2
+                stack.removeLast()
+            }
+        }
+        return edges
+    }
+
+    // Whether an erased frame constructs a composed value with a `T`-carrying field — the trigger for
+    // emitting the producer typed-root prologue/epilogue (task 100.4.3.6). Mirrors the registration
+    // predicate in `makeStruct`/`makeEnum` so the prologue save exists exactly when a `ret` (or back-edge)
+    // will need to unwind a push.
+    private func frameBuildsRegistrableComposite(_ f: SSAFunction) -> Bool {
+        for blk in f.blocks {
+            for inst in blk.insts {
+                switch inst.kind {
+                case .makeStruct(let t, _), .makeEnum(let t, _, _):
+                    if composedHasTypeParamField(t) { return true }
+                default: break
+                }
+            }
+        }
+        return false
+    }
+
+    // Whether a composed generic type (as it appears in an erased body — type parameters retained) has a
+    // field / payload whose type mentions a type parameter, i.e. a `T`-component held inline in its buffer.
+    private func composedHasTypeParamField(_ t: Type) -> Bool {
+        guard case .generic(let base, let args) = t else { return false }
+        if let s = e.structMap[base] {
+            let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
+            return s.fields.contains { mentionsTypeParam(substType($0.type, subst)) }
+        }
+        if let en = e.enumMap[base] {
+            let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
+            return en.cases.contains { $0.fields.contains { mentionsTypeParam(substType($0.type, subst)) } }
+        }
+        return false
+    }
+
+    // Register the `T`-components of a just-constructed composed buffer as typed GC roots (task
+    // 100.4.3.6). `baseOff` is the component's byte offset within `buf`. A bare type parameter pushes one
+    // shadow node pairing its slot with the runtime VWT passed for that parameter; a nested composed
+    // struct recurses into its `T`-carrying fields. (A nested composed *enum* field is deferred — its
+    // active case, and so which payload is managed, is a runtime property; the top-level `makeEnum` knows
+    // its own case and registers that directly.) A construction in a loop is cleared each iteration by the
+    // back-edge unwind. No-op when the prologue took no save (the frame builds no registrable composite).
+    private func registerErasedComponents(_ buf: LLVMValueRef, _ t: Type, _ baseOff: LLVMValueRef, _ span: Span) {
+        guard curProducerSave != nil else { return }
+        switch t {
+        case .typeParam(let name):
+            guard let vwt = curVWTParams[name] else { return }
+            producerShadowPush(e.gepByte(buf, baseOff), vwt)
+        case .generic(let base, let args):
+            guard let s = e.structMap[base] else { return }
+            let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
+            for (i, f) in s.fields.enumerated() {
+                let ft = substType(f.type, subst)
+                guard mentionsTypeParam(ft), let foff = erasedFieldOffset(t, i, span) else { continue }
+                registerErasedComponents(buf, ft, LLVMBuildAdd(b, baseOff, foff, "coff")!, span)
+            }
+        default:
+            break
+        }
+    }
+
+    // Push one typed-root node for `comp` (a slot address) paired with its value-layout VWT, on the
+    // current fiber's shadow stack. The node storage is an entry-hoisted alloca; `rtShadowPush` is a
+    // no-op when no fiber is bound (non-scheduler runs), so this is safe in any run config.
+    private func producerShadowPush(_ comp: LLVMValueRef, _ vwt: LLVMValueRef) {
+        let push = e.preludeFn("nomu_fn_rtShadowPush", ret: e.voidTy, params: [e.i8ptr, e.i8ptr, e.i8ptr])
+        let node = e.entryAlloca(e.structTy([e.i8ptr, e.i8ptr, e.i8ptr]), "pshadow.node")
+        _ = e.buildCall(push.0, push.1, [node, comp, vwt])
+    }
+
     private func lowerBlock(_ blk: SSABlock) {
+        curBlockId = blk.id
         var i = 0
         while i < blk.insts.count {
             let inst = blk.insts[i]
@@ -587,6 +723,15 @@ final class SSAIRToLLVM {
     // MARK: - Terminators (block args → φ incomings)
 
     private func lowerTerminator(_ term: SSATerm) {
+        // Loop-scoped typed-root unwind (task 100.4.3.6): a back-edge restores the shadow-top saved at its
+        // header, clearing this iteration's producer pushes before the next iteration re-pushes them. The
+        // non-back successors of such a block are the loop exit, which also wants the pre-loop top, so an
+        // unconditional restore here is correct for the standard loop shapes. A `ret` block is never a
+        // back-edge source (it branches nowhere), so this never races the function epilogue pop.
+        if let header = curBackEdges[curBlockId], let slot = headerSaveSlot[header], curProducerSave != nil {
+            let pop = e.preludeFn("nomu_fn_rtShadowPopTo", ret: e.voidTy, params: [e.i8ptr])
+            _ = e.buildCall(pop.0, pop.1, [LLVMBuildLoad2(b, e.i8ptr, slot, "loopshadow")])
+        }
         switch term.kind {
         case .br(let target, let args):
             passArgs(to: target, args)
@@ -603,6 +748,14 @@ final class SSAIRToLLVM {
                 LLVMAddCase(sw, LLVMConstInt(e.i64, UInt64(bitPattern: Int64(c.value)), 1), blockMap[c.target])
             }
         case .ret(let v):
+            // Producer-internal typed-root epilogue (task 100.4.3.6): unwind every shadow node this frame
+            // pushed, restoring the shadow-top saved in the prologue. Before the return move, so the
+            // frame's registrations never outlive it. The returned composed buffer's `T`-components are
+            // re-registered by the caller (consumer bracketing) or the caller's own prologue, if held.
+            if let save = curProducerSave {
+                let pop = e.preludeFn("nomu_fn_rtShadowPopTo", ret: e.voidTy, params: [e.i8ptr])
+                _ = e.buildCall(pop.0, pop.1, [save])
+            }
             if let sret = curSretParam, let rt = curReturnType, let v = v {
                 // Erased return: move the value buffer into the caller's result buffer (backend.md §4),
                 // sized by the return type's derived VWT (a bare `T`, or a composed `Box<T>` summed from
@@ -764,6 +917,7 @@ final class SSAIRToLLVM {
                     guard let fsize = erasedTypeSize(ft, span) else { return nil }
                     let (memcpy, mty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
                     _ = e.buildCall(memcpy, mty, [dst, val(fields[i]), fsize])
+                    registerErasedComponents(buf, ft, off, span)   // typed GC root for the `T`-component (100.4.3.6)
                 } else {
                     LLVMBuildStore(b, val(fields[i]), dst)
                 }
@@ -797,6 +951,7 @@ final class SSAIRToLLVM {
                     guard let fsize = erasedTypeSize(ft, span) else { return nil }
                     let (memcpy, mty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
                     _ = e.buildCall(memcpy, mty, [dst, val(fields[i]), fsize])
+                    registerErasedComponents(buf, ft, off, span)   // typed GC root for the `T`-component (100.4.3.6)
                 } else {
                     LLVMBuildStore(b, val(fields[i]), dst)
                 }
@@ -1286,6 +1441,31 @@ final class SSAIRToLLVM {
                                             selfType: nil, selfByPointer: false)
                 return e.buildCall(fn, fnTy, args.map { val($0) })
             }
+            // An instance method on an imported type (task 100.4.3.5): its body lives in the producer, so
+            // declare the producer's symbol and link. The receiver type is origin-encoded in the callee
+            // (`m:<origin@Type>:method`); decode the origin for the qualifier, matching the symbol the
+            // dependency emitted. Parameter types (self included) follow the values ssairgen produced — a
+            // class receiver is a reference, a non-mutating value receiver is by value. A *mutating* value
+            // method would need its self-by-pointer ABI, which awaits `isMutating` in the `.nmi` (B).
+            if name.hasPrefix("m:") {
+                let rest = name.dropFirst(2)
+                if let colon = rest.firstIndex(of: ":"),
+                   case let typePart = String(rest[rest.startIndex..<colon]),
+                   let (origin, bareType) = ExternalName.decode(typePart) {
+                    let method = String(rest[rest.index(after: colon)...])
+                    guard let retTy = ty(resultType, span) else { return nil }
+                    let argVals = args.map { val($0) }
+                    let paramTys = argVals.map { LLVMTypeOf($0)! }
+                    let symbol = Mangle.method(bareType, method,
+                                               qualifier: Mangle.qualifier(module: origin.split(separator: "/").map(String.init)))
+                    let (fn, fnTy) = e.emitFunction(symbol, ret: retTy, params: paramTys)
+                    e.callables[key] = Callable(fn: fn, ty: fnTy,
+                                                ir: NOIRFunc(name: name, params: [], returnType: resultType,
+                                                             body: [], isMutating: false, span: span),
+                                                selfType: nil, selfByPointer: false)
+                    return e.buildCall(fn, fnTy, argVals)
+                }
+            }
             // A property accessor `m:Type:prop.get`/`.set` with no method body is a stored-field
             // requirement — ssairgen devirtualized it to a direct call; lower it to a field access.
             if let v = lowerStoredAccessor(name, args, span) { return v }
@@ -1308,8 +1488,11 @@ final class SSAIRToLLVM {
 
         // The PWT arguments (task 100.4.3.3.3): one per (type parameter, bound), bounds name-sorted —
         // the identical order the producer declares. Each is the concrete type argument's erased witness
-        // table for that bound. A bounded type argument must be POD (pointer-free): the erased buffer's
-        // GC trace map isn't wired yet (100.4.3.6/100.4.7), so a non-POD conformer can't cross soundly.
+        // table for that bound. A non-POD **value-type** conformer crosses soundly now — its erased arg
+        // buffer is registered as a typed GC root below (the `shadowBufs` path, task 100.4.3.6), and the
+        // VWT threaded for it carries the value-layout descriptor the walk reads. A **class/actor**
+        // conformer (different self-ABI) and a **covariant-`Self`** requirement are still rejected, deeper
+        // — when `witnessInstanceErased` builds the thunks (`bridgeErasedThunkSelf` / `methodThunkErased`).
         var pwtConformers: [(type: String, iface: String)] = []
         for (i, bounds) in sig.bounds.enumerated() {
             guard bounds.isEmpty || { if case .named = typeArgs[i] { return true } else { return false } }() else {
@@ -1317,12 +1500,6 @@ final class SSAIRToLLVM {
                 return nil
             }
             for iface in bounds.sorted() {
-                var offsets: [Int32] = []
-                e.collectManagedOffsets(typeArgs[i], baseSlot: 0, into: &offsets)
-                guard offsets.isEmpty else {
-                    e.fail("100.4.3.3.3: cross-module generic over a non-POD type '\(typeArgs[i])' awaits the GC trace map (100.4.3.6/100.4.7); only pointer-free type arguments cross the erased boundary today", span)
-                    return nil
-                }
                 guard case .named(let tn, _) = typeArgs[i] else { return nil }
                 pwtConformers.append((tn, iface))
             }
@@ -1375,6 +1552,10 @@ final class SSAIRToLLVM {
             resultBuf = buf
             callArgs.append(buf)
         }
+        // Non-POD `T` arg buffers to register as typed GC roots across the call (task 100.4.3.6): the
+        // collector can't see managed pointers inside an opaque `T` buffer, so without this the callee's
+        // allocations would strand or dangle them. Each pairs the buffer with its value-layout VWT.
+        var shadowBufs: [(buf: LLVMValueRef, vwt: LLVMValueRef)] = []
         for (i, p) in sig.params.enumerated() {
             let v = val(args[i])
             if mentionsTypeParam(p) {
@@ -1382,11 +1563,35 @@ final class SSAIRToLLVM {
                 let buf = e.entryAlloca(at, "erased.arg")
                 LLVMBuildStore(b, v, buf)
                 callArgs.append(buf)
+                var offs: [Int32] = []
+                e.collectManagedOffsets(args[i].type, baseSlot: 0, into: &offs)
+                if !offs.isEmpty { shadowBufs.append((buf, e.valueWitness(args[i].type))) }
             } else {
                 callArgs.append(v)
             }
         }
+
+        // Register the non-POD buffers on the current fiber's typed-root shadow stack, around the call.
+        // A node per buffer rides this (addrspace-0) frame; `rtShadowPopTo` restores the saved top on
+        // return. POD args are left unregistered — the hybrid fast path keeps them pure inline buffers.
+        var savedTop: LLVMValueRef? = nil
+        if !shadowBufs.isEmpty {
+            let save = e.preludeFn("nomu_fn_rtShadowSave", ret: e.i8ptr, params: [])
+            savedTop = e.buildCall(save.0, save.1, [])
+            let push = e.preludeFn("nomu_fn_rtShadowPush", ret: e.voidTy, params: [e.i8ptr, e.i8ptr, e.i8ptr])
+            let nodeTy = e.structTy([e.i8ptr, e.i8ptr, e.i8ptr])
+            for sb in shadowBufs {
+                let node = e.entryAlloca(nodeTy, "shadow.node")
+                _ = e.buildCall(push.0, push.1, [node, sb.buf, sb.vwt])
+            }
+        }
+
         let call = e.buildCall(fn, fnTy, callArgs)
+
+        if let st = savedTop {
+            let pop = e.preludeFn("nomu_fn_rtShadowPopTo", ret: e.voidTy, params: [e.i8ptr])
+            _ = e.buildCall(pop.0, pop.1, [st])
+        }
         if returnsTP, let rt = ty(resultType, span), let buf = resultBuf {
             return LLVMBuildLoad2(b, rt, buf, "erased.res")
         }

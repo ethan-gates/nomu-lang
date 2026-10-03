@@ -2554,9 +2554,9 @@ fun rtScanSchedRoot(outBuf: RawPtr, n0: Int, cap: Int) -> Int {
 //   Timer entry (16B): 0 expiry-ns · 8 fiber
 //   Mailbox (ABI, runtime.h): 0 header · 8 mb_head · 16 mb_tail · 24 scheduled · 32 sched_next
 //   Message (ABI, runtime.h): 0 header · 8 next · 16 thunk · 24 self · args…
-//   Fiber (288B): 0..167 ctx buffer · 168 state · 176 next-link · 184 entry · 192 arg · 200 sched
+//   Fiber (296B): 0..167 ctx buffer · 168 state · 176 next-link · 184 entry · 192 arg · 200 sched
 //                 · 208 stackBase · 216 result · 224 joiner · 232 carrierCtx · 240 reg-next · 248 reg-prev
-//                 · 256 pool-next · 264 anchor-sp · 272 anchor-pc
+//                 · 256 pool-next · 264 anchor-sp · 272 anchor-pc · 288 shadow-top (typed roots, 100.4.3.6)
 //   state: 0 ready · 1 running · 2 parked · 3 done      mutex-word: 0 unlocked · 1 locked · 2 contended
 //   anchor-sp/anchor-pc (task 128.3.2): the user-frame (sp, pc) captured by the C dispatch shim at the
 //   point the fiber stopped (a park at join/sleep, or a safepoint poll) — a statepoint return address the
@@ -2781,7 +2781,7 @@ fun rtSchedTimerMain(sched: RawPtr) -> RawPtr {
 fun rtSchedFiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   let stack = RawPtr.alloc(bytes: 131072, align: 16)
   let stackTop = stack.advanced(by: 131072)
-  let fib = RawPtr.alloc(bytes: 288, align: 16)
+  let fib = RawPtr.alloc(bytes: 296, align: 16)
   fib.store(2, toByteOffset: 168)
   fib.store(RawPtr.null, toByteOffset: 176)
   fib.store(entry, toByteOffset: 184)
@@ -2796,6 +2796,7 @@ fun rtSchedFiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   fib.store(RawPtr.null, toByteOffset: 256)   // pool-next
   fib.store(RawPtr.null, toByteOffset: 264)   // anchor-sp
   fib.store(0, toByteOffset: 272)             // anchor-pc
+  fib.store(RawPtr.null, toByteOffset: 288)   // shadow-top — typed-root list head (erased non-POD T, 100.4.3.6)
   fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(rtSchedFiberMain), arg: fib)
   return fib
 }
@@ -2946,7 +2947,7 @@ fun rtSchedMailboxFiberMain(fib: RawPtr) -> RawPtr {
 fun rtSchedMailboxFiberNew(sched: RawPtr) -> RawPtr {
   let stack = RawPtr.alloc(bytes: 131072, align: 16)
   let stackTop = stack.advanced(by: 131072)
-  let fib = RawPtr.alloc(bytes: 288, align: 16)
+  let fib = RawPtr.alloc(bytes: 296, align: 16)
   fib.store(0, toByteOffset: 168)
   fib.store(RawPtr.null, toByteOffset: 176)
   fib.store(sched, toByteOffset: 200)
@@ -2955,6 +2956,7 @@ fun rtSchedMailboxFiberNew(sched: RawPtr) -> RawPtr {
   fib.store(RawPtr.null, toByteOffset: 256)
   fib.store(RawPtr.null, toByteOffset: 264)   // anchor-sp (set when a handler parks / stops at a safepoint)
   fib.store(0, toByteOffset: 272)             // anchor-pc
+  fib.store(RawPtr.null, toByteOffset: 288)   // shadow-top — typed-root list head (erased non-POD T, 100.4.3.6)
   rtSchedRegInsert(sched, fib)                // in the registry so a handler stopped mid-drain is STW-walked
   fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(rtSchedMailboxFiberMain), arg: fib)
   return fib
@@ -2978,6 +2980,7 @@ fun rtSchedMailboxDispatch(sched: RawPtr) {
     let pn: RawPtr = f.load(fromByteOffset: 256)
     sched.store(pn, toByteOffset: 104)                           // free = f->pool_next
     f.store(RawPtr.null, toByteOffset: 256)
+    f.store(RawPtr.null, toByteOffset: 288)                       // reset shadow-top on reuse (typed roots)
     f.store(0, toByteOffset: 168)
     rtSchedEnqueue(sched, f)
     rtSchedWake(sched, false)
@@ -3030,6 +3033,85 @@ fun rtSchedSetAnchor(fib: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
   fib.store(anchorPc, toByteOffset: 272)
 }
 
+// ---- Typed-root shadow stack (task 100.4.3.6: GC-trace of an opaque erased `T`) ----
+// An erased `T` value lives in an opaque byte buffer the LLVM stackmap cannot see into, so its interior
+// managed pointers are invisible to the precise root walk. Generated erased code registers each live
+// non-POD `T` buffer with the current fiber as a `{ prev, buffer, vwt }` node on its own native stack;
+// the STW walk expands each node via the VWT's GC descriptor into the buffer's interior pointer slots,
+// which then ride the ordinary evacuation + in-place fixup. The node's lifetime is the frame that
+// declared it; the fiber holds the list head at offset 288.
+
+// Link a caller-allocated node `{ prev(0), buffer(8), vwt(16) }` at the current fiber's shadow-top.
+fun rtShadowPush(node: RawPtr, buffer: RawPtr, vwt: RawPtr) {
+  let self = RawPtr.tlsGet()
+  if self.isNull {
+    return
+  }
+  let prev: RawPtr = self.load(fromByteOffset: 288)
+  node.store(prev, toByteOffset: 0)
+  node.store(buffer, toByteOffset: 8)
+  node.store(vwt, toByteOffset: 16)
+  self.store(node, toByteOffset: 288)
+}
+
+// Restore the shadow-top to a value saved on entry (LIFO pop of every node a frame pushed, on any exit).
+fun rtShadowPopTo(savedTop: RawPtr) {
+  let self = RawPtr.tlsGet()
+  if self.isNull {
+    return
+  }
+  self.store(savedTop, toByteOffset: 288)
+}
+
+// The current fiber's shadow-top (saved on entry to an erased frame, restored on exit).
+fun rtShadowSave() -> RawPtr {
+  let self = RawPtr.tlsGet()
+  if self.isNull {
+    return RawPtr.null
+  }
+  return self.load(fromByteOffset: 288)
+}
+
+// Walk one fiber's typed-root shadow list, appending each registered buffer's interior managed-pointer
+// roots into `outBuf` (slot addresses when `emitSlots != 0` for a moving fixup, else values). The VWT's
+// `type_id` (byte 8) is its value-layout GC descriptor offset (100.4.7.4), read through the same pointer
+// map the object walk uses. Called with the world stopped, so the buffers on the fiber's stack are stable.
+fun rtWalkShadow(fib: RawPtr, outBuf: RawPtr, n0: Int, cap: Int, emitSlots: Int) -> Int {
+  var n = n0
+  var node: RawPtr = fib.load(fromByteOffset: 288)
+  while node.isNull == false {
+    let buf: RawPtr = node.load(fromByteOffset: 8)
+    let vwt: RawPtr = node.load(fromByteOffset: 16)
+    if buf.isNull == false {
+      if vwt.isNull == false {
+        let w: Int = vwt.load(fromByteOffset: 8)      // { type_id (low 32), flags (high 32) }
+        let hi = w / 4294967296
+        let tid = w - hi * 4294967296                 // type_id = value-layout descriptor offset
+        let nptr = RawPtr.gcTypeNumPtrs(tid)
+        var i = 0
+        while i < nptr {
+          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let slotPtr = buf.advanced(by: off)
+          let root: RawPtr = slotPtr.load(fromByteOffset: 0)
+          if root.isNull == false {
+            if n < cap {
+              if emitSlots != 0 {
+                outBuf.store(slotPtr, toByteOffset: n * 8)
+              } else {
+                outBuf.store(root, toByteOffset: n * 8)
+              }
+              n = n + 1
+            }
+          }
+          i = i + 1
+        }
+      }
+    }
+    node = node.load(fromByteOffset: 0)               // prev
+  }
+  return n
+}
+
 // A carrier acknowledges the stop-the-world and waits for resume. Called by a carrier that has reached a
 // quiescent point under an active STW (idle at the loop top, or after its running fiber parked at a
 // safepoint). Bumps the ack count (waking the initiator, which waits on it) and sleeps on the stw-gen
@@ -3079,6 +3161,9 @@ fun nomuSchedWalkRoots(sched: RawPtr, outBuf: RawPtr, cap: Int, emitSlots: Int) 
         let pc: Int = cur.load(fromByteOffset: 272)
         n = rtWalkFrom(sp, pc, outBuf, n, cap, emitSlots)
       }
+      // Typed roots: the interior managed pointers of this fiber's live erased non-POD `T` buffers,
+      // invisible to the stackmap walk above (task 100.4.3.6).
+      n = rtWalkShadow(cur, outBuf, n, cap, emitSlots)
     }
     if st == 3 {
       // Completed spawn fiber awaiting join (150.3.13): its result is a managed box at fib+216, reachable

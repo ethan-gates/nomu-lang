@@ -11,10 +11,12 @@ private let zeroSpan = Span(startOffset: -1, endOffset: -1, map: nil)
 // grammar. Everything is `public` (only public symbols reach a `.nmi`).
 //
 // The `.nmi` carries the full surface (task 100.4.1): enums, generics + bounds, methods, computed
-// properties, conformances, interfaces. Reconstruction covers what the consumer can use today: struct /
-// class / enum types (including **generic** types, task 100.4.3.1 — the consumer monomorphizes their
-// layout locally) and non-generic free functions. Deferred to the erased witness-dispatch path
-// (100.4.3.2–.4): generic *functions* (no body in the consumer) and *methods* on imported types.
+// properties, conformances, interfaces. Reconstruction covers: struct / class / enum types (including
+// **generic** types, task 100.4.3.1 — the consumer monomorphizes their layout locally), free functions
+// (generic included, via the erased witness-dispatch path), and **non-static, non-generic instance
+// methods** on imported types (task 100.4.3.5 increment A — body-free, the call links to the producer's
+// symbol). Still deferred: static and **generic** methods / methods on generic types (the erased-method
+// path), and computed-property requirements on imported types.
 public func interfaceToDecls(_ iface: ModuleInterface) -> [TopDecl] {
     func typeRef(_ s: String) -> TypeRef { parseTypeText(s) ?? TypeRef(name: s, span: zeroSpan) }
     func field(_ f: InterfaceField) -> VarField {
@@ -25,6 +27,19 @@ public func interfaceToDecls(_ iface: ModuleInterface) -> [TopDecl] {
     func generics(_ gs: [InterfaceGeneric]) -> [GenericParam] {
         gs.map { GenericParam(name: $0.name, bounds: $0.bounds.map { Conformance(name: $0, span: zeroSpan) },
                               isShared: $0.isShared, span: zeroSpan) }
+    }
+
+    // Reconstruct a non-static, non-generic instance method as a body-free `FuncDecl` (task 100.4.3.5):
+    // enough for the consumer's Sema to resolve and type-check `x.m()`; the body lives in the producer
+    // and the call links to its symbol. Static methods (free-function-shaped) and generic methods (the
+    // erased-method path) are skipped here — increment A is non-generic instance methods.
+    func method(_ m: InterfaceFunc) -> FuncDecl? {
+        guard !m.isStatic, m.generics.isEmpty else { return nil }
+        return FuncDecl(name: m.name,
+                        generics: [],
+                        params: m.params.map { Param(label: $0.label, name: $0.name, type: typeRef($0.type), span: zeroSpan) },
+                        returnType: m.ret.map(typeRef), body: [], isStatic: false,
+                        visibility: .public, span: zeroSpan)
     }
 
     var out: [TopDecl] = []
@@ -44,12 +59,13 @@ public func interfaceToDecls(_ iface: ModuleInterface) -> [TopDecl] {
     }
     for t in iface.types {
         let fields = t.fields.map(field)
+        let methods = t.methods.compactMap(method)
         if t.keyword == "class" {
             out.append(.classDecl(ClassDecl(name: t.name, generics: generics(t.generics), fields: fields, properties: [],
-                                            methods: [], conformances: [], visibility: .public, span: zeroSpan)))
+                                            methods: methods, conformances: [], visibility: .public, span: zeroSpan)))
         } else {
             out.append(.structDecl(StructDecl(name: t.name, generics: generics(t.generics), fields: fields, properties: [],
-                                              methods: [], conformances: [], visibility: .public, span: zeroSpan)))
+                                              methods: methods, conformances: [], visibility: .public, span: zeroSpan)))
         }
     }
     for e in iface.enums {

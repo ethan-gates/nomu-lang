@@ -510,8 +510,10 @@ private func compileDependency(files: [SourceFile], module: ModuleID, externalDe
 
     // A dependency's own symbols carry its module-path qualifier (task 100.4), so they cannot collide
     // with another module's same-named symbols at link.
-    let err = emitObject(monoModule, to: objPath, optimize: options.optimize,
-                         subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames),
+    // Gen SSAIR in the driver so the stage sequence is explicit (task 165.1); `emitObject` lowers it.
+    let gen = lowerToSSAIR(monoModule, subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames))
+    if gen.diagnostics.hasErrors { fputs("error: SSAIR: " + gen.diagnostics.render() + "\n", stderr); return nil }
+    let err = emitObject(gen.module, from: monoModule, to: objPath, optimize: options.optimize,
                          requireMain: false, externalFuncNames: semaResult.externalFuncNames,
                          externalGenericSigs: semaResult.externalGenericSigs,
                          weakOriginFiles: weakFiles, emitTypeMaps: false,
@@ -535,7 +537,14 @@ private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: Strin
     // through the `StageSink`, so the timing table's `ssair`/`llvm` phases break down rather than
     // showing one opaque `codegen` bucket. `--emit-llvm` writes the egress module (pre-opt) to
     // `<stem>.ll`; `--stop=llvm` writes it and skips object emission + linking.
-    let err = emitObject(module, to: objPath, optimize: optimize, subsetFuncs: subsetFuncs,
+    // Gen SSAIR here so the driver owns the stage sequence (task 165.1): gen → [inference + `.nmi` emit,
+    // task 164] → transforms → lower. `emitObject` takes the gen'd SSA and lowers it.
+    let gen = timings.measure("ssair", "gen") { lowerToSSAIR(module, subsetFuncs: subsetFuncs) }
+    if gen.diagnostics.hasErrors {
+        fputs("error: SSAIR: " + gen.diagnostics.render() + "\n", stderr)
+        timings.report(); exit(1)
+    }
+    let err = emitObject(gen.module, from: module, to: objPath, optimize: optimize,
                          onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
                          emitLLVMTo: emitLLVM ? stem + ".ll" : nil, stopAfterEgress: stopAfterLLVM,
                          externalFuncNames: externalFuncNames, externalGenericSigs: externalGenericSigs,

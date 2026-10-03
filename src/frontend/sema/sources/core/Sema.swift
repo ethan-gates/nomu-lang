@@ -151,14 +151,18 @@ public struct Sema {
         }
         // Imported (external) types are lowered for their layout — codegen needs the aggregate shape to
         // construct values and access fields. Imported functions are not lowered; they are external
-        // declarations resolved at link (task 100.4.2).
+        // declarations resolved at link (task 100.4.2). An imported type's **methods** are lowered for
+        // resolution (they are in `structs`/`classes`, so `x.m()` type-checks) but their bodies live in
+        // the producer, so they are stripped before lowering here — codegen must emit no definition for
+        // them; a call links to the producer's symbol instead (task 100.4.3.5).
         for decl in externalDecls {
             switch decl {
             case .structDecl, .enumDecl, .classDecl:
+                let d = strippingMethodBodies(decl)
                 // An imported *generic* type lowers through the same generic path as an own-module one
                 // (task 100.4.3.1), so the consumer monomorphizes its layout locally from the interface.
-                if isGenericType(decl) { decls.append(NOIRGen.lowerGenericDecl(&self, decl)) }
-                else { decls.append(NOIRGen.lowerDecl(&self, decl)) }
+                if isGenericType(d) { decls.append(NOIRGen.lowerGenericDecl(&self, d)) }
+                else { decls.append(NOIRGen.lowerDecl(&self, d)) }
             case .actorDecl:
                 decls.append(NOIRGen.lowerDecl(&self, decl))
             default: break
@@ -182,6 +186,29 @@ public struct Sema {
     }
 
     // MARK: - Global collection
+
+    // A copy of an imported type decl with its instance methods removed, for the layout-only lowering of
+    // an external type (task 100.4.3.5): the methods stay in `structs`/`classes` (registered from the
+    // original) for `x.m()` resolution, but their bodies live in the producer, so the consumer emits no
+    // definition for them.
+    private func strippingMethodBodies(_ decl: TopDecl) -> TopDecl {
+        switch decl {
+        case .structDecl(let s):
+            return .structDecl(StructDecl(name: s.name, generics: s.generics, fields: s.fields,
+                                          properties: s.properties, methods: [], conformances: s.conformances,
+                                          visibility: s.visibility, span: s.span))
+        case .classDecl(let c):
+            return .classDecl(ClassDecl(name: c.name, generics: c.generics, fields: c.fields,
+                                        properties: c.properties, methods: [], conformances: c.conformances,
+                                        visibility: c.visibility, span: c.span))
+        case .enumDecl(let e):
+            return .enumDecl(EnumDecl(name: e.name, generics: e.generics, cases: e.cases,
+                                      properties: e.properties, methods: [], conformances: e.conformances,
+                                      visibility: e.visibility, span: e.span))
+        default:
+            return decl
+        }
+    }
 
     private mutating func collectGlobals() {
         // Phase 1 — register every type name. A module is one namespace with no declaration

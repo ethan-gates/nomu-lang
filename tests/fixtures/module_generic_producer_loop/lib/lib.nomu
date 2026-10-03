@@ -1,0 +1,31 @@
+// A non-POD `T` composed into a producer-internal buffer *inside a loop*, held across a moving GC each
+// iteration (task 100.4.3.6 — the loop case / hazard (b)). `loopHold` constructs a fresh `Box<T>` every
+// iteration and holds it across a spin where the forced collector runs. The shadow node for the box's
+// `T`-component is entry-hoisted (one storage slot), so each iteration's push must be unwound at the
+// back-edge — without that, iteration two re-pushes the same node onto itself, cycling the shadow chain
+// and hanging the next root walk.
+public struct Box<T> {
+    var value: T
+}
+
+public fun spin(n: Int) -> Int {
+    var i = 0
+    var acc = 0
+    while i < n {
+        acc = acc + (i % 7)
+        i = i + 1
+    }
+    return acc
+}
+
+public fun loopHold<T>(x: T, iters: Int) -> T {
+    var r = x
+    var i = 0
+    while i < iters {
+        let b = Box(value: x)
+        let j = spin(6000000)
+        r = b.value
+        i = i + 1
+    }
+    return r
+}

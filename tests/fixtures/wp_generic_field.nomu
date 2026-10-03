@@ -1,0 +1,18 @@
+// Whole-program (single-module) twin of `module_generic_field`: the generic type `Box<T>` and the
+// generic function `unwrap<T>` reading its `T` field are monomorphized in this one module rather than
+// erased across a boundary. Asserting the same output as `module-generic-field` is the 100.4.3.7
+// differential for a generic type + field read — erased cross-module lowering (the VWT-derived field
+// offset) must match the whole-program monomorphized layout.
+struct Box<T> {
+    var value: T
+}
+
+fun unwrap<T>(b: Box<T>) -> T {
+    return b.value
+}
+
+fun main() {
+    let b = Box(value: 42)
+    print(unwrap(b))   // 42
+    print("\n")
+}

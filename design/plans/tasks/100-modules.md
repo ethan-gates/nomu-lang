@@ -231,10 +231,6 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
 **interims**:
 - **Weak prelude linkage.** The prelude is still prepended to every module, so its functions get
   `WeakODR` linkage to fold the per-object duplicates. Proper fix: prelude-as-packages (100.3.7).
-- **Entry-only GC type maps.** The `nomu_gc_typemap_*` tables are single extern globals the C runtime
-  reads, so only the entry object emits them; dependency objects reference them externally. A
-  dependency's own heap types are therefore not yet in the map — needs **cross-module type-id / type-map
-  unification** (new sub-item under this milestone) before GC-traced types cross a module boundary.
 - **Package identity not yet in the qualifier.** The qualifier encodes the relative module path but not
   the package name, since cross-package linkage (external-package deps via manifest aliases) is not live
   yet. Package identity folds into `Mangle.qualifier` when that lands; today every module sits in one
@@ -297,21 +293,29 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
     - 100.4.3.3.2 — backend lowers a move-only erased body (residual `.typeParam` → opaque buffer, `T`
       return → sret, moves → VWT-sized memcpy). Target: `public fun id<T>(x: T) -> T` emits IR-verified
       erased code, producer-side. First milestone.
-    - 100.4.3.3.3 — requirement dispatch for bounded `T` via the PWT. **Done, POD-scoped, end-to-end.**
-      Producer: `declareErasedFunction` adds a PWT parameter per (type parameter, bound) after the VWTs
-      (bounds name-sorted); a requirement call on a `.typeParam` receiver lowers to a witness call
-      (`FunctionLowerer` resolves the bound declaring the method) that the backend dispatches through the
-      PWT parameter with the value buffer as self (`witnessDispatchErased`). Consumer: `interfaceToDecls`
-      reconstructs imported interfaces; `buildIRInterfaces` includes them so codegen has the slot layout;
-      the call threads a **value-buffer-self** witness table (`witnessInstanceErased` — dedicated erased
-      thunks, so the `any I` box-self path is untouched, protecting release dynamic-dispatch perf). Self-ABI
-      chosen as **Option 3** (separate erased thunks) over unifying the existential thunk, on GC-soundness
-      and hot-path-perf grounds. **POD guardrail:** a non-POD type argument is a clear compile error until
-      the GC trace map lands (100.4.3.6/100.4.7.4) — the erased buffer isn't yet scannable, so only
-      pointer-free type arguments cross soundly. Fixture `module_generic_bound` (`total<T: Sized>`,
-      conformer `Point` with the impl in the consumer). Deferred within .3.3.3: class/actor conformers
-      (non-POD), covariant-`Self` requirements, and importing a conformer whose method impls live in the
-      producer (needs producer-exported witness tables).
+    - 100.4.3.3.3 — requirement dispatch for bounded `T` via the PWT. **Done, end-to-end; POD and non-POD
+      value/class conformers.** Producer: `declareErasedFunction` adds a PWT parameter per (type parameter,
+      bound) after the VWTs (bounds name-sorted); a requirement call on a `.typeParam` receiver lowers to a
+      witness call (`FunctionLowerer` resolves the bound declaring the method) that the backend dispatches
+      through the PWT parameter with the value buffer as self (`witnessDispatchErased`). Consumer:
+      `interfaceToDecls` reconstructs imported interfaces; `buildIRInterfaces` includes them so codegen has
+      the slot layout; the call threads a **value-buffer-self** witness table (`witnessInstanceErased` —
+      dedicated erased thunks, so the `any I` box-self path is untouched, protecting release
+      dynamic-dispatch perf). Self-ABI chosen as **Option 3** (separate erased thunks) over unifying the
+      existential thunk, on GC-soundness and hot-path-perf grounds. **Non-POD lifted:** the old POD
+      guardrail is gone now that an erased arg buffer is a typed GC root (100.4.3.6) and its VWT carries the
+      value-layout descriptor (100.4.7.4). A **non-POD value-type** conformer (`struct`/`enum` with managed
+      fields — e.g. an `Array` field) crosses: `bridgeErasedThunkSelf` loads the value from the buffer as
+      before, and the buffer is scanned via its descriptor. A **class** conformer crosses too:
+      `bridgeErasedThunkSelf` loads the object reference the buffer holds at offset 0 as the `p1` self
+      (`propThunkErased` likewise loads the reference then GEPs the object for a stored-property
+      requirement). Fixtures `module_generic_bound` (`total<T: Sized>`, POD `Point`) and
+      `module_generic_bound_nonpod` (`holdGet<T: Valued>`, class conformer `Cell` held across a force-all
+      evacuation — teeth: `fixed 1 roots`, the buffer's reference fixed up, dispatch reads the relocated
+      object). **Deferred within .3.3.3:** actor conformers (same reference ABI, but synchronous erased
+      dispatch on an actor is untested — rejected in `bridgeErasedThunkSelf`), covariant-`Self` requirements
+      (rejected in `methodThunkErased`), and importing a conformer whose method impls live in the producer
+      (needs producer-exported witness tables).
     - 100.4.3.3.4 — `T`-field access / constructing `T`-containing values. **Done for struct-composed POD
       types, end-to-end** (field read, construction, composed return). Mono emits each generic type
       **template** (type parameters retained, methods stripped) so an erased body has a composed
@@ -329,8 +333,9 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
       plus a payload sized to the largest case (a runtime max over the cases' derived sizes); construction
       stamps the tag and copies the payload, `enumTag`/`extractPayload`/`switch` read the tag and payload
       fields at their derived offsets, and a composed enum return memcpys the derived size. Fixtures
-      `module_generic_field`/`_compose`/`_enum`. **Deferred:** the GC-trace of a non-POD opaque `T` (couples
-      100.4.7 — the POD guardrail holds until then).
+      `module_generic_field`/`_compose`/`_enum`. The GC-trace of a non-POD opaque `T` that this composition
+      enables is handled in **100.4.3.6** (typed roots) + **100.4.7** (descriptors) — now done for the
+      straight-line and common loop forms; see those items for the residual gaps.
   - 100.4.3.4 — Witness-argument ABI: pass each type parameter's metadata / VWT plus one protocol witness
     table per bound as hidden leading parameters; the producer emits the compiled-once erased symbol, the
     consumer emits the external call threading the witnesses for its concrete type arguments. **Done for
@@ -339,17 +344,77 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
     the SSAIR→LLVM egress lowers a call to one through the erased ABI — a VWT global per concrete type
     argument, a result buffer when the return mentions a type parameter, and each `.typeParam` value boxed
     into a stack buffer, reading the result back after the call. Fixture `module_generic_fn` (imports
-    `id<T>`, calls at `Int`) compiles and runs, matching the whole-program result. **Deferred:** a **bounded**
-    type parameter's PWT arguments + requirement dispatch (pairs with 100.4.3.3.3), and `T`-field / `T`-value
-    construction across the boundary (pairs with 100.4.3.3.4).
-  - 100.4.3.5 — Generic methods on imported generic types (`Option.isSome()` across a boundary) — method
-    erasure atop 100.4.3.3.
+    `id<T>`, calls at `Int`) compiles and runs, matching the whole-program result. The once-deferred
+    extensions are now done in their own items: a **bounded** type parameter's PWT arguments + requirement
+    dispatch in 100.4.3.3.3 (POD and non-POD value/class conformers), and `T`-field / `T`-value
+    construction across the boundary in 100.4.3.3.4.
+  - 100.4.3.5 — Methods on imported types across a boundary; method erasure atop 100.4.3.3.
+    **Increment A done — non-static, non-generic instance methods on imported non-generic types.** Before
+    this, no method (generic or not) resolved on an imported type — the `.nmi` serialized methods but
+    `interfaceToDecls` dropped them. Now: `interfaceToDecls` reconstructs a type's non-static, non-generic
+    methods body-free (so `structs`/`classes` carry them and `x.m()` type-checks); Sema lowers the imported
+    type for layout with **method bodies stripped** (`strippingMethodBodies`), emitting no definition; the
+    call lowers to the producer's symbol by decoding the receiver's origin-encoded type name
+    (`m:<origin@Type>:method` → `Mangle.method(Type, method, qualifier)`), parameter types following the
+    values ssairgen produced (a class receiver is a reference, a non-mutating value receiver is by value).
+    Fixture `module_method` (a struct `Pt.sum()` / `Pt.scaled(by:)` and a class `Counter.doubled()` called
+    across the boundary). **Deferred:** (B) a **mutating** value method — its self-by-pointer ABI needs
+    `isMutating` in the `.nmi` (`InterfaceFunc` doesn't carry it), so the consumer can't pick the ABI
+    today; a class method is unaffected (self is always a reference). (C) **generic** methods / methods on
+    generic types (`Option.isSome()` across a boundary) — the erased-method path atop 100.4.3.3; this is
+    the blocker the 100.4.3.7 method-differential leg waits on. Static methods and computed-property
+    requirements on imported types are also still deferred.
   - 100.4.3.6 — GC-trace of an opaque `T`: the type metadata / VWT carries the per-type GC trace map so a
     tracing / moving collector scans an erased `T`'s stack buffer and heap copies. **Couples with
-    100.4.7** (cross-module type-id / type-map unification) — the same GC work from two sides; build
-    together.
+    100.4.7** (cross-module type-id / type-map unification) — the same GC work from two sides; built
+    together. **Mechanism: typed stack roots (hybrid).** An erased `T` lives in an opaque byte buffer the
+    LLVM stackmap can't see into, so generated code registers each live non-POD `T` buffer on a per-fiber
+    shadow stack (`{prev, buffer, vwt}` nodes on the native stack; fiber head at offset 288); the STW root
+    walk (`nomuSchedWalkRoots` → `rtWalkShadow`) expands each via the VWT's value-layout descriptor
+    (100.4.7.4) into the buffer's interior managed-pointer slots, which ride the ordinary evacuation +
+    in-place fixup. POD args stay unregistered (the hybrid fast path keeps them pure inline buffers).
+    Boxing was rejected: the producer is compiled once with `T` erased and can't statically choose
+    box-vs-inline, so a uniform box either regresses the POD path or is thrown away.
+    **Done (consumer-side):** registration for non-POD **unbounded** erased args (`emitErasedExternalCall`
+    wraps the call in `rtShadowSave`/`rtShadowPush`/`rtShadowPopTo`), end-to-end under a forced moving STW
+    — fixture `module_generic_nonpod` (a non-POD `T` reachable only through the erased buffer survives
+    force-all evacuation; teeth-checked via the STW root count in stderr).
+    **Done (producer-internal, straight-line):** an erased body that *constructs* a composed value with a
+    `T`-component (`makeStruct`/`makeEnum` → `erased.box`/`erased.enum`) registers that component as a
+    typed root for the rest of the frame. A function-scoped save/restore brackets it: the erased prologue
+    captures the shadow-top (`curProducerSave`, emitted only when the frame builds a registrable
+    composite), each construction pushes an entry-hoisted node per `T`-component (bare `T` via the runtime
+    VWT parameter; a nested composed **struct** field recurses; a POD `T` is registered too and expands to
+    nothing in the walk), and every `ret` `rtShadowPopTo`s the saved top so the pushes unwind on any exit.
+    Fixture `module_generic_producer` (an erased `holdBoxed<T>` composes `Box<T>` and holds it across
+    force-all evacuation; the box's own copy of the pointer is fixed up — teeth: the stderr root count is
+    `fixed 2 roots`, the arg buffer plus the box component, vs `fixed 1 roots` and a moved-from read when
+    producer registration is disabled).
+    **Done (producer-internal, loops):** a composite constructed inside a loop is registered too, scoped by
+    a loop-local unwind — each loop header saves the shadow-top into `headerSaveSlot[header]`, and every
+    back-edge `rtShadowPopTo`s it (`curBackEdges`) so the iteration's pushes clear before the next
+    iteration re-pushes the same entry-hoisted nodes; without the pop the re-push would set a node's `prev`
+    to itself and cycle the chain. Fixture `module_generic_producer_loop` (a `Box<T>` rebuilt each
+    iteration and held across repeated force-all evacuations; teeth: with the back-edge pop removed the
+    root walk hits the self-referential chain and hangs). **Deferred:** (a) a composite that is
+    **loop-carried or live-out of the loop** (its buffer flows through a φ to a later iteration or past the
+    loop) is protected only within its construction iteration — the back-edge pop unwinds it, and it is
+    re-registered only at a construction site, so a collection in a later iteration while it is live sees
+    it unregistered (no worse than before, no cycle); full coverage wants per-iteration nodes or φ-aware
+    lifetime; (b) a nested composed **enum** field (e.g. `Wrap<Opt<T>>`) — the active case (and so which
+    payload is managed) is a runtime property, so only the top-level `makeEnum`, which knows its own case,
+    registers its payload; (c) the **bounded** non-POD path is now open for value-type and class conformers
+    (guardrail lifted, the non-POD arg buffer rides the same typed-root registration; task 100.4.3.3.3) —
+    only actor conformers and covariant-`Self` remain; (d) a non-scheduler run config (no `NOMU_SCHED=nomu`)
+    has no shadow walk.
   - 100.4.3.7 (tests) — cross-module generic function, generic type, and generic method; erased output
-    matches the whole-program mono golden (same observable result).
+    matches the whole-program mono golden (same observable result). **Partial.** The generic-function and
+    generic-type/field legs are covered by whole-program twins asserting the same output as the erased
+    split-module fixtures: `wp_generic_fn.nomu` ↔ `module_generic_fn` (`id<T>`), `wp_generic_field.nomu` ↔
+    `module_generic_field` (`Box<T>` + `unwrap<T>`), each monomorphized in one module vs erased across the
+    boundary, both `42`. **Deferred:** the generic-method leg — methods are not yet serialized in the
+    interface, so a method on an imported type (generic or not) does not resolve across a boundary; this
+    blocks on **100.4.3.5** (method erasure / interface method serialization).
 
   *Residual-`.typeParam` blast radius* (the sites erased lowering must handle) is extracted to the
   working doc **`100.4.3.3.md`** at the project root, alongside the 100.4.3.3 decomposition.
@@ -387,16 +452,36 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
 
   - 100.4.7.1 — Type descriptors: emit a fixed-size descriptor per heap type into the aggregated section
     (COMDAT/weak), pointer-map out of line; retire the per-module dense counter and the single-object
-    flat-array emission (`emitTypeMaps`, `emitTypeMaps: false` for deps).
+    flat-array emission (`emitTypeMaps`, `emitTypeMaps: false` for deps). **Done.** Record `{ size, stride,
+    kind, nptr, ptrmap_off, pad }` (24 B) in `__DATA,__nomu_descs`, variable map in `__DATA,__nomu_ptrmaps`;
+    `weak_odr` for foldable shapes (named types, singletons, array buffers) and `internal` per-site
+    (closures). Emitted by every module (`emitDescriptors`), the flat arrays gone.
   - 100.4.7.2 — Header stamp + GC read: the header holds `&desc − __start`; the GC resolves
-    `section_base + offset` and reads the descriptor in place.
+    `section_base + offset` and reads the descriptor in place. **Done.** The offset is the link-time
+    `&desc − section$start$__DATA$__nomu_descs` (LLVM `\01` raw-symbol escape so the name matches ld64's
+    synthetic section-start symbol); `runtime.c` resolves the base via `getsectiondata` and reads the
+    descriptor in place; the self-hosted collector reads it through the same `nomu_gc_type*` accessors,
+    with its per-type histogram re-keyed to the ordinal `offset / 24`.
   - 100.4.7.3 — Cross-module + shared types: a consumer stamping an imported (or locally-instantiated
     generic) type references the producer's descriptor symbol, resolved at link; shared descriptors
-    (prelude, shared instantiations) fold by symbol (couples 100.4.3.6).
+    (prelude, shared instantiations) fold by symbol (couples 100.4.3.6). **Done.** `weak_odr` descriptors
+    keyed by mangled type name fold at link; fixture `module_gc_deptype` holds a dependency-defined managed
+    graph (`Holder` → `Inner`, both declared and allocated in the `lib` dependency) live across a churning
+    GC-stress workload, so the evacuating collector resolves the dependency's descriptors across the
+    boundary to size the copy and fix up the interior `inner` slot. Two suite legs (`module-gc-deptype`
+    nogc baseline, `module-gc-deptype-evac` immix + `NOMU_GC_STRESS`) assert identical output; the evac leg
+    runs ~2941 defrag-every-GC evacuations with the graph live (confirmed via `NOMU_GC_STATS`), so a
+    mis-resolved cross-module descriptor would corrupt the object or leave `inner` pointing at moved-from
+    space.
   - 100.4.7.4 — VWT `type_id` becomes the same descriptor offset (shared with 100.4.3, backend.md §4).
+    **Done.** The VWT carries a value-layout descriptor (`val_<type>`, managed map at offset 0, no object
+    header), its offset filling `type_id`; the typed-root walk reaches a buffer's pointer map through it.
   - 100.4.7.5 (tests) — a GC-traced heap type defined in a dependency, and a generic instantiation
     crossing the boundary, are scanned / relocated correctly under forced GC (the `Tn` obligations,
-    `ssair.md`).
+    `ssair.md`). **Done.** `module_generic_nonpod` covers an erased non-POD type argument under force-all
+    evacuation (the scheduler STW path); `module_gc_deptype` covers a dependency-defined non-generic managed
+    graph relocated across the boundary under immix GC-stress (the single-threaded evac path), its output
+    matching the nogc baseline.
 - *Deliverable:* editing a module body doesn't rebuild its dependents. (Cross-module generics are
   witness-dispatched here; perf restored in 100.5.)
 

@@ -357,6 +357,22 @@ preserving debug locations through `RewriteStatepointsForGC` keeps its source vi
 obligation). The built-in per-fiber backtrace rides the same `pcsp` walk for the frame list + line numbers;
 register/variable inspection is left to lldb over the emitted DWARF.
 
+**A second root source — the typed-root shadow stack (erased generics, task 100.4.3.6).** An erased `T`
+value lives in an opaque byte buffer the precise stackmap cannot see into (its interior managed pointers
+are not `addrspace(1)` SSA roots and SROA cannot split the buffer), so the `pcsp` walk alone misses them.
+Generated code therefore registers each live non-POD `T` buffer on a **per-fiber shadow stack** — a list
+of `{prev, buffer, vwt}` nodes allocated in the registering frame (fixed-size entry allocas, so the
+`pcsp` fixed-frame dependency holds), with the list head in the fiber control block (offset 288). At STW,
+`nomuSchedWalkRoots` walks each stopped fiber's list (`rtWalkShadow`) after its `pcsp` frames: for each
+node it reads the VWT's `type_id` (the value-layout GC descriptor offset, backend.md §4 / task 100.4.7.4),
+and emits `buffer + off` for every managed offset in that descriptor's pointer map — slot addresses that
+then ride the ordinary evacuation + in-place fixup (§10.6–10.7) exactly like stackmap roots. POD `T` is
+left unregistered (its descriptor has no managed offsets anyway). **Built:** consumer-side registration for
+non-POD unbounded erased arguments (`emitErasedExternalCall` brackets the call with
+`rtShadowSave`/`rtShadowPush`/`rtShadowPopTo`). **Deferred:** producer-internal composed buffers
+(`erased.box`/`erased.enum`) — see 100-modules.md §100.4.3.6 for the lifetime / loop-alloca / nested-field
+hazards.
+
 **Rung 2 sequencing — building the tracer before the walk (revised).** Rather than borrow the C stack
 walk as throwaway scaffolding, rung 2 builds the tracer, marking, and fingerprint first in Nomu **seeded
 from an explicit root**, on single-root-reachable fixtures diffed against MMTk. This removes root discovery

@@ -1,0 +1,24 @@
+// A bounded generic over a **non-POD value-type** conformer, crossing the erased boundary and held
+// across a moving GC (task 100.4.3.3.3 / 100.4.3.6 — lifts the POD guardrail). `holdGet` is compiled
+// once (erased) here; it holds its bounded `T` across a long spin, then dispatches the requirement
+// `get()` through the consumer's value-buffer witness table. `T`'s buffer is a typed GC root, so the
+// managed pointer inside the conformer struct is fixed up when the collector evacuates — the dispatch
+// after the spin reads the relocated object.
+public interface Valued {
+    fun get() -> Int
+}
+
+public fun spin(n: Int) -> Int {
+    var i = 0
+    var acc = 0
+    while i < n {
+        acc = acc + (i % 7)
+        i = i + 1
+    }
+    return acc
+}
+
+public fun holdGet<T: Valued>(x: T) -> Int {
+    let j = spin(400000000)
+    return x.get()
+}

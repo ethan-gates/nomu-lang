@@ -1,14 +1,13 @@
 import ssair
-import ssairgen
 import ssairpasses
 import noir
 import ast
 import support
-// M8 — the LLVM backend seam. All LLVM C-API use stays inside this module, so the driver sees a
-// flat surface: a typed `NOIRModule` in, a native object out (`emitObject`), or nil/error. The
-// lowering runs NOIR → SSAIR (`lowerToSSAIR`) → the optimizer pipeline → LLVM (`SSAIRToLLVM`); this
-// file drives that egress, target setup, the GC pass pipeline (`mem2reg`/`sroa` →
-// `rewrite-statepoints-for-gc`, or `-O2` in release), and object emission via `llvm-c/TargetMachine.h`.
+// M8 — the LLVM backend boundary. All LLVM C-API use stays inside this module, so the driver sees a
+// flat surface: an already-gen'd `SSAModule` in, a native object out (`emitObject`), or nil/error. The
+// driver gens NOIR → SSAIR (`lowerToSSAIR`) and interposes inference + `.nmi` emit (task 164); this file
+// runs the optimizer pipeline → LLVM (`SSAIRToLLVM`), target setup, the GC pass pipeline (`mem2reg`/`sroa`
+// → `rewrite-statepoints-for-gc`, or `-O2` in release), and object emission via `llvm-c/TargetMachine.h`.
 import Foundation
 import LLVM_C
 
@@ -28,11 +27,13 @@ private func cgStage<T>(_ phase: String, _ name: String, _ onStage: StageSink?, 
     return r
 }
 
-/// Lower a whole typed IR module to a native object file for the host triple (the driver then links
-/// it with the runtime `.a`). Returns nil on success, else a `file:line:col`-prefixed error.
-/// `optimize` selects the release (`default<O2>`) pipeline over the debug default (8.5.3).
-public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = false,
-                       subsetFuncs: Set<String> = [], onStage: StageSink? = nil,
+/// Lower an already-gen'd SSAIR module to a native object file for the host triple (the driver gens the
+/// SSA, interposes inference + `.nmi` emit, then calls this and links the result with the runtime `.a`).
+/// `noirModule` is the source NOIR the egress still reads for lowering. Returns nil on success, else a
+/// `file:line:col`-prefixed error. `optimize` selects the release (`default<O2>`) pipeline over the debug
+/// default (8.5.3).
+public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: String, optimize: Bool = false,
+                       onStage: StageSink? = nil,
                        emitLLVMTo: String? = nil, stopAfterEgress: Bool = false,
                        requireMain: Bool = true, externalFuncNames: Set<String> = [],
                        externalGenericSigs: [String: ExternalGenericSig] = [:],
@@ -50,15 +51,14 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
     defer { LLVMContextDispose(ctx) }
     let mod = LLVMModuleCreateWithNameInContext("nomu", ctx)!
 
-    // The backend egress: NOIR → SSAIR → LLVM (the sole path since M7.7 retired the NOIR tree-walk).
-    // The optimizer pipeline runs in place, verifying the GC-precision invariants (§7.0.5) after every
-    // pass. Pipeline order is devirt → inline → stack/scalar promotion (§7.0.4): devirt un-uses a
-    // locally-dispatched box and inline exposes callee bodies, so promotion then falls out. Each pass
-    // has an A/B env gate (`NOMU_NO_DEVIRT`/`NOMU_NO_INLINE`/`NOMU_NO_ESCAPE`/`NOMU_NO_SCALAR`) so a
-    // tier-off baseline stays available for bisecting a regression.
-    let ssa = cgStage("ssair", "gen", onStage) { lowerToSSAIR(module, subsetFuncs: subsetFuncs) }
-    if ssa.diagnostics.hasErrors { return "SSAIR: " + ssa.diagnostics.render() }
-    var ssaModule = ssa.module
+    // The backend egress takes the gen'd SSAIR → LLVM (the sole path since M7.7 retired the NOIR
+    // tree-walk; the driver owns gen now, task 165.1). The optimizer pipeline runs in place, verifying
+    // the GC-precision invariants (§7.0.5) after every pass. Pipeline order is devirt → inline →
+    // stack/scalar promotion (§7.0.4): devirt un-uses a locally-dispatched box and inline exposes callee
+    // bodies, so promotion then falls out. Each pass has an A/B env gate
+    // (`NOMU_NO_DEVIRT`/`NOMU_NO_INLINE`/`NOMU_NO_ESCAPE`/`NOMU_NO_SCALAR`) so a tier-off baseline stays
+    // available for bisecting a regression.
+    var ssaModule = ssa
     let env = ProcessInfo.processInfo.environment
     var passes: [SSAPass] = []
     if env["NOMU_NO_DEVIRT"] == nil { passes.append(Devirtualize()) }
@@ -76,7 +76,7 @@ public func emitObject(_ module: NOIRModule, to path: String, optimize: Bool = f
     egress.e.weakOriginFiles = weakOriginFiles
     egress.e.emitsTypeMaps = emitTypeMaps
     egress.e.homeQualifier = homeQualifier
-    cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: module) }
+    cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: noirModule) }
     if let err = egress.error { return err }
     // The entry object must have `main`; a library object need not.
     if requireMain, !egress.loweredMain { return "LLVM: no `main` function to lower" }
