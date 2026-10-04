@@ -7,7 +7,7 @@ swift_library(
     name = "ssairpasses",
     srcs = glob(["sources/*.swift"]),
     module_name = "ssairpasses",
-    deps = ["//src/support", "//src/midend/ssair"],
+    deps = ["//src/support", "//src/midend/ssair", "//src/inference", "//src/facts"],
     visibility = ["//visibility:public"],
 )
 
@@ -16,5 +16,5 @@ swift_library(
 swift_test(
     name = "ssairpasses_tests",
     srcs = glob(["tests/*.swift"]),
-    deps = ["//src/support", "//src/frontend/ast", "//src/midend/ssair", ":ssairpasses"],
+    deps = ["//src/support", "//src/frontend/ast", "//src/midend/ssair", "//src/inference", "//src/facts", ":ssairpasses"],
 )

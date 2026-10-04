@@ -1,8 +1,21 @@
 # Formal inference stage + post-inference interface generation
 
 **Avenue:** Infra (compiler architecture) · **Type/Lifecycle:** `refactor · midend` · **Size:** L ·
-**Status:** build-soon — substrate design settled in [`internals/inference.md`](../../internals/inference.md);
-behavior-preserving prerequisite is [165](165-midend-pipeline-prefactor.md).
+**Status:** **done** (suite 94/94) — design settled in
+[`internals/inference.md`](../../internals/inference.md). The independent infrastructure is built:
+[166](166-points-to-graph.md) (points-to graph), [167](167-fact-store.md) (fact store),
+[168](168-scc-fixpoint-engine.md) (SCC/fixpoint engine), [169](169-interprocedural-escape-summary.md)
+(escape summary). This task was the **convergence**, a dependency chain of sub-phases: **164.1 done**
+(fact-store Sema writers), **164.2 done** (inference-phase escape summary into the store) — both
+behavior-preserving; **164.3 folded into 164.4**; **164.4.1 done** (store-sourced emit — mutating-ness
+now crosses the boundary in the `.nmi`, the producer half of 100.4.3.5.2); **164.4.2 done** (sectioned `.nmi` with independent
+ABI/perf hashes); **164.4.3 done** (per-definition erased-body escape summary in the perf section);
+**164.6 done** (cross-module seeding — the published `.nmi` escape facts account for imported callees'
+dispositions). **164.5 moved to [148](148-ssair-optimizer-tier.md) §148.1** — the lone codegen-consumption
+phase, blocked on a placement decision (the addrspace-across-calls wall) that is optimizer-tier work, not
+inference-stage work. Inference is now a first-class pipeline phase; the `.nmi` serializes its results.
+Prerequisites:
+[165](165-midend-pipeline-prefactor.md) (done), 166/167/168/169 (done).
 
 ## What
 
@@ -131,38 +144,161 @@ The sections below are the execution plan against that design.
 
 ## Build outline
 
-**Prerequisite:** [165](165-midend-pipeline-prefactor.md) lands the behavior-preserving restructure — the
-pipeline lift (so the driver sequences the stages and can interpose inference + emit) and the escape
-analysis/transform separation. The steps below assume those are in place.
+**Prerequisites:** all the independent infrastructure is built — [165](165-midend-pipeline-prefactor.md)
+(pipeline lift + escape analysis/transform separation), [166](166-points-to-graph.md) (points-to graph +
+escape queries), [167](167-fact-store.md) (fact store), [168](168-scc-fixpoint-engine.md) (SCC engine +
+mutating-ness ported onto it), [169](169-interprocedural-escape-summary.md) (escape summary). The
+`ssair:gen` substrate question is resolved (raw SSA; see "Where the emit sits"). What remains is wiring
+these into the real compile path, broken into the sub-phases below. The ordering is a dependency chain:
+each assumes the ones before it.
 
-1. **Confirm the `ssair:gen` sub-timing split** — done; raw SSA is the substrate (see "Where the emit
-   sits" and [`internals/inference.md`](../../internals/inference.md)).
-2. **Introduce the fact store** — per-symbol structured summaries, stable-id keys, an **extensible,
-   versioned record with independently-hashed sections** (so later dimensions are field additions, not
-   format changes). Two writers: Sema for the cheap facts; the inference stage for value-flow.
-3. **Build the interprocedural fixpoint engine** (SCC over the call graph, seeded by imported summaries)
-   as a stage-agnostic, **scope-agnostic** solver (one module now, whole-program at a link later). First
-   analysis through it: mutating-ness, driven at the Sema altitude so its early error checks stay in
-   place — task B's correct form (mutating-ness in the `.nmi`), done as the first slice rather than a
-   pre-Sema overlay.
-4. **Stand up the points-to / reachability graph builder** over raw SSA — nodes, field-sensitive edges,
-   the cross-fiber sink taxonomy (the substrate in `internals/inference.md`). The large new analysis.
-5. **Relocate interface emission** from pre-Sema `buildInterface(AST)` to a single post-inference emit
-   reading the store + surface. Section it (ABI / perf) with independent hashes.
-6. **Migrate escape to a summary-producing analysis** on the graph; promotion (already separated by 165)
-   reads the stored summary. The GC-stress fixtures are the regression tripwire.
-7. Subsequent dimensions (uniqueness form 1, fiber locality, shareable-requirement, …) register as
-   analyses into the same engine and `.nmi` sections.
+### 164.1 — Fact store in the compile path, Sema writers — **done + green (behavior-preserving, 94/94)**
+
+`collectFacts(_ module: NOIRModule) -> FactStore` (`frontend/sema/sources/passes/FactCollection.swift`)
+writes mutating-ness into the store's ABI section, keyed `Type.method` (the per-definition convention the
+mid-end + emit share). The driver (`compile`) builds the store after Sema and threads it into
+`emitLLVMBinary(facts:)` — reserved at the inference interposition point for 164.2. **Behavior-preserving:**
+the store is populated but unread, suite 94/94. Unit-tested in `tests/FactCollectionTests.swift`.
+
+**Remaining 164.1 writers** (carry forward): type shareability + conditional conformance (needs the
+`Shareability` predicate wired over the module's types), and the dependency compile path (`compileDependency`
+→ `emitObject`) populating its own store symmetrically.
+
+### 164.2 — Inference stage: escape summary into the store — **done + green (behavior-preserving, 94/94)**
+
+At the interposition point [165](165-midend-pipeline-prefactor.md) opened (between `lowerToSSAIR` and
+`emitObject` in `emitLLVMBinary`), the driver runs [169](169-interprocedural-escape-summary.md)'s
+`computeEscapeSummaries` over the gen'd SSA and `writeEscapeSummaries` into the store's perf section,
+wrapped in a `ssair`/`inference` timing phase (visible in the timing table, ~3 ms on a bare `main`). The
+store is then threaded into `emitObject(facts:)` (reserved for 164.4/164.5). **Inference is now a real
+pipeline phase** (gen → inference → emit → transforms); behavior-preserving (written, unconsumed), suite
+94/94. The driver deps `//src/midend/ssairpasses`; `emitObject` deps `//src/facts`.
+
+**Key-space note (the symbol-key alignment this surfaces):** the perf escape summary is keyed by
+**post-mono SSA function name** — the per-instance summary the promotion path (164.5) reads, running on the
+same functions — while 164.1's ABI facts are keyed **per-definition** (`Type.method`) for the `.nmi`
+(164.4). The two consumers want different key spaces, so the store holds both; the per-definition
+erased-body escape summary the `.nmi` needs is a 164.4 concern.
+
+### 164.3 — Emit-relocation finding: the move is not independently behavior-preserving — **folded into 164.4**
+
+The intended 165-style "move the emit, then change its inputs" does not factor cleanly here:
+
+- The **entry path** (`compile`) already calls `buildInterface` *after* Sema (the `--nmi` branch), so the
+  "run post-inference" position 164.3 wanted is already satisfied there.
+- The **dependency path** (`compileDependency`) calls `buildInterface` deliberately **before**
+  `prependPrelude` + `mergeExtensions`, so it reads the module's own pre-prelude, pre-merge surface.
+  Moving it to post-Sema is **not** behavior-preserving — it would fold in merged extension methods and
+  change the emitted interface. (Note: the two paths already differ in this respect — the entry path's
+  post-merge emit sees extensions, the dependency path's pre-merge emit does not. An existing
+  inconsistency to resolve at 164.4, not here.)
+
+So there is no clean standalone timing move to make; relocation only becomes coherent together with the
+input change (AST → store + NOIR surface), where the prelude/merge filtering is handled deliberately.
+164.3 is therefore **folded into 164.4**, which does the position + input change as one step.
+
+### 164.4 — Post-inference, store-sourced emit (absorbs 164.3)
+
+Switch the interface emit to assemble the `.nmi` from the fact store + the declaration surface, running
+post-inference in both driver paths, carrying the inferred facts across the boundary and (eventually)
+sectioning the file. Split into sub-phases.
+
+#### 164.4.1 — Store-sourced emit; mutating-ness in the `.nmi` (producer half of 100.4.3.5.2) — **done + green (94/94)**
+
+`buildInterface` takes a `FactStore` and sets `InterfaceFunc.isMutating` (new optional Codable field) from
+it, keyed `Type.method`. The driver builds the store after Sema and passes it in both paths; the
+dependency path relocated its `buildInterface` call to post-Sema, built from a **pre-merge own-surface
+snapshot** so the emitted surface is unchanged but for the added facts (the folded-in 164.3 move, done
+safely). Verified: a library `.nmi` now carries `isMutating: true` on a mutating method, `false` on a
+pure one; suite 94/94 (incl. the `.nmi`-consuming module tests). `interface` deps `//src/facts`.
+mutating-ness now crosses the boundary in the `.nmi`; the consumer-side use is [100](100-modules.md) §100.4.3.5.2.
+
+#### 164.4.2 — Section the `.nmi` (ABI/soundness + perf) with independent hashes — **done + green (94/94)**
+
+The `.nmi` is now an `NMIFile` — `{version, abi: ModuleInterface, perf: InterfacePerf, abiHash, perfHash}`
+— each section FNV-hashed over its own canonical JSON, so `abiHash` is a function of the ABI section alone
+(a perf-only change leaves it byte-identical, the §100.4.6 incremental-cache lever). `serialize` wraps +
+hashes; `parseNMI` reads the full file (with a flat-`ModuleInterface` fallback for a stale file);
+`parseInterface` still returns the ABI section, so every cross-module consumer is unchanged (suite 94/94).
+`InterfacePerf` holds a per-definition `[String: EscapeSummary]`, empty until 164.4.3. Oracle:
+`testAbiHashIndependentOfPerf` (perf-only change ⇒ equal `abiHash`, differing `perfHash`) +
+`testSectionedRoundTrip`. Overlaps the on-disk format work in [162](162-interface-serialization-opt.md).
+
+#### 164.4.3 — Per-definition erased-body escape summary in the perf section — **done + green (94/94)**
+
+The `--emit-nmi` path now lowers the module's **erased/template** bodies — the pre-mono SSA — to SSA,
+runs [169](169-interprocedural-escape-summary.md)'s `computeEscapeSummaries` over them (a generic
+definition summarizes once over its erased body, verified: `firstOf<T>` and `Box<T>.get` each get one
+summary, no post-mono duplication), re-keys the result to the per-definition convention
+(`perDefinitionEscapeSummaries`: `m:Type:method` → `Type.method`, a free function keeps its bare name —
+matching the ABI facts), projects it onto the public surface (only an exported definition carries a
+summary, no private leak), and passes it as the `InterfacePerf` to `serialize`. Best-effort: a body that
+fails to lower pre-mono simply carries no summary (read as "unknown"); lowering diagnostics are dropped
+(an interface's perf facts are advisory). Verified: a library `.nmi` now carries an `escape` entry per
+exported definition, keyed identically to its ABI facts. Driver glue + a pure re-keying helper in
+`ssairpasses` (unit-tested, `testPerDefinitionReKeying`). The per-instance post-mono summary stays the
+promotion input (164.5); this per-definition form is the cross-module one a dependent seeds from (164.6).
+
+**Resolved by 164.6:** the whole-program build keeps dependency interfaces in memory (ABI via
+`compileDependency` → `interfaces[m]`), and the `.nmi` file itself is produced only by the `--emit-nmi`
+path. 164.6 carries the dependency perf summaries in a parallel in-memory map (`depEscape[m]`) filled as
+each dependency compiles, rather than round-tripping them through an on-disk `.nmi` — so seeding needs no
+representation change here. Reading a dependency's perf section back from an on-disk `.nmi` is the
+separate incremental-build concern ([100](100-modules.md) §100.4.5/4.6), where a dependency is not
+recompiled from source.
+
+#### Deferred within 164.4
+
+The entry path emits its post-merge surface (sees extensions); the dependency path emits its pre-merge
+own-surface (does not). Unifying the prelude/merge filtering across both paths is carried forward (it
+changes `.nmi` surface content, so it wants its own validation).
+
+### 164.5 — Promotion reads the stored escape summary — **moved to [148](148-ssair-optimizer-tier.md) §148.1**
+
+The one phase that consumes the summary in codegen rather than producing it. It is blocked on a placement
+decision (the addrspace-across-calls wall + I4), which is a GC-root-model / allocation-model project, not
+inference-stage work — so it lives with the optimizer tier under 148.1 "Interprocedural EA lift — promotion
+reads the summary", alongside the route analysis (force-inline / bounded argument explosion / frame roots /
+per-fiber `p1` region) and the runtime finding (per-carrier TLAB + migrating fibers). The wiring is thin
+once a route lands: the per-instance summary shares `computeEscapeSummaries`'s `external:` parameter, so
+promotion reads it the same way the `.nmi` producer does. With this moved out, **task 164 is done** — the
+inference stage is a real pipeline phase, the fact store + SCC engine are the shared substrate, and the
+`.nmi` carries mutating-ness plus a cross-module-accurate per-definition escape summary.
+
+### 164.6 — Seed the engine across the module boundary — **done + green (94/94)**
+
+`computeEscapeSummaries` gained an `external:` provider — a dependency's published per-definition
+summaries, keyed by the call names a consumer's SSA emits for them (a free function `foo` → `origin@foo`,
+a method `Type.method` → `m:origin@Type:method`, via `externalEscapeKeys` + the new public
+`ssaMethodSymbol`). A direct call to a non-in-module callee reads that summary instead of the conservative
+floor (`argEscapes` prefers `external` over the in-graph lookup). The driver fills it topologically:
+`compileDependency` computes its own per-definition summary seeded by its visible dependencies'
+(`externalEscape(of:)`) and returns it into `depEscape[m]`; the entry's `--emit-nmi` seeds the same way.
+Verified on a two-module fixture: a function passing its param to an imported no-escape callee publishes
+`noEscape`, one passing to an imported param-returning callee publishes `escapes` — where the pre-164.6
+floor marked both `escapes`. Unit-tested (`testExternalSummarySeedsImportedCall`). This makes the published
+analysis genuinely cross-module.
+
+**Scoped to the `.nmi` producer.** The per-definition (`--emit-nmi` / `compileDependency`) path is seeded;
+the per-instance post-mono summary 164.2 computes for promotion shares the same `external:` parameter, so
+seeding it is a one-line follow-on once promotion (164.5) has a consumer. Depends on 164.4 (the `.nmi`
+carries the summaries).
+
+**Beyond 164:** subsequent dimensions (uniqueness form 1, fiber locality, shareable-requirement, …)
+register as analyses into the same engine and `.nmi` sections — the pattern this task establishes, not
+further 164 sub-phases.
 
 ## Relationship to existing tasks
 
 - [165 mid-end pipeline prefactor](165-midend-pipeline-prefactor.md) — the behavior-preserving
-  prerequisite (pipeline lift + escape analysis/transform separation).
+  prerequisite (pipeline lift + escape analysis/transform separation). Done.
+- [166 points-to / reachability graph](166-points-to-graph.md) — the upstream analysis core (the graph
+  every value-flow fact queries); 164.5's promotion wiring consumes its summary.
 - [`internals/inference.md`](../../internals/inference.md) — the design home for the model and substrate.
 - [100 modules](100-modules.md) — §100.4.1 (`.nmi` generation) is reshaped by this; §100.4.5/4.6
-  (incremental cache + byte-stable interface) depend on it; §100.4.3.5 task B (mutating-ness across the
-  boundary) is this refactor's first slice; §100.5 (`.bir` / specialization) is the perf section's
-  future content.
+  (incremental cache + byte-stable interface) depend on it; §100.4.3.5.2 (a mutating value method across
+  the boundary) consumes the mutating-ness this carries; §100.5 (`.bir` / specialization) is the perf
+  section's future content.
 - [162 interface/IR serialization](162-interface-serialization-opt.md) — the on-disk format this emits.
 - [148 SSAIR optimizer tier](148-ssair-optimizer-tier.md) — the stage-3 transforms (incl. the
   interprocedural-escape lift this consumes/produces).
@@ -173,8 +309,9 @@ analysis/transform separation. The steps below assume those are in place.
 
 ## Sequencing
 
-[165](165-midend-pipeline-prefactor.md) is the behavior-preserving prerequisite and lands first. Pause
-module *feature* work at the current green checkpoint (100.4.3.5 increment A done). This refactor
-precedes 100.4.5 and every inferred-fact-crossing-the-boundary track. Task B falls out of step 3 as the
-first analysis through the engine. The erased-method path (100.4.3.5 C) is the one current item
-independent of this and can be scheduled either side.
+[165](165-midend-pipeline-prefactor.md) (done) is the behavior-preserving prerequisite; the graph builder
+[166](166-points-to-graph.md) is the upstream analysis core and lands beside the engine (step 5's escape
+migration consumes it). Pause module *feature* work at the current green checkpoint (100.4.3.5.1
+done). This refactor precedes 100.4.5 and every inferred-fact-crossing-the-boundary track. 100.4.3.5.2's
+producer half falls out of step 3 as the first analysis through the engine. The erased-method path (100.4.3.5.3) is the one
+current item independent of this and can be scheduled either side.

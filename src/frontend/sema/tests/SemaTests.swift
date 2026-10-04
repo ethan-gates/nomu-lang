@@ -389,6 +389,70 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(s.methods.first { $0.name == "twice" }!.isMutating)
     }
 
+    // Mutating-ness is computed by the shared SCC/fixpoint engine (task 168). These exercise the two
+    // paths the engine port changed and that the end-to-end suite does not cover: multi-hop propagation
+    // (callees-first ordering past depth 1) and a recursive SCC (mutual recursion must converge, not loop).
+
+    func testDeepTransitiveMutatingInferred() {
+        // Mutation propagates along a self-call chain of depth > 1.
+        let r = sema("""
+        struct C {
+            var count: Int
+            fun bump() { count = count + 1 }
+            fun a() { self.bump() }
+            fun b() { self.a() }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .structDecl(let s) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertTrue(s.methods.first { $0.name == "a" }!.isMutating)
+        XCTAssertTrue(s.methods.first { $0.name == "b" }!.isMutating, "mutation reaches the depth-2 caller")
+    }
+
+    func testMutualRecursionMutatingInferred() {
+        // Mutually-recursive same-type methods form one SCC; a write anywhere in the cycle marks all of it.
+        let r = sema("""
+        struct C {
+            var count: Int
+            fun ping() { count = count + 1  self.pong() }
+            fun pong() { self.ping() }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .structDecl(let s) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertTrue(s.methods.first { $0.name == "ping" }!.isMutating)
+        XCTAssertTrue(s.methods.first { $0.name == "pong" }!.isMutating, "mutation flows around the cycle")
+    }
+
+    func testMutualRecursionNonMutatingConverges() {
+        // A non-mutating cycle must converge to non-mutating — and the fixpoint must terminate.
+        let r = sema("""
+        struct C {
+            var count: Int
+            fun ping() -> Int { return self.pong() }
+            fun pong() -> Int { return self.ping() }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .structDecl(let s) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertFalse(s.methods.first { $0.name == "ping" }!.isMutating)
+        XCTAssertFalse(s.methods.first { $0.name == "pong" }!.isMutating)
+    }
+
+    func testTransitiveNonMutatingStays() {
+        // Calling only a non-mutating method on self keeps the caller non-mutating.
+        let r = sema("""
+        struct C {
+            var count: Int
+            fun get() -> Int { return count }
+            fun read() -> Int { return self.get() }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        guard case .structDecl(let s) = r.module.decls[0] else { XCTFail(); return }
+        XCTAssertFalse(s.methods.first { $0.name == "read" }!.isMutating, "calling a getter stays non-mutating")
+    }
+
     func testMutatingCallOnLetRejected() {
         let r = sema("""
         struct C {

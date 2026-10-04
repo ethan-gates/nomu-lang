@@ -25,10 +25,47 @@ LLVM leaves (`NOMU_DUMP_LLVM` → `.post.ll`) before adding a pass.
 
 ## 148.1 · Escape analysis & promotion (§7.3)
 
-- **Interprocedural EA lift** `[M · next]` `[§7.3]` — the conservative "any call argument escapes" rule
-  is the broadest limiter. Lift via a **post-inline EA re-run** (cheapest — inline already runs; promote
-  again after so EA/scalar-promotion reach across the inlined call boundary) or **per-function escape
-  summaries**. Highest-reach EA item; compounds with scalar promotion (§7.3.1).
+- **Interprocedural EA lift — promotion reads the summary** `[M · next]` `[§7.3]` (absorbs the former
+  164.5) — the conservative "any call argument escapes" rule is the broadest limiter. The **per-function
+  escape summary** is built and now **published**: the Level-1 floor ([169](169-interprocedural-escape-summary.md),
+  on the 166 graph + 168 engine) is computed per definition, serialized into the `.nmi` perf section, and
+  cross-module seeded across the import boundary ([164](164-formal-inference-stage.md) complete). What
+  remains — formerly 164.5 — is **consuming** it in codegen: wire `StackPromotion` (provider injectable
+  since [165.2](165-midend-pipeline-prefactor.md)) to read the stored interprocedural summary instead of
+  recomputing intraprocedurally, gated by the GC-stress suite. The wiring is thin (the per-instance summary
+  shares `computeEscapeSummaries`'s `external:` parameter); the blocker is the placement route below, since
+  the promotions the summary adds are exactly the ones that trip I4 + the addrspace wall. A **post-inline EA
+  re-run** (inline already runs; promote again after so EA/scalar-promotion reach across the inlined call
+  boundary) is the independent, no-new-machinery slice that lands without the placement decision. Highest-
+  reach EA item; compounds with scalar promotion (§7.3.1).
+  - **The addrspace-across-calls obstacle (decision deferred).** The incremental win from the summary is
+    promoting an `alloc` that only reaches a callee that does not escape it (the `escape_nonleaf` /
+    `sink(g)` shape). Landing that trips two things: **I4** (the verifier's oracle is the *faithful*
+    intraprocedural query, which escapes every call argument), and the **addrspace wall** — a promoted
+    `stackAlloc` is `addrspace(0)`, the callee's reference parameter is `addrspace(1)`, and no
+    `addrspacecast` survives a safepoint in either direction (0→1 asks the statepoint rewriter to relocate
+    a slot; 1→0 lets a collection stale a raw pointer the callee holds). The `Inline` pass already runs
+    before promotion, so the inlinable callees are covered by faithful EA alone; the promotions the summary
+    *adds* are exactly the non-inlined (recursive / large / cross-module `.nmi`) calls that hit the wall.
+    The addrspace encodes "the collector tracks this," so one callee body cannot take both representations
+    — a single body implies a single representation: keep the object `addrspace(1)` and make `p1` cheap
+    instead. Candidate routes, none picked: **(a)** force-inline at the promoted site (low reach — overlaps
+    the inliner); **(b)** bounded same-module argument explosion (the object's fields passed as separate
+    `p1` args, à la LLVM `argpromotion` — internal-linkage, load-only, clone-based, no cross-module reach);
+    **(c)** frame roots / `gcroot`-style pinned slot with a field pointer-map the collector scans (a second
+    root path parallel to the SSA-value statepoints the GC substrate rests on); **(d)** promote into a
+    fiber-local `p1` region reclaimed at frame exit (uniform ABI, composes across calls). **Runtime finding
+    gating (d):** allocation today is **per-carrier** (the TLAB bump, `_Thread_local` per carrier — Go
+    `mcache` / MMTk per-mutator), and fibers **migrate** across carriers via a single shared run queue, so
+    a naive "rewind the TLAB bump at frame exit" is unsound (another fiber on the carrier shares the cursor;
+    the fiber may resume on a different carrier). A true region tier therefore needs new **per-fiber** arena
+    machinery (state that travels with the fiber, interacting with STW root scanning + nursery demotion on
+    survival) — the project names "fiber-local allocation" as an inferred placement, but the runtime has
+    not built it. Prior art: non-moving collectors (Go stack maps, Julia GC frames, Boehm) and refcounting
+    (Swift SIL interprocedural EA → `alloc_ref [stack]`) pass such pointers freely because nothing
+    relocates; moving-GC JITs (HotSpot) inline then scalar-replace and **bail to heap** on a non-inlined
+    escape. Routes (b)/(c)/(d) each touch either the GC-root model or the allocation model; the choice is a
+    148-level decision parked until the inference track (164) finishes.
 - **Scalar promotion — in-place field mutation of a φ value** `[M · deferred]` `[§7.3.1 A1]` — a
   loop-carried object *both* reassigned to fresh *and* mutated in place needs field-level joins (full
   per-field mem2reg). Rare pattern; bails to heap today (sound).
@@ -46,6 +83,14 @@ LLVM leaves (`NOMU_DUMP_LLVM` → `.post.ll`) before adding a pass.
   loop-carried φ). Candidate approach: scalarize captures, or thread the env addr0.
 - **Spawn-env promotion** `[M · deferred]` `[§7.3]` — unsound as built (crosses the fiber boundary as a
   runtime-held root); needs the egress to copy env into fiber-owned storage.
+- **Stored-into-local / nested-object promotion** `[M · deferred]` `[166.4]` — consume the precise escape
+  query ([166](166-points-to-graph.md), `NOMU_PTG_PRECISE`): a class object written into a non-escaping
+  local object's field, and a loop-carried object flowing into a non-escaping block parameter, are
+  provably non-escaping and promotable, but promoting them today trips **I4** — a `stackAlloc` stored into
+  a managed field makes an `addrspace(1)` field point at an `addrspace(0)` stack slot that the statepoint
+  rewriter relocates as heap. Needs SROA of the nested promoted object (so the field becomes an SSA value,
+  not a stored stack pointer) and I4 re-expressed against the precise contract rather than faithful
+  `escapingValues`. The analysis is ready and subset-validated; this is the transform/verifier half.
 - **Array inline / small-buffer storage** `[L · deferred]` `[§7.3, deferred stdlib]` — the real
   array-allocation lever is smallvec-style inline stack capacity + heap spill on growth, a representation
   change to `Array` that belongs with the stdlib `Array` design, not a pass. Fixed-`arrayLit` promotion

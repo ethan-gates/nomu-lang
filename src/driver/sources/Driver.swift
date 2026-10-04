@@ -9,6 +9,8 @@ import interface
 import sema
 import ssair
 import ssairgen
+import ssairpasses
+import facts
 import embedded
 import LLVMBridge
 
@@ -150,6 +152,10 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
     let preludeFiles: Set<String> = [EmbeddedSources.preludeName, EmbeddedSources.runtimePreludeName]
     let topo: [ModuleID] = { if case .success(let o) = graph.topologicalOrder() { return o }; return [entryID] }()
     var interfaces: [ModuleID: ModuleInterface] = [:]
+    // Each compiled dependency's published per-definition escape summary (task 164.6), keyed per module.
+    // Seeds a consumer's escape computation across the import boundary so its own published `.nmi` summary
+    // reflects imported non-escaping callees rather than the conservative floor. Filled topologically.
+    var depEscape: [ModuleID: [String: EscapeSummary]] = [:]
     var depObjects: [String] = []
     try? FileManager.default.createDirectory(atPath: buildRoot, withIntermediateDirectories: true)
     // A module plus everything it re-exports via `public import`, transitively (task 100.2.4).
@@ -174,6 +180,16 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
             for k in reexportClosure(of: dep) where seen.insert(k).inserted { order.append(k) }
         }
         return order
+    }
+    // The escape-summary seed for compiling `m` (task 164.6): the union of each visible dependency's
+    // published per-definition summaries, re-keyed to the call names `m`'s SSA emits for them.
+    func externalEscape(of m: ModuleID) -> [String: EscapeSummary] {
+        var out: [String: EscapeSummary] = [:]
+        for k in visibleModules(of: m) {
+            guard let summ = depEscape[k] else { continue }
+            out.merge(externalEscapeKeys(summ, origin: k.components.joined(separator: "/"))) { a, _ in a }
+        }
+        return out
     }
     // The function / type names each currently-known module exports, keyed by module path. Feed per-file
     // resolution + collision handling (tasks 100.2.3.1/100.2.3.2), separately by kind so a name can be
@@ -232,17 +248,19 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
     for m in topo where m != entryID {
         let objPath = buildRoot + "/__mod_" + (m.components.isEmpty ? "root" : m.components.joined(separator: "_")) + ".o"
         let scopes = fileScopes(parsedByModule[m] ?? [])
-        guard let iface = compileDependency(files: parsedByModule[m] ?? [], module: m,
-                                            externalDecls: externals(of: m),
-                                            fileVisibleModules: scopes.fileVisible, fileQualifiers: scopes.fileQualifiers,
-                                            moduleFuncs: moduleFuncs(), moduleTypes: moduleTypes(),
-                                            leafCollisions: scopes.leafCollisions,
-                                            packageName: packageName,
-                                            packageRoot: packageRoot, objPath: objPath, buildRoot: buildRoot,
-                                            options: options, weakFiles: preludeFiles, timings: timings) else {
+        guard let dep = compileDependency(files: parsedByModule[m] ?? [], module: m,
+                                          externalDecls: externals(of: m),
+                                          fileVisibleModules: scopes.fileVisible, fileQualifiers: scopes.fileQualifiers,
+                                          moduleFuncs: moduleFuncs(), moduleTypes: moduleTypes(),
+                                          leafCollisions: scopes.leafCollisions,
+                                          packageName: packageName,
+                                          packageRoot: packageRoot, objPath: objPath, buildRoot: buildRoot,
+                                          options: options, weakFiles: preludeFiles,
+                                          externalEscape: externalEscape(of: m), timings: timings) else {
             timings.report(); exit(1)
         }
-        interfaces[m] = iface
+        interfaces[m] = dep.iface
+        depEscape[m] = dep.escape
         depObjects.append(objPath)
     }
     let entryExternals = externals(of: entryID)
@@ -317,12 +335,20 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
         exit(1)
     }
 
+    // Sema's structural facts (mutating-ness; task 164.1) into the shared fact store, keyed per
+    // definition. Consumed by the `.nmi` emit below (164.4, task B) and threaded to the codegen path's
+    // inference interposition point (164.2) where 164.5 will feed promotion.
+    let factStore = collectFacts(semaResult.module)
+
     // Module interface (`.nmi`) emission (task 100.4.1). Built from the checked public surface of the
-    // entry module. Terminal — a library module need not have an entry point or link, so this returns
-    // rather than proceeding to codegen.
+    // entry module, carrying the inferred facts from the store (164.4). Terminal — a library module need
+    // not have an entry point or link, so this returns rather than proceeding to codegen.
     if options.nmi {
-        let iface = buildInterface(program, package: packageName, module: entryID, packageRoot: packageRoot)
-        writeArtifact(serialize(iface), toFile: stem + ".nmi")
+        let iface = buildInterface(program, package: packageName, module: entryID, packageRoot: packageRoot, facts: factStore)
+        let perf = escapePerfSection(iface, semaResult.module,
+                                     subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames),
+                                     external: externalEscape(of: entryID))
+        writeArtifact(serialize(iface, perf: perf), toFile: stem + ".nmi")
         timings.report()
         return
     }
@@ -358,8 +384,47 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
                    emitLLVM: options.llvm || options.stopAt == .llvm, stopAfterLLVM: options.stopAt == .llvm,
                    extraObjects: depObjects, externalFuncNames: semaResult.externalFuncNames,
                    externalGenericSigs: semaResult.externalGenericSigs,
-                   weakOriginFiles: preludeFiles)
+                   weakOriginFiles: preludeFiles, facts: factStore)
     timings.report()
+}
+
+// The `.nmi` perf section (task 164.4.3): the per-definition escape summary of each exported definition.
+// Computed over the module's **erased/template** bodies — the pre-mono SSA — so each definition is
+// summarized once (the cross-module form a dependent reads, 164.6), distinct from the per-instance
+// post-mono summary the promotion path consumes (164.2/164.5). The summary is re-keyed to the per-
+// definition convention and projected onto the public surface, so only an exported definition carries
+// one (no private symbol leaks, and the key matches the ABI facts). Best-effort: a body that fails to
+// lower pre-mono simply carries no summary (read as "unknown", the conservative floor); lowering
+// diagnostics are intentionally dropped — a valid interface's facts are advisory, never fatal here.
+private func escapePerfSection(_ iface: ModuleInterface, _ module: NOIRModule,
+                               subsetFuncs: Set<String>,
+                               external: [String: EscapeSummary] = [:]) -> InterfacePerf {
+    let gen = lowerToSSAIR(module, subsetFuncs: subsetFuncs)
+    let perDef = perDefinitionEscapeSummaries(
+        computeEscapeSummaries(gen.module.functions, aggregates: gen.module.aggregates, external: external))
+
+    var surface = Set(iface.functions.map(\.name))
+    for t in iface.types { for m in t.methods { surface.insert("\(t.name).\(m.name)") } }
+    for e in iface.enums { for m in e.methods { surface.insert("\(e.name).\(m.name)") } }
+    return InterfacePerf(escape: perDef.filter { surface.contains($0.key) })
+}
+
+// Re-key a dependency's published per-definition escape summaries to the call names an importer uses for
+// them (task 164.6), so a consumer's escape computation finds the summary at the `.direct(name)` its SSA
+// emits for an imported call: a free function `foo` → `origin@foo`, a method `Type.method` →
+// `m:origin@Type:method` (mirrors `ExternalName.encode` + ssairgen's method symbol). The importer seeds
+// `computeEscapeSummaries(external:)` with the union of these over its visible dependencies.
+private func externalEscapeKeys(_ perDef: [String: EscapeSummary], origin: String) -> [String: EscapeSummary] {
+    var out: [String: EscapeSummary] = [:]
+    for (key, s) in perDef {
+        if let dot = key.firstIndex(of: ".") {   // `Type.method` — a method on an imported type
+            let type = String(key[..<dot]), method = String(key[key.index(after: dot)...])
+            out[ssaMethodSymbol(ExternalName.encode(origin: origin, name: type), method)] = s
+        } else {                                 // a bare free-function name
+            out[ExternalName.encode(origin: origin, name: key)] = s
+        }
+    }
+    return out
 }
 
 // Write a text artifact to `path` (or exit) and report its path — the "emit" style,
@@ -473,7 +538,8 @@ private func compileDependency(files: [SourceFile], module: ModuleID, externalDe
                                leafCollisions: [(file: String, leaf: String, span: Span)],
                                packageName: String, packageRoot: String, objPath: String,
                                buildRoot: String, options: EmitOptions, weakFiles: Set<String>,
-                               timings: Timings) -> ModuleInterface? {
+                               externalEscape: [String: EscapeSummary],
+                               timings: Timings) -> (iface: ModuleInterface, escape: [String: EscapeSummary])? {
     var program = Program(decls: files.flatMap(\.decls), imports: files.flatMap(\.imports))
 
     let dupDiags = DiagnosticSink()
@@ -482,7 +548,10 @@ private func compileDependency(files: [SourceFile], module: ModuleID, externalDe
     reportLeafCollisions(leafCollisions, into: dupDiags)
     if dupDiags.hasErrors { fputs(dupDiags.render() + "\n", stderr); return nil }
 
-    let iface = buildInterface(program, package: packageName, module: module, packageRoot: packageRoot)
+    // Snapshot the module's own surface (pre-prelude, pre-merge) for the interface; the interface is built
+    // post-Sema (task 164.4) so it can carry the fact store, from this same surface so its output is
+    // unchanged but for the added inferred facts.
+    let ownSurface = program
 
     let runtimeSubsetNames: Set<String>
     (program, runtimeSubsetNames) = prependPrelude(program)
@@ -504,6 +573,21 @@ private func compileDependency(files: [SourceFile], module: ModuleID, externalDe
     checkExhaustiveness(semaResult.module, into: semaResult.diagnostics)
     if !semaResult.diagnostics.isEmpty { fputs(semaResult.diagnostics.render() + "\n", stderr); return nil }
 
+    // The dependency's interface, carrying its inferred facts (task 164.4) — built from the pre-merge
+    // own-surface snapshot so the surface matches the pre-relocation output.
+    let iface = buildInterface(ownSurface, package: packageName, module: module, packageRoot: packageRoot,
+                               facts: collectFacts(semaResult.module))
+    // This dependency's own per-definition escape summary (task 164.6), seeded by its visible
+    // dependencies' published summaries so it is itself cross-module-accurate when a downstream consumer
+    // seeds from it. Computed over the pre-mono erased bodies, like the `--emit-nmi` path, and only when a
+    // `.nmi` is being produced — it is a second SSA lowering whose sole consumer is the published perf
+    // section, so a full codegen build skips it (the entry's `escapePerfSection` is `--nmi`-gated too).
+    let ownEscape = options.nmi
+        ? escapePerfSection(iface, semaResult.module,
+                            subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames),
+                            external: externalEscape).escape
+        : [:]
+
     let monoDiags = DiagnosticSink()
     let monoModule = monomorphize(semaResult.module, into: monoDiags)
     if !monoDiags.isEmpty { fputs(monoDiags.render() + "\n", stderr); return nil }
@@ -519,7 +603,7 @@ private func compileDependency(files: [SourceFile], module: ModuleID, externalDe
                          weakOriginFiles: weakFiles, emitTypeMaps: false,
                          homeQualifier: Mangle.qualifier(module: module.components))
     if let err = err { fputs("error: \(err)\n", stderr); return nil }
-    return iface
+    return (iface, ownEscape)
 }
 
 // LLVM backend binary stage (8.1.4): emit a host object via the LLVM C API, build the runtime
@@ -531,7 +615,7 @@ private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: Strin
                             emitLLVM: Bool = false, stopAfterLLVM: Bool = false,
                             extraObjects: [String] = [], externalFuncNames: Set<String> = [],
                             externalGenericSigs: [String: ExternalGenericSig] = [:],
-                            weakOriginFiles: Set<String> = []) {
+                            weakOriginFiles: Set<String> = [], facts: FactStore = FactStore()) {
     let objPath = stem + ".o"
     // The LLVM path (SSAIR gen + passes, IR egress, LLVM opt, object emit) reports its sub-stages up
     // through the `StageSink`, so the timing table's `ssair`/`llvm` phases break down rather than
@@ -544,11 +628,21 @@ private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: Strin
         fputs("error: SSAIR: " + gen.diagnostics.render() + "\n", stderr)
         timings.report(); exit(1)
     }
+    // Inference stage (task 164.2): over the raw, pre-transform SSA, compute the interprocedural escape
+    // summary (169) and write it into the fact store's perf section — the real `gen → inference → emit →
+    // transforms` ordering. Keyed by post-mono SSA function name (the per-instance summary the promotion
+    // path reads in 164.5), alongside the per-definition ABI facts 164.1 wrote. Still behavior-preserving:
+    // written, not yet consumed (promotion reads it at 164.5, the `.nmi` serializes it at 164.4).
+    var store = facts
+    timings.measure("ssair", "inference") {
+        let summaries = computeEscapeSummaries(gen.module.functions, aggregates: gen.module.aggregates)
+        writeEscapeSummaries(summaries, into: &store)
+    }
     let err = emitObject(gen.module, from: module, to: objPath, optimize: optimize,
                          onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
                          emitLLVMTo: emitLLVM ? stem + ".ll" : nil, stopAfterEgress: stopAfterLLVM,
                          externalFuncNames: externalFuncNames, externalGenericSigs: externalGenericSigs,
-                         weakOriginFiles: weakOriginFiles)
+                         weakOriginFiles: weakOriginFiles, facts: store)
     if let err = err {
         fputs("error: \(err)\n", stderr)
         timings.report()

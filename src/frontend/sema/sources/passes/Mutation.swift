@@ -1,5 +1,6 @@
 import noir
 import support
+import inference   // the shared SCC/fixpoint engine (task 168)
 // Mutation analysis (M4.11) — an IR pass over the typed module.
 //
 // Infers which value/reference-type methods mutate `self`, validates writes to
@@ -48,20 +49,25 @@ private final class MutationAnalyzer {
             selfCalls[methodKey(typeName, m.name)] = calls
         }
 
-        // Fixpoint: mutating if it writes directly, or calls a mutating method (same type) on self.
-        var mutating = Set(direct.filter { $0.value }.map { $0.key })
-        var changed = true
-        while changed {
-            changed = false
-            for (typeName, m) in allMethods(module) {
-                let k = methodKey(typeName, m.name)
-                if mutating.contains(k) { continue }
-                if selfCalls[k]?.contains(where: { mutating.contains(methodKey(typeName, $0)) }) == true {
-                    mutating.insert(k)
-                    changed = true
-                }
-            }
+        // Fixpoint over the shared engine (task 168): a method is mutating if it writes a field of `self`
+        // directly, or calls a mutating method of the same type on `self`. The call graph is each method
+        // to the same-type methods it calls on self; the transfer is "direct write, or any mutating
+        // callee". A self-call to a method with no definition resolves through the engine's default
+        // provider as non-mutating, matching the previous bare-set membership test.
+        var graph = CallGraph<String>()
+        var calleeKeys: [String: [String]] = [:]
+        for (typeName, m) in allMethods(module) {
+            let k = methodKey(typeName, m.name)
+            graph.addNode(k)
+            let callees = (selfCalls[k] ?? []).map { methodKey(typeName, $0) }
+            calleeKeys[k] = callees
+            for c in callees { graph.addEdge(from: k, to: c) }
         }
+        let solution = FixpointSolver(graph: graph) { (k: String, lookup: (String) -> BoolFact) in
+            if direct[k] == true { return BoolFact(true) }
+            return BoolFact(calleeKeys[k]?.contains { lookup($0).value } ?? false)
+        }.solve()
+        let mutating = Set(solution.filter { $0.value.value }.map { $0.key })
 
         return MutationResult(module: annotate(module, mutating: mutating), mutating: mutating)
     }

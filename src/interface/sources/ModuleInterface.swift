@@ -2,6 +2,7 @@ import ast
 import support
 import modules
 import parse
+import facts
 import Foundation
 
 private let zeroSpan = Span(startOffset: -1, endOffset: -1, map: nil)
@@ -135,9 +136,14 @@ public struct InterfaceGeneric: Codable, Equatable {
 public struct InterfaceFunc: Codable, Equatable {
     public var name: String; public var generics: [InterfaceGeneric]
     public var params: [InterfaceParam]; public var ret: String?; public var isStatic: Bool
+    // Inferred mutating-ness, sourced from the fact store at emit (task 164.4 / 100.4.3.5 task B). A
+    // consumer calling this method needs a mutable receiver. Optional so a `.nmi` written before this
+    // field decodes as "unknown" rather than failing (the `.nmi` is build-internal and regenerated).
+    public var isMutating: Bool?
     public init(name: String, generics: [InterfaceGeneric] = [], params: [InterfaceParam],
-                ret: String?, isStatic: Bool = false) {
+                ret: String?, isStatic: Bool = false, isMutating: Bool? = nil) {
         self.name = name; self.generics = generics; self.params = params; self.ret = ret; self.isStatic = isStatic
+        self.isMutating = isMutating
     }
 }
 public struct InterfaceParam: Codable, Equatable {
@@ -214,9 +220,10 @@ private func renderParams(_ ps: [Param]) -> [InterfaceParam] {
 }
 // A public type exports all of its members (pinned policy, task 100.4.1). Methods are name-sorted for
 // determinism; a static method carries `isStatic`.
-private func renderMethods(_ ms: [FuncDecl]) -> [InterfaceFunc] {
+private func renderMethods(_ owner: String, _ ms: [FuncDecl], _ facts: FactStore) -> [InterfaceFunc] {
     ms.map { InterfaceFunc(name: $0.name, generics: renderGenerics($0.generics), params: renderParams($0.params),
-                           ret: $0.returnType.map(renderType), isStatic: $0.isStatic) }
+                           ret: $0.returnType.map(renderType), isStatic: $0.isStatic,
+                           isMutating: facts.facts(for: SymbolID("\(owner).\($0.name)"))?.abi.mutating) }
       .sorted { $0.name < $1.name }
 }
 private func renderProperties(_ ps: [ComputedProperty]) -> [InterfaceProperty] {
@@ -232,7 +239,8 @@ private func renderConformances(_ cs: [Conformance]) -> [String] { cs.map(\.name
 // Build the interface of one module from the merged program: its `public` declarations whose file lies
 // in the module's directory. Deterministic — top-level declarations are name-sorted, as are the
 // order-insensitive members (see the pinned conventions in task 100.4.1).
-public func buildInterface(_ program: Program, package: String, module: ModuleID, packageRoot: String) -> ModuleInterface {
+public func buildInterface(_ program: Program, package: String, module: ModuleID, packageRoot: String,
+                           facts: FactStore = FactStore()) -> ModuleInterface {
     func inModule(_ span: Span) -> Bool { moduleID(forFile: span.file, packageRoot: packageRoot) == module }
 
     var types: [InterfaceType] = []
@@ -247,16 +255,16 @@ public func buildInterface(_ program: Program, package: String, module: ModuleID
         case .structDecl(let s) where s.visibility == .public && inModule(s.span):
             types.append(InterfaceType(keyword: "struct", name: s.name, generics: renderGenerics(s.generics),
                 fields: s.fields.map { InterfaceField(name: $0.name, type: renderType($0.type), isMutable: $0.isMutable) },
-                properties: renderProperties(s.properties), methods: renderMethods(s.methods),
+                properties: renderProperties(s.properties), methods: renderMethods(s.name, s.methods, facts),
                 conformances: renderConformances(s.conformances)))
         case .classDecl(let c) where c.visibility == .public && inModule(c.span):
             types.append(InterfaceType(keyword: "class", name: c.name, generics: renderGenerics(c.generics),
                 fields: c.fields.map { InterfaceField(name: $0.name, type: renderType($0.type), isMutable: $0.isMutable) },
-                properties: renderProperties(c.properties), methods: renderMethods(c.methods),
+                properties: renderProperties(c.properties), methods: renderMethods(c.name, c.methods, facts),
                 conformances: renderConformances(c.conformances)))
         case .enumDecl(let e) where e.visibility == .public && inModule(e.span):
             enums.append(InterfaceEnum(name: e.name, generics: renderGenerics(e.generics), cases: renderCases(e.cases),
-                properties: renderProperties(e.properties), methods: renderMethods(e.methods),
+                properties: renderProperties(e.properties), methods: renderMethods(e.name, e.methods, facts),
                 conformances: renderConformances(e.conformances)))
         case .interfaceDecl(let i) where i.visibility == .public && inModule(i.span):
             let methods = i.methods.map { m in
@@ -290,17 +298,64 @@ public func buildInterface(_ program: Program, package: String, module: ModuleID
 
 // The `.nmi` bytes: pretty, key-sorted JSON, so the arrays' name-sort makes a byte diff mean a real
 // interface change (interface byte-stability for incremental caching later).
-public func serialize(_ i: ModuleInterface) -> String {
+// The perf section of a `.nmi` (task 164.4.2): optimization facts, keyed per definition. Separate from the
+// ABI section so a body edit that changes only perf facts leaves the ABI section — and its hash —
+// byte-identical (§100.4.6, the incremental-cache lever). The escape summary (164.4.3) fills `escape`;
+// empty today.
+public struct InterfacePerf: Codable, Equatable {
+    public var escape: [String: EscapeSummary]
+    public init(escape: [String: EscapeSummary] = [:]) { self.escape = escape }
+}
+
+// The on-disk `.nmi`, sectioned (task 164.4.2): an ABI/soundness section (the surface a consumer compiles
+// against — signatures, mutating-ness, shareability, conformances) and a perf section, each with its own
+// content hash. `abiHash` is the incremental-cache key: it is a function of the ABI section alone, so a
+// perf-only change does not perturb it.
+public struct NMIFile: Codable, Equatable {
+    public var version: UInt64
+    public var abi: ModuleInterface
+    public var perf: InterfacePerf
+    public var abiHash: UInt64
+    public var perfHash: UInt64
+}
+
+// The `.nmi` schema version. Bump on a format change; the file is build-internal and regenerated, so a
+// mismatch just invalidates a stale cache rather than needing migration.
+public let nmiFormatVersion: UInt64 = 1
+
+// Deterministic content hash (FNV-1a) over a section's canonical JSON. Independent by construction — each
+// section hashes only its own bytes.
+private func sectionHash<T: Encodable>(_ v: T) -> UInt64 {
+    let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
+    let bytes = (try? enc.encode(v)) ?? Data()
+    var h: UInt64 = 0xcbf2_9ce4_8422_2325
+    for b in bytes { h ^= UInt64(b); h = h &* 0x0000_0100_0000_01b3 }
+    return h
+}
+
+public func serialize(_ i: ModuleInterface, perf: InterfacePerf = InterfacePerf()) -> String {
+    let file = NMIFile(version: nmiFormatVersion, abi: i, perf: perf,
+                       abiHash: sectionHash(i), perfHash: sectionHash(perf))
     let enc = JSONEncoder()
     enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-    guard let data = try? enc.encode(i) else { return "" }
+    guard let data = try? enc.encode(file) else { return "" }
     return String(decoding: data, as: UTF8.self) + "\n"
 }
 
-// Parse a `.nmi` back to an interface (the consumer side; task 100.4.2). Returns nil on malformed input.
-public func parseInterface(_ text: String) -> ModuleInterface? {
+// Parse a `.nmi`'s full sectioned form (task 164.4.2). Falls back to a pre-sectioning flat
+// `ModuleInterface` so an older build-internal file still reads (it is regenerated anyway).
+public func parseNMI(_ text: String) -> NMIFile? {
     guard let data = text.data(using: .utf8) else { return nil }
-    return try? JSONDecoder().decode(ModuleInterface.self, from: data)
+    if let file = try? JSONDecoder().decode(NMIFile.self, from: data) { return file }
+    guard let flat = try? JSONDecoder().decode(ModuleInterface.self, from: data) else { return nil }
+    return NMIFile(version: nmiFormatVersion, abi: flat, perf: InterfacePerf(),
+                   abiHash: sectionHash(flat), perfHash: sectionHash(InterfacePerf()))
+}
+
+// Parse a `.nmi` back to its ABI interface (the consumer side; task 100.4.2). Returns nil on malformed
+// input.
+public func parseInterface(_ text: String) -> ModuleInterface? {
+    parseNMI(text)?.abi
 }
 
 // Render a syntactic type reference to its `.nmi` text.

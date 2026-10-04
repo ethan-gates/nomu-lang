@@ -1,0 +1,18 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# The interprocedural fixpoint engine (task 168): a stage- and scope-agnostic SCC solver generic over an
+# abstract lattice + transfer function + summary provider. Low-level infra depending on nothing, so both
+# the frontend (mutating-ness at the Sema altitude) and the midend (escape at the inference altitude) can
+# drive it. Design home: design/internals/inference.md.
+swift_library(
+    name = "inference",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "inference",
+    visibility = ["//visibility:public"],
+)
+
+swift_test(
+    name = "inference_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = [":inference"],
+)

@@ -23,6 +23,11 @@ public struct SSAGenResult {
     public let diagnostics: DiagnosticSink
 }
 
+// The SSAFunction name / direct-call key a type method lowers to (`m:Type:method`). Exposed so a later
+// stage can address a method's summary by the same mangled key ssairgen emits — the `.nmi` perf emit
+// re-keys an imported type's method to `m:origin@Type:method` to match a consumer's call site (task 164.6).
+public func ssaMethodSymbol(_ type: String, _ name: String) -> String { ModuleContext.methodSymbol(type, name) }
+
 public func lowerToSSAIR(_ module: NOIRModule, subsetFuncs: Set<String> = []) -> SSAGenResult {
     let diags = DiagnosticSink()
     var structFields: [String: [NOIRField]] = [:]

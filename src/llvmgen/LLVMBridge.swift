@@ -1,5 +1,6 @@
 import ssair
 import ssairpasses
+import facts
 import noir
 import ast
 import support
@@ -38,7 +39,7 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
                        requireMain: Bool = true, externalFuncNames: Set<String> = [],
                        externalGenericSigs: [String: ExternalGenericSig] = [:],
                        weakOriginFiles: Set<String> = [], emitTypeMaps: Bool = true,
-                       homeQualifier: String = "") -> String? {
+                       homeQualifier: String = "", facts: FactStore = FactStore()) -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
@@ -63,7 +64,20 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
     var passes: [SSAPass] = []
     if env["NOMU_NO_DEVIRT"] == nil { passes.append(Devirtualize()) }
     if env["NOMU_NO_INLINE"] == nil { passes.append(Inline()) }
-    if env["NOMU_NO_ESCAPE"] == nil { passes.append(StackPromotion()) }
+    // Escape provider A/B (tasks 166.3/166.4): `NOMU_PTG_ESCAPE` swaps the legacy `escapingValues` for the
+    // points-to-graph-backed `graphEscaping`. Its faithful query reproduces `escapingValues` exactly (an
+    // unchanged-output differential oracle over the suite); `NOMU_PTG_PRECISE` additionally flips it to the
+    // graph's container/field-sensitive query, which promotes a superset. Both gates stay available to
+    // bisect a precision regression back to faithful, then back to legacy.
+    if env["NOMU_NO_ESCAPE"] == nil {
+        if env["NOMU_PTG_ESCAPE"] != nil {
+            let aggregates = ssaModule.aggregates
+            let precise = env["NOMU_PTG_PRECISE"] != nil
+            passes.append(StackPromotion(escaping: { graphEscaping($0, aggregates: aggregates, precise: precise) }))
+        } else {
+            passes.append(StackPromotion())
+        }
+    }
     // Scalar promotion (§7.3.1) rides the escape A/B flag (off ⇒ no promotion) with its own bisect gate;
     // it decomposes a loop-carried non-escaping class the simple-slot path leaves heap.
     if env["NOMU_NO_ESCAPE"] == nil && env["NOMU_NO_SCALAR"] == nil { passes.append(ScalarPromotion()) }

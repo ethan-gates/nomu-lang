@@ -9,7 +9,7 @@ swift_library(
     name = "sema",
     srcs = glob(["sources/**/*.swift"]),
     module_name = "sema",
-    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/noir"],
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/noir", "//src/inference", "//src/facts"],
     visibility = ["//visibility:public"],
 )
 
@@ -17,5 +17,5 @@ swift_library(
 swift_test(
     name = "frontend_tests",
     srcs = glob(["tests/*.swift"]),
-    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir", "//src/midend", "//src/frontend/sema"],
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir", "//src/midend", "//src/frontend/sema", "//src/facts"],
 )

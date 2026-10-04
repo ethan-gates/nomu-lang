@@ -348,22 +348,25 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
     extensions are now done in their own items: a **bounded** type parameter's PWT arguments + requirement
     dispatch in 100.4.3.3.3 (POD and non-POD value/class conformers), and `T`-field / `T`-value
     construction across the boundary in 100.4.3.3.4.
-  - 100.4.3.5 — Methods on imported types across a boundary; method erasure atop 100.4.3.3.
-    **Increment A done — non-static, non-generic instance methods on imported non-generic types.** Before
-    this, no method (generic or not) resolved on an imported type — the `.nmi` serialized methods but
-    `interfaceToDecls` dropped them. Now: `interfaceToDecls` reconstructs a type's non-static, non-generic
-    methods body-free (so `structs`/`classes` carry them and `x.m()` type-checks); Sema lowers the imported
-    type for layout with **method bodies stripped** (`strippingMethodBodies`), emitting no definition; the
-    call lowers to the producer's symbol by decoding the receiver's origin-encoded type name
-    (`m:<origin@Type>:method` → `Mangle.method(Type, method, qualifier)`), parameter types following the
-    values ssairgen produced (a class receiver is a reference, a non-mutating value receiver is by value).
-    Fixture `module_method` (a struct `Pt.sum()` / `Pt.scaled(by:)` and a class `Counter.doubled()` called
-    across the boundary). **Deferred:** (B) a **mutating** value method — its self-by-pointer ABI needs
-    `isMutating` in the `.nmi` (`InterfaceFunc` doesn't carry it), so the consumer can't pick the ABI
-    today; a class method is unaffected (self is always a reference). (C) **generic** methods / methods on
-    generic types (`Option.isSome()` across a boundary) — the erased-method path atop 100.4.3.3; this is
-    the blocker the 100.4.3.7 method-differential leg waits on. Static methods and computed-property
-    requirements on imported types are also still deferred.
+  - 100.4.3.5 — Methods on imported types across a boundary; method erasure atop 100.4.3.3. Decomposed
+    into the numbered sub-phases below; the shared mechanism (set up by 100.4.3.5.1) is: `interfaceToDecls`
+    reconstructs a type's methods body-free so `structs`/`classes` carry them and `x.m()` type-checks, Sema
+    lowers the imported type for layout with **method bodies stripped** (`strippingMethodBodies`) emitting
+    no definition, and the call lowers to the producer's symbol by decoding the receiver's origin-encoded
+    type name (`m:<origin@Type>:method` → `Mangle.method(Type, method, qualifier)`).
+    - 100.4.3.5.1 — **non-static, non-generic instance methods on imported non-generic types. Done.**
+      Before this, no method (generic or not) resolved on an imported type — the `.nmi` serialized methods
+      but `interfaceToDecls` dropped them. Parameter types follow the values ssairgen produced (a class
+      receiver is a reference, a non-mutating value receiver is by value). Fixture `module_method` (a struct
+      `Pt.sum()` / `Pt.scaled(by:)` and a class `Counter.doubled()` called across the boundary).
+    - 100.4.3.5.2 — **a `mutating` value method across the boundary. Next.** Its self-by-pointer ABI needs
+      the method's inferred mutating-ness at the consumer, which 100.4.3.5.1 drops. The `.nmi` now carries
+      it (`InterfaceFunc.isMutating`, added by 164.4.1), so this phase threads it to the consumer so both
+      the mutable-receiver soundness check (`Sema` caller check) and the self-ABI selection
+      (`FunctionLowerer`/egress) see it. A class method is unaffected (self is always a reference).
+    - 100.4.3.5.3 — **generic methods / methods on generic types** (`Option.isSome()` across a boundary) —
+      the erased-method path atop 100.4.3.3; the blocker the 100.4.3.7 method-differential leg waits on.
+    - 100.4.3.5.4 — **static methods and computed-property requirements on imported types.** Deferred.
   - 100.4.3.6 — GC-trace of an opaque `T`: the type metadata / VWT carries the per-type GC trace map so a
     tracing / moving collector scans an erased `T`'s stack buffer and heap copies. **Couples with
     100.4.7** (cross-module type-id / type-map unification) — the same GC work from two sides; built
@@ -414,7 +417,7 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
     `module_generic_field` (`Box<T>` + `unwrap<T>`), each monomorphized in one module vs erased across the
     boundary, both `42`. **Deferred:** the generic-method leg — methods are not yet serialized in the
     interface, so a method on an imported type (generic or not) does not resolve across a boundary; this
-    blocks on **100.4.3.5** (method erasure / interface method serialization).
+    blocks on **100.4.3.5.3** (the erased-method path for generic methods / methods on generic types).
 
   *Residual-`.typeParam` blast radius* (the sites erased lowering must handle) is extracted to the
   working doc **`100.4.3.3.md`** at the project root, alongside the 100.4.3.3 decomposition.

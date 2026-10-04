@@ -7,12 +7,12 @@ swift_library(
     name = "interface",
     srcs = glob(["sources/*.swift"]),
     module_name = "interface",
-    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/modules"],
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/modules", "//src/facts"],
     visibility = ["//visibility:public"],
 )
 
 swift_test(
     name = "interface_tests",
     srcs = glob(["tests/*.swift"]),
-    deps = [":interface"],
+    deps = [":interface", "//src/facts"],
 )

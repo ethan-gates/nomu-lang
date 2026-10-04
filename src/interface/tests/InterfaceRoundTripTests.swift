@@ -1,7 +1,30 @@
 import XCTest
+import facts
 @testable import interface
 
 final class InterfaceRoundTripTests: XCTestCase {
+    // The `.nmi` is sectioned (task 164.4.2): the ABI hash is a function of the ABI section alone, so a
+    // perf-only change leaves it byte-identical — the §100.4.6 incremental-cache lever.
+    func testAbiHashIndependentOfPerf() {
+        let abi = ModuleInterface(package: "p", modulePath: [], types: [],
+                                  functions: [InterfaceFunc(name: "f", params: [], ret: nil)])
+        let f1 = parseNMI(serialize(abi, perf: InterfacePerf()))!
+        let f2 = parseNMI(serialize(abi, perf: InterfacePerf(
+            escape: ["f": EscapeSummary(params: [.escapes], ret: .fresh)])))!
+        XCTAssertEqual(f1.abiHash, f2.abiHash, "a perf-only change leaves the ABI hash fixed")
+        XCTAssertNotEqual(f1.perfHash, f2.perfHash, "the perf hash reflects the perf change")
+    }
+
+    // The sectioned form round-trips both sections and the version.
+    func testSectionedRoundTrip() {
+        let abi = ModuleInterface(package: "p", modulePath: [], types: [],
+                                  functions: [InterfaceFunc(name: "f", params: [], ret: nil)])
+        let perf = InterfacePerf(escape: ["f": EscapeSummary(params: [.noEscape], ret: .escaped)])
+        let file = parseNMI(serialize(abi, perf: perf))!
+        XCTAssertEqual(file.abi, abi)
+        XCTAssertEqual(file.perf, perf)
+        XCTAssertEqual(file.version, nmiFormatVersion)
+    }
     // serialize → parse is the identity (task 100.4.2). Includes a function-typed parameter, whose
     // rendered type carries `) -> `, to confirm the JSON form has no line-grammar ambiguity.
     func testRoundTrip() {

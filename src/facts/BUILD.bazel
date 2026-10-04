@@ -1,0 +1,19 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# The fact store (task 167): the in-memory hub the inference stage writes into and the transforms +
+# interface emit read from. Per-symbol sectioned records (ABI/soundness + perf) with deterministic,
+# independently-hashed sections and a two-writer upsert API. Standalone infra — design home:
+# design/internals/inference.md ("Fact store"). Depended on by frontend/sema, the inference stage, and
+# interface once 164 wires the real writers; nothing depends on it yet.
+swift_library(
+    name = "facts",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "facts",
+    visibility = ["//visibility:public"],
+)
+
+swift_test(
+    name = "facts_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = [":facts"],
+)

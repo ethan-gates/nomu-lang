@@ -2,9 +2,12 @@
 
 **Status:** working draft. The home for how Nomu *infers* memory and concurrency facts — the dimensions
 it computes, the shared analysis substrate (points-to/reachability graph, interprocedural summaries,
-dynamic-dispatch handling), and where each fact lives. This is design reference; the execution task that
-builds the inference stage is [`plans/tasks/164-formal-inference-stage.md`](../plans/tasks/164-formal-inference-stage.md),
-and the exploratory origin is [`inference-dimensions.md`](../../inference-dimensions.md). The guiding bet
+dynamic-dispatch handling), and where each fact lives. This is design reference; the inference stage is
+built across [166](../plans/tasks/166-points-to-graph.md) (points-to graph),
+[167](../plans/tasks/167-fact-store.md) (fact store), [168](../plans/tasks/168-scc-fixpoint-engine.md)
+(SCC/fixpoint engine), and [169](../plans/tasks/169-interprocedural-escape-summary.md) (escape summary),
+with [164](../plans/tasks/164-formal-inference-stage.md) integrating them (writers, emit relocation,
+promotion). The exploratory origin is [`inference-dimensions.md`](../../inference-dimensions.md). The guiding bet
 (CLAUDE.md): an ownership model with precision comparable to explicit ownership systems, inferred from
 program structure rather than annotated.
 
@@ -18,13 +21,13 @@ encoding, which running after ssairgen supplies for free.
 
 | Dimension | Stage computed | Soundness / Perf | Shape | In `.nmi`? | Status |
 |---|---|---|---|---|---|
-| Mutating-ness (self-ABI) | Sema | soundness | body scan + call-graph fixpoint | yes (ABI section) | built intra-module; not yet serialized |
+| Mutating-ness (self-ABI) | Sema | soundness | body scan + call-graph fixpoint | yes (ABI section) | built; call-graph fixpoint now via the shared SCC engine (168); fact-store write + `.nmi` serialization in 164 |
 | Type shareability | Sema | soundness | structural (fields, recursive) | yes | built (M5) |
 | Shareable requirement (param forwarded to a task sink) | inference | soundness | value-flow + fixpoint | yes | leaning; explicit `<shared T>` ships first |
 | Function/closure-type shareability | Sema/inference | soundness | structural over captures | yes | deferred (132) |
 | Conditional conformance (`Box<T>` shareable iff `T`) | Sema | soundness | structural | yes | built |
-| Escape (→ stack/scalar promotion) | inference | perf | value-flow (intra) | interproc summary only | intra-fn built; summary deferred (148) |
-| Interprocedural escape summary | inference | perf | value-flow + fixpoint | yes (perf section) | deferred (148) |
+| Escape (→ stack/scalar promotion) | inference | perf | value-flow (intra) | interproc summary only | intra-fn built (166 graph + faithful/precise queries); precise-promotion consumption deferred (148) |
+| Interprocedural escape summary | inference | perf | value-flow + fixpoint | yes (perf section) | Level-1 summary built (169, on 166 + 168); per-definition summary serialized into the `.nmi` perf section + cross-module seeded (164.4.3/164.6); promotion consumption deferred (164.5 → 148) |
 | Fiber locality | inference | perf | value-flow + fixpoint | yes if interproc | future |
 | Cross-fiber reachability | inference / runtime | perf (poss. soundness) | reachability + fixpoint | yes if a cross-module contract | future; GC scans all fibers today |
 | Lives across suspension | inference | perf | liveness over the fiber CFG across `await`/yield points | yes if interproc (callee-may-suspend) | future; decides frame-held vs promoted placement across a yield |
@@ -255,6 +258,39 @@ The inference is designable now; its value is realized when those consumers exis
 
 ---
 
+## Fact store
+
+The fact store is the **hub**: the one in-memory structure every analysis writes its results into and
+every consumer (this module's transforms, this module's interface emit) reads from. It decouples
+producing a fact from consuming it — the escape *analysis* writes a summary into the store; the promotion
+*transform* and the `.nmi` emit each read it, independently.
+
+- **Per-symbol, keyed by a stable symbol id.** The mangled name is the key — already stable across
+  producer and consumer. **Per-definition, not per-instantiation**: a public generic is summarized once
+  over its erased/template body, so the store (and the `.nmi`) carries one record per definition.
+- **Structured, not scalar flags.** A record holds typed facts — mutating-ness is a per-method bit,
+  shareability a per-type bit, escape is per-parameter/return, stack-depth is per-function.
+- **Sectioned with independent hashes.** Each record splits into an **ABI/soundness** section (facts a
+  consumer must see to compile correctly — mutating-ness, shareability, conditional conformance) and a
+  **perf** section (optimization facts — escape summary, stack-depth, later uniqueness/fiber). Each
+  section hashes independently and deterministically, so a body edit that changes perf facts but not the
+  ABI leaves the ABI digest byte-identical — the property the incremental cache rests on (a debug
+  dependent that consumed only the ABI stays cached). The hash is over a canonical encoding (sorted keys),
+  stable across runs and insertion order.
+- **Two writers, disjoint fields.** The cheap structural/scan facts (mutating-ness, type shareability)
+  are written at the Sema altitude where they already run; the value-flow facts are written at the
+  inference-stage altitude. They touch disjoint fields of a record, so writing is order-independent.
+- **Extensible / versioned.** A new dimension is a field addition, not a format change; the record
+  carries a schema version so the `.nmi` cache can reason across builds.
+- **In-memory hub vs the `.nmi` file.** The store is the mutable in-flight state; the `.nmi` is assembled
+  once from it (one file, sectioned, immutable, build-internal — see 164). Transforms and lowering read
+  the store, never the file; a dependency's published summaries seed this module's store as input.
+
+The store is plain infrastructure — a schema plus deterministic section hashing plus a two-writer API —
+independent of the SCC engine that fills it and the analyses that produce the facts. It is built and
+unit-tested on its own ([`plans/tasks/167-fact-store.md`](../plans/tasks/167-fact-store.md)); the engine
+(168) and the escape summary (169) plug into it, and 164 wires the real writers and the emit.
+
 ## Analysis vs transform vs lowering
 
 Keep the three roles distinct across the whole mid-end and backend:
@@ -281,16 +317,23 @@ drive.
 - **Structural type facts stay with the type system** — shareability + conditional conformance
   (`gen/Shareability.swift`), exhaustiveness (`passes/Exhaustiveness.swift`). They read declarations
   rather than bodies, so SSA offers them nothing.
-- **Value-flow facts live on SSA** — escape (`ssairpasses/EscapeAnalysis.swift`), and later
-  fiber-locality, cross-fiber reachability, shareable-requirement. These consume the materialized def-use
-  the raw-SSA substrate supplies.
-- **The SCC fixpoint is a stage-agnostic engine, not a stage.** Driven at the Sema altitude for
-  mutating-ness (over NOIR bodies + imported summaries) and at the inference-stage altitude for escape
-  (over raw SSA). Each analysis plugs in at one altitude; the engine and the fact store are shared.
+- **Value-flow facts live on SSA** — the points-to graph (`ssairpasses/PointsToGraph.swift`) and its
+  escape queries (`ssairpasses/EscapeQuery.swift`), the interprocedural escape summary
+  (`ssairpasses/InterprocEscape.swift`), and later fiber-locality, cross-fiber reachability,
+  shareable-requirement. These consume the materialized def-use the raw-SSA substrate supplies. (The
+  legacy inline `EscapeAnalysis.swift` is the faithful oracle the graph reproduces.)
+- **The SCC fixpoint is a stage-agnostic engine, not a stage** (`src/inference`, task 168). Driven at the
+  Sema altitude for mutating-ness (over NOIR bodies + imported summaries) and at the inference-stage
+  altitude for the escape summary (over the raw-SSA points-to graph). Each analysis plugs in at one
+  altitude; the engine and the fact store (`src/facts`, task 167) are shared.
 
-Current homes: mutating-ness `passes/Mutation.swift` (run from `Sema.check`, bundled with its soundness
-diagnostics and the caller mutable-receiver check); shareability + conditional conformance
-`gen/Shareability.swift`; exhaustiveness `passes/Exhaustiveness.swift`; runtime-subset
-`passes/RuntimeSubset.swift`; escape `ssairpasses/EscapeAnalysis.swift` (today intraprocedural + inline to
-`StackPromotion`; the interprocedural-summary lift is tracked in 164, the analysis/transform separation in
-[165](../plans/tasks/165-midend-pipeline-prefactor.md)).
+Current homes: mutating-ness `passes/Mutation.swift` (run from `Sema.check` over the shared SCC engine,
+bundled with its soundness diagnostics and the caller mutable-receiver check); shareability + conditional
+conformance `gen/Shareability.swift`; exhaustiveness `passes/Exhaustiveness.swift`; runtime-subset
+`passes/RuntimeSubset.swift`; the points-to graph `ssairpasses/PointsToGraph.swift` with its escape queries
+`ssairpasses/EscapeQuery.swift` (faithful + precise) and the interprocedural summary
+`ssairpasses/InterprocEscape.swift`; the shared engine `src/inference` and the fact store `src/facts`. The
+analysis/transform separation landed in [165](../plans/tasks/165-midend-pipeline-prefactor.md); wiring the
+summaries into the store + emit + promotion is [164](../plans/tasks/164-formal-inference-stage.md). The
+legacy `ssairpasses/EscapeAnalysis.swift` remains as `StackPromotion`'s default provider and the faithful
+differential oracle.
