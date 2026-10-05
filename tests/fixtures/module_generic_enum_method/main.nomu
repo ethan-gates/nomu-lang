@@ -1,0 +1,14 @@
+import pkg/lib
+
+fun main() {
+    let o: Opt<Int> = wrapOpt(5)
+    print(o.present())       // true -> 1
+    print("\n")
+    print(o.orElse(9))       // 5
+    print("\n")
+    let n: Opt<Int> = .none
+    print(n.present())       // false -> 0
+    print("\n")
+    print(n.orElse(9))       // 9
+    print("\n")
+}

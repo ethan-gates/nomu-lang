@@ -1,0 +1,24 @@
+// A method on an imported generic **enum**, called across a module boundary (task 100.4.3.5.3.4). The
+// producer compiles `present`/`orElse` once **erased** over `T`; the consumer dispatches through the
+// witness ABI, threading the receiver instantiation's type-argument VWT. `switch self` reads the tag off
+// the erased self buffer (single load), and an erased-`T` payload (`orElse`) is returned by sret.
+public enum Opt<T> {
+    case some(value: T)
+    case none
+    fun present() -> Bool {
+        switch self {
+        case .some(let v): return true
+        case .none:        return false
+        }
+    }
+    fun orElse(d: T) -> T {
+        switch self {
+        case .some(let v): return v
+        case .none:        return d
+        }
+    }
+}
+
+public fun wrapOpt<T>(x: T) -> Opt<T> {
+    return .some(value: x)
+}

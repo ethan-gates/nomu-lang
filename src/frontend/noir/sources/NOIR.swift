@@ -14,14 +14,27 @@ public struct NOIRModule {
     public let conformances: [NOIRConformance]  // M5 A1.4: drives witness-table instance emission
     public let composites: [NOIRComposite]      // M5 A1.5b: composite (any A & B) witnesses to emit
     public let opaqueUnderlyings: [String: Type]   // M5 A3: opaque owner → hidden concrete underlying type
+    // Imported methods inferred mutating in their producing module, keyed `origin@Type.method` (task
+    // 100.4.3.5.2). Their bodies are stripped on import, so the consumer cannot re-infer mutating-ness;
+    // the `.nmi` carries it (`InterfaceFunc.isMutating`) and it rides here to the caller mutable-receiver
+    // check and the self-by-pointer ABI at the call site.
+    public let externalMutatingMethods: Set<String>
+    // Monomorphized type-instantiation name → its concrete type arguments (task 100.4.3.5.3.3), recorded
+    // by `Monomorphize`. A method call on an imported generic type lands post-mono as a concrete
+    // `util@Box<Int>` whose type args are otherwise only in the mangled name; the erased-method call
+    // lowering reads them here to thread the type-argument VWTs through the witness ABI.
+    public let monoTypeArgs: [String: [Type]]
 
     public init(decls: [NOIRDecl], interfaces: [NOIRInterface] = [], conformances: [NOIRConformance] = [],
-                composites: [NOIRComposite] = [], opaqueUnderlyings: [String: Type] = [:]) {
+                composites: [NOIRComposite] = [], opaqueUnderlyings: [String: Type] = [:],
+                externalMutatingMethods: Set<String> = [], monoTypeArgs: [String: [Type]] = [:]) {
         self.decls = decls
         self.interfaces = interfaces
         self.conformances = conformances
         self.composites = composites
         self.opaqueUnderlyings = opaqueUnderlyings
+        self.externalMutatingMethods = externalMutatingMethods
+        self.monoTypeArgs = monoTypeArgs
     }
 }
 

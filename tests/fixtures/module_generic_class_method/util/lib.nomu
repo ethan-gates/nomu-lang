@@ -1,0 +1,9 @@
+// A method on an imported generic **class**, called across a module boundary (task 100.4.3.9). The
+// receiver is a reference: the producer compiles `get`/`tagged` once erased with `self` a managed `p1`
+// object pointer (so the statepoint GC tracks it), and field access GEPs by the VWT-derived offset past
+// the 8-byte object header. `get` returns the erased `T` (sret); `tagged` a concrete `Bool`.
+public class Ref<T> {
+    var value: T
+    fun get() -> T { return value }
+    fun tagged() -> Bool { return true }
+}

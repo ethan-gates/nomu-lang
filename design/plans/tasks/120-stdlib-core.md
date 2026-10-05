@@ -8,7 +8,7 @@ The named stdlib track. High-stakes sub-decisions are split into their own docs:
 [String / UTF-8 model](121-string-utf8-model.md), [numeric semantics](122-numeric-semantics.md),
 [copy-on-write](123-copy-on-write.md).
 
-**► Package layering settled by the modules design** ([100](100-modules.md) §100.3.7,
+**► Package layering settled by the modules design** ([174](174-prelude-as-packages.md),
 [`../../language/modules.md`](../../language/modules.md)): `core` is the *only* non-Nomu-source package
 (built-in types + functions + the libc/FFI boundary); `std` is the pure-Nomu, non-privileged library
 this task builds, with a curated prelude subset auto-imported; `runtime` is pure-Nomu and privileged.

@@ -43,6 +43,7 @@ private final class Monomorphizer {
     var baseKind:       [String: NamedKind] = [:]   // generic type base → its kind
 
     var out: [NOIRDecl] = []
+    var monoTypeArgs: [String: [Type]] = [:]   // mono'd type name → its type args (task 100.4.3.5.3.3)
     // Specialized names already emitted (guards recursion) + requested (dedupes the worklist).
     var doneFuncs = Set<String>(), doneTypes = Set<String>()
     var reqFuncs  = Set<String>(), reqTypes  = Set<String>()
@@ -84,18 +85,34 @@ private final class Monomorphizer {
             }
         }
         // An erased body may hold a composed generic value (`Box<T>`) by buffer and access its fields
-        // (task 100.4.3.3.4). Emit each generic type **template** (type parameters retained, methods
-        // stripped — generic-type methods are 100.4.3.5) so codegen has the field layout for such a
-        // `.generic` receiver. Its concrete LLVM struct type is never built (erased bodies hold it as an
-        // opaque buffer and index fields by VWT-derived offset), so a `T` field needs no concrete shape.
+        // (task 100.4.3.3.4). Emit each generic type **template** (type parameters retained) so codegen
+        // has the field layout for such a `.generic` receiver. Its concrete LLVM struct type is never
+        // built (erased bodies hold it as an opaque buffer and index fields by VWT-derived offset), so a
+        // `T` field needs no concrete shape. Instance methods are retained on the template and lowered
+        // **erased** (task 100.4.3.5.3), so a consumer calls them through runtime witnesses with `self` a
+        // value-buffer receiver. Each own-module instantiation keeps its specialized methods (emitted by
+        // `specializeType`), so the erased copy adds the cross-module symbol without disturbing the
+        // concrete path. (Gating to the *type's* `public` visibility — to drop internal generic types'
+        // dead erased methods — awaits type visibility on `NOIRStruct`/`NOIREnum`; members are not
+        // individually marked public here, so the type is the unit, 100.4.3.5.3.)
         for (name, s) in genericStructs {
-            out.append(.structDecl(NOIRStruct(name: name, generics: s.generics, fields: s.fields, methods: [], span: s.span)))
+            out.append(.structDecl(NOIRStruct(name: name, generics: s.generics, fields: s.fields,
+                                              methods: s.methods, span: s.span)))
         }
         for (name, e) in genericEnums {
-            out.append(.enumDecl(NOIREnum(name: name, generics: e.generics, cases: e.cases, methods: [], span: e.span)))
+            out.append(.enumDecl(NOIREnum(name: name, generics: e.generics, cases: e.cases,
+                                          methods: e.methods, span: e.span)))
+        }
+        // A generic **class** template, for the erased method path on a reference receiver (task 100.4.3.9):
+        // like structs/enums, retain the template so codegen has the field layout; its methods lower erased
+        // with `self` a managed object pointer and fields indexed by VWT-derived offset past the header.
+        for (name, c) in genericClasses {
+            out.append(.classDecl(NOIRClass(name: name, generics: c.generics, fields: c.fields,
+                                            methods: c.methods, span: c.span)))
         }
         return NOIRModule(decls: out, interfaces: module.interfaces, conformances: module.conformances,
-                        composites: module.composites, opaqueUnderlyings: module.opaqueUnderlyings)
+                        composites: module.composites, opaqueUnderlyings: module.opaqueUnderlyings,
+                        externalMutatingMethods: module.externalMutatingMethods, monoTypeArgs: monoTypeArgs)
     }
 
     // MARK: - Specialization
@@ -111,6 +128,7 @@ private final class Monomorphizer {
     private func specializeType(_ base: String, _ args: [Type]) {
         let name = specName(base, args)
         guard doneTypes.insert(name).inserted else { return }
+        if !args.isEmpty { monoTypeArgs[name] = args }   // for the erased-method call lowering (100.4.3.5.3.3)
         if let s = genericStructs[base] {
             guard !overDepth(name, at: s.span) else { return }
             let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))

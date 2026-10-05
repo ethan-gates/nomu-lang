@@ -121,13 +121,18 @@ final class SSAIRToLLVM {
     // The runtime byte offset of field `fieldIndex` in a struct-composed generic — the running sum of
     // the sizes of the fields before it (8-byte-slot model, no padding).
     private func erasedFieldOffset(_ composed: Type, _ fieldIndex: Int, _ span: Span) -> LLVMValueRef? {
-        guard case .generic(let base, let args) = composed, let s = e.structMap[base] else {
-            return LLVMConstInt(e.i64, 0, 0)
-        }
-        let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
-        var off = LLVMConstInt(e.i64, 0, 0)!
-        for j in 0..<min(fieldIndex, s.fields.count) {
-            guard let fs = erasedTypeSize(substType(s.fields[j].type, subst), span) else { return nil }
+        guard case .generic(let base, let args) = composed else { return LLVMConstInt(e.i64, 0, 0) }
+        // A struct value buffer starts at offset 0; a **class** object (reference receiver, task 100.4.3.9)
+        // starts its user fields past the 8-byte i64 object header. Either way the running offset is the
+        // VWT-derived sum of prior field sizes.
+        let generics: [NOIRGenericParam], fields: [NOIRField], header: UInt64
+        if let s = e.structMap[base] { generics = s.generics; fields = s.fields; header = 0 }
+        else if let c = e.classMap[base] { generics = c.generics; fields = c.fields; header = 8 }
+        else { return LLVMConstInt(e.i64, 0, 0) }
+        let subst = Dictionary(uniqueKeysWithValues: zip(generics.map(\.name), args))
+        var off = LLVMConstInt(e.i64, header, 0)!
+        for j in 0..<min(fieldIndex, fields.count) {
+            guard let fs = erasedTypeSize(substType(fields[j].type, subst), span) else { return nil }
             off = LLVMBuildAdd(b, off, fs, "off")!
         }
         return off
@@ -206,6 +211,7 @@ final class SSAIRToLLVM {
         // Type + witness registries — mirror `NOIRToLLVM.lower`.
         for i in noirModule.interfaces { e.interfaceDefs[i.name] = i }
         e.opaqueUnderlyings = noirModule.opaqueUnderlyings
+        e.monoTypeArgs = noirModule.monoTypeArgs
         for decl in noirModule.decls {
             switch decl {
             case .funcDecl(let f):   e.funcMap[f.name] = f
@@ -613,8 +619,13 @@ final class SSAIRToLLVM {
             // ssairgen emits `writeBarrier(obj, v)` immediately before `store(addr, v)` for a managed
             // field write; fuse the pair into one barriered store (the combined ABI the shared
             // `storeField` emits). A standalone `store` is a plain store.
+            // An erased store (writing a `T`-typed value, held by buffer) is a VWT-sized copy, not a
+            // first-class pointer store, so it must not fold into `storeField` (task 100.4.3.10). The
+            // generational logging barrier for a non-POD `T` written into a heap object is a residual gap;
+            // the current test GC configs full-heap-scan, so no remembered-set entry is lost under them.
             if case .writeBarrier(let object, let bv) = inst.kind,
-               i + 1 < blk.insts.count, case .store(let addr, let sv) = blk.insts[i + 1].kind, sv.id == bv.id {
+               i + 1 < blk.insts.count, case .store(let addr, let sv) = blk.insts[i + 1].kind, sv.id == bv.id,
+               !mentionsTypeParam(sv.type) {
                 e.storeField(val(object), val(addr), val(sv))
                 i += 2
                 continue
@@ -656,7 +667,22 @@ final class SSAIRToLLVM {
             guard let rt = inst.result.flatMap({ ty($0.type, span) }) else { return }
             define(inst, LLVMBuildLoad2(b, rt, val(addr), "ld"))
         case .store(let addr, let value):
-            LLVMBuildStore(b, val(value), val(addr))
+            // An erased value (`.typeParam`, or a composed `.generic`) is held by a buffer pointer, so a
+            // store of one is a VWT-sized copy from the source buffer into the destination — the write dual
+            // of the erased field read/return path (task 100.4.3.10). A residual `.typeParam` only survives
+            // in an erased body, where `curVWTParams` sizes the copy. The destination may be a `p1` field
+            // address of an erased class receiver; a synchronous copy has no safepoint, so casting both
+            // operands to addr0 is sound.
+            if mentionsTypeParam(value.type) {
+                guard let size64 = erasedTypeSize(value.type, span) else { return }
+                let (memcpy, mty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
+                var dst = val(addr), src = val(value)
+                if LLVMGetPointerAddressSpace(LLVMTypeOf(dst)) == 1 { dst = e.toUnmanaged(dst) }
+                if LLVMGetPointerAddressSpace(LLVMTypeOf(src)) == 1 { src = e.toUnmanaged(src) }
+                _ = e.buildCall(memcpy, mty, [dst, src, size64])
+            } else {
+                LLVMBuildStore(b, val(value), val(addr))
+            }
         case .writeBarrier:
             break   // handled by the fused-pair path in `lowerBlock`; a lone barrier is a no-op
         case .fieldAddr(let base, let idx):
@@ -763,7 +789,12 @@ final class SSAIRToLLVM {
                 // trivial (POD) inline memcpy is sound without the indirect `move` witness.
                 guard let size64 = erasedTypeSize(rt, term.span) else { return }
                 let (memcpy, mty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
-                _ = e.buildCall(memcpy, mty, [sret, val(v), size64])
+                // The source may be a `p1` field address of an erased **class** receiver (task 100.4.3.9) —
+                // cast it to addr0 for the memcpy. A synchronous copy has no safepoint, so the object cannot
+                // move mid-copy; the addrspacecast is sound here.
+                var srcBuf = val(v)
+                if LLVMGetPointerAddressSpace(LLVMTypeOf(srcBuf)) == 1 { srcBuf = e.toUnmanaged(srcBuf) }
+                _ = e.buildCall(memcpy, mty, [sret, srcBuf, size64])
                 LLVMBuildRetVoid(b)
             } else if let v = v {
                 LLVMBuildRet(b, val(v))
@@ -1453,6 +1484,20 @@ final class SSAIRToLLVM {
                    case let typePart = String(rest[rest.startIndex..<colon]),
                    let (origin, bareType) = ExternalName.decode(typePart) {
                     let method = String(rest[rest.index(after: colon)...])
+                    // Erased generic method (task 100.4.3.5.3.3): `typePart` is a mono'd instantiation of
+                    // an imported generic type whose method the producer compiled once erased. Route
+                    // through the witness ABI with the receiver's type-arg VWTs to the erased symbol (no
+                    // type-arg suffix), rather than the undefined monomorphized method symbol.
+                    if let typeArgs = e.monoTypeArgs[typePart] {
+                        let erasedTypeKey = String(typePart.prefix { $0 != "<" })   // util@Box
+                        if let sig = e.externalGenericSigs["m:\(erasedTypeKey):\(method)"] {
+                            let bareBase = String(bareType.prefix { $0 != "<" })    // Box
+                            let symbol = Mangle.method(bareBase, method,
+                                qualifier: Mangle.qualifier(module: origin.split(separator: "/").map(String.init)))
+                            return emitErasedExternalCall("m:\(erasedTypeKey):\(method)", sig: sig, args: args,
+                                typeArgs: typeArgs, resultType: resultType, span: span, symbolOverride: symbol)
+                        }
+                    }
                     guard let retTy = ty(resultType, span) else { return nil }
                     let argVals = args.map { val($0) }
                     let paramTys = argVals.map { LLVMTypeOf($0)! }
@@ -1479,7 +1524,8 @@ final class SSAIRToLLVM {
     // arguments, boxes each `.typeParam` value into a stack buffer, and reads the result back from a
     // caller-allocated result buffer.
     private func emitErasedExternalCall(_ name: String, sig: ExternalGenericSig, args: [SSAValue],
-                                        typeArgs: [Type], resultType: Type, span: Span) -> LLVMValueRef? {
+                                        typeArgs: [Type], resultType: Type, span: Span,
+                                        symbolOverride: String? = nil) -> LLVMValueRef? {
         guard typeArgs.count == sig.generics.count, args.count == sig.params.count else {
             e.fail("100.4.3.4: erased call of '\(name)' has \(typeArgs.count) type arg(s) / \(args.count) value arg(s), signature wants \(sig.generics.count) / \(sig.params.count)", span)
             return nil
@@ -1514,7 +1560,10 @@ final class SSAIRToLLVM {
         for _ in pwtConformers { paramTys.append(e.i8ptr) }
         if returnsTP { paramTys.append(e.i8ptr) }
         for p in sig.params {
-            if mentionsTypeParam(p) { paramTys.append(e.i8ptr) }
+            // A generic **class** receiver is a managed `p1` reference, passed directly (task 100.4.3.9); a
+            // value `.typeParam` / `.generic` buffer is an i8ptr; a concrete param is its own type.
+            if case .generic(let gb, _) = p, e.classMap[gb] != nil { paramTys.append(e.p1) }
+            else if mentionsTypeParam(p) { paramTys.append(e.i8ptr) }
             else { guard let t = ty(p, span) else { return nil }; paramTys.append(t) }
         }
         let fnRetTy: LLVMTypeRef = returnsTP ? e.voidTy : (ty(resultType, span) ?? e.voidTy)
@@ -1522,7 +1571,9 @@ final class SSAIRToLLVM {
         // The producer's erased symbol — its qualified name with no type-argument suffix — decoded from
         // the callee's per-origin identity `origin@bare` (task 100.2.3.2), so this matches the definition.
         let symbol: String
-        if let (origin, bare) = ExternalName.decode(name) {
+        if let symbolOverride {           // an erased generic *method* — `Mangle.method`, computed by the caller
+            symbol = symbolOverride
+        } else if let (origin, bare) = ExternalName.decode(name) {
             symbol = Mangle.free(bare, qualifier: Mangle.qualifier(module: origin.split(separator: "/").map(String.init)))
         } else {
             symbol = Mangle.free(name)
@@ -1558,10 +1609,28 @@ final class SSAIRToLLVM {
         var shadowBufs: [(buf: LLVMValueRef, vwt: LLVMValueRef)] = []
         for (i, p) in sig.params.enumerated() {
             let v = val(args[i])
-            if mentionsTypeParam(p) {
-                guard let at = ty(args[i].type, span) else { return nil }
-                let buf = e.entryAlloca(at, "erased.arg")
-                LLVMBuildStore(b, v, buf)
+            // A generic **class** receiver is already a managed `p1` pointer — pass it directly, no buffer
+            // spill (task 100.4.3.9). The statepoint GC tracks it as an ordinary pointer argument.
+            if case .generic(let gb, _) = p, e.classMap[gb] != nil {
+                callArgs.append(v)
+            } else if mentionsTypeParam(p) {
+                // A composed value receiver (`sig.params[0]` typed `.generic`) that ssairgen already
+                // materialized as a pointer is its own storage buffer: a mutating value method passes `self`
+                // by its real address (ssairgen's `structAddr`), so thread it through rather than copying into
+                // a fresh buffer — the producer's erased `T`-field write then lands in the caller's storage
+                // and sticks past the call (task 100.4.3.10). A read-only value self arrives as a first-class
+                // aggregate, and a bare `.typeParam` value (incl. a managed class type argument, itself a
+                // pointer) is the value to box — both are spilled into a buffer as before.
+                let buf: LLVMValueRef
+                let isComposed: Bool = { if case .generic = p { return true } else { return false } }()
+                if isComposed, LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind {
+                    buf = v
+                } else {
+                    guard let at = ty(args[i].type, span) else { return nil }
+                    let a = e.entryAlloca(at, "erased.arg")
+                    LLVMBuildStore(b, v, a)
+                    buf = a
+                }
                 callArgs.append(buf)
                 var offs: [Int32] = []
                 e.collectManagedOffsets(args[i].type, baseSlot: 0, into: &offs)

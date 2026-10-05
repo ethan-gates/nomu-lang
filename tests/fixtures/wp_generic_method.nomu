@@ -1,0 +1,18 @@
+// Whole-program (single-module) twin of `module_generic_method`: the generic type `Box<T>` and its
+// methods `get`/`tagged` are monomorphized in this one module rather than compiled erased and called
+// across a boundary. Asserting the same output as `module-generic-method` is the 100.4.3.7 differential
+// for a method on a generic type — erased cross-module lowering (the VWT-derived `self` buffer, the sret
+// erased-`T` return) must produce the same observable result as whole-program monomorphization.
+struct Box<T> {
+    var value: T
+    fun get() -> T { return value }
+    fun tagged() -> Bool { return true }
+}
+
+fun main() {
+    let b = Box(value: 7)
+    print(b.get())        // 7
+    print("\n")
+    print(b.tagged())     // true -> 1
+    print("\n")
+}

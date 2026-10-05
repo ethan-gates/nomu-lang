@@ -1,0 +1,6 @@
+import pkg/util
+
+fun main() {
+    let p = Pt(x: 1, y: 2)
+    p.shift(by: 10)   // error: mutating method on an immutable `let` receiver (across the boundary)
+}

@@ -55,7 +55,8 @@ public func lowerToSSAIR(_ module: NOIRModule, subsetFuncs: Set<String> = []) ->
     }
     let ctx = ModuleContext(structFields: structFields, classFields: classFields,
                             enumCases: enumCases, methodsByType: methodsByType, actorFields: actorFields,
-                            opaqueUnderlyings: module.opaqueUnderlyings, interfaceSlots: interfaceSlots)
+                            opaqueUnderlyings: module.opaqueUnderlyings, interfaceSlots: interfaceSlots,
+                            externalMutatingMethods: module.externalMutatingMethods)
 
     let sink = ClosureSink()
     var functions: [SSAFunction] = []
@@ -64,14 +65,14 @@ public func lowerToSSAIR(_ module: NOIRModule, subsetFuncs: Set<String> = []) ->
         case .funcDecl(let f):
             let lowerer = FunctionLowerer(diags: diags, ctx: ctx, sink: sink, subsetFuncs: subsetFuncs)
             if let fn = lowerer.lower(f) { functions.append(fn) }
-        case .structDecl(let s): lowerMethods(s.name, .struct_, s.methods, ctx, diags, sink, subsetFuncs, &functions)
-        case .enumDecl(let e):   lowerMethods(e.name, .enum_, e.methods, ctx, diags, sink, subsetFuncs, &functions)
-        case .classDecl(let c):  lowerMethods(c.name, .class_, c.methods, ctx, diags, sink, subsetFuncs, &functions)
+        case .structDecl(let s): lowerMethods(s.name, .struct_, s.methods, s.generics, ctx, diags, sink, subsetFuncs, &functions)
+        case .enumDecl(let e):   lowerMethods(e.name, .enum_, e.methods, e.generics, ctx, diags, sink, subsetFuncs, &functions)
+        case .classDecl(let c):  lowerMethods(c.name, .class_, c.methods, c.generics, ctx, diags, sink, subsetFuncs, &functions)
         case .actorDecl(let a):
             // Each `on`-handler lowers like a mutating method with an actor (reference) `self`.
             let handlers = a.handlers.map { NOIRFunc(name: $0.name, params: $0.params, returnType: $0.returnType,
                                                      body: $0.body, isMutating: true, span: $0.span) }
-            lowerMethods(a.name, .actor_, handlers, ctx, diags, sink, subsetFuncs, &functions)
+            lowerMethods(a.name, .actor_, handlers, [], ctx, diags, sink, subsetFuncs, &functions)
         }
     }
     functions += sink.lifted   // the lifted closure bodies
@@ -100,11 +101,12 @@ public func lowerToSSAIR(_ module: NOIRModule, subsetFuncs: Set<String> = []) ->
 private func field(_ f: NOIRField) -> SSAField { SSAField(name: f.name, type: f.type, isMutable: f.isMutable) }
 
 private func lowerMethods(_ typeName: String, _ kind: NamedKind, _ methods: [NOIRFunc],
+                          _ ownerGenerics: [NOIRGenericParam],
                           _ ctx: ModuleContext, _ diags: DiagnosticSink, _ sink: ClosureSink,
                           _ subsetFuncs: Set<String>, _ out: inout [SSAFunction]) {
     for m in methods {
         let lowerer = FunctionLowerer(diags: diags, ctx: ctx, sink: sink, subsetFuncs: subsetFuncs)
-        if let fn = lowerer.lowerMethod(typeName: typeName, kind: kind, m) { out.append(fn) }
+        if let fn = lowerer.lowerMethod(typeName: typeName, kind: kind, ownerGenerics: ownerGenerics, m) { out.append(fn) }
     }
 }
 

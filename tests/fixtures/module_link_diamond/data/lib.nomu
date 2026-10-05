@@ -1,0 +1,6 @@
+// The shared leaf of the diamond (task 100.4.4): compiled once to its own object `__mod_data.o`, and
+// referenced by both `left` and `right`. The separate-object link resolves two modules' external
+// references against this one object.
+public fun dataBase() -> Int {
+    return 10
+}

@@ -3,7 +3,7 @@
 **Avenue:** Usability · **Type/Lifecycle:** `tooling · driver` · **Size:** S ·
 **Status:** needs-design — deferred from modules ([100](100-modules.md)); JSON ships first
 
-The package manifest ships as **JSON** initially (module work, 100.3.1) because it parses
+The package manifest ships as **JSON** initially ([173](173-package-model-driver-cli.md) §173.1) because it parses
 dependency-free in the Swift host (Foundation). Switch it to **YAML** once the module system is in use,
 for a human-friendlier authoring format (comments, less punctuation noise).
 

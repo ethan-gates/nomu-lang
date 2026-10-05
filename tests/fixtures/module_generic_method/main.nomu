@@ -1,0 +1,9 @@
+import pkg/util
+
+fun main() {
+    let b = Box(value: 7)
+    print(b.get())        // 7  — erased T return across the boundary
+    print("\n")
+    print(b.tagged())     // true -> 1  — concrete return from an erased method
+    print("\n")
+}

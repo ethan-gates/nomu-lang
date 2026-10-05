@@ -1,0 +1,6 @@
+// One arm of the diamond: imports `data` and links against its object (task 100.4.4).
+import pkg/data
+
+public fun leftVal() -> Int {
+    return dataBase() + 1
+}

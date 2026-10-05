@@ -1,0 +1,11 @@
+// A mutating value method on an imported type (task 100.4.3.5.2). `shift` mutates `self`, so its
+// inferred mutating-ness crosses in the `.nmi`; the consumer must then reject calling it on an
+// immutable (`let`) receiver — the soundness half of the self-by-pointer ABI.
+public struct Pt {
+    var x: Int
+    var y: Int
+    fun shift(by: Int) {
+        x = x + by
+        y = y + by
+    }
+}

@@ -1,0 +1,20 @@
+import pkg/util
+
+fun main() {
+    // Value (struct) receiver: a mutating method writes the erased `T` field; self passes by real
+    // storage, so the mutation is visible on the next read (task 100.4.3.10).
+    var b = Box(value: 7)
+    print(b.get())        // 7
+    print("\n")
+    b.replace(x: 42)
+    print(b.get())        // 42
+    print("\n")
+
+    // Reference (class) receiver: the write lands in the shared object, visible through the handle.
+    let r = Ref(value: 3)
+    print(r.get())        // 3
+    print("\n")
+    r.replace(x: 99)
+    print(r.get())        // 99
+    print("\n")
+}

@@ -1,0 +1,18 @@
+// Whole-program (single-module) twin of `module_generic_class_method`: the generic class `Ref<T>` and its
+// methods are monomorphized here rather than compiled erased and called across a boundary. Asserting the
+// same output as `module-generic-class-method` is the 100.4.3.9 differential for a method on a generic
+// class — the erased reference-`self` lowering (p1 receiver, VWT-derived field offset past the header)
+// must match whole-program monomorphization.
+class Ref<T> {
+    var value: T
+    fun get() -> T { return value }
+    fun tagged() -> Bool { return true }
+}
+
+fun main() {
+    let r = Ref(value: 7)
+    print(r.get())        // 7
+    print("\n")
+    print(r.tagged())     // true -> 1
+    print("\n")
+}

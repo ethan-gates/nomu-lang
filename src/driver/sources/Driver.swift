@@ -201,7 +201,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
     }
     func moduleTypes() -> [String: Set<String>] {
         var m: [String: Set<String>] = [:]
-        for (id, iface) in interfaces { m[id.components.joined(separator: "/")] = Set(iface.types.map(\.name)) }
+        for (id, iface) in interfaces { m[id.components.joined(separator: "/")] = Set(iface.types.map(\.name)).union(iface.enums.map(\.name)) }
         return m
     }
     // Per-file import scope. Imports are file-scoped (task 100.2.3.1), so a symbol is bare-visible only in
@@ -240,10 +240,36 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
         visibleModules(of: m).flatMap { k -> [TopDecl] in
             guard let iface = interfaces[k] else { return [] }
             let origin = k.components.joined(separator: "/")
-            let ownTypes = Set(iface.types.map(\.name))
+            let ownTypes = Set(iface.types.map(\.name)).union(iface.enums.map(\.name))
             return interfaceToDecls(parseInterface(serialize(iface)) ?? iface)
                 .map { encodeExternalDecl($0, origin: origin, ownTypes: ownTypes) }
         }
+    }
+    // Imported methods inferred mutating in their producing module, keyed `origin@Type.method` to match
+    // the consumer's call-site key (task 100.4.3.5.2). Sourced from each visible dependency's `.nmi`
+    // (`InterfaceFunc.isMutating`); drives the consumer's mutable-receiver check + self-by-pointer ABI.
+    func externalMutating(of m: ModuleID) -> Set<String> {
+        var out: Set<String> = []
+        for k in visibleModules(of: m) {
+            guard let iface = interfaces[k] else { continue }
+            let origin = k.components.joined(separator: "/")
+            func add(_ typeName: String, _ methods: [InterfaceFunc], _ properties: [InterfaceProperty]) {
+                let key = ExternalName.encode(origin: origin, name: typeName)
+                for mth in methods where mth.isMutating == true && !mth.isStatic {
+                    out.insert("\(key).\(mth.name)")
+                }
+                // A computed property's accessors lower to `p.get` / `p.set` methods (task 100.4.3.5.4); a
+                // mutating accessor (a setter that writes a stored field) needs the same self-by-pointer ABI
+                // as a mutating method, so key it the same way the call site does.
+                for p in properties {
+                    if p.getterMutating == true { out.insert("\(key).\(p.name).get") }
+                    if p.setterMutating == true { out.insert("\(key).\(p.name).set") }
+                }
+            }
+            for t in iface.types { add(t.name, t.methods, t.properties) }
+            for e in iface.enums { add(e.name, e.methods, e.properties) }
+        }
+        return out
     }
     for m in topo where m != entryID {
         let objPath = buildRoot + "/__mod_" + (m.components.isEmpty ? "root" : m.components.joined(separator: "_")) + ".o"
@@ -256,7 +282,8 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
                                           packageName: packageName,
                                           packageRoot: packageRoot, objPath: objPath, buildRoot: buildRoot,
                                           options: options, weakFiles: preludeFiles,
-                                          externalEscape: externalEscape(of: m), timings: timings) else {
+                                          externalEscape: externalEscape(of: m),
+                                          externalMutatingMethods: externalMutating(of: m), timings: timings) else {
             timings.report(); exit(1)
         }
         interfaces[m] = dep.iface
@@ -311,7 +338,8 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
     let semaResult = timings.measure("noir", "sema") { () -> SemaResult in
         var sema = Sema(program, externalDecls: entryExternals, subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames),
                         fileVisibleModules: entryScopes.fileVisible, fileQualifiers: entryScopes.fileQualifiers,
-                        moduleFuncs: moduleFuncs(), moduleTypes: moduleTypes())
+                        moduleFuncs: moduleFuncs(), moduleTypes: moduleTypes(),
+                        externalMutatingMethods: externalMutating(of: entryID))
         let result = sema.check()
         // T4: exhaustiveness as an IR pass over the typed module, into the same sink.
         checkExhaustiveness(result.module, into: result.diagnostics)
@@ -500,6 +528,20 @@ private func encodeExternalDecl(_ decl: TopDecl, origin: String, ownTypes: Set<S
         return TypeRef(name: nm, fn: fn, existentialOf: r.existentialOf, opaqueOf: r.opaqueOf,
                        genericArgs: r.genericArgs?.compactMap { encT($0) }, qualifier: r.qualifier, span: r.span)
     }
+    // A reconstructed computed property's declared type references an imported type by its bare name;
+    // origin-encode it like a field's (task 100.4.3.5.4). The accessor bodies are empty placeholders.
+    func encP(_ p: ComputedProperty) -> ComputedProperty {
+        ComputedProperty(name: p.name, type: encT(p.type)!, getter: p.getter, setter: p.setter, span: p.span)
+    }
+    // A reconstructed method's (instance or `static`) signature may name an imported type — encode its
+    // param/return types like a field's, so a static method's `-> Rect` return resolves to the right
+    // per-origin identity (task 100.4.3.5.4). Bodies are empty (they live in the producer).
+    func encM(_ m: FuncDecl) -> FuncDecl {
+        FuncDecl(name: m.name, generics: m.generics,
+                 params: m.params.map { Param(label: $0.label, name: $0.name, type: encT($0.type)!, span: $0.span) },
+                 returnType: encT(m.returnType), body: m.body, isStatic: m.isStatic,
+                 visibility: m.visibility, span: m.span)
+    }
     let key = { ExternalName.encode(origin: origin, name: $0) }
     switch decl {
     case .funcDecl(let f):
@@ -509,11 +551,17 @@ private func encodeExternalDecl(_ decl: TopDecl, origin: String, ownTypes: Set<S
     case .structDecl(let s):
         return .structDecl(StructDecl(name: key(s.name), generics: s.generics,
             fields: s.fields.map { VarField(name: $0.name, type: encT($0.type)!, isMutable: $0.isMutable, span: $0.span) },
-            properties: s.properties, methods: s.methods, conformances: s.conformances, visibility: s.visibility, span: s.span))
+            properties: s.properties.map(encP), methods: s.methods.map(encM), conformances: s.conformances, visibility: s.visibility, span: s.span))
     case .classDecl(let c):
         return .classDecl(ClassDecl(name: key(c.name), generics: c.generics,
             fields: c.fields.map { VarField(name: $0.name, type: encT($0.type)!, isMutable: $0.isMutable, span: $0.span) },
-            properties: c.properties, methods: c.methods, conformances: c.conformances, visibility: c.visibility, span: c.span))
+            properties: c.properties.map(encP), methods: c.methods.map(encM), conformances: c.conformances, visibility: c.visibility, span: c.span))
+    case .enumDecl(let e):
+        return .enumDecl(EnumDecl(name: key(e.name), generics: e.generics,
+            cases: e.cases.map { EnumCaseDecl(name: $0.name,
+                fields: $0.fields.map { VarField(name: $0.name, type: encT($0.type)!, isMutable: $0.isMutable, span: $0.span) },
+                span: $0.span) },
+            properties: e.properties.map(encP), methods: e.methods.map(encM), conformances: e.conformances, visibility: e.visibility, span: e.span))
     default:
         return decl
     }
@@ -538,7 +586,7 @@ private func compileDependency(files: [SourceFile], module: ModuleID, externalDe
                                leafCollisions: [(file: String, leaf: String, span: Span)],
                                packageName: String, packageRoot: String, objPath: String,
                                buildRoot: String, options: EmitOptions, weakFiles: Set<String>,
-                               externalEscape: [String: EscapeSummary],
+                               externalEscape: [String: EscapeSummary], externalMutatingMethods: Set<String>,
                                timings: Timings) -> (iface: ModuleInterface, escape: [String: EscapeSummary])? {
     var program = Program(decls: files.flatMap(\.decls), imports: files.flatMap(\.imports))
 
@@ -568,7 +616,8 @@ private func compileDependency(files: [SourceFile], module: ModuleID, externalDe
     var sema = Sema(program, externalDecls: externalDecls,
                     subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames),
                     fileVisibleModules: fileVisibleModules, fileQualifiers: fileQualifiers,
-                    moduleFuncs: moduleFuncs, moduleTypes: moduleTypes)
+                    moduleFuncs: moduleFuncs, moduleTypes: moduleTypes,
+                    externalMutatingMethods: externalMutatingMethods)
     let semaResult = sema.check()
     checkExhaustiveness(semaResult.module, into: semaResult.diagnostics)
     if !semaResult.diagnostics.isEmpty { fputs(semaResult.diagnostics.render() + "\n", stderr); return nil }

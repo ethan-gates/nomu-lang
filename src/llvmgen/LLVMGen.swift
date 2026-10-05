@@ -56,6 +56,9 @@ final class LLVMGen {
 
     // `some I` owner → its hidden concrete underlying (M5 A3); resolves `.opaque` to a real type.
     var opaqueUnderlyings: [String: Type] = [:]
+    // Mono'd type-instantiation name → its concrete type args (task 100.4.3.5.3.3); read by the
+    // erased-method call lowering to thread the receiver's type-argument VWTs.
+    var monoTypeArgs: [String: [Type]] = [:]
 
     // Top-level function registry, and the callables declared on demand. `funcMap` holds every
     // top-level `fun` by name (input to `declareFree`). `callables` keys declared LLVM functions —

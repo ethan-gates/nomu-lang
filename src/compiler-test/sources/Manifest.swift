@@ -64,7 +64,7 @@ struct ResolvedCase {
     var carriers: [Int]
     var runTimeout: Double
     var compileTimeout: Double
-    var weight: Int   // lanes occupied in the fixed-8 pool; a self-parallelizing case declares more
+    var weight: Int   // cores this case saturates (its pool lanes); derived from the run shape, below
     var compile: CompileSpec?
     var stderrMatch: [StderrMatch]
 
@@ -76,10 +76,25 @@ struct ResolvedCase {
 }
 
 extension Manifest {
-    func resolvedCases() -> [ResolvedCase] {
+    // The number of cores a case saturates — its pool weight (task: CPU-aware scheduling). A case advertises
+    // this so the run pool never admits more concurrent cores than the host has (minus a buffer). Default it
+    // from the run shape: a carrier matrix peaks at its largest carrier count (each carrier is a scheduler
+    // worker thread the runtime pins to a core); an **empty** carriers list is a self-threading fixture, which
+    // the runtime boots with its own default of 4 carriers. Explicit `weight` overrides; legacy `heavy` takes
+    // the whole pool. Clamped to the pool so a case can never deadlock it.
+    static let selfThreadingCarriers = 4   // the runtime's default carrier count when NOMU_CARRIERS is unset
+    private static func weight(_ c: Case, _ d: Defaults?, carriers: [Int], capacity: Int) -> Int {
+        if let w = c.weight { return min(max(1, w), capacity) }
+        if c.heavy ?? d?.heavy ?? false { return capacity }
+        let peak = carriers.isEmpty ? selfThreadingCarriers : (carriers.max() ?? 1)
+        return max(1, min(peak, capacity))
+    }
+
+    func resolvedCases(capacity: Int) -> [ResolvedCase] {
         let d = defaults
         return cases.map { c in
-            ResolvedCase(
+            let carriers = c.carriers ?? d?.carriers ?? [1]
+            return ResolvedCase(
                 name: c.name,
                 fixture: c.fixture,
                 compileArgs: c.compileArgs ?? [],
@@ -87,11 +102,10 @@ extension Manifest {
                 runEnv: c.runEnv ?? [:],
                 expect: c.expect,
                 iterations: c.iterations ?? d?.iterations ?? 1,
-                carriers: c.carriers ?? d?.carriers ?? [1],
+                carriers: carriers,
                 runTimeout: c.timeoutSec ?? d?.timeoutSec ?? 60,
                 compileTimeout: c.compileTimeoutSec ?? d?.compileTimeoutSec ?? 120,
-                // Explicit weight wins; else legacy `heavy` maps to a full-pool lane count; else 1.
-                weight: c.weight ?? ((c.heavy ?? d?.heavy ?? false) ? 8 : 1),
+                weight: Manifest.weight(c, d, carriers: carriers, capacity: capacity),
                 compile: c.compile,
                 stderrMatch: c.stderrMatch ?? []
             )

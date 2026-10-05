@@ -1,0 +1,7 @@
+// The other arm of the diamond: also imports `data`, so the shared leaf's single object resolves
+// references from both `left` and `right` at link (task 100.4.4).
+import pkg/data
+
+public fun rightVal() -> Int {
+    return dataBase() + 2
+}

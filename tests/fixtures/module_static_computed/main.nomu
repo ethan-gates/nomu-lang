@@ -1,0 +1,16 @@
+import pkg/util
+
+fun main() {
+    let r = Rect.square(side: 5)   // static method across the boundary
+    print(r.area)                  // computed property -> 25
+    print("\n")
+    var m = Rect(w: 6, h: 3)
+    print(m.scale)                 // get accessor -> 2
+    print("\n")
+    m.scale = 5                    // mutating set accessor: w = h*5 = 15
+    print(m.area)                  // 15*3 -> 45
+    print("\n")
+    let s: Shape = .square(side: 4)
+    print(s.area)                  // enum computed property -> 16
+    print("\n")
+}

@@ -43,6 +43,30 @@ public func interfaceToDecls(_ iface: ModuleInterface) -> [TopDecl] {
                         visibility: .public, span: zeroSpan)
     }
 
+    // Reconstruct a `static fun` member on an imported type (task 100.4.3.5.4) as a body-free static
+    // `FuncDecl`. A static method is free-function-shaped — the producer emits it as a free function
+    // `Type.method`, so a consumer's `Type.method(…)` call links to that symbol like an imported free
+    // function. The consumer's Sema registers it (for `Type.method` resolution and its signature); the
+    // body lives in the producer. Generic static methods (own type params) ride task 170.
+    func staticMethod(_ m: InterfaceFunc) -> FuncDecl? {
+        guard m.isStatic, m.generics.isEmpty else { return nil }
+        return FuncDecl(name: m.name,
+                        generics: [],
+                        params: m.params.map { Param(label: $0.label, name: $0.name, type: typeRef($0.type), span: zeroSpan) },
+                        returnType: m.ret.map(typeRef), body: [], isStatic: true,
+                        visibility: .public, span: zeroSpan)
+    }
+
+    // Reconstruct a computed property on an imported type (task 100.4.3.5.4) as a body-free
+    // `ComputedProperty`: the consumer's `registerProps` records its type + settability so `x.p` / `x.p = v`
+    // type-check and lower to accessor calls (`p.get` / `p.set`), which link to the producer's accessor
+    // symbols — the same model as an imported instance method. Only the signature matters; the accessor
+    // bodies live in the producer, so getter/setter blocks are empty placeholders.
+    func property(_ p: InterfaceProperty) -> ComputedProperty {
+        ComputedProperty(name: p.name, type: typeRef(p.type), getter: [],
+                         setter: p.isSettable ? Setter(paramName: "value", body: []) : nil, span: zeroSpan)
+    }
+
     var out: [TopDecl] = []
     // Imported interfaces (task 100.4.3.3.3): a consumer needs the requirement surface to conform its own
     // types to an imported interface and to bound-check a call to an imported generic. Bodies don't cross,
@@ -60,19 +84,20 @@ public func interfaceToDecls(_ iface: ModuleInterface) -> [TopDecl] {
     }
     for t in iface.types {
         let fields = t.fields.map(field)
-        let methods = t.methods.compactMap(method)
+        let methods = t.methods.compactMap(method) + t.methods.compactMap(staticMethod)
+        let properties = t.properties.map(property)
         if t.keyword == "class" {
-            out.append(.classDecl(ClassDecl(name: t.name, generics: generics(t.generics), fields: fields, properties: [],
+            out.append(.classDecl(ClassDecl(name: t.name, generics: generics(t.generics), fields: fields, properties: properties,
                                             methods: methods, conformances: [], visibility: .public, span: zeroSpan)))
         } else {
-            out.append(.structDecl(StructDecl(name: t.name, generics: generics(t.generics), fields: fields, properties: [],
+            out.append(.structDecl(StructDecl(name: t.name, generics: generics(t.generics), fields: fields, properties: properties,
                                               methods: methods, conformances: [], visibility: .public, span: zeroSpan)))
         }
     }
     for e in iface.enums {
         let cases = e.cases.map { EnumCaseDecl(name: $0.name, fields: $0.fields.map(field), span: zeroSpan) }
-        out.append(.enumDecl(EnumDecl(name: e.name, generics: generics(e.generics), cases: cases, properties: [],
-                                      methods: [], conformances: [], visibility: .public, span: zeroSpan)))
+        out.append(.enumDecl(EnumDecl(name: e.name, generics: generics(e.generics), cases: cases, properties: e.properties.map(property),
+                                      methods: e.methods.compactMap(method) + e.methods.compactMap(staticMethod), conformances: [], visibility: .public, span: zeroSpan)))
     }
     // Free functions, generic included. A generic function reconstructs with its type parameters +
     // bounds so a consumer's call type-checks; it stays external (Sema marks it, never lowering its
@@ -151,11 +176,18 @@ public struct InterfaceParam: Codable, Equatable {
     public init(label: String, name: String, type: String) { self.label = label; self.name = name; self.type = type }
 }
 // A computed property on a type, or a property requirement on an interface. `isSettable` is `{ get set }`
-// vs `{ get }` — it also determines whether a `name.set` witness slot exists.
+// vs `{ get }` — it also determines whether a `name.set` witness slot exists. `getterMutating` /
+// `setterMutating` carry the accessor's inferred mutating-ness (task 100.4.3.5.4), so a consumer calling
+// `x.p` / `x.p = v` across a boundary passes `self` by the same ABI the producer compiled the accessor
+// with (a setter that writes a stored field is mutating → self-by-pointer). Optional so a `.nmi` written
+// before the field — or an interface *requirement*, which has no body — decodes as "unknown".
 public struct InterfaceProperty: Codable, Equatable {
     public var name: String; public var type: String; public var isSettable: Bool
-    public init(name: String, type: String, isSettable: Bool) {
+    public var getterMutating: Bool?; public var setterMutating: Bool?
+    public init(name: String, type: String, isSettable: Bool,
+                getterMutating: Bool? = nil, setterMutating: Bool? = nil) {
         self.name = name; self.type = type; self.isSettable = isSettable
+        self.getterMutating = getterMutating; self.setterMutating = setterMutating
     }
 }
 // A struct or class type (`keyword`). Carries its generic parameters, stored fields (declared order —
@@ -226,9 +258,12 @@ private func renderMethods(_ owner: String, _ ms: [FuncDecl], _ facts: FactStore
                            isMutating: facts.facts(for: SymbolID("\(owner).\($0.name)"))?.abi.mutating) }
       .sorted { $0.name < $1.name }
 }
-private func renderProperties(_ ps: [ComputedProperty]) -> [InterfaceProperty] {
-    ps.map { InterfaceProperty(name: $0.name, type: renderType($0.type), isSettable: $0.setter != nil) }
-      .sorted { $0.name < $1.name }
+private func renderProperties(_ owner: String, _ ps: [ComputedProperty], _ facts: FactStore) -> [InterfaceProperty] {
+    ps.map {
+        InterfaceProperty(name: $0.name, type: renderType($0.type), isSettable: $0.setter != nil,
+            getterMutating: facts.facts(for: SymbolID("\(owner).\($0.name).get"))?.abi.mutating,
+            setterMutating: $0.setter != nil ? facts.facts(for: SymbolID("\(owner).\($0.name).set"))?.abi.mutating : nil)
+    }.sorted { $0.name < $1.name }
 }
 private func renderCases(_ cs: [EnumCaseDecl]) -> [InterfaceCase] {
     cs.map { c in InterfaceCase(name: c.name,
@@ -255,16 +290,16 @@ public func buildInterface(_ program: Program, package: String, module: ModuleID
         case .structDecl(let s) where s.visibility == .public && inModule(s.span):
             types.append(InterfaceType(keyword: "struct", name: s.name, generics: renderGenerics(s.generics),
                 fields: s.fields.map { InterfaceField(name: $0.name, type: renderType($0.type), isMutable: $0.isMutable) },
-                properties: renderProperties(s.properties), methods: renderMethods(s.name, s.methods, facts),
+                properties: renderProperties(s.name, s.properties, facts), methods: renderMethods(s.name, s.methods, facts),
                 conformances: renderConformances(s.conformances)))
         case .classDecl(let c) where c.visibility == .public && inModule(c.span):
             types.append(InterfaceType(keyword: "class", name: c.name, generics: renderGenerics(c.generics),
                 fields: c.fields.map { InterfaceField(name: $0.name, type: renderType($0.type), isMutable: $0.isMutable) },
-                properties: renderProperties(c.properties), methods: renderMethods(c.name, c.methods, facts),
+                properties: renderProperties(c.name, c.properties, facts), methods: renderMethods(c.name, c.methods, facts),
                 conformances: renderConformances(c.conformances)))
         case .enumDecl(let e) where e.visibility == .public && inModule(e.span):
             enums.append(InterfaceEnum(name: e.name, generics: renderGenerics(e.generics), cases: renderCases(e.cases),
-                properties: renderProperties(e.properties), methods: renderMethods(e.name, e.methods, facts),
+                properties: renderProperties(e.name, e.properties, facts), methods: renderMethods(e.name, e.methods, facts),
                 conformances: renderConformances(e.conformances)))
         case .interfaceDecl(let i) where i.visibility == .public && inModule(i.span):
             let methods = i.methods.map { m in

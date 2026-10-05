@@ -1,0 +1,9 @@
+import pkg/util
+
+fun main() {
+    let r = Ref(value: 7)
+    print(r.get())        // 7 — erased T return through a reference receiver
+    print("\n")
+    print(r.tagged())     // true -> 1 — concrete return
+    print("\n")
+}

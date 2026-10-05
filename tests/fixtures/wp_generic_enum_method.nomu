@@ -1,0 +1,38 @@
+// Whole-program (single-module) twin of `module_generic_enum_method`: the generic enum `Opt<T>` and its
+// methods `present`/`orElse` are monomorphized in this one module rather than compiled erased and called
+// across a boundary. Asserting the same output as `module-generic-enum-method` is the 100.4.3.7
+// differential for a method on a generic enum — the erased `switch self` tag read off the value buffer and
+// the sret erased-`T` payload return must match the whole-program monomorphized layout.
+enum Opt<T> {
+    case some(value: T)
+    case none
+    fun present() -> Bool {
+        switch self {
+        case .some(let v): return true
+        case .none:        return false
+        }
+    }
+    fun orElse(d: T) -> T {
+        switch self {
+        case .some(let v): return v
+        case .none:        return d
+        }
+    }
+}
+
+fun wrapOpt<T>(x: T) -> Opt<T> {
+    return .some(value: x)
+}
+
+fun main() {
+    let o: Opt<Int> = wrapOpt(5)
+    print(o.present())       // true -> 1
+    print("\n")
+    print(o.orElse(9))       // 5
+    print("\n")
+    let n: Opt<Int> = .none
+    print(n.present())       // false -> 0
+    print("\n")
+    print(n.orElse(9))       // 9
+    print("\n")
+}

@@ -77,12 +77,35 @@ final class FunctionLowerer {
     // a struct/enum receiver passes `self` by pointer only when the method mutates it, else by value
     // (spilled to a slot for uniform field access). Self ABI is derivable at the egress from
     // `isMutating` + the receiver kind, so no extra flag is threaded.
-    func lowerMethod(typeName: String, kind: NamedKind, _ f: NOIRFunc) -> SSAFunction? {
+    func lowerMethod(typeName: String, kind: NamedKind, ownerGenerics: [NOIRGenericParam] = [], _ f: NOIRFunc) -> SSAFunction? {
         lastSpan = f.span
         let entry = newBlock(); entryId = entry; seal(entry); curId = entry
 
         let fields = ctx.fields(typeName, kind) ?? []
         currentSelf = SelfCtx(typeName: typeName, kind: kind, fields: fields)
+
+        // A method on a **generic value type** lowers erased (task 100.4.3.5.3): `self` is a value-buffer
+        // receiver typed `.generic`, so self-field access GEPs by the backend's VWT-derived offset (the
+        // same `.generic` path a composed value uses, 100.4.3.3.4), and the SSAFunction carries the
+        // owner's type parameters (then the method's own) so the egress declares it under the erased
+        // witness-passing ABI (`self` in the §4 value-param slot). The erased body is the compiled-once
+        // cross-module copy; own-module calls still use the monomorphized specialization.
+        if !ownerGenerics.isEmpty, kind == .struct_ || kind == .enum_ || kind == .class_ {
+            currentGenerics = ownerGenerics + f.generics
+            let selfType = Type.generic(base: typeName, args: ownerGenerics.map { .typeParam($0.name) })
+            let selfParam = newValue(selfType)
+            // A value receiver (struct/enum) is a value buffer: the erased param IS the buffer pointer (a
+            // slot). A **class** receiver is a reference: the erased param is the managed object pointer
+            // itself (task 100.4.3.9), bound as `self` like a concrete class method; self-field access then
+            // GEPs by the VWT-derived offset *past the object header*.
+            if kind == .class_ { write("self", entry, selfParam) }
+            else { slots["self"] = selfParam }
+            var params = [selfParam]
+            params += bindParams(f)
+            return finishFunction(f, params: params, name: ModuleContext.methodSymbol(typeName, f.name),
+                                  generics: ownerGenerics + f.generics)
+        }
+
         let selfType = Type.named(typeName, kind)
         let selfParam = newValue(selfType)
         let byPointer = kind == .class_ || kind == .actor_ || f.isMutating
@@ -120,7 +143,8 @@ final class FunctionLowerer {
         return params
     }
 
-    private func finishFunction(_ f: NOIRFunc, params: [SSAValue], name: String) -> SSAFunction? {
+    private func finishFunction(_ f: NOIRFunc, params: [SSAValue], name: String,
+                                generics: [NOIRGenericParam]? = nil) -> SSAFunction? {
         lowerBlock(f.body)
         if bbs[curId]?.term == nil {       // fell off the end
             joinSpawns(from: 0)
@@ -130,7 +154,7 @@ final class FunctionLowerer {
         if diags.hasErrors { return nil }
         return SSAFunction(name: name, params: params, returnType: f.returnType,
                            blocks: blocks, isMutating: f.isMutating, span: f.span,
-                           noSafepoint: subsetFuncs.contains(f.name), generics: f.generics)
+                           noSafepoint: subsetFuncs.contains(f.name), generics: generics ?? f.generics)
     }
 
     // MARK: Builder primitives
@@ -588,7 +612,7 @@ final class FunctionLowerer {
             fail("unsupported method-call receiver", span)
             return nil
         }
-        let isMutating = ctx.method(typeName, method)?.isMutating ?? false
+        let isMutating = ctx.methodIsMutating(typeName, method)
         // `self` argument: a class is the object pointer; a mutating value receiver passes its address;
         // a read-only value receiver passes its value.
         let selfArg: SSAValue?
@@ -626,7 +650,14 @@ final class FunctionLowerer {
         if let binding = spawnBindings[name], let rt = spawnResultTypes[binding] {
             return emit(.spawnJoin(binding: binding, resultType: rt, final: false), rt, span)   // reading a spawn joins it (intermediate; leaves it registered)
         }
-        if let slot = slots[name] { return emit(.load(slot), slot.type, span) }
+        if let slot = slots[name] {
+            // An erased `.generic` value (a generic-type method's `self`, task 100.4.3.5.3) is held by a
+            // value buffer: the slot already IS the buffer pointer that represents the value, so reading it
+            // yields that pointer directly — never a load (the `.generic` convention, 100.4.3.3.4). A
+            // `switch self` then reads the tag off the buffer with a single load. A concrete slot loads.
+            if case .generic = slot.type { return slot }
+            return emit(.load(slot), slot.type, span)
+        }
         if varType[name] != nil { return read(name, curId) }
         if let idx = selfFieldIndex(name) { return selfFieldRead(name, idx, fieldType, span) }
         fail("unknown variable '\(name)'", span); return nil
@@ -646,6 +677,10 @@ final class FunctionLowerer {
     private func selfFieldRead(_ name: String, _ idx: Int, _ type: Type, _ span: Span) -> SSAValue? {
         guard let base = selfBase() else { fail("no self for '\(name)'", span); return nil }
         let addr = emit(.fieldAddr(base: base, fieldIndex: idx), type, span)
+        // An erased `self` (a generic-type method, task 100.4.3.5.3) is a value buffer: a field access
+        // yields the field's **address** — the T representation — never a loaded first-class value, the
+        // same convention `lowerFieldRead` uses for a `.generic` base (100.4.3.3.4).
+        if case .generic = base.type { return addr }
         return emit(.load(addr), type, span)
     }
 

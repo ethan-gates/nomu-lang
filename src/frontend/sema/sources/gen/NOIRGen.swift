@@ -643,11 +643,14 @@ enum NOIRGen {
             let ret = s.resolve(req.returnType, selfAs: selfT)
             return NOIRExpr(type: ret, span: span, kind: .staticCall(onType: selfT, method: name, args: irArgs))
         }
-        // Static method: `Type.method(args)` — a type-associated function with no receiver. Only
-        // for a non-generic user type (generic types reject members entirely, so no static free
-        // function is ever emitted for them); the call lowers to a direct call of `Type.method`.
+        // Static method: `Type.method(args)` — a type-associated function with no receiver. For a
+        // non-generic user type (generic types reject members entirely, so no static free function is
+        // emitted for them); the call lowers to a direct call of `Type.method`. An imported type is
+        // written by its bare name here, so resolve it to its per-origin identity first (task 100.4.3.5.4)
+        // — the call then targets `origin@Type.method`, the producer's static free-function symbol.
         if case .member(let base, let name, _) = callee,
-           let (tn, explicit) = s.typeNameAndArgs(base), s.lookup(tn) == nil,
+           let (rawTn, explicit) = s.typeNameAndArgs(base), s.lookup(rawTn) == nil,
+           case let tn = s.importedTypeIdentity(rawTn, at: span),
            let k = s.kindOf(tn), let m = s.staticMethodDecl(tn, k, name) {
             // A generic type's static method: `Box<Int>.make(...)`. The signature substitutes the
             // explicit type args, and they ride on the call so monomorphization specializes the
@@ -1184,10 +1187,16 @@ enum NOIRGen {
             let ret = s.resolve(m.returnType)
             let body = withMethodScope(&s, selfType: nil, fields: [], params: params, returnType: ret, m.body)
             // On a generic type the free function carries the type's parameters, so monomorphization
-            // treats it as a generic template and specializes it per instantiation (task 151).
+            // treats it as a generic template and specializes it per instantiation (task 151). Such a
+            // generic static method is also emitted **erased** for cross-module calls (task 100.4.3.8),
+            // which Monomorphize gates on `.public`; mark it so (a generic type's members are the erasure
+            // unit, as with its instance methods). A non-generic static method stays `.internal` — it is a
+            // plain free function, linked by symbol, never erased.
             s.pendingStaticFuncs.append(.funcDecl(NOIRFunc(name: "\(typeName).\(m.name)", generics: generics,
                                                          params: params, returnType: ret, body: body,
-                                                         isMutating: false, span: m.span)))
+                                                         isMutating: false,
+                                                         visibility: generics.isEmpty ? .internal : .public,
+                                                         span: m.span)))
         }
     }
 

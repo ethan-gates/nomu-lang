@@ -1,0 +1,28 @@
+// Static methods + computed properties on imported GENERIC types, across a module boundary (task
+// 100.4.3.8). A computed property on a generic type is an erased accessor method (the 100.4.3.5.3 path):
+// `b.held` / `b.flag` route through the witness ABI with the receiver's type-arg VWT; an erased-`T`
+// getter returns by sret. A static method on a generic type is the producer's erased generic free
+// function: `Box<Int>.of(…)` threads the instantiation's VWT like a generic function call.
+public struct Box<T> {
+    var value: T
+    var held: T { value }                // erased-T computed property (sret return)
+    var flag: Int {
+        get { 10 }
+        set(n) { value = value }         // mutating setter across the boundary
+    }
+    static fun of(x: T) -> Box<T> { return Box(value: x) }
+}
+
+public enum Opt<T> {
+    case some(value: T)
+    case none
+    var isSome: Bool {                    // computed property on a generic enum (switch self)
+        get {
+            switch self {
+            case .some(let v): return true
+            case .none:        return false
+            }
+        }
+    }
+    static fun wrap(x: T) -> Opt<T> { return .some(value: x) }
+}

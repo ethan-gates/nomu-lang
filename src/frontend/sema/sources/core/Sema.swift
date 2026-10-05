@@ -119,11 +119,17 @@ public struct Sema {
     // built once after global collection; discharges `<shared T>` bounds at call sites.
     private var shareChecker = Shareability(lookup: { _ in nil })
 
+    // Imported methods inferred mutating in their producing module, keyed `origin@Type.method` (task
+    // 100.4.3.5.2). Sourced from deps' `.nmi` (`InterfaceFunc.isMutating`); drives the caller
+    // mutable-receiver check for an imported mutating value method and rides to the self-ABI via NOIR.
+    var externalMutatingMethods: Set<String> = []
+
     public init(_ program: Program, externalDecls: [TopDecl] = [], subsetFuncs: Set<String> = [],
                 fileVisibleModules: [String: Set<String>] = [:],
                 fileQualifiers: [String: [String: Set<String>]] = [:],
                 moduleFuncs: [String: Set<String>] = [:],
-                moduleTypes: [String: Set<String>] = [:]) {
+                moduleTypes: [String: Set<String>] = [:],
+                externalMutatingMethods: Set<String> = []) {
         self.program = program
         self.externalDecls = externalDecls
         self.subsetFuncs = subsetFuncs
@@ -131,6 +137,7 @@ public struct Sema {
         self.fileQualifiers = fileQualifiers
         self.moduleFuncs = moduleFuncs
         self.moduleTypes = moduleTypes
+        self.externalMutatingMethods = externalMutatingMethods
     }
 
     public mutating func check() -> SemaResult {
@@ -175,9 +182,15 @@ public struct Sema {
         // annotate the IR, then check that mutating value-type calls have a mutable receiver.
         let module0 = NOIRModule(decls: decls, interfaces: InterfaceModel.buildIRInterfaces(self),
                                conformances: conformanceList, composites: compositeList,
-                               opaqueUnderlyings: opaqueUnderlyings)
+                               opaqueUnderlyings: opaqueUnderlyings,
+                               externalMutatingMethods: externalMutatingMethods)
         let mutation = analyzeMutation(module0, into: diags)
-        for site in methodCallSites where mutation.mutating.contains(site.callee) && !site.receiverMutable {
+        // A mutating value method needs a `var` receiver — whether its mutating-ness was inferred in this
+        // module or imported across a boundary (task 100.4.3.5.2; the imported set is keyed the same
+        // `origin@Type.method` as the call site).
+        for site in methodCallSites
+            where (mutation.mutating.contains(site.callee) || externalMutatingMethods.contains(site.callee))
+                  && !site.receiverMutable {
             diags.error("cannot call mutating method on an immutable value — the receiver must be a 'var'", at: site.span)
         }
         checkRuntimeSubset(mutation.module, designated: subsetFuncs, into: diags)
@@ -187,23 +200,24 @@ public struct Sema {
 
     // MARK: - Global collection
 
-    // A copy of an imported type decl with its instance methods removed, for the layout-only lowering of
-    // an external type (task 100.4.3.5): the methods stay in `structs`/`classes` (registered from the
-    // original) for `x.m()` resolution, but their bodies live in the producer, so the consumer emits no
-    // definition for them.
+    // A copy of an imported type decl with its instance methods **and computed properties** removed, for
+    // the layout-only lowering of an external type (task 100.4.3.5). Both stay in the registration tables
+    // (methods in `structs`/`classes`, computed properties in `computedProps`, from the original decl) so
+    // `x.m()` / `x.p` resolve, but their bodies live in the producer — the consumer emits no accessor or
+    // method definition; a call links to the producer's symbol instead (task 100.4.3.5.4).
     private func strippingMethodBodies(_ decl: TopDecl) -> TopDecl {
         switch decl {
         case .structDecl(let s):
             return .structDecl(StructDecl(name: s.name, generics: s.generics, fields: s.fields,
-                                          properties: s.properties, methods: [], conformances: s.conformances,
+                                          properties: [], methods: [], conformances: s.conformances,
                                           visibility: s.visibility, span: s.span))
         case .classDecl(let c):
             return .classDecl(ClassDecl(name: c.name, generics: c.generics, fields: c.fields,
-                                        properties: c.properties, methods: [], conformances: c.conformances,
+                                        properties: [], methods: [], conformances: c.conformances,
                                         visibility: c.visibility, span: c.span))
         case .enumDecl(let e):
             return .enumDecl(EnumDecl(name: e.name, generics: e.generics, cases: e.cases,
-                                      properties: e.properties, methods: [], conformances: e.conformances,
+                                      properties: [], methods: [], conformances: e.conformances,
                                       visibility: e.visibility, span: e.span))
         default:
             return decl
@@ -265,6 +279,92 @@ public struct Sema {
                     params: extParams, ret: extRet)
             }
             genericScope = saved
+        }
+        // Imported **generic-type methods** (task 100.4.3.5.3.2): a method on an imported generic type is
+        // the producer's erased copy (100.4.3.5.3.1), called through the witness ABI like an imported
+        // generic function. Register its erased signature, keyed by the method call symbol, so the
+        // call-site lowering (100.4.3.5.3.3) routes to the erased symbol with the receiver's type-arg VWTs
+        // instead of a (nonexistent) monomorphized specialization. Hidden type parameters are the owning
+        // type's then the method's own; `self` is the leading value parameter, a `.generic` buffer.
+        func registerGenericMethods(_ typeName: String, _ typeGenerics: [GenericParam], _ methods: [FuncDecl]) {
+            guard !typeGenerics.isEmpty else { return }
+            for m in methods where !m.isStatic {
+                let gens = typeGenerics + m.generics
+                let saved = genericScope; genericScope = Set(gens.map(\.name))
+                let selfType = Type.generic(base: typeName, args: typeGenerics.map { .typeParam($0.name) })
+                let params = [selfType] + m.params.map { resolve($0.type) }
+                let ret = resolve(m.returnType, opaqueOwner: "fn:\(typeName).\(m.name)")
+                let sym = "m:\(typeName):\(m.name)"
+                externalGenericSigs[sym] = ExternalGenericSig(
+                    generics: gens.map(\.name), bounds: gens.map { $0.bounds.map(\.name) },
+                    params: params, ret: ret)
+                externalFuncNames.insert(sym)
+                genericScope = saved
+            }
+        }
+        // Imported **computed properties on a generic type** (task 100.4.3.8): an accessor is a method, so
+        // the producer compiles it erased too (`Box<T>.p.get`/`.set`), and the consumer must route `x.p` /
+        // `x.p = v` through the erased witness ABI rather than a (nonexistent) monomorphized accessor. Register
+        // each accessor's erased sig under its method key — `self` the leading `.generic` value param, the
+        // getter returning the property type, the setter taking the new value and returning void.
+        func registerGenericAccessors(_ typeName: String, _ typeGenerics: [GenericParam], _ properties: [ComputedProperty]) {
+            guard !typeGenerics.isEmpty else { return }
+            let saved = genericScope; genericScope = Set(typeGenerics.map(\.name)); defer { genericScope = saved }
+            let selfType = Type.generic(base: typeName, args: typeGenerics.map { .typeParam($0.name) })
+            let gens = typeGenerics.map(\.name), bounds = typeGenerics.map { $0.bounds.map(\.name) }
+            for p in properties {
+                let propType = resolve(p.type)
+                let getSym = "m:\(typeName):\(p.name).get"
+                externalGenericSigs[getSym] = ExternalGenericSig(generics: gens, bounds: bounds, params: [selfType], ret: propType)
+                externalFuncNames.insert(getSym)
+                if p.setter != nil {
+                    let setSym = "m:\(typeName):\(p.name).set"
+                    externalGenericSigs[setSym] = ExternalGenericSig(generics: gens, bounds: bounds, params: [selfType, propType], ret: .void)
+                    externalFuncNames.insert(setSym)
+                }
+            }
+        }
+        for decl in externalDecls {
+            switch decl {
+            case .structDecl(let s): registerGenericMethods(s.name, s.generics, s.methods); registerGenericAccessors(s.name, s.generics, s.properties)
+            case .classDecl(let c):  registerGenericMethods(c.name, c.generics, c.methods); registerGenericAccessors(c.name, c.generics, c.properties)
+            case .enumDecl(let e):   registerGenericMethods(e.name, e.generics, e.methods); registerGenericAccessors(e.name, e.generics, e.properties)
+            default: break
+            }
+        }
+        // Imported **static methods** (task 100.4.3.5.4 non-generic / 100.4.3.8 generic): a `static fun` is
+        // free-function-shaped — the producer emits it as a free function `Type.method`. Register the
+        // consumer's view under the same `Type.method` key (the type name is already origin-encoded, so the
+        // key is `origin@Type.method`). A static method on a **non-generic** type links by symbol via the
+        // external-function path. A static method on a **generic** type is the producer's erased generic
+        // free function (parameterized by the owning type's params); register its erased sig in
+        // `externalGenericSigs` so a `Type<Args>.method(…)` call routes through `emitErasedExternalCall`
+        // with the instantiation's VWTs. (A static method with its *own* type params rides task 170.)
+        func registerStaticMethods(_ typeName: String, _ typeGenerics: [GenericParam], _ methods: [FuncDecl]) {
+            for m in methods where m.isStatic && m.generics.isEmpty {
+                let key = "\(typeName).\(m.name)"
+                let saved = genericScope
+                if !typeGenerics.isEmpty { genericScope = Set(typeGenerics.map(\.name)) }
+                let params = m.params.map { resolve($0.type) }
+                let ret = resolve(m.returnType)
+                genericScope = saved
+                funcs[key] = FnSig(params: params, ret: ret, generics: typeGenerics,
+                                   visibility: .public, declFile: m.span.file, isExternal: true)
+                externalFuncNames.insert(key)
+                if !typeGenerics.isEmpty {
+                    externalGenericSigs[key] = ExternalGenericSig(
+                        generics: typeGenerics.map(\.name), bounds: typeGenerics.map { $0.bounds.map(\.name) },
+                        params: params, ret: ret)
+                }
+            }
+        }
+        for decl in externalDecls {
+            switch decl {
+            case .structDecl(let s): registerStaticMethods(s.name, s.generics, s.methods)
+            case .classDecl(let c):  registerStaticMethods(c.name, c.generics, c.methods)
+            case .enumDecl(let e):   registerStaticMethods(e.name, e.generics, e.methods)
+            default: break
+            }
         }
         // Computed-property tables need the type dicts above populated first (a property
         // type may name any user type), so register them in a second pass.
@@ -347,7 +447,17 @@ public struct Sema {
             return TypeResolution.resolveOpaque(self, ifaces, owner: opaqueOwner, at: ref.span)
         }
         if let args = ref.genericArgs {       // `Box<Int>` — an applied generic type (M5 5.2.1)
-            return TypeResolution.resolveGeneric(self, ref.name, args: args, selfAs: selfAs, at: ref.span)
+            // An imported generic type is written by its bare name here (`Box<Int>`), but it is
+            // registered under its per-origin identity (`origin@Box`), as the non-generic bare-name
+            // path below resolves. Rewrite the base to that identity first so the instantiation keys
+            // the right decl (and later origin-decodes at the call site), matching how structs and
+            // enums both carry their origin through monomorphization.
+            var base = ref.name
+            if genericArity(base) == nil, base != "Array", base != "Ptr",
+               case .key(let k) = resolveExternal(base, qualifier: nil, kind: .type, at: ref.span) {
+                base = k
+            }
+            return TypeResolution.resolveGeneric(self, base, args: args, selfAs: selfAs, at: ref.span)
         }
         if genericScope.contains(ref.name) {  // a generic type parameter `T` in scope (M5 5.2.1)
             return .typeParam(ref.name)
@@ -730,6 +840,17 @@ public struct Sema {
     // A construction base that is a plain type name (`Type`) or a name carrying explicit type
     // arguments (`Type<Args>`, parsed as `.genericIdent`). The arguments are resolved in the
     // current generic scope so a `T` at the site binds to the enclosing function's parameter.
+    // The registered identity of a type written `bare` in this file: its per-origin key (`origin@bare`) if
+    // `bare` is an imported type, else `bare` unchanged (task 100.4.3.5.4 — static-method / member
+    // resolution on an imported type). Non-diagnostic: a same-module type, a module qualifier, or an
+    // ambiguous/unimported name all return `bare` so the caller's own resolution/diagnostics still apply.
+    func importedTypeIdentity(_ bare: String, at span: Span) -> String {
+        if kindOf(bare) != nil { return bare }
+        guard let inScope = fileVisibleModules[span.file] else { return bare }
+        let exporters = inScope.filter { moduleTypes[$0]?.contains(bare) == true }.sorted()
+        return exporters.count == 1 ? ExternalName.encode(origin: exporters[0], name: bare) : bare
+    }
+
     func typeNameAndArgs(_ e: Expr) -> (name: String, explicit: [Type]?)? {
         switch e {
         case .ident(let n, _):                   return (n, nil)

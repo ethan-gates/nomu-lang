@@ -4,3 +4,5 @@ bin/
 
 # Compiler outputs — everything lands under <project-root>/build/.
 build/
+
+practice/

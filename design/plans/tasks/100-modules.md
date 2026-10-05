@@ -59,7 +59,8 @@ ABI stability.
 ## Plan — implementation milestones (100.1–100.5)
 
 Sequencing principle: **land the whole language surface on the existing whole-program pipeline first
-(100.1–100.3), then swap the build model underneath without changing the surface (100.4–100.5).** That
+(100.1–100.2 + the packaging layer, now [173](173-package-model-driver-cli.md)/[174](174-prelude-as-packages.md)),
+then swap the build model underneath without changing the surface (100.4–100.5).** That
 isolates the one hard re-architecture (separate compilation) and keeps every phase shippable and
 green. Bazel is dropped from this plan (design stays RE-ready; see scope).
 
@@ -89,7 +90,8 @@ Smallest step from today's single-CU.
   fixtures** (a fixture directory = one module; the harness passes its `.nomu` files as the file list,
   with an explicit `-o` binary path). The existing flat `examples/` fixtures stay single-file for now.
   Migrating the whole suite so that every fixture is its own directory (**1 dir == 1 module**) is
-  deferred until directory-as-module exists (100.2.1+); tracked under 100.3.8.
+  deferred until directory-as-module exists (100.2.1+); tracked under [155](155-integration-suite-harness.md)
+  (the suite migration folded in from the old 100.3.8).
 - *Foundation exists:* the driver's `prependPrelude` already parses multiple sources (`core.nomu`,
   `runtime.nomu`) into separate `Program`s and merges their decls into the user program. 100.1
   generalizes that merge from "2 fixed preludes + 1 user file" to "N user files as one module," adding
@@ -137,7 +139,7 @@ The full import/visibility surface, still compiled whole-program (all modules, o
       (bare error), `module_leaf_collision` (leaf error), `module_collision_resolve` (funcs + types
       resolved distinctly), plus `module_reexport`/`module_perfile_import` unchanged.
     - Type-directed clash resolution (Swift-style) stays deferred (the "leaning" model; depends on cheap
-      inference). Sealed/cross-package rules are not live (100.3.3.1).
+      inference). Sealed/cross-package rules are not live ([173](173-package-model-driver-cli.md) §173.3.1).
 - 100.2.4 — `public import` re-export (resolution + republish into public API). **Done:** a module's
   `.nmi` records its `public import` edges (`reexports: [InterfaceRef]`, package + module path); a
   consumer follows them transitively (`visibleModules` in the driver), unioning each re-exported
@@ -154,7 +156,7 @@ The full import/visibility surface, still compiled whole-program (all modules, o
   its signature — the `.nmi` well-formedness guard. **Deferred to multi-package:** `package` reaching
   same-package siblings (excluded from the `.nmi` today, so it behaves like `internal` across a module),
   seal enforcement, and denying a foreign package a `package` symbol — none is exercisable until
-  cross-package linkage exists. That cross-boundary half is tracked as **100.3.3.1**.
+  cross-package linkage exists. That cross-boundary half is tracked as **[173](173-package-model-driver-cli.md) §173.3.1**.
 - 100.2.6 — Mangling: encode real package + relative module path, replacing the implied `main`
   (generic-arg encoding already present). Mangling is currently **spread** (9-encoding in
   `midend/sources/Monomorphize.swift`; `nomu_` construction across `llvmgen/*`); **consolidate it into
@@ -163,74 +165,45 @@ The full import/visibility surface, still compiled whole-program (all modules, o
 - 100.2.8 (tests) — Multi-module fixtures; visibility errors; re-export; collision diagnostics.
 - *Deliverable:* multi-module programs compile and run whole-program; full surface works.
 
-### 100.3 — Packages, manifest, driver, entry points (whole-program)
+### 100.3 — Packages, manifest, driver, entry points — **moved out of task 100**
 
-Package structure and the usable tool, build still whole-program internally.
+The package structure + usable build tool was pulled out of 100, since its prerequisites (100.1/100.2/100.4)
+are done, nothing remaining in 100 (the 100.5 dial) depends on it, and it is a layer *around* the compiler
+rather than compilation-pipeline work. It splits into:
 
-- 100.3.1 — Manifest in **JSON** (dependency-free in the Swift host; switch to YAML later,
-  [163](163-manifest-yaml.md)) + schema: name, version, `sealed`, `bin`, tests (deps later). Interim
-  file name `pkg.json`; root still marked by `nomu.yaml` (both subject to change). A minimal
-  name-only manifest already loads (separate-compilation-first reorder); absent → default package
-  `main`. **Open policy:** keep open requiring a manifest and erroring when absent (drop the default)
-  once the fixtures/tooling assume one — decide when the whole suite migrates to 1 dir == 1 module.
-- 100.3.2 — Package boundary (manifest presence); workspace (root + members); package identity.
-- 100.3.3 — Seal enforcement (sealed module not importable outside package; symbols capped at package).
-  - 100.3.3.1 — **`package`-tier visibility across the package boundary** (the multi-package half of
-    100.2.5, deferred there until cross-package linkage exists). Today only `public` reaches a `.nmi`,
-    so a `package` symbol behaves like `internal` across a module — wrong once siblings compile
-    separately. When multi-package lands: emit `package` symbols into the `.nmi` **tagged with their
-    visibility**, have a consumer admit a `package` (or sealed) symbol only when it shares the producer's
-    package (deny it to a foreign package with a clear diagnostic), and fold package identity into the
-    mangling qualifier (the pending item noted in §100.4). The single-package signature-consistency
-    guard (100.2.5) already stands; this closes the cross-boundary half.
-- 100.3.4 — Entry points: `main` detection, `bin` declarations, root-`main` shorthand;
-  declarations-only enforcement; ordered-eager global init in module-topological order.
-- 100.3.5 — Single-binary driver: `compile`/`build`/`run`/`test`/`query`; compile-logic-as-library;
-  in-process build orchestration over the module graph.
-- 100.3.6 — `query` metadata (package → modules + inter-module dep edges + external deps).
-- 100.3.7 — **Prelude becomes packages, not a decl-prepend.** Replace `prependPrelude` with a
-  first-party package layering, compiled once (cached per toolchain version, or prebuilt) and referenced
-  via cross-module linkage rather than merged into every module:
-  - **`core`** — the *only* package containing non-Nomu source: built-in types (`Int`/`Bool`/`String`/
-    `RawPtr`), built-in functions (intrinsics, C-leaf ops), and the libc/FFI boundary. Types are
-    ambient (always in scope); low-level functions are the native/unsafe surface. **Invariant
-    (target):** non-Nomu source ⊆ `core` — reached as the runtime finishes self-hosting; native GC
-    (mmtk) still sits under the runtime today, so it is not yet literally true.
-  - **`runtime`** — pure Nomu (target), privileged; runtime-subset-by-default moves from the interim
-    file-designation to **module membership** ([149](149-runtime-subset.md)). Uses `core` for native
-    primitives.
-  - **`std`** — pure Nomu, non-privileged; today's `core.nomu` contents (`Option`, `Result`, `abs`/
-    `max`/`min`, `Time`, `SimpleRNG`) move here, plus future `Array`/collections/IO. A **curated prelude
-    subset** (`Option`, `Result`, pervasive helpers) is auto-imported into every module (Rust `std::prelude`
-    shape); the rest is explicit `import std/...`.
-  - User packages — pure Nomu.
-
-  Bootstrapping: `std` does not auto-import its own prelude; `core` types stay ambient. Required by 100.4
-  (decl-prepend duplicates symbols under separate compilation). The *demand-driven* emission that links
-  only used prelude parts stays a [136](136-incremental-compilation.md) optimization. Enables the
-  extensible stdlib ([120](120-stdlib-core.md)/[121](121-string-utf8-model.md)).
-  - *Open sub-decision (build-time):* whether each `core` **function** is ambient or explicit-import/
-    `unsafe`-gated (types are ambient; low-level fns lean gated, cf. Rust `core::intrinsics`).
-- 100.3.8 (tests) — Package builds; multiple bins; `run`/`test`; seal enforcement; init order;
-  implicit-`core` visibility and single-definition of core symbols. **Migrate the integration suite to
-  1 dir == 1 module** — reorganize the flat `examples/` fixtures so each is its own module directory,
-  once directory-as-module (100.2.1) makes the rule real.
-- *Deliverable:* `nomuc build/run/test` on a manifest'd package with multiple bins.
+- **[173](173-package-model-driver-cli.md) — Package model, manifest + driver CLI** (the old 100.3.1–100.3.6):
+  JSON manifest + schema, package boundary / workspace / identity, seal enforcement (incl. the cross-package
+  `package`-tier + qualifier item carried from 100.4's interims), entry points / `bin` declarations / ordered
+  init, and the `compile`/`build`/`run`/`test`/`query` single-binary driver. Deliverable: `nomuc build/run/test`
+  on a manifest'd package with multiple bins.
+- **[174](174-prelude-as-packages.md) — Prelude as packages** (the old 100.3.7 + its Mini-horizon): `core` /
+  `runtime` / `std` become real packages compiled once and referenced, retiring `prependPrelude` + the
+  `WeakODR` per-object duplication (the 100.4.4 interim). Its three prerequisites — the full `.nmi` (100.4.1),
+  cross-module generics (100.4.3), cross-module GC type-ids (100.4.7) — are now all done. Couples with
+  [149](149-runtime-subset.md) (runtime-subset by module membership).
+- **Suite migration to 1 dir == 1 module** (the old 100.3.8) folds into
+  [155](155-integration-suite-harness.md).
 
 ### 100.4 — Separate compilation (witness baseline)
 
 The architectural shift: module = compilation unit, compiled against interfaces, incremental.
 
-**Status (separate-compilation-first reorder):** 100.4.1 (`.nmi`, textual/subset) and the core of 100.4.2
-are built — the driver compiles each module to its own object in topological order, a consumer resolves
-and links against a dependency's serialized interface (import-scoped, public-only; non-public symbols
-are invisible by construction), and objects link into the binary. Module-path mangling is in: a
-dependency's symbols carry its module-path qualifier (`nomu_fn_<path>_<name>`, etc.), a consumer derives
-the same qualifier from the interface's `modulePath`, and the entry module plus the C-ABI prelude/runtime
-symbols stay bare (nothing imports the entry; the C runtime pins the prelude names). Two carried-forward
-**interims**:
+**Status — 100.4 complete.** Every sub-phase is done (100.4.1 `.nmi` generation, 100.4.2 per-module compile
+against deps' `.nmi`, 100.4.3 cross-module generics via witness dispatch, 100.4.4 separate-object + runtime
+link, 100.4.7 cross-module GC type-id unification) or moved to a dedicated task (100.4.5/.6 → the build cache
+[172](172-incremental-build-cache.md)). The driver compiles each module to its own object in topological
+order, a consumer resolves and links against a dependency's serialized interface (import-scoped, public-only;
+non-public symbols are invisible by construction), and the objects + runtime link into the binary. Module-path
+mangling is in: a dependency's symbols carry its module-path qualifier (`nomu_fn_<path>_<name>`, etc.), a
+consumer derives the same qualifier from the interface's `modulePath`, and the entry module plus the C-ABI
+prelude/runtime symbols stay bare (nothing imports the entry; the C runtime pins the prelude names). The
+deferred edges of 100.4.3 live in [171](171-modules-cleanup.md); the packaging + build tool spun out to
+[173](173-package-model-driver-cli.md) (package model, manifest, driver CLI) and
+[174](174-prelude-as-packages.md) (prelude-as-packages); the remaining in-100 work is 100.5 (the
+specialization dial). Two carried-forward **interims**, both owned by other phases:
 - **Weak prelude linkage.** The prelude is still prepended to every module, so its functions get
-  `WeakODR` linkage to fold the per-object duplicates. Proper fix: prelude-as-packages (100.3.7).
+  `WeakODR` linkage to fold the per-object duplicates. Proper fix: [174](174-prelude-as-packages.md)
+  (prelude-as-packages).
 - **Package identity not yet in the qualifier.** The qualifier encodes the relative module path but not
   the package name, since cross-package linkage (external-package deps via manifest aliases) is not live
   yet. Package identity folds into `Mangle.qualifier` when that lands; today every module sits in one
@@ -315,7 +288,7 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
       object). **Deferred within .3.3.3:** actor conformers (same reference ABI, but synchronous erased
       dispatch on an actor is untested — rejected in `bridgeErasedThunkSelf`), covariant-`Self` requirements
       (rejected in `methodThunkErased`), and importing a conformer whose method impls live in the producer
-      (needs producer-exported witness tables).
+      (needs producer-exported witness tables). Owned by [171](171-modules-cleanup.md) §171.2.
     - 100.4.3.3.4 — `T`-field access / constructing `T`-containing values. **Done for struct-composed POD
       types, end-to-end** (field read, construction, composed return). Mono emits each generic type
       **template** (type parameters retained, methods stripped) so an erased body has a composed
@@ -359,14 +332,110 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
       but `interfaceToDecls` dropped them. Parameter types follow the values ssairgen produced (a class
       receiver is a reference, a non-mutating value receiver is by value). Fixture `module_method` (a struct
       `Pt.sum()` / `Pt.scaled(by:)` and a class `Counter.doubled()` called across the boundary).
-    - 100.4.3.5.2 — **a `mutating` value method across the boundary. Next.** Its self-by-pointer ABI needs
-      the method's inferred mutating-ness at the consumer, which 100.4.3.5.1 drops. The `.nmi` now carries
-      it (`InterfaceFunc.isMutating`, added by 164.4.1), so this phase threads it to the consumer so both
-      the mutable-receiver soundness check (`Sema` caller check) and the self-ABI selection
-      (`FunctionLowerer`/egress) see it. A class method is unaffected (self is always a reference).
+    - 100.4.3.5.2 — **a `mutating` value method across the boundary. Done + green (95/95).** Its
+      self-by-pointer ABI needs the method's inferred mutating-ness at the consumer, which 100.4.3.5.1
+      drops. The `.nmi` carries it (`InterfaceFunc.isMutating`, 164.4.1); this phase threads the set of
+      imported mutating methods (keyed `origin@Type.method`, built in the driver's `externalMutating(of:)`
+      from deps' `.nmi`) through `Sema` → `NOIRModule.externalMutatingMethods` → `ModuleContext`, where it
+      drives two consumers: the caller mutable-receiver check (`Sema`, unioned with the in-module
+      `mutating` set) and the receiver-ABI choice (`ModuleContext.methodIsMutating` → `FunctionLowerer`
+      passes `self` by pointer). The egress needs nothing new — it builds the external call's param types
+      from the arg values ssairgen produced, so a by-pointer `self` follows automatically. A class method
+      is unaffected (self is always a reference). Fixtures: `module_method` extended with a mutating
+      `Pt.shift(by:)` on a `var` receiver (the mutation sticks: sum → 23); `module_mut_method_bad` asserts
+      the compile error when the receiver is a `let`.
     - 100.4.3.5.3 — **generic methods / methods on generic types** (`Option.isSome()` across a boundary) —
-      the erased-method path atop 100.4.3.3; the blocker the 100.4.3.7 method-differential leg waits on.
-    - 100.4.3.5.4 — **static methods and computed-property requirements on imported types.** Deferred.
+      the erased-method path atop 100.4.3.3; the blocker the 100.4.3.7 method-differential leg waits on. The
+      erased-receiver ABI is already designed (`backend.md` §4: `self` is a normal value param, a
+      value-buffer pointer, after the hidden VWT/PWT/sret params), so this extends the erased-function path
+      to a `self`. **Convention (pinned here):** a method's hidden VWT/PWT params cover the **owning type's**
+      generics in declaration order, then the method's own generics; the owning-type VWTs are supplied from
+      the receiver's instantiation (`Box<Int>` → `Int`'s VWT). Steps (flat — no deeper nesting):
+      - 100.4.3.5.3.1 — **producer. Done + green (95/95).** `Monomorphize` keeps generic-type methods on
+        the emitted template; `FunctionLowerer.lowerMethod` lowers a generic-value-type method erased —
+        `self` typed `.generic(base, [typeParams])` (so self-field access GEPs by VWT offset via the
+        existing 100.4.3.3.4 `.generic` path), the SSAFunction carrying the owner's type params then the
+        method's own, so the egress declares it under the erased ABI with `self` in the §4 value slot.
+        Verified: a public `Box<T>.get() -> T` emits `@nomu_m_Box_get(ptr VWT, ptr sret, ptr self)` and
+        `Opt<T>.present() -> Bool` emits `@nomu_m_Opt_present(ptr VWT, ptr self)`; both lower, own-module
+        calls still use the monomorphized specialization (unchanged output), suite green. Refinement (erased
+        emission gated to all generic types rather than public-only — a code-size, not correctness, item) →
+        [171](171-modules-cleanup.md) §171.6. (Generic **class** receivers landed later in 100.4.3.9; the
+        generic-enum discriminant check landed in 100.4.3.5.3.4.)
+      - 100.4.3.5.3.2 — **interface + resolution. Done + green (95/95).** `interfaceToDecls` now
+        reconstructs **enum** methods too (struct/class already did); `Sema` registers each imported
+        generic-type method into `externalGenericSigs` keyed `m:origin@Type:method`, with hidden generics =
+        owning type's then the method's own, `self` the leading `.generic` value param, so the call-site
+        lowering (.3.3) can route to the erased symbol with the receiver's type-arg VWTs. Behavior-
+        preserving: the registered erased key does not match today's monomorphized call name, so nothing
+        changes until .3.3. Verified: an imported `Box<T>.get()` and `Opt<T>.present()` now type-check and
+        resolve (they reach lowering — `get` link-fails on the mono'd symbol, `present` hits `unknown call
+        target` — both .3.3's to fix), where the enum method previously failed to resolve at all.
+      - 100.4.3.5.3.3 — **consumer call lowering. Done + green (96/96) for struct generic methods.**
+        `Monomorphize` records each instantiation's type args (`NOIRModule.monoTypeArgs`, threaded to the
+        egress like `opaqueUnderlyings`). The egress `m:` branch detects a call whose receiver is a mono'd
+        instantiation of an imported generic type with a registered erased sig (.3.2) and routes it through
+        `emitErasedExternalCall` (gained a `symbolOverride` for `Mangle.method`): `self` is `sig.params[0]`
+        (`.generic`), spilled to a buffer by the existing arg path; the receiver's type args supply the
+        VWTs; the erased symbol drops the type-arg suffix (`nomu_m_util_Box_get`). A fix in `selfFieldRead`:
+        an erased `self` yields a field's **address** (its `T` representation), never a loaded value — the
+        `.generic` convention. Fixture `module_generic_method`: `Box<T>.get() -> T` (erased T return, sret)
+        and `Box<T>.tagged() -> Bool` (concrete return) called across the boundary → `7` / `1`.
+        **Carry-forward:** generic **enum** methods (`Opt<T>.present()`) are blocked by a pre-existing gap —
+        an imported generic **enum**'s receiver type resolves without its `origin@` prefix, so the call
+        symbol is `m:Opt<Int>:present` (no origin) and the erased routing can't key it. This is an
+        enum-type-resolution issue, independent of the erased-method ABI; it lands with .3.4.
+      - 100.4.3.5.3.4 — **generic-enum methods across the boundary. Done + green (97/97).** Closed the
+        enum-origin gap the .3.3 carry-forward flagged: an imported generic **enum** now carries its
+        `origin@` prefix like a struct, so the erased method call keys and routes. Fixes, symmetric with
+        the struct path: `encodeExternalDecl` gained an `.enumDecl` case (name + case-field types encoded);
+        `ownTypes` and `moduleTypes` include `iface.enums`; the bare generic-type-annotation path in
+        `Sema.resolve` origin-resolves the base name (`Opt<Int>` → `origin@Opt`, the same resolution the
+        non-generic bare-name path already did — this also fixed explicit `Box<Int>` annotations, which had
+        only worked via constructor inference). A fix in `FunctionLowerer.readVar`: an erased `.generic`
+        value slot (the method's `self`) reads as the buffer **pointer** directly, never a load — so
+        `switch self` reads the tag with a single load (the prior double-load dereferenced the tag value and
+        segfaulted on a `.some` tag of 0). Fixture `module_generic_enum_method`: `Opt<T>.present() -> Bool`
+        and `Opt<T>.orElse(d: T) -> T` (erased-`T` payload returned by sret) → `1`/`5`/`0`/`9`.
+        **Moved out:** **methods with their own type params** (`Box<T>.map<U>`) are not an edge of this
+        boundary work — method-level generics are unimplemented in-module too (even on a non-generic type,
+        a method's own `<U>` never enters scope). Owned end to end by [170](170-method-level-generics.md);
+        the 100.4.3.7 method-differential leg for generic **methods-with-own-params** rides 170.5.
+      - 100.4.3.7 (method leg, structs/enums over the type's params) — **done.** Whole-program twins
+        (`wp_generic_method` / `wp_generic_enum_method`) assert the erased split-module generic-**type**-method
+        output matches mono; the method-own-params leg waits on [170](170-method-level-generics.md).
+    - 100.4.3.5.4 — **static methods + computed properties on imported types. Non-generic types done + green
+      (98/98); generic types split out to 100.4.3.8.** (The original phrasing was unqualified — "on imported
+      types" — so this is a resized scope: the non-generic member case shipped, the generic-type case is its
+      own sibling phase. "Computed-property *requirements*" in the interface-conformance sense is not what was
+      built here — these are computed-property *members*; a conformance-requirement reading is unaddressed.)
+      Both members were carried in the `.nmi` already but dropped on reconstruction; now reconstructed and
+      linked.
+      - **Computed properties.** `interfaceToDecls` reconstructs each `InterfaceProperty` as a body-free
+        `ComputedProperty` (getter, plus a setter when settable); `registerProps` (already run over
+        `externalDecls`) records it, so `x.p` / `x.p = v` type-check and lower to accessor calls
+        (`p.get` / `p.set`) that link to the producer's accessor symbols — the imported-instance-method
+        model. `strippingMethodBodies` now also strips properties so the consumer emits no accessor
+        definition (registration uses the un-stripped original). A **mutating setter** needs the
+        self-by-pointer ABI the same way a mutating method does (100.4.3.5.2): the accessor's inferred
+        mutating-ness, already in the fact store (accessors lower to methods, so `collectFacts` keys
+        `Type.p.set`), is carried on the `.nmi` as `InterfaceProperty.getterMutating`/`setterMutating`, and
+        the driver's `externalMutating(of:)` adds the mutating accessor keys so the consumer's mutable-
+        receiver check + ABI match the producer. Verified: a `let`-receiver setter is rejected with the
+        mutating-receiver diagnostic across the boundary.
+      - **Static methods.** A `static fun` is free-function-shaped (the producer emits it as a free function
+        `Type.method`), so `interfaceToDecls` reconstructs it as a static `FuncDecl`, Sema registers it as an
+        external free function keyed `origin@Type.method` (`externalFuncNames`), and the call-site resolution
+        origin-resolves the bare type name (new `Sema.importedTypeIdentity`) so `Rect.square(…)` targets
+        `origin@Rect.square` — linked via the external-function path. `encodeExternalDecl` gained an `encM`
+        (encode method signature types) + `encP` (encode property type) so a `-> Rect` return / property type
+        resolves to its per-origin identity.
+        Fixture `module_static_computed`: `Rect.square(side:) -> Rect` (static), `Rect.area` (read),
+        `Rect.scale` (get + mutating set), `Shape.area` (enum computed property) → `25`/`2`/`45`/`16`.
+        **Deferred:** static methods / computed properties on imported **generic** types (ride the erased
+        paths — a generic-type computed property is an erased accessor method like 100.4.3.5.3; a generic-type
+        static method rides the erased generic-function path), and **generic** static methods (own type
+        params) which ride [170](170-method-level-generics.md).
   - 100.4.3.6 — GC-trace of an opaque `T`: the type metadata / VWT carries the per-type GC trace map so a
     tracing / moving collector scans an erased `T`'s stack buffer and heap copies. **Couples with
     100.4.7** (cross-module type-id / type-map unification) — the same GC work from two sides; built
@@ -409,23 +478,110 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
     registers its payload; (c) the **bounded** non-POD path is now open for value-type and class conformers
     (guardrail lifted, the non-POD arg buffer rides the same typed-root registration; task 100.4.3.3.3) —
     only actor conformers and covariant-`Self` remain; (d) a non-scheduler run config (no `NOMU_SCHED=nomu`)
-    has no shadow walk.
+    has no shadow walk. Deferred edges (a)/(b)/(d) are owned by [171](171-modules-cleanup.md) §171.3; (c)'s
+    actor/covariant-`Self` remainder by §171.2.
   - 100.4.3.7 (tests) — cross-module generic function, generic type, and generic method; erased output
     matches the whole-program mono golden (same observable result). **Partial.** The generic-function and
     generic-type/field legs are covered by whole-program twins asserting the same output as the erased
     split-module fixtures: `wp_generic_fn.nomu` ↔ `module_generic_fn` (`id<T>`), `wp_generic_field.nomu` ↔
     `module_generic_field` (`Box<T>` + `unwrap<T>`), each monomorphized in one module vs erased across the
-    boundary, both `42`. **Deferred:** the generic-method leg — methods are not yet serialized in the
-    interface, so a method on an imported type (generic or not) does not resolve across a boundary; this
-    blocks on **100.4.3.5.3** (the erased-method path for generic methods / methods on generic types).
+    boundary, both `42`. **Done:** the generic-method leg over the **type's** params — whole-program twins
+    `wp_generic_method.nomu` ↔ `module_generic_method` (`Box<T>.get`/`tagged`, `7`/`1`) and
+    `wp_generic_enum_method.nomu` ↔ `module_generic_enum_method` (`Opt<T>.present`/`orElse`, `1`/`5`/`0`/`9`),
+    each monomorphized in one module vs erased across the boundary, same output (suite 100/100). **Blocked on
+    [170](170-method-level-generics.md):** the method-own-type-params leg (`Box<T>.map<U>`), since
+    method-level generics are unimplemented in-module.
+
+  - 100.4.3.8 — **static methods + computed properties on imported *generic* types. Done + green (101/101).**
+    The deferred half of 100.4.3.5.4 (non-generic case), split out as a flat sibling. Both reuse machinery
+    already in place; the producer already emits the erased accessors, so the work was consumer routing + one
+    producer gate.
+    - **Computed properties.** An accessor on a generic type is an erased method, so `Sema.collectGlobals`
+      now registers each generic type's accessors (`m:origin@Type:p.get` / `.set`) in `externalGenericSigs`
+      (`registerGenericAccessors`, `self` the leading `.generic` value param) — the egress `m:` branch then
+      routes `x.p` / `x.p = v` on a mono'd instantiation through `emitErasedExternalCall` with the receiver's
+      type-arg VWTs, instead of a nonexistent monomorphized accessor symbol. Covers an erased-`T` getter
+      (sret), a concrete getter, a mutating setter, and a generic **enum**'s `switch self` accessor.
+    - **Static methods.** A `static fun` on a generic type is the producer's erased **generic free function**
+      (`Box.of`, parameterized by the owner's params). The producer gate: `lowerStaticMethods` now marks the
+      generic static method's free function `.public` so `Monomorphize`'s public-generic erased emission fires
+      (a non-generic static method stays `.internal` — a plain symbol, never erased). The consumer:
+      `registerStaticMethods` registers the generic case in `externalGenericSigs` keyed `origin@Type.method`,
+      and the existing generic-static call site (`Box<Int>.of(…)`, type args threaded) routes through the
+      erased free-function path.
+    Fixture `module_generic_static_computed`: `Box<Int>.of` + `Box.held`/`flag`, `Opt<Int>.wrap` +
+    `Opt.isSome` → `7`/`10`/`1`/`0`. (Still distinct from a method with its *own* type params — task
+    [170](170-method-level-generics.md) — and the erased-`T` field *write* gap, 100.4.3.10.)
+  - 100.4.3.9 — **methods on an imported generic *class* (reference `self`). Read path done + green.** The
+    erased-method path extended from value receivers to a reference receiver (closing the stale
+    "not yet handled" note under 100.4.3.5.3.1). Changes: `Monomorphize` emits the generic **class**
+    template (like struct/enum) so codegen has its layout; `FunctionLowerer.lowerMethod`'s erased branch
+    accepts `.class_`, binding `self` as the managed object pointer (via `write("self", …)`, not a value
+    buffer); `llvmType(.generic)` lowers a class base to **`p1`** so the statepoint GC tracks the erased
+    `self` as a root; `erasedFieldOffset` adds the 8-byte object header before the VWT-derived field sum;
+    the consumer (`emitErasedExternalCall`) passes a class `self` directly (no buffer spill) as `p1`; and
+    the erased-return `memcpy` addrspace-casts a `p1` field source to addr0 (sound — a synchronous copy has
+    no safepoint). Fixtures `module_generic_class_method` + `wp_generic_class_method` (`Ref<T>.get`/`tagged`
+    → `7`/`1`). The **write** path (a mutating class method) is now closed by 100.4.3.10 below. **Open:** the
+    §4 ·62 thunk reconciliation for a class receiver — a requirement dispatch on a bounded field of a generic
+    class — is deferred to [171](171-modules-cleanup.md) §171.1.
+  - 100.4.3.10 — **erased-`T` field *write* in a mutating method. Done + green (105/105).** The write dual of
+    the erased field read/return path, for a generic **struct** and **class** alike. Three changes:
+    - **Producer (the core).** The backend `.store` of an erased value (`value.type` mentions a type
+      parameter) is a VWT-sized memcpy from the source buffer into the destination field, not a first-class
+      pointer store — the `curVWTParams`-sized copy (`SSAIRToLLVM` `.store` case), the write dual of the
+      construct/return memcpys. Both operands addrspace-cast to addr0 so a `p1` class-field destination is
+      sound (a synchronous copy has no safepoint). The write-barrier/store **fuse** in `lowerBlock` is
+      suppressed for an erased store (`!mentionsTypeParam`) so it does not fold into `storeField`.
+    - **Consumer — mutating recognition.** A generic instantiation (`origin@Box<Int>`) keys the carried
+      mutating set under its bare type name (`origin@Box`), since mutating-ness is a property of the generic
+      method, not the instantiation (`ModuleContext.methodIsMutating` strips the type-arg suffix). This drives
+      ssairgen to pass `self` by its real storage (`structAddr`) for a mutating value method.
+    - **Consumer — self by address.** `emitErasedExternalCall` threads a composed value receiver already
+      materialized as a pointer (`sig.params[0]` is `.generic` and the arg is an address) straight through as
+      the self buffer rather than copying it into a fresh buffer — so the producer's write lands in the
+      caller's storage and sticks past the call. A read-only value self (first-class aggregate) and a bare
+      `.typeParam` value (incl. a managed class type argument, itself a pointer) are still spilled into a
+      buffer. A generic **class** receiver already passes directly as `p1` (100.4.3.9), so the write lands in
+      the shared object with only the producer change.
+    Fixtures `module_generic_mut_method` (struct `Box<T>.replace` by real storage + class `Ref<T>.replace`
+    through the shared object → `7`/`42`/`3`/`99`) and the whole-program twin `wp_generic_mut_method` (same
+    output from monomorphized stores). **Deferred (→ [171](171-modules-cleanup.md)):** the generational
+    logging barrier for a **non-POD** `T` written into a heap (class) object — the memcpy writes the interior
+    managed pointers but logs no remembered-set entry; the current test GC configs full-heap-scan, so none is
+    lost under them (§171.4). Also a `let`-receiver mutating-call diagnostic for a generic instantiation (the
+    Sema mutation pass keys the un-stripped instantiation name) — a missing error, not a miscompile (§171.5.1).
+
+  *Deferred edges of 100.4.3 — moved to [171](171-modules-cleanup.md).* The uncovered corners noted at each
+  sub-phase (requirement dispatch on a bounded field of a generic class [the §4 class-receiver thunk]; the
+  bounded-dispatch conformer gaps under 100.4.3.3.3; the erased-`T` GC typed-root corners under 100.4.3.6;
+  the non-POD erased-field-write barrier under 100.4.3.10; the diagnostic clarifications) are owned by task
+  171 so the remaining module-generics scope has one home. Method-own type params stay in
+  [170](170-method-level-generics.md).
 
   *Residual-`.typeParam` blast radius* (the sites erased lowering must handle) is extracted to the
   working doc **`100.4.3.3.md`** at the project root, alongside the 100.4.3.3 decomposition.
-- 100.4.4 — Link separate per-module objects + runtime.
-- 100.4.5 — Driver incremental cache: content-addressed per-module keying; interface byte-stability;
-  skip unchanged modules; rebuild on interface change.
-- 100.4.6 (tests) — Incremental (body edit doesn't rebuild dependents); interface stability;
-  separate-compile output matches the whole-program golden.
+- 100.4.4 — **Link separate per-module objects + runtime. Done + green (106/106).** The mechanism stood
+  from 100.4.2/100.4.3 — the driver emits each module to its own object (`__mod_<path>.o`) in topological
+  order and links the entry object + every per-module dependency object + the runtime static archive + the GC
+  archive into one native binary via `cc` (`emitLLVMBinary`, `extraObjects` = the dep objects). This phase
+  closes it with an explicit teeth test: fixture `module_link_diamond` — a diamond (`main` → `left`, `right`;
+  `left`, `right` → `data`) where the shared leaf `data` compiles to one object (`__mod_data.o`) that
+  satisfies external references from **both** `left.o` and `right.o` at link, so four separately-compiled
+  objects (plus the runtime/GC archives) must combine correctly → `23`. **Carried-forward interim (not a
+  100.4.4 gap):** the prelude + Nomu runtime tier is still prepended into every module object as
+  `weak_odr`/`weak external` symbols, folded to one copy at link (an N-module program compiles the runtime N
+  times and discards N−1). The proper fix — the prelude/runtime compiled once and referenced, not duplicated
+  — is owned by **[174](174-prelude-as-packages.md)** (prelude-as-packages) and **149** (runtime-subset by
+  module membership). Package identity in the mangling qualifier likewise waits on multi-package linkage
+  ([173](173-package-model-driver-cli.md) §173.3.1).
+- 100.4.5 / 100.4.6 — **Moved out to [172](172-incremental-build-cache.md).** The driver incremental cache
+  (content-addressed per-module keying, interface byte-stability, skip-unchanged, rebuild-on-interface-change)
+  and its stability / correctness harness (body edit doesn't rebuild dependents; interface stability;
+  separate-compile output matches the whole-program golden) are pulled into a dedicated, design-first caching
+  task. The separate-compilation artifacts this builds on — sectioned `.nmi` with independent ABI/perf hashes
+  (164.4.2), per-module objects (100.4.2) — are in place. The finer-grained query-based successor stays at
+  [136](136-incremental-compilation.md).
 - 100.4.7 — Cross-module GC type-id / type-map unification: a dependency module's heap types get stable
   cross-module type-ids and contribute to the `nomu_gc_typemap_*` tables, so a GC-traced type crossing a
   module boundary is scanned (closes the entry-only GC-type-map interim). Prerequisite for the full
@@ -485,8 +641,10 @@ symbols stay bare (nothing imports the entry; the C runtime pins the prelude nam
     evacuation (the scheduler STW path); `module_gc_deptype` covers a dependency-defined non-generic managed
     graph relocated across the boundary under immix GC-stress (the single-threaded evac path), its output
     matching the nogc baseline.
-- *Deliverable:* editing a module body doesn't rebuild its dependents. (Cross-module generics are
-  witness-dispatched here; perf restored in 100.5.)
+- *Deliverable:* each module compiles against its deps' interfaces to its own object, and the objects +
+  runtime link into a binary (100.4.1–100.4.4 + 100.4.7, done). Cross-module generics are witness-dispatched
+  here; perf restored in 100.5. The "editing a module body doesn't rebuild its dependents" payoff is the
+  caching task [172](172-incremental-build-cache.md) (pulled out of the old 100.4.5/.6).
 
 ### 100.5 — Specialization dial + release mode
 
@@ -503,62 +661,13 @@ Restore monomorphized performance under separate compilation via the flag-driven
   release-specialized both correct.
 - *Deliverable:* release recovers monomorphized performance; debug stays fast and incremental.
 
-### Mini-horizon — the full prelude module (100.3.7 dependency chain)
+### Mini-horizon — the full prelude module → [174](174-prelude-as-packages.md)
 
-**Goal:** `core`/`runtime`/`std` become real packages compiled once and referenced via the
-external-symbol path; `prependPrelude` + WeakODR retire; runtime-subset moves onto module membership
-(task 149). Reaching it needs the deferred half of the interface, the erased generic path, and the
-GC-map interim closed. This overlay sequences existing phases toward that one goal; it does not add
-work outside task 100.
-
-Where the prerequisites stand today: the witness *execution* path exists only for existentials (`any I`
-is a heap-boxed `{witness, payload}`, dispatched via `call .witness` in `FunctionLowerer`); generic
-**functions** are always monomorphized (`Monomorphize` specializes every instantiation, and
-`FunctionLowerer` errors if a static requirement survives to codegen). The `.nmi` is the non-generic
-subset (`interfaceToDecls` reconstructs everything as `generics: []`, no enums/methods/conformances).
-GC type maps are entry-only. So the goal is gated, in this order:
-
-1. **Complete 100.4.1 — the full `.nmi`.** Extend interface emit + the (de)serializer to carry enums,
-   methods (including on generic types), generic signatures + bounds, conformances, witness /
-   value-witness layouts, per-type GC trace metadata, and the mutating-ness / shareability facts. The
-   contract a consumer must see to use prelude generics. Prerequisite for both items below.
-
-   *Pinned conventions (internal ABI, no language surface):*
-   - **Witness-slot order.** An interface's requirement slots are keyed `name` (method), `name.get` /
-     `name.set` (property accessor) — the same keys `ModuleContext.interfaceSlots` already uses — and
-     the witness-table index is those keys in lexicographic order. The `.nmi` records the requirements
-     name-sorted; both producer and consumer derive the identical order from that one rule.
-   - **Member export.** A public type exports all of its members (methods, computed properties, enum
-     cases). A private helper method on a public type is the refinement case, left for later.
-   - **Determinism.** Enums, interfaces, methods, properties, conformances are name-sorted; generic
-     parameters, enum cases, and fields keep declared order (position / discriminant / layout are
-     significant).
-   *Deferred out of this step:* per-type layout + GC pointer-map (semantic layout info; couples with
-   100.4.7) and the mutating-ness / shareability contract facts (gate 100.4.5, not the prelude). This
-   step carries the declaration/signature surface; consuming generics across a boundary is 100.4.3.
-2. **100.4.3 — cross-module generics via witness dispatch.** Build the erased generic-function path: a
-   `fun f<T: I>` lowered once to take a witness dictionary + a value-witness table for `T` (size /
-   align / copy / move / destroy) and dispatch `T`'s requirements through it, instead of being
-   monomorphized away. Reuse the existential `.witness` execution machinery; the new ABI piece is
-   value-witnesses for stack `T`. Debug default = witnesses at module edges; specialization stays the
-   100.5 dial. This is what lets `Option`/`Result` live in a compiled-once `std`.
-3. **100.4.7 (new) — cross-module GC type-id / type-map unification.** Close the entry-only GC-type-map
-   interim: a dependency (and prelude) module's heap types get stable cross-module type-ids and
-   contribute to the `nomu_gc_typemap_*` tables, so a GC-traced type crossing a module boundary is
-   scanned. Couples with the value-witness GC-trace metadata from step 1/2, and also fixes plain
-   non-generic dependency heap types (independent of 100.4.3).
-4. **100.3.7 — prelude as packages (full), the goal.** With 1–3 in place: `core` (ambient built-in
-   types + intrinsics / FFI leaves), `runtime` (privileged, subset-by-module-membership — the task 149
-   designation swap), and `std` (`Option`/`Result`/helpers + the curated auto-imported prelude subset)
-   become real packages compiled once, referenced via the external path. Retire `prependPrelude` +
-   WeakODR. `core`-function gating (ambient vs `unsafe`) stays deferred — no new keyword surface without
-   agreement.
-
-**Dependency graph:** 100.4.1 → {100.4.3, 100.4.7} → 100.3.7. Steps 2 and 3 are coupled through
-GC-trace metadata and can be built together. Partial fallback (if the goal is deferred): the
-non-generic prelude surface — the `rt*` runtime functions plus `abs`/`max`/`min`, `Time`/`SimpleRNG`
-methods — can move to compiled-once packages on the existing external path now, keeping `Option`/`Result`
-ambient, which retires WeakODR for everything except generic instantiations.
+The overlay that sequenced the prelude-as-packages goal moved to task [174](174-prelude-as-packages.md)
+along with the goal itself. Its three gating prerequisites — the full `.nmi` (100.4.1), cross-module generics
+via witness dispatch (100.4.3), and cross-module GC type-id / type-map unification (100.4.7) — are all now
+done, so the gate is open; 174 carries the remaining construction (`core` / `runtime` / `std` as real
+packages, retiring `prependPrelude` + `WeakODR`), coupled with [149](149-runtime-subset.md).
 
 ### Source organization
 
@@ -600,7 +709,7 @@ appends or `extension` blocks on the monoliths):
 - **`src/nomu-cli/sources/`** — thin subcommand wiring over the driver library.
 
 Per-milestone touch map: 100.1 → parse + sema/passes. 100.2 → parse, sema/passes, `src/modules/`
-(graph), llvmgen (mangling). 100.3 → `src/modules/` (package + manifest), driver, nomu-cli. 100.4 →
+(graph), llvmgen (mangling). 173/174 → `src/modules/` (package + manifest), driver, nomu-cli. 100.4 →
 `src/interface/`, sema (`InterfaceLoad`), llvmgen (per-module object + link), driver (incremental
 cache). 100.5 → `src/interface/` (`.bir`), midend (`CrossModuleSpecialize`), llvmgen (link-fold).
 
@@ -643,12 +752,14 @@ mutating-ness, `../../internals/concurrency.md` §5 shareability inference.)
 
 ### Attached / dependent tasks
 
-- [161](161-test-framework.md) test framework — after 100.3 (test-module identity + `test import`).
+- [161](161-test-framework.md) test framework — after [173](173-package-model-driver-cli.md) (test-module
+  identity + `test import`).
 - [162](162-interface-serialization-opt.md) serialization optimization — after 100.4 (v1 exists).
 - [145](145-monomorphization-cost.md) monomorphization cost model — after 100.5.
 - [160](160-resource-embedding.md) resource embedding, [141](141-comptime.md) conditional compilation
   — independent / later.
-- [136](136-incremental-compilation.md) incremental compilation overlaps 100.4.5; coordinate.
+- [172](172-incremental-build-cache.md) module-granular build cache (the pulled-out 100.4.5/.6);
+  [136](136-incremental-compilation.md) fine-grained incremental builds on it.
 - [149](149-runtime-subset.md) runtime-subset designation moves onto module membership once 100.2 lands
   (see below).
 

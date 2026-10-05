@@ -197,6 +197,7 @@ private final class MutationAnalyzer {
         }
         return NOIRModule(decls: decls, interfaces: module.interfaces,
                         conformances: module.conformances, composites: module.composites,
-                        opaqueUnderlyings: module.opaqueUnderlyings)
+                        opaqueUnderlyings: module.opaqueUnderlyings,
+                        externalMutatingMethods: module.externalMutatingMethods)
     }
 }

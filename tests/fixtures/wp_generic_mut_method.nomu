@@ -1,0 +1,33 @@
+// Whole-program (single-module) twin of `module_generic_mut_method`: the generic types `Box<T>` /
+// `Ref<T>` and their mutating `replace` methods are monomorphized in this one module rather than
+// compiled erased and called across a boundary. Asserting the same output as `module-generic-mut-method`
+// is the 100.4.3.7 differential for the erased `T`-field *write* (task 100.4.3.10) — the VWT-sized copy
+// into a `self` field, and the mutating self-by-pointer ABI, must produce the same observable result as
+// whole-program monomorphization (a plain field store).
+struct Box<T> {
+    var value: T
+    fun get() -> T { return value }
+    fun replace(x: T) { value = x }
+}
+
+class Ref<T> {
+    var value: T
+    fun get() -> T { return value }
+    fun replace(x: T) { value = x }
+}
+
+fun main() {
+    var b = Box(value: 7)
+    print(b.get())        // 7
+    print("\n")
+    b.replace(x: 42)
+    print(b.get())        // 42
+    print("\n")
+
+    let r = Ref(value: 3)
+    print(r.get())        // 3
+    print("\n")
+    r.replace(x: 99)
+    print(r.get())        // 99
+    print("\n")
+}

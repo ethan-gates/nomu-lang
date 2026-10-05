@@ -1,0 +1,15 @@
+import pkg/util
+
+fun main() {
+    let b = Box<Int>.of(x: 7)   // static method on a generic imported type
+    print(b.held)               // erased-T computed property -> 7
+    print("\n")
+    print(b.flag)               // concrete computed property -> 10
+    print("\n")
+    let o = Opt<Int>.wrap(x: 5) // static method on a generic imported enum
+    print(o.isSome)             // enum computed property -> 1
+    print("\n")
+    let n: Opt<Int> = .none
+    print(n.isSome)             // -> 0
+    print("\n")
+}

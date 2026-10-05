@@ -1,0 +1,30 @@
+// Static methods and computed properties on imported types, across a module boundary (task 100.4.3.5.4).
+// A `static fun` is free-function-shaped — the producer emits `Rect.square` as a free function the
+// consumer links to. A computed property lowers to accessor methods (`area.get`, `scale.get`/`.set`); a
+// mutating setter carries its self-by-pointer ABI in the `.nmi` (InterfaceProperty.setterMutating), the
+// same model as an imported mutating method.
+public struct Rect {
+    var w: Int
+    var h: Int
+    var area: Int { w * h }              // read-only computed property
+    var scale: Int {
+        get { w / h }
+        set(s) { w = h * s }             // mutating setter — writes a stored field
+    }
+    static fun square(side: Int) -> Rect {
+        return Rect(w: side, h: side)
+    }
+}
+
+public enum Shape {
+    case dot
+    case square(side: Int)
+    var area: Int {                      // computed property on a generic-free enum
+        get {
+            switch self {
+            case .dot: return 0
+            case .square(let s): return s * s
+            }
+        }
+    }
+}

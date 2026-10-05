@@ -63,8 +63,12 @@ extension LLVMGen {
             return llvmType(u, span)                 // `some I` is unboxed — the concrete underlying's type
         case .typeParam:
             return i8ptr   // an erased generic body holds a `T` value indirectly — a ptr to a caller-allocated VWT-sized buffer (backend.md §4)
-        case .generic:
-            return i8ptr   // a residual composed generic (`Box<T>`) in an erased body is likewise held by buffer; mono names concrete instantiations, so only residual ones reach here (task 100.4.3.3.4)
+        case .generic(let base, _):
+            // A residual composed generic (`Box<T>`) in an erased body is held by buffer (i8ptr); but a
+            // generic **class** is a reference, a managed `p1` object pointer (task 100.4.3.9) — so the
+            // statepoint GC tracks an erased class `self` as a root and its fields are byte-GEP'd in
+            // addrspace 1. mono names concrete instantiations, so only residual ones reach here (100.4.3.3.4).
+            return classMap[base] != nil ? p1 : i8ptr
         default:
             fail("8.2.4: unsupported type '\(t)'", span)
             return nil

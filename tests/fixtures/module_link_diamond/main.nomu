@@ -1,0 +1,11 @@
+// Separate-compilation link test (task 100.4.4): the entry links against four separately-compiled
+// module objects — `__mod_data.o`, `__mod_left.o`, `__mod_right.o`, and its own — plus the runtime and
+// GC archives. `data` is a shared dependency of both `left` and `right` (a diamond), so its one object
+// satisfies external references from two modules at once. (10+1) + (10+2) = 23.
+import pkg/left
+import pkg/right
+
+fun main() {
+    print(leftVal() + rightVal())
+    print("\n")
+}

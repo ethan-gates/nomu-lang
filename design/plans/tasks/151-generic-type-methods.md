@@ -33,7 +33,9 @@ Instance methods, computed properties, and `static fun` now work on generic **st
 - **Whole-aggregate value read (D6).** A method returning a whole value+reference-mixing aggregate by value
   (`get() -> T` where the concrete `T` mixes value and reference fields) inherits the pre-existing D6 spill
   limitation (`c-types.md` §3.4) — scalar / reference / pure-value `T` and field-wise access are fine.
-- **Own generics on a member** (`static fun map<U>(…)`) — members currently use only the type's params.
+- **Own generics on a member** (`fun map<U>(…)`) — members currently use only the type's params. This is a
+  distinct feature (method-own type parameters, bound per call, and applicable to non-generic types too);
+  it is owned end to end by [170](170-method-level-generics.md).
 
 ## Why it matters (high priority, usability)
 

@@ -6,7 +6,8 @@ closure check + safepoint-poll suppression · **Source:** distilled from
 [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
 
 **► Built (slice 1).** Two designation sources — the **runtime prelude** (`src/stdlib/runtime.nomu`,
-subset-by-default; the proper "designated file" until [100](100-modules.md)) and an ad-hoc
+subset-by-default; the proper "designated file" until the module-membership swap in
+[174](174-prelude-as-packages.md)) and an ad-hoc
 `--runtime-subset=<names>` flag — feeding the NOIR call-graph closure check in `Sema.swift`
 (`checkRuntimeSubset`): a subset function may not allocate on the heap (class/actor construct, closure,
 `any`-box, array, `spawn`) or call outside the allowlist (subset functions + the 125 `__raw*`/`__ptr*`

@@ -9,4 +9,10 @@ fun main() {
     let c = Counter(n: 21)
     print(c.doubled())    // 42
     print("\n")
+    // A mutating value method across the boundary (100.4.3.5.2): `self` passes by pointer, so the
+    // mutation sticks. `q` must be a `var`; shift(by: 10) makes (11, 12), sum = 23.
+    var q = Pt(x: 1, y: 2)
+    q.shift(by: 10)
+    print(q.sum())        // 23
+    print("\n")
 }

@@ -1,0 +1,9 @@
+// A method on an imported generic type, called across a module boundary (task 100.4.3.5.3). The
+// producer compiles `get`/`tagged` once **erased** over `T`; the consumer dispatches through the
+// witness ABI, threading the receiver instantiation's type-argument VWT — no monomorphized method
+// body crosses. `get` returns the erased `T` (sret buffer); `tagged` returns a concrete `Bool`.
+public struct Box<T> {
+    var value: T
+    fun get() -> T { return value }
+    fun tagged() -> Bool { return true }
+}

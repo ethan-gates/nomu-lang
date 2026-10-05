@@ -12,15 +12,19 @@ let USAGE = """
     --enable LIST    run only these cases (base becomes empty, then these are added)
     --disable LIST   run everything except these
     --deadline SEC   overall wall-clock backstop (default 300)
+    --jobs N         pool capacity in cores (default: host cores − 2)
 
     LIST entries match a case name; `all` is the wildcard; a trailing `*` matches by prefix.
-    Concurrency is fixed at 8 lanes; a case's `weight` sets how many it occupies. Every run is bounded.
+    The pool holds `--jobs` cores; a case occupies `weight` of them (its advertised core saturation —
+    a carrier matrix peaks at its largest carrier count, a self-threading fixture at the runtime's 4),
+    so concurrent work never oversubscribes the host. Every run is bounded.
     """
 
 struct Ctx {
     let enableList: [String]
     let disableList: [String]
     let deadline: Double
+    let poolCapacity: Int   // concurrent cores the run pool admits (host cores − buffer, or --jobs)
     let configPath: String
     let manifest: Manifest
     let projectRoot: String
@@ -74,6 +78,7 @@ struct Ctx {
         var enableList: [String] = []
         var disableList: [String] = []
         var deadline = 300.0   // suite-level wall-clock backstop (seconds)
+        var jobs: Int? = nil   // pool capacity override; default derives from host cores below
 
         var i = 0
         while i < argv.count {
@@ -90,6 +95,12 @@ struct Ctx {
             case "--deadline":
                 i += 1; guard i < argv.count, let v = Double(argv[i]) else { die("--deadline needs a number") }
                 deadline = v
+            case "--jobs":
+                i += 1; guard i < argv.count, let v = Int(argv[i]), v >= 1 else { die("--jobs needs a positive integer") }
+                jobs = v
+            case let f where f.hasPrefix("--jobs="):
+                guard let v = Int(f.dropFirst("--jobs=".count)), v >= 1 else { die("--jobs needs a positive integer") }
+                jobs = v
             case let f where f.hasPrefix("--enable="):
                 enableList += splitList(String(f.dropFirst("--enable=".count)))
             case let f where f.hasPrefix("--disable="):
@@ -112,9 +123,14 @@ struct Ctx {
         catch { die("failed to read manifest \(configPath): \(error)") }
 
         let root = findProjectRoot()
+        // Default the pool to the host's cores minus a small buffer (the harness's own I/O / timer threads
+        // and each running test's idle main/GC threads), so the sum of concurrently-running cases' advertised
+        // weights never oversubscribes the CPU — oversubscription starves the cooperative scheduler/STW and
+        // wedges a run. `--jobs` overrides.
+        let capacity = jobs ?? max(1, ProcessInfo.processInfo.activeProcessorCount - 2)
         return Ctx(enableList: enableList, disableList: disableList, deadline: deadline,
-                   configPath: configPath, manifest: manifest, projectRoot: root,
-                   nomuc: resolveNomuc(projectRoot: root), cases: manifest.resolvedCases())
+                   poolCapacity: capacity, configPath: configPath, manifest: manifest, projectRoot: root,
+                   nomuc: resolveNomuc(projectRoot: root), cases: manifest.resolvedCases(capacity: capacity))
     }
 }
 
