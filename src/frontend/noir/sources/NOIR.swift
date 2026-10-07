@@ -332,3 +332,38 @@ public struct NOIRArg {
         self.label = label; self.value = value
     }
 }
+
+// MARK: - Serialization (`.bir` body IR, task 100.5.1)
+//
+// Synthesized `Codable` over the NOIR tree, so a generic template's body can be serialized by a producer
+// and re-decoded by a consumer for cross-module specialization. Declared in this file so the synthesis
+// applies; `Span` carries only its offsets across the boundary (Span.swift), and `Type` rides its own
+// synthesized conformance. JSON is the interim wire form (as with the `.nmi`); a bespoke binary is task
+// 162. The whole module is Codable, but only the generic decls a `.bir` ships are actually serialized.
+
+extension NOIRModule: Codable {}
+extension NOIRComposite: Codable {}
+extension NOIRInterface: Codable {}
+extension NOIRMethodReq: Codable {}
+extension NOIRPropReq: Codable {}
+extension NOIRConformance: Codable {}
+extension NOIRDecl: Codable {}
+extension NOIRField: Codable {}
+extension NOIRStruct: Codable {}
+extension NOIREnumCase: Codable {}
+extension NOIREnum: Codable {}
+extension NOIRClass: Codable {}
+extension NOIRActorField: Codable {}
+extension NOIRHandler: Codable {}
+extension NOIRActor: Codable {}
+extension NOIRParam: Codable {}
+extension NOIRGenericParam: Codable {}
+extension NOIRFunc: Codable {}
+extension NOIRStmt: Codable {}
+extension StmtKind: Codable {}
+extension NOIRSwitch: Codable {}
+extension NOIRCaseArm: Codable {}
+extension NOIRBinding: Codable {}
+extension NOIRExpr: Codable {}
+extension ExprKind: Codable {}
+extension NOIRArg: Codable {}

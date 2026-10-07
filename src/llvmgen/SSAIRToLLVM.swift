@@ -268,15 +268,18 @@ final class SSAIRToLLVM {
     // `m:<type>:<method>` — matching the `.direct`/`.witness` call names ssairgen emits.
     private func keyAndSelf(_ f: SSAFunction) -> (key: String, selfType: String?, byPointer: Bool, symbol: String) {
         // The origin qualifier is the module this function is *defined* in (task 100.4); it must match
-        // the on-demand declaration in `LLVMGenCallables`, which derives it the same way from the file.
-        let qualifier = e.definitionQualifier(forFile: f.span.file)
+        // the on-demand declaration in `LLVMGenCallables`, which derives it the same way (name + file).
+        // A cross-module specialization carries an origin-keyed name, so it is producer-qualified, not
+        // home-qualified — the weak-ODR fold then collapses identical copies across objects (100.5.5).
         guard f.name.hasPrefix("m:") else {
+            let qualifier = e.definitionQualifier(for: f.name, file: f.span.file)
             return ("f:\(f.name)", nil, false, Mangle.free(f.name, qualifier: qualifier))
         }
         let rest = f.name.dropFirst(2)
         let colon = rest.firstIndex(of: ":")!
         let type = String(rest[rest.startIndex..<colon])
         let method = String(rest[rest.index(after: colon)...])
+        let qualifier = e.definitionQualifier(for: type, file: f.span.file)
         let isActor = e.actorMap[type] != nil
         let isReference = e.classMap[type] != nil || isActor
         let byPointer = isReference || f.isMutating
@@ -345,7 +348,12 @@ final class SSAIRToLLVM {
                                         debug: (f.name, f.span.begin.line))
         // Prelude functions are compiled into every module's object (interim, task 100.3.7); weak
         // linkage lets the linker fold the duplicate definitions to one.
-        if e.weakOriginFiles.contains(f.span.file) { LLVMSetLinkage(fn, LLVMWeakODRLinkage) }
+        // Weak-ODR so duplicate definitions fold at link: a prelude function (compiled into every object,
+        // task 100.3.7) or a cross-module generic specialized under its producer-keyed name in more than
+        // one consumer (task 100.5.5 — the name is identical across consumers, so the copies coalesce).
+        if e.weakOriginFiles.contains(f.span.file) || ExternalName.isEncoded(f.name) {
+            LLVMSetLinkage(fn, LLVMWeakODRLinkage)
+        }
         let dummy = NOIRFunc(name: f.name, params: [], returnType: f.returnType,
                              body: [], isMutating: f.isMutating, span: f.span)
         e.callables[key] = Callable(fn: fn, ty: fnTy, ir: dummy,
@@ -378,7 +386,12 @@ final class SSAIRToLLVM {
         }
         let (fn, fnTy) = e.emitFunction(symbol, ret: retTy, params: paramTys,
                                         debug: (f.name, f.span.begin.line))
-        if e.weakOriginFiles.contains(f.span.file) { LLVMSetLinkage(fn, LLVMWeakODRLinkage) }
+        // Weak-ODR so duplicate definitions fold at link: a prelude function (compiled into every object,
+        // task 100.3.7) or a cross-module generic specialized under its producer-keyed name in more than
+        // one consumer (task 100.5.5 — the name is identical across consumers, so the copies coalesce).
+        if e.weakOriginFiles.contains(f.span.file) || ExternalName.isEncoded(f.name) {
+            LLVMSetLinkage(fn, LLVMWeakODRLinkage)
+        }
         let dummy = NOIRFunc(name: f.name, params: [], returnType: f.returnType,
                              body: [], isMutating: f.isMutating, span: f.span)
         e.callables[key] = Callable(fn: fn, ty: fnTy, ir: dummy, selfType: nil, selfByPointer: false)

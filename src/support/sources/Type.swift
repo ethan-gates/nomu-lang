@@ -1,12 +1,12 @@
 // The semantic type model — what a `TypeRef` (syntax) resolves to (design: noir.md).
 // Replaces the string-typing the codegen used to carry in `typeOf` / `Scope`.
 
-public enum NamedKind: Equatable {
+public enum NamedKind: Equatable, Codable {
     case struct_, enum_, class_, actor_
     case interface_   // M5 A1: the type of `self` inside an interface default body
 }
 
-public indirect enum Type: Equatable {
+public indirect enum Type: Equatable, Codable {
     case int
     case uint8    // an 8-bit unsigned byte; wrapping arithmetic, unsigned compares/shifts (i8)
     case uint64   // a 64-bit unsigned word; wrapping arithmetic, unsigned compares/shifts (i64)

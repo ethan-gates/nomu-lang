@@ -127,11 +127,52 @@ compile-time refinement, not a correctness gap — the extra symbols are `weak_o
 `FunctionLowerer.lowerMethod` (the erased branch); `NOIRStruct` / `NOIREnum` (where a visibility field would
 land).
 
+### 171.7 — Erased bodies that call into other generics (surfaced by the specialization dial)
+
+Two cases where a generic body's own compilation fails in the **producer**, under a plain erased build —
+independent of `--mono`. The specialization dial ([100](100-modules.md) §100.5.4) can never reach them,
+because a module must first compile its erased public generics (for `mono=none` consumers) before any
+consumer specializes; specialization cannot exceed what the producer compiles. Both were found building the
+§100.5.4 fixtures.
+
+- 171.7.1 — **A public (erased) generic that calls a *private* generic.** The erased copy of the public
+  generic emits a call to the private generic, but a private generic is monomorphized-only (never emitted
+  erased), so the erased body has no callable target:
+
+  ```
+  fun echo<T>(x: T) -> T { return x }                 // private
+  public fun relay<T>(x: T) -> T { return echo(x) }   // public → emitted erased
+  ```
+  → `error: 7.2.3: unknown call target 'echo'` at the producer. Either the private generic is also emitted
+  erased when an erased body calls it (promote-to-erased on demand), or the erased body lowers the nested
+  generic call through the witness ABI against a private-but-exported erased symbol (the §100.5.1
+  "exported, interface-invisible" linkage effect). Until then, make a public erased body calling a private
+  generic a clean diagnostic rather than a raw lowering error.
+
+- 171.7.2 — **A generic body that calls a method on a generic-type local.** Constructing a generic type in
+  a generic body and calling one of its methods fails SSAIR lowering:
+
+  ```
+  public struct Box<T> { let v: T   fun get() -> T { return v } }
+  public fun unboxed<T>(x: T) -> T { let b = Box(v: x)   return b.get() }
+  ```
+  → `error: SSAIR lowering: unsupported method-call receiver` at the producer (`return b.get()`). The
+  erased-method path (§100.4.3.5.3) handles a method call on an *imported* generic receiver and on a direct
+  parameter, but not on a `Box<T>` value **constructed locally inside** an erased body. Wants the erased
+  method-call receiver lowering to cover a locally-materialized generic-type value (buffer-materialize the
+  receiver, thread the type-arg VWTs). The specialization path for generic-type *construction + field read*
+  (§100.5.4) already works; this is the method-call corner.
+
+*Refs:* `Monomorphize` (private-generic erased-emission gate, 171.7.1); `FunctionLowerer` erased
+method-call lowering + the "unsupported method-call receiver" guard (171.7.2); the §100.5.4 probes
+(`relay` → private `echo`; `unboxed` → `Box<T>.get`).
+
 ## Dependencies & triggers
 
 - **Rides:** the erased witness/VWT machinery and the typed-root GC path (§100.4.3, present).
 - **Blocks:** a fully general bounded-generic-class fixture (171.1); a non-POD erased field write surviving a
-  minor GC (171.4).
+  minor GC (171.4); the specialization dial reaching a private generic callee or a generic-type method
+  (171.7 — these fail in the producer's erased build, [100](100-modules.md) §100.5.4).
 - **Interacts with:** [170](170-method-level-generics.md) (method-own type params — the adjacent axis);
   [118 associated types](118-associated-types.md) (covariant-`Self`, 171.2.2).
 

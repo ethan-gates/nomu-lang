@@ -81,3 +81,20 @@ extension Span: CustomStringConvertible {
     // `file:line:col` at the start — the usual diagnostic prefix.
     public var description: String { "\(file):\(begin.line):\(begin.col)" }
 }
+
+// A `Span` crosses a serialization boundary (the `.bir` body-IR, task 100.5.1) carrying only its byte
+// offsets — the `SourceMap` is per-build and cannot cross, so a decoded span resolves no line/column
+// (map is nil, the synthetic-span behavior). Offsets are kept so a decoded body's spans stay ordered.
+extension Span: Codable {
+    private enum CodingKeys: String, CodingKey { case startOffset, endOffset }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(startOffset: try c.decode(Int.self, forKey: .startOffset),
+                  endOffset: try c.decode(Int.self, forKey: .endOffset), map: nil)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(startOffset, forKey: .startOffset)
+        try c.encode(endOffset, forKey: .endOffset)
+    }
+}

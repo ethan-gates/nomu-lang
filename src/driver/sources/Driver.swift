@@ -103,10 +103,10 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
         exit(1)
     }
 
-    // The entry module flows through the full pipeline below (its emit/stop flags apply). Its
-    // dependencies are compiled separately after the parse gate — modules are never merged into one
-    // namespace (separate compilation, task 100.4.2).
-    var program = Program(decls: (parsedByModule[entryID] ?? []).flatMap(\.decls),
+    // The entry module's raw parse, for the --emit-ast debug view below (the per-module pipeline rebuilds
+    // its own program from `parsedByModule`). Modules are never merged into one namespace (separate
+    // compilation, task 100.4.2).
+    let program = Program(decls: (parsedByModule[entryID] ?? []).flatMap(\.decls),
                           imports: (parsedByModule[entryID] ?? []).flatMap(\.imports))
     let buildRoot = root.appendingPathComponent("build").path
     // The artifact stem: `-o <path>` gives it explicitly (its parent is created); otherwise it mirrors
@@ -180,6 +180,21 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
             for k in reexportClosure(of: dep) where seen.insert(k).inserted { order.append(k) }
         }
         return order
+    }
+    // The imported generic templates visible to `m` (task 100.5.4): each visible dependency's shipped
+    // `.bir` (task 100.5.1), parsed back to NOIR decls. A dependency with no `.bir` (no public generics),
+    // or an unreadable / version-stale one, contributes nothing — that import then stays on the erased
+    // witness path. Deterministic in `visibleModules` order.
+    func importedTemplates(of m: ModuleID) -> [ImportedTemplate] {
+        var out: [ImportedTemplate] = []
+        for k in visibleModules(of: m) {
+            let birPath = buildRoot + "/__mod_" + (k.components.isEmpty ? "root" : k.components.joined(separator: "_")) + ".bir"
+            guard let text = try? String(contentsOfFile: birPath, encoding: .utf8),
+                  let decls = parseBIR(text) else { continue }
+            let origin = k.components.joined(separator: "/")
+            out.append(contentsOf: decls.map { ImportedTemplate(origin: origin, decl: $0) })
+        }
+        return out
     }
     // The escape-summary seed for compiling `m` (task 164.6): the union of each visible dependency's
     // published per-definition summaries, re-keyed to the call names `m`'s SSA emits for them.
@@ -271,148 +286,166 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
         }
         return out
     }
-    for m in topo where m != entryID {
-        let objPath = buildRoot + "/__mod_" + (m.components.isEmpty ? "root" : m.components.joined(separator: "_")) + ".o"
-        let scopes = fileScopes(parsedByModule[m] ?? [])
-        guard let dep = compileDependency(files: parsedByModule[m] ?? [], module: m,
-                                          externalDecls: externals(of: m),
-                                          fileVisibleModules: scopes.fileVisible, fileQualifiers: scopes.fileQualifiers,
-                                          moduleFuncs: moduleFuncs(), moduleTypes: moduleTypes(),
-                                          leafCollisions: scopes.leafCollisions,
-                                          packageName: packageName,
-                                          packageRoot: packageRoot, objPath: objPath, buildRoot: buildRoot,
-                                          options: options, weakFiles: preludeFiles,
-                                          externalEscape: externalEscape(of: m),
-                                          externalMutatingMethods: externalMutating(of: m), timings: timings) else {
-            timings.report(); exit(1)
+    // Compile one module through the full pipeline. The only fork is binary vs library (`isRoot`): the
+    // root is the invocation target — it owns the program-wide GC type maps + unqualified symbols and
+    // links an executable; a dependency emits a home-qualified object + its interface. Everything else —
+    // prelude, checks, sema, interface, `.bir` shipping, specialization injection, mono, inference — runs
+    // the same for every module. Dependencies are compiled first (topological order), so their interfaces
+    // and `.bir` exist when a dependent reads them. Returns false on a fatal diagnostic (the caller exits).
+    func compileModule(_ id: ModuleID, isRoot: Bool) -> Bool {
+        let files = parsedByModule[id] ?? []
+        var program = Program(decls: files.flatMap(\.decls), imports: files.flatMap(\.imports))
+        // The pre-prelude, pre-merge surface — the interface + `.bir` own-name set are taken from it.
+        let ownSurface = program
+        let scopes = fileScopes(files)
+
+        // Duplicate-symbol / visibility / leaf-collision checks (tasks 100.1.3 / 100.2.5), before the
+        // prelude is prepended so they see only the module's own declarations.
+        let dupDiags = DiagnosticSink()
+        timings.measure("noir", "duplicates") { checkDuplicates(program, into: dupDiags) }
+        checkVisibilityConsistency(program, into: dupDiags)
+        reportLeafCollisions(scopes.leafCollisions, into: dupDiags)
+        if dupDiags.hasErrors { fputs(dupDiags.render() + "\n", stderr); return false }
+
+        // Prelude (M4.13) + plain-extension merge (M4.12).
+        let runtimeSubsetNames: Set<String>
+        (program, runtimeSubsetNames) = timings.measure("noir", "prelude") { prependPrelude(program) }
+        let mergeDiags = DiagnosticSink()
+        program = timings.measure("noir", "merge") { mergeExtensions(program, into: mergeDiags) }
+        if mergeDiags.hasErrors { fputs(mergeDiags.render() + "\n", stderr); return false }
+
+        // Typecheck (POD + let/var, T2 §4).
+        let typeDiags = DiagnosticSink()
+        timings.measure("noir", "typecheck") { var checker = Typechecker(program, diagnostics: typeDiags); checker.check() }
+        if typeDiags.hasErrors { fputs(typeDiags.render() + "\n", stderr); return false }
+
+        // Semantic pass → typed NOIR (+ exhaustiveness, T4).
+        let subset = options.subsetFuncs.union(runtimeSubsetNames)
+        let semaResult = timings.measure("noir", "sema") { () -> SemaResult in
+            var sema = Sema(program, externalDecls: externals(of: id), subsetFuncs: subset,
+                            fileVisibleModules: scopes.fileVisible, fileQualifiers: scopes.fileQualifiers,
+                            moduleFuncs: moduleFuncs(), moduleTypes: moduleTypes(),
+                            externalMutatingMethods: externalMutating(of: id))
+            let result = sema.check()
+            checkExhaustiveness(result.module, into: result.diagnostics)
+            return result
         }
-        interfaces[m] = dep.iface
-        depEscape[m] = dep.escape
+
+        // NOIR debug view (root only): --emit-noir writes it; --stop=noir writes it and halts (reporting
+        // diagnostics without failing — a debug view).
+        if isRoot && (options.noir || options.stopAt == .noir) {
+            writeArtifact(dumpNOIR(semaResult.module), toFile: stem + ".noir")
+        }
+        if isRoot && options.stopAt == .noir {
+            if !semaResult.diagnostics.isEmpty { fputs(semaResult.diagnostics.render() + "\n", stderr) }
+            return true
+        }
+        // Proceeding to codegen: semantic errors are now fatal.
+        if !semaResult.diagnostics.isEmpty { fputs(semaResult.diagnostics.render() + "\n", stderr); return false }
+
+        // Sema's structural facts (mutating-ness; task 164.1) into the shared store — read by the `.nmi`
+        // emit (164.4) and the codegen promotion interposition (164.2/164.5).
+        let factStore = collectFacts(semaResult.module)
+
+        // Module interface — built for every module (dependents read it from `interfaces`), from the
+        // pre-prelude surface, carrying the inferred facts (164.4). Its escape perf section is computed
+        // only when a `.nmi` is wanted (164.6 seeding).
+        let iface = buildInterface(ownSurface, package: packageName, module: id, packageRoot: packageRoot, facts: factStore)
+        let ownEscape = options.nmi
+            ? escapePerfSection(iface, semaResult.module, subsetFuncs: subset, external: externalEscape(of: id)).escape
+            : [:]
+        interfaces[id] = iface
+        depEscape[id] = ownEscape
+
+        // `.nmi` emission — the library interface. `--emit-nmi` on the root is terminal (no codegen/link);
+        // a module need not have an entry point to publish its interface.
+        if isRoot && options.nmi {
+            let perf = escapePerfSection(iface, semaResult.module, subsetFuncs: subset, external: externalEscape(of: id))
+            writeArtifact(serialize(iface, perf: perf), toFile: stem + ".nmi")
+            return true
+        }
+
+        // Object path: the root is the binary's stem object; a dependency is a qualified `__mod_*` object.
+        let objPath = isRoot
+            ? stem + ".o"
+            : buildRoot + "/__mod_" + (id.components.isEmpty ? "root" : id.components.joined(separator: "_")) + ".o"
+
+        // Ship this module's `.bir` (public generic closure, references canonicalized to origin-keyed
+        // names) so a dependent under `--mono` specializes the generics it imports (tasks 100.5.1 / 100.5.4).
+        let ownNames = topDeclNames(ownSurface)
+        let shipped = canonicalizeForExport(shippedTemplates(semaResult.module, ownNames: ownNames),
+                                            origin: id.components.joined(separator: "/"), ownNames: ownNames)
+        if !shipped.isEmpty {
+            let birPath = objPath.hasSuffix(".o") ? String(objPath.dropLast(2)) + ".bir" : objPath + ".bir"
+            try? serializeBIR(shipped).write(toFile: birPath, atomically: true, encoding: .utf8)
+        }
+
+        // Cross-module specialization (tasks 100.5.2 / 100.5.4): under `--mono != none`, inject the generic
+        // templates each visible dependency shipped in its `.bir` so the monomorphizer specializes the
+        // instances this module uses — recovering whole-program-mono performance across the boundary. This
+        // runs for every module, so a dependency specializes its own imports too. `none` injects nothing
+        // (erased witness path). A name specialized locally is dropped from the external sets so its call
+        // sites bind to the local specialization, not the erased import.
+        var moduleForMono = semaResult.module
+        var localizedGenerics: Set<String> = []
+        if options.effectiveMono != .none {
+            let selected = selectForDial(importedTemplates(of: id), mode: options.effectiveMono, consumer: moduleForMono)
+            let injection = injectImportedTemplates(into: moduleForMono, templates: selected)
+            moduleForMono = injection.module
+            localizedGenerics = injection.localizedNames
+        }
+
+        // Monomorphization (M5 5.4): specialize each instantiation into concrete decls; `any I` stays dynamic.
+        let monoDiags = DiagnosticSink()
+        let monoModule = timings.measure("noir", "mono") { monomorphize(moduleForMono, into: monoDiags) }
+        if !monoDiags.isEmpty { fputs(monoDiags.render() + "\n", stderr); return false }
+
+        // SSAIR debug view (root only): --emit-ssair writes it; --stop=ssair writes it and halts.
+        if isRoot && (options.ssair || options.stopAt == .ssair) {
+            let ssa = timings.measure("ssair", "gen") { lowerToSSAIR(monoModule) }
+            writeArtifact(dumpSSAIR(ssa.module), toFile: stem + ".ssair")
+            if options.stopAt == .ssair {
+                if !ssa.diagnostics.isEmpty { fputs(ssa.diagnostics.render() + "\n", stderr) }
+                return true
+            }
+        }
+
+        let extFuncs = semaResult.externalFuncNames.subtracting(localizedGenerics)
+        let extGenerics = semaResult.externalGenericSigs.filter { !localizedGenerics.contains($0.key) }
+
+        // Backend (M8). The root goes through the binary path (object + runtime link); a dependency emits a
+        // home-qualified object only (no entry point, no program-wide type maps).
+        if isRoot {
+            emitLLVMBinary(monoModule, stem: stem, buildRoot: buildRoot, optimize: options.optimize,
+                           subsetFuncs: subset, timings: timings,
+                           emitLLVM: options.llvm || options.stopAt == .llvm, stopAfterLLVM: options.stopAt == .llvm,
+                           extraObjects: depObjects, externalFuncNames: extFuncs, externalGenericSigs: extGenerics,
+                           weakOriginFiles: preludeFiles, facts: factStore)
+            return true
+        }
+        // Dependency object: gen SSAIR → inference (promotion) → emit, qualified + interface-invisible.
+        let gen = timings.measure("ssair", "gen") { lowerToSSAIR(monoModule, subsetFuncs: subset) }
+        if gen.diagnostics.hasErrors { fputs("error: SSAIR: " + gen.diagnostics.render() + "\n", stderr); return false }
+        var store = factStore
+        timings.measure("ssair", "inference") {
+            let summaries = computeEscapeSummaries(gen.module.functions, aggregates: gen.module.aggregates)
+            writeEscapeSummaries(summaries, into: &store)
+        }
+        let err = emitObject(gen.module, from: monoModule, to: objPath, optimize: options.optimize,
+                             onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
+                             requireMain: false, externalFuncNames: extFuncs, externalGenericSigs: extGenerics,
+                             weakOriginFiles: preludeFiles, emitTypeMaps: false,
+                             homeQualifier: Mangle.qualifier(module: id.components), facts: store)
+        if let err = err { fputs("error: \(err)\n", stderr); return false }
         depObjects.append(objPath)
-    }
-    let entryExternals = externals(of: entryID)
-    let entryScopes = fileScopes(parsedByModule[entryID] ?? [])
-
-    // Duplicate-symbol detection across the module's files (task 100.1.3) — before the prelude is
-    // prepended, so it sees only the module's own declarations.
-    let dupDiags = DiagnosticSink()
-    timings.measure("noir", "duplicates") { checkDuplicates(program, into: dupDiags) }
-    // Signature visibility consistency (task 100.2.5): a public/package signature may not expose a
-    // lesser-visibility type — guards the public surface before it becomes an interface.
-    checkVisibilityConsistency(program, into: dupDiags)
-    reportLeafCollisions(entryScopes.leafCollisions, into: dupDiags)
-    if dupDiags.hasErrors {
-        fputs(dupDiags.render() + "\n", stderr)
-        timings.report()
-        exit(1)
+        return true
     }
 
-    // Prepend the Nomu standard library, compiled with every program (M4.13). Under
-    // the single compilation unit this is a decl concatenation; prelude symbols are
-    // then callable from user code with no import. (Times the prelude's own lex+parse.)
-    let runtimeSubsetNames: Set<String>
-    (program, runtimeSubsetNames) = timings.measure("noir", "prelude") { prependPrelude(program) }
-
-    // Fold plain extensions into their target types before any checking (M4.12);
-    // downstream passes then see one type with all its methods.
-    let mergeDiags = DiagnosticSink()
-    program = timings.measure("noir", "merge") { mergeExtensions(program, into: mergeDiags) }
-    if mergeDiags.hasErrors {
-        fputs(mergeDiags.render() + "\n", stderr)
-        timings.report()
-        exit(1)
+    // Compile every module in dependency order (leaves first); the entry module — the binary — is last and
+    // links. Separate compilation (task 100.4.2): a module sees a dependency only through its interface.
+    for m in topo {
+        guard compileModule(m, isRoot: m == entryID) else { timings.report(); exit(1) }
     }
-
-    // Semantic pass → typed IR. POD + let/var checks (AST typechecker) run first (T2 §4).
-    let typeDiags = DiagnosticSink()
-    timings.measure("noir", "typecheck") {
-        var checker = Typechecker(program, diagnostics: typeDiags)
-        checker.check()
-    }
-    if typeDiags.hasErrors {
-        fputs(typeDiags.render() + "\n", stderr)
-        timings.report()
-        exit(1)
-    }
-
-    let semaResult = timings.measure("noir", "sema") { () -> SemaResult in
-        var sema = Sema(program, externalDecls: entryExternals, subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames),
-                        fileVisibleModules: entryScopes.fileVisible, fileQualifiers: entryScopes.fileQualifiers,
-                        moduleFuncs: moduleFuncs(), moduleTypes: moduleTypes(),
-                        externalMutatingMethods: externalMutating(of: entryID))
-        let result = sema.check()
-        // T4: exhaustiveness as an IR pass over the typed module, into the same sink.
-        checkExhaustiveness(result.module, into: result.diagnostics)
-        return result
-    }
-
-    // NOIR stage. --emit-noir writes NOIR to build/; --stop=noir
-    // writes it and halts (reporting diagnostics without failing — it is a debug view).
-    if options.noir || options.stopAt == .noir {
-        writeArtifact(dumpNOIR(semaResult.module), toFile: stem + ".noir")
-    }
-    if options.stopAt == .noir {
-        if !semaResult.diagnostics.isEmpty { fputs(semaResult.diagnostics.render() + "\n", stderr) }
-        timings.report()
-        return
-    }
-    // Proceeding to codegen: semantic errors are now fatal.
-    if !semaResult.diagnostics.isEmpty {
-        fputs(semaResult.diagnostics.render() + "\n", stderr)
-        timings.report()
-        exit(1)
-    }
-
-    // Sema's structural facts (mutating-ness; task 164.1) into the shared fact store, keyed per
-    // definition. Consumed by the `.nmi` emit below (164.4, task B) and threaded to the codegen path's
-    // inference interposition point (164.2) where 164.5 will feed promotion.
-    let factStore = collectFacts(semaResult.module)
-
-    // Module interface (`.nmi`) emission (task 100.4.1). Built from the checked public surface of the
-    // entry module, carrying the inferred facts from the store (164.4). Terminal — a library module need
-    // not have an entry point or link, so this returns rather than proceeding to codegen.
-    if options.nmi {
-        let iface = buildInterface(program, package: packageName, module: entryID, packageRoot: packageRoot, facts: factStore)
-        let perf = escapePerfSection(iface, semaResult.module,
-                                     subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames),
-                                     external: externalEscape(of: entryID))
-        writeArtifact(serialize(iface, perf: perf), toFile: stem + ".nmi")
-        timings.report()
-        return
-    }
-
-    // Monomorphization (M5 5.4): specialize every generic instantiation into concrete
-    // decls (whole-program mono under the single compilation unit). An IR→IR pass; `any I`
-    // stays dynamic. Runs only on error-free IR.
-    let monoDiags = DiagnosticSink()
-    let monoModule = timings.measure("noir", "mono") { monomorphize(semaResult.module, into: monoDiags) }
-    if !monoDiags.isEmpty {
-        fputs(monoDiags.render() + "\n", stderr)
-        timings.report()
-        exit(1)
-    }
-
-    // SSAIR stage (M7 · 7.2.4). --emit-ssair writes the optimizer IR (post-mono NOIR → SSAIR) to
-    // build/; --stop=ssair writes it and halts. A debug view, so ssairgen diagnostics report without
-    // failing. The backend lowers SSAIR itself (the sole egress); this is the standalone inspectable dump.
-    if options.ssair || options.stopAt == .ssair {
-        let ssa = timings.measure("ssair", "gen") { lowerToSSAIR(monoModule) }
-        writeArtifact(dumpSSAIR(ssa.module), toFile: stem + ".ssair")
-        if options.stopAt == .ssair {
-            if !ssa.diagnostics.isEmpty { fputs(ssa.diagnostics.render() + "\n", stderr) }
-            timings.report()
-            return
-        }
-    }
-
-    // Backend (M8): lower the typed IR via LLVM's C API → object → link with the runtime .a.
-    // (The C backend was the differential oracle through 8.2 and was retired at the 8.2 exit.)
-    emitLLVMBinary(monoModule, stem: stem, buildRoot: buildRoot, optimize: options.optimize,
-                   subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames), timings: timings,
-                   emitLLVM: options.llvm || options.stopAt == .llvm, stopAfterLLVM: options.stopAt == .llvm,
-                   extraObjects: depObjects, externalFuncNames: semaResult.externalFuncNames,
-                   externalGenericSigs: semaResult.externalGenericSigs,
-                   weakOriginFiles: preludeFiles, facts: factStore)
     timings.report()
 }
 
@@ -579,80 +612,111 @@ private func reportLeafCollisions(_ collisions: [(file: String, leaf: String, sp
 // same pipeline the entry uses, but it emits an object with no entry point (no link here) and reports
 // its own diagnostics; returns nil on any error. The interface is built from the module's own public
 // surface before the prelude is prepended.
-private func compileDependency(files: [SourceFile], module: ModuleID, externalDecls: [TopDecl],
-                               fileVisibleModules: [String: Set<String>],
-                               fileQualifiers: [String: [String: Set<String>]],
-                               moduleFuncs: [String: Set<String>], moduleTypes: [String: Set<String>],
-                               leafCollisions: [(file: String, leaf: String, span: Span)],
-                               packageName: String, packageRoot: String, objPath: String,
-                               buildRoot: String, options: EmitOptions, weakFiles: Set<String>,
-                               externalEscape: [String: EscapeSummary], externalMutatingMethods: Set<String>,
-                               timings: Timings) -> (iface: ModuleInterface, escape: [String: EscapeSummary])? {
-    var program = Program(decls: files.flatMap(\.decls), imports: files.flatMap(\.imports))
+// The imported templates to inject for the consumer dial (task 100.5.2/100.5.4). `all` injects the whole
+// shipped closure (whole-tree specialization). `edge` injects only the generics the consumer's own code
+// calls **directly**, plus the non-public callees those reach — so a nested public generic (one reached
+// only through another specialized body) stays on the erased witness path. The producer ships bodies with
+// their original visibility, so a `.public` template is a generic others may call directly while a
+// non-public one is a private callee that must travel with its caller. The direct-call scan reads the
+// consumer's own function bodies (origin-keyed call targets); a call from inside a type's method is not
+// scanned yet, so it conservatively stays erased under `edge`.
+private func selectForDial(_ templates: [ImportedTemplate], mode: MonoMode, consumer: NOIRModule) -> [ImportedTemplate] {
+    guard mode != .none else { return [] }
+    if mode == .all { return templates }
+    func encoded(_ t: ImportedTemplate) -> String { ExternalName.encode(origin: t.origin, name: noirDeclName(t.decl)) }
+    func isPublic(_ t: ImportedTemplate) -> Bool {
+        if case .funcDecl(let f) = t.decl { return f.visibility == .public }
+        return false
+    }
+    var byEncoded: [String: ImportedTemplate] = [:]
+    for t in templates { byEncoded[encoded(t)] = t }
+    // The generic names the consumer's own code calls directly (origin-keyed, as resolved in its NOIR).
+    var direct = Set<String>()
+    for decl in consumer.decls { direct.formUnion(collectReferencedNames(decl)) }
 
-    let dupDiags = DiagnosticSink()
-    checkDuplicates(program, into: dupDiags)
-    checkVisibilityConsistency(program, into: dupDiags)
-    reportLeafCollisions(leafCollisions, into: dupDiags)
-    if dupDiags.hasErrors { fputs(dupDiags.render() + "\n", stderr); return nil }
+    var selectedNames = Set<String>()
+    var selected: [ImportedTemplate] = []
+    var worklist: [ImportedTemplate] = []
+    for t in templates where isPublic(t) && direct.contains(encoded(t)) {
+        if selectedNames.insert(encoded(t)).inserted { selected.append(t); worklist.append(t) }
+    }
+    // Pull in the non-public callees the selected bodies reach (they cannot be erased-linked); leave a
+    // referenced public generic un-injected so it stays on the witness path.
+    while let t = worklist.popLast() {
+        for ref in collectReferencedNames(t.decl) {
+            guard let u = byEncoded[ref], !isPublic(u), selectedNames.insert(ref).inserted else { continue }
+            selected.append(u); worklist.append(u)
+        }
+    }
+    return selected
+}
 
-    // Snapshot the module's own surface (pre-prelude, pre-merge) for the interface; the interface is built
-    // post-Sema (task 164.4) so it can carry the fact store, from this same surface so its output is
-    // unchanged but for the added inferred facts.
-    let ownSurface = program
+private func noirDeclName(_ d: NOIRDecl) -> String {
+    switch d {
+    case .funcDecl(let f):   return f.name
+    case .structDecl(let s): return s.name
+    case .enumDecl(let e):   return e.name
+    case .classDecl(let c):  return c.name
+    case .actorDecl(let a):  return a.name
+    }
+}
 
-    let runtimeSubsetNames: Set<String>
-    (program, runtimeSubsetNames) = prependPrelude(program)
+// The names of a module's own top-level declarations (task 100.5.4): the set a shipped `.bir` body's
+// references are canonicalized against — a reference to one of these is this module's, so it is rewritten
+// to an origin-keyed name; anything else (prelude, builtins, locals, type params) stays bare. Taken from
+// the pre-prelude own-surface snapshot, so prelude names are excluded.
+private func topDeclNames(_ program: Program) -> Set<String> {
+    var names = Set<String>()
+    for decl in program.decls {
+        switch decl {
+        case .funcDecl(let f):      names.insert(f.name)
+        case .structDecl(let s):    names.insert(s.name)
+        case .classDecl(let c):     names.insert(c.name)
+        case .enumDecl(let e):      names.insert(e.name)
+        case .interfaceDecl(let i): names.insert(i.name)
+        default:                    break
+        }
+    }
+    return names
+}
 
-    let mergeDiags = DiagnosticSink()
-    program = mergeExtensions(program, into: mergeDiags)
-    if mergeDiags.hasErrors { fputs(mergeDiags.render() + "\n", stderr); return nil }
-
-    let typeDiags = DiagnosticSink()
-    var checker = Typechecker(program, diagnostics: typeDiags)
-    checker.check()
-    if typeDiags.hasErrors { fputs(typeDiags.render() + "\n", stderr); return nil }
-
-    var sema = Sema(program, externalDecls: externalDecls,
-                    subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames),
-                    fileVisibleModules: fileVisibleModules, fileQualifiers: fileQualifiers,
-                    moduleFuncs: moduleFuncs, moduleTypes: moduleTypes,
-                    externalMutatingMethods: externalMutatingMethods)
-    let semaResult = sema.check()
-    checkExhaustiveness(semaResult.module, into: semaResult.diagnostics)
-    if !semaResult.diagnostics.isEmpty { fputs(semaResult.diagnostics.render() + "\n", stderr); return nil }
-
-    // The dependency's interface, carrying its inferred facts (task 164.4) — built from the pre-merge
-    // own-surface snapshot so the surface matches the pre-relocation output.
-    let iface = buildInterface(ownSurface, package: packageName, module: module, packageRoot: packageRoot,
-                               facts: collectFacts(semaResult.module))
-    // This dependency's own per-definition escape summary (task 164.6), seeded by its visible
-    // dependencies' published summaries so it is itself cross-module-accurate when a downstream consumer
-    // seeds from it. Computed over the pre-mono erased bodies, like the `--emit-nmi` path, and only when a
-    // `.nmi` is being produced — it is a second SSA lowering whose sole consumer is the published perf
-    // section, so a full codegen build skips it (the entry's `escapePerfSection` is `--nmi`-gated too).
-    let ownEscape = options.nmi
-        ? escapePerfSection(iface, semaResult.module,
-                            subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames),
-                            external: externalEscape).escape
-        : [:]
-
-    let monoDiags = DiagnosticSink()
-    let monoModule = monomorphize(semaResult.module, into: monoDiags)
-    if !monoDiags.isEmpty { fputs(monoDiags.render() + "\n", stderr); return nil }
-
-    // A dependency's own symbols carry its module-path qualifier (task 100.4), so they cannot collide
-    // with another module's same-named symbols at link.
-    // Gen SSAIR in the driver so the stage sequence is explicit (task 165.1); `emitObject` lowers it.
-    let gen = lowerToSSAIR(monoModule, subsetFuncs: options.subsetFuncs.union(runtimeSubsetNames))
-    if gen.diagnostics.hasErrors { fputs("error: SSAIR: " + gen.diagnostics.render() + "\n", stderr); return nil }
-    let err = emitObject(gen.module, from: monoModule, to: objPath, optimize: options.optimize,
-                         requireMain: false, externalFuncNames: semaResult.externalFuncNames,
-                         externalGenericSigs: semaResult.externalGenericSigs,
-                         weakOriginFiles: weakFiles, emitTypeMaps: false,
-                         homeQualifier: Mangle.qualifier(module: module.components))
-    if let err = err { fputs("error: \(err)\n", stderr); return nil }
-    return (iface, ownEscape)
+// The decls a dependency ships in its `.bir` (tasks 100.5.1 / 100.5.4): its **public generic** free
+// functions, plus the transitive closure of **non-public** functions those bodies reach — the automatic
+// transitive closure (§100.5). A non-public callee is absent from the `.nmi` (interface-invisible), so the
+// consumer's Sema never sees it; shipping its body lets the consumer emit it locally (internal, origin-
+// keyed) under `--mono`. A public callee is left out: a public generic is already seeded here, and a public
+// non-generic links through the ordinary import path. `ownNames` excludes the prelude (pre-prelude
+// snapshot), so a prelude/builtin callee is never pulled in. Generic **types**/methods ride a later
+// 100.5.4 increment.
+private func shippedTemplates(_ module: NOIRModule, ownNames: Set<String>) -> [NOIRDecl] {
+    // This module's own functions, by name (excludes prelude, which `ownNames` already filters out).
+    var ownFuncs: [String: NOIRDecl] = [:]
+    for decl in module.decls {
+        if case .funcDecl(let f) = decl, ownNames.contains(f.name) { ownFuncs[f.name] = decl }
+    }
+    func isPublic(_ decl: NOIRDecl) -> Bool {
+        if case .funcDecl(let f) = decl { return f.visibility == .public }
+        return false
+    }
+    func isGeneric(_ decl: NOIRDecl) -> Bool {
+        if case .funcDecl(let f) = decl { return !f.generics.isEmpty }
+        return false
+    }
+    var shippedNames = Set<String>()
+    var shipped: [NOIRDecl] = []
+    var worklist: [NOIRDecl] = []
+    // Seed: every public generic function.
+    for (name, decl) in ownFuncs where isPublic(decl) && isGeneric(decl) {
+        shippedNames.insert(name); shipped.append(decl); worklist.append(decl)
+    }
+    // Close over the non-public functions the shipped bodies reach, transitively.
+    while let decl = worklist.popLast() {
+        for ref in collectReferencedNames(decl) {
+            guard let callee = ownFuncs[ref], !isPublic(callee), shippedNames.insert(ref).inserted else { continue }
+            shipped.append(callee); worklist.append(callee)
+        }
+    }
+    return shipped
 }
 
 // LLVM backend binary stage (8.1.4): emit a host object via the LLVM C API, build the runtime

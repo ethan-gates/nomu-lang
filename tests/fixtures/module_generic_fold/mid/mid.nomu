@@ -1,0 +1,5 @@
+import pkg/leaf
+
+public fun useGid(n: Int) -> Int {
+    return gid(n) + 1
+}

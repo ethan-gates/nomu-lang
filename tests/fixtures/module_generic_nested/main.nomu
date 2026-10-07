@@ -1,0 +1,8 @@
+// Call an imported generic that itself calls another imported generic across the module boundary.
+import pkg/lib
+
+fun main() {
+    let n = relay(7)
+    print(n)        // 7
+    print("\n")
+}

@@ -1,8 +1,8 @@
 # Interfaces
 
-**Status:** authoritative spec — interfaces as built through **M5**. Documents the *implemented* language: declaration, requirements + defaults, conformance + extensions, computed properties, dispatch, existentials (`any I`) and opaque types (`some I`), `Self`-requirements + existential legality, and composition. Read this instead of the compiler. Generic bounds `<T: I>`, monomorphization, the `shared` bound, and the coherence/orphan rule live in `generics.md`; the concurrency angle of `shared` in `concurrency.md` §5. Rationale and rejected alternatives are §9; deferred surface is §8.
+**Status:** authoritative spec — interfaces as built through **M5**. Documents the *implemented* language: declaration, requirements + defaults + provided methods, conformance + extensions, computed properties, dispatch, existentials (`any I`) and opaque types (`some I`), `Self`-requirements + existential legality, and composition. Read this instead of the compiler. Generic bounds `<T: I>`, monomorphization, the `shared` bound, and the coherence/orphan rule live in `generics.md`; the concurrency angle of `shared` in `concurrency.md` §5. Rationale and rejected alternatives are §9; deferred surface is §8.
 
-Scope note: everything below is committed and compiles today unless marked **Deferred**. Decision dates are kept as provenance.
+Scope note: everything below is committed and compiles today unless marked **Deferred** or **Agreed (not yet built)**. Decision dates are kept as provenance.
 
 **Terminology:** "interface" for the Swift-protocol / Rust-trait / Go-interface family. "Requirement" = a member the interface demands; "conformer" = a type that satisfies it.
 
@@ -15,6 +15,23 @@ Scope note: everything below is committed and compiles today unless marked **Def
 - **Overridable defaults.** A method requirement with a body in the interface is an **overridable default** — an *optional* requirement a conformer may skip and inherit. Defaults live in the interface body, never in an extension. A default may read a requirement by **bare name** (`count`, not just `self.count`), **write** a settable requirement (`self.count = v`), and call another requirement/default (`self.m()`).
 - **Property requirements are accessor-shaped, never storage.** A `{ get }`/`{ get set }` requirement is a get (and set) **accessor** in the witness table — never a field offset. A conformer satisfies it with a **stored field** (auto-synthesizes trivial accessors) or a **computed property** (§3); the interface never dictates layout. This lets a default method operate on required state (`fun increment() { count = count + 1 }`) without state inheritance: multiple interfaces requiring `count` collapse to **one** field with shared accessors (no state diamond, §7.1), and it works through `any I` (an erased box has accessors, not offsets). — Decided (property requirements 2026-07-20).
 - **Mutation:** a settable access on a value conformer (a `{ get set }` default that writes, or `d.prop = v`) needs a mutable (`var`) receiver — mutating-method semantics on value types. Read-only `{ get }` avoids this.
+
+### 1.1 Provided methods — Agreed (not yet built); spelling deferred
+
+A **provided method** is a concrete method an interface supplies to every conformer, written against the interface's requirements (Swift's protocol-extension method). It is a category distinct from an overridable default:
+
+- An **overridable default** (above) is a *requirement* with a body: optional for conformers, carried in the witness table, overridable, and **dynamic** through `any I` (the conformer's override runs).
+- A **provided method** is a non-requirement: **sealed** (a conformer cannot override it), absent from the witness table, and **static everywhere**. It is reachable on a concrete type, a `some I` value, a generic `<T: I>`, and on `any I` — resolved statically to the one provided implementation, which then dispatches the requirements it calls through the box's witness.
+
+**The collision-ban keeps this safe** — three hard errors, raised at declaration or conformance:
+
+1. **conformer-vs-provided** — a conformer declaring a member that matches a provided method on **name + nominal argument types**.
+2. **requirement-vs-provided** — a requirement and a provided method matching on name + argument types.
+3. **provided-vs-provided** — two provided methods reachable on one conformer (through refinement §7.1 or composition §7.4) matching on name + argument types.
+
+With the ban in force, each `(name, argument-types)` resolves to exactly one method on any concrete type, fixed by that type and its conformances. Resolution is **independent of the static binding** — concrete, `some I`, `any I`, or generic all pick the same method — so a provided method carries one meaning and dispatches statically everywhere. This is what removes Swift's default-vs-extension gotcha for the category (§9).
+
+**Spelling** — a dedicated keyword versus an `extension I { … }` form — is deferred to implementation.
 
 ---
 
@@ -44,6 +61,7 @@ A committed language feature (structs had stored fields only before M5). — Dec
 
 - **Requirements** — static on a concrete receiver, a `some I` value, or a specialized generic; dynamic through `any I` (or an unspecialized generic). The conformer's implementation runs in every case; erasure only changes how it's reached. **Guaranteed-static, specialization-independent sites are concrete types and `some I`** (`generics.md` §1).
 - **Plain extension methods** — always static; not in the witness table, not seen through `any I`.
+- **Provided methods (§1.1)** — static everywhere, reachable on `any I` as well as on concrete / `some I` / generic receivers. The collision-ban fixes one resolution per concrete type, so dispatch never depends on the binding. Requirements a provided method calls still dispatch dynamically when the receiver is `any I`.
 - **Property-requirement performance follows the same rule.** A `{ get }` on a stored-backed property **devirtualizes to a field load** wherever the concrete type is known (concrete / `some` / specialized generic); it's an indirect accessor call only through `any I` or an unspecialized generic. Computed properties add no cost to the stored path.
 
 Because today's monomorphization specializes all generic code (`generics.md` §6), `<T: I>` is static in practice; the *guaranteed*-static levers remain concrete types and `some I`.
@@ -141,6 +159,7 @@ Interface inheritance is **requirement aggregation + a subtype edge**, not imple
 ## 9. Rationale & rejected alternatives
 
 - **One witness per `(type, requirement)`, dispatched consistently** — a representational invariant that removes **Swift's default-vs-witness gotcha** (an extension supplying a default dispatches statically while the same surface through `any P` dispatches dynamically to a possibly-different method). Nomu uses the invariant, not a location rule; a conformance is a single witness whether written in the type body or a conformance extension.
+- **Provided methods stay safe by banning collisions, not by a dispatch rule** — Swift lets a protocol-extension method and a conformer method share a name, then resolves by static type (the extension-method gotcha). Nomu forbids the collision outright (§1.1), so a provided-method name denotes one method on any conformer; static dispatch everywhere is then sound, because a dynamic binding has nothing different to select. A provided method and a requirement are barred from sharing a name for the same reason the plain-extension/requirement shadow is (§2).
 - **Constraint-only is a real limit, not conservatism** — a contravariant (consuming) `Self` cannot be erased: two `any I` boxes can hold different concrete types, so `a.combined(with: b)` is genuinely ill-typed under erasure. No compiler cleverness recovers it (that would only downgrade a static guarantee to a runtime trap). Covariant `Self` *can* be erased, which is why §6 admits exactly that case and no more.
 - **Multi-interface `any A & B`** accepts a heavier box (a witness per interface) for ergonomics — Rust restricts `dyn` to one non-auto trait for representation reasons; we take the box.
 - **`shared` as a prefix capability modifier**, not an `&`-composed marker interface — it also spells shareable closure/function types, which a bare function type can't express as an `&`-composition (`generics.md` §2, §12).

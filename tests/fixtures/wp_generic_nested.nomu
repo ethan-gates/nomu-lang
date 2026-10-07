@@ -1,0 +1,15 @@
+// Whole-program twin of `module_generic_nested`: `relay<T>` / `echo<T>` are monomorphized in one module.
+// The `--mono=all` module build must produce the same observable result (7).
+fun echo<T>(x: T) -> T {
+    return x
+}
+
+fun relay<T>(x: T) -> T {
+    return echo(x)
+}
+
+fun main() {
+    let n = relay(7)
+    print(n)        // 7
+    print("\n")
+}

@@ -208,15 +208,68 @@ semantic baseline; monomorphization is a specialization pass layered on top. `an
 `{witness, payload}`. Both paths exist through M5, so the dial below is a policy over existing
 machinery, not new representation.
 
-**Specialization dial — a build flag with mode defaults.**
-- Controlled by a compiler flag (e.g. `--mono`), never by in-source markers (no `@specialize`).
-- **Debug default: none** — cross-module specialization off; generics dispatch through witnesses at
-  module edges. Opt in per invocation (`nomuc compile MyModule --mono=all`).
-- **Release default: specialize** — start at specialize-all (recovers today's whole-program
-  performance); a smarter threshold (heuristic / profile-guided / size-budget) is task
-  [145](../plans/tasks/145-monomorphization-cost.md).
-- The flag is part of the build config and every action's cache key, so switching debug↔release is a
-  full rebuild.
+**Specialization control — two axes: a consumer build flag + a producer in-source surface.**
+
+*Consumer axis — the dial, a build flag.* `--mono` controls whether the module under compilation
+specializes the generics it **consumes**, as a spectrum of values:
+- **`none`** — no cross-module specialization; generics dispatch through witnesses at module edges.
+- **`edge`** — specialize the directly-called generic instances only; nested generic calls inside a
+  specialized body stay witness-dispatched. Shallow: faster builds / smaller code than full tree, more
+  speed than witness.
+- **`all`** — whole-tree: recursively specialize nested generic calls too (recovers whole-program-mono
+  performance).
+- **Depth is a configurable knob to start** (`edge` vs `all`), held open while the right default is
+  unknown; it may later be subsumed by the per-call-site cost model (task
+  [145](../plans/tasks/145-monomorphization-cost.md)), which would make a global depth flag obsolete.
+- Mode defaults: **debug = `none`**, **release = `all`** (opt in per invocation,
+  `nomuc compile MyModule --mono=edge`).
+- The flag is part of the build config and every action's cache key, so switching modes is a full rebuild.
+  The consumer axis is controlled by the flag, never an in-source marker — it is a build decision. The same
+  depth knob governs the whole-program release pass below.
+
+*Producer axis — in-source, per declaration.* A generic's author controls whether and how it is
+specialized. (This reverses the earlier blanket "no in-source markers" — that rule now governs only the
+consumer axis above.) Two forms:
+- **Default: dynamic (witness), specialize opt-in.** A generic is witness-only by default — the erased
+  path, no `.bir` shipped, consumers cannot specialize it. A **single contextual modifier keyword** —
+  **`mono`** — marks a generic as specializable: ships its `.bir` so a consumer may
+  specialize it per its dial. Contextual — recognized only in modifier
+  position — so it does not reserve the word in user namespaces. No opt-out keyword is needed (witness is
+  the default). This governs only the *cross-module* published form; in-module callers still monomorphize
+  from the local body regardless.
+- A **top-level `specialize <Instance>` directive** lists concrete instantiations the producer
+  **prespecializes**: emits into its own object and advertises in the `.nmi`. The directive **must be
+  top-level and must appear in the file where the generic is declared.** Prespecialization is
+  producer-owned and co-located with the generic; a consumer cannot prespecialize a dependency's generic,
+  so consumer-specific instances rely on the dial or the whole-program pass instead.
+- **A prespecialized instance overrides the consumer dial.** At the consumer's *compile*, each generic call
+  at a statically-known concrete type checks the dependency's `.nmi`-advertised prespecialization set; if the
+  instance is there, the call binds directly to the prebuilt symbol — even under `mono=none`. This is
+  deterministic and hermetic (the set is in the interface the consumer already reads), distinct from the
+  rejected link-time sibling piggyback. It is always safe to let the prespecialization win: a specialization
+  of `Foo<Int>` is semantically identical regardless of who built it. A **witness-default generic that
+  prespecializes its hot instances is the stdlib pattern** — ship no bodies, prebuild the hot set, and every
+  consumer (including debug) picks them up.
+
+*Release mechanism — per-module specialization + COMDAT fold.* Release compiles each module with `--mono`
+and the linker folds the duplicate specializations, which already yields whole-program-mono output — no
+separate link-time pass is needed for parity. Duplicate specializations **fold at link** (COMDAT / coalesced
+weak symbols); the specialized symbol is **producer-qualified + type args**, so copies emitted by different
+consumers are byte-identical (deterministic specialization) and fold to one. There is **no opportunistic
+"sibling piggyback"**: a module's witness calls are a per-module commitment, never redirected to a sibling's
+specialization at link.
+
+*Whole-program specialization pass — deferred build-efficiency optimization.* A deterministic whole-program
+specialization / devirtualization pass at the link (LLVM WPD / ThinLTO model) would dedup the specialization
+*work* — deciding and building each instance once instead of per consumer — but per-module + COMDAT already
+gives the same *output*, so this changes build cost, not the binary, and is not required for release parity.
+A "missed specialization" report (a witness call whose specialization is present in the binary anyway) feeds
+the prespecialization list — a sibling of task [175](../plans/tasks/175-inference-observability.md).
+
+*Prespecialization advertisement* rides the `.nmi` **ABI section** as a per-instance `(generic, type-args)`
+set: a prespecialized instance is an additional exported concrete symbol, and its removal must invalidate
+dependents, so it is ABI-relevant. The consumer derives the prebuilt symbol by mangling and matches via the
+canonical type encoding.
 
 **Module artifacts.** A module compile produces `.o` (concrete code + the erased generic path), `.nmi`
 (interface), and `.bir` (generic and inlinable-non-generic body IR).

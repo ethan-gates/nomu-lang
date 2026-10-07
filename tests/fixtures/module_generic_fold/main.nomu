@@ -1,0 +1,8 @@
+// main and mid both call leaf's `gid`, so both specialize the same instance under `--mono` (the fold).
+import pkg/mid
+import pkg/leaf
+
+fun main() {
+    print(gid(10) + useGid(29))   // 10 + (29 + 1) = 40
+    print("\n")
+}

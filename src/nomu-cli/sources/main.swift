@@ -29,6 +29,8 @@ for arg in CommandLine.arguments.dropFirst() {
               --emit-llvm        also emit LLVM IR from the egress, pre-opt (<name>.ll)
               --stop=STAGE       halt after STAGE (ast | noir | ssair | llvm | binary); default binary
               -O, --release      optimize (LLVM -O2); default is a debug build
+              --mono=MODE        cross-module specialization depth (none | edge | all);
+                                 default follows the build: none for debug, all for release
               -o PATH            output binary path (artifacts derive from it); default under build/
               -h, --help         show this help
             """)
@@ -45,6 +47,12 @@ for arg in CommandLine.arguments.dropFirst() {
     case let a where a.hasPrefix("--runtime-subset="):
         let names = String(a.dropFirst("--runtime-subset=".count)).split(separator: ",").map(String.init)
         options.subsetFuncs.formUnion(names)
+    case let a where a.hasPrefix("--mono="):
+        guard let mode = MonoMode(rawValue: String(a.dropFirst("--mono=".count))) else {
+            fputs("error: unknown mode '\(String(a.dropFirst("--mono=".count)))' for --mono (expected none, edge, or all)\n", stderr)
+            exit(1)
+        }
+        options.mono = mode
     case let a where a.hasPrefix("--stop="):
         switch String(a.dropFirst("--stop=".count)) {
         case "ast":     options.stopAt = .ast

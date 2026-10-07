@@ -126,7 +126,7 @@ public enum TopDecl {
 // package; `public` is the module's external API. Written as a contextual prefix modifier, so the
 // words stay usable as identifiers. `rank` orders the tiers for consistency checks (a symbol may not
 // expose one of lesser reach in its public/package signature).
-public enum Visibility: Int, Comparable {
+public enum Visibility: Int, Comparable, Codable {
     case `private` = 0    // visible in its file only
     case `internal` = 1   // visible in its module (default)
     case `package` = 2    // visible to every module in the package
@@ -483,7 +483,7 @@ public struct Arg {
     }
 }
 
-public enum BinOp: Equatable {
+public enum BinOp: Equatable, Codable {
     case add, sub, mul, div, mod
     case eq, neq, lt, gt, lte, gte
     case bitAnd, bitOr, bitXor, shl, shr

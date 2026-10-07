@@ -20,6 +20,15 @@ public enum Stage {
 // object → link. The C backend was the differential oracle through 8.2 and was retired at the
 // 8.2 exit, so there is no longer a backend to select.
 
+// Specialization depth for the generics a module *consumes* across a boundary (the consumer dial, task
+// 100.5.2). `none` keeps every imported generic on the erased witness path (debug default — fast builds,
+// no `.bir` read); `edge` specializes directly-called instances (nested generic calls stay witness);
+// `all` specializes the whole instantiation tree (release default — recovers monomorphized performance).
+// A producer's advertised prespecialization still binds under `none` (it overrides the consumer dial).
+public enum MonoMode: String, Equatable {
+    case none, edge, all
+}
+
 public struct EmitOptions {
     public var ast = false       // --emit-ast: emit the parsed AST (<name>.ast)
     public var noir = false      // --emit-noir: emit NOIR (<name>.noir)
@@ -40,6 +49,12 @@ public struct EmitOptions {
     // under `build/`. The driver builds the file list; a module's identity/output name is given, not
     // inferred from a filename.
     public var outputPath: String? = nil
+    // `--mono=none|edge|all` — the consumer specialization dial (task 100.5.2). Nil means "mode default":
+    // resolved by `effectiveMono` to `none` for a debug build and `all` for a release (`-O`) build, so the
+    // dial follows the optimization level unless set explicitly. Part of the build-cache key (task 172).
+    public var mono: MonoMode? = nil
+    // The dial in force, resolving the nil default against the optimization level (debug=none, release=all).
+    public var effectiveMono: MonoMode { mono ?? (optimize ? .all : .none) }
 
     public init() {}
 }

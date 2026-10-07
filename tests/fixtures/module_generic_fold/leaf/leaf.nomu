@@ -1,0 +1,6 @@
+// A public generic specialized by more than one consumer below. Under `--mono` both `mid` and `main`
+// specialize `gid<Int>` into their own objects under the producer-qualified symbol `leaf@gid<Int>`;
+// weak-ODR linkage folds the duplicate copies to one at link (task 100.5.5).
+public fun gid<T>(x: T) -> T {
+    return x
+}

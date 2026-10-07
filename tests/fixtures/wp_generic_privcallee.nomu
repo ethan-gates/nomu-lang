@@ -1,0 +1,15 @@
+// Whole-program twin of `module_generic_privcallee`: the private helper is monomorphized in one module.
+// The `--mono=all` module build must produce the same result (40).
+fun scale(n: Int) -> Int {
+    return n * 10
+}
+
+fun scaleIt<T>(tag: T, n: Int) -> Int {
+    return scale(n)
+}
+
+fun main() {
+    let r = scaleIt(false, 4)
+    print(r)        // 40
+    print("\n")
+}

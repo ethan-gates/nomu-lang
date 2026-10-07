@@ -53,7 +53,9 @@ LLVM leaves (`NOMU_DUMP_LLVM` → `.post.ll`) before adding a pass.
     the inliner); **(b)** bounded same-module argument explosion (the object's fields passed as separate
     `p1` args, à la LLVM `argpromotion` — internal-linkage, load-only, clone-based, no cross-module reach);
     **(c)** frame roots / `gcroot`-style pinned slot with a field pointer-map the collector scans (a second
-    root path parallel to the SSA-value statepoints the GC substrate rests on); **(d)** promote into a
+    root path parallel to the SSA-value statepoints the GC substrate rests on) — now homed in
+    [176 shaped GC roots](176-shaped-gc-roots.md) §176.3, the same shape-aware root path the bit-stealing
+    `String` ([121](121-string-utf8-model.md)) rests on; **(d)** promote into a
     fiber-local `p1` region reclaimed at frame exit (uniform ABI, composes across calls). **Runtime finding
     gating (d):** allocation today is **per-carrier** (the TLAB bump, `_Thread_local` per carrier — Go
     `mcache` / MMTk per-mutator), and fibers **migrate** across carriers via a single shared run queue, so
@@ -64,8 +66,11 @@ LLVM leaves (`NOMU_DUMP_LLVM` → `.post.ll`) before adding a pass.
     not built it. Prior art: non-moving collectors (Go stack maps, Julia GC frames, Boehm) and refcounting
     (Swift SIL interprocedural EA → `alloc_ref [stack]`) pass such pointers freely because nothing
     relocates; moving-GC JITs (HotSpot) inline then scalar-replace and **bail to heap** on a non-inlined
-    escape. Routes (b)/(c)/(d) each touch either the GC-root model or the allocation model; the choice is a
-    148-level decision parked until the inference track (164) finishes.
+    escape. Routes (b)/(c)/(d) each touch either the GC-root model or the allocation model. The inference
+    track this was parked behind ([164](164-formal-inference-stage.md)) is done, and route (c) is now
+    chosen and homed in [176 shaped GC roots](176-shaped-gc-roots.md) §176.3 — a shape-aware root path
+    shared with the bit-stealing `String` ([121](121-string-utf8-model.md)); consuming it here is this
+    item's remaining codegen work.
 - **Scalar promotion — in-place field mutation of a φ value** `[M · deferred]` `[§7.3.1 A1]` — a
   loop-carried object *both* reassigned to fresh *and* mutated in place needs field-level joins (full
   per-field mem2reg). Rare pattern; bails to heap today (sound).

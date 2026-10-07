@@ -1,0 +1,11 @@
+// A public generic whose body calls a **private** (module-only) helper (task 100.5.4). `scale` is absent
+// from the `.nmi` (interface-invisible), so a consumer's Sema never sees it. Under `--mono` the producer
+// ships `scale`'s body in the `.bir` transitive closure and the consumer emits it locally (origin-keyed,
+// internal), so the specialized `scaleIt<Bool>` calls a local `lib@scale` — no cross-object dependency.
+fun scale(n: Int) -> Int {
+    return n * 10
+}
+
+public fun scaleIt<T>(tag: T, n: Int) -> Int {
+    return scale(n)
+}

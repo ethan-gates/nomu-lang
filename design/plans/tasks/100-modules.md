@@ -648,17 +648,165 @@ specialization dial). Two carried-forward **interims**, both owned by other phas
 
 ### 100.5 — Specialization dial + release mode
 
-Restore monomorphized performance under separate compilation via the flag-driven dial.
+Restore monomorphized performance under separate compilation. The full control surface + its semantics are
+pinned in the contract doc ([`../../language/modules.md`](../../language/modules.md), "Specialization
+control"); this section carries the implementation.
 
-- 100.5.1 — `.bir` body-IR serialization (bespoke, keyed by generic id).
-- 100.5.2 — `--mono` flag + mode defaults (debug=none, release=a specialization spectrum along the
-  dial, not a guarantee of full monomorphization — the erased witness path can still run in release,
-  so its performance is a release-mode property); flag in the cache key.
-- 100.5.3 — Cross-module specialization: consuming module reads deps' `.bir`, specializes its used
-  instances; call sites dispatch specialized vs witness.
-- 100.5.4 — Link-fold duplicate instances (COMDAT/weak symbols).
-- 100.5.5 (tests) — Release perf parity with whole-program mono (golden/perf); debug-fast and
-  release-specialized both correct.
+**Surface (decided — see modules.md).** Two axes: a **consumer** build flag (`--mono`, debug=none /
+release=specialize) for the generics a module consumes, and a **producer** in-source surface for a module's
+own generics. **Dynamic (witness) is the default; specialize is opt-in** — the contextual modifier keyword
+**`mono`** marks a generic specializable (ships `.bir`); unmarked generics are witness-only
+cross-module (in-module callers still monomorphize). A top-level `specialize <Instance>`
+directive lists prespecialized instances. **Prespecialization constraint:** the directive must be
+**top-level** and must appear in the **file where the generic is declared** (producer-owned, co-located; a
+consumer cannot prespecialize a dependency's generic). A prespecialized instance is emitted into the
+producer's object and **advertised in the `.nmi`**; at the consumer's compile, a call at a known concrete
+type binds to the prebuilt symbol **even under `mono=none`** — the advertised prespecialization overrides
+the consumer dial (deterministic, hermetic, always safe). A witness-default generic that prespecializes its
+hot instances is the stdlib pattern.
+
+**Release mechanism: per-module specialization + COMDAT fold (decided — B).** Release compiles every module
+with `--mono` and the linker folds the duplicate specializations, which already yields whole-program-mono
+output — so no separate link-time pass is needed for parity. The specialized symbol is producer-qualified +
+type args, so copies emitted by different consumers are byte-identical (deterministic specialization) and fold
+via COMDAT / coalesced weak symbols. **No sibling piggyback:** a module's witness calls are a per-module
+commitment, never opportunistically redirected to a sibling's specialization at link. A deterministic
+whole-program specialization / devirt pass (LLVM WPD / ThinLTO model) is a **deferred build-efficiency
+optimization** — it dedups the specialization *work*, not the binary, and does not change output — so it is
+not a v1 phase.
+
+**A — `.bir` reference re-resolution (design).** When a consumer specializes an imported generic it injects the
+producer's NOIR body and substitutes the concrete type. That body references other decls, and the design is to
+make those references speak the *existing* cross-module vocabulary rather than invent a new namespace mechanism:
+- **Serialize:** the producer canonicalizes every reference in the shipped body to an **origin-keyed absolute
+  identity** (the `ExternalName` `origin@name` scheme, 100.2.3.2) — a local→absolute rewrite.
+- **Inject:** the consumer resolves each origin key with the resolver it already uses for direct imports —
+  external symbol (public callee / dep), interface-reconstructed type (`interfaceToDecls`, origin-keyed so a
+  `producer@Widget` never collides with the consumer's `Widget`), conformance, or type-param substitution — then
+  hands the result to `Monomorphize` + the normal pipeline. The `.bir` is a **self-contained closure unit**
+  (internal refs by local index, external refs by origin key; §100.5.1 unit format).
+- **Conformance provenance** is resolved by the **orphan rule** (interfaces.md §2 / generics.md §11): a bounded
+  specialization's `T: I` conformance lives in `owner(T)` or `owner(I)`, both already in the consumer's
+  transitive closure — a deterministic lookup, no ambiguity.
+- **Release input closure widens to the transitive `.nmi`.** To resolve a shipped body's references the consumer
+  *loads* the transitive `.nmi` closure the body reaches — all within its *already-existing* dependency closure
+  (the producer's deps ⊆ the consumer's transitive deps, since it depends on the producer). No new dependencies,
+  no visibility change; only the set of interfaces loaded for the specialization pass grows. So the **release**
+  compile's input set = transitive `.nmi` + deps' `.bir`, vs **debug** = direct `.nmi`. This must show up in the
+  Bazel action inputs and the 172 cache key.
+- **Version coherence is required.** Re-specializing against `otherdep@bar` is correct only if the consumer's
+  `otherdep` is the same build the producer canonicalized against; the repo-wide single-version policy provides
+  this, and the `.bir`'s cache validity keys on the transitive interface hashes it was built against. A body
+  references only *public* symbols of its deps (visibility rules), so the resolution boundary is always
+  interface-advertised — the consumer never needs transitive-private info.
+
+- 100.5.1 — `.bir` body-IR serialization (bespoke, NOIR generic bodies — the pre-mono form `Monomorphize`
+  consumes; deterministic, reusing the `.nmi` serializer). **Closure (decided):** ship generic/nested-generic
+  bodies; a **non-generic** private callee is instead **exported** with external linkage but kept
+  **interface-invisible** — absent from the `.nmi` public surface, so Sema never resolves a consumer-source
+  reference to it (only the injected `.bir` body holds its producer-qualified name); the `@usableFromInline`
+  linkage effect, optionally marked hidden/`private_extern` so it never enters a dynamic symbol table. Access
+  from outside the specialized generic is structurally impossible (it has no nameable identity in the consumer).
+  **Done (first increment):** NOIR gained synthesized `Codable` (over `Type`/`Span`/`Visibility`/`BinOp`; a
+  decoded `Span` carries offsets only, no `SourceMap`); the `.bir` is JSON (as the `.nmi` is, bespoke binary
+  still 162) in `src/interface/BodyInterface.swift` — `serializeBIR`/`parseBIR` + a version gate +
+  round-trip/determinism tests. Ships public generic **free functions**; the closure's private-callee and
+  nested-generic bodies, and the origin-keyed local-index table, ride the body-reference re-resolution work.
+- 100.5.2 — `--mono` flag + mode defaults (debug=none; release=specialize-all to start, the threshold
+  spectrum is [145](145-monomorphization-cost.md); the erased witness path still runs in release, so its
+  perf is a release-mode property). Flag in the build cache key ([172](172-incremental-build-cache.md)).
+  **Done:** `MonoMode { none, edge, all }` on `EmitOptions`, parsed from `--mono=…`, `effectiveMono`
+  resolving the default against `-O` (debug=none / release=all). Not yet in the 172 cache key (172 is
+  design-first). `edge` vs `all` is **live** (100.5.4): `all` injects the whole shipped closure, `edge`
+  injects only the consumer's directly-called generics (+ their private callees), leaving nested public
+  generics on the witness path. The depth *policy* may later fold into 145.
+- 100.5.3 — Producer surface: parse + check the contextual policy keyword and the top-level
+  `specialize <Instance>` directive (enforce top-level + same-file-as-declaration + bounds satisfaction),
+  emit prespecialized instances into the producer object (linkonce_odr), and advertise them in the `.nmi` as a
+  per-instance `(generic, type-args)` set in the **ABI section** (decided — C: a prespecialized instance is an
+  additional exported concrete symbol, and its removal must invalidate dependents, so it is ABI-relevant; the
+  symbol name is derived by mangling, not stored; matching reuses the canonical type encoding). Coarse
+  per-module ABI invalidation is accepted for v1 (finer per-symbol invalidation → 172/136).
+- 100.5.4 — Cross-module specialization (consumer, `--mono`): read deps' `.bir`, inject the imported generic
+  bodies into the consumer's NOIR module so `Monomorphize` specializes the used instances, then route call
+  sites to the specialized symbol (vs the erased witness symbol) — including binding to a producer's
+  **advertised prespecialization** even under `mono=none`.
+  **Done (first milestone):** `src/midend/CrossModuleSpecialize.swift` (`injectImportedTemplates`) injects a
+  dep's `.bir` function templates under their origin-keyed name (`lib@id`, the `ExternalName` encoding the
+  call site already uses) at **internal** visibility, so `Monomorphize` specializes `lib@id<Int>` as a local
+  def and the driver drops the name from the external generic/func sets (direct call, no erased witness). The
+  driver reads each visible dep's `.bir` and injects when `effectiveMono != none`. Fixture
+  `module-generic-fn-mono` (= `module_generic_fn` under `--mono=all`) matches the `wp_generic_fn` golden.
+  **Runs for every module (driver unified):** the driver's per-module pipeline is now one `compileModule`
+  nested function over a single topological loop — the only fork is binary (root: links, owns the
+  program-wide type maps + unqualified symbols) vs library (dependency: home-qualified object + interface).
+  The former `compileDependency` split (a thinner dependency-only path) is gone, so specialization +
+  inference/promotion run for dependencies too. Verified: in a `main → mid → leaf` chain, `__mod_mid.o`
+  carries an **undefined** `leaf_gid` under `mono=none` (erased witness) but a **locally defined**
+  `mid_leaf@gid<Int>` under `mono=all` (the dependency specialized leaf's generic into its own object).
+  **Body-reference re-resolution:** a producer-side canonicalizer (`src/interface/BodyExport.swift`,
+  scope-aware) rewrites a shipped body's references to the module's own decls into origin-keyed names
+  before serialization; prelude/builtins, locals/params, and type parameters stay bare. So a nested
+  generic call re-points at the injected `origin@callee` and specializes transitively — fixture
+  `module-generic-nested` (`relay<T>` → `echo<T>`) matches the `wp_generic_nested` golden under
+  `--mono=all` (both specialize locally).
+  **Private-callee closure:** the producer ships the automatic transitive closure — public generics plus
+  the **non-public** functions their bodies reach (`collectReferencedNames` in the driver, over the
+  canonicalized references). A private callee is injected under its origin-keyed name at its original
+  visibility, so `Monomorphize` emits it as a local def and the specialized generic calls it directly, no
+  cross-object dependency — fixture `module-generic-privcallee` (`scaleIt<T>` → private `scale`) matches
+  its `wp` twin under `--mono=all`.
+  **Generic types** work via the existing `.nmi` type reconstruction + the canonicalizer: a shipped body
+  constructing an imported generic type (`Box<T>`) specializes its layout locally (verified; not yet a
+  committed fixture).
+  **Depth dial:** `selectForDial` in the driver implements `edge` vs `all` — `edge` injects only the
+  consumer's directly-called generics (+ reachable private callees), leaving nested public generics erased;
+  `all` injects the whole closure. Fixtures `module-generic-nested-{mono,edge}` cover both legs.
+  **Remaining:** a **private generic** callee and a **method on a generic type** both fail in the
+  *producer's own* compilation today (the erased-emission path, independent of `--mono`), so specialization
+  cannot reach them until that path is extended → [171](171-modules-cleanup.md) §171.7. The `.bir`'s
+  self-contained local-index unit format (currently JSON keyed by origin name) is a serialization
+  refinement. Prespecialization binding under `mono=none` needs 100.5.3.
+- 100.5.5 — Link-fold duplicate instances (COMDAT / coalesced weak symbols; producer-qualified mangling so
+  copies fold; sound because specialization is deterministic → byte-identical copies).
+  **Done.** A specialized cross-module instance carries an **origin-keyed** name (`leaf@gid<Int>`), and
+  `definitionQualifier` (`LLVMGenCallables` + `keyAndSelf` in `SSAIRToLLVM`) now gives an origin-keyed name
+  **no consumer home-qualifier** — so every consumer that specializes the same instance emits the identical
+  producer-qualified symbol `_nomu_fn_leaf@gid<Int>`. Those definitions are set `weak_odr` (the same
+  mechanism the per-object prelude copies use), so the linker coalesces them to one. Verified with `nm -m`:
+  `main.o` and `__mod_mid.o` both carry `weak external _nomu_fn_leaf@gid<Int>` and link without a
+  duplicate-symbol error; leaf's own erased `leaf_gid` stays strong `external`. Fixture
+  `module-generic-fold` (main + mid both specialize `leaf.gid<Int>`) covers it under `--mono=all`. No
+  separate COMDAT section is needed on Mach-O — weak-ODR coalescing is the fold.
+- 100.5.6 (tests) — Release perf parity with whole-program mono (golden/perf); debug-fast and
+  release-specialized both correct; the `wp_*` differential twins extended with a `--mono=all` leg.
+- 100.5.7 (deferred, not v1) — whole-program specialization / devirt pass (LLVM WPD / ThinLTO model): a
+  build-efficiency optimization that dedups specialization *work*; per-module + COMDAT (100.5.4/.5) already
+  gives release parity, so this changes build cost, not output.
+
+**Open sub-decisions (design, before build):**
+- **Decided:** default direction is dynamic (witness) + specialize opt-in (a single positive contextual
+  keyword, no opt-out needed); a witness-default generic may prespecialize hot instances, and an advertised
+  prespecialization overrides the consumer dial. The keyword *word* is **decided: `mono`**.
+- **Decided — specialization depth is a configurable dial value.** `--mono=none|edge|all`: `edge`
+  specializes directly-called instances (nested generic calls stay witness), `all` is whole-tree. Defaults
+  debug=`none`, release=`all`. Held configurable to start while the right default is unknown; may later fold
+  into the 145 per-call-site cost model. The same depth knob governs the whole-program release pass.
+- **Decided (follows) — the `.bir` closure is (b) automatic transitive closure.** Because `edge`/`all` depth
+  is selectable and `all` needs the nested generics' bodies, `.bir` must ship the reachable private-callee +
+  nested-generic bodies — no `@usableFromInline`-style annotation (Nomu has no ABI stability, so exposing a
+  private body is build-artifact cost only, deferred to 162/136). Serialization size is the only cost.
+- **Decided — B (release mechanism): per-module specialization + COMDAT fold** yields whole-program-mono
+  output; the whole-program link-time pass is a deferred build-efficiency optimization (100.5.7), not v1.
+- **Decided — C (prespecialization advertisement): a per-instance `(generic, type-args)` set in the `.nmi`
+  ABI section**, symbol derived by mangling, matched via the canonical type encoding.
+- **Decided — keyword is `mono`**; non-generic private closure callees are **exported but
+  interface-invisible** (usableFromInline linkage effect), so they can't be accessed outside the specialized
+  generic. **`.bir` unit format:** a self-contained unit with a **per-unit local definition table**, entries
+  in deterministic name-sorted order with dense local indices; internal references encode the local index,
+  external references the origin-key; the consumer mints fresh local decls per entry and remaps indices on
+  injection. The design pass is **complete — zero residual.**
+
 - *Deliverable:* release recovers monomorphized performance; debug stays fast and incremental.
 
 ### Mini-horizon — the full prelude module → [174](174-prelude-as-packages.md)

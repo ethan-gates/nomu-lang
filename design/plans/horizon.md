@@ -1,138 +1,62 @@
-# Near-horizon — what's next, and why in this order
+# Near-horizon — the active epics
 
-The current working order. Identity numbers point into [`tasks.md`](tasks.md); this doc carries only
-the sequencing reasoning. The order is editable and separate from task identity.
+Each goal is an **epic** drawn as a dependency stack: the **end goal sits at the top**, and each item
+below it is a prerequisite of the one above. Work **bottom-up** — the bottom item is the next action, the
+top is what it all adds up to. Identity numbers point into [`tasks.md`](tasks.md), which carries the
+detail and status; this doc carries only the goals and their order. Everything not on an epic here is
+parallel/cheap work tracked in `tasks.md`.
 
-**Frame.** The core bet is a runtime — GC and scheduler — written in Nomu itself
-([128](tasks/128-self-hosting-runtime.md)): no Rust/MMTk, no C, a tiny binary, and runtime code that
-inlines into user code through the same backend. This is the differentiator behind "faster and smaller
-than Go and Swift," and it is built **now**. The earlier "build late" framing was written when Nomu had
-no memory management at all; MMTk/GenImmix now exists as a reference implementation to diff against,
-which is what makes an incremental self-host tractable. The collector algorithm
-([127 LXR](tasks/127-lxr-collector.md)) is the final question we answer *inside* the self-hosted runtime,
-reached after a self-hosted GenImmix works.
+Two epics are live. **[176](tasks/176-shaped-gc-roots.md) is the current highest priority** — the bottom
+of the strings epic, and the nearest action on either.
 
-**Two axes, sequenced.** Self-hosting is a *location* change (MMTk/Rust → Nomu); LXR is an *algorithm*
-change (GenImmix → RC-hybrid). Doing both at once multiplies two unknowns, so we hold the algorithm
-constant while moving location, then hold location constant while changing the algorithm.
+---
 
-## Now — the self-hosting foundation
+## Epic A — Self-hosted GC + runtime
 
-**Status:** 125 **built** (`RawPtr`/`Ptr<T>`), 149 **slice 1 built** (runtime-prelude "designated file" +
-call-graph closure check; remaining: codegen barrier/poll guards, `nosplit`, module designation), 150
-**150.1 (NoGC) complete** (self-hosted allocator is a selectable plan, `NOMU_GC_PLAN=nomu`, byte-identical
-to MMTk NoGC) and **150.2 (mark-verify) substantially built** (150.2.1–150.2.8; the tracer, self-hosted
-pcsp walk, and MMTk-side fingerprint oracle — full-runtime root-scanning integration handed to 128.3).
-**128.3.1** (self-hosted parked-fiber walk + scheduler-root) built + oracle-checked. **150.3 (Immix) in
-progress — 150.3.1–150.3.6 built** (region substrate + `RawPtr.toInt()`; region-structured allocator +
-LOS; line marking + verifier + `RawPtr.gcSelfhostSpace()`; **sweep reclamation — the first functioning
-self-hosted collector**, non-moving, hole-aware reuse; forwarding word + copy primitive, payload-word-0
-guard clean); **150.3.7 (evacuation + pointer fixup) next.** Whole-program automatic collection at a real
-STW is 128.3.2. Tests:
-`tools/{raw-mem,typed-ptr,raw-struct,subset,bump-alloc,rt-prelude,selfhost-gc,mark-verify,mark-verify-oracle,walk-mark,walk-multiframe,walk-parked,sched-root,immix-region,immix-alloc,immix-los,immix-line-mark,immix-sweep,immix-forward}.sh`.
+**End goal:** a hand-rolled [LXR](tasks/127-lxr-collector.md) collector running inside a runtime — GC and
+scheduler — written in Nomu itself ([128](tasks/128-self-hosting-runtime.md)): no Rust/MMTk/C, a tiny
+binary whose runtime inlines into user code through the same backend. The differentiator behind "faster
+and smaller than Go and Swift."
 
-- [125 Unsafe raw memory](tasks/125-unsafe-raw-memory.md) — the raw-pointer / untyped-memory surface the
-  collector and allocator manipulate. The first hard prerequisite. (Its earlier "byte buffer for
-  String/Array" scope was a mis-bundling; the stdlib buffer machinery already exists in codegen. The real
-  deliverable is the unsafe surface the runtime needs.)
-- [149 Runtime-subset mechanism](tasks/149-runtime-subset.md) — the pragmas + checking that let runtime
-  code avoid recursively invoking the services it implements (no implicit GC alloc, no write barrier, no
-  unplanned safepoint, controlled stack growth). Go's `//go:nosplit` / `nowritebarrier` / `noescape`
-  analog. Needed before any collector code can be written in Nomu.
+**Order rule:** self-hosting is a *location* change (MMTk/Rust → Nomu); LXR is an *algorithm* change
+(GenImmix → RC-hybrid). Hold the algorithm constant while moving location, then hold location constant
+while changing the algorithm — so the two unknowns never multiply.
 
-## Next — the self-hosted GC, climbed as a ladder
+```
+   127    LXR — RC-primary reclamation, on Immix backing          ◀ end goal
+    ▲ requires
+   —      retire MMTk (kept live as the baseline until here)
+   158/159 GC benchmarking + packaging, both plans live
+   100    modules (proven surface; unblocks stdlib + prelude emission)
+   155    test harness (the feedback loop for everything above)
+   150.4  GenImmix — nursery + write barrier + remembered set
+   128.1  scheduler self-host + bootstrap assembly floor
+          (interleaved here: GenImmix's STW reads every carrier's safepoint context,
+           and the generational barrier co-designs with the mutator path)
+   150.3  Immix — evacuation + pointer fixup (150.3.7); 150.3.1–.6 built   ◀ next
+```
 
-[150](tasks/150-selfhosted-gc-ladder.md) brings the collector up one mechanism at a time, each rung
-diffed against the matching MMTk plan as a correctness oracle (the NoGC→GenImmix ramp that worked for the
-MMTk integration, one level down):
+MMTk/GenImmix already exists as the reference implementation each rung diffs against, which is what makes
+the incremental self-host tractable.
 
-1. **NoGC** — **complete.** Bump allocator + all plumbing, in Nomu; a selectable plan (`NOMU_GC_PLAN=nomu`)
-   handing out managed objects via `ptrtoint`→`inttoptr`, byte-identical to MMTk NoGC.
-2. **Mark-verify** — **next.** Trace from roots, mark, and diff a live-set fingerprint against MMTk across
-   separate runs (clean-separation method, `selfhosted-gc.md` §1/§6). Proves root scanning + tracing with
-   no reclamation or movement. A checkpoint; the heap only grows.
-3. **Immix (non-generational)** — first real collector: line/block reclamation + evacuation (movement +
-   pointer fixup) + region management. Diff vs MMTk Immix.
-4. **GenImmix** — add the nursery, write barrier, remembered set. Diff vs MMTk GenImmix.
+---
 
-- [127 LXR](tasks/127-lxr-collector.md) — the final rung: swap reclamation to RC-primary once self-hosted
-  GenImmix is solid. LXR uses Immix backing, so rung 3's region machinery carries in; only the
-  reclamation policy changes. The ladder doubles as the experiment — real footprint/throughput numbers
-  for Immix and GenImmix in Nomu tell us whether LXR's extra complexity earns its keep.
+## Epic B — Production-grade strings
 
-**The ladder pauses at Immix, and the scheduler self-host is interleaved before GenImmix.** Rung 3 Immix
-is a real functioning collector — it reclaims and moves — so it is a natural resting point. At that point
-the work turns to the scheduler half (128.1), for two reasons that make the interleave the right order:
-GenImmix's stop-the-world over all mutators (128.3.2) reads every running carrier's saved safepoint
-context, which is the self-hosted scheduler's machinery; and the generational write barrier co-designs
-with the mutator/carrier path. So the order is **Immix (150.3) → scheduler self-host (128.1) → GenImmix
-(150.4) → test harness (155) → modules (100) → GC benchmarking → retire MMTk → LXR (127)**. Immix runs
-hosted on the existing C scheduler in the meantime; GenImmix lands on the self-hosted one. The four steps
-after GenImmix are their own ordered run-up, below.
+**End goal:** a real stdlib [`String`](tasks/121-string-utf8-model.md) — UTF-8, value semantics,
+small-string optimization, zero-copy literals — retiring the leaking C-primitive builtin. A hand-rolled
+16-byte bit-stealing struct with 15-byte SSO and a moving heap buffer.
 
-## Later under self-hosting — the scheduler + bootstrap floor
+```
+   121    String — the bit-stealing stdlib type; retires the builtin   ◀ end goal
+    ▲ requires
+   176    shaped GC roots — value-conditional scanning + relocation takeover
+          (decouples rooting/placement from addrspace(1); the enabler the bit-stealing word needs)  ◀ next
+```
 
-- The M:N scheduler in Nomu and the per-arch **bootstrap assembly floor** (context switch, entry / TLS /
-  stack setup) stay under [128](tasks/128-self-hosting-runtime.md), and now come **after Immix, before
-  GenImmix** (the interleave above). The GC ladder runs hosted alongside the existing runtime through
-  Immix; the bootstrap floor pairs with self-hosting the scheduler.
-  [104 fiber stacks](tasks/104-fiber-stack-strategy.md) rides that later work.
-- **MMTk retires after a four-step run-up, not immediately after GenImmix.** GenImmix reclaiming + moving
-  generationally in Nomu and matching the oracle is the entry to the run-up, below — MMTk stays live as the
-  benchmarking baseline until step 3.
-
-## After GenImmix — the ordered run-up to MMTk removal
-
-Once self-hosted GenImmix lands and matches the MMTk GenImmix oracle, four steps run in order before MMTk
-is removed. This ordering moves modules **earlier** than the previous plan implied — the language's bet is
-proven programmer surfaces over unproven memory internals, and modules are the surface the stdlib and the
-compile pipeline both now want.
-
-1. **Test harness ([155](tasks/155-integration-suite-harness.md)) first.** The integration suite is 60+
-   hand-rolled `tools/*.sh` scripts driven by a copy-pasted loop, with per-run env duplicated by hand — the
-   source of silent-green hazards and the lever-interaction confusion the GenImmix bring-up hit repeatedly.
-   It is the primary feedback loop for every step below, so a single-entry, parallel, source-declared-env
-   harness pays for itself immediately across modules, benchmarking, and the removal pass.
-2. **Modules ([100](tasks/100-modules.md)) — needed sooner than later.** A proven programmer surface the
-   language leans on to make the unproven-runtime bet approachable. It also unblocks demand-driven prelude
-   emission (the ~1.7s/compile prelude re-emit the harness measures, [136](tasks/136-incremental-compilation.md))
-   and the real, extensible `Array`/`String` stdlib types ([120](tasks/120-stdlib-core.md)/[121](tasks/121-string-utf8-model.md)).
-3. **GC benchmarking.** Benchmark self-hosted GenImmix against MMTk GenImmix — mutator throughput, GC pause
-   distribution, peak footprint — while **both plans are live** (`selfhosted-gc.md` §7); retiring MMTk first
-   removes the baseline. This is also where **GC packaging ([158](tasks/158-gc-packaging.md))** lands — the
-   trigger mechanism formalized carefully, so it hosts several memory models without biasing any of them.
-   What is **shared** is the trigger→request protocol
-   (a typed request carrying the collection kind and whether it needs a stop-the-world or a concurrent
-   assist, plus the safepoint/park contract) and one invariant: the active plan's coordinator services every
-   trigger that plan can raise (the GenImmix bring-up deadlocked when a trigger posted to a coordinator that
-   was not running). What is **per-plan** is the coordinator itself: GenImmix, non-generational Immix, and
-   simple mark-sweep are stop-the-world tracing collectors and can share an STW coordinator, while LXR is
-   mostly-concurrent and brings its own — so the mechanism never forces a concurrent collector into an STW
-   pause shape. Each plan is then benchmarked on its native coordinator, which is the apples-to-apples
-   comparison the language's memory-model experiment needs. The throughput/pause/footprint numbers come from
-   **GC observability ([159](tasks/159-gc-observability.md))**, built alongside — structured per-collection
-   stats, phase tracing, and pause timing (the durable form of the debug scaffold the GenImmix bring-up needed).
-4. **MMTk removal**, then [127 LXR](tasks/127-lxr-collector.md) proceeds inside the self-hosted runtime
-   (keeping MMTk as a test-only oracle is a separate open question, `selfhosted-gc.md` §7).
-
-## In parallel — frontend + stdlib, independent of the runtime work
-
-Usability work, proceeding independently of the core bet:
-
-- [117 `for … in`](tasks/117-for-in-iteration.md), [115 error handling `?`](tasks/115-error-handling.md),
-  and cheap papercut [119 float literals](tasks/119-float-exponent-literals.md).
-  [114 grouping parens](tasks/114-grouping-parens.md) and [143 parser recovery](tasks/143-parser-error-recovery.md)
-  are shipped (143's continue-into-Sema tail rides [137](tasks/137-tooling-lsp-formatter.md)).
-- [151 methods on generic types](tasks/151-generic-type-methods.md) — **shipped.** Instance methods, computed
-  properties, and `static fun` now work on generic structs/classes/enums (the frontend fed the mono+codegen
-  halves that already handled them). This unblocks the two items below and the real-iterables form of 117.
-  Tails: type-arg inference for generic statics, and the D6 by-value read limit.
-- Real, extensible [120 Array](tasks/120-stdlib-core.md) / [121 String](tasks/121-string-utf8-model.md) as
-  Nomu-source types. Today they are codegen intrinsics you cannot extend, and String leaks via immortal
-  buffers; making them real Nomu types wants a *safe* language-level buffer type, tracked with the stdlib
-  work. **Rides [151](tasks/151-generic-type-methods.md)** (a real `Array<T>` needs methods on a generic type).
-
-## Settle cheaply, regardless
-
-- [142 IR hardening](tasks/142-ir-pipeline-hardening.md) — cheapest while SSAIR is young; underlies
-  incremental compilation later.
+The 121.1 immortal+heap interim (where the pointer word is uniformly a managed-or-null buffer pointer)
+rides the existing GC and can precede 176; 176 gates the bit-stealing `small`/SSO case. **Unblocks:**
+compiler-inferred COW ([123](tasks/123-copy-on-write.md)) and the hand-written manifest/YAML parser
+([163](tasks/163-manifest-yaml.md)), which motivated the epic. The same shaped-root mechanism also clears
+the addrspace-across-calls wall for interprocedural stack promotion
+([148 §148.1](tasks/148-ssair-optimizer-tier.md)), so 176 pays off beyond strings.
