@@ -13,6 +13,22 @@ enum Option<T> {
     case none
 }
 
+// A managed, relocatable single-object buffer: a fixed `Header` plus a variable-length tail of `Element`,
+// in one allocation (`{ type-id, cap, Header, Element[cap] }`). The shared storage primitive under `Array`,
+// heap `String`, and a future `Dictionary` (task 180, design/plans/tasks/180-managed-buffer.md). An ordinary
+// generic reference type for the type system; its four operations (`create`, `capacity`, `headerPtr`,
+// `elementPtr`) are compiler intrinsics — the magic is the tail-allocation + the GC descriptor, confined
+// there. Header and element access is raw (`RawPtr`); consumers build typed, bounds-checked APIs on top.
+class ManagedBuffer<Header, Element> {
+}
+
+// The zero-field header for a `ManagedBuffer` that needs no per-buffer metadata beyond `cap` — a
+// `headerSize = 0` buffer, byte-identical to the historical ad-hoc kind-1 buffer. Heap `String` storage is a
+// `ManagedBuffer<EmptyHeader, UInt8>` (task 180.4; 121 later grows this into a `StringHeader` carrying the
+// isASCII / scalar-count cache), and `Array`'s buffer migrates onto `ManagedBuffer<EmptyHeader, T>`.
+struct EmptyHeader {
+}
+
 // The outcome of a failable operation: a success value (`ok`) or an error (`err`).
 // Error handling is explicit `match`/`switch` — no `?` operator, no typed throws
 // (deferred, generics.md §2). Payloads are labelled: `Result.ok(value: x)` /

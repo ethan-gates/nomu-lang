@@ -1,0 +1,40 @@
+// Task 176 Stage 1 site 2 — a String *field inside a heap class* survives moving collections, scanned
+// through the enumerator's shaped-field fold (`nomu_gc_live_offsets` recurses into the field's kind-2
+// sub-shape). The companion to `gc_string` (which holds the String as a local): here the live String rides
+// a `Holder` object's field across every collection. `Holder` carries no direct managed pointer — its only
+// managed content is the conditional `word0` of its `String` field — so if the fold failed to reach that
+// field the buffer would be lost or mis-scanned and the readback hash would diverge.
+//
+// The String is `immortal` today (literal/concat → pinned immortal buffer), so the fold reads the field's
+// tag and contributes no managed offset; the object and its off-heap buffer survive the self-hosted sweep.
+// `h` is held live while the inner loop over-allocates garbage past the 256 MiB heap, forcing collections
+// with `h` (and its String field) live, and its field hash is folded on every iteration. Run with
+// NOMU_NO_ESCAPE=1 so `Holder` and the garbage Boxes are real heap objects (the fold needs `Holder` on the
+// heap with a descriptor). The heap-relocation leg of this case lands with the `heap` String flip (176.2).
+class Box {
+  var v: Int
+}
+
+class Holder {
+  var s: String
+}
+
+fun main() {
+  let h = Holder(s: concat("hello", " world"))
+  var i = 0
+  var checksum = 0
+  while i < 3000 {
+    // Garbage to drive collection: 3000 × 8192 × 16 B ≈ 393 MiB ≫ the 256 MiB heap, forcing collections
+    // while `h` (and its String field) is live.
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 8192 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+    checksum = checksum + h.s.hash     // read the field across each collection; the fold must scan it on every GC
+    i = i + 1
+  }
+  print(checksum)
+  print("\n")
+}

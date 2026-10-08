@@ -26,6 +26,14 @@ final class SSAIRToLLVM {
     var values: [Int: LLVMValueRef] = [:]          // SSAValue.id → LLVM value
     var blockMap: [Int: LLVMBasicBlockRef] = [:]   // SSABlock.id → LLVM basic block
     var blocksById: [Int: SSABlock] = [:]          // SSABlock.id → the block (for edge φ wiring)
+    // Shaped-value frame homes (task 176 Stage 3, Model 1): a `String` value live across a safepoint lives
+    // in a 16-byte address-taken alloca — its home. Reads load `{ word1 (ordinary), word0 (volatile) }` from
+    // it (the volatile word0 re-reads the collector's post-relocation writeback), writes store to it. The
+    // home's address goes into each spanning safepoint's `"deopt"` bundle, keeping it memory-resident and
+    // recording it as a shaped root. A `String` that never spans a safepoint stays a pure SSA pair (absent
+    // here). Populated per function from `computeShapedLiveness`.
+    var stringHome: [Int: LLVMValueRef] = [:]      // SSAValue.id → its 16-byte home alloca (strTy)
+    var shapedLive: ShapedLiveness?                // current function's shaped-value liveness
     // φ incomings, deferred until every block's instructions are lowered: a branch argument may be
     // defined in a block that lowers after the branch's block (e.g. a loop latch whose block id
     // precedes the case block that computes the carried value), so resolving `val(arg)` eagerly would
@@ -197,9 +205,48 @@ final class SSAIRToLLVM {
     // egress bug, not user error — report it as a compile error (a null placeholder keeps lowering from
     // trapping; the error aborts the emit before the module is used).
     func val(_ v: SSAValue) -> LLVMValueRef {
+        // A homed shaped value reads from its frame alloca (task 176 Stage 3, Model 1): `word1` ordinary,
+        // `word0` a volatile load so the collector's post-relocation writeback is observed rather than a
+        // stale pre-safepoint value being forwarded. Reconstruct the two-word aggregate from the slot.
+        if let home = stringHome[v.id] {
+            let w0p = e.structGEP(e.strTy, home, 0)
+            let w1p = e.structGEP(e.strTy, home, 1)
+            let w0 = LLVMBuildLoad2(b, e.i64, w0p, "str.w0")!
+            LLVMSetVolatile(w0, 1)
+            let w1 = LLVMBuildLoad2(b, e.i64, w1p, "str.w1")!
+            var agg = LLVMBuildInsertValue(b, LLVMGetUndef(e.strTy), w0, 0, "str.lo")!
+            agg = LLVMBuildInsertValue(b, agg, w1, 1, "str.hi")!
+            return agg
+        }
         if let x = values[v.id] { return x }
         e.fail("7.2.3: internal — unmapped SSA value id=\(v.id) (\(v.type)) in '\(curFnName)'", e.zeroSpan)
         return LLVMConstNull(e.i8ptr)
+    }
+
+    // Store a produced two-word String value into `id`'s home alloca, if it has one.
+    private func storeHomeIfShaped(_ id: Int, _ value: LLVMValueRef) {
+        if let home = stringHome[id] { LLVMBuildStore(b, value, home) }
+    }
+
+    // The `"deopt"` shaped-root operands for the homed values in `ids` (task 176 Stage 4): per root an i32
+    // shape ordinal (0 = String, the only shaped type today) and its home-slot pointer. The walker maps the
+    // ordinal to the kind-2 descriptor and scans the slot conditionally.
+    private func shapedDeoptOps(_ ids: Set<Int>) -> [LLVMValueRef?] {
+        var ops: [LLVMValueRef?] = []
+        for id in ids.sorted() {
+            guard let home = stringHome[id] else { continue }
+            ops.append(LLVMConstInt(e.i32, 0, 0))
+            ops.append(home)
+        }
+        return ops
+    }
+
+    // The loop-header safepoint poll, recording the shaped values live at the header as shaped roots on the
+    // poll's statepoint (task 176). A header with no live homed shaped value emits the plain poll.
+    private func emitHeaderPoll(_ blockId: Int) {
+        let ops = shapedDeoptOps(shapedLive?.liveInBlock[blockId] ?? [])
+        if ops.isEmpty { e.emitSafepointPoll(); return }
+        e.emitSafepointPollWithDeopt(ops)
     }
 
     // MARK: - Entry
@@ -248,6 +295,35 @@ final class SSAIRToLLVM {
         // here exercises the VWT capability (unreferenced ones dead-strip).
         for name in e.structMap.keys.sorted() where name.contains("<") { e.valueWitness(.named(name, .struct_)) }
         for name in e.enumMap.keys.sorted() where name.contains("<") { e.valueWitness(.named(name, .enum_)) }
+
+        // The shared kind-2 shaped descriptor for every `String` value (task 121/176): register it so the
+        // discriminant-keyed map is serialized and emitted (weak-folded across modules). The collector
+        // consumes it once String flows as a root/field (176.1); emitting it here exercises the kind-2
+        // serialization path and lands the descriptor in the binary.
+        // The String kind-2 shaped descriptor + a global holding its type-id. A String *value* carries no
+        // object header, so nothing stamps this descriptor's symbol — without a reference the linker would
+        // dead-strip it, and the walker's ordinal→descriptor resolution would find no kind-2 record. The
+        // global both pins it (its initializer is a reloc against the descriptor) and lets the runtime resolve
+        // shape ordinal 0 → String by a direct read instead of scanning for "the sole kind-2" (task 176.2).
+        let shapeId = e.stringShapeId()
+        let shapeTypeIdGlobal = LLVMGetNamedGlobal(e.mod, "__nomu_string_shape_typeid")
+            ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_string_shape_typeid")!
+        LLVMSetInitializer(shapeTypeIdGlobal, e.descOffsetHeader(shapeId))
+        LLVMSetGlobalConstant(shapeTypeIdGlobal, 1)
+        LLVMSetLinkage(shapeTypeIdGlobal, LLVMWeakODRLinkage)
+
+        // The heap `String` buffer descriptor (task 176.2) + a global holding its type-id. `rt_str_concat`
+        // is C and can't compute a link-time descriptor offset, so the compiler emits the offset into
+        // `__nomu_stringstorage_typeid` (weak-folded across modules) for the C floor to read when it stamps a
+        // `StringStorage` header. Registered here so the descriptor is emitted even when no Nomu code names it.
+        let ssId = e.stringStorageTypeId()
+        // Get-or-add: `emitConcat` may have already declared this global while lowering a concat body; set the
+        // initializer on that declaration rather than minting a suffixed duplicate that stays undefined.
+        let ssTypeIdGlobal = LLVMGetNamedGlobal(e.mod, "__nomu_stringstorage_typeid")
+            ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_stringstorage_typeid")!
+        LLVMSetInitializer(ssTypeIdGlobal, e.descOffsetHeader(ssId))
+        LLVMSetGlobalConstant(ssTypeIdGlobal, 1)
+        LLVMSetLinkage(ssTypeIdGlobal, LLVMWeakODRLinkage)
 
         // The link-time offset-as-id descriptor section (task 100.4.7): every module emits its own
         // types' descriptors, weak duplicates folding at link — so a dependency's heap types are all
@@ -403,6 +479,7 @@ final class SSAIRToLLVM {
         let (key, _, _, _) = keyAndSelf(f)
         guard let c = e.callables[key] else { return }
         values = [:]; blockMap = [:]; blocksById = [:]; spawnHandles = [:]; pendingIncomings.removeAll(keepingCapacity: true)
+        stringHome = [:]; shapedLive = nil
         curVWTParams = [:]; curPWTParams = [:]; curSretParam = nil; curReturnType = nil
         curProducerSave = nil; curBackEdges = [:]; headerSaveSlot = [:]; curBlockId = -1
         curFnName = f.name
@@ -446,6 +523,11 @@ final class SSAIRToLLVM {
             }
         }
 
+        // Shaped-value frame homes (task 176 Stage 3): a `String` value live across a safepoint gets a
+        // 16-byte alloca home, zero-initialized so a not-yet-stored slot scans as the empty `small` string
+        // (Stage 5 zero-scan safety). Reads/writes route through the home (`val`/`define`).
+        setUpShapedHomes(f)
+
         // Producer-internal typed-root prologue (task 100.4.3.6): if this erased frame constructs a
         // composed `T`-carrying value, capture the shadow-top at entry so the epilogue can unwind exactly
         // the frame's own pushes. Emitted once, at the end of the entry block (after its φs, before its
@@ -472,9 +554,14 @@ final class SSAIRToLLVM {
         let headers = f.noSafepoint ? Set<Int>() : loopHeaders(f)
         for blk in f.blocks {
             LLVMPositionBuilderAtEnd(b, blockMap[blk.id])
+            // A loop-carried String arrives as a homed block param (a φ); write it into its slot at block
+            // entry so the slot holds the current value before the header poll records it (task 176).
+            for p in blk.params {
+                if let home = stringHome[p.id], let phi = values[p.id] { LLVMBuildStore(b, phi, home) }
+            }
             if headers.contains(blk.id) {
                 e.setDebugLoc(blk.insts.first?.span ?? blk.terminator.span)
-                e.emitSafepointPoll()
+                emitHeaderPoll(blk.id)
             }
             // Loop-scoped typed-root save (task 100.4.3.6): record the shadow-top on entry to this loop
             // header, so the back-edge can restore it and clear the iteration's producer pushes.
@@ -488,6 +575,58 @@ final class SSAIRToLLVM {
 
         // Every value is now defined; wire the deferred φ incomings (block-argument edges).
         flushIncomings()
+    }
+
+    // Compute the shaped-value liveness and allocate a 16-byte home for every `String` value that crosses a
+    // safepoint — any `isSafepointInst` (a non-leaf call, conservatively every call, plus the allocation-
+    // forming kinds that can trigger a collection) or a loop-header poll. The homing set must match the
+    // recording set (`lowerBlock` records at exactly the same `isSafepointInst` sites), or a string crossing
+    // an allocation but no call would be recorded with no home and silently dropped. Each home is
+    // zero-initialized at entry.
+    private func setUpShapedHomes(_ f: SSAFunction) {
+        let live = computeShapedLiveness(f)
+        shapedLive = live
+        // A String-typed value produced by an address op (`fieldAddr`/`elementAddr`/`stackAlloc`) is a `p1`
+        // pointer *to* a String slot, not a String value — its `: String` annotation is the pointee type. Such
+        // a pointer is an ordinary `addrspace(1)` derived root RS4GC already relocates, so it must not be homed:
+        // homing would store the pointer into a 16-byte slot and later reload a bogus String value from it (the
+        // `h.s = …` field-store path). Exclude these ids from the homed set.
+        var addrOnly = Set<Int>()
+        for blk in f.blocks {
+            for inst in blk.insts {
+                guard let r = inst.result else { continue }
+                switch inst.kind {
+                case .fieldAddr, .elementAddr, .stackAlloc: addrOnly.insert(r.id)
+                default: break
+                }
+            }
+        }
+        var homed = Set<Int>()
+        for blk in f.blocks {
+            for (i, inst) in blk.insts.enumerated() {
+                guard isSafepointInst(inst.kind) else { continue }
+                var crossing = live.liveOutInst[blk.id]?[i] ?? []
+                if let r = inst.result { crossing.remove(r.id) }   // the inst's own result does not cross it
+                homed.formUnion(crossing)
+            }
+        }
+        for h in loopHeaders(f) { homed.formUnion(live.liveInBlock[h] ?? []) }
+        homed.subtract(addrOnly)
+        guard !homed.isEmpty, let entry = f.blocks.first else { return }
+
+        // Allocas land at the entry block (via `entryAlloca`); zero-init stores go at the entry block end,
+        // before its poll/body, so a home dominates every use and starts as the empty string.
+        LLVMPositionBuilderAtEnd(b, blockMap[entry.id])
+        for id in homed.sorted() {
+            let home = e.entryAlloca(e.strTy, "str.home")
+            stringHome[id] = home
+            LLVMBuildStore(b, LLVMConstNull(e.strTy), home)
+        }
+        // A homed `String` function parameter is not produced by a `define`, so seed its home from the
+        // incoming parameter value (after the zero-init so it wins).
+        for p in f.params {
+            if let home = stringHome[p.id], let v = values[p.id] { LLVMBuildStore(b, v, home) }
+        }
     }
 
     // The loop headers of a function: back-edge targets, found by a DFS that marks a node "on the
@@ -643,7 +782,18 @@ final class SSAIRToLLVM {
                 i += 2
                 continue
             }
+            // Record the shaped roots crossing a safepoint instruction, so a per-site statepoint call in its
+            // lowering carries them (task 176). `liveOutInst` is live-after; the inst's own result is new, so
+            // it does not cross. A direct user call / `concat` takes the bundle directly; an allocation routes
+            // through the `noinline` rooted-alloc variant (`rtAllocManaged`) so the bundle reaches its
+            // statepoint. The loop-header poll records roots on its own path (`emitHeaderPoll`).
+            if isSafepointInst(inst.kind) {
+                var crossing = shapedLive?.liveOutInst[blk.id]?[i] ?? []
+                if let r = inst.result { crossing.remove(r.id) }
+                e.pendingDeopt = shapedDeoptOps(crossing)
+            }
             lowerInst(inst)
+            e.pendingDeopt = nil
             i += 1
         }
         e.setDebugLoc(blk.terminator.span)
@@ -757,6 +907,7 @@ final class SSAIRToLLVM {
     private func define(_ inst: SSAInst, _ value: LLVMValueRef?) {
         guard let value = value, let result = inst.result else { return }
         values[result.id] = value
+        storeHomeIfShaped(result.id, value)   // task 176: a homed String's producer also writes its slot
     }
 
     // MARK: - Terminators (block args → φ incomings)
@@ -834,6 +985,14 @@ final class SSAIRToLLVM {
     // Wire every deferred φ incoming once all definitions exist.
     private func flushIncomings() {
         for p in pendingIncomings {
+            // `val` may emit instructions now — a homed shaped arg loads from its frame slot (task 176). Emit
+            // them at the end of the predecessor (before its terminator), not at the function's last block,
+            // so the loads sit in the edge's source block where they are dominated by the slot's store.
+            if let term = LLVMGetBasicBlockTerminator(p.pred) {
+                LLVMPositionBuilderBefore(b, term)
+            } else {
+                LLVMPositionBuilderAtEnd(b, p.pred)
+            }
             var incoming: [LLVMValueRef?] = [val(p.arg)]
             var block: [LLVMBasicBlockRef?] = [p.pred]
             LLVMAddIncoming(p.phi, &incoming, &block, 1)
@@ -1410,12 +1569,99 @@ final class SSAIRToLLVM {
             // time from the linked section (task 100.4.7); no compile-time dense count exists.
             let (fn, fty) = e.runtimeFn("nomu_gc_typecount", ret: e.i64, params: [], varArg: false)
             return e.buildCall(fn, fty, [])
+        case "__gcDescSize":
+            // The descriptor record byte size (task 180): one runtime source for the record stride.
+            let (fn, fty) = e.runtimeFn("nomu_gc_descsize", ret: e.i64, params: [], varArg: false)
+            return e.buildCall(fn, fty, [])
+        case "__managedBufferCreate":
+            // task 180: tail-alloc `{ type-id, cap, Header, Element[cap] }`. `Header`/`Element` come from the
+            // result's ManagedBuffer type; size = 16 + headerSize + cap*stride. The returned `p1` is the
+            // ManagedBuffer reference (same representation as any class), rooted via `rtAllocManaged`.
+            guard let (hdr, elem) = e.managedBufferArgs(resultType) else {
+                e.fail("180: __managedBufferCreate result is not a ManagedBuffer", span); return nil
+            }
+            let tid = e.managedBufferTypeId(header: hdr, element: elem)
+            let headerSize = e.slotCount(hdr) * 8
+            let capV = val(args[0])
+            let elemBytes = LLVMBuildMul(b, capV, LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "mb.elembytes")!
+            let bytes = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(16 + headerSize), 0), elemBytes, "mb.bytes")!
+            let buf = e.rtAllocManaged(bytes)
+            LLVMBuildStore(b, e.descOffsetHeader(tid), buf)
+            LLVMBuildStore(b, capV, e.gepByte(buf, LLVMConstInt(e.i64, 8, 0)))
+            return buf
+        case "__managedBufferCapacity":
+            // The allocated element count, stored at byte 8 by `create`.
+            return LLVMBuildLoad2(b, e.i64, e.gepByte(val(args[0]), LLVMConstInt(e.i64, 8, 0)), "mb.cap")
+        case "__managedBufferHeaderPtr":
+            // The header region as a raw addrspace(0) address (`base + 16`). The derived `RawPtr` must be
+            // used within a safepoint-free region — the buffer can relocate (task 180 access discipline).
+            let baseH = LLVMBuildPtrToInt(b, val(args[0]), e.i64, "mb.base")!
+            let hp = LLVMBuildAdd(b, baseH, LLVMConstInt(e.i64, 16, 0), "mb.hdr")!
+            return LLVMBuildIntToPtr(b, hp, e.i8ptr, "mb.hdr.raw")
+        case "__managedBufferElementPtr":
+            // Element `i` at `base + 16 + headerSize + i*stride`, as a raw addrspace(0) address. Same
+            // reload-before-safepoint discipline as the header pointer.
+            guard let (hdr, elem) = e.managedBufferArgs(args[0].type) else {
+                e.fail("180: __managedBufferElementPtr receiver is not a ManagedBuffer", span); return nil
+            }
+            let elemStart = 16 + e.slotCount(hdr) * 8
+            let baseE = LLVMBuildPtrToInt(b, val(args[0]), e.i64, "mb.base")!
+            let ix = LLVMBuildMul(b, val(args[1]), LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "mb.ix")!
+            let off = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(elemStart), 0), ix, "mb.eoff")!
+            let ep = LLVMBuildAdd(b, baseE, off, "mb.elem")!
+            return LLVMBuildIntToPtr(b, ep, e.i8ptr, "mb.elem.raw")
+        case "__managedBufferStoreRef":
+            // task 180: store a managed reference into element slot `i` through the write-barrier / `p1`
+            // path (not a raw store), so the collector records the edge. The slot stays an addrspace(1)
+            // pointer (a gepByte off the buffer `p1`), which is what `storeField` routes through the barrier.
+            guard let (hdr, elem) = e.managedBufferArgs(args[0].type) else {
+                e.fail("180: __managedBufferStoreRef receiver is not a ManagedBuffer", span); return nil
+            }
+            let recvV = val(args[0])
+            let elemStart = 16 + e.slotCount(hdr) * 8
+            let ix = LLVMBuildMul(b, val(args[2]), LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "mb.ix")!
+            let off = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(elemStart), 0), ix, "mb.eoff")!
+            e.storeField(recvV, e.gepByte(recvV, off), val(args[1]))
+            return LLVMConstInt(e.i64, 0, 0)
+        case "__managedBufferRef":
+            // Load the managed reference at element slot `i` as a `p1` (same reload-before-safepoint
+            // discipline as the raw accessors: the buffer can relocate).
+            guard let (hdr, elem) = e.managedBufferArgs(args[0].type) else {
+                e.fail("180: __managedBufferRef receiver is not a ManagedBuffer", span); return nil
+            }
+            let recvV = val(args[0])
+            let elemStart = 16 + e.slotCount(hdr) * 8
+            let ix = LLVMBuildMul(b, val(args[1]), LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "mb.ix")!
+            let off = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(elemStart), 0), ix, "mb.eoff")!
+            return LLVMBuildLoad2(b, e.p1, e.gepByte(recvV, off), "mb.ref")
+        case "__managedBufferStoreHeaderRef":
+            // Store a managed reference into the header region (`base + 16`) through the barrier.
+            let recvV = val(args[0])
+            e.storeField(recvV, e.gepByte(recvV, LLVMConstInt(e.i64, 16, 0)), val(args[1]))
+            return LLVMConstInt(e.i64, 0, 0)
+        case "__managedBufferHeaderRef":
+            // Load the managed reference stored in the header region as a `p1`.
+            let recvV = val(args[0])
+            return LLVMBuildLoad2(b, e.p1, e.gepByte(recvV, LLVMConstInt(e.i64, 16, 0)), "mb.href")
         case "__gcTypeSize":
             let (fn, fty) = e.runtimeFn("nomu_gc_typesize", ret: e.i64, params: [e.i64], varArg: false)
             return e.buildCall(fn, fty, [val(args[0])])
         case "__gcTypeStride":
             let (fn, fty) = e.runtimeFn("nomu_gc_typestride", ret: e.i64, params: [e.i64], varArg: false)
             return e.buildCall(fn, fty, [val(args[0])])
+        case "__gcTypeHeaderSize":
+            // Buffer user-header byte size (task 180): element 0 sits at `16 + headerSize`.
+            let (fn, fty) = e.runtimeFn("nomu_gc_typeheadersize", ret: e.i32, params: [e.i64], varArg: false)
+            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0])])!, e.i64, "gc.hdrsz")
+        case "__gcHeaderPtrCount":
+            // Count of managed-pointer offsets in a buffer's header (task 180).
+            let (fn, fty) = e.runtimeFn("nomu_gc_typeheaderptrs", ret: e.i32, params: [e.i64], varArg: false)
+            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0])])!, e.i64, "gc.hdrn")
+        case "__gcHeaderOffsetAt":
+            // The k-th header managed byte offset (task 180), relative to the header base.
+            let (fn, fty) = e.runtimeFn("nomu_gc_headeroffset", ret: e.i32, params: [e.i64, e.i32], varArg: false)
+            let k = LLVMBuildTrunc(b, val(args[1]), e.i32, "gc.hdrk")!
+            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0]), k])!, e.i64, "gc.hdroff")
         case "__gcTypeKind":
             let (fn, fty) = e.runtimeFn("nomu_gc_typekind", ret: e.i32, params: [e.i64], varArg: false)
             let k = e.buildCall(fn, fty, [val(args[0])])!
@@ -1433,6 +1679,36 @@ final class SSAIRToLLVM {
             let off = LLVMBuildMul(b, val(args[1]), LLVMConstInt(e.i64, 4, 0), "gc.off.byte")!
             let elt = LLVMBuildLoad2(b, e.i32, e.gepByte(base, off), "gc.off.v")!
             return LLVMBuildZExt(b, elt, e.i64, "gc.off.z")
+        case "__gcLiveCount":
+            // nomu_gc_live_offsets(type_id, base, &count): the shared kind-0/1/2 enumerator (task 176).
+            let (fn, fty) = e.runtimeFn("nomu_gc_live_offsets", ret: e.i8ptr, params: [e.i64, e.i8ptr, e.i8ptr], varArg: false)
+            let cslot = e.entryAlloca(e.i32, "gc.live.c")
+            _ = e.buildCall(fn, fty, [val(args[0]), val(args[1]), cslot])
+            let c = LLVMBuildLoad2(b, e.i32, cslot, "gc.live.c.v")!
+            return LLVMBuildZExt(b, c, e.i64, "gc.live.c.z")
+        case "__gcLiveOffsetAt":
+            let (fn, fty) = e.runtimeFn("nomu_gc_live_offsets", ret: e.i8ptr, params: [e.i64, e.i8ptr, e.i8ptr], varArg: false)
+            let cslot = e.entryAlloca(e.i32, "gc.live.off.c")
+            let mapBase = e.buildCall(fn, fty, [val(args[0]), val(args[1]), cslot])!
+            let off = LLVMBuildMul(b, val(args[2]), LLVMConstInt(e.i64, 4, 0), "gc.live.off.byte")!
+            let elt = LLVMBuildLoad2(b, e.i32, e.gepByte(mapBase, off), "gc.live.off.v")!
+            return LLVMBuildZExt(b, elt, e.i64, "gc.live.off.z")
+        case "__gcShapedCount":
+            let (fn, fty) = e.runtimeFn("nomu_gc_shaped_count", ret: e.i32, params: [e.i64], varArg: false)
+            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0])])!, e.i64, "gc.sh.c")
+        case "__gcShapedOffset":
+            let (fn, fty) = e.runtimeFn("nomu_gc_shaped_offset", ret: e.i32, params: [e.i64, e.i32], varArg: false)
+            let k = LLVMBuildTrunc(b, val(args[1]), e.i32, "gc.sh.k")!
+            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0]), k])!, e.i64, "gc.sh.off")
+        case "__gcShapedShapeId":
+            let (fn, fty) = e.runtimeFn("nomu_gc_shaped_shapeid", ret: e.i32, params: [e.i64, e.i32], varArg: false)
+            let k = LLVMBuildTrunc(b, val(args[1]), e.i32, "gc.sh.k2")!
+            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0]), k])!, e.i64, "gc.sh.sid")
+        case "__gcShapeDescForOrdinal":
+            // nomu_shape_desc_for_ordinal(ordinal) → the kind-2 descriptor type-id (shared with the C walker).
+            let (fn, fty) = e.runtimeFn("nomu_shape_desc_for_ordinal", ret: e.i64, params: [e.i32], varArg: false)
+            let ord = LLVMBuildTrunc(b, val(args[0]), e.i32, "gc.ord")!
+            return e.buildCall(fn, fty, [ord])
         case "__int_double_double": return LLVMBuildSIToFP(b, val(args[0]), e.f64, "i2d")
         case "__double_int_int":
             let (fn, fty) = e.runtimeFn("llvm.round.f64", ret: e.f64, params: [e.f64], varArg: false)

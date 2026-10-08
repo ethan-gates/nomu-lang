@@ -92,6 +92,30 @@ final class SSAIRVerifyTests: XCTestCase {
         XCTAssertFalse(verifySSAIR(fn("f", ret: .void, params: [], [bb])).contains { $0.contains("I7") })
     }
 
+    // I11 — a shaped (`String`) value live across a safepoint is a well-formed shaped root. A String param
+    // held live across a call (used again after it) is the legitimate shaped-root case: it must pass clean.
+    func testShapedValueAcrossCallPassesClean() {
+        let str = v(0, .string)
+        let r1 = v(1, .int)
+        let bb = SSABlock(id: 0, params: [], insts: [
+            SSAInst(result: r1, kind: .call(SSACall(kind: .direct("g"), args: [])), span: sp),   // safepoint
+            SSAInst(result: nil, kind: .call(SSACall(kind: .direct("h"), args: [str])), span: sp),  // uses str
+        ], terminator: SSATerm(kind: .ret(nil), span: sp))
+        let errs = verifySSAIR(fn("f", ret: .void, params: [str], [bb]))
+        XCTAssertFalse(errs.contains { $0.contains("I11") }, "\(errs)")
+    }
+
+    // I11 — an undefined shaped value that spans a safepoint is caught (a dropped shaped-root definition).
+    func testUndefinedShapedRootCaught() {
+        let r0 = v(0, .int)
+        let bb = SSABlock(id: 0, params: [], insts: [
+            SSAInst(result: r0, kind: .call(SSACall(kind: .direct("g"), args: [])), span: sp),          // safepoint
+            SSAInst(result: nil, kind: .call(SSACall(kind: .direct("h"), args: [v(99, .string)])), span: sp),  // %99 undefined, spans g
+        ], terminator: SSATerm(kind: .ret(nil), span: sp))
+        let errs = verifySSAIR(fn("f", ret: .void, params: [], [bb]))
+        XCTAssertTrue(errs.contains { $0.contains("I11") && $0.contains("%99") }, "\(errs)")
+    }
+
     // I1 — a value id used at a type different from its definition.
     func testConflictingTypeCaught() {
         let def = v(0, .int)

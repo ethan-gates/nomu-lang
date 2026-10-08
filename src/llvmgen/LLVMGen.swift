@@ -44,7 +44,7 @@ final class LLVMGen {
     let i64: LLVMTypeRef
     let f64: LLVMTypeRef        // `Double` — LLVM's native double
     let voidTy: LLVMTypeRef
-    let strTy: LLVMTypeRef      // { i8* data, i64 len } — matches runtime.h `String`
+    let strTy: LLVMTypeRef      // { i64 word0, i64 word1 } — the bit-stealing String (task 121/176); matches runtime.h `String`
     let closureHdrTy: LLVMTypeRef  // { i64 header, i8ptr fn } — the fixed prefix of a heap closure { fn, caps… }
     let anyBoxTy: LLVMTypeRef      // { i64 header, i8ptr witness (addr0), p1 payload } — the `any I` heap box (D1)
     let spawnHandleTy: LLVMTypeRef // { i8ptr fiber (addr0, runtime-owned) } — SpawnHandle (8.2.6)
@@ -92,6 +92,10 @@ final class LLVMGen {
     // The LLVM function currently being emitted into (its entry block is where allocas land). Set per
     // body/thunk by whichever egress is emitting; saved/restored across nested thunk emission.
     var currentFn: LLVMValueRef?
+    // Shaped roots live across the safepoint instruction currently being lowered (task 176): a `"deopt"`
+    // operand list `buildCall` attaches so a per-site statepoint call records them. Set/cleared by the
+    // SSAIR→LLVM block lowering around each safepoint instruction; nil elsewhere.
+    var pendingDeopt: [LLVMValueRef?]?
 
     // 8.2.5 witness machinery. `interfaceDefs` gives a requirement surface to lay out a witness struct
     // (its slot order lives in `witnessSlotsCache`). Witness struct types are cached in `witnessTypes`;
@@ -135,21 +139,37 @@ final class LLVMGen {
     var actorTypes: [String: LLVMTypeRef] = [:]
 
     // M6 GC pointer maps — each heap type gets a type-id keying `typeMaps[id]` (managed-field byte
-    // offsets), `typeSizes[id]` (fixed size), `typeKinds[id]` (0 fixed / 1 array), `typeStrides[id]`
-    // (array element stride). Emitted as flat tables at module finalization.
+    // offsets, or a serialized discriminant-keyed map for kind 2), `typeSizes[id]` (fixed size),
+    // `typeKinds[id]` (0 fixed / 1 array / 2 shaped, task 176), `typeStrides[id]` (array element stride).
+    // Emitted as flat tables at module finalization.
     var typeIds: [String: UInt64] = [:]
     var typeMaps: [[Int32]] = []
     var typeSizes: [Int32] = []
     var typeKinds: [Int32] = []
     var typeStrides: [Int32] = []
+    // Parallel to `typeMaps` (task 180): each buffer type's user-header byte size (0 for a fixed object or
+    // a plain array buffer) and the managed-pointer byte offsets within that header. The header offsets are
+    // emitted as the prefix of the pointer-map blob, before the element/direct offsets, so the element map
+    // reads at `blob + nHeaderPtr`. Empty/0 for every non-buffer and header-less type.
+    var typeHeaderSizes: [Int32] = []
+    var typeHeaderMaps: [[Int32]] = []
+    // Parallel to `typeMaps`: each type's *shaped-field* entries (task 176, shaped-roots.md Stage 1 site 2)
+    // — a `(byte offset, shape type-id)` per field that is itself a shaped value (a `String`), so the
+    // collector recurses into the field's kind-2 sub-shape rather than treating it as a direct pointer. The
+    // `UInt64` is the shape's registration id; its descriptor symbol (resolved at emit time) is written into
+    // the pointer map as a link-time descriptor offset after the flat direct offsets. Empty for most types.
+    var typeShaped: [[(offset: Int32, shapeId: UInt64)]] = []
     // Parallel to `typeMaps`: each registered type's stable descriptor symbol (`nomu_gc_desc_*`) and
     // whether it folds across modules (weak `linkonce_odr`) or is a program-local shape (`internal`).
     // Drives the link-time offset-as-id descriptor section (task 100.4.7); the flat tables above are
     // the interim representation, retired once the runtime reads descriptors.
     var typeSymbols: [(name: String, foldable: Bool)] = []
     var arrayBufMapIds: [String: UInt64] = [:]   // element-type description → array-buffer type-id
+    var managedBufferMapIds: [String: UInt64] = [:]  // "Header$Element" → managed-buffer type-id (task 180)
     var valueDescIds: [String: UInt64] = [:]     // type description → value-layout descriptor id (VWT type_id, 100.4.7.4)
     var anyBoxMapId: UInt64?                      // one shared map for every `any I` box (payload at byte 16)
+    var stringShapeMapId: UInt64?                 // one shared kind-2 shaped descriptor for every String (task 121/176)
+    var stringStorageMapId: UInt64?               // one shared kind-1 descriptor for the heap String buffer (task 176.2)
     var arrayHandleMapId: UInt64?                 // one shared type-id for every Array handle (bufptr at byte 16)
     var mailboxTypeId: UInt64?                    // one shared type-id for every mailbox object
 
@@ -171,6 +191,7 @@ final class LLVMGen {
     var runtimeFns: [String: (fn: LLVMValueRef, ty: LLVMTypeRef)] = [:]
     var pollFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var gcAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
+    var gcAllocRootedFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // task 176 — `noinline` shaped-root alloc variant
     var selfhostAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // task 150 — self-hosted alloc slow path
     var barrierFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var stopWorldGlobalCache: LLVMValueRef?
@@ -193,7 +214,9 @@ final class LLVMGen {
         i64 = LLVMInt64TypeInContext(ctx)
         f64 = LLVMDoubleTypeInContext(ctx)
         voidTy = LLVMVoidTypeInContext(ctx)
-        var fields: [LLVMTypeRef?] = [i8ptr, i64]
+        // String is a 16-byte bit-stealing value `{ i64 word0, i64 word1 }` (task 121 Representation):
+        // `word0` is inline bytes / a buffer pointer by case, `word1` carries the tag (top nibble) + count.
+        var fields: [LLVMTypeRef?] = [i64, i64]
         strTy = fields.withUnsafeMutableBufferPointer {
             LLVMStructTypeInContext(ctx, $0.baseAddress, 2, /*packed=*/0)
         }

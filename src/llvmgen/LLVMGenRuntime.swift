@@ -29,6 +29,8 @@ extension LLVMGen {
         "memcpy",           // libc block copy — never allocates
         "memset",           // libc fill — never allocates
         "rt_gc_write_barrier",   // remembers the mutated object; never triggers GC
+        "rt_str_snapshot",  // task 176.2 — off-heap snapshot of concat inputs; malloc only, no managed alloc
+        "rt_str_fill",      // task 176.2 — memcpy snapshot into the StringStorage body + free; no managed alloc
     ]
 
     var funcAttrIndex: LLVMAttributeIndex { LLVMAttributeIndex(bitPattern: Int32(LLVMAttributeFunctionIndex)) }
@@ -39,6 +41,14 @@ extension LLVMGen {
         LLVMAddAttributeAtIndex(fn, funcAttrIndex, attr)
     }
 
+    // Is `fn` marked `gc-leaf-function`? A gc-leaf call never becomes a `gc.statepoint`, so a `"deopt"`
+    // operand bundle on it is both pointless and harmful — the backend mis-handles a deopt bundle on an
+    // ordinary call — so shaped-root bundles must never ride a gc-leaf call (task 176).
+    func isGCLeafFn(_ fn: LLVMValueRef) -> Bool {
+        let name = "gc-leaf-function"
+        return name.withCString { LLVMGetStringAttributeAtIndex(fn, funcAttrIndex, $0, UInt32(name.utf8.count)) } != nil
+    }
+
     func addAlwaysInline(_ fn: LLVMValueRef) {
         let k = LLVMGetEnumAttributeKindForName("alwaysinline", "alwaysinline".utf8.count)
         LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, k, 0))
@@ -47,6 +57,13 @@ extension LLVMGen {
     func addNoInline(_ fn: LLVMValueRef) {
         let k = LLVMGetEnumAttributeKindForName("noinline", "noinline".utf8.count)
         LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, k, 0))
+    }
+
+    // Fetch an existing module global by name, or declare it. Used for runtime externs a seam may build more
+    // than once (the alloc body is emitted for both the inlined and the `noinline` rooted variant); a plain
+    // `LLVMAddGlobal` would mint a suffixed duplicate that no longer resolves against the runtime symbol.
+    func getOrAddGlobal(_ ty: LLVMTypeRef, _ name: String) -> LLVMValueRef {
+        LLVMGetNamedGlobal(mod, name) ?? LLVMAddGlobal(mod, ty, name)!
     }
 
     // Prelude functions that read their own stack frame (`llvm.frameaddress`/`returnaddress`, task 150 the
@@ -85,10 +102,53 @@ extension LLVMGen {
     }
 
     func buildCall(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?]) -> LLVMValueRef? {
+        // While lowering a safepoint instruction, `pendingDeopt` carries the shaped roots live across it
+        // (task 176); attach them so a per-site statepoint call (a user call, concat) records them. Attaching
+        // to any leaf setup call in the same instruction is harmless — RS4GC ignores a deopt bundle on a
+        // non-statepoint call. (The inlined poll/alloc seams take the explicit `*WithDeopt` path instead.)
+        // Only the function being lowered takes the bundle — a lazily-built shared seam body (poll / alloc),
+        // whose internal calls are emitted while `pendingDeopt` is set, must not pick up the caller's roots
+        // (its slots live in another function). Guard on the current insert block's parent.
+        if pendingDeoptApplies() && !isGCLeafFn(fn) {
+            return buildCallWithDeopt(fn, ty, args, pendingDeopt!)
+        }
         var a = args
         return a.withUnsafeMutableBufferPointer {
             LLVMBuildCall2(b, ty, fn, $0.baseAddress, UInt32(args.count), "")
         }
+    }
+
+    // True when a shaped-root `"deopt"` bundle is pending and belongs to the function currently being lowered
+    // (task 176). A lazily-built shared seam body (poll / alloc), whose internal calls are emitted while
+    // `pendingDeopt` is set, must not pick up the caller's roots — its slots live in another function — so the
+    // check is guarded on the current insert block's parent being `currentFn`.
+    func pendingDeoptApplies() -> Bool {
+        guard let d = pendingDeopt, !d.isEmpty,
+              let ib = LLVMGetInsertBlock(b), LLVMGetBasicBlockParent(ib) == currentFn else { return false }
+        return true
+    }
+
+    // A call carrying a `"deopt"` operand bundle of shaped-root records (task 176 Stage 4): each root is two
+    // operands — an i32 shape ordinal and the value's home-slot pointer. `rewrite-statepoints-for-gc` threads
+    // the bundle into the `gc.statepoint`, and the inliner propagates it onto an inlined seam's inner
+    // statepoint (the poll/alloc slow call), so the stackmap records `(shape-id, slot)` for the walker.
+    func buildCallWithDeopt(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?],
+                            _ deoptOps: [LLVMValueRef?]) -> LLVMValueRef? {
+        if deoptOps.isEmpty { return buildCall(fn, ty, args) }
+        var ops = deoptOps
+        let bundle = ops.withUnsafeMutableBufferPointer { op in
+            "deopt".withCString { LLVMCreateOperandBundle($0, 5, op.baseAddress, UInt32(op.count)) }
+        }
+        var a = args
+        var bundles: [LLVMOperandBundleRef?] = [bundle]
+        let r = a.withUnsafeMutableBufferPointer { ap in
+            bundles.withUnsafeMutableBufferPointer { bp in
+                LLVMBuildCallWithOperandBundles(b, ty, fn, ap.baseAddress, UInt32(ap.count),
+                                                bp.baseAddress, UInt32(bp.count), "")
+            }
+        }
+        LLVMDisposeOperandBundle(bundle)
+        return r
     }
 
     func structGEP(_ structTy: LLVMTypeRef, _ addr: LLVMValueRef, _ idx: Int) -> LLVMValueRef {
@@ -115,8 +175,17 @@ extension LLVMGen {
     func rtAllocTy() -> LLVMTypeRef { runtimeFn("rt_alloc", ret: p1, params: [i64], varArg: false).1 }
 
     // Allocate a managed (GC-heap) object of `bytes` bytes through the `__nomu_gc_alloc` seam.
+    //
+    // When shaped roots are live across this allocation (task 176), route through the `noinline` rooted-alloc
+    // variant instead of the `alwaysinline` seam. A GC can fire at the allocation, so the shaped roots must be
+    // recorded on a statepoint that covers this frame. The always-inliner drops a `"deopt"` operand bundle when
+    // it collapses `__nomu_gc_alloc`, so the bundle would never reach the inner `rt_alloc` statepoint. The
+    // `noinline` variant survives both pipelines' inlining untouched, so RS4GC statepoint-converts the call site
+    // in place and threads the bundle onto it — the walker then finds the shaped roots in this frame when a GC
+    // fires inside the allocation. (`buildCall` attaches the pending bundle; the fast-path bump still lives
+    // inside the out-of-line callee.)
     func rtAllocManaged(_ bytes: LLVMValueRef) -> LLVMValueRef {
-        let g = nomuGcAlloc()
+        let g = pendingDeoptApplies() ? nomuGcAllocRooted() : nomuGcAlloc()
         return buildCall(g.0, g.1, [bytes])!
     }
 
@@ -206,28 +275,73 @@ extension LLVMGen {
         _ = buildCall(p.0, p.1, [])
     }
 
+    // A loop-header poll that records shaped roots (task 176 Stage 4). The poll is inlined at this site —
+    // rather than calling the shared `alwaysinline` `__nomu_poll` — because the always-inliner does not
+    // thread a `"deopt"` operand bundle onto the inlined seam's inner statepoint. Emitting the slow-path
+    // `__nomu_gc_poll_slow` call here, in the Nomu body, lets the bundle ride it directly, so
+    // `rewrite-statepoints-for-gc` records the shaped roots on that statepoint. Fast path is identical to
+    // `__nomu_poll`: a volatile flag load + branch. Leaves the builder at the continuation block.
+    func emitSafepointPollWithDeopt(_ deoptOps: [LLVMValueRef?]) {
+        guard let fn = currentFn else { emitSafepointPoll(); return }
+        let flag = stopWorldGlobal()
+        let slow = runtimeFn("__nomu_gc_poll_slow", ret: voidTy, params: [], varArg: false)
+        let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.slow")
+        let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.cont")
+        let v = LLVMBuildLoad2(b, i32, flag, "stopreq")!
+        LLVMSetVolatile(v, 1)
+        let stop = LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstInt(i32, 0, 0), "stop")
+        LLVMBuildCondBr(b, stop, slowBB, contBB)
+        LLVMPositionBuilderAtEnd(b, slowBB)
+        _ = buildCallWithDeopt(slow.0, slow.1, [], deoptOps)
+        LLVMBuildBr(b, contBB)
+        LLVMPositionBuilderAtEnd(b, contBB)
+    }
+
     // The `__nomu_gc_alloc` seam: the inline bump-pointer fast path, tail-calling `rt_alloc` (a
     // statepoint) on the slow path. Returned memory is zeroed. `inlineAlloc` off reverts to the
     // out-of-line body for A/B measurement.
     func nomuGcAlloc() -> (LLVMValueRef, LLVMTypeRef) {
         if let g = gcAllocFn { return g }
+        let g = buildGcAllocFn("__nomu_gc_alloc", alwaysInline: true)
+        gcAllocFn = g
+        return g
+    }
+
+    // The `noinline` rooted-alloc variant (task 176): the same body as `__nomu_gc_alloc`, but kept out of line
+    // so a `"deopt"` operand bundle on the call site survives to `rewrite-statepoints-for-gc`. The always-inliner
+    // (and `default<O3>`'s inliner) would drop the bundle while collapsing the `alwaysinline` seam; `noinline`
+    // leaves the call standing, and RS4GC statepoint-converts it in place, recording the shaped roots in the
+    // caller's frame. Used only when a shaped root is live across the allocation (see `rtAllocManaged`).
+    func nomuGcAllocRooted() -> (LLVMValueRef, LLVMTypeRef) {
+        if let g = gcAllocRootedFn { return g }
+        let g = buildGcAllocFn("__nomu_gc_alloc_rooted", alwaysInline: false)
+        gcAllocRootedFn = g
+        return g
+    }
+
+    // Build an allocation-seam function. `alwaysInline` collapses it at its call sites (the ordinary seam);
+    // `false` adds `noinline` so the call site survives to RS4GC with its deopt bundle intact (the rooted
+    // variant). The body is identical either way.
+    private func buildGcAllocFn(_ name: String, alwaysInline: Bool) -> (LLVMValueRef, LLVMTypeRef) {
         let ty = fnType(p1, [i64])
-        let fn = LLVMAddFunction(mod, "__nomu_gc_alloc", ty)!
+        let fn = LLVMAddFunction(mod, name, ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         LLVMSetGC(fn, "statepoint-example")   // its slow-path `rt_alloc` call is a statepoint
-        addAlwaysInline(fn)
+        if alwaysInline { addAlwaysInline(fn) } else { addNoInline(fn) }
         guard inlineAlloc else {
             withStubBody(fn) { LLVMBuildRet(b, buildCall(rtAlloc(), rtAllocTy(), [LLVMGetParam(fn, 0)])!) }
-            gcAllocFn = (fn, ty)
-            return gcAllocFn!
+            return (fn, ty)
         }
-        let gOff = LLVMAddGlobal(mod, i64, "__nomu_bump_offset")!
-        let gMax = LLVMAddGlobal(mod, i64, "__nomu_max_non_los")!
-        let gMut = LLVMAddGlobal(mod, i8ptr, "rt_mutator")!
+        // Get-or-add: this body is built for both the `alwaysinline` and the `noinline` (rooted) alloc
+        // variants, so these externs may already exist — minting them afresh would produce suffixed
+        // duplicates that no longer resolve against the runtime symbols.
+        let gOff = getOrAddGlobal(i64, "__nomu_bump_offset")
+        let gMax = getOrAddGlobal(i64, "__nomu_max_non_los")
+        let gMut = getOrAddGlobal(i8ptr, "rt_mutator")
         LLVMSetThreadLocal(gMut, 1)
         // task 150 — under `NOMU_GC_PLAN=nomu` this extern flag (set at init) routes allocation at the
         // self-hosted Nomu allocator: the MMTk-TLAB fast path is disabled and the slow path branches to it.
-        let gSelf = LLVMAddGlobal(mod, i8, "__nomu_selfhosted_alloc")!
+        let gSelf = getOrAddGlobal(i8, "__nomu_selfhosted_alloc")
         let memset = runtimeFn("memset", ret: i8ptr, params: [i8ptr, i32, i64], varArg: false)
         withStubBody(fn) {
             let size = LLVMGetParam(fn, 0)!
@@ -281,8 +395,7 @@ extension LLVMGen {
             }
             LLVMBuildRet(b, phi)
         }
-        gcAllocFn = (fn, ty)
-        return gcAllocFn!
+        return (fn, ty)
     }
 
     // The self-hosted allocation slow path (task 150): route allocation at the Nomu Immix allocator in the

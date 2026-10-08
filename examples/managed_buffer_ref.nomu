@@ -1,0 +1,35 @@
+// Task 180 — a ManagedBuffer with a managed pointer in BOTH its header and an element, held live across
+// relocating/evacuating GC. The collector must relocate the buffer and, through the header-pointer scan and
+// the element scan, update the Box pointers stored in the header slot and the element slot. Garbage
+// allocation forces collections; the output must match the NoGC baseline (111 / 222). A broken header or
+// element scan leaves a stale pointer, so the readback diverges from the baseline.
+//
+// The references are stored through the typed managed accessors (`storeHeaderRef` / `storeRef`), which route
+// the store through the write barrier / p1 path — the facility a real consumer (`Array<SomeClass>`) uses to
+// put a reference in a buffer, exercised here end to end rather than seeded with raw address bits.
+class Box {
+  var v: Int
+}
+
+fun main() {
+  let b = ManagedBuffer<Box, Box>.create(capacity: 2)
+  // Store a managed reference into the header slot and element 0 through the barrier; the collector
+  // maintains them from here on.
+  b.storeHeaderRef(Box(v: 111))
+  b.storeRef(Box(v: 222), at: 0)
+
+  // Force collections: the two Boxes survive only through the buffer's header/element slots, so a working
+  // scan traces + relocates them and a broken one drops or strands them.
+  var i = 0
+  while i < 2000 {
+    let junk = Box(v: i)
+    i = i + 1
+  }
+
+  let hb: Box = b.headerRef()
+  let eb: Box = b.ref(at: 0)
+  print(hb.v)
+  print("\n")
+  print(eb.v)
+  print("\n")
+}

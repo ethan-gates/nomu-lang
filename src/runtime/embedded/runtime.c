@@ -286,10 +286,12 @@ void rt_gc_write_barrier(void* obj, void* slot, void* val) {
 typedef struct {
     int32_t size;        // fixed object byte size (header included); 0 for an array buffer
     int32_t stride;      // array element byte size; 0 for a fixed object
-    int32_t kind;        // 0 = fixed, 1 = array buffer
-    int32_t nptr;        // number of managed-pointer offsets in the out-of-line map
+    int32_t kind;        // 0 = fixed, 1 = array buffer, 2 = shaped (task 176)
+    int32_t nptr;        // number of managed-pointer offsets in the out-of-line map (serialized length for kind 2)
     int32_t ptrmap_off;  // byte offset of this type's [off…] array within __nomu_ptrmaps
-    int32_t pad;
+    int32_t nshaped;     // count of shaped-field entries after the nptr direct offsets (task 176 site 2)
+    int32_t header_size; // buffer user-header bytes between the 16-byte prefix and the elements (task 180); 0 otherwise
+    int32_t nheader;     // count of managed-pointer offsets within that header, the blob prefix before the element map (task 180)
 } nomu_gc_desc;
 
 #define NOMU_GC_DESC_SIZE ((unsigned long)sizeof(nomu_gc_desc))
@@ -360,10 +362,159 @@ int32_t nomu_gc_typekind(uint64_t type_id) {
     return d ? d->kind : 0;
 }
 
+// Shaped fields (task 176 Stage 1 site 2): fields of an object that are themselves shaped values (a
+// `String`), which the collector recurses into via their sub-shape rather than scanning as a direct
+// managed pointer. The entries follow the `nptr` direct offsets in the map, two i32 each —
+// `(field byte offset, sub-shape type-id)`. `nshaped` is 0 for the ordinary object, so these are off the
+// hot path. The sub-shape type-id is a descriptor offset, handed straight to `nomu_gc_live_offsets`.
+int32_t nomu_gc_shaped_count(uint64_t type_id) {
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    return d ? d->nshaped : 0;
+}
+int32_t nomu_gc_shaped_offset(uint64_t type_id, int32_t k) {
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    if (!d || k < 0 || k >= d->nshaped) return 0;
+    const int32_t* map = (const int32_t*)(gc_ptrmaps_base + (unsigned)d->ptrmap_off);
+    return map[d->nptr + 2 * k];
+}
+int32_t nomu_gc_shaped_shapeid(uint64_t type_id, int32_t k) {
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    if (!d || k < 0 || k >= d->nshaped) return 0;
+    const int32_t* map = (const int32_t*)(gc_ptrmaps_base + (unsigned)d->ptrmap_off);
+    return map[d->nptr + 2 * k + 1];
+}
+
+// Map a frame-root shape ordinal (deopt bundle, task 176 Stage 4) to its kind-2 descriptor type-id. The
+// stackmap carries the ordinal as a compile-time constant (a descriptor offset is a link-time value, which
+// a stackmap Constant cannot hold). One shaped type exists today — String, ordinal 0 — found by scanning
+// the descriptor section for the sole kind-2 record and cached. A second shape will need an ordinal table.
+// Exported (not `static`) so the self-hosted walker reaches it through the `RawPtr.gcShapeDescForOrdinal`
+// builtin — both walkers resolve the ordinal through this one function, so the ordinal→descriptor mapping
+// (and the future ordinal table) lives in a single place (task 176 Stage 5 lockstep). Ordinal 0 is String;
+// its descriptor type-id is read from the compiler-emitted `__nomu_string_shape_typeid` (a reloc that also
+// keeps the otherwise-unreferenced kind-2 descriptor alive — a String value has no header to stamp it). A
+// second shaped type will extend this to an ordinal table.
+extern uint64_t __nomu_string_shape_typeid __attribute__((weak));
+uint64_t nomu_shape_desc_for_ordinal(int32_t ordinal) {
+    (void)ordinal;
+    return &__nomu_string_shape_typeid ? __nomu_string_shape_typeid : 0;
+}
+
 // Array element byte stride for an array-buffer type-id. 0 for a fixed type.
 uint64_t nomu_gc_typestride(uint64_t type_id) {
     const nomu_gc_desc* d = gc_desc_at(type_id);
     return d ? (uint64_t)d->stride : 0;
+}
+
+// The descriptor record byte size (task 180). The single source of truth for the record stride: the
+// self-hosted collector reads this to map a type-id (a descriptor byte offset) to its dense ordinal and
+// back, so growing the record never desyncs the two sides.
+uint64_t nomu_gc_descsize(void) {
+    return NOMU_GC_DESC_SIZE;
+}
+
+// Buffer user-header byte size for a type-id (task 180): the bytes between the 16-byte primitive prefix
+// (`{ type-id, cap }`) and the first element, so element 0 sits at `16 + header_size`. 0 for an array
+// buffer (no header) and for a fixed object. Both collectors read it to locate the element region.
+int32_t nomu_gc_typeheadersize(uint64_t type_id) {
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    return d ? d->header_size : 0;
+}
+
+// The buffer header's managed-pointer map (task 180): `nomu_gc_typeheaderptrs` is the count `nheader`, and
+// `nomu_gc_headeroffset` the k-th header managed byte offset (relative to the header base at `base + 16`) —
+// the first `nheader` entries of the pointer-map blob, before the element map. Both collectors scan the
+// header once per buffer through these, the same way they scan the element map at each element.
+int32_t nomu_gc_typeheaderptrs(uint64_t type_id) {
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    return d ? d->nheader : 0;
+}
+int32_t nomu_gc_headeroffset(uint64_t type_id, int32_t k) {
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    if (!d || k < 0 || k >= d->nheader) return 0;
+    const int32_t* map = (const int32_t*)(gc_ptrmaps_base + (unsigned)d->ptrmap_off);
+    return map[k];
+}
+
+// The shared shaped-root/field enumerator (task 176, shaped-roots.md Stage 5): resolve the live
+// managed-pointer byte offsets of a value at `base` for `type_id`, writing the count to `*out_count` and
+// returning a pointer to a contiguous `int32_t[*out_count]` offset array. For kind 0/1 this is the static
+// flat map (data-independent, identical to `nomu_gc_typemap`; `base` unused). For kind 2 (shaped) the map
+// is discriminant-keyed — `[tag_off, tag_shift, ncases, (tag, count, off…)…]` — so the tag is read from the
+// value (`*(uint64_t*)(base + tag_off) >> tag_shift`) and the matching case's offsets returned; a tag in no
+// case (e.g. String `small` / `immortal`) yields count 0. Both the stackmap root path and the object-field
+// recursion call through here, so the kind-2 tag-decode lives in exactly one place (the lockstep obligation).
+// A per-thread scratch for the object-field fold below (MMTk workers scan in parallel). The returned
+// offset array is valid only until the caller's next `nomu_gc_live_offsets` call, which every consumer
+// honours (it reads the offsets before re-entering). Grows on demand and is reused across calls.
+static _Thread_local int32_t* gc_live_scratch = NULL;
+static _Thread_local int32_t gc_live_scratch_cap = 0;
+static int32_t* gc_live_scratch_ensure(int32_t need) {
+    if (need > gc_live_scratch_cap) {
+        int32_t cap = gc_live_scratch_cap ? gc_live_scratch_cap : 16;
+        while (cap < need) cap *= 2;
+        gc_live_scratch = (int32_t*)realloc(gc_live_scratch, (size_t)cap * sizeof(int32_t));
+        gc_live_scratch_cap = cap;
+    }
+    return gc_live_scratch;
+}
+
+const int32_t* nomu_gc_live_offsets(uint64_t type_id, const void* base, int32_t* out_count) {
+    const nomu_gc_desc* d = gc_desc_at(type_id);
+    if (!d) {
+        *out_count = 0;
+        return NULL;
+    }
+    const int32_t* map = (const int32_t*)(gc_ptrmaps_base + (unsigned)d->ptrmap_off);
+    if (d->kind == 2) {                 // shaped value: discriminant-keyed map, read the tag
+        int32_t tag_off = map[0];
+        int32_t tag_shift = map[1];
+        int32_t ncases = map[2];
+        uint64_t word = *(const uint64_t*)((const uint8_t*)base + tag_off);
+        uint64_t tag = word >> tag_shift;
+        const int32_t* p = map + 3;
+        for (int32_t c = 0; c < ncases; c++) {
+            int32_t case_tag = p[0];
+            int32_t count = p[1];
+            if ((uint64_t)case_tag == tag) {
+                *out_count = count;
+                return p + 2;
+            }
+            p += 2 + count;
+        }
+        *out_count = 0;                 // tag carries no managed pointer (String small/immortal)
+        return NULL;
+    }
+    // kind 0/1 with no shaped fields — the common object/array: the static flat map, no work (178.1).
+    // For a buffer the element map follows the `nheader` header offsets in the blob (task 180), so skip
+    // that prefix; a fixed object and an array both have `nheader = 0`, so the skip is a no-op there.
+    if (!(d->kind == 0 && d->nshaped > 0)) {
+        *out_count = d->nptr;
+        return map + d->nheader;
+    }
+    // A fixed object carrying shaped fields (task 176 Stage 1 site 2): a `String` field inside a
+    // class/actor. Fold each shaped field's live sub-offsets into the direct offsets so the one object-scan
+    // path reaches them — the flat `nptr` direct offsets, then for each of the `nshaped` `(field offset,
+    // sub-shape type-id)` entries, the enumerator recurses into the sub-shape at `base + field offset` (which
+    // reads its tag) and appends `field offset + sub offset` for each live word. A `heap` String field thus
+    // contributes its `word0`; an `immortal`/`small` one contributes nothing. The sub-shape is a kind-2 leaf
+    // (String), so its recursive call returns the static case map and never touches this scratch — a nested
+    // object-with-shaped-fields sub-shape would need a recursion-safe buffer. (Array-element shaped fields,
+    // kind 1, are not folded here — they need per-element tag reads the single-call contract can't express.)
+    int32_t base_n = d->nptr;
+    int32_t* out = gc_live_scratch_ensure(base_n + d->nshaped);
+    int32_t n = 0;
+    for (int32_t i = 0; i < base_n; i++) out[n++] = map[i];
+    for (int32_t k = 0; k < d->nshaped; k++) {
+        int32_t field_off = map[base_n + 2 * k];
+        int32_t sub_id = map[base_n + 2 * k + 1];
+        int32_t sub_cnt = 0;
+        const int32_t* sub = nomu_gc_live_offsets((uint64_t)sub_id, (const uint8_t*)base + field_off, &sub_cnt);
+        out = gc_live_scratch_ensure(n + sub_cnt);
+        for (int32_t j = 0; j < sub_cnt; j++) out[n++] = field_off + sub[j];
+    }
+    *out_count = n;
+    return out;
 }
 
 // Map-walk self-check (6.1 exit): dump every type's pointer map. Gated by NOMU_GC_TYPEMAPS so it is
@@ -1035,11 +1186,12 @@ String rt_read_line(int fd) {
     if (buf[n - 1] == '\n') {
         n--;
     }
-    // Immortal (non-moving) buffer — String's raw `data` pointer must survive a moving GC (6.2.4).
+    // Immortal (non-moving) buffer — String's `word0` pointer must survive a moving GC (6.2.4); the
+    // `heap` case is gated on the 176 collector finish, so readLine tags its pinned buffer `immortal`.
     char* data = (char*)rt_alloc_immortal(sizeof(ObjectHeader) + (size_t)n + 1) + sizeof(ObjectHeader);
     memcpy(data, buf, (size_t)n);
     data[n] = '\0';
-    return (String){.data = data, .len = (int64_t)n};
+    return nomu_str_make(data, (int64_t)n, NOMU_STR_TAG_IMMORTAL);
 }
 #else
 // Non-macOS: readLine is not wired yet (epoll path unwritten, runtime.md §... poller).
@@ -1059,10 +1211,22 @@ typedef struct {
     int32_t off;
 } gc_slot; // Indirect [dwarf reg + off]; reg 31=SP, 29=FP
 
+// A shaped root (task 176 Stage 4): a 16-byte shaped value (a `String`) pinned to a frame slot and
+// recorded through the statepoint's `"deopt"` operand bundle as a `(shape-id Constant, slot Direct)` pair.
+// `Direct[reg+off]` gives the value's frame address; `shapeid` is its kind-2 descriptor offset. The walker
+// reads the tag at that address and relocates the conditional word only in the case that holds a pointer.
+typedef struct {
+    int reg;
+    int32_t off;
+    int32_t shapeid;
+} gc_shaped;
+
 typedef struct {
     uintptr_t addr;
     int nslots;
     gc_slot* slots;
+    int nshaped;
+    gc_shaped* shaped;
 } gc_record; // one statepoint
 
 static gc_record* gc_records = NULL;
@@ -1106,9 +1270,28 @@ void nomu_gc_stackmap_init(void) {
             gr->addr = (uintptr_t)(faddr + ioff);
             gr->slots = (gc_slot*)calloc(nloc ? nloc : 1, sizeof(gc_slot));
             gr->nslots = 0;
-            // Skip the 3 leading meta constants (calling conv, flags, #deopt); the rest are the live
-            // GC pointers, recorded as (base, derived) pairs — dedup to distinct slots.
-            for (int li = 3; li < nloc; li++) {
+            gr->shaped = NULL;
+            gr->nshaped = 0;
+            // The 3 leading meta constants are (calling conv, flags, #deopt); the 3rd's inline value is
+            // NumDeopt (task 176 Stage 4). The NumDeopt deopt locations follow — our shaped roots, each a
+            // (shape-id Constant, slot Direct) pair — then the live GC pointers as (base, derived) pairs.
+            uint32_t num_deopt = nloc > 2 ? gc_rd32(locs + 2 * 12 + 8) : 0;
+            if (num_deopt >= 2) {
+                gr->shaped = (gc_shaped*)calloc(num_deopt / 2, sizeof(gc_shaped));
+                for (int li = 3; li + 1 < 3 + (int)num_deopt; li += 2) {
+                    const uint8_t* Lc = locs + (size_t)li * 12;        // Constant: shape-id (value in offset field)
+                    const uint8_t* Ld = locs + (size_t)(li + 1) * 12;  // Direct[reg+off]: the value's frame slot
+                    if (Lc[0] != 4 /*Constant*/ || Ld[0] != 2 /*Direct*/) {
+                        continue;
+                    }
+                    gr->shaped[gr->nshaped].shapeid = (int32_t)gc_rd32(Lc + 8);
+                    gr->shaped[gr->nshaped].reg = gc_rd16(Ld + 4);
+                    gr->shaped[gr->nshaped].off = (int32_t)gc_rd32(Ld + 8);
+                    gr->nshaped++;
+                }
+            }
+            // Live GC pointers begin after the meta constants and the deopt range.
+            for (int li = 3 + (int)num_deopt; li < nloc; li++) {
                 const uint8_t* L = locs + (size_t)li * 12;
                 uint8_t kind = L[0];
                 if (kind != 3 /*Indirect*/ && kind != 1 /*Register*/) {
@@ -1174,6 +1357,23 @@ static void nomu_gc_walk_context(unw_context_t* ctx, nomu_root_visitor visit, vo
             }
             void** slot = (void**)((char*)base + rec->slots[s].off);
             visit(slot, *slot, userdata);
+        }
+        // Shaped roots (task 176): resolve the 16-byte value's live managed-pointer offsets through the
+        // shared enumerator (reads the tag), then relocate each via the ordinary root visitor — so for an
+        // `immortal`/`small` String nothing is visited, and for `heap` the one buffer word is relocated.
+        for (int s = 0; s < rec->nshaped; s++) {
+            unw_word_t base = sp;
+            if (rec->shaped[s].reg == UNW_ARM64_FP) {
+                unw_get_reg(&cur, UNW_ARM64_FP, &base);
+            }
+            const uint8_t* valbase = (const uint8_t*)base + rec->shaped[s].off;
+            int32_t cnt = 0;
+            uint64_t shapeDesc = nomu_shape_desc_for_ordinal(rec->shaped[s].shapeid);
+            const int32_t* offs = nomu_gc_live_offsets(shapeDesc, valbase, &cnt);
+            for (int k = 0; k < cnt; k++) {
+                void** slot = (void**)(valbase + offs[k]);
+                visit(slot, *slot, userdata);
+            }
         }
     }
 }

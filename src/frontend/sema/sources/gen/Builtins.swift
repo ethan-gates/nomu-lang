@@ -29,6 +29,10 @@ public enum Builtins {
     public static let cLeaf: Set<String> = [
         "__string_hash_int",
         "__string_eq_bool_string",
+        "__string_count_int",            // byte count (task 121.1.4 byte layer)
+        "__string_isempty_bool",         // count == 0
+        "__string_byteat_uint8_int",     // byte(at:) — bounds-checked UTF-8 byte read
+        "__string_lt_bool_string",       // lexicographic byte ordering (`<`, as a method until operators land)
     ]
 
     // Parse `__<recv>_<name>_<ret>[_<arg>...]`. `split` drops the leading empties from `__`.

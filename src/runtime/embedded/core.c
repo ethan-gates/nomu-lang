@@ -30,30 +30,47 @@ void rt_print_double(double x) {
 // ===========================================================
 //                         Strings
 // ===========================================================
+// A string literal lands in the `immortal` case (task 121.1.2): `word0` points at the static UTF-8
+// buffer the compiler emitted, never moved or freed. The byte count rides word1's low 56 bits.
 String rt_str_lit(const char* data, int64_t len) {
-    return (String){ .data = (char*)data, .len = len };
+    return nomu_str_make(data, len, NOMU_STR_TAG_IMMORTAL);
 }
 
-String rt_str_concat(String a, String b) {
-    int64_t len = a.len + b.len;
-    // Immortal (non-moving) buffer: String is `{ addr0 data, i64 len }` (Q6), so `data` is an
-    // untracked raw pointer a moving collector would leave dangling — pin the buffer (M6 · 6.2.4).
-    char* data = (char*)rt_alloc_immortal(sizeof(ObjectHeader) + len + 1) + sizeof(ObjectHeader);
-    memcpy(data, a.data, (size_t)a.len);
-    memcpy(data + a.len, b.data, (size_t)b.len);
-    data[len] = '\0';
-    return (String){ .data = data, .len = len };
+// Concat's byte work (task 176.2). The managed `StringStorage` allocation itself is emitted in codegen (the
+// plan-aware rooted seam), so these two helpers only touch off-heap memory and never allocate managed memory
+// — they are gc-leaf, which is what lets them run without disturbing the live roots the surrounding generated
+// code holds.
+//
+// `rt_str_snapshot` copies both inputs' bytes into one fresh off-heap buffer. Codegen calls it *before* the
+// managed alloc: that alloc can trigger a moving collection which relocates the inputs' `heap` buffers, and
+// the by-value `a`/`b` here would then be stale — snapshotting first sidesteps that (the snapshot is off-heap,
+// so the collector never moves it). An empty result still returns a 1-byte buffer so `free` has something to
+// take; the storage body copy uses `len`.
+void* rt_str_snapshot(String a, String b) {
+    int64_t alen = nomu_str_len(a), blen = nomu_str_len(b);
+    int64_t len = alen + blen;
+    char* tmp = (char*)malloc(len ? (size_t)len : 1);
+    memcpy(tmp, nomu_str_ptr(a), (size_t)alen);
+    memcpy(tmp + alen, nomu_str_ptr(b), (size_t)blen);
+    return tmp;
+}
+
+// Blit the snapshot into the `StringStorage` body (`word0 + 16`, past `{ header, cap }`) and free it. No
+// managed allocation happens between the alloc and this call, so `body` has not moved.
+void rt_str_fill(void* body, void* snapshot, int64_t len) {
+    memcpy(body, snapshot, (size_t)len);
+    free(snapshot);
 }
 
 const uint64_t FNV_PRIME = 1099511628211ULL;
 const uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
 int64_t __string_hash_int(String s) {
     uint64_t hash = FNV_OFFSET_BASIS;
-    char* key = s.data;
-    while (*key) {
-        hash ^= (uint64_t)(unsigned char)(*key);
+    const char* key = nomu_str_ptr(s);
+    int64_t len = nomu_str_len(s);
+    for (int64_t i = 0; i < len; i++) {
+        hash ^= (uint64_t)(unsigned char)key[i];
         hash *= FNV_PRIME;
-        key++;
     }
     return hash;
 }
@@ -61,8 +78,29 @@ int64_t __string_hash_int(String s) {
 // Byte equality. Returns 0/1 as int64_t; codegen truncates to the Bool i1 (a portable ABI, and
 // no dependency on a platform boolean type).
 int64_t __string_eq_bool_string(String l, String r) {
-    if (l.len != r.len) return 0;
-    return memcmp(l.data, r.data, (size_t)l.len) == 0;
+    int64_t llen = nomu_str_len(l);
+    if (llen != nomu_str_len(r)) return 0;
+    return memcmp(nomu_str_ptr(l), nomu_str_ptr(r), (size_t)llen) == 0;
+}
+
+// Byte-layer reads (task 121.1.4). `count` is the UTF-8 byte count; `isEmpty` is `count == 0` (0/1, codegen
+// truncates to i1); `byteat` is the bounds-checked byte at an index (the low-level unit a parser wants).
+int64_t __string_count_int(String s) { return nomu_str_len(s); }
+int64_t __string_isempty_bool(String s) { return nomu_str_len(s) == 0; }
+uint8_t __string_byteat_uint8_int(String s, int64_t i) {
+    int64_t len = nomu_str_len(s);
+    if (i < 0 || i >= len) rt_bounds_trap(i, len);
+    return (uint8_t)(unsigned char)nomu_str_ptr(s)[i];
+}
+
+// Lexicographic byte ordering (`l < r`). Compares the shared prefix; on a tie the shorter string sorts
+// first. Returns 0/1 as int64_t; codegen truncates to the Bool i1.
+int64_t __string_lt_bool_string(String l, String r) {
+    int64_t llen = nomu_str_len(l), rlen = nomu_str_len(r);
+    int64_t n = llen < rlen ? llen : rlen;
+    int c = memcmp(nomu_str_ptr(l), nomu_str_ptr(r), (size_t)n);
+    if (c != 0) return c < 0;
+    return llen < rlen;
 }
 
 // Get monotonic time for benchmarking

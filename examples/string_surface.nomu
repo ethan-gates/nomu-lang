@@ -1,0 +1,41 @@
+// Task 121.1.4 — the String byte-layer surface: `count`, `isEmpty`, `byte(at:)` (bounds-checked), `.eq`,
+// and storing a String into a `var` class field (the field-store path that shaped-root homing must not
+// capture). All on the heap String produced by `concat`.
+class Holder {
+  var s: String
+}
+
+fun main() {
+  var h = Holder(s: "Hello")
+  h.s = concat(h.s, ", world")        // field store of a concat result
+  print(h.s)
+  print("\n")
+  print(h.s.count)                     // 12
+  print("\n")
+  var empty = ""
+  if empty.isEmpty {
+    print("empty\n")
+  }
+  if h.s.isEmpty {
+    print("BUG: nonempty reported empty\n")
+  }
+  // Re-spell the string one byte at a time through byte(at:).
+  var i = 0
+  while i < h.s.count {
+    putByte(h.s.byte(at: i))
+    i = i + 1
+  }
+  print("\n")
+  if h.s.eq("Hello, world") {
+    print("eq-ok\n")
+  }
+  if h.s.eq("other") {
+    print("BUG: wrong eq\n")
+  }
+  if h.s.lt("zzz") {                   // lexicographic ordering (method form of `<`)
+    print("lt-ok\n")
+  }
+  if h.s.lt("A") {
+    print("BUG: wrong lt\n")
+  }
+}

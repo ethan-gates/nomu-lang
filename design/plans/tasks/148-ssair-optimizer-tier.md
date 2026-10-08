@@ -33,44 +33,26 @@ LLVM leaves (`NOMU_DUMP_LLVM` → `.post.ll`) before adding a pass.
   remains — formerly 164.5 — is **consuming** it in codegen: wire `StackPromotion` (provider injectable
   since [165.2](165-midend-pipeline-prefactor.md)) to read the stored interprocedural summary instead of
   recomputing intraprocedurally, gated by the GC-stress suite. The wiring is thin (the per-instance summary
-  shares `computeEscapeSummaries`'s `external:` parameter); the blocker is the placement route below, since
-  the promotions the summary adds are exactly the ones that trip I4 + the addrspace wall. A **post-inline EA
-  re-run** (inline already runs; promote again after so EA/scalar-promotion reach across the inlined call
-  boundary) is the independent, no-new-machinery slice that lands without the placement decision. Highest-
-  reach EA item; compounds with scalar promotion (§7.3.1).
-  - **The addrspace-across-calls obstacle (decision deferred).** The incremental win from the summary is
-    promoting an `alloc` that only reaches a callee that does not escape it (the `escape_nonleaf` /
-    `sink(g)` shape). Landing that trips two things: **I4** (the verifier's oracle is the *faithful*
-    intraprocedural query, which escapes every call argument), and the **addrspace wall** — a promoted
-    `stackAlloc` is `addrspace(0)`, the callee's reference parameter is `addrspace(1)`, and no
-    `addrspacecast` survives a safepoint in either direction (0→1 asks the statepoint rewriter to relocate
-    a slot; 1→0 lets a collection stale a raw pointer the callee holds). The `Inline` pass already runs
-    before promotion, so the inlinable callees are covered by faithful EA alone; the promotions the summary
-    *adds* are exactly the non-inlined (recursive / large / cross-module `.nmi`) calls that hit the wall.
-    The addrspace encodes "the collector tracks this," so one callee body cannot take both representations
-    — a single body implies a single representation: keep the object `addrspace(1)` and make `p1` cheap
-    instead. Candidate routes, none picked: **(a)** force-inline at the promoted site (low reach — overlaps
-    the inliner); **(b)** bounded same-module argument explosion (the object's fields passed as separate
-    `p1` args, à la LLVM `argpromotion` — internal-linkage, load-only, clone-based, no cross-module reach);
-    **(c)** frame roots / `gcroot`-style pinned slot with a field pointer-map the collector scans (a second
-    root path parallel to the SSA-value statepoints the GC substrate rests on) — now homed in
-    [176 shaped GC roots](176-shaped-gc-roots.md) §176.3, the same shape-aware root path the bit-stealing
-    `String` ([121](121-string-utf8-model.md)) rests on; **(d)** promote into a
-    fiber-local `p1` region reclaimed at frame exit (uniform ABI, composes across calls). **Runtime finding
-    gating (d):** allocation today is **per-carrier** (the TLAB bump, `_Thread_local` per carrier — Go
-    `mcache` / MMTk per-mutator), and fibers **migrate** across carriers via a single shared run queue, so
-    a naive "rewind the TLAB bump at frame exit" is unsound (another fiber on the carrier shares the cursor;
-    the fiber may resume on a different carrier). A true region tier therefore needs new **per-fiber** arena
-    machinery (state that travels with the fiber, interacting with STW root scanning + nursery demotion on
-    survival) — the project names "fiber-local allocation" as an inferred placement, but the runtime has
-    not built it. Prior art: non-moving collectors (Go stack maps, Julia GC frames, Boehm) and refcounting
-    (Swift SIL interprocedural EA → `alloc_ref [stack]`) pass such pointers freely because nothing
-    relocates; moving-GC JITs (HotSpot) inline then scalar-replace and **bail to heap** on a non-inlined
-    escape. Routes (b)/(c)/(d) each touch either the GC-root model or the allocation model. The inference
-    track this was parked behind ([164](164-formal-inference-stage.md)) is done, and route (c) is now
-    chosen and homed in [176 shaped GC roots](176-shaped-gc-roots.md) §176.3 — a shape-aware root path
-    shared with the bit-stealing `String` ([121](121-string-utf8-model.md)); consuming it here is this
-    item's remaining codegen work.
+  shares `computeEscapeSummaries`'s `external:` parameter); the blocker is the placement mechanism below,
+  since the promotions the summary adds are exactly the ones that trip I4 + the addrspace wall. A
+  **post-inline EA re-run** (inline already runs; promote again after so EA/scalar-promotion reach across
+  the inlined call boundary) is the independent, no-new-machinery slice that lands without the placement
+  mechanism. Highest-reach EA item; compounds with scalar promotion (§7.3.1).
+  - **The addrspace-across-calls obstacle — placement mechanism owned by [179](179-value-level-gc-classification.md).**
+    The incremental win from the summary is promoting an `alloc` that only reaches a callee that does not
+    escape it (the `escape_nonleaf` / `sink(g)` shape). Landing that trips two things: **I4** (the
+    verifier's oracle is the *faithful* intraprocedural query, which escapes every call argument), and the
+    **addrspace wall** — a promoted `stackAlloc` is `addrspace(0)`, the callee's reference parameter is
+    `addrspace(1)`, and no `addrspacecast` survives a safepoint in either direction. The `Inline` pass
+    already runs before promotion, so the inlinable callees are covered by faithful EA alone; the
+    promotions the summary *adds* are the non-inlined (recursive / large / cross-module `.nmi`) calls that
+    hit the wall. [179 value-level GC classification](179-value-level-gc-classification.md) dissolves that
+    wall at the source — it repurposes `addrspace(1)` to "may be a managed reference," so a stack-promoted
+    object crosses a non-inlined call with one stable ABI type, and the collector pins-and-traces a root
+    whose address lies in a stack frame (reusing [176 §176.3](176-shaped-gc-roots.md)'s frame-root
+    field-map). Consuming the summary here (phase 179.5) depends on 179 landing; I4 is re-expressed against
+    the precise contract as part of that work. The inference track this was parked behind
+    ([164](164-formal-inference-stage.md)) is done.
 - **Scalar promotion — in-place field mutation of a φ value** `[M · deferred]` `[§7.3.1 A1]` — a
   loop-carried object *both* reassigned to fresh *and* mutated in place needs field-level joins (full
   per-field mem2reg). Rare pattern; bails to heap today (sound).

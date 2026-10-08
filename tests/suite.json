@@ -1,5 +1,5 @@
 {
-  "computed_order": ["scheduler-actor", "scheduler-poller", "stw-collect", "gc-string", "module-generic-producer", "gc-stress-evac", "gc-stress", "module-generic-producer-loop", "gc-pressure", "scheduler-timer", "gc-anybox", "scheduler-mc", "gc-concurrent", "module-generic-bound-nonpod", "module-generic-nonpod", "gen-major", "futex-subset", "pingpong", "gen-minor", "scheduler-tls", "module-gc-deptype-evac", "scalar-carried-evac", "immix-line-mark", "escape-nonleaf-evac", "module-generic-privcallee-mono", "module-generic-compose", "raw-mem-evac", "immix-forward", "subset-ok", "immix-evac", "gen-los", "module-generic-fn-mono", "module-generic-enum-method", "module-shared", "rt-prelude-evac", "erased-generic-fn", "gen-barrier", "sysclock-subset", "arr-gc-evac", "scheduler-lock", "bump-alloc-evac", "module-generic-mut-method", "fiberswitch-evac", "module-method", "module-generic-enum", "module-generic-method", "module-generic-fn-wp", "module-generic-type", "raw-struct", "asmswitch", "module-generic-mut-method-wp", "module-generic-class-method", "module-generic-class-method-wp", "gc-gen", "module-reexport", "fiber-registry", "module-static-computed", "module-generic-static-computed", "module-generic-field-wp", "module-generic-nested-wp", "typed-ptr-evac", "scheduler-evac", "selfhost-alloc-self", "module-link-diamond", "module-generic-field", "module-generic-bound", "module-generic-nested", "module-generic-enum-method-wp", "immix-sweep", "module-qualified", "atomics", "immix-los-self", "gen-nursery", "module-collision-resolve", "immix-region", "module-generic-method-wp", "immix-defrag", "futex", "module-generic-fold", "module-generic-fold-mono", "module-generic-privcallee-wp", "immix-alloc-self", "gc-gen-self", "module-generic-nested-edge", "module-generic-nested-mono", "module-generic-privcallee", "escape-nonleaf", "raw-struct-evac", "module-generic-fn", "scalar-carried", "sysclock-evac", "asmswitch-evac", "module-gc-deptype", "immix-region-evac", "arr-gc", "immix-los", "fiber-registry-evac", "scheduler-lock-evac", "atomics-evac", "bump-alloc", "typed-ptr", "rt-prelude", "sysclock", "raw-mem", "scheduler", "immix-alloc", "selfhost-alloc", "fiberswitch", "module-collision", "module-dup", "module-leaf-collision", "module-mut-method-bad", "module-perfile-import", "module-private", "module-visibility", "subset-bad"],
+  "computed_order": ["stw-collect", "scheduler-poller", "scheduler-mc", "gc-string-field", "module-generic-producer", "gc-anybox", "gc-string", "gc-stress", "gc-stress-evac", "scheduler-tls", "module-generic-producer-loop", "gc-pressure", "gc-string-relocate-evac", "scheduler-timer", "gc-concurrent", "gen-minor", "gen-los", "module-generic-bound-nonpod", "module-generic-nonpod", "gen-major", "escape-nonleaf-evac", "scheduler-actor", "module-gc-deptype-evac", "scalar-carried-evac", "pingpong", "futex-subset", "gen-barrier", "managed-buffer-ref-evac", "gc-gen-self", "module-generic-fold", "immix-defrag", "module-generic-nested-wp", "module-collision-resolve", "immix-evac", "module-generic-enum", "module-generic-privcallee-wp", "selfhost-alloc-self", "managed-buffer-evac", "fiberswitch", "module-generic-fn-wp", "fiber-registry", "subset-ok", "module-generic-enum-method", "module-generic-mut-method-wp", "module-shared", "immix-alloc", "module-reexport", "module-method", "module-generic-bound", "module-generic-enum-method-wp", "module-generic-static-computed", "module-generic-class-method-wp", "module-generic-method", "module-generic-method-wp", "module-qualified", "string-surface", "module-generic-field-wp", "erased-generic-fn", "asmswitch", "sysclock", "module-generic-type", "module-generic-privcallee-mono", "module-link-diamond", "module-generic-class-method", "module-generic-mut-method", "rt-prelude", "atomics", "scheduler", "module-generic-nested", "typed-ptr-evac", "module-generic-fn-mono", "immix-forward", "scheduler-lock", "immix-los-self", "arr-gc-evac", "module-generic-field", "module-static-computed", "raw-struct", "immix-sweep", "module-generic-compose", "gen-nursery", "immix-region", "immix-line-mark", "bump-alloc", "futex", "managed-buffer-ref-self", "raw-mem-evac", "raw-struct-evac", "gc-gen", "module-generic-fn", "module-generic-privcallee", "escape-nonleaf", "module-generic-fold-mono", "scalar-carried", "module-gc-deptype", "module-generic-nested-mono", "arr-gc", "immix-region-evac", "module-generic-nested-edge", "scheduler-evac", "scheduler-lock-evac", "immix-los", "typed-ptr", "bump-alloc-evac", "fiberswitch-evac", "managed-buffer", "managed-buffer-ref", "rt-prelude-evac", "sysclock-evac", "atomics-evac", "fiber-registry-evac", "asmswitch-evac", "immix-alloc-self", "selfhost-alloc", "sysclock-subset", "raw-mem", "managed-buffer-scalar-ref-bad", "module-collision", "module-dup", "module-leaf-collision", "module-mut-method-bad", "module-perfile-import", "module-private", "module-visibility", "subset-bad"],
   "defaults": { "timeout_sec": 60, "compile_timeout_sec": 120, "iterations": 1, "carriers": [1], "heavy": false },
   "cases": [
 
@@ -15,6 +15,24 @@
       "expect": { "stdout_file": "tests/expected/gc_string.txt" },
       "carriers": [1, 2, 4], "iterations": 4, "weight": 4,
       "stderr_match": [ { "pattern": "nomu-gc-sync: collection", "min": 1 } ] },
+
+    { "name": "gc-string-field", "fixture": "examples/gc_string_field.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_RUNTIME": "selfhost", "NOMU_GC_DEBUG_PRESSURE": "1" },
+      "expect": { "stdout_file": "tests/expected/gc_string_field.txt" },
+      "carriers": [1, 2, 4], "iterations": 4, "weight": 4,
+      "stderr_match": [ { "pattern": "nomu-gc-sync: collection", "min": 1 } ] },
+
+    { "name": "gc-string-relocate-evac", "fixture": "examples/gc_string_relocate.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "256" },
+      "expect": { "stdout_file": "tests/expected/gc_string_relocate.txt" },
+      "iterations": 2, "weight": 4 },
+
+    { "name": "string-surface", "fixture": "examples/string_surface.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nogc" },
+      "expect": { "stdout": "Hello, world\n12\nempty\nHello, world\neq-ok\nlt-ok\n" }, "carriers": [] },
 
     { "name": "gen-minor", "fixture": "examples/gen_minor.nomu",
       "run_env": { "NOMU_RUNTIME": "selfhost", "NOMU_GC_PLAN": "nomu", "NOMU_SCHED": "nomu", "NOMU_NURSERY_RESERVE": "8" },
@@ -126,6 +144,24 @@
       "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "10\n20\n30\n30\n7\n" }, "carriers": [] },
     { "name": "typed-ptr-evac", "fixture": "examples/typed_ptr.nomu",
       "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "10\n20\n30\n30\n7\n" }, "carriers": [] },
+
+    { "name": "managed-buffer", "fixture": "examples/managed_buffer.nomu",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "4\n42\n10\n20\n" }, "carriers": [] },
+    { "name": "managed-buffer-evac", "fixture": "examples/managed_buffer.nomu",
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "64" }, "expect": { "stdout": "4\n42\n10\n20\n" }, "carriers": [] },
+
+    { "name": "managed-buffer-ref", "fixture": "examples/managed_buffer_ref.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "111\n222\n" }, "carriers": [] },
+    { "name": "managed-buffer-ref-evac", "fixture": "examples/managed_buffer_ref.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "64" }, "expect": { "stdout": "111\n222\n" }, "carriers": [] },
+    { "name": "managed-buffer-ref-self", "fixture": "examples/managed_buffer_ref.nomu",
+      "compile_env": { "NOMU_NO_ESCAPE": "1" },
+      "run_env": { "NOMU_RUNTIME": "selfhost", "NOMU_SCHED": "nomu", "NOMU_GC_PLAN": "nomu", "NOMU_STW_COLLECT": "1" },
+      "expect": { "stdout": "111\n222\n" }, "carriers": [] },
+    { "name": "managed-buffer-scalar-ref-bad", "fixture": "tests/fixtures/managed_buffer_scalar_ref_bad.nomu",
+      "compile": { "expect_error": "requires a reference Element" }, "carriers": [] },
 
     { "name": "sysclock", "fixture": "examples/sysclock.nomu",
       "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "1\n1\n" }, "carriers": [] },

@@ -1,0 +1,26 @@
+// Task 180 · ManagedBuffer<Header, Element> — the shared tail-allocated buffer. Creates a buffer, reads its
+// capacity, and round-trips an Int header (via headerPtr) and Int elements (via elementPtr). A smoke test of
+// the four intrinsics: create / capacity / headerPtr / elementPtr.
+// Expected output: 4 / 42 / 10 / 20.
+fun main() {
+  let b = ManagedBuffer<Int, Int>.create(capacity: 4)
+  print(b.capacity())                    // 4
+  print("\n")
+
+  let h = b.headerPtr()
+  h.store(42, toByteOffset: 0)
+  let hv: Int = h.load(fromByteOffset: 0)
+  print(hv)                              // 42
+  print("\n")
+
+  let e0 = b.elementPtr(at: 0)
+  e0.store(10, toByteOffset: 0)
+  let e2 = b.elementPtr(at: 2)
+  e2.store(20, toByteOffset: 0)
+  let v0: Int = e0.load(fromByteOffset: 0)
+  let v2: Int = e2.load(fromByteOffset: 0)
+  print(v0)                              // 10
+  print("\n")
+  print(v2)                              // 20
+  print("\n")
+}

@@ -454,10 +454,16 @@ enum NOIRGen {
                 return BuiltinsSema.member("__uint64_uint8_uint8", b, span)
             }
 
-            // String property builtins (`str.hash`). Method builtins with arguments (`str.eq(x)`)
-            // are handled in checkCall, since they parse with a call's argument list.
+            // String property builtins (`str.hash`, `str.count`, `str.isEmpty`). Method builtins with
+            // arguments (`str.eq(x)`, `str.byte(at:)`) are handled in checkCall.
             if b.type == .string, field == "hash" {
                 return BuiltinsSema.member("__string_hash_int", b, span)
+            }
+            if b.type == .string, field == "count" {
+                return BuiltinsSema.member("__string_count_int", b, span)
+            }
+            if b.type == .string, field == "isEmpty" {
+                return BuiltinsSema.member("__string_isempty_bool", b, span)
             }
             // Array<T> builtin members (M6 stdlib). `count` is the element count; lowered to a builtin
             // call codegen recognizes by name (element type comes from the receiver's `.array` type).
@@ -611,6 +617,17 @@ enum NOIRGen {
     }
 
     static func checkCall(_ s: inout Sema, callee: Expr, args: [Arg], span: Span, expected: Type? = nil) -> NOIRExpr {
+        // ManagedBuffer<Header, Element>.create (task 180) — a compiler-synthesized static on the stdlib
+        // generic class. It is declared (so `s.lookup` finds it), hence it is handled here rather than in
+        // the `lookup == nil` built-in-pointer block below.
+        if case .member(let base, let method, _) = callee,
+           let (tn, explicit) = s.typeNameAndArgs(base), tn == "ManagedBuffer" {
+            guard let gen = explicit, gen.count == 2 else {
+                s.diags.error("'ManagedBuffer' needs two type arguments, e.g. 'ManagedBuffer<Header, Element>.\(method)(...)'", at: span)
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return ManagedBufferIntrinsics.checkStatic(&s, header: gen[0], element: gen[1], method, args, span)
+        }
         // Qualified enum construction: `EnumType.case(args)` or `EnumType<Args>.case(args)`. A
         // `static fun` of the same enum takes precedence over case construction for that name.
         if case .member(let base, let caseName, _) = callee,
@@ -733,6 +750,11 @@ enum NOIRGen {
                     return NOIRExpr(type: .error, span: span, kind: .intLit(0))
                 }
             }
+            // ManagedBuffer instance accessors (task 180): capacity / headerPtr / elementPtr and the typed
+            // reference accessors storeRef / ref / storeHeaderRef / headerRef.
+            if case .generic(let base, _) = recv.type, base == "ManagedBuffer" {
+                return ManagedBufferIntrinsics.checkMethod(&s, recv, name, args, span)
+            }
             // RawPtr instance methods (task 125): free / advanced / store / load / asPtr.
             if case .rawPtr = recv.type {
                 return PointerIntrinsics.checkRawPtrMethod(&s, recv, name, args, span, expected: expected)
@@ -755,6 +777,31 @@ enum NOIRGen {
                         s.diags.error("String.eq expects a String argument, got '\(rhs.type)'", at: rhs.span)
                     }
                     return BuiltinsSema.method("__string_eq_bool_string", recv, [rhs], span)
+                case "lt":
+                    // `lt(other) -> Bool` — lexicographic ordering (`<` as a method until operators land).
+                    guard args.count == 1 else {
+                        s.diags.error("String.lt expects 1 argument, got \(args.count)", at: span)
+                        return NOIRExpr(type: .error, span: span, kind: .boolLit(false))
+                    }
+                    let rhs = checkExpr(&s, args[0].value)
+                    if rhs.type != .string && rhs.type != .error {
+                        s.diags.error("String.lt expects a String argument, got '\(rhs.type)'", at: rhs.span)
+                    }
+                    return BuiltinsSema.method("__string_lt_bool_string", recv, [rhs], span)
+                case "byte":
+                    // `byte(at: i) -> UInt8` — the bounds-checked byte read (task 121.1.4 byte layer).
+                    guard args.count == 1 else {
+                        s.diags.error("String.byte expects 1 argument, got \(args.count)", at: span)
+                        return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+                    }
+                    if let l = args[0].label, l != "at" {
+                        s.diags.error("String.byte argument label must be 'at:', got '\(l):'", at: span)
+                    }
+                    let idx = checkExpr(&s, args[0].value)
+                    if idx.type != .int && idx.type != .error {
+                        s.diags.error("String.byte(at:) expects an Int index, got '\(idx.type)'", at: idx.span)
+                    }
+                    return BuiltinsSema.method("__string_byteat_uint8_int", recv, [idx], span)
                 default:
                     s.diags.error("value of type 'String' has no method '\(name)'", at: span)
                     return NOIRExpr(type: .error, span: span, kind: .boolLit(false))

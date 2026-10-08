@@ -51,6 +51,14 @@ fun rtObjTypeId(obj: RawPtr) -> Int {
   return h - lo
 }
 
+// Byte offset of element 0 in a variable-length buffer (task 180): the 16-byte primitive prefix
+// (`{ type-id, cap }`) plus the user header. 16 for an array buffer (no header). The one place the element
+// start is derived, so a header shift lands here, not in each scan phase; the buffer's byte size is then
+// `rtBufElemStart(tid) + cap * stride`.
+fun rtBufElemStart(tid: Int) -> Int {
+  return 16 + RawPtr.gcTypeHeaderSize(tid)
+}
+
 // The address-independent content hash of one object: fold its type-id and its scalar (non-pointer) field
 // words into a 64-bit polynomial hash, skipping the header and every managed-pointer slot (so no raw
 // address enters the hash). A fixed object scans words in [8, size); an array buffer scans its `cap` word
@@ -61,7 +69,7 @@ fun rtObjHash(obj: RawPtr, tid: Int) -> Int {
   var h = tid + 1
   h = h * prime
   let kind = RawPtr.gcTypeKind(tid)
-  let nptr = RawPtr.gcTypeNumPtrs(tid)
+  let nptr = RawPtr.gcLiveCount(tid, obj)
   if kind == 0 {
     let size = RawPtr.gcTypeSize(tid)
     var w = 8
@@ -69,7 +77,7 @@ fun rtObjHash(obj: RawPtr, tid: Int) -> Int {
       var managed = false
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
         if off == w {
           managed = true
         }
@@ -87,15 +95,16 @@ fun rtObjHash(obj: RawPtr, tid: Int) -> Int {
     h = h * prime
     h = h + ecap
     let stride = RawPtr.gcTypeStride(tid)
+    let elemStart = rtBufElemStart(tid)
     var e = 0
     while e < ecap {
-      let elemBase = 16 + e * stride
+      let elemBase = elemStart + e * stride
       var w = 0
       while w < stride {
         var managed = false
         var i = 0
         while i < nptr {
-          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
           if off == w {
             managed = true
           }
@@ -127,8 +136,9 @@ fun rtTryMark(obj: RawPtr, counts: RawPtr, fp: RawPtr) -> Bool {
   let marked = h + 4294967296
   obj.store(marked, toByteOffset: 0)
   // `counts` is a dense per-type histogram sized by gcTypeCount(); a type-id is a descriptor byte
-  // offset (task 100.4.7), so its ordinal is the offset divided by the 24-byte record size.
-  let slot = tid / 24 * 8
+  // offset (task 100.4.7), so its ordinal is the offset divided by the record size (task 180: read from
+  // the runtime, one source of truth, so growing the record never desyncs this math).
+  let slot = tid / RawPtr.gcDescSize() * 8
   let c: Int = counts.load(fromByteOffset: slot)
   counts.store(c + 1, toByteOffset: slot)
   let oh = rtObjHash(obj, tid)
@@ -157,11 +167,11 @@ fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
     let obj: RawPtr = work.load(fromByteOffset: slot)
     let tid = rtObjTypeId(obj)
     let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    let nptr = RawPtr.gcLiveCount(tid, obj)
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         let childNull = child.eq(RawPtr.null)
         if !childNull {
@@ -176,12 +186,26 @@ fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)       // array buffer: { header, cap, elems… }
       let stride = RawPtr.gcTypeStride(tid)
+      let elemStart = rtBufElemStart(tid)
+      var hk = 0
+      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180), scanned once
+      while hk < nhdr {
+        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        if !hchild.eq(RawPtr.null) {
+          if rtTryMark(hchild, counts, fp) {
+            work.store(hchild, toByteOffset: top * 8)
+            top = top + 1
+          }
+        }
+        hk = hk + 1
+      }
       var e = 0
       while e < ecap {
-        let elemBase = 16 + e * stride
+        let elemBase = elemStart + e * stride
         var i = 0
         while i < nptr {
-          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
@@ -315,6 +339,52 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
           found = true
           frameSize = fStackSize
           let frameFp = sp.advanced(by: fStackSize - 16)
+          // Shaped roots (task 176 Stage 4) — the NumDeopt deopt range before the ordinary GC pointers, kept
+          // in lockstep with `rtWalkFrom` and the C walker. The 3rd meta location's inline Constant value is
+          // NumDeopt; the range is (shape-id Constant, slot Direct) pairs. Each is resolved to its kind-2
+          // descriptor and run through the shared enumerator over the 16-byte value at the slot — the tag read
+          // yields no offset for an `immortal`/`small` String and the one buffer word for a `heap` one. This
+          // walk emits root VALUES (its counting/marking contract), so the buffer pointer is marked.
+          var numDeopt = 0
+          if nloc > 2 {
+            numDeopt = rtU32(base, recCur + 16 + 2 * 12 + 8)
+          }
+          let deoptEnd = 3 + numDeopt
+          var di = 3
+          while di + 1 < deoptEnd {
+            let cLoc = recCur + 16 + di * 12
+            let dLoc = recCur + 16 + (di + 1) * 12
+            let cw: Int = base.load(fromByteOffset: cLoc)
+            let cKind = cw - cw / 256 * 256
+            let dw: Int = base.load(fromByteOffset: dLoc)
+            let dKind = dw - dw / 256 * 256
+            if cKind == 4 && dKind == 2 {           // Constant (shape ordinal) + Direct[reg+off] (slot)
+              let ordinal = rtU32(base, cLoc + 8)
+              let dReg = rtU16(base, dLoc + 4)
+              let dOff = rtI32(base, dLoc + 8)
+              var vbBase = sp
+              if dReg == 29 {
+                vbBase = frameFp
+              }
+              let valbase = vbBase.advanced(by: dOff)
+              let descId = RawPtr.gcShapeDescForOrdinal(ordinal)
+              let cnt = RawPtr.gcLiveCount(descId, valbase)
+              var sk = 0
+              while sk < cnt {
+                let soff = RawPtr.gcLiveOffsetAt(descId, valbase, sk)
+                let wordPtr = valbase.advanced(by: soff)
+                let sroot: RawPtr = wordPtr.load(fromByteOffset: 0)
+                if sroot.isNull == false {
+                  if n < cap {
+                    outBuf.store(sroot, toByteOffset: n * 8)
+                    n = n + 1
+                  }
+                }
+                sk = sk + 1
+              }
+            }
+            di = di + 2
+          }
           var li = 3                              // skip the 3 leading meta locations
           while li < nloc {
             let locOff = recCur + 16 + li * 12
@@ -406,6 +476,57 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitS
           found = true
           frameSize = fStackSize
           let frameFp = sp.advanced(by: fStackSize - 16)
+          // Shaped roots (task 176 Stage 4), mirroring the C walker's `nomu_gc_walk_context`. The 3rd meta
+          // location's inline Constant value is NumDeopt; the deopt range that follows (before the ordinary
+          // GC pointers) is our shaped roots — (shape-id Constant, slot Direct) pairs. For each, resolve the
+          // ordinal to its kind-2 descriptor and run the shared enumerator over the 16-byte value at the slot:
+          // it reads the tag and yields the live managed-word offsets, so an `immortal`/`small` String
+          // contributes nothing and a `heap` String yields its one buffer word (emitted slot-mode so a moving
+          // collection rewrites `word0` in place, which the mutator's volatile reload then observes).
+          var numDeopt = 0
+          if nloc > 2 {
+            numDeopt = rtU32(base, recCur + 16 + 2 * 12 + 8)
+          }
+          let deoptEnd = 3 + numDeopt
+          var di = 3
+          while di + 1 < deoptEnd {
+            let cLoc = recCur + 16 + di * 12
+            let dLoc = recCur + 16 + (di + 1) * 12
+            let cw: Int = base.load(fromByteOffset: cLoc)
+            let cKind = cw - cw / 256 * 256
+            let dw: Int = base.load(fromByteOffset: dLoc)
+            let dKind = dw - dw / 256 * 256
+            if cKind == 4 && dKind == 2 {               // Constant (shape ordinal) + Direct[reg+off] (slot)
+              let ordinal = rtU32(base, cLoc + 8)
+              let dReg = rtU16(base, dLoc + 4)
+              let dOff = rtI32(base, dLoc + 8)
+              var vbBase = sp
+              if dReg == 29 {
+                vbBase = frameFp
+              }
+              let valbase = vbBase.advanced(by: dOff)
+              let descId = RawPtr.gcShapeDescForOrdinal(ordinal)
+              let cnt = RawPtr.gcLiveCount(descId, valbase)
+              var sk = 0
+              while sk < cnt {
+                let soff = RawPtr.gcLiveOffsetAt(descId, valbase, sk)
+                let wordPtr = valbase.advanced(by: soff)
+                let sroot: RawPtr = wordPtr.load(fromByteOffset: 0)
+                if sroot.isNull == false {
+                  if n < cap {
+                    if emitSlots != 0 {
+                      outBuf.store(wordPtr, toByteOffset: n * 8)
+                    } else {
+                      outBuf.store(sroot, toByteOffset: n * 8)
+                    }
+                    n = n + 1
+                  }
+                }
+                sk = sk + 1
+              }
+            }
+            di = di + 2
+          }
           var li = 3
           while li < nloc {
             let locOff = recCur + 16 + li * 12
@@ -1251,13 +1372,13 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
     let obj: RawPtr = work.load(fromByteOffset: slot)
     let tid = rtObjTypeId(obj)
     let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    let nptr = RawPtr.gcLiveCount(tid, obj)
     if kind == 0 {
       let size = RawPtr.gcTypeSize(tid)
       rtMarkObjLines(space, obj, size)
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         let childNull = child.eq(RawPtr.null)
         if !childNull {
@@ -1272,14 +1393,28 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
       let stride = RawPtr.gcTypeStride(tid)
-      let size = 16 + ecap * stride
+      let elemStart = rtBufElemStart(tid)
+      let size = elemStart + ecap * stride
       rtMarkObjLines(space, obj, size)
+      var hk = 0
+      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180)
+      while hk < nhdr {
+        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        if !hchild.eq(RawPtr.null) {
+          if rtTryMark(hchild, counts, fp) {
+            work.store(hchild, toByteOffset: top * 8)
+            top = top + 1
+          }
+        }
+        hk = hk + 1
+      }
       var e = 0
       while e < ecap {
-        let elemBase = 16 + e * stride
+        let elemBase = elemStart + e * stride
         var i = 0
         while i < nptr {
-          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
@@ -1367,14 +1502,15 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
     let obj: RawPtr = work.load(fromByteOffset: top * 8)
     let tid = rtObjTypeId(obj)
     let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    let nptr = RawPtr.gcLiveCount(tid, obj)
     var size = 0
     if kind == 0 {
       size = RawPtr.gcTypeSize(tid)
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
       let stride = RawPtr.gcTypeStride(tid)
-      size = 16 + ecap * stride
+      let elemStart = rtBufElemStart(tid)
+      size = elemStart + ecap * stride
     }
     let a = obj.toInt()
     var inHeap = true
@@ -1400,7 +1536,7 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         if rtUnmarkIfMarked(child) {
           work.store(child, toByteOffset: top * 8)
@@ -1411,12 +1547,24 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
     } else {
       let ecap2: Int = obj.load(fromByteOffset: 8)
       let stride2 = RawPtr.gcTypeStride(tid)
+      let elemStart = rtBufElemStart(tid)
+      var hk = 0
+      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180)
+      while hk < nhdr {
+        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        if rtUnmarkIfMarked(hchild) {
+          work.store(hchild, toByteOffset: top * 8)
+          top = top + 1
+        }
+        hk = hk + 1
+      }
       var ee = 0
       while ee < ecap2 {
-        let elemBase = 16 + ee * stride2
+        let elemBase = elemStart + ee * stride2
         var i2 = 0
         while i2 < nptr {
-          let off2 = RawPtr.gcTypePtrOffset(tid, i2)
+          let off2 = RawPtr.gcLiveOffsetAt(tid, obj, i2)
           let at = elemBase + off2
           let child2: RawPtr = obj.load(fromByteOffset: at)
           if rtUnmarkIfMarked(child2) {
@@ -1490,20 +1638,21 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
     let obj: RawPtr = work.load(fromByteOffset: top * 8)
     let tid = rtObjTypeId(obj)
     let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    let nptr = RawPtr.gcLiveCount(tid, obj)
     var size = 0
     if kind == 0 {
       size = RawPtr.gcTypeSize(tid)
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
       let stride = RawPtr.gcTypeStride(tid)
-      size = 16 + ecap * stride
+      let elemStart = rtBufElemStart(tid)
+      size = elemStart + ecap * stride
     }
     rtMarkObjLines(space, obj, size)
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         let childNull = child.eq(RawPtr.null)
         if !childNull {
@@ -1517,12 +1666,26 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
     } else {
       let ecap2: Int = obj.load(fromByteOffset: 8)
       let stride2 = RawPtr.gcTypeStride(tid)
+      let elemStart = rtBufElemStart(tid)
+      var hk = 0
+      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180)
+      while hk < nhdr {
+        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        if !hchild.eq(RawPtr.null) {
+          if rtTryMarkBare(hchild) {
+            work.store(hchild, toByteOffset: top * 8)
+            top = top + 1
+          }
+        }
+        hk = hk + 1
+      }
       var e = 0
       while e < ecap2 {
-        let elemBase = 16 + e * stride2
+        let elemBase = elemStart + e * stride2
         var i = 0
         while i < nptr {
-          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
@@ -1630,11 +1793,11 @@ fun rtImmixUnmark(root: RawPtr) {
     let obj: RawPtr = work.load(fromByteOffset: top * 8)
     let tid = rtObjTypeId(obj)
     let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    let nptr = RawPtr.gcLiveCount(tid, obj)
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         if rtUnmarkIfMarked(child) {
           work.store(child, toByteOffset: top * 8)
@@ -1645,12 +1808,24 @@ fun rtImmixUnmark(root: RawPtr) {
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
       let stride = RawPtr.gcTypeStride(tid)
+      let elemStart = rtBufElemStart(tid)
+      var hk = 0
+      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180)
+      while hk < nhdr {
+        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        if rtUnmarkIfMarked(hchild) {
+          work.store(hchild, toByteOffset: top * 8)
+          top = top + 1
+        }
+        hk = hk + 1
+      }
       var e = 0
       while e < ecap {
-        let elemBase = 16 + e * stride
+        let elemBase = elemStart + e * stride
         var i = 0
         while i < nptr {
-          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           if rtUnmarkIfMarked(child) {
@@ -1695,11 +1870,11 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
     }
     let tid = rtObjTypeId(obj)
     let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    let nptr = RawPtr.gcLiveCount(tid, obj)
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         if rtUnmarkIfMarked(child) {
           work.store(child, toByteOffset: top * 8)
@@ -1710,12 +1885,24 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
       let stride = RawPtr.gcTypeStride(tid)
+      let elemStart = rtBufElemStart(tid)
+      var hk = 0
+      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180)
+      while hk < nhdr {
+        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        if rtUnmarkIfMarked(hchild) {
+          work.store(hchild, toByteOffset: top * 8)
+          top = top + 1
+        }
+        hk = hk + 1
+      }
       var e = 0
       while e < ecap {
-        let elemBase = 16 + e * stride
+        let elemBase = elemStart + e * stride
         var i = 0
         while i < nptr {
-          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           if rtUnmarkIfMarked(child) {
@@ -1787,7 +1974,8 @@ fun rtObjSize(obj: RawPtr) -> Int {
   }
   let ecap: Int = obj.load(fromByteOffset: 8)
   let stride = RawPtr.gcTypeStride(tid)
-  return 16 + ecap * stride
+  let elemStart = rtBufElemStart(tid)
+  return elemStart + ecap * stride
 }
 
 // Copy `bytes` (a multiple of 8) word by word — the whole object including its header.
@@ -1854,8 +2042,9 @@ fun rtCheckPayloadWord() -> Int {
   var t = 0
   while t < tcount {
     // gcTypeCount() is the descriptor count; a type-id is a descriptor byte offset (task 100.4.7),
-    // so ordinal `t` maps to offset `t * 24` (the record size) for the accessor reads.
-    let off = t * 24
+    // so ordinal `t` maps to offset `t * record-size` for the accessor reads (task 180: record size from
+    // the runtime, one source of truth).
+    let off = t * RawPtr.gcDescSize()
     let kind = RawPtr.gcTypeKind(off)
     if kind == 0 {
       let sz = RawPtr.gcTypeSize(off)
@@ -1933,20 +2122,21 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
     let obj: RawPtr = work.load(fromByteOffset: top * 8)
     let tid = rtObjTypeId(obj)
     let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcTypeNumPtrs(tid)
+    let nptr = RawPtr.gcLiveCount(tid, obj)
     var size = 0
     if kind == 0 {
       size = RawPtr.gcTypeSize(tid)
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
       let stride = RawPtr.gcTypeStride(tid)
-      size = 16 + ecap * stride
+      let elemStart = rtBufElemStart(tid)
+      size = elemStart + ecap * stride
     }
     rtMarkObjLines(space, obj, size)
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         let childNull = child.eq(RawPtr.null)
         if !childNull {
@@ -1962,12 +2152,28 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
     } else {
       let ecap2: Int = obj.load(fromByteOffset: 8)
       let stride2 = RawPtr.gcTypeStride(tid)
+      let elemStart = rtBufElemStart(tid)
+      var hk = 0
+      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180): evacuate + write back
+      while hk < nhdr {
+        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        if !hchild.eq(RawPtr.null) {
+          let hnc = rtEvacuate(space, hchild)
+          obj.store(hnc, toByteOffset: hat)
+          if rtTryMarkBare(hnc) {
+            work.store(hnc, toByteOffset: top * 8)
+            top = top + 1
+          }
+        }
+        hk = hk + 1
+      }
       var e = 0
       while e < ecap2 {
-        let elemBase = 16 + e * stride2
+        let elemBase = elemStart + e * stride2
         var i = 0
         while i < nptr {
-          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
@@ -2218,23 +2424,30 @@ fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
   var count = count0
   let tid = rtObjTypeId(obj)
   let kind = RawPtr.gcTypeKind(tid)
-  let nptr = RawPtr.gcTypeNumPtrs(tid)
+  let nptr = RawPtr.gcLiveCount(tid, obj)
   if kind == 0 {
     var i = 0
     while i < nptr {
-      let off = RawPtr.gcTypePtrOffset(tid, i)
+      let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
       count = rtMinorForward(space, obj.advanced(by: off), q, count)
       i = i + 1
     }
   } else {
     let ecap: Int = obj.load(fromByteOffset: 8)
     let stride = RawPtr.gcTypeStride(tid)
+    let elemStart = rtBufElemStart(tid)
+    var hk = 0
+    let nhdr = RawPtr.gcHeaderPtrCount(tid)        // header managed pointers (task 180)
+    while hk < nhdr {
+      count = rtMinorForward(space, obj.advanced(by: 16 + RawPtr.gcHeaderOffsetAt(tid, hk)), q, count)
+      hk = hk + 1
+    }
     var e = 0
     while e < ecap {
-      let elemBase = 16 + e * stride
+      let elemBase = elemStart + e * stride
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcTypePtrOffset(tid, i)
+        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
         count = rtMinorForward(space, obj.advanced(by: elemBase + off), q, count)
         i = i + 1
       }
@@ -3087,10 +3300,10 @@ fun rtWalkShadow(fib: RawPtr, outBuf: RawPtr, n0: Int, cap: Int, emitSlots: Int)
         let w: Int = vwt.load(fromByteOffset: 8)      // { type_id (low 32), flags (high 32) }
         let hi = w / 4294967296
         let tid = w - hi * 4294967296                 // type_id = value-layout descriptor offset
-        let nptr = RawPtr.gcTypeNumPtrs(tid)
+        let nptr = RawPtr.gcLiveCount(tid, buf)
         var i = 0
         while i < nptr {
-          let off = RawPtr.gcTypePtrOffset(tid, i)
+          let off = RawPtr.gcLiveOffsetAt(tid, buf, i)
           let slotPtr = buf.advanced(by: off)
           let root: RawPtr = slotPtr.load(fromByteOffset: 0)
           if root.isNull == false {

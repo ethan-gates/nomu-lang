@@ -18,9 +18,13 @@ use mmtk::util::{Address, ObjectReference};
 use mmtk::vm::*;
 use mmtk::{memory_manager, AllocationSemantics, MMTKBuilder, Mutator, MMTK};
 
-// The runtime's pointer-map accessor (runtime.c, 6.1.3): managed-field byte offsets for a type-id.
+// The runtime's pointer-map accessors (runtime.c, 6.1.3): managed-field byte offsets for a type-id.
 unsafe extern "C" {
-    fn nomu_gc_typemap(type_id: u64, out_count: *mut i32) -> *const i32;
+    // The shared shaped-root/field enumerator (task 176, shaped-roots.md Stage 5): the live managed-pointer
+    // byte offsets of a value at `base`. Kind 0/1 return the static flat map (`base` unused, identical to
+    // `nomu_gc_typemap`); kind 2 (shaped) reads the discriminant at `base` and returns the live case's
+    // offsets. Routing object scanning through this keeps the kind-2 tag-decode in one place (lockstep).
+    fn nomu_gc_live_offsets(type_id: u64, base: *const u8, out_count: *mut i32) -> *const i32;
     // 6.2.4 object sizing: the total byte size of every object of a type-id (header included), from
     // the codegen size table parallel to the pointer maps. `ObjectModel::get_current_size` reads it.
     fn nomu_gc_typesize(type_id: u64) -> u64;
@@ -29,6 +33,13 @@ unsafe extern "C" {
     // the per-element managed-pointer map read from `nomu_gc_typemap`.
     fn nomu_gc_typekind(type_id: u64) -> i32;
     fn nomu_gc_typestride(type_id: u64) -> u64;
+    // Buffer user-header byte size (task 180): element 0 sits at `16 + header_size`; 0 for an array
+    // buffer, so the sizing/scan geometry below stays byte-identical for arrays.
+    fn nomu_gc_typeheadersize(type_id: u64) -> i32;
+    // The buffer header's managed-pointer map (task 180): count + k-th offset (relative to `base + 16`),
+    // scanned once per buffer. 0 for an array buffer (header-less), so these loops are empty there.
+    fn nomu_gc_typeheaderptrs(type_id: u64) -> i32;
+    fn nomu_gc_headeroffset(type_id: u64, k: i32) -> i32;
     // 6.2.1 root scanning: walk a stopped carrier's stack (from its STW-saved context), invoking
     // `visit(slot, value, userdata)` per live GC root — `slot` is the stack address holding the
     // pointer. Reports nothing until the STW handshake saves carrier contexts (6.2.3).
@@ -177,7 +188,7 @@ fn mv_obj_hash(base: Address, type_id: u64) -> i64 {
     let mut h: i64 = (type_id as i64).wrapping_add(1);
     h = h.wrapping_mul(PRIME);
     let mut count: i32 = 0;
-    let offs = unsafe { nomu_gc_typemap(type_id, &mut count) };
+    let offs = unsafe { nomu_gc_live_offsets(type_id, base.as_usize() as *const u8, &mut count) };
     // Is byte-offset `w` a managed-pointer slot (skipped, so no address enters the hash)?
     let managed = |w: usize| -> bool {
         (0..count as isize).any(|i| unsafe { *offs.offset(i) } as usize == w)
@@ -193,12 +204,13 @@ fn mv_obj_hash(base: Address, type_id: u64) -> i64 {
             w += 8;
         }
     } else {
-        let ecap = unsafe { (base + 8usize).load::<i64>() }; // array buffer: { header, cap, elems… }
+        let ecap = unsafe { (base + 8usize).load::<i64>() }; // buffer: { header, cap, [user header], elems… }
         h = h.wrapping_mul(PRIME).wrapping_add(ecap);
         let stride = unsafe { nomu_gc_typestride(type_id) } as usize;
+        let elem_start = 16usize + unsafe { nomu_gc_typeheadersize(type_id) } as usize;
         let mut e: i64 = 0;
         while e < ecap {
-            let elem_base = 16usize + (e as usize) * stride;
+            let elem_base = elem_start + (e as usize) * stride;
             let mut w = 0usize;
             while w < stride {
                 if !managed(w) {
@@ -342,7 +354,8 @@ impl ObjectModel<NomuVM> for VMObjectModel {
             // cap × element stride. `cap` is the *allocated* extent, so this accounts the whole object.
             let cap = unsafe { (base + 8usize).load::<i64>() } as usize;
             let stride = unsafe { nomu_gc_typestride(type_id) } as usize;
-            return 16 + cap * stride;
+            let header = unsafe { nomu_gc_typeheadersize(type_id) } as usize;
+            return 16 + header + cap * stride;
         }
         unsafe { nomu_gc_typesize(type_id) as usize }
     }
@@ -553,15 +566,22 @@ impl Scanning<NomuVM> for VMScanning {
             MV_FP.fetch_add(mv_obj_hash(base, type_id), Ordering::Relaxed);
         }
         let mut count: i32 = 0;
-        let offs = unsafe { nomu_gc_typemap(type_id, &mut count) };
+        let offs = unsafe { nomu_gc_live_offsets(type_id, base.as_usize() as *const u8, &mut count) };
         if unsafe { nomu_gc_typekind(type_id) } != 0 {
             // Array buffer: apply the per-element managed-pointer map at each of the `cap` element
             // slots. Slots beyond `len` are zero-initialized (rt_alloc zeroing + copy-only-live on
             // grow), so their managed offsets hold null and MMTk skips them — scanning `cap` is safe.
             let cap = unsafe { (base + 8usize).load::<i64>() } as isize;
             let stride = unsafe { nomu_gc_typestride(type_id) } as usize;
+            let elem_start = 16usize + unsafe { nomu_gc_typeheadersize(type_id) } as usize;
+            // Header managed pointers (task 180), scanned once at `base + 16 + off`; empty for an array.
+            let nhdr = unsafe { nomu_gc_typeheaderptrs(type_id) };
+            for hk in 0..nhdr {
+                let hoff = unsafe { nomu_gc_headeroffset(type_id, hk) } as usize;
+                slot_visitor.visit_slot(mmtk::vm::slot::SimpleSlot::from_address(base + 16usize + hoff));
+            }
             for i in 0..cap {
-                let elem_base = base + 16usize + (i as usize) * stride;
+                let elem_base = base + elem_start + (i as usize) * stride;
                 for j in 0..count as isize {
                     let off = unsafe { *offs.offset(j) } as usize;
                     slot_visitor.visit_slot(mmtk::vm::slot::SimpleSlot::from_address(elem_base + off));
@@ -794,10 +814,10 @@ pub extern "C" fn nomu_gc_write_barrier_post(
     memory_manager::object_reference_write_post::<NomuVM>(m, src, slot, target);
 }
 
-/// Allocate `size` bytes in **immortal** space (M6 · 6.2.4): non-moving, never reclaimed. The String
-/// interim routes its `rt_str_concat`/`rt_read_line` buffers here so their raw `addr0` `data` pointer
-/// (`{ addr0, i64 }`, Q6) stays valid under a moving collector — the buffers leak until real heap-
-/// boxing (the D6 spill seam + Q6) lands. `rt_str_lit` needs no allocation (it wraps static rodata).
+/// Allocate `size` bytes in **immortal** space (M6 · 6.2.4): non-moving, never reclaimed. `rt_read_line`
+/// still routes its buffer here (immortal interim). String literals (`rt_str_lit`) wrap static rodata and
+/// need no allocation; `concat` now produces a relocatable `heap` `StringStorage` (task 176.2), not an
+/// immortal buffer.
 #[unsafe(no_mangle)]
 pub extern "C" fn nomu_gc_alloc_immortal(mutator: *mut Mutator<NomuVM>, size: usize, align: usize) -> *mut c_void {
     alloc_semantic(mutator, size, align, AllocationSemantics::Immortal)

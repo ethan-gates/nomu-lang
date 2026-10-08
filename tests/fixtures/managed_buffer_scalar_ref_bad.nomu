@@ -1,0 +1,7 @@
+// Task 180 — the typed managed accessors are reference-only. `storeRef` on a buffer whose Element is a
+// scalar (`Int`) is a compile error: a scalar element has no managed pointer to route through the barrier,
+// so the raw `elementPtr(at:)` accessor is the one to use. This fixture pins that diagnostic.
+fun main() {
+  let b = ManagedBuffer<Int, Int>.create(capacity: 1)
+  b.storeRef(5, at: 0)
+}

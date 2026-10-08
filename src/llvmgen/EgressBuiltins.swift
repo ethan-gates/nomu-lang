@@ -29,8 +29,20 @@ enum EgressBuiltins {
         case .bool:
             return g.e.buildCall(fn, pty, [g.e.intFormat(), LLVMBuildZExt(g.b, value, g.e.i64, "b2i")])
         case .string:
-            let data = LLVMBuildExtractValue(g.b, value, 0, "data")
-            let len = LLVMBuildExtractValue(g.b, value, 1, "len")
+            // Bit-stealing layout: `word0` is the buffer pointer (immortal/heap case), `word1`'s low 56
+            // bits are the byte count; the tag is the top nibble (task 121). The small/inline case is not
+            // produced yet (121.3), so pulling `(ptr, count)` from `word0`/`word1` covers every current value.
+            let word0 = LLVMBuildExtractValue(g.b, value, 0, "word0")
+            let word1 = LLVMBuildExtractValue(g.b, value, 1, "word1")
+            // A `heap` String's `word0` is the StringStorage base; its bytes start past `{ header, cap }` at
+            // offset 16. `immortal` (and the empty string) keep bytes at `word0` directly (task 176.2).
+            let tag = LLVMBuildLShr(g.b, word1, LLVMConstInt(g.e.i64, 60, 0), "tag")
+            let isHeap = LLVMBuildICmp(g.b, LLVMIntEQ, tag, LLVMConstInt(g.e.i64, 2, 0), "isheap")
+            let heapW0 = LLVMBuildAdd(g.b, word0, LLVMConstInt(g.e.i64, 16, 0), "heapw0")
+            let dataInt = LLVMBuildSelect(g.b, isHeap, heapW0, word0, "dataint")
+            let data = LLVMBuildIntToPtr(g.b, dataInt, g.e.i8ptr, "data")
+            let mask = LLVMConstInt(g.e.i64, 0x00FF_FFFF_FFFF_FFFF, 0)
+            let len = LLVMBuildAnd(g.b, word1, mask, "len")
             let len32 = LLVMBuildTrunc(g.b, len, g.e.i32, "len32")
             return g.e.buildCall(fn, pty, [g.e.strFormat(), len32, data])
         default:
@@ -52,10 +64,41 @@ enum EgressBuiltins {
         return g.e.buildCall(fn, pty, [])
     }
 
+    // Concatenation produces a `heap` String (task 176.2): a managed `StringStorage` buffer the moving
+    // collector relocates. The allocation is emitted here (not in C) so it rides the plan-aware, shaped-root
+    // seam — a live `heap` String in the caller is recorded across it (`rtAllocManaged` picks the rooted
+    // variant while `pendingDeopt` is set for this call). The two inputs are snapshotted off-heap *before* the
+    // alloc (gc-leaf `rt_str_snapshot`), so a collection triggered by the alloc relocating them can't strand
+    // the copy; `rt_str_fill` then blits the snapshot into the storage body. No managed allocation happens
+    // between the alloc and the fill, so the fresh storage pointer is stable across the byte work.
     static func emitConcat(_ g: SSAIRToLLVM, _ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
         guard args.count == 2 else { g.e.fail("7.2.3: concat expects two arguments", span); return nil }
-        let (fn, fty) = g.e.runtimeFn("rt_str_concat", ret: g.e.strTy, params: [g.e.strTy, g.e.strTy], varArg: false)
-        return g.e.buildCall(fn, fty, [g.val(args[0]), g.val(args[1])])
+        let e = g.e, b = g.b
+        let a = g.val(args[0]), c = g.val(args[1])
+        let mask = LLVMConstInt(e.i64, 0x00FF_FFFF_FFFF_FFFF, 0)
+        let alen = LLVMBuildAnd(b, LLVMBuildExtractValue(b, a, 1, "aw1"), mask, "alen")!
+        let blen = LLVMBuildAnd(b, LLVMBuildExtractValue(b, c, 1, "bw1"), mask, "blen")!
+        let len = LLVMBuildAdd(b, alen, blen, "len")!
+        // Snapshot both inputs into one off-heap buffer before any managed allocation (gc-leaf).
+        let (snapFn, snapTy) = e.runtimeFn("rt_str_snapshot", ret: e.i8ptr, params: [e.strTy, e.strTy], varArg: false)
+        let snap = e.buildCall(snapFn, snapTy, [a, c])!
+        // Managed StringStorage: `{ header, cap, bytes… }` = 16 + len bytes, via the rooted plan-aware seam.
+        let size = LLVMBuildAdd(b, LLVMConstInt(e.i64, 16, 0), len, "sssize")!
+        let ss = e.rtAllocManaged(size)
+        let tidG = LLVMGetNamedGlobal(e.mod, "__nomu_stringstorage_typeid")
+            ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_stringstorage_typeid")
+        LLVMBuildStore(b, LLVMBuildLoad2(b, e.i64, tidG, "ss.tid"), ss)                 // header at offset 0
+        LLVMBuildStore(b, len, e.gepByte(ss, LLVMConstInt(e.i64, 8, 0)))                // cap (byte count) at 8
+        let body = e.toUnmanaged(e.gepByte(ss, LLVMConstInt(e.i64, 16, 0)))             // bytes at 16
+        let (fillFn, fillTy) = e.runtimeFn("rt_str_fill", ret: e.voidTy, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
+        _ = e.buildCall(fillFn, fillTy, [body, snap, len])
+        // Build the heap String value: word0 = storage base, word1 = (heap tag << 60) | byte count.
+        let w0 = LLVMBuildPtrToInt(b, ss, e.i64, "ss.w0")!
+        let w1 = LLVMBuildOr(b, LLVMConstInt(e.i64, UInt64(2) << 60, 0), len, "ss.w1")!
+        var result = LLVMGetUndef(e.strTy)
+        result = LLVMBuildInsertValue(b, result, w0, 0, "s0")!
+        result = LLVMBuildInsertValue(b, result, w1, 1, "s1")!
+        return result
     }
 
     static func emitSleep(_ g: SSAIRToLLVM, _ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
@@ -84,6 +127,7 @@ enum EgressBuiltins {
         case .string: return g.e.strTy
         case .double: return g.e.f64
         case .bool:   return g.e.i1
+        case .uint8:  return g.e.i8    // a UInt8 builtin result/arg is one byte (e.g. `byte(at:)`)
         default:      return g.e.i64
         }
     }

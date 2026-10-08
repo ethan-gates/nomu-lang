@@ -27,7 +27,7 @@ enum PointerIntrinsics {
     // Validate a builtin call's argument labels against a fixed expected list (nil = an unlabeled
     // positional argument). The pointer surface spells its offsets/counts explicitly (`toByteOffset:`,
     // `by:`), so the labels are required, matching the design.
-    private static func checkArgLabels(_ s: inout Sema, _ args: [Arg], _ expected: [String?], _ ctx: String, _ span: Span) -> Bool {
+    static func checkArgLabels(_ s: inout Sema, _ args: [Arg], _ expected: [String?], _ ctx: String, _ span: Span) -> Bool {
         guard args.count == expected.count else {
             let sig = expected.map { $0.map { "\($0):" } ?? "_" }.joined(separator: ", ")
             s.diags.error("\(ctx) expects \(expected.count) argument(s) (\(sig)), got \(args.count)", at: span)
@@ -46,7 +46,7 @@ enum PointerIntrinsics {
     // Check an `Int`-typed argument of a pointer builtin, enforcing the type as the virtual signature
     // demands (a byte offset / count / alignment). `coerce(_, to: .int)` is a no-op, so this is what
     // actually rejects a non-Int argument.
-    private static func intArg(_ s: inout Sema, _ e: Expr, _ ctx: String, _ what: String) -> NOIRExpr {
+    static func intArg(_ s: inout Sema, _ e: Expr, _ ctx: String, _ what: String) -> NOIRExpr {
         let v = NOIRGen.checkExpr(&s, e, expected: .int)
         if v.type != .int, v.type != .error {
             s.diags.error("\(ctx): \(what) must be an 'Int', got '\(v.type)'", at: v.span)
@@ -99,12 +99,19 @@ enum PointerIntrinsics {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return s.ptrIntrinsic("__gcTypeCount", .int, [], span)
-        case "gcTypeSize", "gcTypeKind", "gcTypeStride", "gcTypeNumPtrs":
+        case "gcDescSize":
+            // The descriptor record byte size (task 180): the single source of truth the self-hosted
+            // collector reads for the type-id ↔ ordinal stride, rather than hardcoding the record width.
+            guard checkArgLabels(&s, args, [], "RawPtr.gcDescSize", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__gcDescSize", .int, [], span)
+        case "gcTypeSize", "gcTypeKind", "gcTypeStride", "gcTypeNumPtrs", "gcTypeHeaderSize", "gcHeaderPtrCount":
             guard checkArgLabels(&s, args, [nil], "RawPtr.\(method)", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             let id = intArg(&s, args[0].value, "RawPtr.\(method)", "id")
-            let intr = "__" + method   // __gcTypeSize / __gcTypeKind / __gcTypeStride / __gcTypeNumPtrs
+            let intr = "__" + method   // __gcTypeSize / __gcTypeKind / __gcTypeStride / __gcTypeNumPtrs / __gcTypeHeaderSize
             return s.ptrIntrinsic(intr, .int, [id], span)
         case "gcTypePtrOffset":
             guard checkArgLabels(&s, args, [nil, nil], "RawPtr.gcTypePtrOffset", span) else {
@@ -113,6 +120,61 @@ enum PointerIntrinsics {
             let id = intArg(&s, args[0].value, "RawPtr.gcTypePtrOffset", "id")
             let i = intArg(&s, args[1].value, "RawPtr.gcTypePtrOffset", "i")
             return s.ptrIntrinsic("__gcTypePtrOffset", .int, [id, i], span)
+        case "gcHeaderOffsetAt":
+            // The k-th managed-pointer byte offset within a buffer's header (task 180), relative to the
+            // header base (`base + 16`). Paired with `gcHeaderPtrCount` to scan the header once per buffer.
+            guard checkArgLabels(&s, args, [nil, nil], "RawPtr.gcHeaderOffsetAt", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let id = intArg(&s, args[0].value, "RawPtr.gcHeaderOffsetAt", "id")
+            let k = intArg(&s, args[1].value, "RawPtr.gcHeaderOffsetAt", "k")
+            return s.ptrIntrinsic("__gcHeaderOffsetAt", .int, [id, k], span)
+        // The shared shaped-root/field enumerator (task 176, shaped-roots.md Stage 5): resolve the live
+        // managed-pointer byte offsets of a value of type-id `id` at address `base`. For kind 0/1 this is the
+        // static flat map (`base` unused), identical to `gcTypeNumPtrs`/`gcTypePtrOffset`; for kind 2 (shaped)
+        // the tag is read from the value at `base` and the live case's offsets returned. Both collectors read
+        // their object model through this one enumerator so the kind-2 tag-decode lives in exactly one place.
+        case "gcLiveCount":
+            guard checkArgLabels(&s, args, [nil, nil], "RawPtr.gcLiveCount", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let id = intArg(&s, args[0].value, "RawPtr.gcLiveCount", "id")
+            let base = ptrArg(&s, args[1].value, "RawPtr.gcLiveCount", "base")
+            return s.ptrIntrinsic("__gcLiveCount", .int, [id, base], span)
+        case "gcLiveOffsetAt":
+            guard checkArgLabels(&s, args, [nil, nil, nil], "RawPtr.gcLiveOffsetAt", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let id = intArg(&s, args[0].value, "RawPtr.gcLiveOffsetAt", "id")
+            let base = ptrArg(&s, args[1].value, "RawPtr.gcLiveOffsetAt", "base")
+            let i = intArg(&s, args[2].value, "RawPtr.gcLiveOffsetAt", "i")
+            return s.ptrIntrinsic("__gcLiveOffsetAt", .int, [id, base, i], span)
+        // Shaped-field accessors (task 176 Stage 1 site 2): the fields of an object (type-id) that are
+        // themselves shaped values (a `String`), recursed into via their sub-shape. `gcShapedCount` is the
+        // number of such fields; `gcShapedOffset`/`gcShapedShapeId` give the k-th field's byte offset and
+        // sub-shape type-id. The object-scan loops read these to recurse into each shaped field.
+        case "gcShapedCount":
+            guard checkArgLabels(&s, args, [nil], "RawPtr.gcShapedCount", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__gcShapedCount", .int, [intArg(&s, args[0].value, "RawPtr.gcShapedCount", "id")], span)
+        case "gcShapedOffset", "gcShapedShapeId":
+            guard checkArgLabels(&s, args, [nil, nil], "RawPtr.\(method)", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let id = intArg(&s, args[0].value, "RawPtr.\(method)", "id")
+            let k = intArg(&s, args[1].value, "RawPtr.\(method)", "k")
+            return s.ptrIntrinsic("__" + method, .int, [id, k], span)   // __gcShapedOffset / __gcShapedShapeId
+        // Map a frame-root shape ordinal (a `"deopt"`-bundle Constant, task 176 Stage 4) to its kind-2
+        // descriptor type-id. The self-hosted stackmap walker (`rtWalkFrom`) resolves each shaped root
+        // through this, the same C `nomu_shape_desc_for_ordinal` the C walker uses — one ordinal→descriptor
+        // mapping for both collectors.
+        case "gcShapeDescForOrdinal":
+            guard checkArgLabels(&s, args, [nil], "RawPtr.gcShapeDescForOrdinal", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let ord = intArg(&s, args[0].value, "RawPtr.gcShapeDescForOrdinal", "ordinal")
+            return s.ptrIntrinsic("__gcShapeDescForOrdinal", .int, [ord], span)
         // The `__llvm_stackmaps` section (task 150 rung 2, the pcsp root walk): base address + byte size,
         // reached through the linker-provided section-bracket symbols (no libc, no new runtime C). The Nomu
         // pcsp walk parses this section (return-address → SP-relative root slots + per-function frame size).
@@ -612,5 +674,110 @@ enum PointerIntrinsics {
             s.diags.error("value of type 'Ptr<\(elem)>' has no method '\(name)'", at: span)
             return NOIRExpr(type: .error, span: span, kind: .intLit(0))
         }
+    }
+}
+
+// Task 180: `ManagedBuffer<Header, Element>` — the four compiler intrinsics for the stdlib generic class
+// (core.nomu). The declared class carries no method bodies; `create` (static) and `capacity` / `headerPtr` /
+// `elementPtr` (instance) are synthesized here as `__managedBuffer*` intrinsic calls. Codegen derives the
+// header byte size, element stride, and GC descriptor from the concrete `Header`/`Element` (through
+// monomorphization's type-arg table), so Sema only emits the calls carrying the `ManagedBuffer` type on the
+// relevant operand (the result for `create`, the receiver for the accessors).
+enum ManagedBufferIntrinsics {
+    private static func err(_ span: Span) -> NOIRExpr {
+        NOIRExpr(type: .error, span: span, kind: .intLit(0))
+    }
+
+    // `ManagedBuffer<Header, Element>.create(capacity: Int) -> ManagedBuffer<Header, Element>`.
+    static func checkStatic(_ s: inout Sema, header: Type, element: Type,
+                            _ method: String, _ args: [Arg], _ span: Span) -> NOIRExpr {
+        switch method {
+        case "create":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["capacity"], "ManagedBuffer.create", span) else {
+                return err(span)
+            }
+            let cap = PointerIntrinsics.intArg(&s, args[0].value, "ManagedBuffer.create", "capacity")
+            return s.ptrIntrinsic("__managedBufferCreate",
+                                  .generic(base: "ManagedBuffer", args: [header, element]), [cap], span)
+        default:
+            s.diags.error("'ManagedBuffer' has no static method '\(method)'", at: span)
+            return err(span)
+        }
+    }
+
+    // Instance accessors on a `ManagedBuffer` receiver: the raw accessors (`capacity()`, `headerPtr()`,
+    // `elementPtr(at:)`) whose layout is resolved at codegen, and the typed *reference* accessors
+    // (`storeRef`/`ref`, `storeHeaderRef`/`headerRef`) which read `Header`/`Element` from the receiver's
+    // generic type here. The reference accessors store/load a managed pointer through the write-barrier /
+    // `p1` path (codegen), the facility `Array<SomeClass>` needs to put a reference in a buffer; the raw
+    // `RawPtr` accessors reject references (barrier-free), so scalar code uses those instead.
+    static func checkMethod(_ s: inout Sema, _ recv: NOIRExpr,
+                            _ method: String, _ args: [Arg], _ span: Span) -> NOIRExpr {
+        // `Header`/`Element` from `ManagedBuffer<Header, Element>`; the reference accessors require them.
+        var header: Type? = nil, element: Type? = nil
+        if case .generic(_, let gargs) = recv.type, gargs.count == 2 {
+            header = gargs[0]; element = gargs[1]
+        }
+        switch method {
+        case "capacity":
+            guard PointerIntrinsics.checkArgLabels(&s, args, [], "ManagedBuffer.capacity", span) else { return err(span) }
+            return s.ptrIntrinsic("__managedBufferCapacity", .int, [recv], span)
+        case "headerPtr":
+            guard PointerIntrinsics.checkArgLabels(&s, args, [], "ManagedBuffer.headerPtr", span) else { return err(span) }
+            return s.ptrIntrinsic("__managedBufferHeaderPtr", .rawPtr, [recv], span)
+        case "elementPtr":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["at"], "ManagedBuffer.elementPtr", span) else { return err(span) }
+            let i = PointerIntrinsics.intArg(&s, args[0].value, "ManagedBuffer.elementPtr", "at")
+            return s.ptrIntrinsic("__managedBufferElementPtr", .rawPtr, [recv, i], span)
+        // Typed managed element access: store/load a reference at element slot `at`, through the write
+        // barrier so the collector records the edge. Reference `Element` only — a bare `p1`, no aggregate;
+        // a scalar/value element uses `elementPtr(at:)`.
+        case "storeRef":
+            guard let elem = requireRefArg(&s, element, kind: "Element", "storeRef", span) else { return err(span) }
+            guard PointerIntrinsics.checkArgLabels(&s, args, [nil, "at"], "ManagedBuffer.storeRef", span) else { return err(span) }
+            let value = refValueArg(&s, args[0].value, elem, span)
+            let i = PointerIntrinsics.intArg(&s, args[1].value, "ManagedBuffer.storeRef", "at")
+            return s.ptrIntrinsic("__managedBufferStoreRef", .void, [recv, value, i], span)
+        case "ref":
+            guard let elem = requireRefArg(&s, element, kind: "Element", "ref", span) else { return err(span) }
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["at"], "ManagedBuffer.ref", span) else { return err(span) }
+            let i = PointerIntrinsics.intArg(&s, args[0].value, "ManagedBuffer.ref", "at")
+            return s.ptrIntrinsic("__managedBufferRef", elem, [recv, i], span)
+        // The same, for a reference `Header` (the whole header is one managed pointer).
+        case "storeHeaderRef":
+            guard let hdr = requireRefArg(&s, header, kind: "Header", "storeHeaderRef", span) else { return err(span) }
+            guard PointerIntrinsics.checkArgLabels(&s, args, [nil], "ManagedBuffer.storeHeaderRef", span) else { return err(span) }
+            let value = refValueArg(&s, args[0].value, hdr, span)
+            return s.ptrIntrinsic("__managedBufferStoreHeaderRef", .void, [recv, value], span)
+        case "headerRef":
+            guard let hdr = requireRefArg(&s, header, kind: "Header", "headerRef", span) else { return err(span) }
+            guard PointerIntrinsics.checkArgLabels(&s, args, [], "ManagedBuffer.headerRef", span) else { return err(span) }
+            return s.ptrIntrinsic("__managedBufferHeaderRef", hdr, [recv], span)
+        default:
+            s.diags.error("value of type 'ManagedBuffer' has no method '\(method)'", at: span)
+            return err(span)
+        }
+    }
+
+    // A reference accessor is well-formed only when the relevant type argument is a reference type (class /
+    // actor / array). Returns the type on success; diagnoses and returns nil otherwise.
+    private static func requireRefArg(_ s: inout Sema, _ t: Type?, kind: String,
+                                      _ method: String, _ span: Span) -> Type? {
+        guard let t = t else {
+            s.diags.error("'ManagedBuffer.\(method)' needs the buffer's \(kind) type, e.g. 'ManagedBuffer<Header, Element>'", at: span)
+            return nil
+        }
+        guard s.isReferenceType(t) else {
+            s.diags.error("'ManagedBuffer.\(method)' requires a reference \(kind) (class or actor), but \(kind) is '\(t)'; use the raw accessor for a scalar or value \(kind.lowercased())", at: span)
+            return nil
+        }
+        return t
+    }
+
+    // Typecheck a reference-valued argument against the expected reference type.
+    private static func refValueArg(_ s: inout Sema, _ e: Expr, _ expected: Type, _ span: Span) -> NOIRExpr {
+        let value = NOIRGen.coerce(&s, NOIRGen.checkExpr(&s, e, expected: expected), to: expected)
+        NOIRGen.checkAssignable(&s, value.type, to: expected, role: "argument", at: span)
+        return value
     }
 }

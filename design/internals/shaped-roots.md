@@ -1,9 +1,17 @@
 # Shaped GC roots — design
 
 **Status:** design in progress — the spine is settled and the cost model accepted; stages 1–2 locked, the
-Stage 4 recording mechanism (deopt operands) validated by an LLVM spike. Build task:
-[`176`](../plans/tasks/176-shaped-gc-roots.md)
-(this is its design home). Consumers: the bit-stealing `String`
+Stage 4 recording mechanism (deopt operands) validated by an LLVM spike, Stage 5's structure settled (the
+shared enumerator). Stages 1–5 are **built and green for a bare `String`** (local, and as a `class`/`actor`
+field). The `String` layout coupling is resolved (tag in `word1`'s top byte, clean `word0` pointer, leaf
+`heap` buffer — see the open questions). **Remaining: Stage 3b — frame-root placement for value aggregates
+(task 176.3)**, the generalization from a bare shaped value to *any value aggregate holding shaped content*
+(a `struct` with a `String` field, an `enum` with a `String` payload). This is a correctness gap today
+(demonstrated below), and [121 String](../plans/tasks/121-string-utf8-model.md) rests on it.
+Build task: [`176`](../plans/tasks/176-shaped-gc-roots.md)
+(this is its design home). The shaped-root mechanism here is the first cut of the unified `(region, shape)`
+root model in [`gc-model-upgrade.md`](gc-model-upgrade.md) — read that for the governing model and the
+open soundness questions it must satisfy. Consumers: the bit-stealing `String`
 ([`121`](../plans/tasks/121-string-utf8-model.md)) and interprocedural stack promotion
 ([`148 §148.1`](../plans/tasks/148-ssair-optimizer-tier.md)). Sits on the GC substrate in
 [`backend.md`](backend.md) ("GC backend substrate") and [`memory-model.md`](memory-model.md) §6.
@@ -17,7 +25,7 @@ the collector rewrites in place; after the call the code reloads from the slot.
 
 Two things that model cannot express:
 
-- **A managed pointer whose managed-ness is per-value and dynamic.** `String`'s `word1` is a buffer pointer
+- **A managed pointer whose managed-ness is per-value and dynamic.** `String`'s `word0` is a buffer pointer
   in the `heap` case and inline UTF-8 bytes in `small`. Typing it `addrspace(1)` would relocate the bytes
   case; typing it `i64` would leave the `heap` pointer untraced and unrelocated.
 - **A managed value the compiler wants placed in a frame slot, not the heap.** An escape-promoted object
@@ -51,10 +59,12 @@ ncases     : number of discriminant values that carry managed pointers
 per case   : tag_value → { managed byte-offsets }
 ```
 
-For `String` (16 bytes, tag in `word0`'s top byte) this collapses to its minimal form: **offset 8 is a
-managed pointer iff tag == `heap`.** `small` contributes nothing; `immortal` contributes nothing either —
-its buffer lives in immortal space, never collected or moved, so the tracer skips it. One conditional
-offset, one tag test.
+For `String` (16 bytes, tag in `word1`'s top byte — byte 15) this collapses to its minimal form: **offset 0
+(`word0`) is a managed pointer iff tag == `heap`.** The pointer word is clean and untagged, so no masking is
+needed on relocate. `small` contributes nothing; `immortal` contributes nothing either — its buffer lives in
+immortal space, never collected or moved, so the tracer skips it. The `heap` buffer (`StringStorage`) is a
+GC leaf (`nptr = 0`), so the trace relocates and marks it with no recursion. One conditional offset, one tag
+test.
 
 This is the **per-discriminant pointer map keyed on the discriminant** from the original enum-enabler
 framing, now a general shape descriptor a hand-rolled struct points at rather than something welded to enum
@@ -82,20 +92,137 @@ Analogous to the existing I5 ("a managed field becomes a statepoint-tracked root
 way: at every statepoint a live shaped value spans, it must appear in that statepoint's shaped-root set.
 Between safepoints the value stays register-fast; only safepoint crossings force it to the slot.
 
-## Stage 3 — codegen (sketch; firmed after the spike)
+## Stage 3 — codegen (firmed — Model 1: alloca-as-home)
 
-- Lower a shaped local as an **address-taken alloca** (16 bytes for `String`), kept off the `addrspace(1)`
-  / SSA root path. Value ops (`byte(at:)`, compare, slice) read the words from the alloca, register-promoted
-  within safepoint-free regions.
-- At each statepoint the value is live across, attach the slot + shape-id via the recording mechanism
-  (Stage 4), so LLVM keeps the alloca memory-resident and reports its frame location after regalloc.
-- **The post-safepoint reload of a relocatable word must be non-forwardable** (a `volatile` load, or an
-  equivalent barrier). A deopt operand does not mark its pointed-to memory as clobbered, so a plain load of
-  `word1` after the call is forwarded from the pre-call value and the collector's writeback is missed
-  (Stage 4 result). Only the relocatable word (`word1`, read in the `heap` case) needs this; `word0` (the
-  tag) is never written by the collector, so its reads stay ordinary. The volatile read lands once at the
-  first post-safepoint use and is a normal SSA value afterward, so register-fast access resumes until the
-  next safepoint.
+**Storage model.** A shaped value live across a safepoint lives in a 16-byte **address-taken alloca** — its
+home. Value ops (`byte(at:)`, compare, slice, tag read) read/write the two words through it, and LLVM's
+backend register-promotes those accesses within safepoint-free regions. The deopt bundle at each statepoint
+references the alloca (Stage 4), keeping it memory-resident and reporting its frame slot after regalloc. The
+alternative — keep the value SSA and hand-place a spill/reload around each safepoint — was rejected: Model 1
+is what the spike exercised, and it leans on LLVM for the register promotion rather than placing spills by
+hand.
+
+Rules:
+
+- **Materialization is safepoint-gated.** A shaped value that never spans a safepoint stays a pure SSA
+  `(i64, i64)` pair — no alloca, no record, fully register-promoted. The alloca appears only when the value
+  is live across at least one safepoint (the Stage 2 invariant).
+- **`word0` volatile, `word1` ordinary.** The first post-safepoint read of the relocatable word (`word0`,
+  the buffer pointer, read in the `heap` case) is a `volatile` load — a deopt operand does not mark the
+  alloca clobbered, so a plain load is forwarded from the pre-call value and the collector's writeback is
+  missed (Stage 4 result). After that first read it is a normal SSA value, register-fast until the next
+  safepoint. `word1` (tag/count) is never written by the collector, so its reads are ordinary and forward
+  across safepoints.
+- **Multi-safepoint live range.** One deopt record per statepoint the value spans; one `word0` volatile
+  reload per safepoint, at the first post-safepoint use. The single-safepoint pattern, repeated.
+- **Composition with the object-field form (Stage 1 site 2).** A `String` field inside a `class`/`actor` is
+  scanned via that object's pointer-map `(field offset, shape-id)` — the object-scan path, not the slot
+  path. Loading the field into a shaped local that spans a safepoint puts the local on the slot path;
+  storing back is an ordinary store. The two forms stay distinct and compose through plain load/store, and
+  both read the one `kind 2` descriptor.
+
+`word0` is an `i64` in the stack alloca (addrspace(0)), so RS4GC ignores it; the deopt/shape record is what
+makes the collector find and relocate it. This is the intended `String` exception to the `addrspace(1)` root
+model.
+
+## Stage 3b — frame-root placement for value aggregates (task 176.3)
+
+Stage 3 homes a value whose *whole* type is shaped — a bare `String`. A value **aggregate** that merely
+*contains* shaped content — `struct Pair { s: String; n: Int }`, `enum Option<String>` — held as a local
+across a safepoint is not covered by it (the aggregate's type is not `.string`, so `isShapedType` is false
+and it is never homed), nor by the object-field path of Stage 1 site 2 (that scans a *heap object's* fields;
+a value aggregate local is not a heap object). The shaped sub-value's `word0` is a bare `i64` inside the
+aggregate, invisible to RS4GC, so its buffer is not relocated.
+
+**This is a correctness gap in the current compiler.** Demonstrated: a `Pair { s: String; n: Int }` and an
+`Option<String>` held live across an evacuating collection read back garbage (the field/payload `word0` is
+stale), diverging from the `-c nogc` baseline. The two cases are the regression oracles for this stage.
+
+**It must be structural — a compiler law.** Adding a `String` stored property to any `struct`/`enum` may
+never require a per-type compiler change; a language where it does is not a language. So "contains shaped
+content" is a **recursive structural property** computed from a type's stored properties (the heap-object
+descriptor path already obeys this — that is why `class Holder { var s: String }` works with no per-type
+code), never a maintained list of types. Stage 3b extends the *value-local* path to the same law.
+
+**Scope is bounded by the value-type rule.** A value type may not store a reference field (the frontend
+rejects `struct Pair { var node: SomeClass }` — "use a class"). So the only managed content a value-aggregate
+local can carry is **shaped** (a `String`, directly or nested in a value field/payload). There are no
+ordinary `addrspace(1)` fields in a value aggregate, so homing the whole aggregate to a frame slot hides
+nothing from RS4GC — the Stage 3 "alloca-as-home" model extends directly, with no RS4GC interaction to
+reconcile.
+
+### Representation note (corrected after build)
+
+A value-aggregate `let`/`var` local is **not an SSA aggregate value** — ssairgen materializes it to a
+`stackAlloc` slot (`%slot = alloca %struct.Pair`), with field reads lowered as `fieldAddr` + `load`. So the
+Stage 3 "SSA value homed into an alloca" model does not apply to it: the aggregate is *already* memory-
+resident in its own slot, and it is excluded from the SSA-homing set as an address op. The fix is therefore
+true **frame-root placement of the existing slot**, not homing a new one:
+
+- **Record the slot as a shaped root.** At each safepoint the slot is live across, emit a deopt shaped-root
+  record `(ordinal, gep(slot, off))` per shaped sub-field — the same record as a homed value, pointing at
+  the stackAlloc slot. Needs a **slot-liveness** notion (which shaped-containing slots are read after which
+  safepoints); a zero-initialized slot scans safely (Stage 5 zero-value safety) so conservative recording of
+  a live slot is sound.
+- **Volatile `word0` on field reads.** A `fieldAddr`+`load` of a shaped sub-field after a safepoint must read
+  `word0` `volatile`, so the collector's in-place writeback into the slot is observed (the Stage 4 forwarding
+  hazard, now on the field-load path rather than the homed-value reload).
+
+(The SSA-homing generalization above still applies to a genuinely-SSA shaped aggregate — a struct returned by
+value and consumed across a call without being slotted — and a bare `String` local stays the Stage 3 case.
+The common value-local is the stackAlloc-slot path.)
+
+### Mechanism (SSA-value form)
+
+A shaped value that *is* an SSA value (a bare `String`, or an SSA aggregate) live across a safepoint is homed
+to a frame-slot alloca of its own LLVM type (the Stage 3 model, generalized off `strTy` to the aggregate
+type). What is recorded and how the slot is reloaded splits by whether the shaped content sits at a **fixed**
+or a **discriminant-conditional** offset:
+
+- **Structs (fixed offsets) — reuses the existing mechanism, no collector change.** `collectManagedOffsets`
+  already yields the aggregate's shaped sub-fields as `(byte offset, shape-id)` pairs (it recurses struct
+  fields; a `String` field contributes `(off, stringShapeId)`). Codegen records **one shaped-root deopt pair
+  per shaped sub-field**, `(shape-ordinal, gep(slot, off))` — the same `(shape-id, slot-Direct)` pair Stage 4
+  records, pointing at the sub-field rather than the slot base. The walkers already "run the enumerator on
+  each recorded slot base" (Stage 5 root path), so a sub-field base is scanned exactly as a bare `String`
+  with zero collector, stackmap-format, or descriptor change. A bare `String` is the degenerate case: one
+  shaped sub-field at offset 0 — Stage 3 is subsumed, not special-cased.
+
+- **Enums (discriminant-conditional offsets) — needs a descriptor + collector extension.** An `enum`'s
+  shaped payload is present only in some cases, and a *non-shaped* case's data can alias the payload slot with
+  an arbitrary bit pattern, so unconditionally scanning the payload offset is unsound (a stray value whose
+  `word1` top nibble reads as `heap` would be treated as a buffer pointer). The collector must read the enum
+  tag first and scan the payload's shaped sub-value only in the cases that hold one. This is expressed by the
+  existing `kind 2` descriptor made **nested**: a case entry may be a `(offset, sub-shape-id)` shaped entry
+  (the String sub-shape) rather than only a flat managed offset — the discriminant-keyed form the descriptor
+  was designed around, now two levels (enum tag → the payload String → the String's own tag). Requires:
+  `collectManagedOffsets` to handle enum payloads (it currently skips enums — "payloads carry no references
+  today"), producing per-case shaped entries over the `{ i64 tag, [P x i64] payload }` layout; the shared
+  enumerator (both collectors) to recurse a nested shaped sub-entry; and codegen to record the enum value's
+  `(enum-shape-id, slot)` as one shaped root.
+
+### Reload
+
+On use after a safepoint the homed aggregate is reloaded from its slot with a **`volatile` load of the whole
+aggregate** (not a plain load — Stage 4: a plain load is forwarded from the pre-call value and misses the
+collector's writeback). The collector has written each relocated `word0` back into the slot, so one volatile
+aggregate load observes every update; `word1`/scalar words are reloaded too (harmless — the collector never
+writes them). This generalizes Stage 3's split `word0`-volatile / `word1`-ordinary reconstruction to an
+arbitrary layout; the finer split is a later optimization, not a correctness requirement.
+
+### Staging
+
+- **176.3a — structs (fixed offsets).** Codegen only: generalize the homing predicate to "type transitively
+  contains shaped content" (recursive, structural — never a type list), home the aggregate, emit one shaped
+  deopt pair per shaped sub-field via `collectManagedOffsets`, volatile-reload the aggregate. No collector,
+  stackmap-format, or descriptor change. Oracle: the `Pair { s: String; n: Int }` forced/evac test.
+- **176.3b — enums (conditional offsets).** Extend `collectManagedOffsets` to enum payloads, the `kind 2`
+  descriptor to nested per-case shaped entries, and the shared enumerator in both collectors to recurse them;
+  record the enum value as one shaped root. Oracle: the `Option<String>` forced/evac test. Both collectors in
+  lockstep (the standard mark-verify / `*-evac` / `*-self` legs).
+
+Both stages uphold the law: the predicate and the offsets are derived structurally from stored properties, so
+any `struct`/`enum` with a `String` (anywhere, nested) is correct with no per-type compiler change.
 
 ## Stage 4 — recording mechanism (deopt operands — validated)
 
@@ -123,7 +250,7 @@ Findings:
 2. **The alloca stays memory-resident.** Because its address escapes into the deopt bundle, `mem2reg`/`sroa`
    do not promote it — it keeps a real frame slot.
 3. **A plain reload is unsound.** A deopt operand does *not* mark its pointed-to memory as clobbered, so a
-   plain `load` of `word1` after the call is forwarded from the pre-call value (`ret %init`) — the
+   plain `load` of `word0` after the call is forwarded from the pre-call value (`ret %init`) — the
    collector's in-place writeback would be missed. A **`volatile` load** of the relocatable word after the
    safepoint blocks the forwarding and composes with the statepoint rewrite (an inline-asm memory clobber
    does **not** — the rewrite tries to statepoint-convert the asm call and the module fails verification).
@@ -137,13 +264,40 @@ Findings:
 
 ## Stage 5 — collector consumption
 
-- **Conditional trace (176.1)** — read-only. Both scanners learn the `kind` 2 branch (read tag, loop the
-  live case's offsets) for objects, the `(offset, shape-id)` recursion for shaped fields, and the shaped-slot
-  handling in the root walk. Enough for a shaped value whose target does not move.
-- **Conditional relocate + writeback (176.2)** — the walker overwrites the managed offset in the slot with
-  the forwarded address in the pointer cases; the mutator's post-call reload observes it.
-- Both the C walker (`nomu_gc_walk_context`, libunwind) and the self-hosted `rtWalkFrom` carry the same
-  logic; the GC-stress / `*-evac` suite legs are the lockstep check.
+Both collectors consume the shape descriptor: the MMTk-binding path (`gcbinding/lib.rs` + the C stack
+walker in `runtime.c`) and the self-hosted collector (`runtime.nomu`). The self-hosted tracer runs the
+pointer-map loop in **ten phase functions** — `rtObjHash`, `rtMarkVerify`, `rtMarkVerifyImmix`,
+`rtLineMarkCheck`, `rtImmixMark`, `rtImmixUnmark`, `rtGenUnmarkAndUnlog`, `rtImmixEvacMark`,
+`rtMinorScanObj`, `rtWalkShadow` — each with its own per-reference action, and the MMTk side has its own
+scan sites. Scattering a `kind` 2 branch across all of them is the main lockstep hazard.
+
+**Decision — centralize the tag-decode behind a shared enumerator.** The `kind` 2 conditional depends on
+the value's data (the tag), so it lives behind the accessor layer both collectors already share. One
+enumerator resolves *the live managed word offsets of a value at `base`* across kind 0 (flat), kind 1
+(array element), and kind 2 (read tag at `base + tag_off`, select the case's offsets), including the
+`(field offset, shape-id)` recursion for a shaped field inside an object. The ten phase-loops keep their
+own per-reference action and iterate the resolved offsets, so the conditional logic exists in exactly one
+place per collector. The enumerator must keep the common kind-0 path at its current cost — a runtime perf
+obligation tracked as [`178.1`](../plans/tasks/178-runtime-gc-performance.md) (no added indirection or
+per-word branch on the path every ordinary object and root takes; the tag-decode is paid only by shaped
+values).
+
+**Root path.** `nomu_gc_walk_context` (C/libunwind) and `rtWalkFrom` / `rtWalkShadow` (self-hosted) read
+`NumDeopt` and interpret the deopt locations as `(shape-id constant, slot Direct)` pairs — every shaped
+root is two operands, shape-id then slot — and run the enumerator on each slot base. This covers the
+current-stack, parked-fiber, and stopped-carrier walks, which all funnel through those functions.
+
+**176.1 / 176.2 split.** The read-only phases (`rtImmixMark`, mark-verify, `rtMinorScanObj`, the MMTk
+trace) take `kind` 2 first — trace only. `rtImmixEvacMark` and the MMTk evac copy path add
+relocate-and-write-back of the conditional word, reusing each phase's existing per-reference relocate
+primitive; the mutator's `volatile` reload (Stage 3) then observes it.
+
+**Zero-value scan safety.** The tag is designed so `0 = small, length 0` (empty string), so a zeroed or
+not-yet-assigned slot scans as no managed offsets — a partially-live frame is always safe.
+
+**Lockstep oracle.** The mark-verify and `*-evac` legs hold a `String` in each case
+(`small` / `immortal` / `heap`) live across a forced collection, as a local and as a `class`/`actor`
+field; the self-hosted and MMTk fingerprints must match.
 
 ## Stage 6 — invariants + tests
 
@@ -163,7 +317,15 @@ Stage 1 site 2 (object-field recursion) is in the first cut, not deferred.
 ## Open questions
 
 - **Deopt-operand recording** — confirmed by the spike (Stage 4), including the `volatile`-reload obligation.
-- **Immortal buffer** — relies on immortal-space membership so the tracer can skip it (`nomu_gc_alloc_immortal`
-  exists); confirm the tracer never needs to visit it and that literals become headered immortal objects.
-- **Tag encoding** — reading `word0`'s top byte as a byte at offset 7 vs an `i64` shift; pick alongside the
-  `String` layout in 121.
+- **Immortal buffer — resolved.** Immortal buffers are never traced or moved (immortal-space membership;
+  `nomu_gc_alloc_immortal` exists). And a `String` is a GC leaf: its `heap` buffer (`StringStorage`) holds
+  only bytes, `nptr = 0`, so even in the `heap` case the trace relocates and marks the buffer with no
+  child recursion. Still to confirm in build: literals become headered immortal objects.
+- **Tag encoding — resolved (with the 121 layout).** The discriminant is the **top nibble of `word1`**
+  (Swift-style: 4-bit discriminant in bits 60–63, the inline count in byte 15's low nibble). The collector
+  extracts it by loading the i64 at `base + tag_off` and shifting right by `tag_shift`, so the `kind 2`
+  descriptor for `String` is `tag_off = 8` (`word1`), `tag_shift = 60`, one case (`heap`, tag value `2`)
+  with managed offset `0` (`word0`). Discriminant values `small = 0` (so a zeroed value is the empty
+  string — Stage 5 zero-scan safety), `immortal = 1`, `heap = 2`. The managed pointer (`word0`) is clean and
+  untagged, so relocate needs no masking. (The descriptor is shift-only, no mask field, because the tag sits
+  at the top of the word; a future shaped type with a mid-word tag would add a mask.)

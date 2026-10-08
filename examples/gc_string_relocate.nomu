@@ -1,0 +1,30 @@
+// Task 176.2 — a `heap` String buffer is *relocated* by a moving collection and read back correctly. `acc`
+// grows by `concat` (each result a fresh `heap` `StringStorage` the collector may move), held live across an
+// inner garbage loop that drives collections, and its content hash is folded every iteration. The hash is
+// content-deterministic, so it is identical under NoGC and under either moving collector only if `word0` is
+// relocated in lockstep with the buffer and the post-safepoint reload observes the new address. Smaller than
+// `gc_string` so it can also run under MMTk evacuation (NOMU_GC_STRESS) without a multi-minute runtime.
+//
+// Run with NOMU_NO_ESCAPE=1 so `acc`'s buffer and the garbage Boxes are real heap objects.
+class Box {
+  var v: Int
+}
+
+fun main() {
+  var acc = ""
+  var i = 0
+  var checksum = 0
+  while i < 1500 {
+    acc = concat(acc, "x")
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 256 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+    checksum = checksum + acc.hash
+    i = i + 1
+  }
+  print(checksum)
+  print("\n")
+}

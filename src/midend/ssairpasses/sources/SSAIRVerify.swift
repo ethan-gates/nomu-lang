@@ -35,6 +35,14 @@ import support
 //    live across a safepoint. Held by construction: Option B keeps mutable value aggregates in slots
 //    (§7.2), and the statepoint rewriter rejects a GC pointer nested in an FCA. A liveness-based check
 //    belongs with the transform that could introduce such a sink (inlining, 7.5).
+//  • I11 — a shaped value (`String`, task 176, shaped-roots.md Stage 2) live across a safepoint is
+//    recorded as a shaped root there. Codegen homes a shaped value and records it on the safepoint's
+//    statepoint iff the shaped liveness says it crosses an `isSafepointInst` site or is live at a loop
+//    header (the poll). The verifier recomputes that root set from the shared liveness and checks each
+//    member is a well-defined `String` value, so a transform that drops the definition of a live shaped
+//    root, or retypes it out of the shaped set while it still crosses a safepoint, is rejected. (A shaped
+//    value embedded in a value aggregate is the separate object-field path — Stage 1 site 2 — not a
+//    standalone root, so it is out of scope here.)
 //
 // Returns a list of human-readable violations; empty means the module is well-formed.
 public func verifySSAIR(_ module: SSAModule) -> [String] {
@@ -182,6 +190,65 @@ private func verifyFunction(_ f: SSAFunction, _ errs: inout [String]) {
             }
         }
     }
+
+    // I11 — the shaped-root set codegen will home and record is well-formed. The set is reconstructed from
+    // the shared shaped-value liveness the same way codegen derives it: the shaped values crossing each
+    // `isSafepointInst` site (the inst's own result excluded — it is new, so it does not cross) plus those
+    // live at a loop header (recorded by the header poll). Each member must be a defined `String` value, so a
+    // transform that drops a live shaped root's definition or retypes it out of the shaped set while it still
+    // spans a safepoint is caught here with a GC-precision diagnostic (the shaped companion to I1/I3, as I5/I6
+    // specialize the escape analysis). A shaped value embedded in a value aggregate is scanned via the
+    // object-field path, not as a standalone root, and is out of scope.
+    let shaped = computeShapedLiveness(f)
+    func checkShapedRoot(_ id: Int, _ site: String) {
+        guard let t = typeOf[id] else {
+            errs.append("[\(f.name)] I11: shaped root %\(id) spans a safepoint (\(site)) but is undefined")
+            return
+        }
+        if !isShapedType(t) {
+            errs.append("[\(f.name)] I11: shaped root %\(id) spanning a safepoint (\(site)) is \(t), not a shaped value")
+        }
+    }
+    for blk in f.blocks {
+        for (i, inst) in blk.insts.enumerated() where isSafepointInst(inst.kind) {
+            var crossing = shaped.liveOutInst[blk.id]?[i] ?? []
+            if let r = inst.result { crossing.remove(r.id) }
+            for id in crossing.sorted() { checkShapedRoot(id, "bb\(blk.id) safepoint") }
+        }
+    }
+    for h in loopHeaders(f).sorted() {
+        for id in (shaped.liveInBlock[h] ?? []).sorted() { checkShapedRoot(id, "bb\(h) loop-header poll") }
+    }
+}
+
+// The loop headers of `f`: targets of a back edge, found by a DFS that marks each node on the recursion
+// stack — an edge to an on-stack node is a back edge, its target a header. Iterative, to avoid deep
+// recursion on large CFGs. (Matches the egress's own loop-header detection; a loop header is where the
+// unconditional safepoint poll sits, so a loop-carried shaped value is recorded there.)
+private func loopHeaders(_ f: SSAFunction) -> Set<Int> {
+    var succ: [Int: [Int]] = [:]
+    for blk in f.blocks { succ[blk.id] = edgeArgs(blk.terminator.kind).map(\.0) }
+    var headers = Set<Int>()
+    var state: [Int: Int] = [:]   // absent = unvisited, 1 = on stack, 2 = done
+    guard let entry = f.blocks.first?.id else { return headers }
+    var stack: [(node: Int, next: Int)] = [(entry, 0)]
+    state[entry] = 1
+    while let top = stack.last {
+        let kids = succ[top.node] ?? []
+        if top.next < kids.count {
+            stack[stack.count - 1].next += 1
+            let k = kids[top.next]
+            switch state[k] {
+            case 1:  headers.insert(k)           // edge to an on-stack node → back edge
+            case 2:  break                       // already fully explored
+            default: state[k] = 1; stack.append((k, 0))
+            }
+        } else {
+            state[top.node] = 2
+            stack.removeLast()
+        }
+    }
+    return headers
 }
 
 // The (target, edge-args) pairs a terminator carries — the block-argument side of each CFG edge.
