@@ -80,20 +80,31 @@ final class Progress {
 
     // Compile-phase completion (no pass/fail tally — failures surface per case in the run phase).
     func finishCompile(_ name: String) {
-        lock.lock(); active.removeAll { $0 == name }; done += 1; lock.unlock()
+        lock.lock(); active.removeAll { $0 == name }; done += 1; let d = done, t = total; lock.unlock()
         refresh()
+        streamProgress("[\(d)/\(t)] \(label) \(name)")
     }
 
     func finishCase(_ name: String, _ status: Status) {
+        let tag: String
         lock.lock()
         active.removeAll { $0 == name }; done += 1
         switch status {
-        case .pass:    passed += 1
-        case .fail:    failed += 1
-        case .timeout: timedOut += 1
+        case .pass:    passed += 1; tag = "ok"
+        case .fail:    failed += 1; tag = "FAIL"
+        case .timeout: timedOut += 1; tag = "TIMEOUT"
         }
+        let d = done, t = total, p = passed, fl = failed, to = timedOut
         lock.unlock()
         refresh()
+        streamProgress("[\(d)/\(t)] \(label) \(name) \(tag)  (✓\(p) ✗\(fl) ⏱\(to))")
+    }
+
+    // Off a TTY the self-updating status line is suppressed (a pipe/CI/backgrounded run), so stream one
+    // plain line per completed unit instead — otherwise a long run emits nothing until its final report and
+    // a hang is indistinguishable from slow progress. On a TTY the pinned status line already shows this.
+    private func streamProgress(_ s: String) {
+        if !renderer.interactive { renderer.log(s) }
     }
 
     func logLine(_ s: String) { renderer.log(s) }

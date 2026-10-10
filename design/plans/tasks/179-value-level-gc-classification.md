@@ -94,6 +94,23 @@ bit-stealing is a different problem than conditional rooting. 179 dissolves the 
 that stay pointers; the bit-punned word still rides 176's `kind 2` shape descriptor. 176.3's frame-root
 field-map is a building block 179 reuses for the stack-promotion case.
 
+## Capability gaps absorbed from 176
+
+Two shape-descriptor generality gaps moved here from [176](176-shaped-gc-roots.md). Both are **sound in 176
+today** (one fail-stops at build, the other routes through a separate channel), so neither blocks 176 or
+[121](121-string-utf8-model.md); they are generality work this task's unified descriptor path is the natural
+home for.
+
+- **Nested enum-in-enum managed payloads.** 176.3b's shared scan enumerator recurses a matched enum case's
+  sub-shapes through a dedicated alias-free scratch (`gc_live_scratch_enum`). A managed payload that is itself
+  an enum would alias that scratch, so it is **fail-stopped at descriptor build** today — sound, not silent.
+  Resolving it wants a reentrant or depth-indexed scratch in the enumerator both collectors call.
+- **Cross-module shape-table ordinals.** 176.3's ordinal→descriptor table (`__nomu_shape_table`) is
+  per-compilation; ordinals are not unified across modules. The erased-generic shaped path sidesteps this by
+  rooting through the VWT (a runtime descriptor-id), a different channel. A cross-module program that must
+  share shape ordinals across translation units needs the table unified at link time — which lands naturally
+  alongside 179's whole-program managed-set classification.
+
 ## Performance expectation
 
 - **Common mutator path:** unchanged. RS4GC lowering is identical, classification is compile-time only,
@@ -164,7 +181,9 @@ The two-collector world (kept for benchmarking, not retired yet) is its differen
   route-(c)/[176 §176.3](176-shaped-gc-roots.md) selection as the way across the addrspace wall (the
   frame-root field-map from 176.3 is reused as a building block). 179.5 closes that consumption item.
 - **[176 shaped GC roots](176-shaped-gc-roots.md)** — the alternative/complementary piggyback; see the
-  relationship section. Not a dependency in either direction; move 1 weighs them against each other.
+  relationship section. Not a dependency in either direction; move 1 weighs them against each other. Two of
+  176's shape-descriptor generality gaps (nested enum-in-enum payloads, cross-module shape-table ordinals) are
+  absorbed here — see "Capability gaps absorbed from 176."
 - **[121 String](121-string-utf8-model.md)** — related, independent. 179 does not gate 121; the `small`
   bit-punned word stays 176's shape path regardless of the address-space model.
 - **[169](169-interprocedural-escape-summary.md) / [166](166-points-to-graph.md) /

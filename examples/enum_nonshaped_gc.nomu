@@ -1,0 +1,33 @@
+// Task 176.3b soundness oracle: a mixed enum where one case carries a `String` and another carries a plain
+// `Int` in the same payload slot. Holding the *non-shaped* `.count` case live across a moving collection
+// exercises the conditional guard: the collector must read the enum tag first and scan the payload's String
+// sub-shape only in the `.text` case. If it scanned the payload unconditionally, the `.count` Int (an
+// arbitrary 64-bit value) would be misread as a buffer pointer and relocated — corruption or a crash. The
+// correct result is the Int read back intact. Run with NOMU_NO_ESCAPE=1 so the garbage Boxes are heap.
+struct Box {
+  var v: Int
+}
+enum Payload {
+  case text(value: String)
+  case count(n: Int)
+}
+fun main() {
+  let p: Payload = Payload.count(n: 123456789)
+  var i = 0
+  var checksum = 0
+  while i < 2000 {
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 1024 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+    switch p {
+    case .text(let s):  checksum = checksum + s.hash
+    case .count(let n): checksum = checksum + n
+    }
+    i = i + 1
+  }
+  print(checksum)
+  print("\n")
+}

@@ -1,13 +1,21 @@
 # Shaped GC roots — value-conditional scanning + frame-root relocation
 
 **Avenue:** Risk (the moving-collector precision substrate) · **Type/Lifecycle:**
-`gc · codegen · midend` · **Size:** L · **Status:** in-progress — 176.1 + 176.2 built + green for a bare
-`String` (local and as a `class`/`actor` field). **On the strings critical path**
-([121](121-string-utf8-model.md) builds on it, since `word0` is `i64` in the end-state layout). **Remaining:
-176.3 — frame-root placement for value aggregates holding shaped content** (a `struct` with a `String` field,
-an `enum` with a `String` payload): a correctness gap today and a compiler law, which strings rest on
-(corrects the earlier belief that strings needed only 176.1 + 176.2). Staged 176.3a (structs, codegen-only) →
-176.3b (enums, descriptor + both-collector extension). The escape-promotion placement route is now 176.4
+`gc · codegen · midend` · **Size:** L · **Status:** 176.1–176.3 built + green. 176.1 + 176.2 (bare `String`,
+local and as a `class`/`actor` field); **176.3a (structs)** — frame-root placement for value aggregates;
+**176.3b (enums)** — the discriminant-conditional half (an `Option<String>` / mixed-case enum relocates its
+payload buffer only in the shaped case). Covered by the `verifySSAIR` I11 aggregate-rooting check (teeth
+tests) and forced/evac oracles (`pair_string_gc`, `option_string_gc`, `enum_nonshaped_gc`); full suite
+133/133. **On the strings critical path** ([121](121-string-utf8-model.md) builds on it, since `word0` is
+`i64` in the end-state layout). **Capability complete.** The two throughput refinements moved to
+[178](178-runtime-gc-performance.md) — the per-`String`-load volatile narrowing is
+[178.2](178-runtime-gc-performance.md) and the Option A/B frame-cost measurement is
+[178.3](178-runtime-gc-performance.md), alongside the pre-existing shaped-scan trace-speed item
+[178.1](178-runtime-gc-performance.md). Two shape-descriptor generality gaps (nested enum-in-enum managed
+payloads — fail-stopped at build today, not silent; and cross-module shape-table ordinals — the erased-shaped
+path roots through the VWT, a different channel) are absorbed into
+[179](179-value-level-gc-classification.md), whose unified descriptor path is their natural home. **176 is
+done:** nothing performance or capability remains in it. The escape-promotion placement route is now 176.4
 (stays with [148 §148.1](148-ssair-optimizer-tier.md)/[179](179-value-level-gc-classification.md)) ·
 **Source:** split out of [121 String](121-string-utf8-model.md) (the GC capability the bit-stealing
 `String` rests on) and [148 §148.1](148-ssair-optimizer-tier.md) (the addrspace-across-calls placement
@@ -95,12 +103,49 @@ collector still finds and fixes up exactly the references that are live.
   stored property must never need a per-type compiler change. Bounded because a value type cannot store a
   reference field, so the only managed content is shaped. **[121](121-string-utf8-model.md) rests on this** —
   it was previously (incorrectly) believed strings needed only 176.1 + 176.2. Staged:
-  - **176.3a — structs** (fixed shaped-field offsets). Codegen only: home the aggregate, record one shaped
-    deopt pair per shaped sub-field (offsets from `collectManagedOffsets`), volatile-reload. Reuses the
-    existing collector/stackmap/descriptor unchanged. Oracle: the `Pair` forced/evac test.
-  - **176.3b — enums** (discriminant-conditional offsets). Extend `collectManagedOffsets` to enum payloads,
-    the `kind 2` descriptor to nested per-case shaped entries, and both collectors' shared enumerator to
-    recurse them. Oracle: the `Option<String>` forced/evac test. Both collectors in lockstep.
+  - **176.3a — structs** (fixed shaped-field offsets). **Done + green.** Record **one** shaped deopt pair per
+    live shaped-containing slot — `(aggregate-shape-ordinal, slot-base)`, the bare alloca base (a stackmap
+    spike confirmed a non-zero `gep(slot, off)` records as `Indirect` and is dropped; only a bare base is
+    `Direct` — `shaped-roots.md` Stage 3b). As built:
+    - `transitivelyContainsShaped` (structural predicate over struct fields) + `computeSlotLiveness` (generic
+      liveness of the shaped-containing `stackAlloc` slots) in `ShapedLiveness.swift`; the egress
+      (`setUpShapedHomes`) records each live slot's base at its crossing safepoints and the header poll.
+    - The aggregate's value-layout descriptor (`valueDescId`, kind-0 + `nshaped`) carries the `String`
+      sub-fields; the shared enumerator's fold recurses them, so the collector/stackmap are unchanged.
+    - The one new runtime piece: the **ordinal→descriptor table** `__nomu_shape_table` (emitted by
+      `emitShapeOrdinalTable`, read by a generalized `nomu_shape_desc_for_ordinal` — both walkers, one place).
+    - Zero-init of the shaped slot (I11b) + volatile `word0` on `String`-typed loads (I11a).
+    Oracle: `examples/pair_string_gc.nomu` (nogc = `immix` evac = `7366794707792290656`); suite 129/129.
+    - **`verifySSAIR` I11 aggregate-rooting check (done).** A value aggregate that transitively contains a
+      `String`, live across a safepoint, must be a frame slot (an address op codegen records); a first-class
+      SSA aggregate is flagged (`SSAIRVerify.swift`, with `SSAAggregate` field types threaded in). Teeth:
+      `testUnrootedShapedAggregateCaught` (caught) + `testShapedAggregateSlotPassesClean`. The `volatile`
+      `word0` reload (I11a) and slot zero-init (I11b) are by-construction in the egress, below SSAIR.
+    **Deferred within 176.3a:** the `String`-load volatile is applied to *every* `String` load (conservative
+    — the per-safepoint narrowing is now perf line item [178.2](178-runtime-gc-performance.md)); and the shape
+    table is per-compilation (cross-module ordinal unification absorbed into
+    [179](179-value-level-gc-classification.md), since the erased-shaped path roots through the VWT, not this
+    table).
+  - **176.3b — enums** (discriminant-conditional offsets). **Done + green.** As built:
+    - **Enum kind-2 descriptor** (`enumShapeDescId`): tag = case index at offset 0; each case's managed/shaped
+      entries come from `collectManagedOffsets` over its payload fields (payload at slot 1). The unified
+      per-case format grew to `(tag, nFlat, flat…, nShaped, (off, subId)…)` — a case carries both flat
+      conditional pointers (`Option<SomeClass>`) and nested shaped sub-shapes (`Option<String>`). Serialized
+      at `emitDescriptors` (deferred, since a sub-id resolves to a link-time section offset);
+      `registerShapedMap` (String) writes the same shape with `nShaped = 0`.
+    - **`collectManagedOffsets`** treats an enum field with conditional managed content as a nested kind-2
+      shaped entry, so a struct holding an `Option<String>` nests the enum descriptor (`valueDescId` fold).
+    - **Shared enumerator** (`nomu_gc_live_offsets`, both collectors) parses the unified format and recurses a
+      matched case's sub-entries through a dedicated enum scratch (alias-free: enum payloads flatten structs
+      inline, so a sub-entry is a `String` leaf). A **nested enum-in-enum payload is fail-stopped** at
+      descriptor build (would alias the scratch) — the deferred edge.
+    - `shapeOrdinal` routes an enum slot to its kind-2 descriptor; `transitivelyContainsShaped` (egress +
+      `verifySSAIR`) and the I11 aggregate-rooting check extend to enums (teeth: `testUnrootedShapedEnumCaught`).
+    Oracles: `examples/option_string_gc.nomu` (`Option<String>`, nogc = evac = `7366794707792276656`) and
+    `examples/enum_nonshaped_gc.nomu` (the **conditional-soundness** oracle — a non-shaped `.count(Int)` case
+    held across evac reads back intact, proving the tag is read before the payload is scanned). Suite 133/133.
+    **Absorbed into [179](179-value-level-gc-classification.md):** nested enum-in-enum managed payloads
+    (fail-stopped at build today, not silent — resolving it wants a reentrant enumerator scratch).
 - **176.4 — frame-root placement route** for escape promotion ([148 §148.1](148-ssair-optimizer-tier.md)
   route (c)): a frame slot plus a field pointer-map the collector scans, letting a promoted object cross
   a non-inlined call without the heap representation. Rides the done inference stack that proves

@@ -1,0 +1,29 @@
+// Task 176.3b oracle: an `enum` with a `String` payload — `Option<String>` — held live across a moving
+// collection. The shaped `word0` sits in the enum payload only in the `.some` case; the frame-root record
+// carries the enum's kind-2 descriptor, so the collector reads the enum tag first and relocates the payload
+// String's buffer only in `.some` (a `.none`/zeroed payload scans as nothing). Before 176.3b the enum slot
+// was unrecorded and the payload buffer went un-relocated. The garbage `Box` arrays drive collections while
+// `o` is live. Run with NOMU_NO_ESCAPE=1 so they are heap.
+struct Box {
+  var v: Int
+}
+fun main() {
+  let o: Option<String> = Option<String>.some(value: concat("hello", " world"))
+  var i = 0
+  var checksum = 0
+  while i < 2000 {
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 1024 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+    switch o {
+    case .some(let s): checksum = checksum + s.hash
+    case .none:        checksum = checksum + 1
+    }
+    i = i + 1
+  }
+  print(checksum)
+  print("\n")
+}

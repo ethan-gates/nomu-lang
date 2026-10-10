@@ -159,14 +159,36 @@ Stage 3 "SSA value homed into an alloca" model does not apply to it: the aggrega
 resident in its own slot, and it is excluded from the SSA-homing set as an address op. The fix is therefore
 true **frame-root placement of the existing slot**, not homing a new one:
 
-- **Record the slot as a shaped root.** At each safepoint the slot is live across, emit a deopt shaped-root
-  record `(ordinal, gep(slot, off))` per shaped sub-field — the same record as a homed value, pointing at
-  the stackAlloc slot. Needs a **slot-liveness** notion (which shaped-containing slots are read after which
-  safepoints); a zero-initialized slot scans safely (Stage 5 zero-value safety) so conservative recording of
-  a live slot is sound.
+- **Record the slot base + the aggregate's shape** (corrected after a stackmap spike — see below). At each
+  safepoint the slot is live across, emit **one** deopt shaped-root record `(aggregate-shape-ordinal,
+  slot-base)` — the slot's *base* alloca pointer, with the aggregate's own value-layout descriptor (a kind-0
+  map carrying the `String` sub-field as an `nshaped` entry at its offset — the `valueDescId` machinery
+  181/P1.1 already builds). The shared enumerator's fold recurses the sub-shape at `base + off`, so one record
+  per aggregate reaches every shaped sub-field. Needs a **slot-liveness** notion (which shaped-containing slots
+  are read after which safepoints); a zero-initialized slot scans safely (Stage 5 zero-value safety) so
+  conservative recording of a live slot is sound.
+
+  **Why the base, not `gep(slot, off)` per sub-field** (stackmap spike, LLVM 22, `llvm-readobj --stackmap`):
+  a deopt operand that is a bare alloca base records as a **`Direct[reg+off]`** stackmap location — the frame
+  address both walkers expect. A `gep(slot, 0)` collapses to the base and is also `Direct`, but a
+  `gep(slot, off)` at a **non-zero** offset records as **`Indirect[reg+0]`** — the backend spills the derived
+  pointer rather than rematerializing it as a frame address — and the deopt-range parse
+  (`nomu_gc_walk_context` / `rtWalkShadow`) only accepts `Direct`, so the root is **silently dropped**. So the
+  recorded pointer must always be a bare alloca base; the offset lives in the shape descriptor, not the GEP.
+
+  This is the P1.2 **Option A** recording (`gc-model-upgrade.md`): the same SROA spike confirms recording the
+  slot base pins the whole aggregate alloca and keeps the setup stores to non-shaped fields live while the slot
+  is live across a safepoint. The cost is bounded — the pinned frame slot + dead stores, not reload traffic
+  (GVN forwards a non-shaped field read across the safepoint, since the volatile is only on the managed word)
+  — and this is the recommended first cut. **Option B** (home each shaped sub-field in its own alloca and
+  record *that* base — also `Direct`, with the plain String ordinal — leaving the rest of the aggregate
+  SROA-promotable) preserves promotion of the non-shaped fields and is the measurement-gated optimization;
+  see `gc-model-upgrade.md` P1.2.
 - **Volatile `word0` on field reads.** A `fieldAddr`+`load` of a shaped sub-field after a safepoint must read
   `word0` `volatile`, so the collector's in-place writeback into the slot is observed (the Stage 4 forwarding
-  hazard, now on the field-load path rather than the homed-value reload).
+  hazard, now on the field-load path rather than the homed-value reload). A non-shaped field read stays an
+  ordinary load — GVN forwards it across the safepoint (the collector never writes it), so recording the slot
+  costs no reload for the scalar fields.
 
 (The SSA-homing generalization above still applies to a genuinely-SSA shaped aggregate — a struct returned by
 value and consumed across a call without being slotted — and a bare `String` local stays the Stage 3 case.
@@ -301,13 +323,29 @@ field; the self-hosted and MMTk fingerprints must match.
 
 ## Stage 6 — invariants + tests
 
-- **New I-invariant** (Stage 2): a shaped value live across a safepoint is recorded as a shaped root.
-  Enforced by `verifySSAIR`.
+The P0 soundness contract ([`gc-model-upgrade.md`](gc-model-upgrade.md) P0) resolves the Stage 2 placement
+rule and the frame-region generalization into two `verifySSAIR` invariants and a set of `Tn` obligations:
+
+- **I11** (`ssair.md`) — region recording + zero-init + volatile reload. **I11a:** every shaped home or
+  value-aggregate slot live across a safepoint is recorded with its shape, and every post-safepoint read of a
+  recorded region's managed/shaped offset is a reload def (lowering to a `volatile` load), so the collector's
+  writeback is observed. **I11b:** a zero-init def dominates every safepoint the region is live across, and
+  the all-zero pattern decodes to "no managed pointer" (String `small = 0`; a kind-0 managed offset is null,
+  which both walkers skip) — a partially-constructed region scans safely.
+- **I12** (`ssair.md`) — no interior/derived pointer into a managed/shaped base is live across a safepoint.
 - **`Tn` forced-GC obligations:** a `String` in each case (`small` / `immortal` / `heap`), held live across a
   forced collection, both as a local and as a `class`/`actor` field, survives and (for `heap`) relocates
-  correctly.
-- **Both-collector lockstep:** the `kind` 2 descriptor read identically by the C and Nomu tracers — a
-  fingerprint/oracle diff, as the existing mark-verify legs do.
+  correctly (the Stage 1–5 bare-String obligations); plus the P0 obligations **T-vol** (multi-managed-field
+  region, volatile-reload differential), **T-init** (mid-construction `Pair` scanned at a safepoint),
+  **T-dual** (one buffer dual-rooted via an object field and a homed local, relocated once), **T-interior**
+  (interior pointer across a poll rejected at compile time; re-derive pattern stable), and the **T-lockstep**
+  fingerprint legs below.
+- **Both-collector lockstep:** the `kind` 2 descriptor is read through one shared implementation —
+  `nomu_gc_live_offsets` / `nomu_shape_desc_for_ordinal`, which the self-hosted tracer reaches via the
+  `RawPtr.gcLiveCount` / `gcLiveOffsetAt` / `gcShapeDescForOrdinal` intrinsics (they lower to those exact C
+  functions). The per-reference action (the ~10 self-hosted phases + MMTk scan sites) and the deopt-range
+  parse (`nomu_gc_walk_context` / `rtWalkShadow`) stay per-collector, so each new shape adds a
+  fingerprint/oracle leg (**T-lockstep**) exercising both, as the existing mark-verify legs do.
 
 ## Scope
 

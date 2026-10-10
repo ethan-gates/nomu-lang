@@ -1,0 +1,20 @@
+// Holds an erased, shaped `T` (a `String`) across a long busy loop. Under a forced stop-the-world
+// evacuation the value is reachable only through the caller's opaque `T` buffer, registered as a typed GC
+// root (task 100.4.3.6). The shaped `word0` — the heap StringStorage pointer in the `heap` case — must be
+// found via the VWT's value-layout descriptor and fixed up, or `return x` yields a stale (moved-from)
+// buffer. `T` is erased — compiled once here — so the trace rides the value-witness table rather than a
+// monomorphized layout. Spike for the erased-generic shaped typed-root gap (gc-model-upgrade.md).
+fun spin(n: Int) -> Int {
+    var i = 0
+    var acc = 0
+    while i < n {
+        acc = acc + (i % 7)
+        i = i + 1
+    }
+    return acc
+}
+
+public fun hold<T>(x: T) -> T {
+    let j = spin(400000000)
+    return x
+}

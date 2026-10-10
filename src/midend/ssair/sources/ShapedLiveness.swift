@@ -24,6 +24,53 @@ public func isShapedType(_ t: Type) -> Bool {
     return false
 }
 
+// Liveness of a given set of SSA value ids — used for shaped-containing value-aggregate *slots* (task 176.3a):
+// which `stackAlloc` slots carrying shaped content are live across which safepoints, so the egress records
+// each live slot's base + aggregate shape there. Same backward dataflow as `computeShapedLiveness`, but the
+// tracked set is supplied by the consumer (the slot ids) and uses are *all* operands in that set (via
+// `remapOperands`), not only shaped-typed ones. Returns the same shape: `liveOutInst[b][i]` = tracked ids
+// live immediately after inst `i`; `liveInBlock[b]` = tracked ids live at block entry incl. live params.
+public func computeSlotLiveness(_ f: SSAFunction, tracked: Set<Int>) -> ShapedLiveness {
+    func uses(_ kind: SSAInstKind) -> [Int] {
+        var out: [Int] = []
+        _ = remapOperands(kind) { if tracked.contains($0.id) { out.append($0.id) }; return $0 }
+        return out
+    }
+    func uses(_ term: SSATermKind) -> [Int] {
+        var out: [Int] = []
+        _ = remapOperands(term) { if tracked.contains($0.id) { out.append($0.id) }; return $0 }
+        return out
+    }
+    var prop: [Int: Set<Int>] = [:]
+    var entry: [Int: Set<Int>] = [:]
+    for b in f.blocks { prop[b.id] = []; entry[b.id] = [] }
+    var liveOutInst: [Int: [Set<Int>]] = [:]
+
+    var changed = true
+    while changed {
+        changed = false
+        for b in f.blocks.reversed() {
+            var cur = Set<Int>()
+            for s in termSuccessors(b.terminator.kind) { cur.formUnion(prop[s] ?? []) }
+            cur.formUnion(uses(b.terminator.kind))
+
+            var perInst = [Set<Int>](repeating: [], count: b.insts.count)
+            for i in b.insts.indices.reversed() {
+                perInst[i] = cur
+                if let r = b.insts[i].result, tracked.contains(r.id) { cur.remove(r.id) }
+                cur.formUnion(uses(b.insts[i].kind))
+            }
+            liveOutInst[b.id] = perInst
+            entry[b.id] = cur
+
+            var p = cur
+            for bp in b.params where tracked.contains(bp.id) { p.remove(bp.id) }
+            if p != prop[b.id] { prop[b.id] = p; changed = true }
+        }
+    }
+    return ShapedLiveness(liveInBlock: entry, liveOutInst: liveOutInst)
+}
+
 // Instructions whose lowering emits a non-leaf (statepoint) call — a GC safepoint where a live shaped value
 // must be homed and recorded as a shaped root (task 176, shaped-roots.md Stage 2). Shared so the codegen
 // homing/recording sites and the `verifySSAIR` I11 check read one authoritative set: a kind here but missing

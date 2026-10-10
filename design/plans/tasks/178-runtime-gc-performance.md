@@ -23,6 +23,19 @@ side (horizon "after GenImmix"). Correctness lives in [150](150-selfhosted-gc-la
   The kind-2 tag-decode (read the discriminant, select the case's offsets) is paid only by objects and roots
   that are actually shaped. Validate on the benchmark harness once 176 lands: trace throughput on a heap
   with no shaped objects must not regress against the pre-176 baseline, measured in both collectors.
+- **178.2 — shaped-root load-volatile narrowing** `[from 176.3a]`. The shaped-root egress emits every
+  `String`-typed load volatile (invariant I11a) so a value relocated across a safepoint observes the
+  collector's writeback. Applied to *every* `String` load it blocks LLVM from forwarding, coalescing, or
+  hoisting any `String` read — a mutator tax that scales with String use ([121](121-string-utf8-model.md)).
+  Narrow volatile to the loads that actually reload across a safepoint; non-safepoint `String` reads recover
+  stock load optimization. Validate that a String-heavy benchmark regains load forwarding with the relocation
+  oracle still green.
+- **178.3 — shaped-aggregate frame cost: Option A vs. Option B** `[from 176.3, P1.2]`. The shipped Option A
+  records the slot base + aggregate shape ordinal, pinning the whole aggregate across a safepoint — dead
+  stores to non-shaped fields stay live, growing frame and stackmap size (an SROA spike confirmed GVN still
+  forwards non-shaped field *reads* across the safepoint, so the cost is frame/stackmap size, not reload
+  traffic). Option B gives shaped content a separate home so the aggregate is not pinned. Measurement-gated:
+  measure Option A's frame/stackmap bloat under real String traffic, then build Option B only if it pays.
 - **mutator fast-path tuning** `[bucket]` — the inlined alloc bump path, write barrier, and safepoint poll
   (`internals/backend.md`, [150](150-selfhosted-gc-ladder.md)); benchmarking-driven, not re-specified here.
 - **root-scan cost** `[bucket]` — couples with [177](177-register-resident-gc-roots.md) (register-resident

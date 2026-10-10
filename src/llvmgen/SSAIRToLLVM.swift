@@ -34,6 +34,11 @@ final class SSAIRToLLVM {
     // here). Populated per function from `computeShapedLiveness`.
     var stringHome: [Int: LLVMValueRef] = [:]      // SSAValue.id → its 16-byte home alloca (strTy)
     var shapedLive: ShapedLiveness?                // current function's shaped-value liveness
+    // Shaped-containing value-aggregate slots (task 176.3a): a `stackAlloc` whose type transitively contains a
+    // `String` field. Live across a safepoint, its base + the aggregate's shape ordinal are recorded so the
+    // collector relocates the shaped sub-field(s) in place. `shapedSlots` maps the slot's SSA id → its type.
+    var shapedSlots: [Int: Type] = [:]
+    var shapedSlotLive: ShapedLiveness?            // liveness of the shaped-containing slots
     // φ incomings, deferred until every block's instructions are lowered: a branch argument may be
     // defined in a block that lowers after the branch's block (e.g. a loop latch whose block id
     // precedes the case block that computes the carried value), so resolving `val(arg)` eagerly would
@@ -231,12 +236,21 @@ final class SSAIRToLLVM {
     // The `"deopt"` shaped-root operands for the homed values in `ids` (task 176 Stage 4): per root an i32
     // shape ordinal (0 = String, the only shaped type today) and its home-slot pointer. The walker maps the
     // ordinal to the kind-2 descriptor and scans the slot conditionally.
-    private func shapedDeoptOps(_ ids: Set<Int>) -> [LLVMValueRef?] {
+    private func shapedDeoptOps(homed: Set<Int>, slots: Set<Int>) -> [LLVMValueRef?] {
         var ops: [LLVMValueRef?] = []
-        for id in ids.sorted() {
+        for id in homed.sorted() {
             guard let home = stringHome[id] else { continue }
-            ops.append(LLVMConstInt(e.i32, 0, 0))
+            ops.append(LLVMConstInt(e.i32, 0, 0))   // ordinal 0 = String
             ops.append(home)
+        }
+        // A shaped-containing value-aggregate slot (task 176.3a): record its base + the aggregate's shape
+        // ordinal. The base is the bare `stackAlloc` alloca, which records as a `Direct` stackmap location
+        // (a non-zero sub-field GEP records as `Indirect` and is dropped — see shaped-roots.md Stage 3b).
+        for id in slots.sorted() {
+            guard let t = shapedSlots[id], let base = values[id] else { continue }
+            let ord = e.shapeOrdinal(t)
+            ops.append(LLVMConstInt(e.i32, UInt64(bitPattern: Int64(ord)), 0))
+            ops.append(base)
         }
         return ops
     }
@@ -244,7 +258,8 @@ final class SSAIRToLLVM {
     // The loop-header safepoint poll, recording the shaped values live at the header as shaped roots on the
     // poll's statepoint (task 176). A header with no live homed shaped value emits the plain poll.
     private func emitHeaderPoll(_ blockId: Int) {
-        let ops = shapedDeoptOps(shapedLive?.liveInBlock[blockId] ?? [])
+        let ops = shapedDeoptOps(homed: shapedLive?.liveInBlock[blockId] ?? [],
+                                 slots: shapedSlotLive?.liveInBlock[blockId] ?? [])
         if ops.isEmpty { e.emitSafepointPoll(); return }
         e.emitSafepointPollWithDeopt(ops)
     }
@@ -311,6 +326,11 @@ final class SSAIRToLLVM {
         LLVMSetInitializer(shapeTypeIdGlobal, e.descOffsetHeader(shapeId))
         LLVMSetGlobalConstant(shapeTypeIdGlobal, 1)
         LLVMSetLinkage(shapeTypeIdGlobal, LLVMWeakODRLinkage)
+
+        // The ordinal→descriptor table the frame-root walk reads (task 176.3a): entry 0 = String, entries 1+ =
+        // the shaped-containing value aggregates recorded during this compilation. Emitted after all functions
+        // are lowered, so every recorded ordinal is known.
+        e.emitShapeOrdinalTable()
 
         // The heap `String` buffer descriptor (task 176.2) + a global holding its type-id. `rt_str_concat`
         // is C and can't compute a link-time descriptor offset, so the compiler emits the offset into
@@ -479,7 +499,7 @@ final class SSAIRToLLVM {
         let (key, _, _, _) = keyAndSelf(f)
         guard let c = e.callables[key] else { return }
         values = [:]; blockMap = [:]; blocksById = [:]; spawnHandles = [:]; pendingIncomings.removeAll(keepingCapacity: true)
-        stringHome = [:]; shapedLive = nil
+        stringHome = [:]; shapedLive = nil; shapedSlots = [:]; shapedSlotLive = nil
         curVWTParams = [:]; curPWTParams = [:]; curSretParam = nil; curReturnType = nil
         curProducerSave = nil; curBackEdges = [:]; headerSaveSlot = [:]; curBlockId = -1
         curFnName = f.name
@@ -583,9 +603,35 @@ final class SSAIRToLLVM {
     // recording set (`lowerBlock` records at exactly the same `isSafepointInst` sites), or a string crossing
     // an allocation but no call would be recorded with no home and silently dropped. Each home is
     // zero-initialized at entry.
+    // A type that transitively contains a shaped value (a `String`), computed structurally from stored
+    // properties — the "compiler law" that adding a `String` field never needs a per-type change (task
+    // 176.3a). Mirrors what `collectManagedOffsets` captures as shaped: a `String`, or a `struct` with such a
+    // field (recursively). Enums are false here (their conditional payload scanning is 176.3b).
+    func transitivelyContainsShaped(_ t: Type) -> Bool {
+        switch t {
+        case .string: return true
+        case .named(let n, .struct_):
+            return (e.structMap[n]?.fields ?? []).contains { transitivelyContainsShaped($0.type) }
+        case .named(let n, .enum_):   // task 176.3b — a case payload may carry shaped/managed content
+            return (e.enumMap[n]?.cases ?? []).contains { $0.fields.contains { transitivelyContainsShaped($0.type) } }
+        default: return false
+        }
+    }
+
     private func setUpShapedHomes(_ f: SSAFunction) {
         let live = computeShapedLiveness(f)
         shapedLive = live
+        // Shaped-containing value-aggregate slots (task 176.3a): every `stackAlloc` whose aggregate type
+        // transitively contains a `String`. Recorded at each safepoint they are live across (base + shape
+        // ordinal), so the collector finds the shaped sub-field through the aggregate's value-layout descriptor.
+        for blk in f.blocks {
+            for inst in blk.insts {
+                if case .stackAlloc(let t) = inst.kind, let r = inst.result, transitivelyContainsShaped(t) {
+                    shapedSlots[r.id] = t
+                }
+            }
+        }
+        shapedSlotLive = computeSlotLiveness(f, tracked: Set(shapedSlots.keys))
         // A String-typed value produced by an address op (`fieldAddr`/`elementAddr`/`stackAlloc`) is a `p1`
         // pointer *to* a String slot, not a String value — its `: String` annotation is the pointee type. Such
         // a pointer is an ordinary `addrspace(1)` derived root RS4GC already relocates, so it must not be homed:
@@ -789,8 +835,9 @@ final class SSAIRToLLVM {
             // statepoint. The loop-header poll records roots on its own path (`emitHeaderPoll`).
             if isSafepointInst(inst.kind) {
                 var crossing = shapedLive?.liveOutInst[blk.id]?[i] ?? []
-                if let r = inst.result { crossing.remove(r.id) }
-                e.pendingDeopt = shapedDeoptOps(crossing)
+                var slotCrossing = shapedSlotLive?.liveOutInst[blk.id]?[i] ?? []
+                if let r = inst.result { crossing.remove(r.id); slotCrossing.remove(r.id) }
+                e.pendingDeopt = shapedDeoptOps(homed: crossing, slots: slotCrossing)
             }
             lowerInst(inst)
             e.pendingDeopt = nil
@@ -825,10 +872,27 @@ final class SSAIRToLLVM {
             define(inst, lowerAlloc(t, span))
         case .stackAlloc(let t):
             guard let lt = storageType(t, span) else { return }
-            define(inst, e.entryAlloca(lt, "slot"))
+            let slot = e.entryAlloca(lt, "slot")
+            // Zero-init a shaped-containing slot before any safepoint can observe it (I11b): the all-zero
+            // pattern decodes to the empty String (tag 0), so a mid-construction aggregate scans safely.
+            if transitivelyContainsShaped(t) { LLVMBuildStore(b, LLVMConstNull(lt), slot) }
+            define(inst, slot)
         case .load(let addr):
-            guard let rt = inst.result.flatMap({ ty($0.type, span) }) else { return }
-            define(inst, LLVMBuildLoad2(b, rt, val(addr), "ld"))
+            guard let r = inst.result, let rt = ty(r.type, span) else { return }
+            // A shaped field read reloads `word0` `volatile` so the collector's in-place writeback into a
+            // recorded slot is observed rather than a stale pre-safepoint load forwarded (I11a); `word1`
+            // (tag/len) is ordinary. Matches the homed-`String` reconstruction in `val`.
+            if case .string = r.type {
+                let p = val(addr)
+                let w0 = LLVMBuildLoad2(b, e.i64, e.structGEP(e.strTy, p, 0), "str.w0")!
+                LLVMSetVolatile(w0, 1)
+                let w1 = LLVMBuildLoad2(b, e.i64, e.structGEP(e.strTy, p, 1), "str.w1")!
+                var agg = LLVMBuildInsertValue(b, LLVMGetUndef(e.strTy), w0, 0, "str.lo")!
+                agg = LLVMBuildInsertValue(b, agg, w1, 1, "str.hi")!
+                define(inst, agg)
+            } else {
+                define(inst, LLVMBuildLoad2(b, rt, val(addr), "ld"))
+            }
         case .store(let addr, let value):
             // An erased value (`.typeParam`, or a composed `.generic`) is held by a buffer pointer, so a
             // store of one is a VWT-sized copy from the source buffer into the destination — the write dual
@@ -1921,9 +1985,15 @@ final class SSAIRToLLVM {
                     buf = a
                 }
                 callArgs.append(buf)
+                // Register the arg buffer as a typed GC root if it carries any managed content — a direct
+                // `addrspace(1)` field *or* shaped content (a `String`, whose `word0` is a conditional
+                // managed pointer). Reading only the direct offsets would drop a shaped-only type (`T =
+                // String`), leaving its heap buffer unrooted across the erased call (the erased-generic
+                // shaped typed-root gap — `internals/gc-model-upgrade.md`).
                 var offs: [Int32] = []
-                e.collectManagedOffsets(args[i].type, baseSlot: 0, into: &offs)
-                if !offs.isEmpty { shadowBufs.append((buf, e.valueWitness(args[i].type))) }
+                var shp: [(offset: Int32, shapeId: UInt64)] = []
+                e.collectManagedOffsets(args[i].type, baseSlot: 0, into: &offs, shaped: &shp)
+                if !offs.isEmpty || !shp.isEmpty { shadowBufs.append((buf, e.valueWitness(args[i].type))) }
             } else {
                 callArgs.append(v)
             }

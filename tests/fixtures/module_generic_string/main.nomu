@@ -1,0 +1,25 @@
+// A shaped value — a `String`, whose `word0` is a heap StringStorage pointer in the `heap` case —
+// crossing an erased generic boundary, held across a moving stop-the-world collection. `hold` is compiled
+// once (erased) in the dependency; this module calls it at `T = String`. `concat` produces a heap-tagged
+// String (a managed, movable StringStorage buffer). `s` is dead in this frame after the call, so the
+// buffer is reachable only through the erased argument buffer.
+//
+// For the buffer to be a typed GC root, the erased path must treat shaped content as managed. The three
+// value-layout sites (the consumer registration decision, the VWT POD flag, and the value-layout
+// descriptor) all read through the shaped-discarding `collectManagedOffsets` overload, so the StringStorage
+// is unrooted, not relocated, and `r.hash` reads a stale pointer — diverging from the `-c nogc` baseline.
+// With shaped content carried through, the STW walk finds `word0` via the VWT descriptor + shared
+// enumerator and fixes it up, so the hash matches nogc and the typed-root count rises by one.
+import pkg/lib
+
+fun run() -> Int {
+    let s = concat("hello world this is ", "a long heap string value")
+    let r = hold(s)
+    return r.hash
+}
+
+fun main() {
+    spawn let x = run()
+    print(x)
+    print("\n")
+}

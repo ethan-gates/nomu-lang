@@ -167,6 +167,20 @@ final class LLVMGen {
     var arrayBufMapIds: [String: UInt64] = [:]   // element-type description → array-buffer type-id
     var managedBufferMapIds: [String: UInt64] = [:]  // "Header$Element" → managed-buffer type-id (task 180)
     var valueDescIds: [String: UInt64] = [:]     // type description → value-layout descriptor id (VWT type_id, 100.4.7.4)
+    // Frame-root shape ordinals (task 176.3): a shaped-containing value aggregate recorded in a deopt bundle
+    // carries an ordinal the walker maps to its descriptor through `__nomu_shape_table`. Ordinal 0 is String;
+    // aggregates get 1+ in first-recorded order. `shapeOrdinalDescIds[i]` is ordinal `i+1`'s value-layout id.
+    var shapeOrdinalForType: [String: Int32] = [:]
+    var shapeOrdinalDescIds: [UInt64] = []
+    // Enum shaped (kind-2) descriptors (task 176.3b): a discriminant-conditional value whose payload carries
+    // managed/shaped content only in some cases. Keyed by descriptor id; serialized at `emitDescriptors`
+    // (deferred, because a nested shaped sub-entry's id becomes a link-time section offset). `enumShapeIds`
+    // memoizes by type; `enumShapeInProgress` fails-stops a nested enum-in-enum payload (unsupported — it
+    // would alias the enumerator's recursion scratch).
+    var enumKind2Descs: [UInt64: (tagOff: Int32, tagShift: Int32,
+                                  cases: [(tag: Int32, flat: [Int32], shaped: [(offset: Int32, shapeId: UInt64)])])] = [:]
+    var enumShapeIds: [String: UInt64] = [:]
+    var enumShapeInProgress: Set<String> = []
     var anyBoxMapId: UInt64?                      // one shared map for every `any I` box (payload at byte 16)
     var stringShapeMapId: UInt64?                 // one shared kind-2 shaped descriptor for every String (task 121/176)
     var stringStorageMapId: UInt64?               // one shared kind-1 descriptor for the heap String buffer (task 176.2)

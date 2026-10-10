@@ -395,8 +395,15 @@ int32_t nomu_gc_shaped_shapeid(uint64_t type_id, int32_t k) {
 // keeps the otherwise-unreferenced kind-2 descriptor alive — a String value has no header to stamp it). A
 // second shaped type will extend this to an ordinal table.
 extern uint64_t __nomu_string_shape_typeid __attribute__((weak));
+// The compiler-emitted ordinal→descriptor-offset table (task 176.3a): entry 0 is String, entries 1+ are the
+// shaped-containing value aggregates. Weak so a program with no shaped values links without it (the String
+// fallback then serves the sole ordinal 0). Both walkers resolve ordinals through here (Stage 5 lockstep).
+extern uint64_t __nomu_shape_table[] __attribute__((weak));
+extern uint64_t __nomu_shape_table_count __attribute__((weak));
 uint64_t nomu_shape_desc_for_ordinal(int32_t ordinal) {
-    (void)ordinal;
+    if (&__nomu_shape_table_count && (uint64_t)ordinal < __nomu_shape_table_count) {
+        return __nomu_shape_table[ordinal];
+    }
     return &__nomu_string_shape_typeid ? __nomu_string_shape_typeid : 0;
 }
 
@@ -459,6 +466,23 @@ static int32_t* gc_live_scratch_ensure(int32_t need) {
     return gc_live_scratch;
 }
 
+// A second scratch for the enum kind-2 path (task 176.3b): distinct from `gc_live_scratch` so the kind-0
+// object-field fold and a kind-2 enum scan can be live at once without aliasing (a struct holding an
+// `Option<String>` folds the enum via this buffer while the object fold uses the other). An enum case's
+// nested sub-entries are Strings — a kind-2 leaf that returns a static map pointer and uses no scratch — so
+// one enum-scratch level suffices; a nested enum-in-enum payload is rejected at descriptor build.
+static _Thread_local int32_t* gc_live_scratch_enum = NULL;
+static _Thread_local int32_t gc_live_scratch_enum_cap = 0;
+static int32_t* gc_live_scratch_enum_ensure(int32_t need) {
+    if (need > gc_live_scratch_enum_cap) {
+        int32_t cap = gc_live_scratch_enum_cap ? gc_live_scratch_enum_cap : 16;
+        while (cap < need) cap *= 2;
+        gc_live_scratch_enum = (int32_t*)realloc(gc_live_scratch_enum, (size_t)cap * sizeof(int32_t));
+        gc_live_scratch_enum_cap = cap;
+    }
+    return gc_live_scratch_enum;
+}
+
 const int32_t* nomu_gc_live_offsets(uint64_t type_id, const void* base, int32_t* out_count) {
     const nomu_gc_desc* d = gc_desc_at(type_id);
     if (!d) {
@@ -472,17 +496,36 @@ const int32_t* nomu_gc_live_offsets(uint64_t type_id, const void* base, int32_t*
         int32_t ncases = map[2];
         uint64_t word = *(const uint64_t*)((const uint8_t*)base + tag_off);
         uint64_t tag = word >> tag_shift;
+        // Per-case format `(tag, nFlat, flat…, nShaped, (off, subId)…)` (task 176.3b). A flat-only case
+        // (String, or a conditional class pointer) returns its offsets directly; a case with nested shaped
+        // sub-entries (an `Option<String>` payload) recurses each into the enum scratch.
         const int32_t* p = map + 3;
         for (int32_t c = 0; c < ncases; c++) {
             int32_t case_tag = p[0];
-            int32_t count = p[1];
-            if ((uint64_t)case_tag == tag) {
-                *out_count = count;
-                return p + 2;
+            int32_t nflat = p[1];
+            const int32_t* flat = p + 2;
+            int32_t nshaped = p[2 + nflat];
+            const int32_t* subs = p + 2 + nflat + 1;   // `(off, subId)` pairs
+            if ((uint64_t)case_tag != tag) { p = subs + 2 * nshaped; continue; }
+            if (nshaped == 0) {               // flat-only case: the offsets live in the static map
+                *out_count = nflat;
+                return nflat ? flat : NULL;
             }
-            p += 2 + count;
+            int32_t* out = gc_live_scratch_enum_ensure(nflat + nshaped);
+            int32_t n = 0;
+            for (int32_t k = 0; k < nflat; k++) out[n++] = flat[k];
+            for (int32_t k = 0; k < nshaped; k++) {
+                int32_t off = subs[2 * k];
+                int32_t sub_id = subs[2 * k + 1];
+                int32_t sub_cnt = 0;
+                const int32_t* sub = nomu_gc_live_offsets((uint64_t)sub_id, (const uint8_t*)base + off, &sub_cnt);
+                out = gc_live_scratch_enum_ensure(n + sub_cnt);
+                for (int32_t j = 0; j < sub_cnt; j++) out[n++] = off + sub[j];
+            }
+            *out_count = n;
+            return n ? out : NULL;
         }
-        *out_count = 0;                 // tag carries no managed pointer (String small/immortal)
+        *out_count = 0;                 // tag carries no managed pointer (String small/immortal, enum .none)
         return NULL;
     }
     // kind 0/1 with no shaped fields — the common object/array: the static flat map, no work (178.1).
