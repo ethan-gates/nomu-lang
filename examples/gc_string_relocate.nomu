@@ -10,6 +10,17 @@ class Box {
   var v: Int
 }
 
+// Content fold over the String's bytes — the GC-relocation readback (summing every byte).
+fun strsum(s: String) -> Int {
+  var acc = 0
+  var i = 0
+  while i < s.count {
+    acc = acc + s.byte(at: i).int
+    i = i + 1
+  }
+  return acc
+}
+
 fun main() {
   var acc = ""
   var i = 0
@@ -22,7 +33,7 @@ fun main() {
       xs.append(Box(v: w))
       w = w + 1
     }
-    checksum = checksum + acc.hash
+    checksum = checksum + strsum(acc)
     i = i + 1
   }
   print(checksum)

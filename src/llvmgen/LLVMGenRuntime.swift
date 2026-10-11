@@ -24,13 +24,11 @@ extension LLVMGen {
     // Runtime C functions that never allocate on the GC heap and never park the fiber — their calls
     // stay plain (no statepoint). Conservative: mislabeling a GC-triggering call as leaf is unsound.
     static let gcLeafRuntimeFns: Set<String> = [
-        "printf", "rt_str_lit", "rt_mutex_new", "rt_mutex_unlock",
+        "printf", "rt_mutex_new", "rt_mutex_unlock",
         "rt_bounds_trap",   // aborts, never allocates
         "memcpy",           // libc block copy — never allocates
         "memset",           // libc fill — never allocates
         "rt_gc_write_barrier",   // remembers the mutated object; never triggers GC
-        "rt_str_snapshot",  // task 176.2 — off-heap snapshot of concat inputs; malloc only, no managed alloc
-        "rt_str_fill",      // task 176.2 — memcpy snapshot into the StringStorage body + free; no managed alloc
     ]
 
     var funcAttrIndex: LLVMAttributeIndex { LLVMAttributeIndex(bitPattern: Int32(LLVMAttributeFunctionIndex)) }
@@ -228,11 +226,34 @@ extension LLVMGen {
         return f
     }
 
+    // A string literal lowered in codegen (task 121, the `fromStaticUTF8` role) — no runtime call, both words
+    // compile-time constants. Following Swift: a **short** literal (≤ 15 UTF-8 bytes) is a `small` value with
+    // the bytes packed inline (tag 0), avoiding any static storage; a **long** literal is `immortal` — `word0`
+    // is the static UTF-8 global's address, `word1 = (immortal tag 1 << 60) | byte count`.
     func lowerStringLit(_ s: String) -> LLVMValueRef {
+        let bytes = Array(s.utf8)
+        if bytes.count <= 15 {
+            // `small`: inline bytes at offsets 0–14 (little-endian: byte i at bit i*8 of word0 for i<8, of
+            // word1 for 8≤i≤14). Byte 15 = (small tag 0 in the top nibble) | (count in the low nibble).
+            var w0: UInt64 = 0, w1: UInt64 = 0
+            for (i, byte) in bytes.enumerated() {
+                if i < 8 { w0 |= UInt64(byte) << (i * 8) }
+                else { w1 |= UInt64(byte) << ((i - 8) * 8) }
+            }
+            w1 |= UInt64(bytes.count) << 56   // count ≤ 15 → low nibble of byte 15; tag nibble stays 0 (small)
+            var sv = LLVMGetUndef(strTy)
+            sv = LLVMBuildInsertValue(b, sv, LLVMConstInt(i64, w0, 0), 0, "lit0")!
+            sv = LLVMBuildInsertValue(b, sv, LLVMConstInt(i64, w1, 0), 1, "lit1")!
+            return sv!
+        }
         let data = LLVMBuildGlobalStringPtr(b, s, "str")!
-        let len = LLVMConstInt(i64, UInt64(s.utf8.count), 0)
-        let (fn, ty) = runtimeFn("rt_str_lit", ret: strTy, params: [i8ptr, i64], varArg: false)
-        return buildCall(fn, ty, [data, len])!
+        let count = UInt64(bytes.count) & 0x00FF_FFFF_FFFF_FFFF
+        let w0 = LLVMBuildPtrToInt(b, data, i64, "lit.w0")!
+        let w1 = LLVMConstInt(i64, (UInt64(1) << 60) | count, 0)   // immortal tag = 1
+        var sv = LLVMGetUndef(strTy)
+        sv = LLVMBuildInsertValue(b, sv, w0, 0, "lit0")!
+        sv = LLVMBuildInsertValue(b, sv, w1, 1, "lit1")!
+        return sv!
     }
 
     // The external stop-world flag (`volatile int __nomu_stop_world`) the poll tests.

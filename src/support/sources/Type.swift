@@ -12,7 +12,7 @@ public indirect enum Type: Equatable, Codable {
     case uint64   // a 64-bit unsigned word; wrapping arithmetic, unsigned compares/shifts (i64)
     case double
     case bool
-    case string
+    case stringBase
     case void
     case named(String, NamedKind)                 // struct / enum / class / actor
     case existential(String)                       // `any I` — a boxed value conforming to interface I (M5 A1.4)
@@ -36,7 +36,7 @@ extension Type: CustomStringConvertible {
         case .uint64: return "UInt64"
         case .double: return "Double"
         case .bool:   return "Bool"
-        case .string: return "String"
+        case .stringBase: return "String"
         case .void:   return "Void"
         case .error:  return "<error>"
         case .named(let name, _): return name

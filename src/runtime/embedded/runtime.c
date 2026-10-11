@@ -1224,7 +1224,7 @@ String rt_read_line(int fd) {
     char buf[4096];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     if (n <= 0) {
-        return rt_str_lit("", 0);
+        return nomu_str_make("", 0, NOMU_STR_TAG_IMMORTAL);
     }
     if (buf[n - 1] == '\n') {
         n--;
@@ -1240,7 +1240,7 @@ String rt_read_line(int fd) {
 // Non-macOS: readLine is not wired yet (epoll path unwritten, runtime.md §... poller).
 String rt_read_line(int fd) {
     (void)fd;
-    return rt_str_lit("", 0);
+    return nomu_str_make("", 0, NOMU_STR_TAG_IMMORTAL);
 }
 #endif
 

@@ -441,7 +441,7 @@ final class FunctionLowerer {
         case .intLit(let n):    return emit(.constInt(n), e.type, e.span)   // .int, or .uint8 in a byte context
         case .doubleLit(let x): return emit(.constDouble(x), .double, e.span)
         case .boolLit(let b):   return emit(.constBool(b), .bool, e.span)
-        case .stringLit(let s): return emit(.constString(s), .string, e.span)
+        case .stringLit(let s): return emit(.constString(s), .stringBase, e.span)
 
         case .varRef(let name):
             return readVar(name, e.span, fieldType: e.type)

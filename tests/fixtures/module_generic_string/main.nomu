@@ -7,15 +7,26 @@
 // For the buffer to be a typed GC root, the erased path must treat shaped content as managed. The three
 // value-layout sites (the consumer registration decision, the VWT POD flag, and the value-layout
 // descriptor) all read through the shaped-discarding `collectManagedOffsets` overload, so the StringStorage
-// is unrooted, not relocated, and `r.hash` reads a stale pointer — diverging from the `-c nogc` baseline.
+// is unrooted, not relocated, and `strsum(r)` reads a stale pointer — diverging from the `-c nogc` baseline.
 // With shaped content carried through, the STW walk finds `word0` via the VWT descriptor + shared
 // enumerator and fixes it up, so the hash matches nogc and the typed-root count rises by one.
 import pkg/lib
 
+// Content fold over the String's bytes — reads back through the (possibly relocated) buffer.
+fun strsum(s: String) -> Int {
+    var acc = 0
+    var i = 0
+    while i < s.count {
+        acc = acc + s.byte(at: i).int
+        i = i + 1
+    }
+    return acc
+}
+
 fun run() -> Int {
     let s = concat("hello world this is ", "a long heap string value")
     let r = hold(s)
-    return r.hash
+    return strsum(r)
 }
 
 fun main() {

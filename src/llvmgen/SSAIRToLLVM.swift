@@ -332,18 +332,12 @@ final class SSAIRToLLVM {
         // are lowered, so every recorded ordinal is known.
         e.emitShapeOrdinalTable()
 
-        // The heap `String` buffer descriptor (task 176.2) + a global holding its type-id. `rt_str_concat`
-        // is C and can't compute a link-time descriptor offset, so the compiler emits the offset into
-        // `__nomu_stringstorage_typeid` (weak-folded across modules) for the C floor to read when it stamps a
-        // `StringStorage` header. Registered here so the descriptor is emitted even when no Nomu code names it.
-        let ssId = e.stringStorageTypeId()
-        // Get-or-add: `emitConcat` may have already declared this global while lowering a concat body; set the
-        // initializer on that declaration rather than minting a suffixed duplicate that stays undefined.
-        let ssTypeIdGlobal = LLVMGetNamedGlobal(e.mod, "__nomu_stringstorage_typeid")
-            ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_stringstorage_typeid")!
-        LLVMSetInitializer(ssTypeIdGlobal, e.descOffsetHeader(ssId))
-        LLVMSetGlobalConstant(ssTypeIdGlobal, 1)
-        LLVMSetLinkage(ssTypeIdGlobal, LLVMWeakODRLinkage)
+        // Register the heap `String` byte-buffer descriptor — a `ManagedBuffer<EmptyHeader, UInt8>` (task
+        // 176.2 / 180.4) — at module start, so a module that only *relocates* a received heap String (never
+        // allocating one itself, so it has no `__stringAllocHeap` site) still emits the weak-ODR descriptor
+        // into its own section. `allocHeap` sites register the same id; this is the belt for the alloc-free
+        // consumer. No String-specific symbol: the id folds onto the shared `ManagedBuffer` descriptor.
+        _ = e.managedBufferTypeId(header: .named("EmptyHeader", .struct_), element: .uint8)
 
         // The link-time offset-as-id descriptor section (task 100.4.7): every module emits its own
         // types' descriptors, weak duplicates folding at link — so a dependency's heap types are all
@@ -609,7 +603,7 @@ final class SSAIRToLLVM {
     // field (recursively). Enums are false here (their conditional payload scanning is 176.3b).
     func transitivelyContainsShaped(_ t: Type) -> Bool {
         switch t {
-        case .string: return true
+        case .stringBase: return true
         case .named(let n, .struct_):
             return (e.structMap[n]?.fields ?? []).contains { transitivelyContainsShaped($0.type) }
         case .named(let n, .enum_):   // task 176.3b — a case payload may carry shaped/managed content
@@ -619,7 +613,9 @@ final class SSAIRToLLVM {
     }
 
     private func setUpShapedHomes(_ f: SSAFunction) {
-        let live = computeShapedLiveness(f)
+        // The shaped set includes single-field shaped wrappers (task 121.1.1), so a `struct String` value is
+        // tracked and homed exactly like a bare `StringBase`.
+        let live = computeShapedLiveness(f, e.shapedStructs)
         shapedLive = live
         // Shaped-containing value-aggregate slots (task 176.3a): every `stackAlloc` whose aggregate type
         // transitively contains a `String`. Recorded at each safepoint they are live across (base + shape
@@ -882,7 +878,7 @@ final class SSAIRToLLVM {
             // A shaped field read reloads `word0` `volatile` so the collector's in-place writeback into a
             // recorded slot is observed rather than a stale pre-safepoint load forwarded (I11a); `word1`
             // (tag/len) is ordinary. Matches the homed-`String` reconstruction in `val`.
-            if case .string = r.type {
+            if case .stringBase = r.type {
                 let p = val(addr)
                 let w0 = LLVMBuildLoad2(b, e.i64, e.structGEP(e.strTy, p, 0), "str.w0")!
                 LLVMSetVolatile(w0, 1)
@@ -941,7 +937,13 @@ final class SSAIRToLLVM {
         case .makeEnum(let t, let caseIndex, let fields):
             define(inst, makeEnum(t, caseIndex, fields, span))
         case .extractField(let base, let idx):
-            define(inst, LLVMBuildExtractValue(b, val(base), UInt32(idx), "fld"))
+            // A single-field shaped wrapper lowers to its field's type directly (task 121.1.1), so extracting
+            // its one field is identity — the value already *is* the field. (No `extractvalue` on a strTy.)
+            if e.isShapedWrapper(base.type) {
+                define(inst, val(base))
+            } else {
+                define(inst, LLVMBuildExtractValue(b, val(base), UInt32(idx), "fld"))
+            }
         case .enumTag(let base):
             if case .generic = base.type {
                 define(inst, LLVMBuildLoad2(b, e.i64, val(base), "etag"))   // tag word at offset 0 of the buffer
@@ -1191,6 +1193,11 @@ final class SSAIRToLLVM {
             }
             return buf
         }
+        // A single-field shaped wrapper is its field (task 121.1.1): the value *is* the one field's value, no
+        // aggregate to insert into — `struct String { let base }` built from a `StringBase` is that StringBase.
+        if e.isShapedWrapper(t), let f = fields.first {
+            return val(f)
+        }
         guard case .named(let name, _) = t, let st = e.structType(name) else {
             e.fail("7.2.3: makeStruct of non-struct", span); return nil
         }
@@ -1349,11 +1356,93 @@ final class SSAIRToLLVM {
         }
     }
 
+    // The byte count of a `StringBase` value (task 121). The tag is `word1`'s top nibble (`>> 60`): `small`
+    // (0) keeps its count in byte 15's low nibble (bits 56–59, 0–15); `immortal` (1) / `heap` (2) keep it in
+    // `word1`'s low 56 bits. The bit-stealing layout is codegen's; `count` is lowered here, not via a C leaf.
+    func strLen(_ value: LLVMValueRef) -> LLVMValueRef {
+        let word1 = LLVMBuildExtractValue(b, value, 1, "s.w1")!
+        let tag = LLVMBuildLShr(b, word1, LLVMConstInt(e.i64, 60, 0), "s.ltag")!
+        let isSmall = LLVMBuildICmp(b, LLVMIntEQ, tag, LLVMConstInt(e.i64, 0, 0), "s.issmall")!
+        let smallCount = LLVMBuildAnd(b, LLVMBuildLShr(b, word1, LLVMConstInt(e.i64, 56, 0), "s.sc")!,
+                                      LLVMConstInt(e.i64, 0xF, 0), "s.smallcount")!
+        let bigCount = LLVMBuildAnd(b, word1, LLVMConstInt(e.i64, 0x00FF_FFFF_FFFF_FFFF, 0), "s.bigcount")!
+        return LLVMBuildSelect(b, isSmall, smallCount, bigCount, "s.len")!
+    }
+
+    // The tag-aware UTF-8 byte address of a `StringBase` value as an addrspace(0) `i8*` (task 121). `heap`
+    // (tag 2): bytes sit past the buffer's `{ header, cap }` prefix at `word0 + 16`. `immortal` (1)/empty:
+    // bytes at `word0`. `small` (0): the bytes are *inline* in the 16-byte value, so there is no persistent
+    // address — materialize the value to a fresh stack slot (its own, so concurrent `bytePointer`s don't
+    // clobber) and point at offset 0 (little-endian: inline byte i is at slot+i). The slot is addrspace(0)
+    // plain bytes (no GC root), stable across safepoints; the pointer is valid for the caller's immediate use.
+    func strPtr(_ value: LLVMValueRef) -> LLVMValueRef {
+        let word0 = LLVMBuildExtractValue(b, value, 0, "s.w0")!
+        let word1 = LLVMBuildExtractValue(b, value, 1, "s.w1p")!
+        let tag = LLVMBuildLShr(b, word1, LLVMConstInt(e.i64, 60, 0), "s.tag")!
+        let isSmall = LLVMBuildICmp(b, LLVMIntEQ, tag, LLVMConstInt(e.i64, 0, 0), "s.issmall")!
+        let isHeap = LLVMBuildICmp(b, LLVMIntEQ, tag, LLVMConstInt(e.i64, 2, 0), "s.isheap")!
+        let heapW0 = LLVMBuildAdd(b, word0, LLVMConstInt(e.i64, 16, 0), "s.heapw0")!
+        let bigInt = LLVMBuildSelect(b, isHeap, heapW0, word0, "s.bigint")!
+        let slot = e.entryAlloca(e.strTy, "s.spill")
+        LLVMBuildStore(b, value, slot)
+        let smallInt = LLVMBuildPtrToInt(b, slot, e.i64, "s.smallint")!
+        let dataInt = LLVMBuildSelect(b, isSmall, smallInt, bigInt, "s.dataint")!
+        return LLVMBuildIntToPtr(b, dataInt, e.i8ptr, "s.data")!
+    }
+
+    // Tail-alloc a `ManagedBuffer<Header, Element>` of `capV` elements through the rooted plan-aware seam,
+    // returning the buffer reference (`p1`): size = 16 + headerSize + cap*stride, with the weak-ODR type-id
+    // header word at offset 0 and the capacity at 8 (task 180). The one buffer-alloc path — `__managedBufferCreate`
+    // and String's heap byte buffer (121.1.3) both go through here, so there is no bespoke String allocator.
+    func emitManagedBufferAlloc(header hdr: Type, element elem: Type, capacity capV: LLVMValueRef) -> LLVMValueRef {
+        let tid = e.managedBufferTypeId(header: hdr, element: elem)
+        let headerSize = e.slotCount(hdr) * 8
+        let elemBytes = LLVMBuildMul(b, capV, LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "mb.elembytes")!
+        let bytes = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(16 + headerSize), 0), elemBytes, "mb.bytes")!
+        let buf = e.rtAllocManaged(bytes)
+        LLVMBuildStore(b, e.descOffsetHeader(tid), buf)
+        LLVMBuildStore(b, capV, e.gepByte(buf, LLVMConstInt(e.i64, 8, 0)))
+        return buf
+    }
+
     private func lowerDirectCall(_ name: String, _ args: [SSAValue], typeArgs: [Type] = [], resultType: Type, span: Span) -> LLVMValueRef? {
         switch name {
         case "print":    return EgressBuiltins.emitPrint(self, args, span)
         case "putByte":  return EgressBuiltins.emitPutByte(self, args, span)
-        case "concat":   return EgressBuiltins.emitConcat(self, args, span)
+        case "__stringAllocHeap":
+            // task 121.1.3: a `heap` StringBase backed by a fresh `ManagedBuffer<EmptyHeader, UInt8>` of
+            // `count` bytes — allocated through the shared `emitManagedBufferAlloc` (the same path as
+            // `__managedBufferCreate`), then wrapped into the bit-stealing value: word0 = buffer base,
+            // word1 = (heap tag << 60) | count. The bytes are uninitialized; the Nomu `concat` fills them
+            // with no safepoint in between.
+            let capV = val(args[0])
+            let buf = emitManagedBufferAlloc(header: .named("EmptyHeader", .struct_), element: .uint8, capacity: capV)
+            let w0 = LLVMBuildPtrToInt(b, buf, e.i64, "sb.w0")!
+            let w1 = LLVMBuildOr(b, LLVMConstInt(e.i64, UInt64(2) << 60, 0), capV, "sb.w1")!
+            var sb = LLVMGetUndef(e.strTy)
+            sb = LLVMBuildInsertValue(b, sb, w0, 0, "sb0")!
+            sb = LLVMBuildInsertValue(b, sb, w1, 1, "sb1")!
+            return sb
+        case "__stringSmallConcat":
+            // task 121.2: build a `small` StringBase inline from two sources — the ≤15-byte `concat` result
+            // (concat guards `strLen(a) + strLen(b) ≤ 15`). Zero a 16-byte slot (canonical: unused inline bytes
+            // are 0), copy both sources to offsets 0 and `an`, set byte 15 = count (small tag 0 in the top
+            // nibble, count in the low), and load the value back once — no mutate-then-reload of an SSA value.
+            let sa = val(args[0]), sb2 = val(args[1])
+            let an = strLen(sa), bn = strLen(sb2)
+            let pa = strPtr(sa), pb = strPtr(sb2)
+            let slot = e.entryAlloca(e.strTy, "small.build")
+            LLVMBuildStore(b, LLVMConstNull(e.strTy), slot)
+            let slot8 = LLVMBuildBitCast(b, slot, e.i8ptr, "small.slot8")!
+            let (memcpy, mty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)
+            _ = e.buildCall(memcpy, mty, [slot8, pa, an])
+            _ = e.buildCall(memcpy, mty, [e.gepByte(slot8, an), pb, bn])
+            let n = LLVMBuildAdd(b, an, bn, "small.n")!
+            LLVMBuildStore(b, LLVMBuildTrunc(b, n, e.i8, "small.b15")!,
+                           e.gepByte(slot8, LLVMConstInt(e.i64, 15, 0)))
+            return LLVMBuildLoad2(b, e.strTy, slot, "small.val")
+        case "__string_count_int":          return strLen(val(args[0]))      // StringBase byte count (task 121)
+        case "__string_bytepointer_rawptr": return strPtr(val(args[0]))      // StringBase tag-aware byte address
         case "sleep":    return EgressBuiltins.emitSleep(self, args, span)
         case "readLine": return EgressBuiltins.emitReadLine(self)
         case "__array_count_int": return LLVMBuildLoad2(b, e.i64, e.gepByte(val(args[0]), LLVMConstInt(e.i64, 8, 0)), "arr.count")
@@ -1639,20 +1728,12 @@ final class SSAIRToLLVM {
             return e.buildCall(fn, fty, [])
         case "__managedBufferCreate":
             // task 180: tail-alloc `{ type-id, cap, Header, Element[cap] }`. `Header`/`Element` come from the
-            // result's ManagedBuffer type; size = 16 + headerSize + cap*stride. The returned `p1` is the
-            // ManagedBuffer reference (same representation as any class), rooted via `rtAllocManaged`.
+            // result's ManagedBuffer type. The returned `p1` is the ManagedBuffer reference (same
+            // representation as any class), rooted via the shared `emitManagedBufferAlloc`.
             guard let (hdr, elem) = e.managedBufferArgs(resultType) else {
                 e.fail("180: __managedBufferCreate result is not a ManagedBuffer", span); return nil
             }
-            let tid = e.managedBufferTypeId(header: hdr, element: elem)
-            let headerSize = e.slotCount(hdr) * 8
-            let capV = val(args[0])
-            let elemBytes = LLVMBuildMul(b, capV, LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "mb.elembytes")!
-            let bytes = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(16 + headerSize), 0), elemBytes, "mb.bytes")!
-            let buf = e.rtAllocManaged(bytes)
-            LLVMBuildStore(b, e.descOffsetHeader(tid), buf)
-            LLVMBuildStore(b, capV, e.gepByte(buf, LLVMConstInt(e.i64, 8, 0)))
-            return buf
+            return emitManagedBufferAlloc(header: hdr, element: elem, capacity: val(args[0]))
         case "__managedBufferCapacity":
             // The allocated element count, stored at byte 8 by `create`.
             return LLVMBuildLoad2(b, e.i64, e.gepByte(val(args[0]), LLVMConstInt(e.i64, 8, 0)), "mb.cap")

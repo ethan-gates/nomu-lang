@@ -26,7 +26,10 @@ and M10's LSP depends on modules for responsiveness.
 - **Module interface format** — the artifact a consumer compiles against: exported signatures, types,
   witness tables, shareability facts, and (open) generic bodies for cross-module
   specialization/inlining. Analogues: Swift `.swiftinterface` / `.swiftmodule`, Rust crate metadata.
-  (The deferred "Module-level interface as input" item made concrete.)
+  (The deferred "Module-level interface as input" item made concrete.) Carrying bodies for **non-generic
+  inlinable** functions (the `@inlinable`-equivalent that lets stdlib/core ops inline into clients without
+  LTO) extends this format and is owned by [182 cross-module inlining](182-cross-module-inlining.md), to land
+  after this interface settles.
 - **Linker outputs** — per-module object files + symbol visibility / mangling across modules (builds
   on M4.15 mangling).
 - **nomuc scope / driver** — a driver refactor + a scope decision: keep a pure compiler with a

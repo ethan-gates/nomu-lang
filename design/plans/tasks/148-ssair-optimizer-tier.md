@@ -93,6 +93,11 @@ LLVM leaves (`NOMU_DUMP_LLVM` → `.post.ll`) before adding a pass.
 
 ## 148.3 · Inlining & specialization (§7.5)
 
+This section is the **intra-module** inliner (the `Inline` pass, built) and its refinements. The
+**cross-module** inline story — an `@inlinable`-equivalent policy, carrying inlinable bodies in the module
+interface, and making the stdlib/runtime inline into clients without LTO — is
+[182 cross-module inlining](182-cross-module-inlining.md), which feeds imported bodies to this pass.
+
 - **Cost model** `[M · deferred]` `[§7.5]` — a real size/hotness heuristic beyond the fixed inst caps.
 - **Value / constant specialization** `[M · deferred]` `[§7.5]` — clone a callee specialized to a
   known-value argument (the "specialization" axis mono doesn't cover — it specializes on types).

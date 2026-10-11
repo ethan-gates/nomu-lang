@@ -7,6 +7,16 @@
 struct Box {
   var v: Int
 }
+// Content fold over the String's bytes — the GC-relocation readback (summing every byte).
+fun strsum(s: String) -> Int {
+  var acc = 0
+  var i = 0
+  while i < s.count {
+    acc = acc + s.byte(at: i).int
+    i = i + 1
+  }
+  return acc
+}
 fun main() {
   let o: Option<String> = Option<String>.some(value: concat("hello", " world"))
   var i = 0
@@ -19,7 +29,7 @@ fun main() {
       w = w + 1
     }
     switch o {
-    case .some(let s): checksum = checksum + s.hash
+    case .some(let s): checksum = checksum + strsum(s)
     case .none:        checksum = checksum + 1
     }
     i = i + 1

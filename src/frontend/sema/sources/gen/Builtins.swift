@@ -6,10 +6,10 @@ import support
 //
 //     __<receiver>_<name>_<return>[_<arg>...]
 //
-// e.g. `__string_eq_bool_string` = receiver `String`, member `eq`, returns `Bool`, one `String` arg;
-// the C function is named `__string_eq_bool_string`. Because the name carries the full signature,
-// both Sema (build the typed call) and codegen (emit the extern call) derive types from it instead
-// of hand-writing a case per builtin.
+// e.g. `__string_count_int` = receiver `String`, member `count`, returns `Int`, no args (a trailing
+// `_<arg>…` would name each argument type). The C function has the same name. Because the name carries the
+// full signature, both Sema (build the typed call) and codegen (emit the extern call) derive types from it
+// instead of hand-writing a case per builtin.
 
 // The signature parsed out of a mangled name: the receiver type, the member name, argument types
 // (receiver excluded), and the return type.
@@ -22,18 +22,11 @@ public struct BuiltinSig {
 }
 
 public enum Builtins {
-    // Builtins whose mangled name is a same-named C leaf function (pure, no GC allocation, no
-    // safepoint). Codegen dispatches these generically. Codegen-native builtins that are *not* a C
-    // call — the numeric conversions (`sitofp`/round), the array ops (field loads, in-codegen grow)
-    // — are not here; they keep their explicit lowering.
-    public static let cLeaf: Set<String> = [
-        "__string_hash_int",
-        "__string_eq_bool_string",
-        "__string_count_int",            // byte count (task 121.1.4 byte layer)
-        "__string_isempty_bool",         // count == 0
-        "__string_byteat_uint8_int",     // byte(at:) — bounds-checked UTF-8 byte read
-        "__string_lt_bool_string",       // lexicographic byte ordering (`<`, as a method until operators land)
-    ]
+    // Builtins whose mangled name is a same-named C leaf function (pure, no GC allocation, no safepoint),
+    // dispatched generically to an extern C call in codegen. Currently empty: the former string entries
+    // (`__string_count_int`, `__string_bytepointer_rawptr`) are lowered codegen-native (`strLen`/`strPtr` in
+    // `SSAIRToLLVM`), so no builtin routes through the C floor. The facility stays for any future C-leaf op.
+    public static let cLeaf: Set<String> = []
 
     // Parse `__<recv>_<name>_<ret>[_<arg>...]`. `split` drops the leading empties from `__`.
     public static func signature(_ mangled: String) -> BuiltinSig {
@@ -48,7 +41,7 @@ public enum Builtins {
 
 // A namespace for building NomuIR (NOIR) for builtins.
 struct BuiltinsSema {
-    /// A zero-argument member builtin, e.g. `"str".hash` or `i.double`. `base` is the receiver.
+    /// A zero-argument member builtin, e.g. `i.double` or a bare `StringBase`'s `count`. `base` is the receiver.
     static func member(_ mangled: String, _ base: NOIRExpr, _ span: Span) -> NOIRExpr {
         call(mangled, base, [], span)
     }
@@ -77,7 +70,8 @@ extension Type {
         case "uint64": return .uint64
         case "double": return .double
         case "bool":   return .bool
-        case "string": return .string
+        case "string": return .stringBase
+        case "rawptr": return .rawPtr
         default:       return .error
         }
     }

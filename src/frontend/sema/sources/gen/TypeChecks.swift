@@ -143,7 +143,7 @@ enum TypeChecks {
             return
         }
         guard allowed.contains(lhs.type) else {
-            if lhs.type == .string && equality {
+            if lhs.type == .stringBase && equality {
                 s.diags.error("String has no '==' / '!=' operator yet — use '.eq(...)'", at: span)
             } else {
                 s.diags.error("type '\(lhs.type)' does not support comparison", at: span)

@@ -19,6 +19,17 @@ class Holder {
   var s: String
 }
 
+// Content fold over the String's bytes — the GC-relocation readback (summing every byte).
+fun strsum(s: String) -> Int {
+  var acc = 0
+  var i = 0
+  while i < s.count {
+    acc = acc + s.byte(at: i).int
+    i = i + 1
+  }
+  return acc
+}
+
 fun main() {
   let h = Holder(s: concat("hello", " world"))
   var i = 0
@@ -32,7 +43,7 @@ fun main() {
       xs.append(Box(v: w))
       w = w + 1
     }
-    checksum = checksum + h.s.hash     // read the field across each collection; the fold must scan it on every GC
+    checksum = checksum + strsum(h.s)     // read the field across each collection; the fold must scan it on every GC
     i = i + 1
   }
   print(checksum)

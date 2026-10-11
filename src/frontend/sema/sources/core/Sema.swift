@@ -377,8 +377,8 @@ public struct Sema {
             }
         }
         // Prototype builtins (print is special-cased in checkCall — it is variadic-ish).
-        funcs["concat"]   = FnSig(params: [.string, .string], ret: .string)
-        funcs["readLine"] = FnSig(params: [], ret: .string)
+        // `concat` is a Nomu function (core.nomu) over `StringBase.allocHeap` (task 121.1.4); no builtin proto.
+        funcs["readLine"] = FnSig(params: [], ret: .named("String", .struct_))
         funcs["sleep"]    = FnSig(params: [.int], ret: .int)
     }
 
@@ -476,7 +476,10 @@ public struct Sema {
         case "UInt64": return .uint64
         case "Double": return .double
         case "Bool":   return .bool
-        case "String": return .string
+        // `String` is a Nomu struct (core.nomu) wrapping the internal `StringBase` primitive — the 16-byte
+        // bit-stealing shaped value (task 121). The name resolves to the struct via the normal same-module
+        // path (below); `StringBase` names the primitive, for the stdlib wrapper's one field.
+        case "StringBase": return .stringBase
         case "RawPtr": return .rawPtr    // task 125 — untyped unmanaged address
         case "Void":   return .void
         default:

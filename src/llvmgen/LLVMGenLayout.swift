@@ -10,6 +10,14 @@ extension LLVMGen {
     func structType(_ name: String) -> LLVMTypeRef? {
         if let t = structTypes[name] { return t }
         guard let s = structMap[name] else { return nil }
+        // A single-field shaped wrapper is byte-identical to its field, so it lowers to the field's type
+        // directly (task 121.1.1) — `struct String` is `strTy`, not `{ strTy }`. This is what lets a wrapper
+        // value stay a two-register shaped SSA value on the shaped-root path (its `makeStruct`/`extractField`
+        // are identity in the egress) instead of a nested aggregate forced to a frame slot.
+        if shapedStructs.contains(name), let ft = llvmType(s.fields[0].type, s.fields[0].span) {
+            structTypes[name] = ft
+            return ft
+        }
         let st = LLVMStructCreateNamed(ctx, "struct.\(name)")!
         structTypes[name] = st   // cache before filling (value structs never self-nest, but be safe)
         var elems: [LLVMTypeRef] = []
@@ -32,7 +40,7 @@ extension LLVMGen {
         case .uint64:     return i64   // a 64-bit unsigned word
         case .double:     return f64
         case .bool:       return i1    // 8.5.2 — Bool is LLVM's native i1 (was i64)
-        case .string:     return strTy
+        case .stringBase:     return strTy
         case .void:       return voidTy
         case .function:   return p1   // a closure value is a managed pointer to a heap { fn, caps… } object (8.4.1)
         case .named(let n, .struct_):
@@ -157,7 +165,7 @@ extension LLVMGen {
         switch t {
         case .int, .uint8, .uint64, .double, .bool: return 1
         case .rawPtr, .ptr: return 1   // an addrspace(0) pointer word (task 125)
-        case .string:     return 2
+        case .stringBase:     return 2
         case .function:   return 1   // a managed pointer to a heap { fn, caps… } box (8.4.1)
         case .existential, .composition: return 1   // a managed pointer to a heap { witness, payload } box
         case .opaque:     return slotCount(concreteUnderlying(t))

@@ -131,6 +131,41 @@ final class LLVMGen {
     // Type registries + their cached LLVM struct types (built lazily by the layout primitives).
     var structMap: [String: NOIRStruct] = [:]
     var structTypes: [String: LLVMTypeRef] = [:]
+
+    // Single-field shaped wrappers (task 121.1.1): struct names with exactly one stored field that is shaped
+    // (a `StringBase`, or itself such a wrapper), so the struct is byte-identical to the 16-byte shaped value.
+    // Its value is lowered as the field's type directly (two registers, the kind-2 descriptor) and rides the
+    // shaped-root path, inheriting `StringBase`'s treatment with no per-type code — `struct String { let base:
+    // StringBase }` is the motivating case. Memoized once `structMap` is populated (before any function is
+    // lowered). Mirrors `computeShapedStructs` in the `ssair` module (kept parallel like
+    // `transitivelyContainsShaped`), so the egress and the midend agree on the shaped set.
+    private var _shapedStructs: Set<String>?
+    var shapedStructs: Set<String> {
+        if let s = _shapedStructs { return s }
+        var set = Set<String>()
+        func fieldShaped(_ t: Type) -> Bool {
+            switch t {
+            case .stringBase:             return true
+            case .named(let n, .struct_): return set.contains(n)
+            default:                      return false
+            }
+        }
+        var changed = true
+        while changed {
+            changed = false
+            for (name, s) in structMap where !set.contains(name) {
+                if s.fields.count == 1, fieldShaped(s.fields[0].type) { set.insert(name); changed = true }
+            }
+        }
+        _shapedStructs = set
+        return set
+    }
+
+    // Whether `t` is a single-field shaped wrapper (above): its value is the 16-byte shaped representation.
+    func isShapedWrapper(_ t: Type) -> Bool {
+        if case .named(let n, .struct_) = t { return shapedStructs.contains(n) }
+        return false
+    }
     var enumMap: [String: NOIREnum] = [:]
     var enumTypes: [String: LLVMTypeRef] = [:]
     var classMap: [String: NOIRClass] = [:]
@@ -183,7 +218,6 @@ final class LLVMGen {
     var enumShapeInProgress: Set<String> = []
     var anyBoxMapId: UInt64?                      // one shared map for every `any I` box (payload at byte 16)
     var stringShapeMapId: UInt64?                 // one shared kind-2 shaped descriptor for every String (task 121/176)
-    var stringStorageMapId: UInt64?               // one shared kind-1 descriptor for the heap String buffer (task 176.2)
     var arrayHandleMapId: UInt64?                 // one shared type-id for every Array handle (bufptr at byte 16)
     var mailboxTypeId: UInt64?                    // one shared type-id for every mailbox object
 

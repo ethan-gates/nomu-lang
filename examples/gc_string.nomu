@@ -14,6 +14,18 @@ class Box {
   var v: Int
 }
 
+// Content fold over the String's bytes — reads back through the buffer (the GC-relocation check), summing
+// every byte so a stale or mis-scanned buffer diverges from the `-c nogc` baseline.
+fun strsum(s: String) -> Int {
+  var acc = 0
+  var i = 0
+  while i < s.count {
+    acc = acc + s.byte(at: i).int
+    i = i + 1
+  }
+  return acc
+}
+
 fun main() {
   var acc = ""
   var i = 0
@@ -27,7 +39,7 @@ fun main() {
       xs.append(Box(v: w))
       w = w + 1
     }
-    checksum = checksum + acc.hash   // read back through the (immortal) buffer; must survive the collection
+    checksum = checksum + strsum(acc)   // read back through the (immortal) buffer; must survive the collection
     i = i + 1
   }
   print(checksum)

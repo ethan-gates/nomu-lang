@@ -57,7 +57,10 @@ public func verifySSAIR(_ module: SSAModule) -> [String] {
     for a in module.aggregates where a.kind == .struct_ { structFields[a.name] = a.fields.map(\.type) }
     var enumCases: [String: [[Type]]] = [:]
     for e in module.enums { enumCases[e.name] = e.cases.map { $0.fields.map(\.type) } }
-    for f in module.functions { verifyFunction(f, structFields, enumCases, &errs) }
+    // Single-field shaped wrappers (task 121.1.1): treated as shaped values, so a `struct String` rides the
+    // shaped-root check below rather than the aggregate check — in lockstep with the egress shaped set.
+    let shapedStructs = computeShapedStructs(structFields)
+    for f in module.functions { verifyFunction(f, structFields, enumCases, shapedStructs, &errs) }
     return errs
 }
 
@@ -67,7 +70,7 @@ public func verifySSAIR(_ module: SSAModule) -> [String] {
 private func transitivelyContainsShaped(_ t: Type, _ structFields: [String: [Type]],
                                         _ enumCases: [String: [[Type]]], _ seen: inout Set<String>) -> Bool {
     switch t {
-    case .string: return true
+    case .stringBase: return true
     case .named(let n, .struct_):
         if !seen.insert(n).inserted { return false }
         return (structFields[n] ?? []).contains { transitivelyContainsShaped($0, structFields, enumCases, &seen) }
@@ -91,7 +94,8 @@ private func isManaged(_ t: Type) -> Bool {
 }
 
 private func verifyFunction(_ f: SSAFunction, _ structFields: [String: [Type]],
-                            _ enumCases: [String: [[Type]]], _ errs: inout [String]) {
+                            _ enumCases: [String: [[Type]]], _ shapedStructs: Set<String>,
+                            _ errs: inout [String]) {
     // Pass 1 — collect definitions (function params, block params, instruction results) and each
     // value id's type. I1: a redefinition at a different type, or a second definition of an id.
     var typeOf: [Int: Type] = [:]
@@ -230,13 +234,13 @@ private func verifyFunction(_ f: SSAFunction, _ structFields: [String: [Type]],
     // reaches the shaped sub-field through the value-layout descriptor. The second check below enforces the
     // precondition that makes that sound — a shaped-containing aggregate crossing a safepoint is a frame slot
     // (an address op), never a first-class SSA value the record path cannot reach.
-    let shaped = computeShapedLiveness(f)
+    let shaped = computeShapedLiveness(f, shapedStructs)
     func checkShapedRoot(_ id: Int, _ site: String) {
         guard let t = typeOf[id] else {
             errs.append("[\(f.name)] I11: shaped root %\(id) spans a safepoint (\(site)) but is undefined")
             return
         }
-        if !isShapedType(t) {
+        if !isShapedType(t, shapedStructs) {
             errs.append("[\(f.name)] I11: shaped root %\(id) spanning a safepoint (\(site)) is \(t), not a shaped value")
         }
     }
@@ -267,12 +271,12 @@ private func verifyFunction(_ f: SSAFunction, _ structFields: [String: [Type]],
             default: break
             }
             var seen = Set<String>()
-            if !isShapedType(r.type), transitivelyContainsShaped(r.type, structFields, enumCases, &seen) { aggTracked.insert(r.id) }
+            if !isShapedType(r.type, shapedStructs), transitivelyContainsShaped(r.type, structFields, enumCases, &seen) { aggTracked.insert(r.id) }
         }
     }
     for p in f.params {
         var seen = Set<String>()
-        if !isShapedType(p.type), transitivelyContainsShaped(p.type, structFields, enumCases, &seen) { aggTracked.insert(p.id) }
+        if !isShapedType(p.type, shapedStructs), transitivelyContainsShaped(p.type, structFields, enumCases, &seen) { aggTracked.insert(p.id) }
     }
     let agg = computeSlotLiveness(f, tracked: aggTracked)
     func checkAggRoot(_ id: Int, _ site: String) {

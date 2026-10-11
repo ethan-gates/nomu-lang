@@ -324,7 +324,7 @@ private final class Monomorphizer {
         case .uint64: return "UInt64"
         case .double: return "Double"
         case .bool: return "Bool"
-        case .string: return "String"
+        case .stringBase: return "String"
         case .void: return "Void"
         case .named(let n, _): return n
         case .generic(let b, let a): return b + "<" + a.map(typeKey).joined(separator: ",") + ">"

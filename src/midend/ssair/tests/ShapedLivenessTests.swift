@@ -18,7 +18,7 @@ final class ShapedLivenessTests: XCTestCase {
 
     // s0 = "hi"; call sideEffect(); s1 = concat(s0, s0); ret. s0 spans the sideEffect call.
     func testStringCrossesCall() {
-        let s0 = v(0, .string), s1 = v(1, .string)
+        let s0 = v(0, .stringBase), s1 = v(1, .stringBase)
         let bb0 = SSABlock(id: 0, params: [], insts: [
             SSAInst(result: s0, kind: .constString("hi"), span: sp),
             SSAInst(result: nil, kind: .call(call("sideEffect", [])), span: sp),           // inst 1: a safepoint
@@ -33,7 +33,7 @@ final class ShapedLivenessTests: XCTestCase {
 
     // s0 = "hi"; s1 = concat(s0, s0); ret — no safepoint spans s0 (both uses before any call completes).
     func testStringNeverCrossesSafepoint() {
-        let s0 = v(0, .string), s1 = v(1, .string)
+        let s0 = v(0, .stringBase), s1 = v(1, .stringBase)
         let bb0 = SSABlock(id: 0, params: [], insts: [
             SSAInst(result: s0, kind: .constString("hi"), span: sp),
             SSAInst(result: s1, kind: .call(call("concat", [s0, s0])), span: sp),
@@ -47,11 +47,11 @@ final class ShapedLivenessTests: XCTestCase {
     // A loop-carried String (a block param reached by a back-edge) is live at the loop header, so it
     // crosses the loop-header poll: acc is the header's param, rebuilt and carried on the back-edge.
     func testLoopCarriedStringLiveAtHeader() {
-        let acc = v(0, .string)       // header block param
-        let acc2 = v(1, .string)      // rebuilt in the body
+        let acc = v(0, .stringBase)       // header block param
+        let acc2 = v(1, .stringBase)      // rebuilt in the body
         let cond = v(2, .bool)
         // bb0: entry -> br header(initial "")
-        let initStr = v(3, .string)
+        let initStr = v(3, .stringBase)
         let bb0 = SSABlock(id: 0, params: [], insts: [
             SSAInst(result: initStr, kind: .constString(""), span: sp),
         ], terminator: SSATerm(kind: .br(target: 1, args: [initStr]), span: sp))
@@ -72,5 +72,43 @@ final class ShapedLivenessTests: XCTestCase {
         // the header poll and the `more()` call in the header.
         XCTAssertTrue(live.liveInBlock[1]!.contains(acc.id), "loop-carried acc is live at the header")
         XCTAssertTrue(live.liveOutInst[1]![0].contains(acc.id), "acc spans the header-block call")
+    }
+
+    // The single-field-wrapper-is-shaped rule (task 121.1.1): a struct with exactly one stored field that is
+    // shaped is itself shaped, so `struct String { let base: StringBase }` inherits `StringBase`'s treatment.
+    func testComputeShapedStructsWrapperRule() {
+        // String wraps StringBase; Wrapped wraps String (fixpoint reaches it); Pair and Empty are not wrappers.
+        let fields: [String: [Type]] = [
+            "String":  [.stringBase],
+            "Wrapped": [.named("String", .struct_)],
+            "Pair":    [.named("String", .struct_), .int],
+            "Empty":   [],
+            "IntBox":  [.int],
+        ]
+        let set = computeShapedStructs(fields)
+        XCTAssertTrue(set.contains("String"), "a single StringBase field is a shaped wrapper")
+        XCTAssertTrue(set.contains("Wrapped"), "a wrapper over a wrapper is shaped (fixpoint)")
+        XCTAssertFalse(set.contains("Pair"), "a multi-field struct is an aggregate, not a wrapper")
+        XCTAssertFalse(set.contains("Empty"), "a zero-field struct is not a wrapper")
+        XCTAssertFalse(set.contains("IntBox"), "a single non-shaped field is not a wrapper")
+    }
+
+    // A wrapper-typed value is tracked by shaped liveness only when the wrapper set is supplied; with the
+    // default empty set the predicate stays at its StringBase-only base case (pre-wrapper behavior intact).
+    func testWrapperValueCrossesCallOnlyWithSet() {
+        let strTy = Type.named("String", .struct_)
+        let s0 = v(0, strTy), s1 = v(1, strTy)
+        let bb0 = SSABlock(id: 0, params: [], insts: [
+            SSAInst(result: s0, kind: .makeStruct(strTy, fields: [v(2, .stringBase)]), span: sp),
+            SSAInst(result: nil, kind: .call(call("sideEffect", [])), span: sp),             // inst 1: a safepoint
+            SSAInst(result: s1, kind: .call(call("use", [s0])), span: sp),                    // inst 2: uses s0
+        ], terminator: SSATerm(kind: .ret(nil), span: sp))
+
+        let wrappers = computeShapedStructs(["String": [.stringBase]])
+        let withSet = computeShapedLiveness(fn([bb0]), wrappers)
+        XCTAssertTrue(withSet.liveOutInst[0]![1].contains(s0.id), "the wrapper value crosses the call when recognized as shaped")
+
+        let noSet = computeShapedLiveness(fn([bb0]))
+        XCTAssertFalse(noSet.liveOutInst[0]![1].contains(s0.id), "with no wrapper set the value is not shaped (default base case)")
     }
 }

@@ -10,5 +10,5 @@ fun main() {
     print(greeting)
     print(concat("length test: ", "abc"))
 
-    print("world".hash)
+    print("world".count)
 }

@@ -19,9 +19,40 @@ public struct ShapedLiveness {
     public let liveOutInst: [Int: [Set<Int>]]
 }
 
-public func isShapedType(_ t: Type) -> Bool {
-    if case .string = t { return true }
-    return false
+// A *shaped* type is one whose value is the 16-byte bit-stealing shaped representation — `StringBase`, or a
+// **single-field struct that wraps a shaped value** (task 121.1.1). A single-field wrapper is
+// representationally identical to its field (one field at offset 0, the same 16 bytes, two registers), so it
+// is itself shaped: it rides the shaped-root path and takes the kind-2 descriptor directly, rather than the
+// frame-slot aggregate path a multi-field shaped-containing struct takes (task 176.3a). This is how
+// `struct String { let base: StringBase }` inherits `StringBase`'s treatment with no String-specific code; the
+// rule generalizes to any newtype over a shaped value. `shapedStructs` is the precomputed set of such wrapper
+// names (`computeShapedStructs`); it is empty when there is no struct context (the low-level liveness tests),
+// which leaves the predicate at its `StringBase`-only base case.
+public func isShapedType(_ t: Type, _ shapedStructs: Set<String> = []) -> Bool {
+    switch t {
+    case .stringBase:                 return true
+    case .named(let n, .struct_):     return shapedStructs.contains(n)
+    default:                          return false
+    }
+}
+
+// The single-field-shaped-wrapper set over a module's struct layouts: every struct with exactly one stored
+// field whose type is shaped (a `StringBase`, or itself such a wrapper). A fixpoint so a wrapper-over-a-wrapper
+// is included; iteration count is bounded by the struct count. A struct with zero or several stored fields is
+// never a wrapper (a multi-field struct holding a shaped field rides the aggregate path, task 176.3a).
+public func computeShapedStructs(_ structFields: [String: [Type]]) -> Set<String> {
+    var set = Set<String>()
+    var changed = true
+    while changed {
+        changed = false
+        for (name, fields) in structFields where !set.contains(name) {
+            if fields.count == 1, isShapedType(fields[0], set) {
+                set.insert(name)
+                changed = true
+            }
+        }
+    }
+    return set
 }
 
 // Liveness of a given set of SSA value ids — used for shaped-containing value-aggregate *slots* (task 176.3a):
@@ -86,8 +117,8 @@ public func isSafepointInst(_ k: SSAInstKind) -> Bool {
 }
 
 // The shaped-typed SSA value operands (uses) of an instruction.
-private func shapedUses(_ kind: SSAInstKind) -> [SSAValue] {
-    func s(_ vs: SSAValue...) -> [SSAValue] { vs.filter { isShapedType($0.type) } }
+private func shapedUses(_ kind: SSAInstKind, _ shapedStructs: Set<String>) -> [SSAValue] {
+    func s(_ vs: SSAValue...) -> [SSAValue] { vs.filter { isShapedType($0.type, shapedStructs) } }
     switch kind {
     case .constInt, .constDouble, .constBool, .constString,
          .alloc, .stackAlloc, .spawnJoin, .funcAddr:
@@ -104,33 +135,33 @@ private func shapedUses(_ kind: SSAInstKind) -> [SSAValue] {
         var vs = c.args
         if case .witness(let receiver, _, _) = c.kind { vs.append(receiver) }
         if case .indirect(let callee) = c.kind { vs.append(callee) }
-        return vs.filter { isShapedType($0.type) }
+        return vs.filter { isShapedType($0.type, shapedStructs) }
     case .mailboxInit(let a):                      return s(a)
-    case .actorSend(let receiver, _, let args):   return (args + [receiver]).filter { isShapedType($0.type) }
-    case .spawn(_, _, let env, _):                return [env].compactMap { $0 }.filter { isShapedType($0.type) }
-    case .makeStruct(_, let fields):              return fields.filter { isShapedType($0.type) }
-    case .makeEnum(_, _, let fields):             return fields.filter { isShapedType($0.type) }
+    case .actorSend(let receiver, _, let args):   return (args + [receiver]).filter { isShapedType($0.type, shapedStructs) }
+    case .spawn(_, _, let env, _):                return [env].compactMap { $0 }.filter { isShapedType($0.type, shapedStructs) }
+    case .makeStruct(_, let fields):              return fields.filter { isShapedType($0.type, shapedStructs) }
+    case .makeEnum(_, _, let fields):             return fields.filter { isShapedType($0.type, shapedStructs) }
     case .extractField(let base, _):              return s(base)
     case .enumTag(let a):                          return s(a)
     case .extractPayload(let base, _, _):         return s(base)
     case .box(let value, _, _):                   return s(value)
-    case .arrayLit(let elements, _):              return elements.filter { isShapedType($0.type) }
-    case .makeClosure(_, let env, _):             return [env].compactMap { $0 }.filter { isShapedType($0.type) }
+    case .arrayLit(let elements, _):              return elements.filter { isShapedType($0.type, shapedStructs) }
+    case .makeClosure(_, let env, _):             return [env].compactMap { $0 }.filter { isShapedType($0.type, shapedStructs) }
     }
 }
 
-private func shapedUses(_ term: SSATermKind) -> [SSAValue] {
+private func shapedUses(_ term: SSATermKind, _ shapedStructs: Set<String>) -> [SSAValue] {
     switch term {
     case .br(_, let args):
-        return args.filter { isShapedType($0.type) }
+        return args.filter { isShapedType($0.type, shapedStructs) }
     case .condBr(let cond, _, let thenArgs, _, let elseArgs):
-        return ([cond] + thenArgs + elseArgs).filter { isShapedType($0.type) }
+        return ([cond] + thenArgs + elseArgs).filter { isShapedType($0.type, shapedStructs) }
     case .switchOn(let scrutinee, let cases, _, let defaultArgs):
         var vs = [scrutinee] + defaultArgs
         for c in cases { vs += c.args }
-        return vs.filter { isShapedType($0.type) }
+        return vs.filter { isShapedType($0.type, shapedStructs) }
     case .ret(let v):
-        return v.flatMap { isShapedType($0.type) ? [$0] : [] } ?? []
+        return v.flatMap { isShapedType($0.type, shapedStructs) ? [$0] : [] } ?? []
     case .unreachable:
         return []
     }
@@ -146,7 +177,9 @@ private func termSuccessors(_ term: SSATermKind) -> [Int] {
 }
 
 // Backward dataflow to a fixpoint. Shaped values only; ids are enough for the consumer to key on.
-public func computeShapedLiveness(_ f: SSAFunction) -> ShapedLiveness {
+// `shapedStructs` (default empty) extends the shaped set to single-field shaped wrappers (task 121.1.1); with
+// it empty the tracked set is `StringBase` values alone, matching the pre-wrapper behavior exactly.
+public func computeShapedLiveness(_ f: SSAFunction, _ shapedStructs: Set<String> = []) -> ShapedLiveness {
     // `prop` is the live-in propagated to predecessors (block params removed — a param is defined by the
     // incoming edge, not live-in). `entry` is live-at-entry *including* live params — the poll record set.
     var prop: [Int: Set<Int>] = [:]
@@ -161,19 +194,19 @@ public func computeShapedLiveness(_ f: SSAFunction) -> ShapedLiveness {
         for b in f.blocks.reversed() {
             var cur = Set<Int>()
             for s in termSuccessors(b.terminator.kind) { cur.formUnion(prop[s] ?? []) }
-            cur.formUnion(shapedUses(b.terminator.kind).map(\.id))
+            cur.formUnion(shapedUses(b.terminator.kind, shapedStructs).map(\.id))
 
             var perInst = [Set<Int>](repeating: [], count: b.insts.count)
             for i in b.insts.indices.reversed() {
                 perInst[i] = cur                      // live immediately after inst i
-                if let r = b.insts[i].result, isShapedType(r.type) { cur.remove(r.id) }
-                cur.formUnion(shapedUses(b.insts[i].kind).map(\.id))
+                if let r = b.insts[i].result, isShapedType(r.type, shapedStructs) { cur.remove(r.id) }
+                cur.formUnion(shapedUses(b.insts[i].kind, shapedStructs).map(\.id))
             }
             liveOutInst[b.id] = perInst
             entry[b.id] = cur                         // includes live params (the loop-header poll set)
 
             var p = cur
-            for bp in b.params where isShapedType(bp.type) { p.remove(bp.id) }
+            for bp in b.params where isShapedType(bp.type, shapedStructs) { p.remove(bp.id) }
             if p != prop[b.id] {
                 prop[b.id] = p
                 changed = true

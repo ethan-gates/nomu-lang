@@ -158,21 +158,11 @@ extension LLVMGen {
         return id
     }
 
-    // The type-id for the heap `String` byte buffer: a `ManagedBuffer<EmptyHeader, UInt8>` (task 180.4) —
-    // `headerSize = 0`, stride 1 (byte elements), no managed pointers in the element (a GC leaf). `cap`
-    // (byte count) at offset 8 sizes it for copy/scan, the bytes follow at offset 16. A `heap` String's
-    // `word0` points at this object's base; the collector relocates it like any managed buffer. Concat
-    // (lowered in `EgressBuiltins`) stamps this type-id — read from the compiler-emitted
-    // `__nomu_stringstorage_typeid` global — into the storage header. Routing through `managedBufferTypeId`
-    // collapses the former ad-hoc `stringstorage` descriptor onto the shared buffer-descriptor path; the
-    // layout is byte-identical, so the C floor (`rt_str_fill` / concat) is unchanged. 121 later re-keys the
-    // header from `EmptyHeader` to a `StringHeader` carrying the isASCII / scalar-count cache.
-    func stringStorageTypeId() -> UInt64 {
-        if let id = stringStorageMapId { return id }
-        let id = managedBufferTypeId(header: .named("EmptyHeader", .struct_), element: .uint8)
-        stringStorageMapId = id
-        return id
-    }
+    // The heap `String` byte buffer is a `ManagedBuffer<EmptyHeader, UInt8>` (task 180.4) — `headerSize = 0`,
+    // stride 1 (byte elements), a GC leaf (no managed pointers in the element). Its type-id comes from the
+    // shared `managedBufferTypeId(EmptyHeader, UInt8)` (no String-specific descriptor); `__stringAllocHeap`
+    // stamps that id's header word via `emitManagedBufferAlloc`, and the Nomu `concat` fills the bytes. 121
+    // later re-keys the header `EmptyHeader` → a `StringHeader` carrying the isASCII / scalar-count cache.
 
     // Shared type-id for every `any I` box `{ header, witness, payload }`: scan `payload` only.
     func anyBoxTypeId() -> UInt64 {
@@ -286,7 +276,12 @@ extension LLVMGen {
     // i32 constant the stackmap can hold; the descriptor's section offset (a link-time value it cannot hold)
     // lives in the table.
     func shapeOrdinal(_ t: Type) -> Int32 {
-        if case .string = t { return 0 }
+        if case .stringBase = t { return 0 }
+        // A single-field shaped wrapper takes its field's ordinal (task 121.1.1): `struct String` is shaped
+        // ordinal 0, the string kind-2 descriptor, exactly like the `StringBase` it wraps.
+        if isShapedWrapper(t), case .named(let n, .struct_) = t, let f = structMap[n]?.fields.first {
+            return shapeOrdinal(f.type)
+        }
         let key = t.description
         if let o = shapeOrdinalForType[key] { return o }
         // An enum value's shape is its kind-2 descriptor (discriminant-conditional); any other aggregate uses
@@ -339,7 +334,7 @@ extension LLVMGen {
         switch t {
         case .named(_, .class_), .named(_, .actor_), .function, .existential, .composition, .array:
             offsets.append(Int32(baseSlot * 8))
-        case .string:
+        case .stringBase:
             shaped.append((Int32(baseSlot * 8), stringShapeId()))
         case .named(let n, .struct_):
             var s = baseSlot
@@ -369,7 +364,7 @@ extension LLVMGen {
     // short-circuits to `true`), so the recursion is bounded.
     func enumHasManagedOrShaped(_ t: Type) -> Bool {
         switch t {
-        case .string, .named(_, .class_), .named(_, .actor_), .function, .existential, .composition, .array:
+        case .stringBase, .named(_, .class_), .named(_, .actor_), .function, .existential, .composition, .array:
             return true
         case .named(let n, .struct_):
             return (structMap[n]?.fields ?? []).contains { enumHasManagedOrShaped($0.type) }

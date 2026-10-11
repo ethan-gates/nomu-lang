@@ -13,6 +13,30 @@ import support
 // with `&s`.
 enum NOIRGen {
 
+    // MARK: - String surface (task 121)
+
+    // The surface `String` type — the Nomu struct (core.nomu) wrapping the `StringBase` primitive.
+    static let stringType: Type = .named("String", .struct_)
+
+    // The `StringBase` value the compiler-recognized byte-layer ops (`__string_*`, `print`, `concat`) consume.
+    // A surface `String` is unwrapped to its `.base` field; a bare `StringBase` and any non-string pass through
+    // unchanged. The unwrap is a single-field-wrapper field read, which the egress lowers to identity (the
+    // wrapper and its field share the 16-byte `strTy` representation), so this is a type-level adapter with no
+    // runtime cost.
+    static func asStringBase(_ e: NOIRExpr) -> NOIRExpr {
+        if case .named("String", .struct_) = e.type {
+            return NOIRExpr(type: .stringBase, span: e.span, kind: .fieldAccess(base: e, field: "base"))
+        }
+        return e
+    }
+
+    // A `StringBase` value wrapped back into a surface `String` (the inverse of `asStringBase`) — for the
+    // results of builtins that produce a raw `StringBase` (`concat`, a string literal, `readLine`).
+    static func wrapString(_ e: NOIRExpr) -> NOIRExpr {
+        NOIRExpr(type: stringType, span: e.span,
+                 kind: .construct(typeName: "String", args: [NOIRArg(label: "base", value: e)]))
+    }
+
     // MARK: - Statements
 
     static func lowerBlock(_ s: inout Sema, _ block: Block) -> [NOIRStmt] {
@@ -362,7 +386,11 @@ enum NOIRGen {
             return NOIRExpr(type: .int,    span: span, kind: .intLit(v))
         case .doubleLit(let v, let span): return NOIRExpr(type: .double, span: span, kind: .doubleLit(v))
         case .boolLit(let v, let span):   return NOIRExpr(type: .bool,   span: span, kind: .boolLit(v))
-        case .stringLit(let v, let span): return NOIRExpr(type: .string, span: span, kind: .stringLit(v))
+        case .stringLit(let v, let span):
+            // A literal is an `immortal` `StringBase` (built in codegen — `fromStaticUTF8`, no runtime call)
+            // wrapped into the surface `String` struct (task 121). The wrap lowers to identity in the egress —
+            // `String` and `StringBase` share `strTy`.
+            return wrapString(NOIRExpr(type: .stringBase, span: span, kind: .stringLit(v)))
 
         case .ident(let name, let span):
             if let t = s.lookup(name) {
@@ -454,16 +482,12 @@ enum NOIRGen {
                 return BuiltinsSema.member("__uint64_uint8_uint8", b, span)
             }
 
-            // String property builtins (`str.hash`, `str.count`, `str.isEmpty`). Method builtins with
-            // arguments (`str.eq(x)`, `str.byte(at:)`) are handled in checkCall.
-            if b.type == .string, field == "hash" {
-                return BuiltinsSema.member("__string_hash_int", b, span)
-            }
-            if b.type == .string, field == "count" {
+            // String surface properties. `count` and `isEmpty` are Nomu computed properties on the `String`
+            // struct (core.nomu) over the `StringBase` `count` op (`isEmpty` is `self.base.count == 0`), so for
+            // a surface `String` they resolve through the computed-property path below. Only a bare `StringBase`
+            // reaches a builtin gate here, and `count` is the one it needs (via `self.base.count`); task 121.1.4.
+            if case .stringBase = b.type, field == "count" {
                 return BuiltinsSema.member("__string_count_int", b, span)
-            }
-            if b.type == .string, field == "isEmpty" {
-                return BuiltinsSema.member("__string_isempty_bool", b, span)
             }
             // Array<T> builtin members (M6 stdlib). `count` is the element count; lowered to a builtin
             // call codegen recognizes by name (element type comes from the receiver's `.array` type).
@@ -628,6 +652,37 @@ enum NOIRGen {
             }
             return ManagedBufferIntrinsics.checkStatic(&s, header: gen[0], element: gen[1], method, args, span)
         }
+        // `StringBase.allocHeap(count)` (task 121.1.3) — a fresh `heap` StringBase backed by a managed byte
+        // buffer (a `ManagedBuffer<EmptyHeader, UInt8>`). The producer op the Nomu `concat` builds on.
+        if case .member(let base, let method, _) = callee,
+           let (tn, _) = s.typeNameAndArgs(base), s.lookup(tn) == nil, tn == "StringBase", method == "allocHeap" {
+            guard args.count == 1 else {
+                s.diags.error("StringBase.allocHeap expects one argument (the byte count)", at: span)
+                return NOIRExpr(type: .stringBase, span: span, kind: .intLit(0))
+            }
+            let n = checkExpr(&s, args[0].value, expected: .int)
+            if n.type != .int, n.type != .error {
+                s.diags.error("StringBase.allocHeap expects an Int byte count, got '\(n.type)'", at: n.span)
+            }
+            let c = NOIRExpr(type: .void, span: span, kind: .varRef("__stringAllocHeap"))
+            return NOIRExpr(type: .stringBase, span: span,
+                            kind: .call(callee: c, args: [NOIRArg(label: nil, value: n)], typeArgs: []))
+        }
+        // `StringBase.smallConcat(a, b)` (task 121.2) — build a `small` StringBase inline from two sources, the
+        // ≤ 15-byte `concat` result (concat guards the size). No allocation; the result carries the `small` tag.
+        if case .member(let base, let method, _) = callee,
+           let (tn, _) = s.typeNameAndArgs(base), s.lookup(tn) == nil, tn == "StringBase", method == "smallConcat" {
+            guard args.count == 2 else {
+                s.diags.error("StringBase.smallConcat expects two StringBase arguments", at: span)
+                return NOIRExpr(type: .stringBase, span: span, kind: .intLit(0))
+            }
+            let a0 = checkExpr(&s, args[0].value)
+            let a1 = checkExpr(&s, args[1].value)
+            let c = NOIRExpr(type: .void, span: span, kind: .varRef("__stringSmallConcat"))
+            return NOIRExpr(type: .stringBase, span: span,
+                            kind: .call(callee: c, args: [NOIRArg(label: nil, value: a0),
+                                                          NOIRArg(label: nil, value: a1)], typeArgs: []))
+        }
         // Qualified enum construction: `EnumType.case(args)` or `EnumType<Args>.case(args)`. A
         // `static fun` of the same enum takes precedence over case construction for that name.
         if case .member(let base, let caseName, _) = callee,
@@ -764,48 +819,13 @@ enum NOIRGen {
             if case .ptr(let elem) = recv.type {
                 return PointerIntrinsics.checkPtrMethod(&s, recv, elem, name, args, span)
             }
-            // String method builtins. `eq(other)` is byte equality (there is no `==` on String yet).
-            if recv.type == .string {
-                switch name {
-                case "eq":
-                    guard args.count == 1 else {
-                        s.diags.error("String.eq expects 1 argument, got \(args.count)", at: span)
-                        return NOIRExpr(type: .error, span: span, kind: .boolLit(false))
-                    }
-                    let rhs = checkExpr(&s, args[0].value)
-                    if rhs.type != .string && rhs.type != .error {
-                        s.diags.error("String.eq expects a String argument, got '\(rhs.type)'", at: rhs.span)
-                    }
-                    return BuiltinsSema.method("__string_eq_bool_string", recv, [rhs], span)
-                case "lt":
-                    // `lt(other) -> Bool` — lexicographic ordering (`<` as a method until operators land).
-                    guard args.count == 1 else {
-                        s.diags.error("String.lt expects 1 argument, got \(args.count)", at: span)
-                        return NOIRExpr(type: .error, span: span, kind: .boolLit(false))
-                    }
-                    let rhs = checkExpr(&s, args[0].value)
-                    if rhs.type != .string && rhs.type != .error {
-                        s.diags.error("String.lt expects a String argument, got '\(rhs.type)'", at: rhs.span)
-                    }
-                    return BuiltinsSema.method("__string_lt_bool_string", recv, [rhs], span)
-                case "byte":
-                    // `byte(at: i) -> UInt8` — the bounds-checked byte read (task 121.1.4 byte layer).
-                    guard args.count == 1 else {
-                        s.diags.error("String.byte expects 1 argument, got \(args.count)", at: span)
-                        return NOIRExpr(type: .error, span: span, kind: .intLit(0))
-                    }
-                    if let l = args[0].label, l != "at" {
-                        s.diags.error("String.byte argument label must be 'at:', got '\(l):'", at: span)
-                    }
-                    let idx = checkExpr(&s, args[0].value)
-                    if idx.type != .int && idx.type != .error {
-                        s.diags.error("String.byte(at:) expects an Int index, got '\(idx.type)'", at: idx.span)
-                    }
-                    return BuiltinsSema.method("__string_byteat_uint8_int", recv, [idx], span)
-                default:
-                    s.diags.error("value of type 'String' has no method '\(name)'", at: span)
-                    return NOIRExpr(type: .error, span: span, kind: .boolLit(false))
-                }
+            // String byte-layer builtins (task 121). `bytePointer()` is the internal `StringBase` byte-address
+            // op the Nomu byte layer reads through (StringBase only). The surface byte layer — `byte(at:)`,
+            // `eq`, `lt`, `count`, `isEmpty` — is Nomu on the `String` struct (core.nomu) written over
+            // `bytePointer`/`count`, so it is resolved through ordinary struct dispatch below, not intercepted
+            // here (task 121.1.4).
+            if case .stringBase = recv.type, name == "bytePointer" {
+                return BuiltinsSema.method("__string_bytepointer_rawptr", recv, [], span)
             }
             // A method-requirement call through `any I` / `any A & B` — dispatched via the
             // witness slot (including requirements inherited by refinement, M5 A1.5).
@@ -890,7 +910,9 @@ enum NOIRGen {
         if case .ident(let name, _) = callee {
             // print — accepts zero or one arg of any printable type.
             if name == "print" {
-                let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr(&s, $0.value)) }
+                // A `String` arg is unwrapped to its `StringBase` so the `print` builtin's string path reads
+                // the 16-byte value directly (task 121); other printable types pass through.
+                let irArgs = args.map { NOIRArg(label: $0.label, value: asStringBase(checkExpr(&s, $0.value))) }
                 return NOIRExpr(type: .void, span: span, kind: .call(callee: irVar(name, .void, span), args: irArgs, typeArgs: []))
             }
 

@@ -95,7 +95,7 @@ final class SSAIRVerifyTests: XCTestCase {
     // I11 — a shaped (`String`) value live across a safepoint is a well-formed shaped root. A String param
     // held live across a call (used again after it) is the legitimate shaped-root case: it must pass clean.
     func testShapedValueAcrossCallPassesClean() {
-        let str = v(0, .string)
+        let str = v(0, .stringBase)
         let r1 = v(1, .int)
         let bb = SSABlock(id: 0, params: [], insts: [
             SSAInst(result: r1, kind: .call(SSACall(kind: .direct("g"), args: [])), span: sp),   // safepoint
@@ -110,7 +110,7 @@ final class SSAIRVerifyTests: XCTestCase {
         let r0 = v(0, .int)
         let bb = SSABlock(id: 0, params: [], insts: [
             SSAInst(result: r0, kind: .call(SSACall(kind: .direct("g"), args: [])), span: sp),          // safepoint
-            SSAInst(result: nil, kind: .call(SSACall(kind: .direct("h"), args: [v(99, .string)])), span: sp),  // %99 undefined, spans g
+            SSAInst(result: nil, kind: .call(SSACall(kind: .direct("h"), args: [v(99, .stringBase)])), span: sp),  // %99 undefined, spans g
         ], terminator: SSATerm(kind: .ret(nil), span: sp))
         let errs = verifySSAIR(fn("f", ret: .void, params: [], [bb]))
         XCTAssertTrue(errs.contains { $0.contains("I11") && $0.contains("%99") }, "\(errs)")
@@ -119,7 +119,7 @@ final class SSAIRVerifyTests: XCTestCase {
     // The `Pair { s: String; n: Int }` aggregate the I11a cases below reference.
     private var pairAggregate: SSAAggregate {
         SSAAggregate(name: "Pair", kind: .struct_,
-                     fields: [SSAField(name: "s", type: .string, isMutable: false),
+                     fields: [SSAField(name: "s", type: .stringBase, isMutable: false),
                               SSAField(name: "n", type: .int, isMutable: false)], span: sp)
     }
     private func fnAgg(_ f: SSAFunction, _ aggs: [SSAAggregate]) -> SSAModule {
@@ -144,7 +144,7 @@ final class SSAIRVerifyTests: XCTestCase {
     // `makeStruct` result, not a slot) has no record path and leaves its shaped buffer un-relocated; caught.
     func testUnrootedShapedAggregateCaught() {
         let pair = Type.named("Pair", .struct_)
-        let str = v(0, .string), n = v(1, .int), p = v(2, pair), r = v(3, .int)
+        let str = v(0, .stringBase), n = v(1, .int), p = v(2, pair), r = v(3, .int)
         let bb = SSABlock(id: 0, params: [str, n], insts: [
             SSAInst(result: p, kind: .makeStruct(pair, fields: [str, n]), span: sp),             // first-class aggregate
             SSAInst(result: r, kind: .call(SSACall(kind: .direct("g"), args: [])), span: sp),     // safepoint
@@ -158,14 +158,14 @@ final class SSAIRVerifyTests: XCTestCase {
     // `makeEnum` value, rather than a frame slot, is caught — same rooting precondition as the struct case.
     func testUnrootedShapedEnumCaught() {
         let opt = Type.named("Opt", .enum_)
-        let str = v(0, .string), o = v(1, opt), r = v(2, .int)
+        let str = v(0, .stringBase), o = v(1, opt), r = v(2, .int)
         let bb = SSABlock(id: 0, params: [str], insts: [
             SSAInst(result: o, kind: .makeEnum(opt, caseIndex: 0, fields: [str]), span: sp),        // first-class enum value
             SSAInst(result: r, kind: .call(SSACall(kind: .direct("g"), args: [])), span: sp),       // safepoint
             SSAInst(result: nil, kind: .call(SSACall(kind: .direct("h"), args: [o])), span: sp),    // uses o after
         ], terminator: SSATerm(kind: .ret(nil), span: sp))
         let optEnum = SSAEnum(name: "Opt", cases: [
-            SSAEnumCase(name: "some", fields: [SSAField(name: "value", type: .string, isMutable: false)], span: sp),
+            SSAEnumCase(name: "some", fields: [SSAField(name: "value", type: .stringBase, isMutable: false)], span: sp),
             SSAEnumCase(name: "none", fields: [], span: sp),
         ], span: sp)
         let m = SSAModule(functions: [SSAFunction(name: "f", params: [str], returnType: .void, blocks: [bb], isMutating: false, span: sp)],

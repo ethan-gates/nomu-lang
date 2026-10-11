@@ -1,10 +1,24 @@
 # String / UTF-8 model
 
 **Avenue:** Usability · **Type/Lifecycle:** `language-feature · stdlib` · **Size:** L ·
-**Status:** designed — permanent contract + `StringBase`/`String` layering settled (see *Type layering*);
-[176 shaped GC roots](176-shaped-gc-roots.md) is **done** (heap-String relocation validated end-to-end on
-both collectors), so the build is unblocked. · **Source:** deferred.md (stdlib track); pulled forward
-because a hand-written parser ([163 manifest/YAML](163-manifest-yaml.md)) needs a real `String`.
+**Status:** **121.1 + 121.2 (SSO) complete** — green (suite 133/133, incl. the `module_generic_string`
+cross-module relocation leg). `String` is a Nomu struct **off the C floor**: the surface is Nomu
+(`count`/`isEmpty` computed properties, `eq`/`lt`/`byte(at:)` methods, `concat`) and all four `StringBase` ops
+are codegen — `fromStaticUTF8` (literals, `lowerStringLit`), `allocHeap` (`__stringAllocHeap` through the
+shared `emitManagedBufferAlloc`), `count`/`bytePointer` (`strLen`/`strPtr`). The heap buffer is a
+`ManagedBuffer<EmptyHeader, UInt8>` on the one shared tail-alloc path; the bespoke `stringStorageTypeId` /
+`__nomu_stringstorage_typeid` are retired. No String function remains in C; `rt_read_line` (I/O) is the only C
+String constructor, via the `nomu_str_make` inline helper. **121.2 (SSO):** all three tags live — short
+literals (≤15 B) and short `concat` results are `small` (inline, no allocation), longer ones `immortal`/`heap`;
+`strLen`/`strPtr` are tag-aware, and a `small` value's inline bytes are materialized to a per-call stack slot
+when a byte pointer is needed (the small/heap/immortal split is invisible above `StringBase`). Representation
+is chosen by **result size** — small→heap graduation is upward-only, no heap→small demotion (see *Representation*).
+[176 shaped GC roots](176-shaped-gc-roots.md) is **done** including 176.3 frame-root placement.
+`byte(at:)` is an unchecked load today; the bounds-checked form (a `precondition` primitive + analysis-based
+removal) is [183 precondition / bounds checks](183-precondition-bounds-checks.md). **Next:** 121.3
+`UnicodeScalarView` → 121.4 compiler-inferred COW → 121.5 grapheme view. · **Source:**
+deferred.md (stdlib track); pulled forward because a hand-written parser
+([163 manifest/YAML](163-manifest-yaml.md)) needs a real `String`.
 
 ## Goal
 
@@ -74,7 +88,16 @@ byte (byte 15 — the top byte of `word1`)**, matching Swift's small-string layo
 contiguous from offset 0. Three cases share the 16 bytes:
 
 - **`small`** — SSO. Up to **15 inline UTF-8 bytes** sit **contiguous at offsets 0–14**; byte 15 carries the
-  discriminant plus the inline count (0–15). `withBytes` hands out a pointer to offset 0. Zero allocation.
+  discriminant plus the inline count (0–15). Zero allocation. Reading a byte pointer from a `small` value
+  materializes the 16 bytes to a stack slot (no persistent address exists); the byte layer's uses are
+  immediate, so the slot is live for them. **Built (121.2).**
+
+**Representation is chosen by result size (graduation, upward-only).** Each operation sizes its *fresh* value:
+a result ≤ 15 bytes is `small`, a larger one is `heap` (or a long literal is `immortal`). So a string
+*graduates* `small → heap` invisibly as it grows past 15 bytes, and the reverse (`heap → small` demotion)
+never occurs — it cannot arise from `concat` (a `heap` input is always > 15 bytes, so any result containing it
+is > 15), and no operation re-inlines `heap` content into `small`. When slicing/`Substring` lands, a ≤15-byte
+slice of a `heap` string stays heap-backed (shares the parent buffer) rather than demoting — same rule.
 - **`immortal`** — `word0` holds a clean pointer to a static UTF-8 buffer; `word1`'s bytes 8–14 carry the
   count, byte 15 the tag. **String literals land here**: no alloc, no copy, no free — the one good property
   the builtin has, kept.
@@ -192,6 +215,108 @@ remaining 121.1 work restructures that into the settled **`StringBase` (internal
     primitive carrying the 16-byte shaped value and the four ops (`fromStaticUTF8`, `allocHeap`, `count`,
     `bytePointer`); re-key the `kind 2` descriptor (`stringShapeId`) and the shaped-root homing from the
     synthetic builtin to it; add the *single-field-wrapper-is-shaped* rule so `String` inherits the shape.
+    **In progress:**
+    - *Rename (done + green).* The internal Type case `.string` is now `.stringBase` across the compiler
+      (frontend/sema, midend, llvmgen); the shaped machinery (`stringShapeId`, `isShapedType`,
+      `transitivelyContainsShaped`) keys on it. The source name `String` still resolves to `.stringBase` and
+      displays as `"String"` through the interim; the surface name re-points to the Nomu struct at 121.1.5.
+      Full suite 133/133.
+    - *Wrapper rule — built + unit-tested + activated (done + green).* `isShapedType` gained a
+      single-field-shaped-wrapper case and a `computeShapedStructs` fixpoint (a struct with exactly one stored
+      field that is shaped is itself shaped), threaded through `computeShapedLiveness`; unit-tested in
+      `ShapedLivenessTests`. **Activated** in the egress and verifier: the egress collapses a shaped wrapper's
+      LLVM type to its field's (`structType` → `strTy`, not `{ strTy }`), lowers `makeStruct`/`extractField`
+      on it as identity, keys `shapeOrdinal` to the inner ordinal (String = 0), and tracks/homes a wrapper
+      value as a two-register shaped SSA value; `verifySSAIR` routes a wrapper through the shaped-root check.
+      The collapse is ABI-identical, so the existing single-`String`-field structs (`Circle`, `Square`,
+      `Person`) move from the aggregate frame-slot path to the shaped-SSA path with the full suite green
+      (133/133), including the interface/`any`-boxing fixtures and every String-GC `-evac` leg.
+    - *Nomu `struct String` — done + green.* `struct String { let base: StringBase }` declared in core.nomu;
+      the Sema resolver repoints `String` to the struct and names `StringBase` → `.stringBase` for the one
+      field. A literal lowers to an `immortal` `StringBase` wrapped in the struct (`wrapString`); the byte-layer
+      surface (`count`/`isEmpty`/`hash` properties, `eq`/`lt`/`byte(at:)` methods, `print`, `concat`,
+      `readLine`) accepts the struct and unwraps `.base` (an `asStringBase` adapter) to reach the existing
+      C-leaf `__string_*` ops — the unwrap lowers to identity because `String` and `StringBase` share `strTy`,
+      so no codegen op changed. Confirmed end-to-end: `print`, `concat`, `count`, `eq`, and `String` as a
+      struct/class field (suite 133/133, including every interface and String-GC `-evac` leg).
+    - *Byte-layer read surface → Nomu (121.1.4).* `StringBase.bytePointer() -> RawPtr` is surfaced as the
+      first of the four ops (a C-leaf keyed on the primitive, `__string_bytepointer_rawptr`; `rawptr` added to
+      the builtin type parser + `cType`). Over `bytePointer` + `count` + `RawPtr.load`, the read surface is now
+      Nomu: `eq`/`lt` are **methods** and `count`/`isEmpty` are **computed properties** on `String`
+      (core.nomu). The string builtin block + member gates serve only a bare `StringBase` (`self.base.count`),
+      so a surface `String` resolves through struct/computed-property dispatch. Suite 133/133 (`string-surface`
+      exercises all four plus the wrong-result guards). The now-dead `__string_eq`/`__string_lt` C leaves are
+      removed with the rest of the interim (121.1.5).
+    - *`hash` removed.* The `__string_hash_int` builtin (property `s.hash`) is gone — the gate, the `cLeaf`
+      entry, and the C function (+ its FNV constants). Hashing is user/library code, not a `String` builtin;
+      its home is a future hashing/`Dictionary` task. The GC oracles that used `.hash` to read the buffer back
+      after a collection now fold the bytes with a local `strsum` helper (`sum of byte(at:)`), which reads
+      every byte just the same; their asserted values were recomputed (e.g. `pair-string-gc` → `2246000`,
+      `option-string-gc` → `2232000`, `gc_string` → `540180000`, module-generic-string → `4147`) and the
+      `tests/expected/*.txt` files updated. Suite 133/133. (`examples/benchmarks/hashmap.nomu` brings its own
+      `hash()` over a custom struct, so it was unaffected — and demonstrates UInt64 xor + wrapping-multiply
+      exist in Nomu.)
+    - *`byte(at:)` → Nomu, unchecked — done + green.* `byte(at:)` is a Nomu method on `String` (core.nomu)
+      over `self.base.bytePointer()` + `RawPtr.load`, an unchecked raw load like `RawPtr.load` itself: an
+      out-of-range offset reads invalid memory rather than trapping. The `__string_byteat_uint8_int` C leaf
+      (and its `rt_bounds_trap` call) is removed, and the NOIRGen `byte` interception with it, so `s.byte(at:)`
+      resolves through ordinary struct-method dispatch (the `at` label is ignored by sema today, as for `eq`'s
+      `other`). The checked form — a `precondition` primitive plus analysis-based removal or forced omission —
+      is [183](183-precondition-bounds-checks.md); until it lands the stdlib/parser callers that drive the
+      offset own the check. Suite 133/133.
+    - *`concat` → Nomu + `allocHeap` (121.1.3 + .1.4 producer) — done + green.* `StringBase.allocHeap(count)`
+      is surfaced as a static producer op (`__stringAllocHeap`): a `heap` StringBase backed by a managed
+      tail-allocated byte buffer (type-id + cap + bytes-at-16, the `ManagedBuffer<EmptyHeader, UInt8>` layout),
+      through the rooted `rtAllocManaged` seam. `concat` is now a **Nomu function** (core.nomu) over
+      `allocHeap` + two gc-leaf `RawPtr.copyBytes` from the inputs' `bytePointer()`s — the builtin proto and
+      the codegen `concat`/`emitConcat` dispatch are retired. GC-safe: `a`/`b` ride the shaped-root path across
+      the single `allocHeap` safepoint, the copies run with no safepoint between alloc and fill. All String-GC
+      oracles + evac legs green (133/133).
+    - *Perf — investigated, at parity (no action needed).* `gc-string`'s wall-time rose (~12s → ~34s across its
+      carrier×iteration runs), but benchmarking attributes it correctly: the byte-layer ops are already fast
+      un-inlined (byte scan ~125M/s, `eq` ~1.4B byte-compares/s) and `-O` (the LLVM O2 inliner) does not move
+      them, so it is not call-overhead. The rise is the `concat` representation change — the old path made
+      **immortal** off-heap buffers (the GC ignores them), the new `concat` makes correct **heap** buffers
+      (managed, relocated every collection), which is real, intended GC work under gc-string's 24M-box pressure
+      (what `gc-string-relocate` tests) and `-O`-insensitive (~1.1s → ~1.0s per run). "Parity with the builtin"
+      there would mean reverting to leaking immortal buffers, which 121 deliberately abandoned. The general
+      capability for a fast cross-module stdlib **without LTO** (if a cross-module hot path ever measures a gap)
+      is [182 cross-module inlining](182-cross-module-inlining.md), not a per-op egress inline.
+    - *Dead C interim removed (121.1.5) — done + green.* With `eq`/`lt`/`byte(at:)`/`isEmpty` all Nomu, their
+      C leaves and the old codegen concat path are gone: `__string_eq_bool_string`, `__string_lt_bool_string`,
+      `__string_isempty_bool`, `__string_byteat_uint8_int` (the C functions, the `cLeaf` entries, and the
+      NOIRGen `isEmpty` gate); `emitConcat` (the dead egress concat) and its `rt_str_snapshot` / `rt_str_fill`
+      runtime helpers (C defs, `runtime.h` decls, the `gcLeafRuntimeFns` entries). The surviving `StringBase`
+      C primitives are `__string_count_int` (via `self.base.count`) and `__string_bytepointer_rawptr` (via
+      `self.base.bytePointer()`), plus `rt_str_lit` for literals. Suite 133/133.
+    - *Literals → codegen `fromStaticUTF8` (121.1.2) + `String` off the C floor — done + green.* `String` has
+      no C floor left. `lowerStringLit` builds the `immortal` `StringBase` directly in codegen (word0 = the
+      static UTF-8 global's address, word1 = `(immortal tag << 60) | count`, a constant) — `rt_str_lit` the C
+      function is removed (its two `rt_read_line` empty-string uses switched to the `nomu_str_make` inline
+      helper). The two read ops moved off C to codegen-native too: `count` and `bytePointer()` lower through
+      `SSAIRToLLVM.strLen` / `strPtr` (the same word-extraction `print` uses, now shared), so
+      `__string_count_int` / `__string_bytepointer_rawptr` are gone as C leaves and the `cLeaf` registry is
+      empty. The dead `nomu_str_len` / `nomu_str_ptr` / `nomu_str_tag` inline helpers are removed;
+      `nomu_str_make` remains for `rt_read_line` (privileged I/O). So all four `StringBase` ops are codegen
+      (`fromStaticUTF8`, `allocHeap`, `count`, `bytePointer`) and the surface is Nomu — the design's "the magic
+      may be codegen" taken to "codegen, not C." Suite 133/133; `gc_string` evac → `540180000`.
+    - *`allocHeap` on the shared `ManagedBuffer` path (121.1.3) — done + green.* `__stringAllocHeap` and
+      `__managedBufferCreate` both tail-alloc through one shared `emitManagedBufferAlloc(header:element:
+      capacity:)` (size `16 + headerSize + cap*stride`, type-id header at 0, cap at 8); `allocHeap` then wraps
+      the buffer into the `heap` StringBase value. The bespoke `stringStorageTypeId` helper + `stringStorageMapId`
+      cache and the vestigial `__nomu_stringstorage_typeid` global are removed — the heap buffer's type-id is
+      the shared `managedBufferTypeId(EmptyHeader, UInt8)`. A defensive module-start registration of that
+      descriptor remains (a module that only *relocates* a received heap String, with no `allocHeap` site, still
+      emits the weak-ODR descriptor into its own section; the `module_generic_string` cross-module leg exercises
+      this). Suite 133/133. The bounds-checked `byte(at:)` is [183](183-precondition-bounds-checks.md).
+    - *121.1 complete.* The immortal + heap String milestone is done: the surface is Nomu, all four `StringBase`
+      ops are codegen, `String` is off the C floor, and the heap buffer rides the shared `ManagedBuffer`
+      descriptor. Next is 121.2 (`small`/SSO) — see the phase-order note below.
+    - *Deferred — `StringBase` is nameable anywhere today.* The Sema resolver makes `StringBase` resolvable in
+      any file, not just the stdlib, so user code can currently name the internal primitive. The design keeps
+      it stdlib-internal; enforcing that waits until the prelude/core becomes a real module (or modules) with a
+      visibility boundary, at which point `StringBase` is an unexported stdlib name. Tracked here until that
+      module work lands.
   - **121.1.2 — literal lowering → `immortal`.** `"…"` emits a static UTF-8 global + `String.fromStaticUTF8`
     (→ `StringBase.fromStaticUTF8`, tag `immortal`), replacing `rt_str_lit`.
   - **121.1.3 — the `heap` path.** *(Mechanism validated on the ad-hoc kind-1 buffer; final form rides
@@ -207,10 +332,25 @@ remaining 121.1 work restructures that into the settled **`StringBase` (internal
     `String` methods over the four ops; `StringBuilder`. `print` stays compiler-special.
   - **121.1.5 — retire the builtin.** `strTy` / `.string` / sema literal typing resolve `String` to the Nomu
     struct; the `__string_*` C-leaf interim is removed as its methods move to Nomu.
-- **121.2 — `UnicodeScalarView`** (UTF-8 decode, scalar iteration, opaque scalar index).
-- **121.3 — `small` / SSO** — the bit-stealing inline case (up to 15 bytes across `word0`/`word1`). Pure
-  stdlib SSO byte code on the shaped `word0` already built at 121.1 — `small` is a tag value the descriptor
-  already excludes, so no new GC/176 work.
+**Phase order (reordered):** `small`/SSO is taken **before** `UnicodeScalarView`. SSO changes the
+*representation* (the inline-bytes `small` case lives in the 16-byte value, so every byte-access path must
+learn it) — the risk concentrates there. `UnicodeScalarView` is a decode layer *over* byte indexing: it reads
+the same `count` / `bytePointer` / `byte(at:)` surface whatever the storage, so building it first and then
+changing storage underneath would be the wasteful order. De-risk storage first; deferring the (storage-free)
+scalar view carries no risk. Numbered to match that order.
+
+- **121.2 — `small` / SSO — done + green.** The bit-stealing inline case (up to 15 bytes across
+  `word0`/`word1`, tag 0). `small` is a tag the kind-2 GC descriptor already excludes (it scans `word0` only
+  for `heap`), so no GC/176 work — verified against the descriptor (`tagOff 8, tagShift 60`, one case `heap`).
+  Built: (a) tag-aware `strLen`/`strPtr` (`small` count in byte 15's low nibble; `small` byte pointer
+  materializes the value to a per-call stack slot — its own, so `concat`'s three `bytePointer`s don't clobber);
+  (b) producers — short literals (≤15 B) lower to a compile-time `small` constant (`lowerStringLit`, the Swift
+  model), and `concat` builds a `small` result inline via the `StringBase.smallConcat` codegen op (copy both
+  sources into one zeroed slot, set byte 15 = count, load once — no mutate-then-reload of an SSA value). The
+  small/heap/immortal split is invisible above `StringBase`. Suite 133/133; a direct check confirms
+  `concat` → `small` ≤15 B, `heap` ≥16 B, with `eq`/`byte(at:)`/`print` correct for both under nogc and immix.
+- **121.3 — `UnicodeScalarView`** (UTF-8 decode, scalar iteration, opaque scalar index) — layered on byte
+  indexing, storage-agnostic.
 - **121.4 — compiler-inferred COW** (the [123](123-copy-on-write.md) uniqueness analysis; pessimistic copy
   until then).
 - **121.5 — `GraphemeView` + normalization.**

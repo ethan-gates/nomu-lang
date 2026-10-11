@@ -74,7 +74,7 @@ extension LLVMGen {
         case .uint64: return diBasic("UInt64", dwUnsigned, bits: 64)
         case .double: return diBasic("Double", dwFloat, bits: 64)
         case .bool:   return diBasic("Bool", dwBoolean, bits: 8)   // i1, one byte in memory (8.5.2)
-        case .string: return diStringType()
+        case .stringBase: return diStringType()
         case .named(let n, .struct_): return diStructType(n)
         case .named(let n, .class_):  return diClassPointer(n)
         case .opaque: return diType(concreteUnderlying(t))

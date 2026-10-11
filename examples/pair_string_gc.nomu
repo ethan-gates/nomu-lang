@@ -1,7 +1,7 @@
 // Task 176.3a oracle: a value aggregate holding a `String` by value — `Pair { s: String; n: Int }` — held
 // live across a moving collection. The shaped `word0` (the heap StringStorage pointer) sits inside the Pair
 // slot; frame-root placement must record the slot and relocate the shaped sub-field in place through the
-// aggregate's value-layout descriptor, or `p.s.hash` reads a stale buffer and diverges from the `-c nogc`
+// aggregate's value-layout descriptor, or `strsum(p.s)` reads a stale buffer and diverges from the `-c nogc`
 // baseline. Before 176.3a the slot was unrecorded — the shaped sub-field invisible to the collector. The
 // garbage `Box` arrays drive collections while `p` is live. Run with NOMU_NO_ESCAPE=1 so they are heap.
 struct Box {
@@ -10,6 +10,16 @@ struct Box {
 struct Pair {
   var s: String
   var n: Int
+}
+// Content fold over the String's bytes — the GC-relocation readback (summing every byte).
+fun strsum(s: String) -> Int {
+  var acc = 0
+  var i = 0
+  while i < s.count {
+    acc = acc + s.byte(at: i).int
+    i = i + 1
+  }
+  return acc
 }
 fun main() {
   let p = Pair(s: concat("hello", " world"), n: 7)
@@ -22,7 +32,7 @@ fun main() {
       xs.append(Box(v: w))
       w = w + 1
     }
-    checksum = checksum + p.s.hash + p.n
+    checksum = checksum + strsum(p.s) + p.n
     i = i + 1
   }
   print(checksum)

@@ -815,9 +815,9 @@ pub extern "C" fn nomu_gc_write_barrier_post(
 }
 
 /// Allocate `size` bytes in **immortal** space (M6 · 6.2.4): non-moving, never reclaimed. `rt_read_line`
-/// still routes its buffer here (immortal interim). String literals (`rt_str_lit`) wrap static rodata and
-/// need no allocation; `concat` now produces a relocatable `heap` `StringStorage` (task 176.2), not an
-/// immortal buffer.
+/// still routes its buffer here (immortal interim). String literals wrap static rodata (codegen
+/// `fromStaticUTF8`) and need no allocation; `concat` produces a relocatable `heap` buffer (task 176.2), not
+/// an immortal one.
 #[unsafe(no_mangle)]
 pub extern "C" fn nomu_gc_alloc_immortal(mutator: *mut Mutator<NomuVM>, size: usize, align: usize) -> *mut c_void {
     alloc_semantic(mutator, size, align, AllocationSemantics::Immortal)
