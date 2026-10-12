@@ -23,7 +23,8 @@ to 1 dir == 1 module folds into [155](155-integration-suite-harness.md).
 
 ## Deliverable
 
-`nomuc build` / `run` / `test` on a manifest'd package with multiple bins.
+`nomu build` / `run` / `test` on a manifest'd package with multiple bins (the binary is renamed from
+`nomuc`; see 173.5.1).
 
 ## Phases
 
@@ -52,14 +53,36 @@ to 1 dir == 1 module folds into [155](155-integration-suite-harness.md).
     foreign package with a clear diagnostic), and fold package identity into the mangling qualifier (the
     `Mangle.qualifier` package-identity item carried forward from 100.4). The single-package
     signature-consistency guard (100.2.5) already stands; this closes the cross-boundary half.
-- 173.4 — **Entry points:** `main` detection, `bin` declarations, root-`main` shorthand; declarations-only
-  enforcement; ordered-eager global init in module-topological order. **Partial:** `main` runs today; `bin`
-  stanzas / init-order emission not built. (The init-order emission is the one real codegen touch in this
-  task.)
-- 173.5 — **Single-binary driver:** `compile`/`build`/`run`/`test`/`query`; compile-logic-as-library;
-  in-process build orchestration over the module graph. The driver is `nomuc <file>` today; this is the
-  uber-CLI refactor (the `compile` primitive stays; the subcommands wrap it).
-- 173.6 — **`query` metadata** (package → modules + inter-module dep edges + external deps).
+- 173.4 — **Entry points.** **`main` detection + declarations-only enforcement: already satisfied.** `main`
+  lowers to the fixed `nomu_main` entry symbol and the entry object requires it (`loweredMain`); the grammar
+  admits only declarations at the top level (`declStart` has no `let`/`var`/statements), so there is no
+  top-level executable code to reject. **`bin` declarations + root-`main` shorthand:** the live piece,
+  consumed by `build` — it lands with 173.5.2 (building it standalone yields an inert bin list). **Ordered-eager
+  global init: deferred** — the language has no global-variable surface yet (no top-level `let`/`var`), so
+  there is nothing to initialize; the module-topological init-order emission (the one real codegen touch)
+  comes when globals do.
+- 173.5 — **Single-binary driver:** the `nomu` uber-CLI over the `compile` primitive; compile-logic-as-library;
+  in-process build orchestration over the module graph. The driver is `nomuc <file>` today; the subcommands
+  wrap the primitive, which stays. Broken down by command (build order 173.5.1 → .4):
+  - 173.5.1 — **CLI skeleton + `compile` primitive.** _Rides [186](186-cli-argument-parser.md) (the
+    dependency-free subcommand arg parser), built first._ Retire the `nomuc` binary and rename it `nomu`; every
+    entry is a subcommand — `nomu compile|build|run|test|query`. `compile` is the exposed primitive but the
+    easy path is `build`/`run`/`test`/`query`; each subcommand parses its own arguments, so compile's flags
+    stay isolated from the orchestration flags. The compile primitive is invocable **both ways**: as a
+    subprocess (`nomu compile …`, the form the integration harness uses) and **in-process** — a library entry
+    (`compile(...)`) that reports success/failure instead of calling `exit`, so `build`/`run` can drive it
+    without spawning. Foundation for the rest.
+  - 173.5.2 — **`build`.** Manifest-driven: build every declared `bin` in the package at/above the target
+    directory — resolve each bin to its module, gather the module's files, compile + link to the bin's output,
+    in-process over the module graph. Consumes 173.4's `bin` declarations + the root-`main` shorthand (the live
+    half of 173.4 lands here), and populates `examples/pkg.json`'s bin list as the first real multi-bin package.
+  - 173.5.3 — **`run`.** Build a selected bin (by name, or the single declared bin / root-`main` shorthand) and
+    exec it, forwarding arguments + exit status.
+  - 173.5.4 — **`test`.** Build the manifest's test modules with white-box `test import` visibility widening;
+    the case runner + test-case designation stay in the test-framework task ([161](161-test-framework.md)), so
+    this phase builds + links test modules and stops short of a runner.
+- 173.6 — **`query`** — the subcommand (wired on the 173.5.1 dispatch) + its metadata: package → modules +
+  inter-module dep edges + external deps.
 - 173.7 (tests) — Package builds; multiple bins; `run`/`test`; seal enforcement; init order. (The suite-wide
   **1 dir == 1 module** migration is [155](155-integration-suite-harness.md)'s, not this task's.)
 

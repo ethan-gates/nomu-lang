@@ -1,0 +1,18 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# The `nomu` CLI argument parser (task 186): a dependency-free, subcommand-aware parser. Declarative
+# command specs → parsing, validation, and synthesized `--help`. Pure stdlib (no Foundation, no external
+# deps); returns outcomes rather than printing/exiting, so the driver owns I/O. See
+# design/plans/tasks/186-cli-argument-parser.md.
+swift_library(
+    name = "cli",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "cli",
+    visibility = ["//visibility:public"],
+)
+
+swift_test(
+    name = "cli_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = [":cli"],
+)
