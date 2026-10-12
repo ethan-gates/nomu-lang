@@ -27,10 +27,10 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
     // named in the timing header for context.
     timings.egress = "ssair"
 
-    // The package root anchors mechanical `pkg/…` addressing (nearest `nomu.yaml` ancestor, else the
-    // entry's own directory — the interim marker until the manifest lands, task 100.3).
+    // The package root anchors mechanical `pkg/…` addressing and module identity: the nearest `pkg.json`
+    // ancestor, falling back to the `nomu.yaml` workspace marker, then the entry's own directory.
     let input = URL(fileURLWithPath: primary).standardizedFileURL
-    let root = projectRoot(for: input)
+    let root = findPackageRoot(for: input)
     let packageRoot = root.path
 
     // The package identity comes from the manifest (`pkg.json` at the root), or a default when there is
@@ -498,21 +498,28 @@ private func writeArtifact(_ contents: String, toFile path: String) {
     print(path)
 }
 
-// The project root: the nearest ancestor of `input` containing a `nomu.yaml` marker;
-// if none exists up to the filesystem root, the input's own directory. The output
-// root is <project-root>/build/. (More rules — config, explicit flags — come later.)
-private func projectRoot(for input: URL) -> URL {
+// The package root (modules.md §Manifest, §First-party addressing): the nearest ancestor of `input`
+// containing a package manifest (`pkg.json`). Failing that, the nearest ancestor carrying the workspace
+// marker (`nomu.yaml`) — the interim fallback for a tree not yet carrying a package manifest. Failing
+// both, the input's own directory. It anchors mechanical `pkg/…` addressing and module identity (a
+// module is its path relative to this root), and the output root is <package-root>/build/.
+//
+// `pkg.json` (package) and `nomu.yaml` (workspace) sit at different levels, so the package root prefers
+// the package manifest; the workspace marker is only a fallback until every tree carries a `pkg.json`.
+private func findPackageRoot(for input: URL) -> URL {
     let fm = FileManager.default
-    var dir = input.deletingLastPathComponent().standardizedFileURL
-    while true {
-        if fm.fileExists(atPath: dir.appendingPathComponent("nomu.yaml").path) {
-            return dir
+    func nearestAncestor(containing marker: String) -> URL? {
+        var dir = input.deletingLastPathComponent().standardizedFileURL
+        while true {
+            if fm.fileExists(atPath: dir.appendingPathComponent(marker).path) { return dir }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { return nil }   // reached the filesystem root
+            dir = parent
         }
-        let parent = dir.deletingLastPathComponent()
-        if parent.path == dir.path { break }   // reached the filesystem root
-        dir = parent
     }
-    return input.deletingLastPathComponent().standardizedFileURL
+    return nearestAncestor(containing: "pkg.json")
+        ?? nearestAncestor(containing: "nomu.yaml")
+        ?? input.deletingLastPathComponent().standardizedFileURL
 }
 
 // <root>/build/<input's directory relative to root>. Equal dirs yield <root>/build.

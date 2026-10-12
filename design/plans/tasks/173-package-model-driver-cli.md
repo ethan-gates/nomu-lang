@@ -28,13 +28,21 @@ to 1 dir == 1 module folds into [155](155-integration-suite-harness.md).
 ## Phases
 
 - 173.1 — **Manifest** in **JSON** (dependency-free in the Swift host; switch to YAML later,
-  [163](163-manifest-yaml.md)) + schema: name, version, `sealed`, `bin`, tests (deps later). Interim file
-  name `pkg.json`; root still marked by `nomu.yaml` (both subject to change). **Partial:** a minimal
-  name-only manifest already loads; absent → default package `main`. **Open policy:** keep requiring a
-  manifest and erroring when absent (drop the default) once the fixtures/tooling assume one — decide when the
-  whole suite migrates to 1 dir == 1 module ([155](155-integration-suite-harness.md)).
-- 173.2 — **Package boundary** (manifest presence); workspace (root + members); package identity. **Partial:**
-  single-package identity via the name-only manifest; workspaces not built.
+  [163](163-manifest-yaml.md)) + schema: name, version, `sealed`, `bin`, tests (deps later). **Done (schema):**
+  the full contract decodes (`src/modules/sources/Manifest.swift`) — `name` required, `version`/`sealed`/`bin`
+  (`{name, module}`)/`tests` (`{module}`) optional, every section past `name` defaulting so a name-only
+  manifest stays valid; absent → default package `main`; present-but-malformed is fatal. Unit tests in
+  `src/modules/tests`. The two-file scheme is settled (modules.md §Manifest): **package → `pkg.json`**,
+  **workspace → `nomu.yaml`** (repo root), **module → no file**. **Open policy:** keep requiring a manifest
+  and erroring when absent (drop the default) once the fixtures/tooling assume one — now unblocked by the 155
+  migration, still deferred so loose single-file programs compile.
+- 173.2 — **Package boundary** (manifest presence); workspace (root + members); package identity. **Done
+  (package half):** the package root is the nearest `pkg.json` ancestor (`findPackageRoot`,
+  `src/driver/sources/Driver.swift`), falling back to the `nomu.yaml` workspace marker, then the entry's
+  directory; package identity comes from that `pkg.json`'s `name`. It anchors `pkg/…` addressing and module
+  identity. **Deferred:** the workspace section's contents (member packages, one resolved version per external
+  dependency) — not exercisable until cross-package linkage exists, so `nomu.yaml` is a marker only; designed
+  with the external-package work (173.3.1).
 - 173.3 — **Seal enforcement** (sealed module not importable outside package; symbols capped at package).
   - 173.3.1 — **`package`-tier visibility across the package boundary** (the multi-package half of 100.2.5,
     deferred there until cross-package linkage exists). Today only `public` reaches a `.nmi`, so a `package`

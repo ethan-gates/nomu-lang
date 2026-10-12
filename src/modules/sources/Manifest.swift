@@ -1,11 +1,55 @@
 import Foundation
 
-// The package manifest (task 100.3; modules.md §Manifest). JSON for now — dependency-free in the Swift
-// host (YAML is task 163). Read from `pkg.json` at the package root; the root itself is still marked by
-// `nomu.yaml`. Both file names are interim and subject to change. Minimal to start: just the package
-// name (identity). Version, `sealed`, `bin`, tests, and dependencies fill in later.
+// The package manifest (modules.md §Manifest). One per package. JSON for now — dependency-free in the
+// Swift host (Foundation; YAML is task 163). Read from `pkg.json` at the package root; the root itself is
+// still marked by `nomu.yaml`. Both file names are interim and subject to change.
+//
+// Contents are the settled contract: package name + version (identity), the `sealed` module list, `bin`
+// executable declarations, and test-module declarations. Dependencies (external-package aliases) and the
+// repo-root workspace section fill in when cross-package linkage lands. Module metadata stays zero — the
+// manifest references modules only as policy lists (sealed / bin / tests), never as an addressing
+// inventory (the filesystem is the module list, modules.md §Modules).
+//
+// Every section beyond `name` is optional: a name-only manifest is valid, and an absent section defaults
+// to empty. Module paths are package-root-relative with `/` separators; the empty string "" names the
+// root module.
 public struct Manifest: Codable {
     public let name: String
+
+    // An executable: the `name` it builds to and the `module` whose `main` is its entry (modules.md
+    // §Initialization & entry point). A package with no `bin` and a `main` at its root module is the
+    // single-executable shorthand, so `bin` may be empty.
+    public struct Bin: Codable {
+        public let name: String
+        public let module: String
+    }
+
+    // A test module (modules.md §Tests). Test identity is module-level — a module is real XOR test. The
+    // runner + case designation live in the test-framework work (modules.md §Tests); this records the
+    // module identity only.
+    public struct TestModule: Codable {
+        public let module: String
+    }
+
+    // Backing storage is optional so the name-only manifest stays valid; the accessors default to empty
+    // (or nil for `version`). The synthesized Codable decodes a missing optional key as nil.
+    private let versionField: String?
+    private let sealedField: [String]?
+    private let binField: [Bin]?
+    private let testsField: [TestModule]?
+
+    public var version: String? { versionField }
+    public var sealed: [String] { sealedField ?? [] }
+    public var bin: [Bin] { binField ?? [] }
+    public var tests: [TestModule] { testsField ?? [] }
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case versionField = "version"
+        case sealedField = "sealed"
+        case binField = "bin"
+        case testsField = "tests"
+    }
 }
 
 public enum ManifestError: Error, CustomStringConvertible {

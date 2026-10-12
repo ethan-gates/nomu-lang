@@ -116,18 +116,25 @@ other packages.
 
 ## Manifest
 
-**Decided (contents).** One manifest type, appearing once per package. Holds: package name, version,
-dependencies, the `sealed` module list, executable declarations (`bin`), and test-module
-declarations. The repo root additionally carries a workspace section (member packages; the single
-resolved version per external dependency). A single-package repo has exactly one manifest.
+**Decided (two files, one per level).** The package and the workspace each have their own file; a
+module has none.
 
-Module metadata is zero: no per-module file. The manifest references modules only as policy lists
-(sealed, bin, tests, exports of executables), never as an addressing inventory.
+- **Package** — `pkg.json`, at the package root. Holds package name, version, dependencies, the
+  `sealed` module list, executable declarations (`bin`), and test-module declarations. One per package;
+  a single-package repo has exactly one. Its presence marks the package root, and `pkg` addressing
+  resolves to it.
+- **Workspace** — `nomu.yaml`, at the repo root, above the packages. Holds the member-package list and
+  the single resolved version per external dependency. Separate from the package manifest because it
+  governs a different unit (the version/seal boundary is the package; cross-package resolution is the
+  workspace). Its contents land with cross-package linkage; until then it is a marker only.
+- **Module** — no file. Module metadata is zero; the filesystem is the module list (a per-module file
+  is possible later if a need shows up). A manifest references modules only as policy lists (sealed,
+  bin, tests), never as an addressing inventory.
 
 **Decided (format rule).** Not TOML. The manifest is **declarative data**, never a program, so the
 compiler, an LSP, and a dependency resolver can all read it as static, inspectable data.
 
-**Decided (format): JSON for now.** Chosen because it parses dependency-free in the Swift host
+**Decided (format): JSON for `pkg.json` now.** Chosen because it parses dependency-free in the Swift host
 (Foundation), unblocking the module work without taking on a parser dependency. Its cost is
 human-authoring friendliness (no comments). **Switch to YAML later** — task
 [163](../plans/tasks/163-manifest-yaml.md) — for a comment-bearing, human-friendly format once the

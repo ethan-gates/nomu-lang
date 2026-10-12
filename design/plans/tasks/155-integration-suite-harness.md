@@ -108,13 +108,17 @@ and matrix runs exist ad hoc. This task folds them into one harness.
 ### Remaining open axes (later phases)
 
 - **Suite migration to 1 dir == 1 module** _(folded in from the old [100](100-modules.md) §100.3.8)._
-  Reorganize the flat `examples/` fixtures so each is its own module directory (a fixture directory = one
-  module, the universal rule once directory-as-module is real, 100.2.1). Today directory fixtures and flat
-  single-file fixtures coexist in the manifest; this makes the rule uniform. It also unblocks the
-  **manifest-required policy** (drop the default `main` package, [173](173-package-model-driver-cli.md)
-  §173.1): once every fixture is a package directory with a manifest, requiring one and erroring on absence
-  becomes safe. A large mechanical reorganization of `tests/fixtures/` + the manifest `fixture` paths;
-  behavior-preserving (same programs, same expected output), so it rides the differential golden.
+  **Done.** Every flat fixture is now its own module directory with a `main.nomu`, and both
+  `examples/` and `tests/fixtures/` carry package manifests. `examples/` became **one package**
+  (`examples/pkg.json`), each example a binary module directory (`examples/<name>/main.nomu`); the
+  `examples/benchmarks/` programs became nested modules; hyphenated filenames were underscored to satisfy
+  the identifier rule for path components. Each `tests/fixtures/*` became **its own package**
+  (`nomu.yaml` → a `pkg.json` manifest), the nine formerly-flat fixtures moved into `<name>/main.nomu`
+  directories, and the 91 `fixture` paths in `suite.json` were rewritten from file to directory. The
+  repo-root `nomu.yaml` remains the workspace marker. Behavior-preserving — full suite 133/133 green on a
+  clean `build/`. The **manifest-required policy** (drop the default `main`, requiring a `pkg.json`,
+  [173](173-package-model-driver-cli.md) §173.1) is now unblocked but deferred: loose single-file programs
+  (unmanifested) still compile under the default identity via the package-root fallback.
 - **Compiler build mode (release vs debug), configurable.** The harness prefers a release (`-c opt`) `nomuc`
   today (≈10× faster compiles). Make the mode selectable (a flag / manifest field), because GC observability
   ([159](159-gc-observability.md)) likely behaves differently under release vs debug — assertions, timing, and
