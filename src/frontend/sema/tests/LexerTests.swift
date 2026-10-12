@@ -108,4 +108,30 @@ final class LexerTests: XCTestCase {
         XCTAssertTrue(diags.hasErrors)
         XCTAssertEqual(kinds, [.stringLit("hello"), .eof])
     }
+
+    // A triple-quoted block literal strips the closing delimiter's indentation from each line and drops the
+    // newlines adjacent to the delimiters: `"""⏎    a⏎    b⏎    """` → `"a\nb"`.
+    func testBlockStringStripsIndent() {
+        XCTAssertEqual(lex("\"\"\"\n    a\n    b\n    \"\"\""), [.stringLit("a\nb"), .eof])
+    }
+
+    // Inside a block literal a bare `"` needs no escape, and `\t`/`\n` escapes still apply; indentation is
+    // stripped to the closing delimiter's column.
+    func testBlockStringEscapesAndBareQuotes() {
+        XCTAssertEqual(lex("\"\"\"\n  a \"q\" b\n  c\\td\n  \"\"\""),
+                       [.stringLit("a \"q\" b\nc\td"), .eof])
+    }
+
+    // A blank content line survives as an empty line (no indentation to strip).
+    func testBlockStringBlankLine() {
+        XCTAssertEqual(lex("\"\"\"\n  a\n\n  b\n  \"\"\""), [.stringLit("a\n\nb"), .eof])
+    }
+
+    // A block literal with no closing `"""` reports and recovers.
+    func testBlockStringUnterminatedRecovers() {
+        let diags = DiagnosticSink()
+        var lexer = Lexer("\"\"\"\n  hi\n", diagnostics: diags)
+        _ = lexer.tokenize()
+        XCTAssertTrue(diags.hasErrors)
+    }
 }

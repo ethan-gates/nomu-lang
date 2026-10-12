@@ -19,7 +19,10 @@ into `std`.
 ## What — two clusters
 
 - **Core data types:** strings (the UTF-8 decisions), numbers, collections. Decide where each belongs
-  (C `core` floor vs Nomu — M4.13), then create or polish.
+  (C `core` floor vs Nomu — M4.13), then create or polish. Includes **`String` ↔ `Array<UInt8>` interop**
+  (relocated from [121](121-string-utf8-model.md): `from`/`to Array<UInt8>`) — build it when a real consumer
+  lands (raw byte-buffer I/O, or encoding/decoding like base64), which shapes whether the array is owned or
+  borrowed and where the copy happens. The byte-level `String` already exposes byte reads via `byte(at:)`.
 - **Basic I/O to get programs started:** file I/O and network I/O on the colorless blocking model
   (syscall offload, `runtime.md` §5). Likely also env, process, time, stdio.
 

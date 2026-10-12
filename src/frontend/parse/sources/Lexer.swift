@@ -110,7 +110,12 @@ public struct Lexer {
         let c = src[pos]
         if isDigit(c) { return lexNumber() }
         if identStart(at: pos) != 0 { return lexIdent() }
-        if c == 0x22 { return lexString() }   // "
+        if c == 0x22 {   // "
+            if pos + 2 < src.count && src[pos + 1] == 0x22 && src[pos + 2] == 0x22 {
+                return lexBlockString()   // """ … """
+            }
+            return lexString()
+        }
 
         pos += 1
         switch c {
@@ -297,6 +302,83 @@ public struct Lexer {
         }
         pos += 1  // consume closing "
         return .stringLit(String(decoding: buf, as: UTF8.self))
+    }
+
+    // A triple-quoted block string literal, Swift-style. The opening `"""` is followed by a newline; the
+    // closing `"""` sits on its own line, and the whitespace before it sets the indentation stripped from
+    // every content line. The newlines adjacent to the delimiters are dropped, a bare `"` needs no escape,
+    // and `\n`/`\t`/`\\`/`\"` escapes still apply. Emits the same `.stringLit` token as `"…"`, so nothing
+    // downstream changes. (Line-continuation `\` at end of line is not special yet — a possible follow-on.)
+    private mutating func lexBlockString() -> TokenKind {
+        let startOffset = pos
+        pos += 3   // consume opening """
+        // The opening delimiter must be followed by (optional trailing spaces/tabs/CR, then) a newline.
+        while pos < src.count && (src[pos] == 0x20 || src[pos] == 0x09 || src[pos] == 0x0D) { pos += 1 }
+        if pos < src.count && src[pos] == 0x0A { pos += 1 }
+        else { error("opening \"\"\" of a multiline string must be followed by a newline", at: startOffset) }
+
+        // Collect raw bytes up to the first closing `"""`, tracking where the current line began so the
+        // closing delimiter's indentation can be measured.
+        var raw: [UInt8] = []
+        var lineStart = 0
+        var closed = false
+        while pos < src.count {
+            if src[pos] == 0x22 && pos + 2 < src.count && src[pos + 1] == 0x22 && src[pos + 2] == 0x22 {
+                pos += 3
+                closed = true
+                break
+            }
+            raw.append(src[pos])
+            if src[pos] == 0x0A { lineStart = raw.count }
+            pos += 1
+        }
+        guard closed else {
+            error("unterminated multiline string literal (missing closing \"\"\")", at: startOffset)
+            return .stringLit(String(decoding: raw, as: UTF8.self))
+        }
+
+        // The closing line (raw[lineStart...]) must be whitespace only; its length is the strip width.
+        var indent = 0
+        var allWhitespace = true
+        for k in lineStart..<raw.count {
+            if raw[k] == 0x20 || raw[k] == 0x09 { indent += 1 } else { allWhitespace = false; break }
+        }
+        if !allWhitespace { error("closing \"\"\" of a multiline string must be on its own line", at: startOffset) }
+
+        // Content is everything before the closing line, minus the newline that ends it (delimiter-adjacent).
+        var content = Array(raw[0..<lineStart])
+        if content.last == 0x0A { content.removeLast() }
+        if content.last == 0x0D { content.removeLast() }
+
+        // Strip `indent` leading whitespace per line, drop CR of CRLF, then apply escapes.
+        var out: [UInt8] = []
+        var i = 0
+        var atLineStart = true
+        var stripped = 0
+        while i < content.count {
+            let byte = content[i]
+            if atLineStart && (byte == 0x20 || byte == 0x09) && stripped < indent {
+                stripped += 1; i += 1; continue
+            }
+            atLineStart = false
+            if byte == 0x0D && i + 1 < content.count && content[i + 1] == 0x0A { i += 1; continue }
+            if byte == 0x0A {
+                out.append(0x0A); atLineStart = true; stripped = 0; i += 1; continue
+            }
+            if byte == 0x5C && i + 1 < content.count {   // backslash escape
+                i += 1
+                switch content[i] {
+                case 0x6E: out.append(0x0A)   // \n
+                case 0x74: out.append(0x09)   // \t
+                case 0x5C: out.append(0x5C)   // \\
+                case 0x22: out.append(0x22)   // \"
+                default:   out.append(content[i])
+                }
+                i += 1; continue
+            }
+            out.append(byte); i += 1
+        }
+        return .stringLit(String(decoding: out, as: UTF8.self))
     }
 
     // MARK: - Helpers

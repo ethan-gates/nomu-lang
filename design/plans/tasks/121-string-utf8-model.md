@@ -15,8 +15,13 @@ when a byte pointer is needed (the small/heap/immortal split is invisible above 
 is chosen by **result size** — small→heap graduation is upward-only, no heap→small demotion (see *Representation*).
 [176 shaped GC roots](176-shaped-gc-roots.md) is **done** including 176.3 frame-root placement.
 `byte(at:)` is an unchecked load today; the bounds-checked form (a `precondition` primitive + analysis-based
-removal) is [183 precondition / bounds checks](183-precondition-bounds-checks.md). **Next:** 121.3
-`UnicodeScalarView` → 121.4 compiler-inferred COW → 121.5 grapheme view. · **Source:**
+removal) is [183 precondition / bounds checks](183-precondition-bounds-checks.md). **121 is complete** — the
+byte-level `String` is done and parser-ready; `String` is immutable today (no mutation path), so copies share
+the write-once buffer and COW does not yet bite. Follow-ons are their own tasks: checked `byte(at:)` →
+[183](183-precondition-bounds-checks.md); Unicode views → [184 String Unicode views](184-string-unicode-views.md);
+`Substring` → [185 Substring](185-substring.md); `withBytes` → [152](152-first-class-functions.md);
+`Array<UInt8>` interop → [120 stdlib](120-stdlib-core.md); mutation-in-place (`StringBuilder`) +
+compiler-inferred COW → the value-semantics effort ([123 copy-on-write](123-copy-on-write.md)). · **Source:**
 deferred.md (stdlib track); pulled forward because a hand-written parser
 ([163 manifest/YAML](163-manifest-yaml.md)) needs a real `String`.
 
@@ -29,13 +34,15 @@ zero-copy literals, a GC-managed growable buffer, and a layered Unicode API. The
 ## Model (decided)
 
 - **UTF-8 storage.** Bytes are the backing; the public low-level unit is the **byte** (`UInt8` at a byte
-  offset) — what a parser wants. Unicode scalars and grapheme clusters are **views layered on top**, added
-  in later phases, so the parser works on bytes now and the type grows into full Unicode without reshaping
-  its core. (Decision: *bytes now, scalar/grapheme views layered* — not opaque-index-only from the start.)
+  offset) — what a parser wants. Unicode scalars and grapheme clusters are **views layered on top** (now
+  [184 String Unicode views](184-string-unicode-views.md)), so the parser works on bytes now and the type
+  grows into full Unicode without reshaping its core. (Decision: *bytes now, scalar/grapheme views layered* —
+  the byte core is primary, not opaque-index-only from the start.)
 - **Value type** (`struct`) with value semantics; the backing buffer is shared on copy and copied on
-  mutation (copy-on-write). Immutability is the default; mutation needs a `var` binding.
-- **No separate `Char` primitive.** A grapheme is a `String` (a small one); a Unicode scalar is a
-  `UInt32`-carrying value from the scalar view. (Revisit only if ergonomics demand it.)
+  mutation (copy-on-write). Immutability is the default; mutation needs a `var` binding. (The COW elision and
+  a mutating builder ride the value-semantics effort, [123 copy-on-write](123-copy-on-write.md) — see *Phases*.)
+- **No separate `Char` primitive** (carried into [184](184-string-unicode-views.md)): a grapheme is a
+  `String` (a small one); a Unicode scalar is a `UInt32`-carrying value from the scalar view.
 
 ## Type layering (settled): `StringBase` and `String`
 
@@ -50,9 +57,10 @@ The implementation is layered so the compiler magic is quarantined in the lowest
   `StringBase`. Every user-facing operation (the byte layer; `==`/`<`/`+` as methods until the language has
   operators; slicing; hashing; `StringBuilder`) is ordinary Nomu written against the four ops. This is the
   type user code and the rest of the stdlib see.
-- **`Substring`** — a lightweight span over a `String`'s bytes. **Deferred design.** It is the reason the
-  byte-access op lives on `StringBase` as a first-class primitive, so `String` and `Substring` can later
-  share a byte-access abstraction (only if that costs no performance).
+- **`Substring`** — a lightweight zero-copy span over a `String`'s bytes → [185 Substring](185-substring.md)
+  (design decided: Swift-model GC-backed span, distinct type, `small` base inline-by-value, slicing returns a
+  `Substring`, `String(sub)` to copy). It is the reason the byte-access op lives on `StringBase` as a
+  first-class primitive, so `String` and `Substring` share it. Build is deferred (no blocker).
 
 **The four `StringBase` ops — the whole magic boundary:**
 
@@ -63,9 +71,10 @@ The implementation is layered so the compiler magic is quarantined in the lowest
 | `base.count -> Int` | byte count, read from `word1` with no dereference | stdlib `String` (`count`/`isEmpty`/`eq`/sizing) and the compiler's `print` |
 | `base.bytePointer() -> RawPtr` | the reload-aware, tag-aware byte address | stdlib `String` (`byte(at:)`/`eq`/`lt`/copy sources) and the compiler's `print` |
 
-`small`/SSO adds a `fromInline` constructor later (121.3); deferred. With these, `concat` is ordinary Nomu —
-`allocHeap`, then two gc-leaf `memcpy`s from the inputs' `bytePointer()`s — and is GC-safe because
-`allocHeap` is the only safepoint (the inputs ride the shaped-root path across it) and the copies run with no
+`small`/SSO (121.2, done) added a `smallConcat` inline builder alongside these. With these, `concat` is
+ordinary Nomu — for a ≤15-byte result `smallConcat`, else `allocHeap` then two gc-leaf `memcpy`s from the
+inputs' `bytePointer()`s — and the heap path is GC-safe because `allocHeap` is the only safepoint (the inputs
+ride the shaped-root path across it) and the copies run with no
 safepoint between them.
 
 **Single-field-wrapper-is-shaped.** `String` and `StringBase` are representationally identical (one field at
@@ -132,10 +141,10 @@ the `heap` case — `immortal` is skipped as non-moving, `small` holds bytes) pl
 the `heap` buffer still moves and compacts. `word0` is a bare `i64` from the start — the end-state layout —
 so **121.1 depends on 176**, not just the `small` case. The shape descriptor (`managed offset 0 iff
 tag == heap`) is already exercised at 121.1 by the `heap`-vs-`immortal` split: relocate the `heap` buffer,
-skip the permanent `immortal` one. `small` (121.3) adds no GC work — it is a tag value the descriptor already
-excludes, so 121.3 is pure stdlib SSO byte code on the same representation. No interim `addrspace(1)` typing,
-no retype. (The alternative — a reduced-SSO interim where `word0` is typed `addrspace(1)` and retyped at
-121.3 — was rejected as throwaway string work.)
+skip the permanent `immortal` one. `small` (121.2, done) added no GC work — it is a tag value the descriptor
+already excludes, so it was pure stdlib SSO byte code on the same representation. No interim `addrspace(1)`
+typing, no retype. (The alternative — a reduced-SSO interim where `word0` is typed `addrspace(1)` and retyped
+when SSO landed — was rejected as throwaway string work.)
 
 ## The `heap` byte buffer
 
@@ -164,11 +173,13 @@ analysis of [123 copy-on-write](123-copy-on-write.md). Interim, before that infe
 
 ## API surface & index model
 
-- **Byte layer (now):** `count` (bytes), `isEmpty`, `byte(at:) -> UInt8`, slicing to a `String`, `==`,
-  `<`, hashing, `+`/concatenation, `withBytes`, from/to `Array<UInt8>`.
-- **`UnicodeScalarView` (next):** UTF-8 decode, scalar iteration, opaque scalar index (so variable-width
-  access is never mistaken for O(1)).
-- **`GraphemeView` + normalization (later):** cluster iteration; the Unicode-correctness top layer.
+- **Byte layer (121):** `count` (bytes) ✓, `isEmpty` ✓, `byte(at:) -> UInt8` ✓, `==`/`<` (as `eq`/`lt`) ✓,
+  `+`/concatenation (`concat`) ✓ — built; this is the complete byte layer. Relocated: `from`/`to Array<UInt8>`
+  → [120 stdlib](120-stdlib-core.md); slicing (a span) → [185 Substring](185-substring.md); `withBytes` →
+  [152](152-first-class-functions.md); hashing → a future `Dictionary`/hashing task.
+- **Scalar / grapheme views + normalization** → [184 String Unicode views](184-string-unicode-views.md):
+  UTF-8 decode, scalar iteration with an opaque scalar index (variable-width access never mistaken for O(1)),
+  cluster iteration, and the normalization top layer.
 
 ## Compiler coupling (held to two; see *Type layering*)
 
@@ -328,17 +339,11 @@ remaining 121.1 work restructures that into the settled **`StringBase` (internal
     symbols, and re-keys the header `EmptyHeader` → a `StringHeader` once String wants the isASCII /
     scalar-count cache.
   - **121.1.4 — surface, in Nomu.** `struct String { let base: StringBase }`; migrate the byte layer
-    (`count`, `isEmpty`, `byte(at:)`, slicing), `eq`/`lt`, and `concat` off the C-leaf interim into Nomu
-    `String` methods over the four ops; `StringBuilder`. `print` stays compiler-special.
+    (`count`, `isEmpty`, `byte(at:)`), `eq`/`lt`, and `concat` off the C-leaf interim into Nomu `String`
+    methods over the four ops. `print` stays compiler-special. (Slicing → [185 Substring](185-substring.md);
+    `StringBuilder` → the value-semantics/mutation effort, [123](123-copy-on-write.md) — not this phase.)
   - **121.1.5 — retire the builtin.** `strTy` / `.string` / sema literal typing resolve `String` to the Nomu
     struct; the `__string_*` C-leaf interim is removed as its methods move to Nomu.
-**Phase order (reordered):** `small`/SSO is taken **before** `UnicodeScalarView`. SSO changes the
-*representation* (the inline-bytes `small` case lives in the 16-byte value, so every byte-access path must
-learn it) — the risk concentrates there. `UnicodeScalarView` is a decode layer *over* byte indexing: it reads
-the same `count` / `bytePointer` / `byte(at:)` surface whatever the storage, so building it first and then
-changing storage underneath would be the wasteful order. De-risk storage first; deferring the (storage-free)
-scalar view carries no risk. Numbered to match that order.
-
 - **121.2 — `small` / SSO — done + green.** The bit-stealing inline case (up to 15 bytes across
   `word0`/`word1`, tag 0). `small` is a tag the kind-2 GC descriptor already excludes (it scans `word0` only
   for `heap`), so no GC/176 work — verified against the descriptor (`tagOff 8, tagShift 60`, one case `heap`).
@@ -349,11 +354,30 @@ scalar view carries no risk. Numbered to match that order.
   sources into one zeroed slot, set byte 15 = count, load once — no mutate-then-reload of an SSA value). The
   small/heap/immortal split is invisible above `StringBase`. Suite 133/133; a direct check confirms
   `concat` → `small` ≤15 B, `heap` ≥16 B, with `eq`/`byte(at:)`/`print` correct for both under nogc and immix.
-- **121.3 — `UnicodeScalarView`** (UTF-8 decode, scalar iteration, opaque scalar index) — layered on byte
-  indexing, storage-agnostic.
-- **121.4 — compiler-inferred COW** (the [123](123-copy-on-write.md) uniqueness analysis; pessimistic copy
-  until then).
-- **121.5 — `GraphemeView` + normalization.**
+**121 is complete** — the byte-level `String` milestone (immortal + heap + SSO, the full byte surface, GC-safe
+on both collectors) is done and parser-ready. No open phase remains; every follow-on is tracked at its own
+home (below). There is no mutation path, so `String` is immutable today and copies safely share the write-once
+heap buffer — which is why COW does not yet bite.
+
+**Pulled out of 121** (tracked at their own homes):
+
+- **`Array<UInt8>` interop** — `from`/`to Array<UInt8>` → [120 stdlib](120-stdlib-core.md), built when a real
+  consumer (byte-buffer I/O, encoding) lands. No consumer today, and byte reads already go through `byte(at:)`.
+- **Slicing** — a slice is a zero-copy span, not a copying op, so it is the `Substring` feature →
+  [185 Substring](185-substring.md). Slicing returns a `Substring`; `String(sub)` is the explicit copy. No
+  copying-slice stopgap lands in 121 (it would be reworked the moment `Substring` arrives).
+- **`withBytes`** — scoped raw-byte access → needs the closure story to bound the pointer's lifetime (a
+  `small` value's byte pointer is a transient spill that would dangle) → [152 first-class
+  functions](152-first-class-functions.md).
+- **Unicode views** — `UnicodeScalarView`, `GraphemeView`, normalization → [184 String Unicode
+  views](184-string-unicode-views.md). Interpretation layered on the byte core and storage-agnostic, so it
+  need not gate the byte-level type.
+- **Mutation-in-place + copy-on-write** — a mutating `StringBuilder` (the hot append path) and compiler-inferred
+  COW elision → the general *mutation + COW for value types* effort ([123 copy-on-write](123-copy-on-write.md)).
+  `String` is a pure immutable value today with no mutation path, so COW does not yet bite; these land with the
+  value-semantics work, not as String-only phases.
+- **Bounds-checked `byte(at:)`** → [183 precondition / bounds checks](183-precondition-bounds-checks.md)
+  (`byte(at:)` is an unchecked load today).
 
 Prerequisite (separate task): **[176 shaped GC roots](176-shaped-gc-roots.md).**
 

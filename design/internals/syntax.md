@@ -63,6 +63,13 @@ Surface decisions that belong to a subsystem live with that subsystem, so the sy
   - `&` is bitwise-and in expression position and interface composition (`any A & B`) in type position — the two parse contexts are separate. `<<`/`>>` are recombined from two adjacent `<`/`>` tokens in the parser, so nested generic closes (`Box<Box<Int>>`) are unaffected.
   - `- ! ~` desugar in Sema to binary forms (`0 - x`, `x == false`, `x ^ allOnes`), so no unary node reaches NOIR/SSAIR.
   - Open: grouping parentheses `(a + b)` do not parse yet (`plans/tasks/114-grouping-parens.md`); operator overloading via interface conformance is deferred (`generics.md` §10).
+- **String literals** — two forms, both lowering to the same literal (the `String` type/representation is
+  `plans/tasks/121-string-utf8-model.md`):
+  - `"…"` single-line, with escapes `\n` `\t` `\\` `\"` (an unknown escape is the following byte, literally).
+    A raw newline inside `"…"` is allowed and becomes part of the string.
+  - `"""…"""` **block literals**, Swift-style: the opening `"""` is followed by a newline, the closing `"""`
+    sits on its own line, and the whitespace before it is stripped from every content line; the
+    delimiter-adjacent newlines are dropped and a bare `"` needs no escape. — **Decided.**
 
 ---
 
