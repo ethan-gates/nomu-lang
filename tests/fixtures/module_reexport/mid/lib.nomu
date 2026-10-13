@@ -2,6 +2,6 @@
 // mid sees `util_val` without importing util directly.
 public import pkg/util
 
-public fun mid_val() -> Int {
+package fun mid_val() -> Int {
     return 8
 }

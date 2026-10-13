@@ -4,11 +4,11 @@
 // `get()` through the consumer's value-buffer witness table. `T`'s buffer is a typed GC root, so the
 // managed pointer inside the conformer struct is fixed up when the collector evacuates — the dispatch
 // after the spin reads the relocated object.
-public interface Valued {
+package interface Valued {
     fun get() -> Int
 }
 
-public fun spin(n: Int) -> Int {
+package fun spin(n: Int) -> Int {
     var i = 0
     var acc = 0
     while i < n {
@@ -18,7 +18,7 @@ public fun spin(n: Int) -> Int {
     return acc
 }
 
-public fun holdGet<T: Valued>(x: T) -> Int {
+package fun holdGet<T: Valued>(x: T) -> Int {
     let j = spin(400000000)
     return x.get()
 }

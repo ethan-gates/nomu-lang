@@ -1,3 +1,3 @@
-public fun greet() -> Int {
+package fun greet() -> Int {
     return 1
 }

@@ -1,0 +1,1 @@
+{ "name": "p", "dependencies": ["q"], "products": ["extra"] }

@@ -1,4 +1,4 @@
-public fun greet() -> Int { return 2 }
-public struct Val {
+package fun greet() -> Int { return 2 }
+package struct Val {
     let n: Int
 }

@@ -4,11 +4,11 @@ import Foundation
 // Swift host (Foundation; YAML is task 163). Read from `pkg.json` at the package root; the root itself is
 // still marked by `nomu.yaml`. Both file names are interim and subject to change.
 //
-// Contents are the settled contract: package name + version (identity), the `sealed` module list, `bin`
-// executable declarations, and test-module declarations. Dependencies (external-package aliases) and the
-// repo-root workspace section fill in when cross-package linkage lands. Module metadata stays zero — the
-// manifest references modules only as policy lists (sealed / bin / tests), never as an addressing
-// inventory (the filesystem is the module list, modules.md §Modules).
+// Contents are the settled contract: package name + version (identity), the `products` module list (the
+// opt-in external surface), `bin` executable declarations, and test-module declarations. Dependencies (the
+// cross-package allow-list) are a name list; the repo-root workspace section fills in with external pins.
+// Module metadata stays zero — the manifest references modules only as policy lists (products / bin /
+// tests), never as an addressing inventory (the filesystem is the module list, modules.md §Modules).
 //
 // Every section beyond `name` is optional: a name-only manifest is valid, and an absent section defaults
 // to empty. Module paths are package-root-relative with `/` separators; the empty string "" names the
@@ -35,7 +35,7 @@ public struct Manifest: Codable {
     // (or nil for `version` / `defaultModule`). The synthesized Codable decodes a missing optional key as nil.
     private let versionField: String?
     private let defaultModuleField: String?
-    private let sealedField: [String]?
+    private let productsField: [String]?
     private let binField: [Bin]?
     private let testsField: [TestModule]?
     private let dependenciesField: [String]?
@@ -45,7 +45,12 @@ public struct Manifest: Codable {
     // §First-party addressing). A package-root-relative path (`/`-separated); nil when the package
     // designates none — a single-module package's root module is its implicit default, so it needs no entry.
     public var defaultModule: String? { defaultModuleField }
-    public var sealed: [String] { sealedField ?? [] }
+    // The package's **products** (modules.md §Visibility): the opt-in list of modules importable from
+    // outside the package, each a package-root-relative path. Module publicness is opt-in — the default is
+    // package-internal, and `public` is allowed only inside a product module. Replaces the earlier `sealed`
+    // opt-out (a module was public unless sealed); products invert that so encapsulation is the default and
+    // one mechanism covers it. Empty when the package exposes no module. Enforcement rides 187.4.2/187.4.3.
+    public var products: [String] { productsField ?? [] }
     public var bin: [Bin] { binField ?? [] }
     public var tests: [TestModule] { testsField ?? [] }
     // The allow-list of packages this package's modules may import from (task 187.1): each entry is a
@@ -61,7 +66,7 @@ public struct Manifest: Codable {
         case name
         case versionField = "version"
         case defaultModuleField = "default-module"
-        case sealedField = "sealed"
+        case productsField = "products"
         case binField = "bin"
         case testsField = "tests"
         case dependenciesField = "dependencies"

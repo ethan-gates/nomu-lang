@@ -1,0 +1,9 @@
+// `pub_val` is the product's external API; `secret` is a `package`-tier symbol — visible to lib's own
+// modules but not across the package boundary, even though this module is a product (task 187.4.4).
+public fun pub_val() -> Int {
+    return 42
+}
+
+package fun secret() -> Int {
+    return 1
+}

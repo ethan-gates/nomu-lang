@@ -6,7 +6,7 @@ internal struct Hidden {
     let n: Int
 }
 
-public fun leak() -> Hidden {
+package fun leak() -> Hidden {
     return Hidden(n: 7)
 }
 

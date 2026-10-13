@@ -12,20 +12,20 @@ final class ManifestTests: XCTestCase {
         let m = try decode(#"{ "name": "foo" }"#)
         XCTAssertEqual(m.name, "foo")
         XCTAssertNil(m.version)
-        XCTAssertEqual(m.sealed, [])
+        XCTAssertEqual(m.products, [])
         XCTAssertTrue(m.bin.isEmpty)
         XCTAssertTrue(m.tests.isEmpty)
         XCTAssertTrue(m.dependencies.isEmpty)
     }
 
-    // Every section decodes: version, the default module, the sealed list, bin declarations, and tests.
+    // Every section decodes: version, the default module, the products list, bin declarations, and tests.
     func testFullManifest() throws {
         let m = try decode(#"""
         {
           "name": "mypkg",
           "version": "0.1.0",
           "default-module": "core",
-          "sealed": ["internal/secret", "net/raw"],
+          "products": ["core", "net"],
           "bin": [
             { "name": "app", "module": "core" },
             { "name": "tool", "module": "cmd/tool" }
@@ -37,11 +37,20 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(m.name, "mypkg")
         XCTAssertEqual(m.version, "0.1.0")
         XCTAssertEqual(m.defaultModule, "core")
-        XCTAssertEqual(m.sealed, ["internal/secret", "net/raw"])
+        XCTAssertEqual(m.products, ["core", "net"])
         XCTAssertEqual(m.bin.map(\.name), ["app", "tool"])
         XCTAssertEqual(m.bin.map(\.module), ["core", "cmd/tool"])
         XCTAssertEqual(m.tests.map(\.module), ["tests/core"])
         XCTAssertEqual(m.dependencies, ["libfoo", "netutil"])   // the allow-list of package names
+    }
+
+    // Products are opt-in: an absent `products` means the package exposes no module (encapsulated by
+    // default, replacing the `sealed` opt-out), and a present list decodes as the module paths importable
+    // from outside the package.
+    func testProductsOptIn() throws {
+        XCTAssertEqual(try decode(#"{ "name": "p" }"#).products, [])
+        XCTAssertEqual(try decode(#"{ "name": "p", "products": ["api", "net/client"] }"#).products,
+                       ["api", "net/client"])
     }
 
     // Dependencies are a plain allow-list of package names; location/version live elsewhere (markers /

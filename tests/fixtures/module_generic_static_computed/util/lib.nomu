@@ -3,7 +3,7 @@
 // `b.held` / `b.flag` route through the witness ABI with the receiver's type-arg VWT; an erased-`T`
 // getter returns by sret. A static method on a generic type is the producer's erased generic free
 // function: `Box<Int>.of(…)` threads the instantiation's VWT like a generic function call.
-public struct Box<T> {
+package struct Box<T> {
     var value: T
     var held: T { value }                // erased-T computed property (sret return)
     var flag: Int {
@@ -13,7 +13,7 @@ public struct Box<T> {
     static fun of(x: T) -> Box<T> { return Box(value: x) }
 }
 
-public enum Opt<T> {
+package enum Opt<T> {
     case some(value: T)
     case none
     var isSome: Bool {                    // computed property on a generic enum (switch self)

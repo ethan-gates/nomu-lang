@@ -6,13 +6,13 @@
 // `Box<T>` is a **value** (struct) receiver: its mutating-ness crosses in the `.nmi`, so the consumer
 // passes `self` by its real storage and the mutation sticks past the call. `Ref<T>` is a **reference**
 // (class) receiver: `self` is the shared object, so the write is visible through any handle.
-public struct Box<T> {
+package struct Box<T> {
     var value: T
     fun get() -> T { return value }
     fun replace(x: T) { value = x }
 }
 
-public class Ref<T> {
+package class Ref<T> {
     var value: T
     fun get() -> T { return value }
     fun replace(x: T) { value = x }

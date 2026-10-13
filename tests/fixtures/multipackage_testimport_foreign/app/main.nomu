@@ -1,0 +1,8 @@
+// A `test import` of the foreign package `lib` is rejected (task 187.4.5): white-box access never crosses
+// a package boundary. A plain `import lib` would be the correct, black-box form.
+test import lib
+
+fun main() {
+    print(lib.pub_val())
+    print("\n")
+}

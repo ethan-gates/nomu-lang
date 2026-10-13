@@ -1,0 +1,3 @@
+# Workspace for the mangler-identity test (task 187.6): two packages each export a `val`, and a consumer
+# uses both. Workspace-relative symbol identity keeps them distinct, so they link and coexist.
+name: mpcoexist

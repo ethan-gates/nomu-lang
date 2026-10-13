@@ -2,7 +2,7 @@
 // producer compiles `get`/`tagged` once **erased** over `T`; the consumer dispatches through the
 // witness ABI, threading the receiver instantiation's type-argument VWT — no monomorphized method
 // body crosses. `get` returns the erased `T` (sret buffer); `tagged` returns a concrete `Bool`.
-public struct Box<T> {
+package struct Box<T> {
     var value: T
     fun get() -> T { return value }
     fun tagged() -> Bool { return true }

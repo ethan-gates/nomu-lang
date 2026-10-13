@@ -46,10 +46,15 @@ incremental self-host tractable — and why MMTk stays live until the benchmark 
 collector before retirement. Two self-hosting-infra items branch off the modules rung and don't sit on
 the LXR chain: [174](tasks/174-prelude-as-packages.md) (prelude-as-packages — its three prerequisites are
 done, so it is the goal they were gating; couples with [149](tasks/149-runtime-subset.md) runtime-subset
-by module membership) and [173](tasks/173-package-model-driver-cli.md) (package model + the single-binary
-`nomu` driver — `compile`/`build`/`run`/`test`/`query`, **built and green**; its cross-package concerns —
-external dependencies, seal enforcement, the `package` tier across the boundary — are spun out to
-[187](tasks/187-multi-package-builds.md), which turns the single-package driver into multi-package builds).
+by module membership) and the **packaging sub-stack** off [173](tasks/173-package-model-driver-cli.md)
+(package model + the single-binary `nomu` driver — `compile`/`build`/`run`/`test`/`query`, **built**). Its
+cross-package concerns landed in [187](tasks/187-multi-package-builds.md) — **multi-package builds within one
+workspace, built and green** (graph spans packages, workspace-relative mangling identity, the package
+dependency DAG, and the full `products`/`package`-tier/`public`⟺product visibility boundary). The
+external-workspace continuation is deferred to its own rungs: [188](tasks/188-multi-local-workspace-builds.md)
+(cross-workspace linkage by local path — sidesteps dependency management) then
+[189](tasks/189-multi-remote-workspace-builds.md) (registries + version/dependency resolution + lockfile —
+the last rung).
 
 ---
 

@@ -2,7 +2,7 @@
 // producer compiles `present`/`orElse` once **erased** over `T`; the consumer dispatches through the
 // witness ABI, threading the receiver instantiation's type-argument VWT. `switch self` reads the tag off
 // the erased self buffer (single load), and an erased-`T` payload (`orElse`) is returned by sret.
-public enum Opt<T> {
+package enum Opt<T> {
     case some(value: T)
     case none
     fun present() -> Bool {
@@ -19,6 +19,6 @@ public enum Opt<T> {
     }
 }
 
-public fun wrapOpt<T>(x: T) -> Opt<T> {
+package fun wrapOpt<T>(x: T) -> Opt<T> {
     return .some(value: x)
 }

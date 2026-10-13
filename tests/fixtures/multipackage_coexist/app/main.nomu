@@ -1,0 +1,9 @@
+// Two dependency packages each export a `val`; the consumer uses both. Workspace-relative symbol identity
+// (task 187.3) keeps `liba`'s and `libb`'s `val` distinct, so both link and coexist (task 187.6).
+import liba
+import libb
+
+fun main() {
+    print(liba.val() + libb.val())    // 30
+    print("\n")
+}

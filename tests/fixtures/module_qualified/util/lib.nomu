@@ -1,7 +1,9 @@
-public fun util_val() -> Int {
+// `package` tier (task 187.4.4): `util` is an internal helper module (not a product), so it shares its
+// symbols with package siblings via `package`, not `public`. The entry module, same package, admits them.
+package fun util_val() -> Int {
     return 42
 }
-public struct Point {
+package struct Point {
     let x: Int
     let y: Int
 }

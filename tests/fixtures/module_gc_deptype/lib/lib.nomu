@@ -5,16 +5,16 @@
 // evacuations, so the collector must resolve this dependency's descriptors across the boundary — the
 // object sizes for the copy and `Holder`'s pointer map for the `inner` slot fixup — or a post-collection
 // field read yields a moved-from address.
-public class Inner {
+package class Inner {
     var v: Int
 }
 
-public class Holder {
+package class Holder {
     var inner: Inner
     var tag: Int
 }
 
-public fun makeHolder(a: Int, b: Int) -> Holder {
+package fun makeHolder(a: Int, b: Int) -> Holder {
     return Holder(inner: Inner(v: a), tag: b)
 }
 
@@ -24,7 +24,7 @@ fun sink(x: Inner) -> Int {
 
 // Allocates heap garbage (each `Inner` escapes into `sink`) to drive GC-stress collections while the
 // caller's `Holder` stays live.
-public fun churn(n: Int) -> Int {
+package fun churn(n: Int) -> Int {
     var acc = 0
     var i = 0
     while i < n {

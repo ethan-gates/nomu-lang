@@ -1,0 +1,8 @@
+// `greetlib` is a real in-workspace package, but `app`'s manifest does not list it under `dependencies`
+// — imports are strict / non-transitive (task 187.3), so this is rejected rather than silently allowed.
+import greetlib
+
+fun main() {
+    print(greetlib.greeting())
+    print("\n")
+}

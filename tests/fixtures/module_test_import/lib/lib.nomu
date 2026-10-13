@@ -1,9 +1,9 @@
-// Internal (the module-default visibility): absent from `lib`'s public interface, so only a `test import`
+// Internal (the module-default visibility): absent from `lib`'s package interface, so only a `test import`
 // reaches it. A public wrapper exists to show the public surface is unchanged.
 fun secret_answer() -> Int {
     return 42
 }
 
-public fun lib_name() -> Int {
+package fun lib_name() -> Int {
     return secret_answer()
 }

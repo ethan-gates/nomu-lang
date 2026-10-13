@@ -2,10 +2,10 @@
 // `--mono` the consumer injects both `.bir` bodies; `relay`'s reference to `echo` was canonicalized to
 // the origin-keyed name at export, so the injected `relay<Int>` calls the injected `echo<Int>` and both
 // specialize transitively (whole-tree, matching whole-program mono).
-public fun echo<T>(x: T) -> T {
+package fun echo<T>(x: T) -> T {
     return x
 }
 
-public fun relay<T>(x: T) -> T {
+package fun relay<T>(x: T) -> T {
     return echo(x)
 }

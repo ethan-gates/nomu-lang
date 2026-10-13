@@ -3,7 +3,7 @@
 // consumer links to. A computed property lowers to accessor methods (`area.get`, `scale.get`/`.set`); a
 // mutating setter carries its self-by-pointer ABI in the `.nmi` (InterfaceProperty.setterMutating), the
 // same model as an imported mutating method.
-public struct Rect {
+package struct Rect {
     var w: Int
     var h: Int
     var area: Int { w * h }              // read-only computed property
@@ -16,7 +16,7 @@ public struct Rect {
     }
 }
 
-public enum Shape {
+package enum Shape {
     case dot
     case square(side: Int)
     var area: Int {                      // computed property on a generic-free enum

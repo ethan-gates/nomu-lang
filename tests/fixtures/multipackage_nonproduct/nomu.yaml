@@ -1,0 +1,3 @@
+# Workspace for the product-gate test (task 187.4.2): `app` declares `greetlib` as a dependency, but
+# `greetlib` lists no products, so its module is not importable from outside the package.
+name: mpnonprod

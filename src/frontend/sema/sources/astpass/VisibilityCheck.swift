@@ -11,7 +11,31 @@ import support
 // The rule uses the visibility rank (`private < internal < package < public`). Only a type declared in
 // this module can carry sub-`public` visibility; imported types are public and builtins are always
 // visible, so a referenced name absent from the module's type table is treated as visible.
-public func checkVisibilityConsistency(_ program: Program, into diags: DiagnosticSink) {
+public func checkVisibilityConsistency(_ program: Program, into diags: DiagnosticSink, isProduct: Bool = true) {
+    // `public` ⟺ product (task 187.4.3; modules.md §Visibility): `public` means "external API", allowed
+    // only inside a product module. A `public` symbol in a non-product module is a hard error — the remedy
+    // is `package` (share with package siblings) or listing the module under the package's `products`. So a
+    // stray `public` can never leak an internal module, and exposing one stays two deliberate acts.
+    if !isProduct {
+        func flag(_ kind: String, _ name: String, _ v: Visibility, _ span: Span) {
+            guard v == .public else { return }
+            diags.error("public \(kind) '\(name)' in a non-product module — only a product module may "
+                      + "expose `public` symbols; use `package` for in-package sharing, or add this module "
+                      + "to the package's 'products'", at: span)
+        }
+        for decl in program.decls {
+            switch decl {
+            case .funcDecl(let d):      flag("function", d.name, d.visibility, d.span)
+            case .structDecl(let d):    flag("struct", d.name, d.visibility, d.span)
+            case .classDecl(let d):     flag("class", d.name, d.visibility, d.span)
+            case .enumDecl(let d):      flag("enum", d.name, d.visibility, d.span)
+            case .actorDecl(let d):     flag("actor", d.name, d.visibility, d.span)
+            case .interfaceDecl(let d): flag("interface", d.name, d.visibility, d.span)
+            case .extensionDecl:        break
+            }
+        }
+    }
+
     // Every user type's declared visibility, by name.
     var vis: [String: Visibility] = [:]
     for decl in program.decls {

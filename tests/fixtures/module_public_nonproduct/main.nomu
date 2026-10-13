@@ -1,0 +1,11 @@
+// `public` ⟺ product (task 187.4.3): this module is not a product of package `p` (its `pkg.json` lists
+// none), so a `public` symbol here is a hard error — the remedy is `package`, or listing the module as a
+// product.
+public fun leak() -> Int {
+    return 1
+}
+
+fun main() {
+    print(leak())
+    print("\n")
+}

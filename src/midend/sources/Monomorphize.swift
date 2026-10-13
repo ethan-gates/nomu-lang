@@ -74,13 +74,13 @@ private final class Monomorphizer {
             while let w = funcWork.popLast() { specializeFunc(w.base, w.args) }
             while let w = typeWork.popLast() { specializeType(w.base, w.args) }
         }
-        // A public generic function is also emitted **erased**, under its bare symbol, so a
-        // consumer module can call it through runtime witnesses (the debug baseline; the
-        // call-site witness-argument ABI is 100.4.3.4). Type parameters are retained: residual
-        // `.typeParam` survives into codegen, which lowers it to a VWT-driven opaque buffer.
-        // Gated to public — internal generics stay monomorphized-only (emitted above).
+        // An **exported** generic function (`public` cross-package, or `package` same-package — task
+        // 187.4.4) is also emitted **erased**, under its bare symbol, so a consumer module can call it
+        // through runtime witnesses (the debug baseline; the call-site witness-argument ABI is 100.4.3.4).
+        // Type parameters are retained: residual `.typeParam` survives into codegen, which lowers it to a
+        // VWT-driven opaque buffer. `internal`/`private` generics stay monomorphized-only (emitted above).
         for decl in module.decls {
-            if case .funcDecl(let f) = decl, !f.generics.isEmpty, f.visibility == .public {
+            if case .funcDecl(let f) = decl, !f.generics.isEmpty, f.visibility >= .package {
                 out.append(.funcDecl(f))
             }
         }

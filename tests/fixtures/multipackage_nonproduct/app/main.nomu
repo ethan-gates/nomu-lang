@@ -1,0 +1,8 @@
+// `greetlib` is declared in `dependencies`, so the allow-list admits it — but `greetlib` lists no
+// `products`, so its module is package-internal and this cross-package import is rejected (task 187.4.2).
+import greetlib
+
+fun main() {
+    print(greetlib.greeting())
+    print("\n")
+}

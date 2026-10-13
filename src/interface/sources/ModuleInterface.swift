@@ -165,10 +165,14 @@ public struct InterfaceFunc: Codable, Equatable {
     // consumer calling this method needs a mutable receiver. Optional so a `.nmi` written before this
     // field decodes as "unknown" rather than failing (the `.nmi` is build-internal and regenerated).
     public var isMutating: Bool?
+    // The declared visibility of a **free function** (task 187.4.4). `public` is admitted by any consumer;
+    // `package` only by a consumer in the same package; `internal` only by a white-box test importer. Unset
+    // on a method (its exposure follows its owning type) and on an older `.nmi` — both read as `public`.
+    public var visibility: Visibility?
     public init(name: String, generics: [InterfaceGeneric] = [], params: [InterfaceParam],
-                ret: String?, isStatic: Bool = false, isMutating: Bool? = nil) {
+                ret: String?, isStatic: Bool = false, isMutating: Bool? = nil, visibility: Visibility? = nil) {
         self.name = name; self.generics = generics; self.params = params; self.ret = ret; self.isStatic = isStatic
-        self.isMutating = isMutating
+        self.isMutating = isMutating; self.visibility = visibility
     }
 }
 public struct InterfaceParam: Codable, Equatable {
@@ -196,10 +200,14 @@ public struct InterfaceType: Codable, Equatable {
     public var keyword: String; public var name: String; public var generics: [InterfaceGeneric]
     public var fields: [InterfaceField]; public var properties: [InterfaceProperty]
     public var methods: [InterfaceFunc]; public var conformances: [String]
+    // The type's declared visibility (task 187.4.4); nil (an older `.nmi`) reads as `public`.
+    public var visibility: Visibility?
     public init(keyword: String, name: String, generics: [InterfaceGeneric] = [], fields: [InterfaceField],
-                properties: [InterfaceProperty] = [], methods: [InterfaceFunc] = [], conformances: [String] = []) {
+                properties: [InterfaceProperty] = [], methods: [InterfaceFunc] = [], conformances: [String] = [],
+                visibility: Visibility? = nil) {
         self.keyword = keyword; self.name = name; self.generics = generics; self.fields = fields
         self.properties = properties; self.methods = methods; self.conformances = conformances
+        self.visibility = visibility
     }
 }
 public struct InterfaceField: Codable, Equatable {
@@ -212,10 +220,14 @@ public struct InterfaceField: Codable, Equatable {
 public struct InterfaceEnum: Codable, Equatable {
     public var name: String; public var generics: [InterfaceGeneric]; public var cases: [InterfaceCase]
     public var properties: [InterfaceProperty]; public var methods: [InterfaceFunc]; public var conformances: [String]
+    // The enum's declared visibility (task 187.4.4); nil (an older `.nmi`) reads as `public`.
+    public var visibility: Visibility?
     public init(name: String, generics: [InterfaceGeneric] = [], cases: [InterfaceCase],
-                properties: [InterfaceProperty] = [], methods: [InterfaceFunc] = [], conformances: [String] = []) {
+                properties: [InterfaceProperty] = [], methods: [InterfaceFunc] = [], conformances: [String] = [],
+                visibility: Visibility? = nil) {
         self.name = name; self.generics = generics; self.cases = cases
         self.properties = properties; self.methods = methods; self.conformances = conformances
+        self.visibility = visibility
     }
 }
 public struct InterfaceCase: Codable, Equatable {
@@ -229,9 +241,12 @@ public struct InterfaceCase: Codable, Equatable {
 public struct InterfaceProtocol: Codable, Equatable {
     public var name: String; public var refines: [String]
     public var methods: [InterfaceMethodReq]; public var properties: [InterfaceProperty]
+    // The interface's declared visibility (task 187.4.4); nil (an older `.nmi`) reads as `public`.
+    public var visibility: Visibility?
     public init(name: String, refines: [String] = [], methods: [InterfaceMethodReq] = [],
-                properties: [InterfaceProperty] = []) {
+                properties: [InterfaceProperty] = [], visibility: Visibility? = nil) {
         self.name = name; self.refines = refines; self.methods = methods; self.properties = properties
+        self.visibility = visibility
     }
 }
 public struct InterfaceMethodReq: Codable, Equatable {
@@ -279,11 +294,20 @@ private func renderConformances(_ cs: [Conformance]) -> [String] { cs.map(\.name
 // (everything but `private`), for a module reached through a `test import` (modules.md §Tests). A test
 // module then sees its target's non-public API; non-public symbols already carry external linkage in the
 // target's object, so admitting them to the interface is the whole mechanism.
-public func buildInterface(_ program: Program, package: String, module: ModuleID, packageRoot: String,
-                           facts: FactStore = FactStore(), whiteBox: Bool = false) -> ModuleInterface {
-    func inModule(_ span: Span) -> Bool { moduleID(forFile: span.file, packageRoot: packageRoot) == module }
-    // `public` only, unless this module is test-imported — then `internal`/`package` are exposed too.
-    func exported(_ v: Visibility) -> Bool { whiteBox ? v >= .internal : v == .public }
+//
+// `module` is the module's workspace-relative identity (task 187.3) and `moduleIDRoot` the root that
+// identity is measured from (the workspace root), so `inModule` and the recorded `modulePath` are keyed
+// the same way the compile graph is. `reexportModulePath` resolves a `public import` to the re-exported
+// module's identity components (the driver owns cross-package resolution); a nil result skips that import.
+public func buildInterface(_ program: Program, package: String, module: ModuleID, moduleIDRoot: String,
+                           facts: FactStore = FactStore(), whiteBox: Bool = false,
+                           reexportModulePath: (ImportDecl) -> [String]? = { _ in nil }) -> ModuleInterface {
+    func inModule(_ span: Span) -> Bool { moduleID(forFile: span.file, packageRoot: moduleIDRoot) == module }
+    // What crosses the module boundary (task 187.4.4): `public` + `package` normally, widened to `internal`
+    // for a white-box `test import` target. Each decl is tagged with its visibility so the consumer admits
+    // it only where the tier allows — a cross-package consumer takes `public` only; a same-package sibling
+    // also takes `package`; a white-box test importer also takes `internal`. `private` never crosses.
+    func exported(_ v: Visibility) -> Bool { whiteBox ? v >= .internal : v >= .package }
 
     var types: [InterfaceType] = []
     var enums: [InterfaceEnum] = []
@@ -293,21 +317,21 @@ public func buildInterface(_ program: Program, package: String, module: ModuleID
         switch decl {
         case .funcDecl(let f) where exported(f.visibility) && inModule(f.span):
             funcs.append(InterfaceFunc(name: f.name, generics: renderGenerics(f.generics),
-                params: renderParams(f.params), ret: f.returnType.map(renderType)))
+                params: renderParams(f.params), ret: f.returnType.map(renderType), visibility: f.visibility))
         case .structDecl(let s) where exported(s.visibility) && inModule(s.span):
             types.append(InterfaceType(keyword: "struct", name: s.name, generics: renderGenerics(s.generics),
                 fields: s.fields.map { InterfaceField(name: $0.name, type: renderType($0.type), isMutable: $0.isMutable) },
                 properties: renderProperties(s.name, s.properties, facts), methods: renderMethods(s.name, s.methods, facts),
-                conformances: renderConformances(s.conformances)))
+                conformances: renderConformances(s.conformances), visibility: s.visibility))
         case .classDecl(let c) where exported(c.visibility) && inModule(c.span):
             types.append(InterfaceType(keyword: "class", name: c.name, generics: renderGenerics(c.generics),
                 fields: c.fields.map { InterfaceField(name: $0.name, type: renderType($0.type), isMutable: $0.isMutable) },
                 properties: renderProperties(c.name, c.properties, facts), methods: renderMethods(c.name, c.methods, facts),
-                conformances: renderConformances(c.conformances)))
+                conformances: renderConformances(c.conformances), visibility: c.visibility))
         case .enumDecl(let e) where exported(e.visibility) && inModule(e.span):
             enums.append(InterfaceEnum(name: e.name, generics: renderGenerics(e.generics), cases: renderCases(e.cases),
                 properties: renderProperties(e.name, e.properties, facts), methods: renderMethods(e.name, e.methods, facts),
-                conformances: renderConformances(e.conformances)))
+                conformances: renderConformances(e.conformances), visibility: e.visibility))
         case .interfaceDecl(let i) where exported(i.visibility) && inModule(i.span):
             let methods = i.methods.map { m in
                 InterfaceMethodReq(name: m.name, params: renderParams(m.params), ret: m.returnType.map(renderType),
@@ -316,17 +340,18 @@ public func buildInterface(_ program: Program, package: String, module: ModuleID
             let props = i.properties.map { InterfaceProperty(name: $0.name, type: renderType($0.type), isSettable: $0.isSettable) }
                 .sorted { $0.name < $1.name }
             interfaces.append(InterfaceProtocol(name: i.name, refines: i.refines.map(\.name).sorted(),
-                                                methods: methods, properties: props))
+                                                methods: methods, properties: props, visibility: i.visibility))
         default:
             break
         }
     }
-    // Re-export edges (task 100.2.4): the module's `public import`s of first-party (`pkg/…`) modules.
-    // External-package public imports await cross-package linkage, so they are not recorded yet.
+    // Re-export edges (task 100.2.4): the module's `public import`s, resolved to the re-exported module's
+    // workspace-relative identity (task 187.3 — a `public import` may now cross a package boundary; the
+    // driver's resolver returns nil for one that does not resolve, e.g. a deferred external workspace).
     var reexports: [InterfaceRef] = []
     for imp in program.imports {
-        guard imp.isPublic, case .pkg = imp.root else { continue }
-        reexports.append(InterfaceRef(package: package, modulePath: imp.path))
+        guard imp.isPublic, let comps = reexportModulePath(imp) else { continue }
+        reexports.append(InterfaceRef(package: package, modulePath: comps))
     }
     reexports.sort { $0.modulePath.lexicographicallyPrecedes($1.modulePath) }
 

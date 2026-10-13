@@ -1,0 +1,11 @@
+// The dependency package `greetlib` (a single-module package: its source sits at the package root). Its
+// public surface is what crosses the package boundary — a free function and a type with a method, linked
+// into the consumer from this package's separately-compiled object.
+public fun greeting() -> Int {
+    return 42
+}
+
+public struct Box {
+    let v: Int
+    fun plus(by: Int) -> Int { return v + by }
+}

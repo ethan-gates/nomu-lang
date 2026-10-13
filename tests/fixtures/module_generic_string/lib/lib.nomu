@@ -14,7 +14,7 @@ fun spin(n: Int) -> Int {
     return acc
 }
 
-public fun hold<T>(x: T) -> T {
+package fun hold<T>(x: T) -> T {
     let j = spin(400000000)
     return x
 }

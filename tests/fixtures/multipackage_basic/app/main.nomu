@@ -1,0 +1,13 @@
+// Cross-package build (task 187.3): the consumer package `app` imports another in-workspace package
+// `greetlib` by its name, reaches its public function and type across the package boundary, and links
+// against its separately-compiled object. The dependency is discovered by its `pkg.json` marker (no path
+// in the manifest) and admitted only because `app`'s `dependencies` lists it.
+import greetlib
+
+fun main() {
+    print(greetlib.greeting())        // 42
+    print("\n")
+    let b = greetlib.Box(v: 20)
+    print(b.plus(by: 22))             // 42
+    print("\n")
+}

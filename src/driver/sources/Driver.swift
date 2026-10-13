@@ -41,20 +41,31 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     // package's — one workspace has a single build tree shared by its packages. Falls back to the package
     // root when there is no workspace marker. (Package identity + module IDs stay package-relative, above.)
     let workspaceRoot = findWorkspaceRoot(for: input)
+    let wsRootPath = workspaceRoot.path
+    // The workspace name (modules.md §Manifest): the first segment of every library symbol's canonical
+    // identity, so a workspace's objects are safe to link into another workspace as an external. Read
+    // minimally from the `nomu.yaml` `name:` line (full YAML is task 163); falls back to the workspace
+    // directory's name when unset. External-workspace support (task 187.5) threads a dependency's own name
+    // from its `.nmi`; within one workspace every module shares this name.
+    let workspaceName = readWorkspaceName(wsRootPath) ?? workspaceRoot.lastPathComponent
 
-    // Dependency intermediates (`__mod_*.o` / `.bir`) share the workspace `build/`, so their names must be
-    // unique across every package in the workspace — not merely within this package. Key them by the
-    // module's **workspace-relative** path (the package's path under the workspace root, then the module's
-    // package-relative components), so two packages with a same-named module (`util`) never collide.
-    let packagePrefixComponents: [String] = {
-        guard packageRoot.hasPrefix(workspaceRoot.path) else { return [] }
-        var rel = String(packageRoot.dropFirst(workspaceRoot.path.count))
-        while rel.hasPrefix("/") { rel.removeFirst() }
-        return rel.isEmpty ? [] : rel.split(separator: "/").map(String.init)
-    }()
+    // A module's identity across the whole workspace: its directory path relative to the **workspace**
+    // root (not its package). Two packages with a same-named module then never collide — in the compile
+    // graph, in the `build/` intermediates, or in mangled symbols. The graph, every per-module table, and
+    // the mangling origin are all keyed by this.
+    func graphID(forDir dir: String) -> ModuleID { moduleID(forDir: dir, packageRoot: wsRootPath) }
+    func graphID(forFile file: String) -> ModuleID { moduleID(forFile: file, packageRoot: wsRootPath) }
+    // The canonical mangling/origin vocabulary of a module (task 187.3): `workspace-name` + the module's
+    // workspace-relative path. The producer mangles its library symbols under this key and a consumer
+    // derives the identical key for an imported symbol, so a cross-package (and, with 187.5, cross-
+    // workspace) reference links to the one definition. Prelude/runtime symbols are exempt (bare, folded
+    // weak-ODR); the entry binary is bare too — nothing imports it.
+    func mangleOrigin(_ id: ModuleID) -> [String] { [workspaceName] + id.components }
+
+    // Dependency intermediates (`__mod_*.o` / `.bir`) share the workspace `build/`, so they are keyed by
+    // the module's workspace-relative path — unique across every package in the workspace.
     func modArtifactStem(_ id: ModuleID) -> String {
-        let comps = packagePrefixComponents + id.components
-        return comps.isEmpty ? "root" : comps.joined(separator: "_")
+        id.components.isEmpty ? "root" : id.components.joined(separator: "_")
     }
 
     // The package identity comes from the manifest (`pkg.json` at the root), or a default when there is
@@ -84,11 +95,85 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     var testImportTargets = Set<ModuleID>()
     var totalBytes = 0, tokenCount = 0
 
-    let entryID = moduleID(forFile: primary, packageRoot: packageRoot)
+    // Each discovered module's home (task 187.3): the package it lives in — anchoring `pkg/…` resolution
+    // and carrying that package's cross-package dependency allow-list and name (for the `.nmi` identity and
+    // the package-level DAG check).
+    struct ModuleHome { let packageRoot: String; let packageName: String; let declaredDeps: [String] }
+    var moduleHome: [ModuleID: ModuleHome] = [:]
+
+    // Manifests, cached per package root (the entry's is already loaded). The in-workspace package registry
+    // (task 187.2) is built once, lazily — only a cross-package import needs it, so a single-package build
+    // never scans the tree. A duplicate package name surfaces as a resolution error on the first
+    // `.package_` import.
+    var manifestCache: [String: Manifest?] = [packageRoot: manifest]
+    func manifestFor(_ pkgRoot: String) -> Manifest? {
+        if let m = manifestCache[pkgRoot] { return m }
+        let m = (try? loadManifest(packageRoot: pkgRoot)) ?? nil
+        manifestCache[pkgRoot] = m
+        return m
+    }
+    var packageRegistry: [String: String]? = nil
+    var registryError: String? = nil
+    func workspaceRegistry() -> [String: String]? {
+        if let r = packageRegistry { return r }
+        if registryError != nil { return nil }
+        do { let r = try scanWorkspacePackages(workspaceRoot: wsRootPath); packageRegistry = r; return r }
+        catch { registryError = "\(error)"; return nil }
+    }
+
+    // The inter-package dependency edges actually exercised (importer package → imported packages). The
+    // package graph must be a DAG — a rule stronger than the module-import-acyclicity check (task 187.3):
+    // `P` → `Q` → `P` is an error even when no single module cycle exists.
+    var pkgDeps: [String: Set<String>] = [:]
+
+    // Resolve one import from a module in `home` to its target module directory. A `pkg/…` import stays in
+    // the importer's own package; a bare-package import resolves across the workspace (task 187.2),
+    // enforcing the strict allow-list. `crossPackage` names the imported package, for the package edge.
+    enum ImportResolve { case ok(dir: String, packageRoot: String, crossPackage: String?); case failed(String) }
+    func resolveImport(_ imp: ImportDecl, from home: ModuleHome) -> ImportResolve {
+        switch imp.root {
+        case .pkg:
+            return .ok(dir: ([home.packageRoot] + imp.path).joined(separator: "/"),
+                       packageRoot: home.packageRoot, crossPackage: nil)
+        case .package_(let name):
+            guard let registry = workspaceRegistry() else {
+                return .failed(registryError ?? "cannot resolve package '\(name)': no workspace")
+            }
+            switch resolvePackageImport(package: name, path: imp.path,
+                                        declaredDeps: home.declaredDeps, registry: registry) {
+            case .module(let dir):
+                // Product gate (task 187.4.2; modules.md §Visibility): a cross-package import reaches a
+                // module only if it is one of the target package's `products`. Match the imported module's
+                // package-relative path against the list ("" is the single-module package's root). Products
+                // gate permission, not identity — the path still names the module, the list only admits it.
+                let pkgDir = registry[name] ?? home.packageRoot
+                let relPath = moduleID(forDir: dir, packageRoot: pkgDir).components.joined(separator: "/")
+                guard (manifestFor(pkgDir)?.products ?? []).contains(relPath) else {
+                    let shown = relPath.isEmpty ? "(default module)" : relPath
+                    return .failed("module '\(shown)' is not a product of package '\(name)' — list it "
+                                 + "under 'products' in that package's pkg.json")
+                }
+                return .ok(dir: dir, packageRoot: pkgDir, crossPackage: name)
+            case .notDeclared(let p):
+                return .failed("package '\(p)' is not listed in this package's 'dependencies'")
+            case .external(let p):
+                return .failed("package '\(p)' is external — external workspaces are not supported yet")
+            case .noModule(let p):
+                let sub = imp.path.isEmpty ? "(default module)" : imp.path.joined(separator: "/")
+                return .failed("no module '\(sub)' in package '\(p)'")
+            }
+        }
+    }
+
+    let entryID = graphID(forFile: primary)
     seenModule.insert(entryID); graph.addNode(entryID)
+    moduleHome[entryID] = ModuleHome(packageRoot: packageRoot, packageName: packageName,
+                                     declaredDeps: manifest?.dependencies ?? [])
     var worklist: [(id: ModuleID, files: [String])] = [(entryID, paths)]
     while !worklist.isEmpty {
         let (modID, files) = worklist.removeFirst()
+        let home = moduleHome[modID]
+            ?? ModuleHome(packageRoot: packageRoot, packageName: packageName, declaredDeps: [])
         for file in files {
             guard let text = try? String(contentsOfFile: file, encoding: .utf8) else {
                 fputs("error: cannot read '\(file)'\n", stderr)
@@ -106,20 +191,47 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
             }
             parsedByModule[modID, default: []].append(SourceFile(path: file, decls: prog.decls, imports: prog.imports))
             for imp in prog.imports {
-                guard let dir = resolvePkgImportDir(imp, packageRoot: packageRoot) else { continue }
-                let depID = moduleID(forDir: dir, packageRoot: packageRoot)
-                graph.addEdge(from: modID, to: depID)
-                if imp.isTest { testImportTargets.insert(depID) }
-                if seenModule.insert(depID).inserted {
-                    let depFiles = scanModuleFiles(dir)
-                    if depFiles.isEmpty {
-                        parseDiags.error("no module found at 'pkg/\(imp.path.joined(separator: "/"))'", at: imp.span)
-                    } else {
-                        worklist.append((depID, depFiles))
+                switch resolveImport(imp, from: home) {
+                case .failed(let msg):
+                    parseDiags.error(msg, at: imp.span)
+                case .ok(let dir, let depPkgRoot, let crossPackage):
+                    let depID = graphID(forDir: dir)
+                    graph.addEdge(from: modID, to: depID)
+                    if let crossPackage { pkgDeps[home.packageName, default: []].insert(crossPackage) }
+                    // `test import` is same-package only (task 187.4.5): white-box widening into a foreign
+                    // package's internals is forbidden — a cross-package import is always black-box, so a
+                    // package's encapsulation holds even against a foreign test. A same-package test import
+                    // (`pkg/…`, `crossPackage == nil`) grants the white-box target.
+                    if imp.isTest {
+                        if let crossPackage {
+                            parseDiags.error("'test import' may not cross a package boundary — '\(crossPackage)' "
+                                + "is a foreign package, always black-box; use a plain 'import'", at: imp.span)
+                        } else {
+                            testImportTargets.insert(depID)
+                        }
+                    }
+                    if seenModule.insert(depID).inserted {
+                        let depFiles = scanModuleFiles(dir)
+                        if depFiles.isEmpty {
+                            parseDiags.error("no module found at '\(imp.path.joined(separator: "/"))'", at: imp.span)
+                        } else {
+                            let m = manifestFor(depPkgRoot)
+                            moduleHome[depID] = ModuleHome(packageRoot: depPkgRoot,
+                                                           packageName: m?.name ?? defaultPackageName,
+                                                           declaredDeps: m?.dependencies ?? [])
+                            worklist.append((depID, depFiles))
+                        }
                     }
                 }
             }
         }
+    }
+
+    // Package-level dependency cycle (task 187.3): the inter-package graph must be a DAG.
+    if let ring = packageDependencyCycle(pkgDeps) {
+        fputs("error: package dependency cycle: " + ring.joined(separator: " → ") + "\n", stderr)
+        timings.report()
+        return false
     }
     timings.bytes = totalBytes
     timings.tokens = tokenCount
@@ -210,6 +322,51 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         }
         return order
     }
+    // Two modules share a package iff they have the same package root (task 187.4.4).
+    func sharePackage(_ a: ModuleID, _ b: ModuleID) -> Bool {
+        guard let pa = moduleHome[a]?.packageRoot, let pb = moduleHome[b]?.packageRoot else { return a == b }
+        return pa == pb
+    }
+    // The modules `m` reaches through a `test import` (white-box), resolved to graph IDs. Same-package
+    // only (task 187.4.5): a cross-package test import (`crossPackage != nil`) grants no white-box access —
+    // it is a discovery-time error, and never widens admission here.
+    func testImports(of m: ModuleID) -> Set<ModuleID> {
+        guard let home = moduleHome[m] else { return [] }
+        var out = Set<ModuleID>()
+        for f in parsedByModule[m] ?? [] {
+            for imp in f.imports where imp.isTest {
+                if case .ok(let dir, _, let crossPackage) = resolveImport(imp, from: home), crossPackage == nil {
+                    out.insert(graphID(forDir: dir))
+                }
+            }
+        }
+        return out
+    }
+    // Whether consumer `m` admits a producer-`k` declaration of visibility `v` across the module boundary
+    // (task 187.4.4). `public` is admitted by anyone; `package` only within the same package; `internal`
+    // only by a white-box `test import` of `k` (same-package by construction). An older `.nmi` tags nothing
+    // (nil → `public`), so it keeps the pre-tier behavior. `private` never crosses.
+    func admits(consumer m: ModuleID, producer k: ModuleID, _ v: Visibility?, testTargets: Set<ModuleID>) -> Bool {
+        switch v ?? .public {
+        case .public:   return true
+        case .package:  return sharePackage(m, k)
+        case .internal: return testTargets.contains(k)
+        case .private:  return false
+        }
+    }
+    // `k`'s interface filtered to the declarations consumer `m` may admit (task 187.4.4) — the view `m`
+    // compiles against. Keeps the pre-tier behavior for a same-package or public import; drops a `package`
+    // symbol reached across a package boundary, and an `internal` one not reached through a test import.
+    func admittedInterface(_ iface: ModuleInterface, producer k: ModuleID, consumer m: ModuleID) -> ModuleInterface {
+        let tt = testImports(of: m)
+        func ok(_ v: Visibility?) -> Bool { admits(consumer: m, producer: k, v, testTargets: tt) }
+        var out = iface
+        out.functions = iface.functions.filter { ok($0.visibility) }
+        out.types = iface.types.filter { ok($0.visibility) }
+        out.enums = iface.enums.filter { ok($0.visibility) }
+        out.interfaces = iface.interfaces.filter { ok($0.visibility) }
+        return out
+    }
     // The imported generic templates visible to `m` (task 100.5.4): each visible dependency's shipped
     // `.bir` (task 100.5.1), parsed back to NOIR decls. A dependency with no `.bir` (no public generics),
     // or an unreadable / version-stale one, contributes nothing — that import then stays on the erased
@@ -220,7 +377,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
             let birPath = buildRoot + "/__mod_" + modArtifactStem(k) + ".bir"
             guard let text = try? String(contentsOfFile: birPath, encoding: .utf8),
                   let decls = parseBIR(text) else { continue }
-            let origin = k.components.joined(separator: "/")
+            let origin = mangleOrigin(k).joined(separator: "/")
             out.append(contentsOf: decls.map { ImportedTemplate(origin: origin, decl: $0) })
         }
         return out
@@ -231,28 +388,35 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         var out: [String: EscapeSummary] = [:]
         for k in visibleModules(of: m) {
             guard let summ = depEscape[k] else { continue }
-            out.merge(externalEscapeKeys(summ, origin: k.components.joined(separator: "/"))) { a, _ in a }
+            out.merge(externalEscapeKeys(summ, origin: mangleOrigin(k).joined(separator: "/"))) { a, _ in a }
         }
         return out
     }
     // The function / type names each currently-known module exports, keyed by module path. Feed per-file
     // resolution + collision handling (tasks 100.2.3.1/100.2.3.2), separately by kind so a name can be
     // resolved as the right kind at a func vs type use site.
-    func moduleFuncs() -> [String: Set<String>] {
+    // Filtered to what the module being compiled (`consumer`) may admit from each known module (task
+    // 187.4.4), so name resolution never binds to a `package` symbol reached across a package boundary.
+    func moduleFuncs(for consumer: ModuleID) -> [String: Set<String>] {
         var m: [String: Set<String>] = [:]
-        for (id, iface) in interfaces { m[id.components.joined(separator: "/")] = Set(iface.functions.map(\.name)) }
+        for (id, iface) in interfaces {
+            m[mangleOrigin(id).joined(separator: "/")] = Set(admittedInterface(iface, producer: id, consumer: consumer).functions.map(\.name))
+        }
         return m
     }
-    func moduleTypes() -> [String: Set<String>] {
+    func moduleTypes(for consumer: ModuleID) -> [String: Set<String>] {
         var m: [String: Set<String>] = [:]
-        for (id, iface) in interfaces { m[id.components.joined(separator: "/")] = Set(iface.types.map(\.name)).union(iface.enums.map(\.name)) }
+        for (id, iface) in interfaces {
+            let adm = admittedInterface(iface, producer: id, consumer: consumer)
+            m[mangleOrigin(id).joined(separator: "/")] = Set(adm.types.map(\.name)).union(adm.enums.map(\.name))
+        }
         return m
     }
     // Per-file import scope. Imports are file-scoped (task 100.2.3.1), so a symbol is bare-visible only in
     // a file that imports its origin module. Returns, per file, the module paths it may reference bare
     // (each import plus its re-export closure) and the qualifier bindings for qualified access
     // (task 100.2.3.2), plus any leaf-name collisions (two imports sharing a qualifier in one file).
-    func fileScopes(_ files: [SourceFile]) -> (fileVisible: [String: Set<String>],
+    func fileScopes(_ files: [SourceFile], home: ModuleHome) -> (fileVisible: [String: Set<String>],
                                                fileQualifiers: [String: [String: Set<String>]],
                                                leafCollisions: [(file: String, leaf: String, span: Span)]) {
         var fileVisible: [String: Set<String>] = [:]
@@ -263,9 +427,9 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
             var quals: [String: Set<String>] = [:]
             var seenLeaf = Set<String>()
             for imp in f.imports {
-                guard let dir = resolvePkgImportDir(imp, packageRoot: packageRoot) else { continue }
-                let closure = reexportClosure(of: moduleID(forDir: dir, packageRoot: packageRoot))
-                    .map { $0.components.joined(separator: "/") }
+                guard case .ok(let dir, _, _) = resolveImport(imp, from: home) else { continue }
+                let closure = reexportClosure(of: graphID(forDir: dir))
+                    .map { mangleOrigin($0).joined(separator: "/") }
                 vis.formUnion(closure)
                 let q = imp.leafName
                 if !seenLeaf.insert(q).inserted { leafCollisions.append((f.path, q, imp.span)) }
@@ -283,10 +447,12 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     func externals(of m: ModuleID) -> [TopDecl] {
         visibleModules(of: m).flatMap { k -> [TopDecl] in
             guard let iface = interfaces[k] else { return [] }
-            let origin = k.components.joined(separator: "/")
-            let ownTypes = Set(iface.types.map(\.name)).union(iface.enums.map(\.name))
-            return interfaceToDecls(parseInterface(serialize(iface)) ?? iface)
-                .map { encodeExternalDecl($0, origin: origin, ownTypes: ownTypes) }
+            let origin = mangleOrigin(k).joined(separator: "/")
+            // Round-trip through the serialized form (the disk handoff a separate compile would read),
+            // then admit only the tiers `m` may see (task 187.4.4).
+            let seen = admittedInterface(parseInterface(serialize(iface)) ?? iface, producer: k, consumer: m)
+            let ownTypes = Set(seen.types.map(\.name)).union(seen.enums.map(\.name))
+            return interfaceToDecls(seen).map { encodeExternalDecl($0, origin: origin, ownTypes: ownTypes) }
         }
     }
     // Imported methods inferred mutating in their producing module, keyed `origin@Type.method` to match
@@ -295,8 +461,9 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     func externalMutating(of m: ModuleID) -> Set<String> {
         var out: Set<String> = []
         for k in visibleModules(of: m) {
-            guard let iface = interfaces[k] else { continue }
-            let origin = k.components.joined(separator: "/")
+            guard let full = interfaces[k] else { continue }
+            let iface = admittedInterface(full, producer: k, consumer: m)
+            let origin = mangleOrigin(k).joined(separator: "/")
             func add(_ typeName: String, _ methods: [InterfaceFunc], _ properties: [InterfaceProperty]) {
                 let key = ExternalName.encode(origin: origin, name: typeName)
                 for mth in methods where mth.isMutating == true && !mth.isStatic {
@@ -326,13 +493,22 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         var program = Program(decls: files.flatMap(\.decls), imports: files.flatMap(\.imports))
         // The pre-prelude, pre-merge surface — the interface + `.bir` own-name set are taken from it.
         let ownSurface = program
-        let scopes = fileScopes(files)
+        let home = moduleHome[id]
+            ?? ModuleHome(packageRoot: packageRoot, packageName: packageName, declaredDeps: [])
+        let scopes = fileScopes(files, home: home)
 
         // Duplicate-symbol / visibility / leaf-collision checks (tasks 100.1.3 / 100.2.5), before the
-        // prelude is prepended so they see only the module's own declarations.
+        // prelude is prepended so they see only the module's own declarations. `isProduct` decides whether
+        // this module may carry `public` (task 187.4.3): its package-relative path must be in its package's
+        // `products`.
+        let isProduct: Bool = {
+            guard let f = files.first else { return false }
+            let rel = moduleID(forFile: f.path, packageRoot: home.packageRoot).components.joined(separator: "/")
+            return (manifestFor(home.packageRoot)?.products ?? []).contains(rel)
+        }()
         let dupDiags = DiagnosticSink()
         timings.measure("noir", "duplicates") { checkDuplicates(program, into: dupDiags) }
-        checkVisibilityConsistency(program, into: dupDiags)
+        checkVisibilityConsistency(program, into: dupDiags, isProduct: isProduct)
         reportLeafCollisions(scopes.leafCollisions, into: dupDiags)
         if dupDiags.hasErrors { fputs(dupDiags.render() + "\n", stderr); return false }
 
@@ -353,7 +529,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         let semaResult = timings.measure("noir", "sema") { () -> SemaResult in
             var sema = Sema(program, externalDecls: externals(of: id), subsetFuncs: subset,
                             fileVisibleModules: scopes.fileVisible, fileQualifiers: scopes.fileQualifiers,
-                            moduleFuncs: moduleFuncs(), moduleTypes: moduleTypes(),
+                            moduleFuncs: moduleFuncs(for: id), moduleTypes: moduleTypes(for: id),
                             externalMutatingMethods: externalMutating(of: id))
             let result = sema.check()
             checkExhaustiveness(result.module, into: result.diagnostics)
@@ -379,8 +555,12 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         // Module interface — built for every module (dependents read it from `interfaces`), from the
         // pre-prelude surface, carrying the inferred facts (164.4). Its escape perf section is computed
         // only when a `.nmi` is wanted (164.6 seeding).
-        let iface = buildInterface(ownSurface, package: packageName, module: id, packageRoot: packageRoot,
-                                   facts: factStore, whiteBox: testImportTargets.contains(id))
+        let iface = buildInterface(ownSurface, package: home.packageName, module: id, moduleIDRoot: wsRootPath,
+                                   facts: factStore, whiteBox: testImportTargets.contains(id),
+                                   reexportModulePath: { imp in
+                                       guard case .ok(let dir, _, _) = resolveImport(imp, from: home) else { return nil }
+                                       return graphID(forDir: dir).components
+                                   })
         let ownEscape = options.nmi
             ? escapePerfSection(iface, semaResult.module, subsetFuncs: subset, external: externalEscape(of: id)).escape
             : [:]
@@ -404,7 +584,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         // names) so a dependent under `--mono` specializes the generics it imports (tasks 100.5.1 / 100.5.4).
         let ownNames = topDeclNames(ownSurface)
         let shipped = canonicalizeForExport(shippedTemplates(semaResult.module, ownNames: ownNames),
-                                            origin: id.components.joined(separator: "/"), ownNames: ownNames)
+                                            origin: mangleOrigin(id).joined(separator: "/"), ownNames: ownNames)
         if !shipped.isEmpty {
             let birPath = objPath.hasSuffix(".o") ? String(objPath.dropLast(2)) + ".bir" : objPath + ".bir"
             try? serializeBIR(shipped).write(toFile: birPath, atomically: true, encoding: .utf8)
@@ -465,7 +645,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
                              onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
                              requireMain: false, externalFuncNames: extFuncs, externalGenericSigs: extGenerics,
                              weakOriginFiles: preludeFiles, emitTypeMaps: false,
-                             homeQualifier: Mangle.qualifier(module: id.components), facts: store)
+                             homeQualifier: Mangle.qualifier(module: mangleOrigin(id)), facts: store)
         if let err = err { fputs("error: \(err)\n", stderr); return false }
         depObjects.append(objPath)
         return true
@@ -641,41 +821,58 @@ public func queryPackage(target rawPath: String) -> Bool {
     let packageRoot = entry.packageRoot
     let packageName = ((try? loadManifest(packageRoot: packageRoot)) ?? nil)?.name ?? defaultPackageName
 
-    // Discover the module graph reachable from the entry, parsing each file only for its imports.
+    // The graph spans packages (task 187.3), so module identity is workspace-relative — a `.package_`
+    // import to an in-workspace package is followed as a real edge, mirroring `compile`'s discovery. A
+    // declared package that is not in-workspace (an external), or one not listed in `dependencies`, stays
+    // in `externals` rather than being walked.
+    let wsRootPath = findWorkspaceRoot(for: URL(fileURLWithPath: entry.dir + "/_")).path
+    func gid(forDir dir: String) -> ModuleID { moduleID(forDir: dir, packageRoot: wsRootPath) }
+    let registry = (try? scanWorkspacePackages(workspaceRoot: wsRootPath)) ?? [:]
+    func depsOf(_ pkgRoot: String) -> [String] { (((try? loadManifest(packageRoot: pkgRoot)) ?? nil)?.dependencies) ?? [] }
+
     var graph = ModuleGraph()
     var seen = Set<ModuleID>()
     var externals = Set<String>()
     let diags = DiagnosticSink()
-    graph.addNode(entry.id); seen.insert(entry.id)
-    var worklist: [(id: ModuleID, files: [String])] = [(entry.id, scanModuleFiles(entry.dir))]
+    let entryGID = gid(forDir: entry.dir)
+    graph.addNode(entryGID); seen.insert(entryGID)
+    var worklist: [(id: ModuleID, pkgRoot: String, files: [String])] = [(entryGID, packageRoot, scanModuleFiles(entry.dir))]
     while !worklist.isEmpty {
-        let (modID, files) = worklist.removeFirst()
+        let (modID, pkgRoot, files) = worklist.removeFirst()
         for file in files {
             guard let text = try? String(contentsOfFile: file, encoding: .utf8) else { continue }
             var lexer = Lexer(text, file: file, diagnostics: diags)
             var parser = Parser(lexer.tokenize(), diagnostics: diags)
             for imp in parser.parse().imports {
-                // An external-package import has no first-party directory yet (its dependency alias awaits
-                // cross-package linkage); record the package name and move on.
-                if case .package_(let name) = imp.root { externals.insert(name); continue }
-                guard let dir = resolvePkgImportDir(imp, packageRoot: packageRoot) else { continue }
-                let depID = moduleID(forDir: dir, packageRoot: packageRoot)
+                let dir: String
+                let depPkgRoot: String
+                switch imp.root {
+                case .pkg:
+                    dir = ([pkgRoot] + imp.path).joined(separator: "/"); depPkgRoot = pkgRoot
+                case .package_(let name):
+                    switch resolvePackageImport(package: name, path: imp.path,
+                                                declaredDeps: depsOf(pkgRoot), registry: registry) {
+                    case .module(let d): dir = d; depPkgRoot = registry[name] ?? pkgRoot
+                    default: externals.insert(name); continue
+                    }
+                }
+                let depID = gid(forDir: dir)
                 graph.addEdge(from: modID, to: depID)
                 if seen.insert(depID).inserted {
                     let depFiles = scanModuleFiles(dir)
-                    if !depFiles.isEmpty { worklist.append((depID, depFiles)) }
+                    if !depFiles.isEmpty { worklist.append((depID, depPkgRoot, depFiles)) }
                 }
             }
         }
     }
 
-    // Module paths are package-root-relative, `/`-separated; the empty string names the root module.
+    // Module paths are workspace-root-relative, `/`-separated; the empty string names the root module.
     func pathOf(_ id: ModuleID) -> String { id.components.joined(separator: "/") }
     let ordered = seen.sorted { pathOf($0) < pathOf($1) }
     let edges = ordered.flatMap { from in
         graph.dependencies(of: from).map { QueryDep(from: pathOf(from), to: pathOf($0)) }
     }
-    let out = QueryOutput(package: packageName, root: packageRoot, entry: pathOf(entry.id),
+    let out = QueryOutput(package: packageName, root: packageRoot, entry: pathOf(entryGID),
                           modules: ordered.map(pathOf), dependencies: edges, externals: externals.sorted())
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
@@ -789,6 +986,42 @@ private func findWorkspaceRoot(for input: URL) -> URL {
     return findPackageRoot(for: input)
 }
 
+// The workspace name (task 187.3 / 187.5): the `name:` field of the workspace's `nomu.yaml`. A minimal
+// line scan — full YAML is task 163 — tolerant of surrounding whitespace and optional quotes; returns nil
+// when there is no marker or no `name:`, so the caller can fall back to the directory name. The first
+// segment of every library symbol's canonical identity, so it must be stable across a workspace's builds.
+private func readWorkspaceName(_ workspaceRoot: String) -> String? {
+    guard let text = try? String(contentsOfFile: workspaceRoot + "/nomu.yaml", encoding: .utf8) else { return nil }
+    for raw in text.split(separator: "\n") {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        guard line.hasPrefix("name:") else { continue }
+        var value = line.dropFirst("name:".count).trimmingCharacters(in: .whitespaces)
+        if value.hasPrefix("\"") && value.hasSuffix("\"") && value.count >= 2 {
+            value = String(value.dropFirst().dropLast())
+        }
+        return value.isEmpty ? nil : value
+    }
+    return nil
+}
+
+// A cycle in the inter-package dependency graph (task 187.3), importer→imported order closing on the
+// first, or nil if the graph is a DAG. Distinct from the module-import-cycle check: a package cycle is an
+// error even when no single module cycle exists. Deterministic (keys and successors visited sorted).
+private func packageDependencyCycle(_ deps: [String: Set<String>]) -> [String]? {
+    var state: [String: Int] = [:]   // 1 = on the current path, 2 = finished
+    var path: [String] = []
+    func visit(_ n: String) -> [String]? {
+        if state[n] == 2 { return nil }
+        if state[n] == 1 { let start = path.firstIndex(of: n) ?? 0; return Array(path[start...]) + [n] }
+        state[n] = 1; path.append(n)
+        for m in (deps[n] ?? []).sorted() { if let ring = visit(m) { return ring } }
+        path.removeLast(); state[n] = 2
+        return nil
+    }
+    for n in deps.keys.sorted() { if let ring = visit(n) { return ring } }
+    return nil
+}
+
 // <root>/build/<input's directory relative to root>. Equal dirs yield <root>/build.
 private func outputDirectory(for input: URL, root: URL) -> String {
     let inputDir = input.deletingLastPathComponent().standardizedFileURL.path
@@ -898,8 +1131,11 @@ private func selectForDial(_ templates: [ImportedTemplate], mode: MonoMode, cons
     guard mode != .none else { return [] }
     if mode == .all { return templates }
     func encoded(_ t: ImportedTemplate) -> String { ExternalName.encode(origin: t.origin, name: noirDeclName(t.decl)) }
+    // An "exported" template is one a consumer may call directly — `public` (cross-package) or `package`
+    // (same-package, task 187.4.4); either seeds the edge dial. A sub-`package` template is a private callee,
+    // pulled in only when a selected body reaches it.
     func isPublic(_ t: ImportedTemplate) -> Bool {
-        if case .funcDecl(let f) = t.decl { return f.visibility == .public }
+        if case .funcDecl(let f) = t.decl { return f.visibility >= .package }
         return false
     }
     var byEncoded: [String: ImportedTemplate] = [:]
@@ -968,8 +1204,12 @@ private func shippedTemplates(_ module: NOIRModule, ownNames: Set<String>) -> [N
     for decl in module.decls {
         if case .funcDecl(let f) = decl, ownNames.contains(f.name) { ownFuncs[f.name] = decl }
     }
+    // An exported generic — `public` (cross-package) or `package` (same-package, task 187.4.4) — seeds the
+    // shipped `.bir` so a consumer that may call it specializes it; a sub-`package` generic ships only as a
+    // private callee of a seeded body. (A cross-package consumer never instantiates a `package` generic, so
+    // shipping it in the one `.bir` is harmless — it stays unspecialized there.)
     func isPublic(_ decl: NOIRDecl) -> Bool {
-        if case .funcDecl(let f) = decl { return f.visibility == .public }
+        if case .funcDecl(let f) = decl { return f.visibility >= .package }
         return false
     }
     func isGeneric(_ decl: NOIRDecl) -> Bool {
@@ -979,7 +1219,7 @@ private func shippedTemplates(_ module: NOIRModule, ownNames: Set<String>) -> [N
     var shippedNames = Set<String>()
     var shipped: [NOIRDecl] = []
     var worklist: [NOIRDecl] = []
-    // Seed: every public generic function.
+    // Seed: every exported (`public`/`package`) generic function.
     for (name, decl) in ownFuncs where isPublic(decl) && isGeneric(decl) {
         shippedNames.insert(name); shipped.append(decl); worklist.append(decl)
     }

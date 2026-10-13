@@ -2,8 +2,15 @@
 
 **Avenue:** Infra · **Type/Lifecycle:** `language-feature · needs-design` (build orchestration + a thin
 Sema/interface/mangler touch) · **Size:** L · **Status:** in-progress — 187.1 (manifest `dependencies` schema) + 187.2 (the resolver core:
-workspace registry + `.package_` resolution, unit-tested) done; 187.3 (cross-package linkage + graph-spanning
-with package-aware mangling) next · **Source:** spun out
+workspace registry + `.package_` resolution, unit-tested) + 187.3 (cross-package linkage + graph-spanning
+with workspace-relative identity in mangling, the package-level DAG check, and the strict allow-list) + 187.4
+(the visibility boundary: `products` schema, the product import gate, the `package` tier across the boundary,
+the `public`⟺product hard error, and `test import` same-package-only) + 187.6 (the multi-package test
+fixtures) done, suite 143/143. **The in-workspace multi-package deliverable is complete.** 187.5
+(external-workspace support) is **deferred out of this task** — external workspaces (registries, dependency +
+version resolution, ecosystem) are a separate future effort, with **multi–local-workspace builds** as an
+intermediate task before it (sidesteps registries/versioning) and real dependency management much later ·
+**Source:** spun out
 of [173](173-package-model-driver-cli.md) (the single-package driver + model, built) and
 [100](100-modules.md) §100.2.5 (the single-package visibility guard, whose cross-package half lives here).
 
@@ -51,16 +58,25 @@ boundary.
   `query` (a graph that spans packages, keyed by workspace-relative identity) rides 187.3** — it needs the
   package-aware mangling that makes cross-package symbols collision-free, so the resolver ships first (the
   187.1→187.2 shape: infra consumed by the next phase).
-- 187.3 — **Cross-package linkage + graph-spanning.** Wire the 187.2 resolver into the driver's discovery
-  loop (and `query`) so the module graph spans packages, then fold the full identity into mangling so
-  cross-package (and cross-workspace) symbols never collide. Compile a dependency package's modules to
-  objects + `.nmi` (separate compilation, already per-module), compile the consumer against the dependency's
-  interfaces, and link the dependency objects in. **Package-level dependency cycles are forbidden** — the
-  inter-package `dependencies` graph must be a DAG, a rule distinct from (and stronger than) the existing
-  module-import-cycle check: `P` depends on `Q` and `Q` on `P` is an error even when no single module cycle
-  exists (the Rust/Go rule; it keeps per-package separate compilation and future caching sane). Build order
-  is that package DAG. The `build/` `__mod_*` intermediates are already keyed workspace-relative (173/187
-  build-root fix).
+- 187.3 — **Cross-package linkage + graph-spanning.** **Done.** The 187.2 resolver is wired into the
+  driver's discovery loop (and `query`), so the module graph spans packages: a `.package_(name)` import
+  builds the workspace registry lazily, enforces the strict allow-list (the importer's package must list
+  `name` in its `dependencies`), resolves to the dependency module's directory, and adds it to the graph +
+  parse worklist. Each module carries a `ModuleHome` (its package root + name + declared deps), so `pkg/…`
+  resolution and the allow-list are correct per package. Module identity is now **workspace-relative** (keyed
+  off the `nomu.yaml` root), so two packages with a same-named module never collide in the graph, the
+  `build/` intermediates, or the symbols. Mangling folds the canonical identity in lockstep — the
+  `Mangle.qualifier` and the consumer-side `origin@name` encoding both use `workspace-name` + the module's
+  workspace-relative path (via the driver's `mangleOrigin`), so a dependency's `homeQualifier` and the
+  consumer's external declaration resolve to the one symbol. A dependency package's modules compile to
+  home-qualified objects + `.nmi` (separate compilation, already per-module), the consumer compiles against
+  those interfaces and links their objects. **Package-level dependency cycles are forbidden** — the
+  inter-package `dependencies` graph must be a DAG (`packageDependencyCycle`), a rule distinct from (and
+  stronger than) the module-import-cycle check: `P` → `Q` → `P` is an error even when no single module cycle
+  exists. Tests (in-suite): `multipackage-basic` (consumer imports a dependency, links, runs),
+  `multipackage-undeclared` (allow-list rejection), `multipackage-cycle` (a package-only cycle, no module
+  cycle). The `nomu.yaml` `name:` is read minimally here (the 187.5 field pulled forward); full external
+  `.nmi` identity threading rides 187.5.
 
   **Symbol identity — decided.** A mangled symbol's canonical identity is three parts:
   `<workspace-name> :: <workspace-relative-module-path> :: <decl-signature>`, where the signature eventually
@@ -88,9 +104,32 @@ boundary.
   today — `Mangle.qualifier(module: id.components)` and the `origin.split("/")` sites in `SSAIRToLLVM`) go to
   the three-part key in lockstep (the `Mangle.qualifier` package-identity slot carried from 100.4).
 - 187.4 — **Products enforcement + the `package` tier across the boundary** (from 173.3 / the multi-package
-  half of 100.2.5). **Module publicness is opt-in via manifest `products`** (replacing the old `sealed`
-  opt-out — a schema flip in `Manifest`): a module is importable from outside its package only if it is a
-  product; a foreign import of a non-product module is rejected with a clear diagnostic. The coupling
+  half of 100.2.5). In progress. **The `Manifest` schema flip is done:** `sealed` (opt-out) → `products`
+  (opt-in list, default package-internal), in `src/modules/sources/Manifest.swift` with
+  `ManifestTests.swift` green. **The product import gate is done:** `resolveImport` (Driver.swift) matches a
+  cross-package import's targeted module against the target package's `products` (the module's
+  package-relative path; `""` for a single-module package's root) and rejects a non-product with a clear
+  diagnostic — tested by `multipackage-nonproduct` (declared dependency, no products → rejected). Same-package
+  (`pkg/…`) imports are never gated. **The `package` tier across the boundary is done:** each interface
+  decl is tagged with its visibility (`InterfaceFunc`/`Type`/`Enum`/`Protocol` gained a `visibility` field),
+  `buildInterface` ships `public` + `package` (and `internal` for a white-box test target), and the driver
+  admits a producer decl per consumer — `public` to anyone, `package` only to a same-package consumer
+  (`sharePackage`), `internal` only to a `test import`er — filtering `externals`, `moduleFuncs`/`moduleTypes`,
+  and `externalMutating` through `admittedInterface`. Generic `package` symbols cross too: `shippedTemplates`
+  / `selectForDial` ship + select exported (`>= .package`) generics, and `Monomorphize` emits the erased
+  compiled-once symbol for a `package` generic (not just `public`), so a same-package consumer links it.
+  Proven by `multipackage-package-hidden` (a product module's `package` symbol is invisible to a foreign
+  package: "module 'lib' has no member 'secret'"). **The `public`⟺product hard error is done:**
+  `checkVisibilityConsistency` takes `isProduct` (the module's package-relative path ∈ its package's
+  `products`) and rejects a `public` decl in a non-product module — tested by `module-public-nonproduct`.
+  The full fixture sweep landed with it: every single-package `module_*`/`erased_*` fixture's internal
+  `public`→`package` (the multipackage product libs stay `public`). **`test import` same-package-only is
+  done:** a `test import` resolving across a package boundary (a `.package_` root) is a discovery-time error
+  (`crossPackage != nil`), so white-box widening never crosses a package — tested by
+  `multipackage-testimport-foreign`; a same-package `test import` (`pkg/…`) still grants white-box
+  (`module-test-import`). **187.4 is complete, suite green at 142/142.** **Module publicness is opt-in via
+  manifest `products`**: a module is importable from
+  outside its package only if it is a product. The coupling
   invariant is enforced here: a `public` symbol is allowed **only inside a product module**, and a `public`
   in a non-product module is a **hard compile error** (steer to `package`, or add the module to products) —
   so a stray `public` can never leak a module. Consumers reach a product **by path** (`import <pkg>/<prod>`);
@@ -101,22 +140,24 @@ boundary.
   cross-boundary half. **White-box `test import` is restricted to modules in the same package** — a test
   module may widen into its own package's internals (173.5.4) but never into another package's; a
   cross-package import is always black-box, so a package's encapsulation holds even against a foreign test.
-- 187.5 — **Workspace section** (deferred from 173.2). The repo-root `nomu.yaml` gains contents:
-  - A required **`name`** — the workspace's identity. It is the first segment of every symbol's canonical id
-    (187.3), and the handle a consumer pins an external workspace by. (New field; today `nomu.yaml` is a bare
-    marker. A minimal name read is pulled forward into 187.3, since mangling needs it.)
-  - The **external dependency pins** — one version + source per external *workspace*, workspace-wide (the
-    single-version rule). In-workspace packages are **not** listed (discovered by markers, 187.2).
-  - **External workspace aliasing** (deferred, lands with external support). A consumer may bind an external
-    workspace under a local alias, so two unrelated external workspaces that happen to share a `name` can
-    both be used without a flat-namespace clash (prior art: Rust Cargo `package =` rename, Swift
-    `moduleAliases`). Small; it rides whenever external-workspace pulling is built.
-  - Possibly the build/test root set. The minimal workspace-root resolution to anchor the marker scan is
-    pulled forward into 187.2; this phase adds the external-pin + alias schema when external resolution lands.
-- 187.6 (tests) — A two-package fixture: consumer imports a dependency, builds, links, runs; a sealed
-  dependency module is import-rejected; a `package`-tier symbol is denied across the boundary and admitted
-  within; same-named symbols in two packages coexist (mangler identity). These are the cases 173.7 could not
-  construct without a second package.
+- 187.5 — **External-workspace support. Deferred out of this task** (a separate future effort). Pulling an
+  *external* workspace in drags the whole dependency-management problem — registries, dependency + version
+  resolution, source kinds (registry/git/path), a lockfile, and ecosystem concerns — which is out of scope
+  here; 187's goal is multi-package builds **within one workspace**, which 187.1–187.4 deliver. The sequencing
+  decided: **multi–local-workspace builds** come first as an intermediate task (one repo consuming another
+  by local path — this sidesteps registries and version resolution while still exercising cross-workspace
+  linkage: an external module's symbols carry *its* workspace name, so the `.nmi` must then carry each
+  module's full identity, the one piece 187.3 left for here), and **real dependency management** much later.
+  The `nomu.yaml` `name` is read minimally today (187.3); its formalization + the external-pin/alias schema
+  ride those future tasks, folded with the YAML move ([163](163-manifest-yaml.md)). Nothing external is built
+  now.
+- 187.6 — **Multi-package test fixtures. Done.** The cases that need a second package, all in the suite:
+  `multipackage-basic` (consumer imports a dependency, builds, links, runs), `multipackage-undeclared`
+  (strict allow-list), `multipackage-cycle` (the package DAG), `multipackage-nonproduct` (the product import
+  gate), `multipackage-package-hidden` (a `package`-tier symbol denied across the boundary; admitted within
+  via `module-qualified`/`module-method`), `multipackage-testimport-foreign` (`test import` same-package
+  only), `multipackage-coexist` (same-named symbols in two packages coexist — mangler identity), and
+  `module-public-nonproduct` (the `public`⟺product hard error).
 
 ## Design decisions
 
@@ -176,6 +217,31 @@ versioning or distribution unit; a repo is consumed as a whole workspace.
   off type-ids); mitigated by stripping to a separate debug file. Demangler rides [138](138-debugger.md).
 - **External workspace aliasing** (deferred to external support, 187.5) covers two externals sharing a
   `name`.
+
+**Compilation unit & separate compilation — the evolution invariant (decided).** The **module** is the
+compilation unit, and the end state is one module per `nomu compile` subprocess, with an external driver
+(Bazel, then a mini-Bazel CAS) building the module graph and invoking each compile independently. Two
+invariants protect that evolution; anything built here must hold them:
+
+- **No producer compilation state crosses to a consumer in memory — only on-disk, canonical outputs.** A
+  consumer learns a producer's ABI, perf facts, generic templates, and object only from files the producer
+  wrote (`.nmi` = `abi` + `perf`, `.bir`, `.o`). Today the whole-graph-in-one-process driver still holds a
+  producer's `ModuleInterface`/escape summary **in memory** (`interfaces[k]`, `depEscape[k]`) and does not
+  write a dependency's `.nmi` in a normal build — a pre-existing property (100.4). This is **tolerated as an
+  in-process optimization only** because every datum it passes already has its on-disk form; the
+  subprocess-split task replaces the in-memory reads with on-disk `.nmi` reads (no format work needed). Do
+  not introduce a cross-module datum that has no on-disk representation.
+- **Symbol identity is a pure function of a module's canonical identity, derivable from disk alone.** The
+  producer and the consumer each compute a symbol from `workspace-name` + the module's workspace-relative
+  path (the driver's `mangleOrigin`) — no coordination, no reading the producer's symbol out of its
+  in-memory interface. This is what lets two independent subprocesses agree on a link name. Physical-path
+  identity is CAS-compatible: the path is a stable hashed input, so the same content at the same path
+  (across commit switches) yields the same symbol and the same digest → a cache hit. The cross-workspace
+  case (187.5) is the one place a consumer cannot recompute a producer's `workspace-name` (a foreign
+  workspace), so the `.nmi` must then carry the producer's full canonical identity — an additive field.
+- **Producer outputs are reached through one location function.** `modArtifactStem(id)` + the build root is
+  the single "where does this module's output live" map; the mini-Bazel CAS swaps it for a digest→content
+  fetch without touching callers. Keep it the only such map.
 
 ## Dependencies & triggers
 

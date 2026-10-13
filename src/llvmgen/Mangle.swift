@@ -7,15 +7,17 @@
 // The program entry stays `nomu_main` — the C runtime calls it by that name (runtime.c).
 //
 // Cross-module linkage qualifies a symbol by its origin module so two modules sharing a name do not
-// collide at link (task 100.4). The `qualifier` is the module's relative path (`_`-joined), and the
-// producer and a consumer derive it identically — the producer from its own `ModuleID`, a consumer from
-// the dependency interface's `modulePath`. The entry module and the C-ABI prelude/runtime symbols keep
-// the empty qualifier (bare names): nothing imports the entry, and the C runtime pins the prelude names
-// (`nomu_main`, `nomu_actor_drain`, the `nomu_fn_<name>` runtime leaves). Package identity folds into
-// the qualifier when cross-package linkage lands; today every module sits in one implied package.
+// collide at link (task 100.4). The `qualifier` is the module's canonical identity components (`_`-joined),
+// and the producer and a consumer derive it identically — the producer from its own module identity, a
+// consumer from the origin encoded in an imported reference. Since cross-package linkage (task 187.3) the
+// canonical identity is `workspace-name` + the module's workspace-relative path, so two packages (and,
+// with 187.5, two workspaces) that share a module name never collide. The C-ABI prelude/runtime symbols
+// keep the empty qualifier (bare names): the C runtime pins them (`nomu_main`, `nomu_actor_drain`, the
+// `nomu_fn_<name>` runtime leaves), and they are language-owned, folded weak-ODR. The entry binary is bare
+// too — nothing imports it.
 public enum Mangle {
-    // The symbol qualifier for a module: its relative path components, `_`-joined with a trailing `_`.
-    // Empty for the package-root module (and the entry) — those keep bare names.
+    // The symbol qualifier for a module: its canonical identity components, `_`-joined with a trailing `_`.
+    // Empty for a bare-named symbol (prelude/runtime, the entry).
     public static func qualifier(module components: [String]) -> String {
         components.isEmpty ? "" : components.map(sanitize).joined(separator: "_") + "_"
     }
@@ -35,9 +37,10 @@ public enum Mangle {
         "nomu_on_\(qualifier)\(actor)_\(sanitize(handler))"
     }
 
-    // Fold the separators a Nomu name may carry (`:` from callable keys, `.` from qualified members)
-    // into a valid C-identifier symbol. Generic instances are already `<>`-encoded by Monomorphize.
+    // Fold the separators a Nomu name may carry (`:` from callable keys, `.` from qualified members) and
+    // the `-` a workspace/package name may carry (task 187.3 — the first identity component) into a valid
+    // C-identifier symbol. Generic instances are already `<>`-encoded by Monomorphize.
     static func sanitize(_ s: String) -> String {
-        String(s.map { $0 == ":" || $0 == "." ? "_" : $0 })
+        String(s.map { $0 == ":" || $0 == "." || $0 == "-" ? "_" : $0 })
     }
 }

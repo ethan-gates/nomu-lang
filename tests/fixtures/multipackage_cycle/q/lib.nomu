@@ -1,0 +1,5 @@
+import p/extra
+
+public fun qf() -> Int {
+    return extra.ef()
+}

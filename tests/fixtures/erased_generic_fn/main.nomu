@@ -4,7 +4,7 @@
 // witness-argument ABI is 100.4.3.4), so the erased `id` is exercised producer-side: it is emitted
 // and passes the pipeline's LLVM verifier at compile time. `main` prints a fixed value; the point of
 // the case is that compiling the erased body succeeds.
-public fun id<T>(x: T) -> T {
+package fun id<T>(x: T) -> T {
     return x
 }
 

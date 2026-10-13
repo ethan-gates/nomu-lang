@@ -1,0 +1,3 @@
+public fun greeting() -> Int {
+    return 42
+}

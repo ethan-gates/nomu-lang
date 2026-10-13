@@ -4,7 +4,9 @@
 // by-value `self` — and a reference (class) receiver — pointer `self` — a method taking an argument,
 // and (100.4.3.5.2) a **mutating** value method whose inferred mutating-ness crosses in the `.nmi`, so
 // the consumer passes `self` by pointer and the mutation sticks.
-public struct Pt {
+// `util` is an internal helper module shared with its package siblings, so its types are `package`-tier
+// (task 187.4.4), not `public` — the entry module admits them because it is in the same package.
+package struct Pt {
     var x: Int
     var y: Int
     fun sum() -> Int { return x + y }
@@ -15,7 +17,7 @@ public struct Pt {
     }
 }
 
-public class Counter {
+package class Counter {
     var n: Int
     fun doubled() -> Int { return n + n }
 }

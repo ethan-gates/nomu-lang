@@ -1,0 +1,4 @@
+# Workspace for the package-DAG test (task 187.3). The modules form no cycle (p/main → q → p/extra is a
+# chain), but the packages do: p depends on q (p/main imports q) and q depends on p (q imports p/extra).
+# The package-level cycle is an error even though no single module cycle exists.
+name: mpcycle

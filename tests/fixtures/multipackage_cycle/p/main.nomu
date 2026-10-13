@@ -1,0 +1,6 @@
+import q
+
+fun main() {
+    print(q.qf())
+    print("\n")
+}

@@ -1,0 +1,8 @@
+// `app` is a foreign package. It may call lib's `public` `pub_val`, but lib's `package`-tier `secret` is
+// not part of the cross-package surface, so reaching for it is a compile error (task 187.4.4).
+import lib
+
+fun main() {
+    print(lib.secret())
+    print("\n")
+}
