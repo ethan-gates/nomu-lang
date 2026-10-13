@@ -14,10 +14,15 @@ import facts
 import embedded
 import LLVMBridge
 
-public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
+// Returns whether compilation succeeded, rather than calling `exit`, so a subcommand (`nomu compile`) can
+// turn it into an exit code and an in-process caller (`build`/`run`) can drive it without being killed.
+// (Deep helper fatals — codegen/link — still `exit` today; hardened in 173.5.2 when the in-process build
+// path exercises them.)
+@discardableResult
+public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bool {
     guard let primary = paths.first else {
         fputs("error: no source files given\n", stderr)
-        exit(1)
+        return false
     }
 
     // Per-stage timing; reported to stderr on the way out (success or error).
@@ -38,7 +43,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
     // manifest is fatal.
     let manifest: Manifest?
     do { manifest = try loadManifest(packageRoot: packageRoot) }
-    catch { fputs("error: \(error)\n", stderr); exit(1) }
+    catch { fputs("error: \(error)\n", stderr); return false }
     let packageName = manifest?.name ?? defaultPackageName
     timings.package = packageName
 
@@ -64,7 +69,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
         for file in files {
             guard let text = try? String(contentsOfFile: file, encoding: .utf8) else {
                 fputs("error: cannot read '\(file)'\n", stderr)
-                exit(1)
+                return false
             }
             totalBytes += text.utf8.count
             let tokens = timings.measure("parse", "lex") { () -> [Token] in
@@ -100,7 +105,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
     if case .failure(.cycle(let ring)) = graph.topologicalOrder() {
         fputs("error: module import cycle: " + ring.map(\.pathString).joined(separator: " → ") + "\n", stderr)
         timings.report()
-        exit(1)
+        return false
     }
 
     // The entry module's raw parse, for the --emit-ast debug view below (the per-module pipeline rebuilds
@@ -125,7 +130,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
         try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
     } catch {
         fputs("error: failed to create output dir '\(outputDir)': \(error)\n", stderr)
-        exit(1)
+        return false
     }
 
     // AST stage. Emit flags write a build/ artifact and report its path (the "emit"
@@ -136,14 +141,14 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
     }
     if options.stopAt == .ast {
         if !parseDiags.isEmpty { fputs(parseDiags.render() + "\n", stderr) }
-        return
+        return true
     }
     // Lex/parse errors are fatal to compilation — the recovered AST has holes, so the
     // later phases would report noise. Report the collected diagnostics and stop here.
     if parseDiags.hasErrors {
         fputs(parseDiags.render() + "\n", stderr)
         timings.report()
-        exit(1)
+        return false
     }
 
     // Separate compilation (task 100.4.2): compile each dependency in topological order (deps first)
@@ -444,9 +449,81 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) {
     // Compile every module in dependency order (leaves first); the entry module — the binary — is last and
     // links. Separate compilation (task 100.4.2): a module sees a dependency only through its interface.
     for m in topo {
-        guard compileModule(m, isRoot: m == entryID) else { timings.report(); exit(1) }
+        guard compileModule(m, isRoot: m == entryID) else { timings.report(); return false }
     }
     timings.report()
+    return true
+}
+
+// `nomu build <path>` (task 173.5.2): resolve a target directory to a single module and compile it (its
+// `pkg/…` dependencies follow via module discovery). Resolution, per modules.md §First-party addressing:
+//   • a package root (`pkg.json` present) with root-level source → that root module (a single-module package);
+//   • a package root that is a pure container → its manifest `default-module` (error if none designated);
+//   • any other directory → that leaf module.
+// Returns the produced binary's path on success, nil on failure (so `run` can exec it). Directory
+// expansion (`//path/...`) and multi-target builds are the deferred label surface; this resolves one
+// module per invocation.
+@discardableResult
+public func buildTarget(path rawPath: String, options: EmitOptions = EmitOptions()) -> String? {
+    let fm = FileManager.default
+    let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+    var isDir: ObjCBool = false
+    guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
+        fputs("error: build target '\(rawPath)' is not a directory\n", stderr)
+        return nil
+    }
+
+    let moduleDir: String
+    if fm.fileExists(atPath: path + "/pkg.json") {
+        if !scanModuleFiles(path).isEmpty {
+            moduleDir = path                      // single-module package: the root is the module
+        } else {
+            let manifest = try? loadManifest(packageRoot: path)
+            guard let def = manifest?.defaultModule else {
+                fputs("error: package '\(rawPath)' designates no default-module; name a module "
+                    + "(e.g. '\(rawPath)/<module>')\n", stderr)
+                return nil
+            }
+            moduleDir = path + "/" + def          // container package: forward to the default module
+        }
+    } else {
+        moduleDir = path                          // a leaf module directory
+    }
+
+    let files = scanModuleFiles(moduleDir)
+    guard !files.isEmpty else {
+        fputs("error: no '.nomu' source in module '\(moduleDir)'\n", stderr)
+        return nil
+    }
+
+    // Name the binary after the module (its leaf directory) rather than the entry file — every module's
+    // entry is `main.nomu`, so the file-derived default would name every binary `main`. Place it under the
+    // package's `build/` tree mirroring the module path. (An explicit `-o` still wins.)
+    var options = options
+    if options.outputPath == nil {
+        let pkgRoot = findPackageRoot(for: URL(fileURLWithPath: files[0]).standardizedFileURL).path
+        let rel = moduleID(forDir: moduleDir, packageRoot: pkgRoot).pathString
+        let leaf = URL(fileURLWithPath: moduleDir).lastPathComponent
+        let dir = rel.isEmpty ? pkgRoot + "/build" : pkgRoot + "/build/" + rel
+        options.outputPath = dir + "/" + leaf
+    }
+    return compile(paths: files, options: options) ? options.outputPath : nil
+}
+
+// `nomu run <path> [-- args]` (task 173.5.3): build the target module, then exec the produced binary,
+// forwarding `args` and propagating its exit status. A module without a `main` is not executable — its
+// build fails, which surfaces here as a non-zero exit. Returns the process exit code.
+public func runTarget(path: String, args: [String], options: EmitOptions = EmitOptions()) -> Int32 {
+    guard let binary = buildTarget(path: path, options: options) else { return 1 }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: binary)
+    proc.arguments = args
+    do { try proc.run() } catch {
+        fputs("error: cannot run '\(binary)': \(error)\n", stderr)
+        return 1
+    }
+    proc.waitUntilExit()
+    return proc.terminationStatus
 }
 
 // The `.nmi` perf section (task 164.4.3): the per-definition escape summary of each exported definition.
@@ -488,14 +565,15 @@ private func externalEscapeKeys(_ perDef: [String: EscapeSummary], origin: Strin
     return out
 }
 
-// Write a text artifact to `path` (or exit) and report its path — the "emit" style,
-// consistent with --emit-c: outputs are build/ files, not stdout.
+// Write a text artifact to `path` (or exit) and report its path to stderr — the "emit" style,
+// consistent with --emit-c: outputs are build/ files, and the path report is a diagnostic (stderr), so
+// stdout stays clean for a program's own output under `nomu run`.
 private func writeArtifact(_ contents: String, toFile path: String) {
     guard (try? contents.write(toFile: path, atomically: true, encoding: .utf8)) != nil else {
         fputs("error: failed to write '\(path)'\n", stderr)
         exit(1)
     }
-    print(path)
+    fputs(path + "\n", stderr)
 }
 
 // The package root (modules.md §Manifest, §First-party addressing): the nearest ancestor of `input`
@@ -768,7 +846,7 @@ private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: Strin
         timings.report()
         exit(1)
     }
-    if emitLLVM { print(stem + ".ll") }
+    if emitLLVM { fputs(stem + ".ll\n", stderr) }
     if stopAfterLLVM { return }
     let archive = timings.measure("runtime", "archive") { cachedRuntimeArchive(buildRoot: buildRoot) }
     guard let archive = archive else { timings.report(); exit(1) }
@@ -795,7 +873,7 @@ private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: Strin
         timings.report()
         exit(1)
     }
-    print(binPath)
+    fputs(binPath + "\n", stderr)
 }
 
 // Compile the runtime C sources to objects and archive them into `libnomuruntime.a` (the

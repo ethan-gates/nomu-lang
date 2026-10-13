@@ -17,15 +17,16 @@ final class ManifestTests: XCTestCase {
         XCTAssertTrue(m.tests.isEmpty)
     }
 
-    // Every section decodes: version, the sealed module list, bin declarations, and test modules.
+    // Every section decodes: version, the default module, the sealed list, bin declarations, and tests.
     func testFullManifest() throws {
         let m = try decode(#"""
         {
           "name": "mypkg",
           "version": "0.1.0",
+          "default-module": "core",
           "sealed": ["internal/secret", "net/raw"],
           "bin": [
-            { "name": "app", "module": "" },
+            { "name": "app", "module": "core" },
             { "name": "tool", "module": "cmd/tool" }
           ],
           "tests": [ { "module": "tests/core" } ]
@@ -33,10 +34,16 @@ final class ManifestTests: XCTestCase {
         """#)
         XCTAssertEqual(m.name, "mypkg")
         XCTAssertEqual(m.version, "0.1.0")
+        XCTAssertEqual(m.defaultModule, "core")
         XCTAssertEqual(m.sealed, ["internal/secret", "net/raw"])
         XCTAssertEqual(m.bin.map(\.name), ["app", "tool"])
-        XCTAssertEqual(m.bin.map(\.module), ["", "cmd/tool"])
+        XCTAssertEqual(m.bin.map(\.module), ["core", "cmd/tool"])
         XCTAssertEqual(m.tests.map(\.module), ["tests/core"])
+    }
+
+    // A single-module package designates no default (its root module is the implicit default).
+    func testDefaultModuleAbsentIsNil() throws {
+        XCTAssertNil(try decode(#"{ "name": "solo" }"#).defaultModule)
     }
 
     // The empty string names the root module (the single-executable shorthand's explicit form).

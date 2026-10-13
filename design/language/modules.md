@@ -26,8 +26,13 @@ Nested packages are forbidden; a package tree contains only modules.
 
 **Decided.**
 
-- **One directory = one module = one compilation unit.** A directory containing at least one `.nomu`
-  source file is a module. A directory with only subdirectories is a path segment, not a module.
+- **One directory = one module = one compilation unit**, and **a module is a leaf.** A directory holds
+  *either* `.nomu` source (→ it is a module, and has no subdirectories) *or* subdirectories (→ it is a
+  pure path-segment container, and has no source) — never both. So no module contains a submodule, and the
+  package root is a module only for a single-directory package (source, no subdirectories); a multi-module
+  package keeps its root a container whose leaf subdirectories are the modules. Hierarchy (`net/http`) is
+  expressed through container path-segments, not through a directory that is simultaneously a module and a
+  parent — that dual role is what the leaf rule removes, so a path always names exactly one module.
 - **Addressing is mechanical**, derived from the directory path. There is no name→location map and no
   per-module metadata file. The filesystem is the module list.
 - **Files within a module share one namespace implicitly.** A symbol in one file is visible to the
@@ -64,9 +69,11 @@ depends on keeping expression-level inference cheap — see [Type inference depe
 Rename- and extraction-safe (internal imports never name the package), no self-name repetition, no
 `super`/`self`-relative navigation.
 
-External packages are named by their manifest alias: `import foo/parse` targets a nested module,
-`import foo` targets the package's root module. A package need not have a root module; if it lacks one,
-bare `import foo` is an error and callers import a submodule.
+External packages are named by their manifest alias: `import foo/parse` targets the leaf module at that
+path. Bare `import foo` resolves to the package's **default module** — the module the manifest designates
+(a single-directory package's sole module is its implicit default). A package that designates no default
+has no bare name: `import foo` is an error and callers name a submodule (`import foo/parse`). The same
+default-module forwarding governs a bare package path given to `build`/`run`/`test`.
 
 ## Visibility
 
@@ -105,8 +112,9 @@ other packages.
 
 **Decided.**
 
-- **Flat source.** No `src/`. The manifest and the root module's files sit at the package root;
-  `import pkg/foo` maps to `<package-root>/foo`.
+- **Flat source.** No `src/`. The manifest sits at the package root. A single-module package puts its
+  source at the root (the root *is* that module); a multi-module package keeps the root a pure container
+  and its modules in leaf subdirectories. `import pkg/foo` maps to `<package-root>/foo`.
 - **`.nomu`** file extension.
 - **Path components are lowercase valid identifiers** — `[a-z][a-z0-9_]*` — because each component
   becomes a bare qualifier (`net.Client`). This rule covers module directory names and package names
@@ -120,9 +128,10 @@ other packages.
 module has none.
 
 - **Package** — `pkg.json`, at the package root. Holds package name, version, dependencies, the
-  `sealed` module list, executable declarations (`bin`), and test-module declarations. One per package;
-  a single-package repo has exactly one. Its presence marks the package root, and `pkg` addressing
-  resolves to it.
+  **default module** (the leaf module a bare package name forwards to, for `import`/`build`/`run`; a
+  single-module package's root module is the implicit default), the `sealed` module list, executable
+  declarations (`bin`), and test-module declarations. One per package; a single-package repo has exactly
+  one. Its presence marks the package root, and `pkg` addressing resolves to it.
 - **Workspace** — `nomu.yaml`, at the repo root, above the packages. Holds the member-package list and
   the single resolved version per external dependency. Separate from the package manifest because it
   governs a different unit (the version/seal boundary is the package; cross-package resolution is the
@@ -150,9 +159,17 @@ system is in use. StrictYAML and KDL were the earlier leans; JSON is the pragmat
   module-topological order (supplied by the acyclic module graph), completed before `main`. No implicit
   `init()` blocks — initialization is traceable to the variable it initializes. Const-evaluable globals
   fold to compile time. Per-access cost is zero.
-- **Entry point.** A `main` function marks an executable. Executables are declared explicitly in the
-  manifest (`bin`), each naming the module whose `main` is its entry; no auto-discovery. A package with
-  no `bin` section and a `main` at its root module is the single-executable shorthand.
+- **Entry point.** A `main` function makes its module an executable. `build`/`run` target a module **by
+  path** (`nomu run pkg/server`) and build/exec it; a module without a `main` is not executable and running
+  it is an error. Targeting by path is the selection — it is not whole-tree scanning, so the "no
+  auto-discovery" concern does not apply. Binary modules are expected to sit shallow (`<pkg>/<name>`), so
+  the path *is* the name.
+- **Declared executables — deferred.** The manifest's `bin` list is a package's *shipped-executable
+  manifest* (names + which modules), which earns its keep only for **distribution / install** (a package
+  advertising its public executables by name, independent of internal layout) and **naming** (an installed
+  binary named differently from its module). `build`-all is a graph traversal filtered to terminal
+  executable modules, needing no declarations. So `bin` is carried in the schema but unconsumed until
+  distribution/install lands; local `build`/`run` are purely path-based.
 
 ## Tests
 

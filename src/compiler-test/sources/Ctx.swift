@@ -28,7 +28,7 @@ struct Ctx {
     let configPath: String
     let manifest: Manifest
     let projectRoot: String
-    let nomuc: String
+    let nomu: String
     let cases: [ResolvedCase]
 
     // base = all cases, or empty if --enable was given; add --enable; remove --disable.
@@ -130,7 +130,7 @@ struct Ctx {
         let capacity = jobs ?? max(1, ProcessInfo.processInfo.activeProcessorCount - 2)
         return Ctx(enableList: enableList, disableList: disableList, deadline: deadline,
                    poolCapacity: capacity, configPath: configPath, manifest: manifest, projectRoot: root,
-                   nomuc: resolveNomuc(projectRoot: root), cases: manifest.resolvedCases(capacity: capacity))
+                   nomu: resolveNomu(projectRoot: root), cases: manifest.resolvedCases(capacity: capacity))
     }
 }
 
@@ -146,30 +146,30 @@ private func findProjectRoot() -> String {
     return FileManager.default.currentDirectoryPath
 }
 
-// Resolve nomuc once, preferring a release (opt) build of the compiler. bazel writes an opt build under
+// Resolve the `nomu` compiler once, preferring a release (opt) build. bazel writes an opt build under
 // bazel-out/<platform>-opt/bin/… ; the bazel-bin symlink only points there if the last build was
 // -c opt, so we look for the opt config directly (platform-agnostic, no bazel subprocess). Order:
-// COMPILER_TEST_NOMUC override → newest -opt build → bazel-bin (with a warning that it may be debug).
-private func resolveNomuc(projectRoot: String) -> String {
+// COMPILER_TEST_NOMU override → newest -opt build → bazel-bin (with a warning that it may be debug).
+private func resolveNomu(projectRoot: String) -> String {
     let fm = FileManager.default
-    if let override = ProcessInfo.processInfo.environment["COMPILER_TEST_NOMUC"] {
-        guard fm.fileExists(atPath: override) else { die("COMPILER_TEST_NOMUC=\(override) does not exist") }
+    if let override = ProcessInfo.processInfo.environment["COMPILER_TEST_NOMU"] {
+        guard fm.fileExists(atPath: override) else { die("COMPILER_TEST_NOMU=\(override) does not exist") }
         return override
     }
     let bazelOut = projectRoot + "/bazel-out"
-    let rel = "/bin/src/nomu-cli/nomuc"
+    let rel = "/bin/src/nomu-cli/nomu"
     if let entries = try? fm.contentsOfDirectory(atPath: bazelOut) {
         let optBins = entries.filter { $0.hasSuffix("-opt") }
             .map { bazelOut + "/" + $0 + rel }
             .filter { fm.fileExists(atPath: $0) }
         if let newest = optBins.max(by: { mtime($0) < mtime($1) }) { return newest }   // newest opt build wins
     }
-    let fallback = projectRoot + "/bazel-bin/src/nomu-cli/nomuc"
+    let fallback = projectRoot + "/bazel-bin/src/nomu-cli/nomu"
     guard fm.fileExists(atPath: fallback) else {
-        die("nomuc not found — build it (bazel build -c opt //src/nomu-cli:nomuc) or set COMPILER_TEST_NOMUC")
+        die("nomu not found — build it (bazel build -c opt //src/nomu-cli:nomu) or set COMPILER_TEST_NOMU")
     }
     FileHandle.standardError.write(Data(
-        "note: no release (-c opt) nomuc found; using bazel-bin (may be a debug build). For faster compiles: bazel build -c opt //src/nomu-cli:nomuc\n".utf8))
+        "note: no release (-c opt) nomu found; using bazel-bin (may be a debug build). For faster compiles: bazel build -c opt //src/nomu-cli:nomu\n".utf8))
     return fallback
 }
 

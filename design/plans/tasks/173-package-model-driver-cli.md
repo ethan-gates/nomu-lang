@@ -29,10 +29,12 @@ to 1 dir == 1 module folds into [155](155-integration-suite-harness.md).
 ## Phases
 
 - 173.1 — **Manifest** in **JSON** (dependency-free in the Swift host; switch to YAML later,
-  [163](163-manifest-yaml.md)) + schema: name, version, `sealed`, `bin`, tests (deps later). **Done (schema):**
-  the full contract decodes (`src/modules/sources/Manifest.swift`) — `name` required, `version`/`sealed`/`bin`
-  (`{name, module}`)/`tests` (`{module}`) optional, every section past `name` defaulting so a name-only
-  manifest stays valid; absent → default package `main`; present-but-malformed is fatal. Unit tests in
+  [163](163-manifest-yaml.md)) + schema: name, version, `default-module`, `sealed`, `bin`, tests (deps later).
+  **Done (schema):** the full contract decodes (`src/modules/sources/Manifest.swift`) — `name` required,
+  `version`/`default-module`/`sealed`/`bin` (`{name, module}`)/`tests` (`{module}`) optional, every section
+  past `name` defaulting so a name-only manifest stays valid; absent → default package `main`;
+  present-but-malformed is fatal. `default-module` is the leaf module a bare package name forwards to
+  (modules.md §First-party addressing). Unit tests in
   `src/modules/tests`. The two-file scheme is settled (modules.md §Manifest): **package → `pkg.json`**,
   **workspace → `nomu.yaml`** (repo root), **module → no file**. **Open policy:** keep requiring a manifest
   and erroring when absent (drop the default) once the fixtures/tooling assume one — now unblocked by the 155
@@ -56,28 +58,47 @@ to 1 dir == 1 module folds into [155](155-integration-suite-harness.md).
 - 173.4 — **Entry points.** **`main` detection + declarations-only enforcement: already satisfied.** `main`
   lowers to the fixed `nomu_main` entry symbol and the entry object requires it (`loweredMain`); the grammar
   admits only declarations at the top level (`declStart` has no `let`/`var`/statements), so there is no
-  top-level executable code to reject. **`bin` declarations + root-`main` shorthand:** the live piece,
-  consumed by `build` — it lands with 173.5.2 (building it standalone yields an inert bin list). **Ordered-eager
+  top-level executable code to reject. A module with a `main` **is** an executable (`loweredMain` /
+  `nomu_main`); `build`/`run` target it by path, so no declaration is needed. **`bin` declarations deferred
+  to distribution/install** (modules.md §Initialization & entry point): the manifest's `bin` list is a
+  package's shipped-executable manifest (names + modules), useful for install/distribution and renamed
+  binaries, carried in the schema but unconsumed until that lands. **Ordered-eager
   global init: deferred** — the language has no global-variable surface yet (no top-level `let`/`var`), so
   there is nothing to initialize; the module-topological init-order emission (the one real codegen touch)
   comes when globals do.
 - 173.5 — **Single-binary driver:** the `nomu` uber-CLI over the `compile` primitive; compile-logic-as-library;
   in-process build orchestration over the module graph. The driver is `nomuc <file>` today; the subcommands
   wrap the primitive, which stays. Broken down by command (build order 173.5.1 → .4):
-  - 173.5.1 — **CLI skeleton + `compile` primitive.** _Rides [186](186-cli-argument-parser.md) (the
-    dependency-free subcommand arg parser), built first._ Retire the `nomuc` binary and rename it `nomu`; every
-    entry is a subcommand — `nomu compile|build|run|test|query`. `compile` is the exposed primitive but the
-    easy path is `build`/`run`/`test`/`query`; each subcommand parses its own arguments, so compile's flags
-    stay isolated from the orchestration flags. The compile primitive is invocable **both ways**: as a
-    subprocess (`nomu compile …`, the form the integration harness uses) and **in-process** — a library entry
-    (`compile(...)`) that reports success/failure instead of calling `exit`, so `build`/`run` can drive it
-    without spawning. Foundation for the rest.
-  - 173.5.2 — **`build`.** Manifest-driven: build every declared `bin` in the package at/above the target
-    directory — resolve each bin to its module, gather the module's files, compile + link to the bin's output,
-    in-process over the module graph. Consumes 173.4's `bin` declarations + the root-`main` shorthand (the live
-    half of 173.4 lands here), and populates `examples/pkg.json`'s bin list as the first real multi-bin package.
-  - 173.5.3 — **`run`.** Build a selected bin (by name, or the single declared bin / root-`main` shorthand) and
-    exec it, forwarding arguments + exit status.
+  - 173.5.1 — **CLI skeleton + `compile` primitive.** **Done — suite 133/133 green.** _Rode
+    [186](186-cli-argument-parser.md) (the dependency-free subcommand arg parser)._ The `nomuc` binary is
+    retired and renamed `nomu`; every entry is a subcommand — `nomu compile|build|run|test|query` (the
+    command tree in `src/nomu-cli/sources/main.swift`). `compile` is the exposed primitive; `build`/`run`/
+    `test`/`query` exist in the help with a "not yet implemented" stub pending their phases. Each subcommand
+    parses its own arguments, so compile's flags stay isolated. The compile primitive is invocable **both
+    ways**: as a subprocess (`nomu compile …`, the form the integration harness now uses) and **in-process** —
+    `compile(...)` returns `Bool` instead of calling `exit`, so `build`/`run` can drive it without spawning.
+    The root alias and `tools/install` were re-pointed to `:nomu`. **Residual:** `compile()`'s deep helper
+    fatals (codegen/link) still `exit`; converting them to returns for full in-process resilience rides
+    173.5.2 (where the in-process build loop exercises them). A `nomuc`→`nomu` sweep of the legacy
+    `tools/*.sh` dev scripts + doc build commands is a non-blocking cleanup (those are off the build graph).
+  - 173.5.2 — **`build`.** **Core built + green (suite 133/133).** `nomu build [targets…]` resolves each
+    target directory to a **single module** and builds it in-process (`buildTarget` in `Driver.swift`, over
+    the `compile(...)` library form), naming the binary after the module (not the `main.nomu` entry file).
+    Resolution (modules.md §First-party addressing): a package root with root-level source → that root
+    module; a container package root → its `default-module` (error if none); any other directory → that leaf
+    module. Default target is the current directory. The `build` subcommand takes `-O`/`--mono`.
+    **Deferred within the phase:** recursive/multi-module targeting (`//path/...`), so "build the whole
+    package" waits for the label surface; `compile()`'s deep helper fatals still `exit` (harden to returns
+    when the multi-target loop needs per-target resilience); `examples/pkg.json` executable declarations land
+    with `run` (173.5.3). Not bin-centric: `bin` declarations name executables, they do not gate what builds;
+    library-/test-only packages build fine.
+  - 173.5.3 — **`run`.** **Done — path-based, suite green.** `nomu run [target] [-- args]` resolves the
+    target to a module (the same resolver as `build`; default: the cwd), builds it, and execs the binary,
+    forwarding the post-`--` args and propagating the exit status (`runTarget` in `Driver.swift`). A module
+    with no `main` is not executable and errors. **No `bin` declarations or `--bin` selection** — targeting
+    is by path (`nomu run pkg/server`), since a binary module sits shallow (`<pkg>/<name>`) and the path is
+    the name. The compiler's artifact-path diagnostics moved from stdout to stderr, so `run`'s stdout is the
+    program's alone.
   - 173.5.4 — **`test`.** Build the manifest's test modules with white-box `test import` visibility widening;
     the case runner + test-case designation stay in the test-framework task ([161](161-test-framework.md)), so
     this phase builds + links test modules and stops short of a runner.

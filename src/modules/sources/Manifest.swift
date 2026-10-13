@@ -32,13 +32,18 @@ public struct Manifest: Codable {
     }
 
     // Backing storage is optional so the name-only manifest stays valid; the accessors default to empty
-    // (or nil for `version`). The synthesized Codable decodes a missing optional key as nil.
+    // (or nil for `version` / `defaultModule`). The synthesized Codable decodes a missing optional key as nil.
     private let versionField: String?
+    private let defaultModuleField: String?
     private let sealedField: [String]?
     private let binField: [Bin]?
     private let testsField: [TestModule]?
 
     public var version: String? { versionField }
+    // The leaf module a bare package name forwards to, for `import`/`build`/`run` (modules.md
+    // §First-party addressing). A package-root-relative path (`/`-separated); nil when the package
+    // designates none — a single-module package's root module is its implicit default, so it needs no entry.
+    public var defaultModule: String? { defaultModuleField }
     public var sealed: [String] { sealedField ?? [] }
     public var bin: [Bin] { binField ?? [] }
     public var tests: [TestModule] { testsField ?? [] }
@@ -46,6 +51,7 @@ public struct Manifest: Codable {
     private enum CodingKeys: String, CodingKey {
         case name
         case versionField = "version"
+        case defaultModuleField = "default-module"
         case sealedField = "sealed"
         case binField = "bin"
         case testsField = "tests"

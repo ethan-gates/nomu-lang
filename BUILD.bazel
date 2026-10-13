@@ -1,8 +1,8 @@
 # Top-level build file — targets live in their own packages.
 
 alias(
-    name = "nomuc",
-    actual = "//src/nomu-cli:nomuc",
+    name = "nomu",
+    actual = "//src/nomu-cli:nomu",
 )
 
 alias(

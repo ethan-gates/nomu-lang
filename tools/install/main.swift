@@ -1,7 +1,7 @@
 import Foundation
 
-// Copies the freshly-built `nomuc` into `bin/nomuc`. The source binary's path is
-// injected by bazel via `$(rootpath //compiler/nomu-cli:nomuc)` in `args` (see
+// Copies the freshly-built `nomu` into `bin/nomu`. The source binary's path is
+// injected by bazel via `$(rootpath //src/nomu-cli:nomu)` in `args` (see
 // BUILD.bazel) and resolved from the runfiles tree — so it depends on the rule,
 // not a hardcoded output path, and survives the target moving.
 
@@ -14,7 +14,7 @@ guard let workspace = env["BUILD_WORKSPACE_DIRECTORY"] else {
 }
 
 guard CommandLine.arguments.count > 1 else {
-    fputs("error: missing nomuc path argument (set via $(rootpath) in tools/install/BUILD.bazel)\n", stderr)
+    fputs("error: missing nomu path argument (set via $(rootpath) in tools/install/BUILD.bazel)\n", stderr)
     exit(1)
 }
 let rel = CommandLine.arguments[1]
@@ -27,11 +27,11 @@ if let rf = env["RUNFILES_DIR"] {
     candidates.append("\(rf)/_main/\(rel)")
 }
 guard let src = candidates.first(where: { fm.fileExists(atPath: $0) }) else {
-    fputs("error: could not locate the nomuc binary; tried:\n  \(candidates.joined(separator: "\n  "))\n", stderr)
+    fputs("error: could not locate the nomu binary; tried:\n  \(candidates.joined(separator: "\n  "))\n", stderr)
     exit(1)
 }
 
-let dest = "\(workspace)/bin/nomuc"
+let dest = "\(workspace)/bin/nomu"
 try? fm.createDirectory(atPath: "\(workspace)/bin", withIntermediateDirectories: true)
 try? fm.removeItem(atPath: dest)
 // Read + write (rather than copyItem) to dereference the runfiles symlink and land a real file.

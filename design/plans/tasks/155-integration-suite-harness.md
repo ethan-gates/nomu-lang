@@ -108,17 +108,23 @@ and matrix runs exist ad hoc. This task folds them into one harness.
 ### Remaining open axes (later phases)
 
 - **Suite migration to 1 dir == 1 module** _(folded in from the old [100](100-modules.md) §100.3.8)._
-  **Done.** Every flat fixture is now its own module directory with a `main.nomu`, and both
-  `examples/` and `tests/fixtures/` carry package manifests. `examples/` became **one package**
-  (`examples/pkg.json`), each example a binary module directory (`examples/<name>/main.nomu`); the
-  `examples/benchmarks/` programs became nested modules; hyphenated filenames were underscored to satisfy
-  the identifier rule for path components. Each `tests/fixtures/*` became **its own package**
-  (`nomu.yaml` → a `pkg.json` manifest), the nine formerly-flat fixtures moved into `<name>/main.nomu`
-  directories, and the 91 `fixture` paths in `suite.json` were rewritten from file to directory. The
-  repo-root `nomu.yaml` remains the workspace marker. Behavior-preserving — full suite 133/133 green on a
-  clean `build/`. The **manifest-required policy** (drop the default `main`, requiring a `pkg.json`,
-  [173](173-package-model-driver-cli.md) §173.1) is now unblocked but deferred: loose single-file programs
-  (unmanifested) still compile under the default identity via the package-root fallback.
+  **Pass 1 done; pass 2 reopened by the leaf-module invariant.** Pass 1: every flat fixture became its own
+  module directory with a `main.nomu`, and both `examples/` and `tests/fixtures/` gained package manifests
+  — `examples/` one package (`examples/pkg.json`, each example a module directory, `benchmarks/` nested),
+  each `tests/fixtures/*` its own package (`nomu.yaml` → `pkg.json`), hyphens underscored, the 91
+  `suite.json` `fixture` paths rewritten file→dir, repo-root `nomu.yaml` kept as the workspace marker.
+  Behavior-preserving, full suite 133/133 green.
+  **Pass 2 (pending):** the leaf-module invariant (modules.md §Modules — a directory holds source *or*
+  subdirectories, never both) makes the multi-module fixtures that still carry root-level source illegal
+  (e.g. `module_qualified/main.nomu` beside a `util/` subdir). Restructure each such fixture so the root
+  source moves into a leaf subdir and the `pkg.json` designates it the `default-module`
+  (`module_qualified/{pkg.json(default-module: core), core/main.nomu, util/lib.nomu}`); point its
+  `suite.json` fixture at the entry module subdir so the harness passes that module's files and the compiler
+  finds the package root above. Single-module fixtures (root source, no subdirs) and `examples/` (container
+  + module subdirs) are already compliant and stay. Enforcing the invariant in the compiler is a separate
+  guard, sequenced with this pass. The **manifest-required policy** (drop the default `main`, require a
+  `pkg.json`, [173](173-package-model-driver-cli.md) §173.1) is unblocked but still deferred so loose
+  single-file programs compile via the package-root fallback.
 - **Compiler build mode (release vs debug), configurable.** The harness prefers a release (`-c opt`) `nomuc`
   today (≈10× faster compiles). Make the mode selectable (a flag / manifest field), because GC observability
   ([159](159-gc-observability.md)) likely behaves differently under release vs debug — assertions, timing, and
