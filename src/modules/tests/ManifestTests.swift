@@ -15,6 +15,7 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(m.sealed, [])
         XCTAssertTrue(m.bin.isEmpty)
         XCTAssertTrue(m.tests.isEmpty)
+        XCTAssertTrue(m.dependencies.isEmpty)
     }
 
     // Every section decodes: version, the default module, the sealed list, bin declarations, and tests.
@@ -29,7 +30,8 @@ final class ManifestTests: XCTestCase {
             { "name": "app", "module": "core" },
             { "name": "tool", "module": "cmd/tool" }
           ],
-          "tests": [ { "module": "tests/core" } ]
+          "tests": [ { "module": "tests/core" } ],
+          "dependencies": ["libfoo", "netutil"]
         }
         """#)
         XCTAssertEqual(m.name, "mypkg")
@@ -39,6 +41,20 @@ final class ManifestTests: XCTestCase {
         XCTAssertEqual(m.bin.map(\.name), ["app", "tool"])
         XCTAssertEqual(m.bin.map(\.module), ["core", "cmd/tool"])
         XCTAssertEqual(m.tests.map(\.module), ["tests/core"])
+        XCTAssertEqual(m.dependencies, ["libfoo", "netutil"])   // the allow-list of package names
+    }
+
+    // Dependencies are a plain allow-list of package names; location/version live elsewhere (markers /
+    // `nomu.yaml`), never in `pkg.json`.
+    func testDependenciesAreNameList() throws {
+        let m = try decode(#"{ "name": "p", "dependencies": ["net", "json"] }"#)
+        XCTAssertEqual(m.dependencies, ["net", "json"])
+    }
+
+    // A dependency entry that is not a bare name (e.g. an object with a path) is a decode failure — the
+    // schema carries no per-dependency location/version.
+    func testDependencyObjectEntryFails() {
+        XCTAssertThrowsError(try decode(#"{ "name": "p", "dependencies": [ { "path": "libs/net" } ] }"#))
     }
 
     // A single-module package designates no default (its root module is the implicit default).

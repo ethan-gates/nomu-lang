@@ -1,0 +1,4 @@
+// Internal (module-default): invisible to a plain importer.
+fun secret_answer() -> Int {
+    return 42
+}

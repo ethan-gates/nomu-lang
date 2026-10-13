@@ -46,8 +46,10 @@ incremental self-host tractable — and why MMTk stays live until the benchmark 
 collector before retirement. Two self-hosting-infra items branch off the modules rung and don't sit on
 the LXR chain: [174](tasks/174-prelude-as-packages.md) (prelude-as-packages — its three prerequisites are
 done, so it is the goal they were gating; couples with [149](tasks/149-runtime-subset.md) runtime-subset
-by module membership) and [173](tasks/173-package-model-driver-cli.md) (package model + `build`/`run`/`test`
-driver CLI, partially built).
+by module membership) and [173](tasks/173-package-model-driver-cli.md) (package model + the single-binary
+`nomu` driver — `compile`/`build`/`run`/`test`/`query`, **built and green**; its cross-package concerns —
+external dependencies, seal enforcement, the `package` tier across the boundary — are spun out to
+[187](tasks/187-multi-package-builds.md), which turns the single-package driver into multi-package builds).
 
 ---
 

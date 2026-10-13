@@ -42,10 +42,15 @@ let tool = Command("nomu", summary: "The Nomu compiler and build driver.",
             positionals: [Positional("target", help: "executable module directory (default: .)",
                                      required: false)],
             passthrough: true),
-        Command("test", summary: "build a package's test modules",
-            positionals: [Positional("dir", help: "package directory", required: false)]),
-        Command("query", summary: "print package metadata",
-            positionals: [Positional("dir", help: "package directory", required: false)]),
+        Command("test", summary: "build and run test modules",
+            flags: [Flag("release", short: "O", help: "optimize (LLVM -O2); default is a debug build")],
+            options: [Opt("mono", valueName: "mode", help: "cross-module specialization depth",
+                          choices: ["none", "edge", "all"])],
+            positionals: [Positional("target", help: "module, or package dir for its declared tests (default: .)",
+                                     required: false)]),
+        Command("query", summary: "print package metadata as JSON",
+            positionals: [Positional("target", help: "module or package directory (default: .)",
+                                     required: false)]),
     ])
 
 switch parse(tool, Array(CommandLine.arguments.dropFirst()), version: nomuVersion) {
@@ -70,8 +75,11 @@ func dispatch(_ args: Parsed) {
         exit(runBuild(args) ? 0 : 1)
     case "run":
         exit(runRun(args))
+    case "test":
+        exit(runTest(args) ? 0 : 1)
+    case "query":
+        exit(runQuery(args) ? 0 : 1)
     case let sub:
-        // test/query land in their own phases (173.5.4, 173.6); the surface + help exist now.
         fputs("nomu \(sub ?? "?"): not yet implemented\n", stderr)
         exit(1)
     }
@@ -131,4 +139,18 @@ func runBuild(_ args: Parsed) -> Bool {
 func runRun(_ args: Parsed) -> Int32 {
     let target = args.positional("target") ?? "."
     return runTarget(path: target, args: args.passthrough, options: buildOptions(args))
+}
+
+// `nomu test [target]` — build and run test modules (default target: the current directory). A path
+// resolves the same way `build`/`run` resolve it (a container package root runs its declared `tests` set).
+// Each test module is a binary with white-box `test import` access; the case runner is task 161.
+func runTest(_ args: Parsed) -> Bool {
+    let target = args.positional("target") ?? "."
+    return testPackage(target: target, options: buildOptions(args))
+}
+
+// `nomu query [target]` — print the package metadata (modules, dep edges, externals) as JSON on stdout.
+func runQuery(_ args: Parsed) -> Bool {
+    let target = args.positional("target") ?? "."
+    return queryPackage(target: target)
 }

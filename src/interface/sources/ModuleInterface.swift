@@ -274,9 +274,16 @@ private func renderConformances(_ cs: [Conformance]) -> [String] { cs.map(\.name
 // Build the interface of one module from the merged program: its `public` declarations whose file lies
 // in the module's directory. Deterministic — top-level declarations are name-sorted, as are the
 // order-insensitive members (see the pinned conventions in task 100.4.1).
+//
+// `whiteBox` widens the published surface to the module's `internal` and `package` declarations too
+// (everything but `private`), for a module reached through a `test import` (modules.md §Tests). A test
+// module then sees its target's non-public API; non-public symbols already carry external linkage in the
+// target's object, so admitting them to the interface is the whole mechanism.
 public func buildInterface(_ program: Program, package: String, module: ModuleID, packageRoot: String,
-                           facts: FactStore = FactStore()) -> ModuleInterface {
+                           facts: FactStore = FactStore(), whiteBox: Bool = false) -> ModuleInterface {
     func inModule(_ span: Span) -> Bool { moduleID(forFile: span.file, packageRoot: packageRoot) == module }
+    // `public` only, unless this module is test-imported — then `internal`/`package` are exposed too.
+    func exported(_ v: Visibility) -> Bool { whiteBox ? v >= .internal : v == .public }
 
     var types: [InterfaceType] = []
     var enums: [InterfaceEnum] = []
@@ -284,24 +291,24 @@ public func buildInterface(_ program: Program, package: String, module: ModuleID
     var funcs: [InterfaceFunc] = []
     for decl in program.decls {
         switch decl {
-        case .funcDecl(let f) where f.visibility == .public && inModule(f.span):
+        case .funcDecl(let f) where exported(f.visibility) && inModule(f.span):
             funcs.append(InterfaceFunc(name: f.name, generics: renderGenerics(f.generics),
                 params: renderParams(f.params), ret: f.returnType.map(renderType)))
-        case .structDecl(let s) where s.visibility == .public && inModule(s.span):
+        case .structDecl(let s) where exported(s.visibility) && inModule(s.span):
             types.append(InterfaceType(keyword: "struct", name: s.name, generics: renderGenerics(s.generics),
                 fields: s.fields.map { InterfaceField(name: $0.name, type: renderType($0.type), isMutable: $0.isMutable) },
                 properties: renderProperties(s.name, s.properties, facts), methods: renderMethods(s.name, s.methods, facts),
                 conformances: renderConformances(s.conformances)))
-        case .classDecl(let c) where c.visibility == .public && inModule(c.span):
+        case .classDecl(let c) where exported(c.visibility) && inModule(c.span):
             types.append(InterfaceType(keyword: "class", name: c.name, generics: renderGenerics(c.generics),
                 fields: c.fields.map { InterfaceField(name: $0.name, type: renderType($0.type), isMutable: $0.isMutable) },
                 properties: renderProperties(c.name, c.properties, facts), methods: renderMethods(c.name, c.methods, facts),
                 conformances: renderConformances(c.conformances)))
-        case .enumDecl(let e) where e.visibility == .public && inModule(e.span):
+        case .enumDecl(let e) where exported(e.visibility) && inModule(e.span):
             enums.append(InterfaceEnum(name: e.name, generics: renderGenerics(e.generics), cases: renderCases(e.cases),
                 properties: renderProperties(e.name, e.properties, facts), methods: renderMethods(e.name, e.methods, facts),
                 conformances: renderConformances(e.conformances)))
-        case .interfaceDecl(let i) where i.visibility == .public && inModule(i.span):
+        case .interfaceDecl(let i) where exported(i.visibility) && inModule(i.span):
             let methods = i.methods.map { m in
                 InterfaceMethodReq(name: m.name, params: renderParams(m.params), ret: m.returnType.map(renderType),
                                    isStatic: m.isStatic, hasDefault: m.defaultBody != nil) }

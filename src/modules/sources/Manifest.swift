@@ -38,6 +38,7 @@ public struct Manifest: Codable {
     private let sealedField: [String]?
     private let binField: [Bin]?
     private let testsField: [TestModule]?
+    private let dependenciesField: [String]?
 
     public var version: String? { versionField }
     // The leaf module a bare package name forwards to, for `import`/`build`/`run` (modules.md
@@ -47,6 +48,14 @@ public struct Manifest: Codable {
     public var sealed: [String] { sealedField ?? [] }
     public var bin: [Bin] { binField ?? [] }
     public var tests: [TestModule] { testsField ?? [] }
+    // The allow-list of packages this package's modules may import from (task 187.1): each entry is a
+    // dependency's **own package name** — the root token an import uses (`import libfoo/bar` names the
+    // package `libfoo`), no per-importer aliasing since identity is workspace-unique. Imports are strict —
+    // a module may import only packages listed here; a dependency's own dependencies are not transitively
+    // importable. No paths or versions live here: an in-workspace package is found by its `pkg.json` marker
+    // within the workspace tree, and an external package's workspace is pinned (version/source) in
+    // `nomu.yaml`. Empty when the package has none.
+    public var dependencies: [String] { dependenciesField ?? [] }
 
     private enum CodingKeys: String, CodingKey {
         case name
@@ -55,6 +64,7 @@ public struct Manifest: Codable {
         case sealedField = "sealed"
         case binField = "bin"
         case testsField = "tests"
+        case dependenciesField = "dependencies"
     }
 }
 

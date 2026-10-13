@@ -1,0 +1,9 @@
+// A plain `import` (no `test`) stays black-box: `lib`'s internal `secret_answer` is absent from its
+// public interface, so naming it is an error. White-box access requires `test import` (see
+// module_test_import).
+import pkg/lib
+
+fun main() {
+    print(secret_answer())
+    print("\n")
+}

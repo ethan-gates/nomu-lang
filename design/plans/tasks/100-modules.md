@@ -142,7 +142,7 @@ The full import/visibility surface, still compiled whole-program (all modules, o
       (bare error), `module_leaf_collision` (leaf error), `module_collision_resolve` (funcs + types
       resolved distinctly), plus `module_reexport`/`module_perfile_import` unchanged.
     - Type-directed clash resolution (Swift-style) stays deferred (the "leaning" model; depends on cheap
-      inference). Sealed/cross-package rules are not live ([173](173-package-model-driver-cli.md) §173.3.1).
+      inference). Sealed/cross-package rules are not live ([187](187-multi-package-builds.md)).
 - 100.2.4 — `public import` re-export (resolution + republish into public API). **Done:** a module's
   `.nmi` records its `public import` edges (`reexports: [InterfaceRef]`, package + module path); a
   consumer follows them transitively (`visibleModules` in the driver), unioning each re-exported
@@ -159,7 +159,7 @@ The full import/visibility surface, still compiled whole-program (all modules, o
   its signature — the `.nmi` well-formedness guard. **Deferred to multi-package:** `package` reaching
   same-package siblings (excluded from the `.nmi` today, so it behaves like `internal` across a module),
   seal enforcement, and denying a foreign package a `package` symbol — none is exercisable until
-  cross-package linkage exists. That cross-boundary half is tracked as **[173](173-package-model-driver-cli.md) §173.3.1**.
+  cross-package linkage exists. That cross-boundary half is tracked as **[187](187-multi-package-builds.md)** (§187.4).
 - 100.2.6 — Mangling: encode real package + relative module path, replacing the implied `main`
   (generic-arg encoding already present). Mangling is currently **spread** (9-encoding in
   `midend/sources/Monomorphize.swift`; `nomu_` construction across `llvmgen/*`); **consolidate it into
@@ -175,10 +175,11 @@ are done, nothing remaining in 100 (the 100.5 dial) depends on it, and it is a l
 rather than compilation-pipeline work. It splits into:
 
 - **[173](173-package-model-driver-cli.md) — Package model, manifest + driver CLI** (the old 100.3.1–100.3.6):
-  JSON manifest + schema, package boundary / workspace / identity, seal enforcement (incl. the cross-package
-  `package`-tier + qualifier item carried from 100.4's interims), entry points / `bin` declarations / ordered
-  init, and the `compile`/`build`/`run`/`test`/`query` single-binary driver. Deliverable: `nomuc build/run/test`
-  on a manifest'd package with multiple bins.
+  JSON manifest + schema, package boundary / workspace / identity, entry points / `bin` declarations / ordered
+  init, and the `compile`/`build`/`run`/`test`/`query` single-binary driver — **built and green**. Deliverable
+  met: `nomu build/run/test/query` on a manifest'd package. The cross-package half — seal enforcement, the
+  `package`-tier + qualifier item carried from 100.4's interims — is spun out to
+  **[187](187-multi-package-builds.md) — Multi-package builds**.
 - **[174](174-prelude-as-packages.md) — Prelude as packages** (the old 100.3.7 + its Mini-horizon): `core` /
   `runtime` / `std` become real packages compiled once and referenced, retiring `prependPrelude` + the
   `WeakODR` per-object duplication (the 100.4.4 interim). Its three prerequisites — the full `.nmi` (100.4.1),
@@ -577,7 +578,7 @@ specialization dial). Two carried-forward **interims**, both owned by other phas
   times and discards N−1). The proper fix — the prelude/runtime compiled once and referenced, not duplicated
   — is owned by **[174](174-prelude-as-packages.md)** (prelude-as-packages) and **149** (runtime-subset by
   module membership). Package identity in the mangling qualifier likewise waits on multi-package linkage
-  ([173](173-package-model-driver-cli.md) §173.3.1).
+  ([187](187-multi-package-builds.md) §187.3).
 - 100.4.5 / 100.4.6 — **Moved out to [172](172-incremental-build-cache.md).** The driver incremental cache
   (content-addressed per-module keying, interface byte-stability, skip-unchanged, rebuild-on-interface-change)
   and its stability / correctness harness (body edit doesn't rebuild dependents; interface stability;

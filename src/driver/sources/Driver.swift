@@ -37,6 +37,25 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     let input = URL(fileURLWithPath: primary).standardizedFileURL
     let root = findPackageRoot(for: input)
     let packageRoot = root.path
+    // Build artifacts live under the **workspace** `build/` (the nearest `nomu.yaml` root), not the
+    // package's — one workspace has a single build tree shared by its packages. Falls back to the package
+    // root when there is no workspace marker. (Package identity + module IDs stay package-relative, above.)
+    let workspaceRoot = findWorkspaceRoot(for: input)
+
+    // Dependency intermediates (`__mod_*.o` / `.bir`) share the workspace `build/`, so their names must be
+    // unique across every package in the workspace — not merely within this package. Key them by the
+    // module's **workspace-relative** path (the package's path under the workspace root, then the module's
+    // package-relative components), so two packages with a same-named module (`util`) never collide.
+    let packagePrefixComponents: [String] = {
+        guard packageRoot.hasPrefix(workspaceRoot.path) else { return [] }
+        var rel = String(packageRoot.dropFirst(workspaceRoot.path.count))
+        while rel.hasPrefix("/") { rel.removeFirst() }
+        return rel.isEmpty ? [] : rel.split(separator: "/").map(String.init)
+    }()
+    func modArtifactStem(_ id: ModuleID) -> String {
+        let comps = packagePrefixComponents + id.components
+        return comps.isEmpty ? "root" : comps.joined(separator: "_")
+    }
 
     // The package identity comes from the manifest (`pkg.json` at the root), or a default when there is
     // none. It anchors mangling and `.nmi` naming (consumed from task 100.2.6 on). A present-but-invalid
@@ -59,6 +78,10 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     // concatenated away. Module-wide passes take the union view (`files.flatMap(\.decls)`).
     var parsedByModule: [ModuleID: [SourceFile]] = [:]
     var seenModule = Set<ModuleID>()
+    // Modules reached through a `test import` (modules.md §Tests). Their interfaces are built white-box
+    // (internal/package exposed), so the test module reaches its target's non-public API. Any module not in
+    // this set keeps its public-only interface, so the same target stays black-box to a plain importer.
+    var testImportTargets = Set<ModuleID>()
     var totalBytes = 0, tokenCount = 0
 
     let entryID = moduleID(forFile: primary, packageRoot: packageRoot)
@@ -86,6 +109,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
                 guard let dir = resolvePkgImportDir(imp, packageRoot: packageRoot) else { continue }
                 let depID = moduleID(forDir: dir, packageRoot: packageRoot)
                 graph.addEdge(from: modID, to: depID)
+                if imp.isTest { testImportTargets.insert(depID) }
                 if seenModule.insert(depID).inserted {
                     let depFiles = scanModuleFiles(dir)
                     if depFiles.isEmpty {
@@ -113,17 +137,17 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     // compilation, task 100.4.2).
     let program = Program(decls: (parsedByModule[entryID] ?? []).flatMap(\.decls),
                           imports: (parsedByModule[entryID] ?? []).flatMap(\.imports))
-    let buildRoot = root.appendingPathComponent("build").path
+    let buildRoot = workspaceRoot.appendingPathComponent("build").path
     // The artifact stem: `-o <path>` gives it explicitly (its parent is created); otherwise it mirrors
-    // the primary source's path under `build/`. All artifacts append an extension to the stem, and the
-    // binary is the stem itself.
+    // the primary source's path under the workspace `build/`. All artifacts append an extension to the
+    // stem, and the binary is the stem itself.
     let stem: String
     let outputDir: String
     if let out = options.outputPath {
         stem = out
         outputDir = URL(fileURLWithPath: out).deletingLastPathComponent().path
     } else {
-        outputDir = outputDirectory(for: input, root: root)
+        outputDir = outputDirectory(for: input, root: workspaceRoot)
         stem = outputDir + "/" + input.deletingPathExtension().lastPathComponent
     }
     do {
@@ -193,7 +217,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     func importedTemplates(of m: ModuleID) -> [ImportedTemplate] {
         var out: [ImportedTemplate] = []
         for k in visibleModules(of: m) {
-            let birPath = buildRoot + "/__mod_" + (k.components.isEmpty ? "root" : k.components.joined(separator: "_")) + ".bir"
+            let birPath = buildRoot + "/__mod_" + modArtifactStem(k) + ".bir"
             guard let text = try? String(contentsOfFile: birPath, encoding: .utf8),
                   let decls = parseBIR(text) else { continue }
             let origin = k.components.joined(separator: "/")
@@ -355,7 +379,8 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         // Module interface — built for every module (dependents read it from `interfaces`), from the
         // pre-prelude surface, carrying the inferred facts (164.4). Its escape perf section is computed
         // only when a `.nmi` is wanted (164.6 seeding).
-        let iface = buildInterface(ownSurface, package: packageName, module: id, packageRoot: packageRoot, facts: factStore)
+        let iface = buildInterface(ownSurface, package: packageName, module: id, packageRoot: packageRoot,
+                                   facts: factStore, whiteBox: testImportTargets.contains(id))
         let ownEscape = options.nmi
             ? escapePerfSection(iface, semaResult.module, subsetFuncs: subset, external: externalEscape(of: id)).escape
             : [:]
@@ -373,7 +398,7 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         // Object path: the root is the binary's stem object; a dependency is a qualified `__mod_*` object.
         let objPath = isRoot
             ? stem + ".o"
-            : buildRoot + "/__mod_" + (id.components.isEmpty ? "root" : id.components.joined(separator: "_")) + ".o"
+            : buildRoot + "/__mod_" + modArtifactStem(id) + ".o"
 
         // Ship this module's `.bir` (public generic closure, references canonicalized to origin-keyed
         // names) so a dependent under `--mono` specializes the generics it imports (tasks 100.5.1 / 100.5.4).
@@ -455,21 +480,28 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     return true
 }
 
-// `nomu build <path>` (task 173.5.2): resolve a target directory to a single module and compile it (its
-// `pkg/…` dependencies follow via module discovery). Resolution, per modules.md §First-party addressing:
+// A target path resolved to a single module — the shared resolution `build`, `run`, and `test` all use, so
+// a path means the same module to every command (modules.md §First-party addressing):
 //   • a package root (`pkg.json` present) with root-level source → that root module (a single-module package);
 //   • a package root that is a pure container → its manifest `default-module` (error if none designated);
 //   • any other directory → that leaf module.
-// Returns the produced binary's path on success, nil on failure (so `run` can exec it). Directory
-// expansion (`//path/...`) and multi-target builds are the deferred label surface; this resolves one
-// module per invocation.
-@discardableResult
-public func buildTarget(path rawPath: String, options: EmitOptions = EmitOptions()) -> String? {
+// Resolution yields exactly one module per path — directory expansion (`//path/...`) that would name many
+// modules is the deferred label surface. A command then acts on the resolved module, filtered by its own
+// role predicate (`run` wants an executable, `test` wants a declared test module).
+public struct ResolvedModule {
+    public let dir: String          // the module's source directory
+    public let packageRoot: String  // the nearest `pkg.json` ancestor — anchors module identity + `build/`
+    public let id: ModuleID         // the module's identity, package-root-relative
+}
+
+// Resolve a target directory to a single module, or nil (with a diagnostic) if it is not a directory, names
+// a container package with no `default-module`, or holds no `.nomu` source.
+public func resolveModule(path rawPath: String) -> ResolvedModule? {
     let fm = FileManager.default
     let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
     var isDir: ObjCBool = false
     guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
-        fputs("error: build target '\(rawPath)' is not a directory\n", stderr)
+        fputs("error: target '\(rawPath)' is not a directory\n", stderr)
         return nil
     }
 
@@ -495,19 +527,39 @@ public func buildTarget(path rawPath: String, options: EmitOptions = EmitOptions
         fputs("error: no '.nomu' source in module '\(moduleDir)'\n", stderr)
         return nil
     }
+    let packageRoot = findPackageRoot(for: URL(fileURLWithPath: files[0]).standardizedFileURL).path
+    return ResolvedModule(dir: moduleDir, packageRoot: packageRoot,
+                          id: moduleID(forDir: moduleDir, packageRoot: packageRoot))
+}
 
-    // Name the binary after the module (its leaf directory) rather than the entry file — every module's
-    // entry is `main.nomu`, so the file-derived default would name every binary `main`. Place it under the
-    // package's `build/` tree mirroring the module path. (An explicit `-o` still wins.)
+// `nomu build <path>` (task 173.5.2): resolve a target directory to a single module and compile it (its
+// `pkg/…` dependencies follow via module discovery). Returns the produced binary's path on success, nil on
+// failure (so `run` can exec it).
+@discardableResult
+public func buildTarget(path rawPath: String, options: EmitOptions = EmitOptions()) -> String? {
+    guard let m = resolveModule(path: rawPath) else { return nil }
+    return buildResolved(m, options: options)
+}
+
+// Build an already-resolved module and return its binary path. Names the binary after the module (its leaf
+// directory) rather than the entry file — every module's entry is `main.nomu`, so the file-derived default
+// would name every binary `main`. Places it under the package's `build/` tree mirroring the module path.
+// (An explicit `-o` still wins.)
+public func buildResolved(_ m: ResolvedModule, options: EmitOptions = EmitOptions()) -> String? {
     var options = options
     if options.outputPath == nil {
-        let pkgRoot = findPackageRoot(for: URL(fileURLWithPath: files[0]).standardizedFileURL).path
-        let rel = moduleID(forDir: moduleDir, packageRoot: pkgRoot).pathString
-        let leaf = URL(fileURLWithPath: moduleDir).lastPathComponent
-        let dir = rel.isEmpty ? pkgRoot + "/build" : pkgRoot + "/build/" + rel
-        options.outputPath = dir + "/" + leaf
+        // Anchor the binary under the **workspace** `build/` (the `nomu.yaml` root), at the module's own
+        // path within the workspace — so every package shares one build tree and the binary is named after
+        // the module (its directory's last component), with its sibling artifacts (`.o`/`.ll`/…) alongside.
+        // (No workspace marker → the package is its own build root.)
+        let workspaceRoot = findWorkspaceRoot(for: URL(fileURLWithPath: m.dir + "/_")).path
+        var rel = m.dir.hasPrefix(workspaceRoot) ? String(m.dir.dropFirst(workspaceRoot.count)) : ""
+        while rel.hasPrefix("/") { rel.removeFirst() }
+        let leaf = URL(fileURLWithPath: m.dir).lastPathComponent
+        options.outputPath = rel.isEmpty ? workspaceRoot + "/build/" + leaf
+                                         : workspaceRoot + "/build/" + rel
     }
-    return compile(paths: files, options: options) ? options.outputPath : nil
+    return compile(paths: scanModuleFiles(m.dir), options: options) ? options.outputPath : nil
 }
 
 // `nomu run <path> [-- args]` (task 173.5.3): build the target module, then exec the produced binary,
@@ -525,6 +577,127 @@ public func runTarget(path: String, args: [String], options: EmitOptions = EmitO
     proc.waitUntilExit()
     return proc.terminationStatus
 }
+
+// `nomu test [target]` (task 173.5.4): build and run a test module. Resolution is the shared single-module
+// resolver (`resolveModule`), identical to `build`/`run`; `test` then applies its **role predicate** — the
+// resolved module must be a declared test module (manifest `tests`), just as `run` requires an executable.
+// A test module is built exactly like a binary — its only distinction is a `test import`, which widens its
+// visibility into the target (white-box access, handled in `compile`). The real case framework —
+// test-case designation, assertions, discovery, isolation — is task 161; today a test module is a plain
+// executable whose `main` drives its own checks, so this builds it and runs it, reporting an `ok`/`FAIL`
+// line. (Running a whole package's tests from one path is the deferred label surface, shared with `build`.)
+@discardableResult
+public func testPackage(target rawPath: String, options: EmitOptions = EmitOptions()) -> Bool {
+    guard let m = resolveModule(path: rawPath) else { return false }
+
+    // Role predicate: a test module is one declared in the package manifest's `tests` (modules.md §Tests —
+    // test identity is module-level and manifest-declared).
+    let manifest: Manifest?
+    do { manifest = try loadManifest(packageRoot: m.packageRoot) }
+    catch { fputs("error: \(error)\n", stderr); return false }
+    let declared = (manifest?.tests ?? []).map { testModuleID($0.module) }
+    guard declared.contains(m.id) else {
+        let name = m.id.components.isEmpty ? "(root)" : m.id.pathString
+        fputs("error: '\(name)' is not a declared test module — list it under 'tests' in "
+            + "'\(m.packageRoot)/pkg.json'\n", stderr)
+        return false
+    }
+
+    let label = m.id.components.isEmpty ? "(root)" : m.id.pathString
+    guard let binary = buildResolved(m, options: options) else {
+        fputs("FAIL  \(label) — build failed\n", stderr)
+        return false
+    }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: binary)
+    do { try proc.run() } catch {
+        fputs("FAIL  \(label) — cannot run '\(binary)': \(error)\n", stderr)
+        return false
+    }
+    proc.waitUntilExit()
+    if proc.terminationStatus == 0 {
+        fputs("ok    \(label)\n", stderr)
+        return true
+    }
+    fputs("FAIL  \(label) — exit \(proc.terminationStatus)\n", stderr)
+    return false
+}
+
+// The module identity named by a manifest `tests`/`bin` entry: a package-root-relative, `/`-separated path,
+// with "" naming the package's root module.
+private func testModuleID(_ rel: String) -> ModuleID {
+    rel.isEmpty ? ModuleID([]) : ModuleID(rel.split(separator: "/").map(String.init))
+}
+
+// `nomu query [target]` (task 173.6): print the package metadata rooted at a target module — the package
+// identity plus the first-party module graph reachable from it (its modules, the importer→imported
+// dependency edges, and any referenced external packages). Parse-only: it walks `pkg/…` imports exactly as
+// `compile` discovers them, without compiling. Emits JSON on stdout for tooling (task 137 reasons over this
+// graph). Resolution is the shared single-module resolver, so a path names the same module here as to
+// `build`/`run`/`test`, and the graph is what that module reaches. A package-wide query over every module
+// on disk (independent of reachability) waits on the label surface, with the rest of multi-module targeting.
+public func queryPackage(target rawPath: String) -> Bool {
+    guard let entry = resolveModule(path: rawPath) else { return false }
+    let packageRoot = entry.packageRoot
+    let packageName = ((try? loadManifest(packageRoot: packageRoot)) ?? nil)?.name ?? defaultPackageName
+
+    // Discover the module graph reachable from the entry, parsing each file only for its imports.
+    var graph = ModuleGraph()
+    var seen = Set<ModuleID>()
+    var externals = Set<String>()
+    let diags = DiagnosticSink()
+    graph.addNode(entry.id); seen.insert(entry.id)
+    var worklist: [(id: ModuleID, files: [String])] = [(entry.id, scanModuleFiles(entry.dir))]
+    while !worklist.isEmpty {
+        let (modID, files) = worklist.removeFirst()
+        for file in files {
+            guard let text = try? String(contentsOfFile: file, encoding: .utf8) else { continue }
+            var lexer = Lexer(text, file: file, diagnostics: diags)
+            var parser = Parser(lexer.tokenize(), diagnostics: diags)
+            for imp in parser.parse().imports {
+                // An external-package import has no first-party directory yet (its dependency alias awaits
+                // cross-package linkage); record the package name and move on.
+                if case .package_(let name) = imp.root { externals.insert(name); continue }
+                guard let dir = resolvePkgImportDir(imp, packageRoot: packageRoot) else { continue }
+                let depID = moduleID(forDir: dir, packageRoot: packageRoot)
+                graph.addEdge(from: modID, to: depID)
+                if seen.insert(depID).inserted {
+                    let depFiles = scanModuleFiles(dir)
+                    if !depFiles.isEmpty { worklist.append((depID, depFiles)) }
+                }
+            }
+        }
+    }
+
+    // Module paths are package-root-relative, `/`-separated; the empty string names the root module.
+    func pathOf(_ id: ModuleID) -> String { id.components.joined(separator: "/") }
+    let ordered = seen.sorted { pathOf($0) < pathOf($1) }
+    let edges = ordered.flatMap { from in
+        graph.dependencies(of: from).map { QueryDep(from: pathOf(from), to: pathOf($0)) }
+    }
+    let out = QueryOutput(package: packageName, root: packageRoot, entry: pathOf(entry.id),
+                          modules: ordered.map(pathOf), dependencies: edges, externals: externals.sorted())
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    guard let data = try? encoder.encode(out), let json = String(data: data, encoding: .utf8) else {
+        fputs("error: failed to encode query output\n", stderr)
+        return false
+    }
+    print(json)
+    return true
+}
+
+// The `nomu query` JSON shape (task 173.6). Deterministic: modules + edges are emitted in sorted order and
+// keys are sorted, so the output is stable for tooling and golden comparison.
+private struct QueryOutput: Codable {
+    let package: String        // the package identity (manifest `name`, or the default)
+    let root: String           // the package root directory (nearest `pkg.json` ancestor)
+    let entry: String          // the queried module's path ("" = the root module)
+    let modules: [String]      // every first-party module reachable from the entry
+    let dependencies: [QueryDep]
+    let externals: [String]    // external package names referenced (unresolved until cross-package linkage)
+}
+private struct QueryDep: Codable { let from: String; let to: String }
 
 // The `.nmi` perf section (task 164.4.3): the per-definition escape summary of each exported definition.
 // Computed over the module's **erased/template** bodies — the pre-mono SSA — so each definition is
@@ -598,6 +771,22 @@ private func findPackageRoot(for input: URL) -> URL {
     return nearestAncestor(containing: "pkg.json")
         ?? nearestAncestor(containing: "nomu.yaml")
         ?? input.deletingLastPathComponent().standardizedFileURL
+}
+
+// The workspace root (modules.md §Manifest): the nearest ancestor of `input` carrying the `nomu.yaml`
+// workspace marker — the unit the `build/` tree is anchored to, so every package in a workspace shares one
+// build tree (nested workspaces resolve to the nearest marker). With no workspace marker anywhere, a loose
+// package is its own build root (`findPackageRoot`).
+private func findWorkspaceRoot(for input: URL) -> URL {
+    let fm = FileManager.default
+    var dir = input.deletingLastPathComponent().standardizedFileURL
+    while true {
+        if fm.fileExists(atPath: dir.appendingPathComponent("nomu.yaml").path) { return dir }
+        let parent = dir.deletingLastPathComponent()
+        if parent.path == dir.path { break }   // reached the filesystem root
+        dir = parent
+    }
+    return findPackageRoot(for: input)
 }
 
 // <root>/build/<input's directory relative to root>. Equal dirs yield <root>/build.

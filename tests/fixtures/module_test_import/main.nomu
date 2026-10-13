@@ -1,0 +1,9 @@
+// White-box access (modules.md §Tests): `test import` widens this module's visibility into `lib` to
+// internal/package, so it reaches `lib`'s non-public helper. A plain `import pkg/lib` would see only
+// the public surface and could not name `secret_answer`.
+test import pkg/lib
+
+fun main() {
+    print(secret_answer())
+    print("\n")
+}

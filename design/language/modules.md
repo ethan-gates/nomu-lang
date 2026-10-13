@@ -12,15 +12,25 @@ open items live in task [100](../plans/tasks/100-modules.md).
 
 **Decided.** Two units, at different granularities:
 
-- **Package** — the named, versioned, distributed unit. Depends on other packages, carries a
-  manifest, is the boundary for versioning and for the seal.
+- **Package** — the named **encapsulation + identity** unit: a group of modules forming a library, carrying
+  a manifest, that shares internals among its own modules (the `package` visibility tier) while presenting a
+  curated `public` surface and sealing the rest. It is the boundary for visibility and the seal, and the
+  name an import resolves to. Its reason to exist is this mid-tier encapsulation: a **module** is too small
+  (one module cannot share a hidden symbol with a sibling module without making it `public` to the world),
+  and the **workspace** is too big (no encapsulation at all). A package earns its keep exactly when a
+  multi-module library has internal-but-shared modules; absent that, it is only a namespace.
 - **Module** — a directory of source files, the compilation unit. Addressed by its path relative to
   the package source root. A module's identity is `package + relative path`, so `a/util` and `b/util`
   are distinct.
+- **Workspace** — the repo (`nomu.yaml`): the unit of **versioning and external consumption**, above the
+  packages. It pins external dependencies (one version per external *workspace*, workspace-wide). In-workspace
+  packages are discovered by their markers, not listed here. (Versioning/distribution lives here, not on the
+  package — the package is encapsulation + identity only.)
 
 This is Go's package/module split (its "module" is our package, its "package" is our module) with
-Rust-style origin-hiding (a package is referenced by a short local name, not its origin URL).
-Nested packages are forbidden; a package tree contains only modules.
+Rust-style origin-hiding (a package is referenced by a short local name, not its origin URL), and a
+Bazel-style workspace above both as the version/consumption unit. Nested packages are forbidden; a package
+tree contains only modules.
 
 ## Modules
 
@@ -132,10 +142,22 @@ module has none.
   single-module package's root module is the implicit default), the `sealed` module list, executable
   declarations (`bin`), and test-module declarations. One per package; a single-package repo has exactly
   one. Its presence marks the package root, and `pkg` addressing resolves to it.
-- **Workspace** — `nomu.yaml`, at the repo root, above the packages. Holds the member-package list and
-  the single resolved version per external dependency. Separate from the package manifest because it
-  governs a different unit (the version/seal boundary is the package; cross-package resolution is the
-  workspace). Its contents land with cross-package linkage; until then it is a marker only.
+  - **Dependencies** (schema built, task [187](../plans/tasks/187-multi-package-builds.md) §187.1). A
+    `"dependencies"` **list of package names** — the allow-list of packages this package's modules may import
+    from (a module may import only packages its `pkg.json` declares; a dependency's own dependencies are
+    **not** transitively importable). A name is the dependency's **own package name**, which is the root
+    token an import uses (`import libfoo/bar` names the package `libfoo`) — no per-importer aliasing, since a
+    package's identity is workspace-unique. **No paths or versions live in `pkg.json`:** an in-workspace
+    dependency is found by its `pkg.json` marker within the workspace tree (discovered, not declared), and an
+    external dependency's workspace is pinned (version + source) in `nomu.yaml`. Example:
+    `"dependencies": ["libfoo", "netutil"]`.
+- **Workspace** — `nomu.yaml`, at the repo root, above the packages. The unit of **versioning and external
+  consumption**: it pins each external dependency to a **single version + source**, per *workspace* (the
+  unit of external consumption is another repo's workspace, not a lone package), one version across the
+  whole workspace — so the diamond problem cannot arise (the Bazel stance). In-workspace packages are not
+  listed here: they are discovered by their `pkg.json` markers in the tree. A consumed external workspace is
+  self-describing the same way — its own `nomu.yaml` + markers define its packages. Its contents land with
+  cross-package linkage ([187](../plans/tasks/187-multi-package-builds.md)); until then it is a marker only.
 - **Module** — no file. Module metadata is zero; the filesystem is the module list (a per-module file
   is possible later if a need shows up). A manifest references modules only as policy lists (sealed,
   bin, tests), never as an addressing inventory.
@@ -180,7 +202,10 @@ system is in use. StrictYAML and KDL were the earlier leans; JSON is the pragmat
   adjacent to the code they test.
 - **White-box access** via `test import pkg/foo`, which widens the test module's visibility into `foo`
   to `internal`/`package`. A plain import stays black-box (public only). One test module can be
-  black-box on some targets and white-box on others.
+  black-box on some targets and white-box on others. **Implemented** (task 173.5.4): a module reached
+  through a `test import` edge has its interface built white-box (internal/package decls exposed, not just
+  public), so the test module's Sema reaches the target's non-public API; non-public symbols already carry
+  external linkage in the target's object, so admitting them to the interface is the whole mechanism.
 
 Rationale for keeping test code in separate modules rather than mixing it into the module under test:
 avoids an intra-module test/prod marker, namespace leakage of test helpers into production code,
@@ -296,7 +321,11 @@ dependents, so it is ABI-relevant. The consumer derives the prebuilt symbol by m
 canonical type encoding.
 
 **Module artifacts.** A module compile produces `.o` (concrete code + the erased generic path), `.nmi`
-(interface), and `.bir` (generic and inlinable-non-generic body IR).
+(interface), and `.bir` (generic and inlinable-non-generic body IR). They live under the **workspace**
+`build/` (the `nomu.yaml` root), not the package's — one workspace has a single build tree shared by its
+packages (the runtime archive is content-addressed and shared there; dependency `__mod_*` intermediates are
+keyed by workspace-relative module path so same-named modules in different packages do not collide). Absent a
+workspace marker, a loose package is its own build root.
 - `.nmi` is **body-free** and carries the API contract only: signatures, type layouts, generic
   signatures + bounds, conformances, witness / value-witness layouts + per-type GC trace metadata, and
   body-derived contract facts (mutating-ness, shareability). It holds no body and no body hash — that
