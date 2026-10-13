@@ -1,8 +1,9 @@
 # Multi-package builds — external dependencies, cross-package linkage + seal enforcement
 
 **Avenue:** Infra · **Type/Lifecycle:** `language-feature · needs-design` (build orchestration + a thin
-Sema/interface/mangler touch) · **Size:** L · **Status:** in-progress — 187.1 (manifest `dependencies` schema) done; 187.2 (external-import
-resolution) next · **Source:** spun out
+Sema/interface/mangler touch) · **Size:** L · **Status:** in-progress — 187.1 (manifest `dependencies` schema) + 187.2 (the resolver core:
+workspace registry + `.package_` resolution, unit-tested) done; 187.3 (cross-package linkage + graph-spanning
+with package-aware mangling) next · **Source:** spun out
 of [173](173-package-model-driver-cli.md) (the single-package driver + model, built) and
 [100](100-modules.md) §100.2.5 (the single-package visibility guard, whose cross-package half lives here).
 
@@ -37,33 +38,81 @@ boundary.
   (dependency-free JSON, as 173.1); a non-string entry (e.g. an object with a path) is a malformed-manifest
   decode error. **Unconsumed until 187.2** resolves imports against it; the name↔target-name match and the
   one-name-one-location consistency check ride the multi-package view (187.2/187.3).
-- 187.2 — **Cross-package import resolution (in-workspace).** Resolve a `.package_(name)` import (today
-  dropped by `resolvePkgImportDir`, which returns nil for non-`pkg/`): check `name` is in the importer's
-  `pkg.json` `dependencies` allow-list (strict), look it up in the workspace's **name→package-dir map** (built
-  by scanning the tree for `pkg.json` markers — a divergent/duplicate name is a consistency error), then pick
-  the module inside it (its `default-module` for a bare package name, a submodule by path) — the cross-package
-  analogue of `pkg/…` resolution. A module graph now spans packages; each node carries its owning package
-  identity. Needs a minimal workspace-root + marker scan (couples with 187.5). External-workspace resolution
-  (a no-marker dependency name → a `nomu.yaml` pin) is the deferred increment; until then such a name errors.
-- 187.3 — **Cross-package linkage.** Compile a dependency package's modules to objects + `.nmi` (separate
-  compilation, already per-module), then compile the consumer against the dependency's interfaces and link
-  the dependency objects in. Package identity enters mangling here — fold it into the `Mangle.qualifier`
-  (the package-identity slot carried forward from 100.4), so two packages exporting the same module/symbol
-  name stay distinct. Build order is the package dependency DAG (acyclic; a cycle is an error).
-- 187.4 — **Seal enforcement + the `package` tier across the boundary** (from 173.3 / the multi-package half
-  of 100.2.5). A sealed module (manifest `sealed`) is importable only from within its own package — a
-  foreign import is rejected with a clear diagnostic. `package`-tier visibility reaches siblings in the same
-  package but not a foreign package: emit `package` symbols into the `.nmi` **tagged with their visibility**,
-  and have a consumer admit a `package` (or sealed-module) symbol only when it shares the producer's package.
-  The single-package signature-consistency guard (100.2.5) already stands; this closes the cross-boundary
-  half. (White-box `test import` already widens to internal/package within a build — 173.5.4; its
-  interaction with a foreign package's sealing is defined here.)
-- 187.5 — **Workspace section** (deferred from 173.2). The repo-root `nomu.yaml` gains contents: the
-  **external dependency pins** — one version + source per external *workspace*, workspace-wide. In-workspace
-  packages are **not** listed (discovered by markers, 187.2); `nomu.yaml`'s job is the external registry (and
-  possibly the build/test root set). Today it is a bare marker. The minimal workspace-root resolution to
-  anchor the marker scan is pulled forward into 187.2; this phase adds the external-pin schema when
-  external resolution lands.
+- 187.2 — **Cross-package import resolution — the resolver core.** **Done** (`src/modules:modules_tests`
+  green). The reusable machinery in `src/modules/sources/WorkspacePackages.swift`: `scanWorkspacePackages`
+  builds the workspace **name→package-dir registry** by scanning the tree for `pkg.json` markers (packages
+  do not nest, so a marker is a leaf; a nested workspace — a subtree with its own `nomu.yaml` — is a pruned
+  boundary; a duplicate package name is a `WorkspaceError` consistency error). `resolvePackageImport` takes a
+  `.package_(name)` import, the importer's declared deps, and the registry, and returns `.module(dir)` /
+  `.notDeclared` (strict allow-list) / `.external` (declared but not in-workspace — deferred) / `.noModule`;
+  a bare name forwards to the package's `default-module` (or its root module), a path names a submodule.
+  Unit-tested with temp workspaces (registry build, duplicate-name error, nested-workspace pruning, strict
+  rejection, default/submodule resolution, external, missing module). **Wiring into the compile graph and
+  `query` (a graph that spans packages, keyed by workspace-relative identity) rides 187.3** — it needs the
+  package-aware mangling that makes cross-package symbols collision-free, so the resolver ships first (the
+  187.1→187.2 shape: infra consumed by the next phase).
+- 187.3 — **Cross-package linkage + graph-spanning.** Wire the 187.2 resolver into the driver's discovery
+  loop (and `query`) so the module graph spans packages, then fold the full identity into mangling so
+  cross-package (and cross-workspace) symbols never collide. Compile a dependency package's modules to
+  objects + `.nmi` (separate compilation, already per-module), compile the consumer against the dependency's
+  interfaces, and link the dependency objects in. **Package-level dependency cycles are forbidden** — the
+  inter-package `dependencies` graph must be a DAG, a rule distinct from (and stronger than) the existing
+  module-import-cycle check: `P` depends on `Q` and `Q` on `P` is an error even when no single module cycle
+  exists (the Rust/Go rule; it keeps per-package separate compilation and future caching sane). Build order
+  is that package DAG. The `build/` `__mod_*` intermediates are already keyed workspace-relative (173/187
+  build-root fix).
+
+  **Symbol identity — decided.** A mangled symbol's canonical identity is three parts:
+  `<workspace-name> :: <workspace-relative-module-path> :: <decl-signature>`, where the signature eventually
+  encodes the base name + each param's **label and type** + generic args (+ the receiver type for a method),
+  since overloading is **by type and label**. **187.3 implements only `workspace + module-path + name`** —
+  Nomu has no overloading yet, so there is nothing to disambiguate; the label+type signature is added by the
+  parameter-labels task ([112](112-param-labels-args.md)) when overloading lands (a localized `Mangle`
+  change, full rebuild, no external-ABI cost). Properties:
+  - **Workspace name is always included**, even for a single-workspace build — that is what makes a
+    workspace's objects safe to link into *another* workspace as an external. Prelude/runtime symbols are
+    the exception: they belong to the language, not a workspace, so they keep bare names and fold via
+    weak-ODR.
+  - **Identity is physical (workspace-relative path), not logical (package name).** Moving a package's
+    directory changes its symbols → a full rebuild, accepted (incremental-cache misses on a move are rare).
+  - **Full, readable, demanglable names — no hash.** The symbol *is* the canonical id. The id is unique by
+    construction (workspace names unique per build via aliasing; the single-version rule means no two
+    versions of a workspace coexist), so no disambiguator hash is needed — unlike Rust/Go, whose
+    multi-version support forces one. Long symbols (heavy monomorphization) cost binary **size + link time**,
+    never runtime (a static binary resolves to addresses; the runtime dispatches through pointers and keys GC
+    off type-ids, not names); the size cost is handled by **stripping the release binary** (names live in a
+    separate debug file). A demangler is trivial (the symbol parses back to the id) and rides the
+    debugger/crash-trace work ([138](138-debugger.md)).
+
+  The mechanical move: the home-qualifier and the consumer-side origin encoding (both package-relative
+  today — `Mangle.qualifier(module: id.components)` and the `origin.split("/")` sites in `SSAIRToLLVM`) go to
+  the three-part key in lockstep (the `Mangle.qualifier` package-identity slot carried from 100.4).
+- 187.4 — **Products enforcement + the `package` tier across the boundary** (from 173.3 / the multi-package
+  half of 100.2.5). **Module publicness is opt-in via manifest `products`** (replacing the old `sealed`
+  opt-out — a schema flip in `Manifest`): a module is importable from outside its package only if it is a
+  product; a foreign import of a non-product module is rejected with a clear diagnostic. The coupling
+  invariant is enforced here: a `public` symbol is allowed **only inside a product module**, and a `public`
+  in a non-product module is a **hard compile error** (steer to `package`, or add the module to products) —
+  so a stray `public` can never leak a module. Consumers reach a product **by path** (`import <pkg>/<prod>`);
+  products gate permission, never identity (no alias), so depending stays pathing. `package`-tier visibility
+  reaches same-package siblings but not a foreign package: emit `package` symbols into the `.nmi` **tagged
+  with their visibility**, and have a consumer admit a `package` symbol only when it shares the producer's
+  package. The single-package signature-consistency guard (100.2.5) already stands; this closes the
+  cross-boundary half. **White-box `test import` is restricted to modules in the same package** — a test
+  module may widen into its own package's internals (173.5.4) but never into another package's; a
+  cross-package import is always black-box, so a package's encapsulation holds even against a foreign test.
+- 187.5 — **Workspace section** (deferred from 173.2). The repo-root `nomu.yaml` gains contents:
+  - A required **`name`** — the workspace's identity. It is the first segment of every symbol's canonical id
+    (187.3), and the handle a consumer pins an external workspace by. (New field; today `nomu.yaml` is a bare
+    marker. A minimal name read is pulled forward into 187.3, since mangling needs it.)
+  - The **external dependency pins** — one version + source per external *workspace*, workspace-wide (the
+    single-version rule). In-workspace packages are **not** listed (discovered by markers, 187.2).
+  - **External workspace aliasing** (deferred, lands with external support). A consumer may bind an external
+    workspace under a local alias, so two unrelated external workspaces that happen to share a `name` can
+    both be used without a flat-namespace clash (prior art: Rust Cargo `package =` rename, Swift
+    `moduleAliases`). Small; it rides whenever external-workspace pulling is built.
+  - Possibly the build/test root set. The minimal workspace-root resolution to anchor the marker scan is
+    pulled forward into 187.2; this phase adds the external-pin + alias schema when external resolution lands.
 - 187.6 (tests) — A two-package fixture: consumer imports a dependency, builds, links, runs; a sealed
   dependency module is import-rejected; a `package`-tier symbol is denied across the boundary and admitted
   within; same-named symbols in two packages coexist (mangler identity). These are the cases 173.7 could not
@@ -96,12 +145,37 @@ versioning or distribution unit; a repo is consumed as a whole workspace.
 - **Near-term scope.** In-workspace dependencies (marker discovery) first; external-workspace resolution,
   registry/git sources, and the lockfile ride later (fold with 163 YAML).
 
-**Linkage + visibility (to settle in build).**
+**Module visibility (decided) — products, not seal.**
 
-- **Package identity in the mangler.** Reuse the 100.4 `Mangle.qualifier` package-identity slot rather than
-  inventing a new scheme; the module-path home-qualifier stays, now prefixed by package identity.
-- **`sealed` semantics.** Sealing is module-level and manifest-declared (like test identity), gating only
-  the cross-package import — within the package a sealed module is a normal module.
+- **Opt-in via `products`.** A package lists its public modules (`products`) in the manifest; the default is
+  package-internal. This **replaces the `sealed` opt-out** (a schema flip in `Manifest` — `sealed` → an
+  opt-in list), so the default is encapsulated and one mechanism covers it. A module is importable from
+  outside its package only if it is a product.
+- **`public` ⟺ product, enforced (hard error).** A `public` symbol is allowed only inside a product module;
+  a `public` in a non-product module is a compile error (steer to `package`, or add the module to products).
+  Exposing a module is two deliberate acts — mark the symbol `public` *and* list the module as a product —
+  so a stray `public` cannot leak an internal module, and `public` always means "external API."
+- **Consumers path.** `import <package>/<product>`: products gate *permission*, never *identity* (no alias,
+  no rollup), so depending stays pathing and the path names the module unambiguously. Importing a non-product
+  module is an error.
+- **`package` is the in-package tier** (essential), declared locally in source — the level a non-product
+  module's shared symbols use.
+
+**Symbol identity + mangling (decided).**
+
+- **Three-part canonical id:** `<workspace-name> :: <workspace-relative-module-path> :: <decl-signature>`,
+  signature encoding base name + param labels + param types + generic args (+ receiver type for methods),
+  since overloading is by type **and** label. Reuses the 100.4 `Mangle.qualifier` slot, widened to the full
+  key.
+- **Workspace name always present** (so a workspace's objects are linkable as an external anywhere); prelude/
+  runtime symbols excepted (language-owned, bare, weak-ODR-folded).
+- **Physical identity** (workspace-relative path): moving a package's directory is a full rebuild — accepted.
+- **Full demanglable names, no hash.** The symbol is the id, unique by construction (workspace names unique
+  per build via aliasing; single-version rule → no coexisting versions), so no disambiguator is needed.
+  Long symbols cost size + link time, never runtime (static binary; runtime dispatches by pointer, keys GC
+  off type-ids); mitigated by stripping to a separate debug file. Demangler rides [138](138-debugger.md).
+- **External workspace aliasing** (deferred to external support, 187.5) covers two externals sharing a
+  `name`.
 
 ## Dependencies & triggers
 

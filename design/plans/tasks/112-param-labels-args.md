@@ -9,6 +9,12 @@
   overload resolution.
 - **Default argument values.**
 - **Argument evaluation order** (an observable contract).
+- **Overload resolution + symbol mangling.** Overloading is **by type and param label**, so a function's
+  canonical identity — and therefore its mangled symbol — grows to encode param labels + param types (+
+  generic args) beyond the bare name. This task **owns adding that signature to the mangler**;
+  [187](187-multi-package-builds.md) §187.3 deliberately mangles only `workspace + module-path + name` until
+  then (no overloading exists yet, so nothing to disambiguate). Extending it is a localized `Mangle` change
+  (full rebuild, no external-ABI cost).
 
 Variadics out of scope for now.
 

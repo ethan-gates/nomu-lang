@@ -14,8 +14,8 @@ open items live in task [100](../plans/tasks/100-modules.md).
 
 - **Package** — the named **encapsulation + identity** unit: a group of modules forming a library, carrying
   a manifest, that shares internals among its own modules (the `package` visibility tier) while presenting a
-  curated `public` surface and sealing the rest. It is the boundary for visibility and the seal, and the
-  name an import resolves to. Its reason to exist is this mid-tier encapsulation: a **module** is too small
+  curated `public` surface (its declared products). It is the boundary for visibility, and the name an
+  import resolves to. Its reason to exist is this mid-tier encapsulation: a **module** is too small
   (one module cannot share a hidden symbol with a sibling module without making it `public` to the world),
   and the **workspace** is too big (no encapsulation at all). A package earns its keep exactly when a
   multi-module library has internal-but-shared modules; absent that, it is only a namespace.
@@ -62,7 +62,7 @@ tree contains only modules.
 - **Alias** with `import foo as bar` renames the local qualifier only (`bar.Bar`). It exists for
   collision disambiguation (two imported modules sharing a leaf name) and brevity. It does not rename
   bare symbols or affect consumers.
-- **Sealed transitivity.** Importing `B` does not expose what `B` imported. Transitive dependencies
+- **Non-transitive imports.** Importing `B` does not expose what `B` imported. Transitive dependencies
   never leak into scope.
 - **Collisions** between bare symbols are resolved by qualifying (`foo.Bar`); a leaf-name collision
   between two modules is resolved by aliasing one.
@@ -79,8 +79,9 @@ depends on keeping expression-level inference cheap — see [Type inference depe
 Rename- and extraction-safe (internal imports never name the package), no self-name repetition, no
 `super`/`self`-relative navigation.
 
-External packages are named by their manifest alias: `import foo/parse` targets the leaf module at that
-path. Bare `import foo` resolves to the package's **default module** — the module the manifest designates
+External packages are named by their own package name (no per-importer aliasing): `import foo/parse`
+targets the module `parse` in package `foo` — which must be one of `foo`'s products (§Visibility). Bare
+`import foo` resolves to the package's **default module** — the module the manifest designates
 (a single-directory package's sole module is its implicit default). A package that designates no default
 has no bare name: `import foo` is an error and callers name a submodule (`import foo/parse`). The same
 default-module forwarding governs a bare package path given to `build`/`run`/`test`.
@@ -95,16 +96,22 @@ default-module forwarding governs a bare package path given to `build`/`run`/`te
 - `public` — visible externally (the module API).
 
 Widening reach is the deliberate act; the default (`internal`) matches the implicit intra-module
-namespace. A symbol is externally reachable only when it is `public`.
+namespace. A symbol is externally reachable only when it is `public` **and** sits in a product module (below).
 
-**Module publicness is derived**, not declared: a module is externally importable to the extent it has
-`public` symbols. There is no module-level visibility keyword.
+**Module publicness is opt-in, via products.** A package lists its **products** in the manifest — the
+modules that make up its external API. A module is importable from outside its package only if it is a
+product; the default is package-internal. `public` and products are coupled by an invariant: a `public`
+symbol is allowed **only inside a product module**, and a `public` symbol in a non-product module is a
+**compile error** (use `package`, or add the module to the package's products). So exposing a module is two
+deliberate acts — mark the symbol `public` *and* list the module as a product — and a stray `public` can
+never leak an internal module by accident; the invariant keeps `public` meaning exactly "external API."
 
-**The seal** is the one exception, and it is declared in the **package manifest**, not in source. A
-sealed module cannot be imported outside its package, and its symbols are capped at `package` reach
-regardless of any `public` inside it. The seal is a team-governance boundary (auditable in one place,
-diffable), which is why it lives in the manifest while fine-grained symbol visibility stays local in
-source. It guards against a stray `public` leaking a module that is meant to stay internal.
+Consumers still reach a product **by path** — `import <package>/<product>`. The products list is a
+producer-side gate on the module's identity, never an alias: the import path still names the module
+unambiguously (depending is pathing), and the list only governs permission, the way symbol visibility
+already does. Importing a non-product module is an error. (Products replaced the earlier manifest *seal*: an
+opt-in public surface is the inverse of an opt-out hidden list, and the default is now encapsulated, so one
+mechanism covers it.)
 
 ## Re-export
 
@@ -139,7 +146,8 @@ module has none.
 
 - **Package** — `pkg.json`, at the package root. Holds package name, version, dependencies, the
   **default module** (the leaf module a bare package name forwards to, for `import`/`build`/`run`; a
-  single-module package's root module is the implicit default), the `sealed` module list, executable
+  single-module package's root module is the implicit default), the **products** (public-module list — see
+  §Visibility; the opt-in external surface, replacing the earlier `sealed` opt-out), executable
   declarations (`bin`), and test-module declarations. One per package; a single-package repo has exactly
   one. Its presence marks the package root, and `pkg` addressing resolves to it.
   - **Dependencies** (schema built, task [187](../plans/tasks/187-multi-package-builds.md) §187.1). A
@@ -152,14 +160,18 @@ module has none.
     external dependency's workspace is pinned (version + source) in `nomu.yaml`. Example:
     `"dependencies": ["libfoo", "netutil"]`.
 - **Workspace** — `nomu.yaml`, at the repo root, above the packages. The unit of **versioning and external
-  consumption**: it pins each external dependency to a **single version + source**, per *workspace* (the
-  unit of external consumption is another repo's workspace, not a lone package), one version across the
-  whole workspace — so the diamond problem cannot arise (the Bazel stance). In-workspace packages are not
-  listed here: they are discovered by their `pkg.json` markers in the tree. A consumed external workspace is
-  self-describing the same way — its own `nomu.yaml` + markers define its packages. Its contents land with
-  cross-package linkage ([187](../plans/tasks/187-multi-package-builds.md)); until then it is a marker only.
+  consumption**. It carries a **`name`** — the workspace's identity, which is the first segment of every
+  symbol's mangled identity (so a workspace's compiled objects are safe to link into another workspace) and
+  the handle a consumer pins an external by. It pins each external dependency to a **single version +
+  source**, per *workspace* (the unit of external consumption is another repo's workspace, not a lone
+  package), one version across the whole workspace — so the diamond problem cannot arise (the Bazel stance);
+  a consumer may bind an external under a **local alias** when two externals share a `name`. In-workspace
+  packages are not listed here: they are discovered by their `pkg.json` markers in the tree. A consumed
+  external workspace is self-describing the same way — its own `nomu.yaml` + markers define its packages.
+  Its contents land with cross-package linkage ([187](../plans/tasks/187-multi-package-builds.md)); until
+  then it is a marker only.
 - **Module** — no file. Module metadata is zero; the filesystem is the module list (a per-module file
-  is possible later if a need shows up). A manifest references modules only as policy lists (sealed,
+  is possible later if a need shows up). A manifest references modules only as policy lists (products,
   bin, tests), never as an addressing inventory.
 
 **Decided (format rule).** Not TOML. The manifest is **declarative data**, never a program, so the
@@ -202,7 +214,10 @@ system is in use. StrictYAML and KDL were the earlier leans; JSON is the pragmat
   adjacent to the code they test.
 - **White-box access** via `test import pkg/foo`, which widens the test module's visibility into `foo`
   to `internal`/`package`. A plain import stays black-box (public only). One test module can be
-  black-box on some targets and white-box on others. **Implemented** (task 173.5.4): a module reached
+  black-box on some targets and white-box on others. **`test import` is restricted to modules in the same
+  package** — a test may widen into its own package's internals, never another package's; a cross-package
+  import is always black-box, so a package's encapsulation holds even against a foreign test (task 187).
+  **Implemented** (task 173.5.4): a module reached
   through a `test import` edge has its interface built white-box (internal/package decls exposed, not just
   public), so the test module's Sema reaches the target's non-public API; non-public symbols already carry
   external linkage in the target's object, so admitting them to the interface is the whole mechanism.
