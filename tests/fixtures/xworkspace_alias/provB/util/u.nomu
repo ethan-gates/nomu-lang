@@ -1,0 +1,3 @@
+public fun answerB() -> Int {
+    return 200
+}

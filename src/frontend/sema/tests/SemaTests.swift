@@ -4,16 +4,32 @@ import ast
 import support
 import XCTest
 import sema
+import embedded
 
 final class SemaTests: XCTestCase {
+
+    // The prelude's `String` declaration (`std/prelude`), registered as an external the way a real build sees
+    // it through the implicit `import std`. Only `String` is taken: tests declare their own `Option`/`Result`.
+    private static let preludeString: [TopDecl] = {
+        guard let prelude = EmbeddedSources.stdModules.first(where: { $0.module == "prelude" }) else { return [] }
+        var lexer = Lexer(prelude.source, file: prelude.name)
+        var parser = Parser(lexer.tokenize())
+        return parser.parse().decls.filter { if case .structDecl(let d) = $0 { return d.name == "String" } else { return false } }
+    }()
 
     private func sema(_ source: String) -> SemaResult {
         var lexer = Lexer(source, file: "t.nomu")
         var parser = Parser(lexer.tokenize())
         // Match the real pipeline: extensions are merged into their target before Sema (M4.12).
         let merged = mergeExtensions(parser.parse(), into: DiagnosticSink())
-        var s = Sema(merged)
+        var s = Sema(merged, externalDecls: Self.preludeString)
         return s.check()
+    }
+
+    // The module's own lowered decls: an external type lowers into the module too (so a consumer constructs
+    // it), so the prelude `String` is left out of counts.
+    private func ownDecls(_ r: SemaResult) -> [NOIRDecl] {
+        r.module.decls.filter { if case .structDecl(let d) = $0 { return d.name != "String" } else { return true } }
     }
 
     func testInfersIntBinding() {
@@ -598,11 +614,11 @@ final class SemaTests: XCTestCase {
         interface Drawable {
             fun draw() -> String
             var name: String { get }
-            fun describe() -> String { return concat(self.name, self.draw()) }
+            fun describe() -> String { return self.name.concat(self.draw()) }
         }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
-        XCTAssertTrue(r.module.decls.isEmpty)   // interfaces are abstract — no codegen
+        XCTAssertTrue(ownDecls(r).isEmpty)   // interfaces are abstract — no codegen
     }
 
     func testBareInterfaceTypeRejected() {
@@ -1323,7 +1339,7 @@ final class SemaTests: XCTestCase {
             var name: String { get }
             var count: Int { get set }
             fun greet() -> String {
-                return concat("hi ", name)
+                return "hi ".concat(name)
             }
             fun reset() {
                 self.count = 0
@@ -1446,7 +1462,7 @@ final class SemaTests: XCTestCase {
         }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
-        XCTAssertEqual(r.module.decls.count, 2)   // generic `Box` is lowered (5.2.3), plus `unwrap`
+        XCTAssertEqual(ownDecls(r).count, 2)   // generic `Box` is lowered (5.2.3), plus `unwrap`
         guard case .structDecl(let box) = r.module.decls[0] else { XCTFail("expected Box"); return }
         XCTAssertEqual(box.generics.map(\.name), ["T"])
         XCTAssertEqual(box.fields.first?.type, .typeParam("T"))
@@ -1799,7 +1815,7 @@ final class SemaTests: XCTestCase {
             }
         }
         fun describe<T: Drawable>(x: T) -> String {
-            return concat(x.name, x.draw())
+            return x.name.concat(x.draw())
         }
         fun main() {
             print(describe(Circle(name: "c")))

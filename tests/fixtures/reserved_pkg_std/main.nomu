@@ -1,0 +1,5 @@
+// A user package may not take the reserved name `std` (modules.md §Imports).
+
+fun main() {
+    print(1)
+}

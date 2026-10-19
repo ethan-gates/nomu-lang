@@ -28,6 +28,9 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     // Per-stage timing; reported to stderr on the way out (success or error).
     let timings = Timings()
     timings.optimize = options.optimize
+    // An external-workspace build (task 188; the embedded `nomu` workspace, or a pinned local external) runs
+    // as nested `compile()` calls; silence their timing reports so they do not spam the user build's stderr.
+    timings.silent = options.emitLibrary
     // The backend egress is the SSAIR tier (the sole path since M7.7 retired the NOIR tree-walk);
     // named in the timing header for context.
     timings.egress = "ssair"
@@ -60,7 +63,16 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     // derives the identical key for an imported symbol, so a cross-package (and, with 187.5, cross-
     // workspace) reference links to the one definition. Prelude/runtime symbols are exempt (bare, folded
     // weak-ODR); the entry binary is bare too — nothing imports it.
-    func mangleOrigin(_ id: ModuleID) -> [String] { [workspaceName] + id.components }
+    // A module's canonical mangling vocabulary (task 187.3 / 188): its owning workspace's name + its
+    // workspace-relative path. For an in-workspace module the name is the build's own `workspaceName`; a
+    // module from an external workspace carries that workspace's name (via its `ModuleHome`), so a
+    // cross-workspace reference mangles under the producer's identity. The `moduleHome` lookup resolves to
+    // the build's name for every local module, so this is identical to the pre-188 single-name scheme
+    // in-workspace.
+    func mangleOrigin(_ id: ModuleID) -> [String] {
+        if let home = moduleHome[id], home.isExternal { return id.components }   // id is already the full canonical path
+        return [moduleHome[id]?.workspaceName ?? workspaceName] + id.components
+    }
 
     // Dependency intermediates (`__mod_*.o` / `.bir`) share the workspace `build/`, so they are keyed by
     // the module's workspace-relative path — unique across every package in the workspace.
@@ -76,6 +88,12 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     catch { fputs("error: \(error)\n", stderr); return false }
     let packageName = manifest?.name ?? defaultPackageName
     timings.package = packageName
+    // A user package may not take a reserved name (`std`, `pkg`); the embedded `nomu` workspace's `std`
+    // (a `compilingPrelude` build) is exempt.
+    if !options.compilingPrelude, let m = manifest, reservedPackageNames.contains(m.name) {
+        fputs("error: " + reservedPackageNameError(m.name, at: packageRoot) + "\n", stderr)
+        return false
+    }
 
     // Discover the module graph (task 100.2). The entry module is exactly the given files; a first-party
     // `pkg/…` import pulls in that module by directory scan and parses it too, transitively. External
@@ -98,7 +116,18 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     // Each discovered module's home (task 187.3): the package it lives in — anchoring `pkg/…` resolution
     // and carrying that package's cross-package dependency allow-list and name (for the `.nmi` identity and
     // the package-level DAG check).
-    struct ModuleHome { let packageRoot: String; let packageName: String; let declaredDeps: [String] }
+    // `workspaceName`/`workspaceRoot` are the owning workspace's identity + root (task 188): for an
+    // in-workspace module they are the build's own (every local module shares them); a module pulled in from
+    // an external workspace carries *that* workspace's name and root, so its canonical identity mangles under
+    // the producer's name and its path is measured from the producer's root.
+    struct ModuleHome {
+        let packageRoot: String; let packageName: String; let declaredDeps: [String]
+        let workspaceName: String; let workspaceRoot: String
+        // An external-workspace module (task 188): its graph `id` is already the full canonical path
+        // (`[workspaceName] + relative`), so `mangleOrigin` uses it verbatim rather than prefixing the local
+        // name, and the driver loads its interface/object from disk instead of compiling its source.
+        var isExternal = false
+    }
     var moduleHome: [ModuleID: ModuleHome] = [:]
 
     // Manifests, cached per package root (the entry's is already loaded). The in-workspace package registry
@@ -117,25 +146,96 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     func workspaceRegistry() -> [String: String]? {
         if let r = packageRegistry { return r }
         if registryError != nil { return nil }
-        do { let r = try scanWorkspacePackages(workspaceRoot: wsRootPath); packageRegistry = r; return r }
+        do {
+            let r = try scanWorkspacePackages(workspaceRoot: wsRootPath)
+            // A workspace package with a reserved name (`std`, `pkg`) fails the scan, the same as a duplicate.
+            if let bad = r.keys.sorted().first(where: { reservedPackageNames.contains($0) }) {
+                registryError = reservedPackageNameError(bad, at: r[bad]!); return nil
+            }
+            packageRegistry = r; return r
+        }
         catch { registryError = "\(error)"; return nil }
     }
+
+    // Local-path external-workspace pins from this workspace's `nomu.yaml` (task 188): external workspace
+    // name → absolute root. A `.external` package import (declared but not in-workspace) resolves against the
+    // packages these workspaces provide.
+    let externalPins = readWorkspaceExternals(wsRootPath)
+    // Each pinned external workspace's package registry (package name → package dir), scanned lazily + once.
+    var externalRegistries: [String: [String: String]] = [:]
+    func externalRegistry(_ extRoot: String) -> [String: String] {
+        if let r = externalRegistries[extRoot] { return r }
+        let r = (try? scanWorkspacePackages(workspaceRoot: extRoot)) ?? [:]
+        externalRegistries[extRoot] = r
+        return r
+    }
+    // External modules a build references (task 188): discovered here, then built + loaded from their
+    // producer workspace's outputs in a pass after discovery (their interface tables are declared there). The
+    // graph `id` is the full canonical path; `dir` the module's source dir in the producer; `ext` its owning
+    // workspace.
+    var externalModules: [(id: ModuleID, dir: String, ext: ExternalWorkspace)] = []
+    var externalObjects: [String] = []
+    // Modules whose public surface is ambient — visible in every module without an explicit import (task
+    // 174.2). The embedded `nomu/core` package goes here, so prelude types/functions resolve bare. Populated
+    // when the `nomu` workspace is loaded below; empty for a prelude/library build.
+    var ambientModules: [ModuleID] = []
 
     // The inter-package dependency edges actually exercised (importer package → imported packages). The
     // package graph must be a DAG — a rule stronger than the module-import-acyclicity check (task 187.3):
     // `P` → `Q` → `P` is an error even when no single module cycle exists.
     var pkgDeps: [String: Set<String>] = [:]
 
-    // Resolve one import from a module in `home` to its target module directory. A `pkg/…` import stays in
-    // the importer's own package; a bare-package import resolves across the workspace (task 187.2),
-    // enforcing the strict allow-list. `crossPackage` names the imported package, for the package edge.
-    enum ImportResolve { case ok(dir: String, packageRoot: String, crossPackage: String?); case failed(String) }
+    let buildRoot = workspaceRoot.appendingPathComponent("build").path
+    // The embedded `nomu` workspace (task 174) is materialized before discovery for a final binary build (not a
+    // library/prelude build), so discovery resolves `std` imports against it — the implicit `import std` every
+    // file carries included. Its packages compile after discovery, below.
+    var nomuScratch: String? = nil
+    if !options.emitLibrary {
+        let scratch = buildRoot + "/nomu/ws-\(ProcessInfo.processInfo.processIdentifier)-\(UInt32.random(in: 0 ..< .max))"
+        nomuScratch = scratch
+        guard materializeNomuWorkspace(inDir: scratch) else {
+            try? FileManager.default.removeItem(atPath: scratch); return false
+        }
+    }
+    defer { if let s = nomuScratch { try? FileManager.default.removeItem(atPath: s) } }
+
+    // A resolved import's owning external workspace (task 188): nil for an in-workspace target. Carries the
+    // producer workspace's name + root so the consumer mangles the reference under the producer's identity
+    // and reads its artifacts from the producer's build tree.
+    struct ExternalWorkspace { let name: String; let root: String }
+    // Resolve one import from a module in `home` to its target module. A `pkg/…` import stays in the
+    // importer's own package; a bare-package import resolves in-workspace (task 187.2) or, failing that, to a
+    // pinned external workspace (task 188) — both enforcing the strict allow-list + product gate. `id` is the
+    // target's graph identity (for an external target, its full canonical path under the producer's workspace
+    // name, so it never collides with a local module and mangles identically to the producer). `crossPackage`
+    // names the imported package, for the package edge; `external` is set when the target lives in a pinned
+    // external workspace.
+    enum ImportResolve {
+        case ok(id: ModuleID, dir: String, packageRoot: String, crossPackage: String?, external: ExternalWorkspace?)
+        case failed(String)
+    }
     func resolveImport(_ imp: ImportDecl, from home: ModuleHome) -> ImportResolve {
         switch imp.root {
         case .pkg:
-            return .ok(dir: ([home.packageRoot] + imp.path).joined(separator: "/"),
-                       packageRoot: home.packageRoot, crossPackage: nil)
+            let dir = ([home.packageRoot] + imp.path).joined(separator: "/")
+            return .ok(id: graphID(forDir: dir), dir: dir, packageRoot: home.packageRoot,
+                       crossPackage: nil, external: nil)
         case .package_(let name):
+            // `std` names the embedded `nomu` workspace's standard library (task 174): bare `import std` is its
+            // default module (`prelude`, the module every file imports implicitly) and `import std/<module>`
+            // the rest. It needs no `dependencies` entry; a user package may not take the name.
+            if name == "std", let nomuRoot = nomuScratch {
+                return resolveInExternalWorkspace(extRoot: nomuRoot, package: name, subpath: imp.path)
+            }
+            // Workspace-alias-qualified external import (task 188.5): when the root token is a `nomu.yaml`
+            // external pin key — a local alias for an external workspace — `import <alias>/<package>[/<module>]`
+            // names that workspace explicitly, disambiguating a package name two pinned workspaces share. The
+            // pin authorizes the reference; the symbol still mangles under the producer's own workspace name
+            // (the alias rewrites only the local import root). An alias shadows a same-named in-workspace
+            // package — the qualified form is the explicit one.
+            if let extRoot = externalPins[name], let pkg = imp.path.first {
+                return resolveInExternalWorkspace(extRoot: extRoot, package: pkg, subpath: Array(imp.path.dropFirst()))
+            }
             guard let registry = workspaceRegistry() else {
                 return .failed(registryError ?? "cannot resolve package '\(name)': no workspace")
             }
@@ -153,11 +253,12 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
                     return .failed("module '\(shown)' is not a product of package '\(name)' — list it "
                                  + "under 'products' in that package's pkg.json")
                 }
-                return .ok(dir: dir, packageRoot: pkgDir, crossPackage: name)
+                return .ok(id: graphID(forDir: dir), dir: dir, packageRoot: pkgDir,
+                           crossPackage: name, external: nil)
             case .notDeclared(let p):
                 return .failed("package '\(p)' is not listed in this package's 'dependencies'")
             case .external(let p):
-                return .failed("package '\(p)' is external — external workspaces are not supported yet")
+                return resolveExternalImport(package: p, path: imp.path)
             case .noModule(let p):
                 let sub = imp.path.isEmpty ? "(default module)" : imp.path.joined(separator: "/")
                 return .failed("no module '\(sub)' in package '\(p)'")
@@ -165,15 +266,59 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         }
     }
 
+    // Resolve a package within a specific pinned external workspace (task 188). The product gate applies
+    // across the boundary exactly as in-workspace; the resolved `id` is the module's full canonical path
+    // under the *producer's* workspace name (read from its `nomu.yaml`), so it never collides with a local
+    // module and mangles identically to the producer's own compile. A bare package name forwards to the
+    // package's default/root module.
+    func resolveInExternalWorkspace(extRoot: String, package name: String, subpath: [String]) -> ImportResolve {
+        guard let pkgDir = externalRegistry(extRoot)[name] else {
+            return .failed("external workspace at '\(extRoot)' has no package '\(name)'")
+        }
+        let moduleDir: String
+        if subpath.isEmpty {
+            if !scanModuleFiles(pkgDir).isEmpty { moduleDir = pkgDir }                            // single-module package
+            else if let def = (try? loadManifest(packageRoot: pkgDir))??.defaultModule { moduleDir = pkgDir + "/" + def }
+            else { return .failed("package '\(name)' names no default module to import") }
+        } else {
+            moduleDir = pkgDir + "/" + subpath.joined(separator: "/")
+        }
+        guard !scanModuleFiles(moduleDir).isEmpty else {
+            return .failed("no module '\(subpath.joined(separator: "/"))' in external package '\(name)'")
+        }
+        let relPath = moduleID(forDir: moduleDir, packageRoot: pkgDir).components.joined(separator: "/")
+        guard (manifestFor(pkgDir)?.products ?? []).contains(relPath) else {
+            let shown = relPath.isEmpty ? "(default module)" : relPath
+            return .failed("module '\(shown)' is not a product of external package '\(name)' — list it "
+                         + "under 'products' in that package's pkg.json")
+        }
+        let extWsName = readWorkspaceName(extRoot) ?? URL(fileURLWithPath: extRoot).lastPathComponent
+        let extID = ModuleID([extWsName] + moduleID(forDir: moduleDir, packageRoot: extRoot).components)
+        return .ok(id: extID, dir: moduleDir, packageRoot: pkgDir, crossPackage: name,
+                   external: ExternalWorkspace(name: extWsName, root: extRoot))
+    }
+    // Resolve an unqualified `.external` package (declared in the importer's `pkg.json`, absent from the
+    // in-workspace registry) against the pinned workspaces (task 188): the first pinned workspace that
+    // provides a package of that name wins. A same-package-name clash across two pinned workspaces is
+    // disambiguated by the alias-qualified form (`import <alias>/<package>`, task 188.5) instead.
+    func resolveExternalImport(package name: String, path: [String]) -> ImportResolve {
+        for (_, extRoot) in externalPins.sorted(by: { $0.key < $1.key }) where externalRegistry(extRoot)[name] != nil {
+            return resolveInExternalWorkspace(extRoot: extRoot, package: name, subpath: path)
+        }
+        return .failed("package '\(name)' is external but no workspace pinned in nomu.yaml provides it")
+    }
+
     let entryID = graphID(forFile: primary)
     seenModule.insert(entryID); graph.addNode(entryID)
     moduleHome[entryID] = ModuleHome(packageRoot: packageRoot, packageName: packageName,
-                                     declaredDeps: manifest?.dependencies ?? [])
+                                     declaredDeps: manifest?.dependencies ?? [],
+                                     workspaceName: workspaceName, workspaceRoot: wsRootPath)
     var worklist: [(id: ModuleID, files: [String])] = [(entryID, paths)]
     while !worklist.isEmpty {
         let (modID, files) = worklist.removeFirst()
         let home = moduleHome[modID]
-            ?? ModuleHome(packageRoot: packageRoot, packageName: packageName, declaredDeps: [])
+            ?? ModuleHome(packageRoot: packageRoot, packageName: packageName, declaredDeps: [],
+                          workspaceName: workspaceName, workspaceRoot: wsRootPath)
         for file in files {
             guard let text = try? String(contentsOfFile: file, encoding: .utf8) else {
                 fputs("error: cannot read '\(file)'\n", stderr)
@@ -189,13 +334,23 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
                 var parser = Parser(tokens, diagnostics: parseDiags)
                 return parser.parse()
             }
-            parsedByModule[modID, default: []].append(SourceFile(path: file, decls: prog.decls, imports: prog.imports))
-            for imp in prog.imports {
+            // The implicit `import std` (task 174): every file of a binary build imports `std`'s default module
+            // (the prelude) as if it began with an invisible `import std`. A file that names `std` bare itself
+            // (to alias it, say) keeps its own import instead.
+            var imports = prog.imports
+            if nomuScratch != nil && !imports.contains(where: { imp in
+                if case .package_("std") = imp.root { return imp.path.isEmpty } else { return false }
+            }) {
+                imports.insert(ImportDecl(root: .package_("std"), path: [], alias: nil, isPublic: false, isTest: false,
+                                          span: Span(startOffset: 0, endOffset: 0, map: tokens.first?.span.map)),
+                               at: 0)
+            }
+            parsedByModule[modID, default: []].append(SourceFile(path: file, decls: prog.decls, imports: imports))
+            for imp in imports {
                 switch resolveImport(imp, from: home) {
                 case .failed(let msg):
                     parseDiags.error(msg, at: imp.span)
-                case .ok(let dir, let depPkgRoot, let crossPackage):
-                    let depID = graphID(forDir: dir)
+                case .ok(let depID, let dir, let depPkgRoot, let crossPackage, let external):
                     graph.addEdge(from: modID, to: depID)
                     if let crossPackage { pkgDeps[home.packageName, default: []].insert(crossPackage) }
                     // `test import` is same-package only (task 187.4.5): white-box widening into a foreign
@@ -210,6 +365,20 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
                             testImportTargets.insert(depID)
                         }
                     }
+                    // An external-workspace module (task 188) is loaded from the producer's outputs, not
+                    // compiled here: record its external home and defer the build + interface load to the
+                    // post-discovery pass (the interface tables are declared there). Its source is never
+                    // scanned or worklisted.
+                    if let external {
+                        if seenModule.insert(depID).inserted {
+                            moduleHome[depID] = ModuleHome(packageRoot: depPkgRoot,
+                                                           packageName: crossPackage ?? defaultPackageName,
+                                                           declaredDeps: [], workspaceName: external.name,
+                                                           workspaceRoot: external.root, isExternal: true)
+                            externalModules.append((id: depID, dir: dir, ext: external))
+                        }
+                        continue
+                    }
                     if seenModule.insert(depID).inserted {
                         let depFiles = scanModuleFiles(dir)
                         if depFiles.isEmpty {
@@ -218,7 +387,8 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
                             let m = manifestFor(depPkgRoot)
                             moduleHome[depID] = ModuleHome(packageRoot: depPkgRoot,
                                                            packageName: m?.name ?? defaultPackageName,
-                                                           declaredDeps: m?.dependencies ?? [])
+                                                           declaredDeps: m?.dependencies ?? [],
+                                                           workspaceName: workspaceName, workspaceRoot: wsRootPath)
                             worklist.append((depID, depFiles))
                         }
                     }
@@ -249,7 +419,6 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     // compilation, task 100.4.2).
     let program = Program(decls: (parsedByModule[entryID] ?? []).flatMap(\.decls),
                           imports: (parsedByModule[entryID] ?? []).flatMap(\.imports))
-    let buildRoot = workspaceRoot.appendingPathComponent("build").path
     // The artifact stem: `-o <path>` gives it explicitly (its parent is created); otherwise it mirrors
     // the primary source's path under the workspace `build/`. All artifacts append an extension to the
     // stem, and the binary is the stem itself.
@@ -299,6 +468,86 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     var depEscape: [ModuleID: [String: EscapeSummary]] = [:]
     var depObjects: [String] = []
     try? FileManager.default.createDirectory(atPath: buildRoot, withIntermediateDirectories: true)
+
+    // Build + load each referenced external workspace (task 188). A producer workspace's products are
+    // compiled once into home-qualified library objects (origin = the producer's own workspace name); the
+    // consumer loads the imported modules' interfaces from the produced `.nmi` and links all the workspace's
+    // objects (`-dead_strip` drops whatever a reference never reaches). The handoff is disk-only. No content
+    // cache — task 172's CAS cache subsumes it.
+    var builtExternalWorkspaces: [String: [ModuleID: String]] = [:]   // extRoot → (external module id → its `.nmi`)
+    func buildExternalWorkspace(_ ext: ExternalWorkspace) -> [ModuleID: String]? {
+        if let done = builtExternalWorkspaces[ext.root] { return done }
+        var nmiByID: [ModuleID: String] = [:]
+        let outDir = ext.root + "/build/__ext_lib"
+        try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+        for (pkgName, pkgDir) in externalRegistry(ext.root).sorted(by: { $0.key < $1.key }) {
+            for prod in (manifestFor(pkgDir)?.products ?? []) {
+                let prodDir = prod.isEmpty ? pkgDir : pkgDir + "/" + prod
+                let files = scanModuleFiles(prodDir)
+                if files.isEmpty { continue }
+                let extID = ModuleID([ext.name] + moduleID(forDir: prodDir, packageRoot: ext.root).components)
+                let stem = outDir + "/" + extID.components.joined(separator: "_")
+                var opts = EmitOptions()
+                opts.emitLibrary = true
+                opts.outputPath = stem
+                guard compile(paths: files, options: opts) else {
+                    fputs("error: failed to build external workspace '\(ext.name)' package '\(pkgName)'\n", stderr)
+                    return nil
+                }
+                nmiByID[extID] = stem + ".nmi"
+                externalObjects.append(stem + ".o")
+            }
+        }
+        // A product that imports a sibling package emits that dependency as a `__mod_*.o` under the external
+        // build root; link those too so the external's own cross-package references resolve.
+        let extBuild = ext.root + "/build"
+        for f in ((try? FileManager.default.contentsOfDirectory(atPath: extBuild)) ?? []).sorted()
+        where f.hasPrefix("__mod_") && f.hasSuffix(".o") {
+            externalObjects.append(extBuild + "/" + f)
+        }
+        builtExternalWorkspaces[ext.root] = nmiByID
+        return nmiByID
+    }
+    // The embedded `nomu` workspace (task 174): for a final binary build, compile the materialized `core` /
+    // `runtime` / `std` modules once and link every object. `core` and `runtime` load here as compiler-injected
+    // external modules (origin `nomu/<pkg>`); `core` is ambient — its substrate (`ManagedBuffer`) is bare-
+    // visible in every module. `std`'s modules load through the external-module pass below like any pinned
+    // workspace's, for the files that import them (each file's implicit `import std` included); recording them
+    // as the workspace's built outputs keeps that pass from rebuilding them. No cache — task 172's CAS cache
+    // subsumes it.
+    if let scratch = nomuScratch {
+        guard let arts = timings.measure("nomu", "workspace", { compileNomuWorkspace(inDir: scratch) }) else {
+            timings.report(); return false
+        }
+        var stdNMI: [ModuleID: String] = [:]
+        for a in arts {
+            externalObjects.append(a.obj)
+            if a.package == "std" { stdNMI[ModuleID(["nomu", "std", a.module])] = a.nmi; continue }
+            let id = ModuleID(["nomu", a.package])
+            moduleHome[id] = ModuleHome(packageRoot: scratch + "/" + a.package, packageName: a.package,
+                                        declaredDeps: [], workspaceName: "nomu", workspaceRoot: scratch,
+                                        isExternal: true)
+            if let text = try? String(contentsOfFile: a.nmi, encoding: .utf8), let nmi = parseNMI(text) {
+                interfaces[id] = nmi.abi
+                depEscape[id] = nmi.perf.escape
+            }
+            if a.package == "core" { ambientModules.append(id) }
+        }
+        builtExternalWorkspaces[scratch] = stdNMI
+    }
+    for em in externalModules {
+        guard let nmiByID = buildExternalWorkspace(em.ext),
+              let nmiPath = nmiByID[em.id],
+              let text = try? String(contentsOfFile: nmiPath, encoding: .utf8),
+              let nmi = parseNMI(text) else {
+            fputs("error: cannot load external module '\(em.id.pathString)' from workspace '\(em.ext.name)'\n", stderr)
+            timings.report(); return false
+        }
+        interfaces[em.id] = nmi.abi
+        depEscape[em.id] = nmi.perf.escape
+    }
+
+    depObjects = externalObjects   // external objects link into the binary alongside the local dependency objects
     // A module plus everything it re-exports via `public import`, transitively (task 100.2.4).
     // Deterministic order. The unit of "what importing this module brings into scope."
     func reexportClosure(of dep: ModuleID) -> [ModuleID] {
@@ -317,6 +566,8 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     func visibleModules(of m: ModuleID) -> [ModuleID] {
         var seen = Set<ModuleID>()
         var order: [ModuleID] = []
+        // Ambient modules (task 174.2: `nomu/core`) are visible to every module without an import.
+        for a in ambientModules where a != m && seen.insert(a).inserted { order.append(a) }
         for dep in graph.dependencies(of: m) {
             for k in reexportClosure(of: dep) where seen.insert(k).inserted { order.append(k) }
         }
@@ -335,8 +586,8 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         var out = Set<ModuleID>()
         for f in parsedByModule[m] ?? [] {
             for imp in f.imports where imp.isTest {
-                if case .ok(let dir, _, let crossPackage) = resolveImport(imp, from: home), crossPackage == nil {
-                    out.insert(graphID(forDir: dir))
+                if case .ok(let id, _, _, let crossPackage, _) = resolveImport(imp, from: home), crossPackage == nil {
+                    out.insert(id)
                 }
             }
         }
@@ -427,14 +678,16 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
             var quals: [String: Set<String>] = [:]
             var seenLeaf = Set<String>()
             for imp in f.imports {
-                guard case .ok(let dir, _, _) = resolveImport(imp, from: home) else { continue }
-                let closure = reexportClosure(of: graphID(forDir: dir))
+                guard case .ok(let id, _, _, _, _) = resolveImport(imp, from: home) else { continue }
+                let closure = reexportClosure(of: id)
                     .map { mangleOrigin($0).joined(separator: "/") }
                 vis.formUnion(closure)
                 let q = imp.leafName
                 if !seenLeaf.insert(q).inserted { leafCollisions.append((f.path, q, imp.span)) }
                 quals[q, default: []].formUnion(closure)
             }
+            // Ambient modules (task 174.2: `nomu/core`) are bare-visible in every file, no import needed.
+            for a in ambientModules { vis.insert(mangleOrigin(a).joined(separator: "/")) }
             fileVisible[f.path] = vis
             fileQualifiers[f.path] = quals
         }
@@ -445,15 +698,57 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     // module's own decls that name one of its own exported types are rewritten to that encoded identity
     // too, so a function's signature keeps pointing at the right type under a collision.
     func externals(of m: ModuleID) -> [TopDecl] {
-        visibleModules(of: m).flatMap { k -> [TopDecl] in
-            guard let iface = interfaces[k] else { return [] }
+        // One module's admitted declarations, origin-encoded: its own types under its origin, and each foreign
+        // type its signatures name under that type's origin (`foreignTypes`, task 174.7).
+        func decls(of k: ModuleID) -> (decls: [TopDecl], foreign: [String: String]) {
+            guard let iface = interfaces[k] else { return ([], [:]) }
             let origin = mangleOrigin(k).joined(separator: "/")
             // Round-trip through the serialized form (the disk handoff a separate compile would read),
             // then admit only the tiers `m` may see (task 187.4.4).
             let seen = admittedInterface(parseInterface(serialize(iface)) ?? iface, producer: k, consumer: m)
             let ownTypes = Set(seen.types.map(\.name)).union(seen.enums.map(\.name))
-            return interfaceToDecls(seen).map { encodeExternalDecl($0, origin: origin, ownTypes: ownTypes) }
+            let foreign = seen.foreignTypes ?? [:]
+            return (interfaceToDecls(seen).map { encodeExternalDecl($0, origin: origin, ownTypes: ownTypes, foreign: foreign) },
+                    foreign)
         }
+        let visible = visibleModules(of: m)
+        var out: [TopDecl] = []
+        var pending: [String] = []
+        for k in visible {
+            let d = decls(of: k)
+            out += d.decls
+            pending += d.foreign.values.sorted()
+        }
+        // Types a visible signature names from a module `m` does not import (task 174.7): their declarations
+        // load so values of them type-check (fields, methods, matching), but the module stays out of `m`'s
+        // scope, so the names stay unnameable in `m` — no implicit re-export (modules.md §Re-export). Only
+        // types load, transitively through their own signatures; the hidden module's functions do not.
+        let byOrigin = Dictionary(interfaces.keys.map { (mangleOrigin($0).joined(separator: "/"), $0) },
+                                  uniquingKeysWith: { a, _ in a })
+        var loaded = Set(visible.map { mangleOrigin($0).joined(separator: "/") } + [mangleOrigin(m).joined(separator: "/")])
+        while let o = pending.popLast() {
+            guard loaded.insert(o).inserted, let k = byOrigin[o] else { continue }
+            let d = decls(of: k)
+            out += d.decls.filter {
+                switch $0 { case .structDecl, .classDecl, .enumDecl: return true; default: return false }
+            }
+            pending += d.foreign.values.sorted()
+        }
+        return out
+    }
+    // The origin of each foreign type `id`'s interface names (task 174.7): a signature type that is not one
+    // of the module's own exported types, resolved against the modules its files import. A name exported by
+    // more than one of them is left out (it stays bare, as before).
+    func foreignTypeOrigins(_ iface: ModuleInterface, of id: ModuleID, fileVisible: [String: Set<String>]) -> [String: String]? {
+        let own = Set(iface.types.map(\.name)).union(iface.enums.map(\.name))
+        let inScope = fileVisible.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+        let exports = moduleTypes(for: id)
+        var out: [String: String] = [:]
+        for n in signatureTypeNames(iface) where !own.contains(n) {
+            let origins = inScope.filter { exports[$0]?.contains(n) == true }
+            if origins.count == 1, let o = origins.first { out[n] = o }
+        }
+        return out.isEmpty ? nil : out
     }
     // Imported methods inferred mutating in their producing module, keyed `origin@Type.method` to match
     // the consumer's call-site key (task 100.4.3.5.2). Sourced from each visible dependency's `.nmi`
@@ -494,7 +789,8 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         // The pre-prelude, pre-merge surface — the interface + `.bir` own-name set are taken from it.
         let ownSurface = program
         let home = moduleHome[id]
-            ?? ModuleHome(packageRoot: packageRoot, packageName: packageName, declaredDeps: [])
+            ?? ModuleHome(packageRoot: packageRoot, packageName: packageName, declaredDeps: [],
+                          workspaceName: workspaceName, workspaceRoot: wsRootPath)
         let scopes = fileScopes(files, home: home)
 
         // Duplicate-symbol / visibility / leaf-collision checks (tasks 100.1.3 / 100.2.5), before the
@@ -512,9 +808,28 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         reportLeafCollisions(scopes.leafCollisions, into: dupDiags)
         if dupDiags.hasErrors { fputs(dupDiags.render() + "\n", stderr); return false }
 
-        // Prelude (M4.13) + plain-extension merge (M4.12).
+        // Plain-extension merge (M4.12). The prelude prepend is fully retired (task 174.5/.5.1): the runtime
+        // lives in the `runtime` package (referenced by bare symbol), the user-facing surface in `std`, and
+        // `core`'s `ManagedBuffer` is an ambient `nomu/core` package type while its `EmptyHeader` header is a
+        // compiler builtin (seeded in the egress). Nothing is prepended into an ordinary build.
         let runtimeSubsetNames: Set<String>
-        (program, runtimeSubsetNames) = timings.measure("noir", "prelude") { prependPrelude(program) }
+        if options.compilingPrelude {
+            // The `runtime` package designates its own functions runtime-subset by membership (task 174.4):
+            // every free function it defines is subset, sourced from the package rather than a prepend parse.
+            runtimeSubsetNames = options.runtimeSubsetByMembership
+                ? Set(program.decls.compactMap { if case .funcDecl(let f) = $0 { return f.name } else { return nil } })
+                : []
+        } else {
+            // White-box runtime tests (`NOMU_RT_PRELUDE`) prepend the runtime prelude so a user fixture can
+            // call runtime internals (`rtArenaNew`, the Immix ops) by name — the access the retired runtime
+            // prepend used to give every build. The definitions are bare weak-ODR, so they fold with the
+            // `runtime` package's own copies; no production build sets this.
+            if ProcessInfo.processInfo.environment["NOMU_RT_PRELUDE"] != nil {
+                (program, runtimeSubsetNames) = timings.measure("noir", "prelude") { prependRuntimePrelude(program) }
+            } else {
+                runtimeSubsetNames = []
+            }
+        }
         let mergeDiags = DiagnosticSink()
         program = timings.measure("noir", "merge") { mergeExtensions(program, into: mergeDiags) }
         if mergeDiags.hasErrors { fputs(mergeDiags.render() + "\n", stderr); return false }
@@ -555,12 +870,14 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         // Module interface — built for every module (dependents read it from `interfaces`), from the
         // pre-prelude surface, carrying the inferred facts (164.4). Its escape perf section is computed
         // only when a `.nmi` is wanted (164.6 seeding).
-        let iface = buildInterface(ownSurface, package: home.packageName, module: id, moduleIDRoot: wsRootPath,
+        var iface = buildInterface(ownSurface, package: home.packageName, module: id, moduleIDRoot: wsRootPath,
+                                   workspace: workspaceName,
                                    facts: factStore, whiteBox: testImportTargets.contains(id),
                                    reexportModulePath: { imp in
-                                       guard case .ok(let dir, _, _) = resolveImport(imp, from: home) else { return nil }
-                                       return graphID(forDir: dir).components
+                                       guard case .ok(let rid, _, _, _, _) = resolveImport(imp, from: home) else { return nil }
+                                       return rid.components
                                    })
+        iface.foreignTypes = foreignTypeOrigins(iface, of: id, fileVisible: scopes.fileVisible)
         let ownEscape = options.nmi
             ? escapePerfSection(iface, semaResult.module, subsetFuncs: subset, external: externalEscape(of: id)).escape
             : [:]
@@ -579,6 +896,15 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         let objPath = isRoot
             ? stem + ".o"
             : buildRoot + "/__mod_" + modArtifactStem(id) + ".o"
+
+        // External-workspace build (task 188): publish the entry module's `.nmi` beside its library object so
+        // a consumer in another workspace reads the interface from disk (the producer→consumer handoff is
+        // disk-only — `.nmi` / `.bir` / `.o`). Non-terminal, unlike `--emit-nmi`; codegen still follows. The
+        // perf section carries the escape summaries so the consumer seeds across the boundary (164.6).
+        if options.emitLibrary && isRoot {
+            let perf = escapePerfSection(iface, semaResult.module, subsetFuncs: subset, external: externalEscape(of: id))
+            try? serialize(iface, perf: perf).write(toFile: stem + ".nmi", atomically: true, encoding: .utf8)
+        }
 
         // Ship this module's `.bir` (public generic closure, references canonicalized to origin-keyed
         // names) so a dependent under `--mono` specializes the generics it imports (tasks 100.5.1 / 100.5.4).
@@ -624,8 +950,11 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
         let extGenerics = semaResult.externalGenericSigs.filter { !localizedGenerics.contains($0.key) }
 
         // Backend (M8). The root goes through the binary path (object + runtime link); a dependency emits a
-        // home-qualified object only (no entry point, no program-wide type maps).
-        if isRoot {
+        // home-qualified object only (no entry point, no program-wide type maps). An external-workspace build
+        // (task 188; the embedded `nomu` workspace included) emits even its entry module as a library object
+        // — it has no `main` and is linked into a consumer, not run — so it falls through to the dependency
+        // path below.
+        if isRoot && !options.emitLibrary {
             emitLLVMBinary(monoModule, stem: stem, buildRoot: buildRoot, optimize: options.optimize,
                            subsetFuncs: subset, timings: timings,
                            emitLLVM: options.llvm || options.stopAt == .llvm, stopAfterLLVM: options.stopAt == .llvm,
@@ -641,10 +970,24 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
             let summaries = computeEscapeSummaries(gen.module.functions, aggregates: gen.module.aggregates)
             writeEscapeSummaries(summaries, into: &store)
         }
+        // The `runtime` package is the C-ABI boundary (task 174.5): the C floor and codegen reference its
+        // functions by bare mangled name (`nomu_fn_rt…`, Inventory B), so the package emits them **bare** and
+        // weak-ODR — the single definitions the prepend used to supply in every object, now compiled once.
+        // (`runtime.nomu` goes in the weak-origin set for its own package build.) A user build no longer
+        // prepends the runtime (174.5 retired it), so `preludeFiles` here only matters for the core substrate
+        // it still prepends — types, no function symbols — making the set inert for naming/linkage there.
+        let weakOrigins: Set<String>
+        if options.compilingPrelude {
+            // The `runtime` package emits its own functions bare + weak-ODR (its source files are the
+            // weak-origin set — keyed by their materialized path, which is what their spans carry).
+            weakOrigins = options.runtimeSubsetByMembership ? Set(files.map(\.path)) : []
+        } else {
+            weakOrigins = preludeFiles
+        }
         let err = emitObject(gen.module, from: monoModule, to: objPath, optimize: options.optimize,
                              onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
                              requireMain: false, externalFuncNames: extFuncs, externalGenericSigs: extGenerics,
-                             weakOriginFiles: preludeFiles, emitTypeMaps: false,
+                             weakOriginFiles: weakOrigins, emitTypeMaps: false,
                              homeQualifier: Mangle.qualifier(module: mangleOrigin(id)), facts: store)
         if let err = err { fputs("error: \(err)\n", stderr); return false }
         depObjects.append(objPath)
@@ -652,8 +995,10 @@ public func compile(paths: [String], options: EmitOptions = EmitOptions()) -> Bo
     }
 
     // Compile every module in dependency order (leaves first); the entry module — the binary — is last and
-    // links. Separate compilation (task 100.4.2): a module sees a dependency only through its interface.
-    for m in topo {
+    // links. Separate compilation (task 100.4.2): a module sees a dependency only through its interface. An
+    // external-workspace module (task 188) is skipped — already built in its producer workspace and loaded
+    // from its `.nmi`/`.o` above, never recompiled from source here.
+    for m in topo where moduleHome[m]?.isExternal != true {
         guard compileModule(m, isRoot: m == entryID) else { timings.report(); return false }
     }
     timings.report()
@@ -1004,6 +1349,37 @@ private func readWorkspaceName(_ workspaceRoot: String) -> String? {
     return nil
 }
 
+// Local-path external-workspace pins (task 188): a workspace's `nomu.yaml` names each external workspace it
+// consumes and the local filesystem path it lives at. The real schema rides YAML (task 163); until then a
+// minimal block reader — an `externals:` line, then indented `  <name>: <path>` entries, one per external,
+// closed by the next non-indented line. A relative path resolves against the workspace root; the result maps
+// the external's own `name` (the root token an `import <name>/…` uses) to its absolute workspace root. No
+// version/source — a local path is a single already-present workspace (remote sources are task 189).
+private func readWorkspaceExternals(_ workspaceRoot: String) -> [String: String] {
+    guard let text = try? String(contentsOfFile: workspaceRoot + "/nomu.yaml", encoding: .utf8) else { return [:] }
+    var pins: [String: String] = [:]
+    var inBlock = false
+    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+        let indented = raw.first == " " || raw.first == "\t"
+        if !indented {
+            inBlock = (trimmed == "externals:")   // a new top-level key ends any prior block
+            continue
+        }
+        guard inBlock, let colon = trimmed.firstIndex(of: ":") else { continue }
+        let name = String(trimmed[..<colon]).trimmingCharacters(in: .whitespaces)
+        var path = String(trimmed[trimmed.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+        if path.hasPrefix("\"") && path.hasSuffix("\"") && path.count >= 2 { path = String(path.dropFirst().dropLast()) }
+        if name.isEmpty || path.isEmpty { continue }
+        let abs = (path as NSString).isAbsolutePath
+            ? path
+            : URL(fileURLWithPath: workspaceRoot).appendingPathComponent(path).standardizedFileURL.path
+        pins[name] = abs
+    }
+    return pins
+}
+
 // A cycle in the inter-package dependency graph (task 187.3), importer→imported order closing on the
 // first, or nil if the graph is a DAG. Distinct from the module-import-cycle check: a package cycle is an
 // error even when no single module cycle exists. Deterministic (keys and successors visited sorted).
@@ -1031,39 +1407,40 @@ private func outputDirectory(for input: URL, root: URL) -> String {
     return rel.isEmpty ? build : build + "/" + rel
 }
 
-// Lex + parse the embedded preludes and prepend their decls to the program (M4.13). Two preludes,
-// both trusted source (a diagnostic here is a compiler bug): the **core** prelude (`core.nomu` — Option,
-// Result, numeric helpers) and the **runtime** prelude (`runtime.nomu` — the self-hosted runtime tier,
-// task 150). Every function in the runtime prelude is runtime-subset by default (task 149) — its names
-// are returned so the subset checker treats them as designated, the interim "designated file" until the
-// module system (task 100) lands.
-private func prependPrelude(_ program: Program) -> (Program, Set<String>) {
-    func parseEmbedded(_ source: String, _ name: String) -> Program {
-        let diags = DiagnosticSink()
-        var lexer = Lexer(source, file: name, diagnostics: diags)
-        var parser = Parser(lexer.tokenize(), diagnostics: diags)
-        let parsed = parser.parse()
-        if diags.hasErrors {
-            fputs("internal error: failed to parse the embedded prelude '\(name)'\n" + diags.render() + "\n", stderr)
-            exit(1)
-        }
-        return parsed
+// Lex + parse an embedded prelude source (trusted — a diagnostic here is a compiler bug).
+private func parseEmbeddedPrelude(_ source: String, _ name: String) -> Program {
+    let diags = DiagnosticSink()
+    var lexer = Lexer(source, file: name, diagnostics: diags)
+    var parser = Parser(lexer.tokenize(), diagnostics: diags)
+    let parsed = parser.parse()
+    if diags.hasErrors {
+        fputs("internal error: failed to parse the embedded prelude '\(name)'\n" + diags.render() + "\n", stderr)
+        exit(1)
     }
-    let core = parseEmbedded(EmbeddedSources.preludeSource, EmbeddedSources.preludeName)
-    let runtime = parseEmbedded(EmbeddedSources.runtimePreludeSource, EmbeddedSources.runtimePreludeName)
-    let runtimeSubset = Set(runtime.decls.compactMap { decl -> String? in
+    return parsed
+}
+
+// Prepend the `runtime` prelude for a white-box runtime test (`NOMU_RT_PRELUDE`, task 174.5): the fixture
+// calls runtime internals directly, so they must be local decls. Returns the runtime function names as the
+// runtime-subset designation (its functions compile `noSafepoint`, like the package). The bare weak-ODR
+// definitions fold with the `runtime` package's, so this adds no runtime duplication to the test binary.
+private func prependRuntimePrelude(_ program: Program) -> (Program, Set<String>) {
+    let runtime = parseEmbeddedPrelude(EmbeddedSources.runtimePreludeSource, EmbeddedSources.runtimePreludeName)
+    let subset = Set(runtime.decls.compactMap { decl -> String? in
         if case .funcDecl(let f) = decl { return f.name }
         return nil
     })
-    return (Program(decls: core.decls + runtime.decls + program.decls, imports: program.imports), runtimeSubset)
+    return (Program(decls: runtime.decls + program.decls, imports: program.imports), subset)
 }
 
 // Rewrite an imported declaration to its per-origin identity (`origin@name`, task 100.2.3.2), and any
 // type reference inside it that names one of the module's own exported types to that type's identity.
-private func encodeExternalDecl(_ decl: TopDecl, origin: String, ownTypes: Set<String>) -> TopDecl {
+private func encodeExternalDecl(_ decl: TopDecl, origin: String, ownTypes: Set<String>,
+                                foreign: [String: String] = [:]) -> TopDecl {
     func encT(_ r: TypeRef?) -> TypeRef? {
         guard let r = r else { return nil }
-        let nm = ownTypes.contains(r.name) ? ExternalName.encode(origin: origin, name: r.name) : r.name
+        let nm = ownTypes.contains(r.name) ? ExternalName.encode(origin: origin, name: r.name)
+               : foreign[r.name].map { ExternalName.encode(origin: $0, name: r.name) } ?? r.name
         let fn = r.fn.map { FnType(params: $0.params.compactMap { encT($0) }, ret: encT($0.ret)) }
         return TypeRef(name: nm, fn: fn, existentialOf: r.existentialOf, opaqueOf: r.opaqueOf,
                        genericArgs: r.genericArgs?.compactMap { encT($0) }, qualifier: r.qualifier, span: r.span)
@@ -1283,7 +1660,8 @@ private func emitLLVMBinary(_ module: NOIRModule, stem: String, buildRoot: Strin
     let binPath = stem
     // `-dead_strip` drops code unreachable from the program's entry — most of MMTk's plan/scheduler
     // machinery is never reached on the NoGC alloc path — and `-x` strips local symbols. (6.1.1 size.)
-    // Dependency objects (separate compilation, task 100.4.2) link alongside the entry object.
+    // Dependency objects (separate compilation, task 100.4.2) link alongside the entry object; the embedded
+    // `nomu`-workspace objects (task 174) ride in `extraObjects` too, injected by the driver before codegen.
     var linkArgs = ["-o", binPath, "-Wl,-dead_strip", "-Wl,-x", objPath] + extraObjects + [archive]
     // M6 · 6.1.1 — make the GC archive available to the emitted-program link. It rides inside nomuc
     // as an embedded Mach-O section (nomuc stays one atomic file) and is extracted to a cache file
@@ -1334,6 +1712,104 @@ private func cachedRuntimeArchive(buildRoot: String) -> String? {
         return nil
     }
     return cached
+}
+
+// ─── The embedded `nomu` workspace (task 174) ───────────────────────────────────────────────────────
+//
+// `core` / `runtime` / `std` are ordinary Nomu packages whose source is embedded in the compiler. The
+// driver materializes them to a scratch workspace and compiles each module into a home-qualified library
+// object (origin `nomu/<pkg>[/<module>]`), linked into the user binary. Every prelude reference is external
+// (the prepend is retired, 174.5/.5.1): `std` resolves through the implicit `import std` (its `prelude`
+// module) or an explicit `import std/<module>`, `core`'s `ManagedBuffer` resolves as an ambient package type,
+// and the `runtime` package's functions link by bare symbol. There is deliberately no content cache
+// here — the cross-build CAS cache (task 172, next) subsumes it, so until then each build recompiles the
+// workspace.
+
+// The three embedded packages. `core` and `runtime` are single-module packages rooted at their own source
+// file; `std` is a multi-module package (one leaf directory per module) whose `default-module` is `prelude`,
+// the module the implicit `import std` names. Each module is (package-relative dir — "" for a single-module
+// package's root —, file name, source); a module may span several files.
+private struct NomuModuleSource { let dir: String; let file: String; let source: String }
+private struct NomuPackageSource { let name: String; let modules: [NomuModuleSource]; let defaultModule: String? }
+private let nomuPackageSources: [NomuPackageSource] = [
+    NomuPackageSource(name: "core",
+                      modules: [NomuModuleSource(dir: "", file: EmbeddedSources.preludeName,
+                                                 source: EmbeddedSources.preludeSource)],
+                      defaultModule: nil),
+    NomuPackageSource(name: "runtime",
+                      modules: [NomuModuleSource(dir: "", file: EmbeddedSources.runtimePreludeName,
+                                                 source: EmbeddedSources.runtimePreludeSource)],
+                      defaultModule: nil),
+    NomuPackageSource(name: "std",
+                      modules: EmbeddedSources.stdModules.map { NomuModuleSource(dir: $0.module, file: $0.name,
+                                                                                 source: $0.source) },
+                      defaultModule: "prelude"),
+]
+
+// The module directories of a package, in first-seen (deterministic) order.
+private func moduleDirs(_ p: NomuPackageSource) -> [String] {
+    var seen = Set<String>()
+    return p.modules.map(\.dir).filter { seen.insert($0).inserted }
+}
+
+// Materialize the embedded `nomu` workspace into `dir`: a `nomu.yaml` workspace marker named `nomu`, plus one
+// package per embedded source set, each with a `pkg.json` listing every module as a product. Materialization
+// precedes discovery so a user build resolves `std` imports against these files; compilation follows it
+// (`compileNomuWorkspace`). Returns false on failure (message on stderr). The caller owns `dir`'s lifecycle.
+private func materializeNomuWorkspace(inDir dir: String) -> Bool {
+    let fm = FileManager.default
+    func write(_ contents: String, _ path: String) -> Bool {
+        do { try contents.write(toFile: path, atomically: true, encoding: .utf8); return true }
+        catch { fputs("error: failed to write '\(path)': \(error)\n", stderr); return false }
+    }
+    func mkdir(_ path: String) -> Bool {
+        do { try fm.createDirectory(atPath: path, withIntermediateDirectories: true); return true }
+        catch { fputs("error: failed to create dir '\(path)': \(error)\n", stderr); return false }
+    }
+    guard mkdir(dir), write("name: nomu\n", dir + "/nomu.yaml") else { return false }
+    for p in nomuPackageSources {
+        let pkgDir = dir + "/" + p.name
+        let products = moduleDirs(p).map { "\"\($0)\"" }.joined(separator: ", ")
+        let def = p.defaultModule.map { ", \"default-module\": \"\($0)\"" } ?? ""
+        guard mkdir(pkgDir),
+              write("{ \"name\": \"\(p.name)\", \"products\": [\(products)]\(def) }\n", pkgDir + "/pkg.json")
+        else { return false }
+        for m in p.modules {
+            let modDir = m.dir.isEmpty ? pkgDir : pkgDir + "/" + m.dir
+            guard mkdir(modDir), write(m.source, modDir + "/" + m.file) else { return false }
+        }
+    }
+    return true
+}
+
+// Compile each module of the materialized `nomu` workspace in `dir` into a home-qualified library object +
+// interface. Returns one artifact per module, or nil on failure (message on stderr). A module's canonical
+// path is `nomu/<package>[/<module>]` (the workspace name + its workspace-relative dir). A `std` module that
+// imports a sibling (`import pkg/prelude`) also emits that sibling as a `__mod_*` intermediate under the
+// workspace `build/`; only the per-module objects returned here are linked, so each module links once.
+private struct NomuArtifact { let package: String; let module: String; let obj: String; let nmi: String }
+private func compileNomuWorkspace(inDir dir: String) -> [NomuArtifact]? {
+    var artifacts: [NomuArtifact] = []
+    for p in nomuPackageSources {
+        let pkgDir = dir + "/" + p.name
+        for modDir in moduleDirs(p) {
+            let srcDir = modDir.isEmpty ? pkgDir : pkgDir + "/" + modDir
+            let files = p.modules.filter { $0.dir == modDir }.map { srcDir + "/" + $0.file }
+            var opts = EmitOptions()
+            opts.compilingPrelude = true                     // the prelude build: skip prepend, strong linkage
+            opts.emitLibrary = true                          // emit the entry module as a library object + `.nmi`
+            opts.runtimeSubsetByMembership = (p.name == "runtime")  // runtime-subset by package membership (174.4)
+            opts.outputPath = srcDir + "/" + (modDir.isEmpty ? p.name : modDir)  // `<srcDir>/<leaf>.o`
+            guard compile(paths: files, options: opts) else {
+                let shown = modDir.isEmpty ? p.name : p.name + "/" + modDir
+                fputs("error: failed to compile embedded nomu module '\(shown)'\n", stderr)
+                return nil
+            }
+            artifacts.append(NomuArtifact(package: p.name, module: modDir,
+                                          obj: opts.outputPath! + ".o", nmi: opts.outputPath! + ".nmi"))
+        }
+    }
+    return artifacts
 }
 
 // A stable (cross-run) FNV-1a key over everything that determines the archive's contents.

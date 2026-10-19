@@ -1,0 +1,12 @@
+// Types defined here and named in `maker`'s signatures (task 174.7).
+package struct Point {
+    var x: Int
+    var y: Int
+
+    fun sum() -> Int { return self.x + self.y }
+}
+
+package enum Tagged<T> {
+    case some(value: T)
+    case empty
+}

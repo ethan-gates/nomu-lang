@@ -47,6 +47,9 @@ Add an object to `cases` in `tests/suite.json` and a `.nomu` fixture — no new 
   threads (the self-hosted scheduler/actor cases).
 - `stderr_match` — `[ { "pattern": "(minor)", "min": 10 } ]`, a per-line substring count for
   "collection actually fired" checks. `min` / `max` both optional.
+- `object_symbols` — `[ { "pattern": "_nomu_fn_rt", "max": 0 } ]`, a count of defined symbols (`nm -U`)
+  containing the substring in the fixture's own object (`<binary>.o`), checked once after compile. `min` /
+  `max` both optional. Pins what the program's object defines, e.g. no duplicated runtime / `std` copies.
 - `timeout_sec` / `compile_timeout_sec` — per-run and per-compile caps (defaults 60 / 120). Every
   run is bounded; on expiry the whole process group is killed and the case reports `TIMEOUT`.
 - `weight` — lanes the case occupies in the fixed-8 pool (default 1). A self-parallelizing case

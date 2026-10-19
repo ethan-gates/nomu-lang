@@ -1,16 +1,18 @@
 # Near-horizon — the active epics
 
-Each goal is an **epic** drawn as a dependency stack: the **end goal sits at the top**, and each item
-below it is a prerequisite of the one above. Work **bottom-up** — the bottom item is the next action, the
-top is what it all adds up to. Identity numbers point into [`tasks.md`](tasks.md), which carries the
+Each goal is an **epic** drawn as a dependency tree: the **end goal is the root**, and each node's children
+are its open prerequisites. Work **leaves-first** — a leaf is ready to start, `◀ next` marks the next
+action, and the root is what it all adds up to. Siblings are independent of each other; a coupling that is
+not a hard prerequisite is noted inline. Identity numbers point into [`tasks.md`](tasks.md), which carries the
 detail and status; this doc carries only the goals and their order. Everything not on an epic here is
 parallel/cheap work tracked in `tasks.md`.
 
-Two epics are live. The strings epic (B) has landed its core — the byte-level `String` and its shaped-GC
-substrate are built and green — so its remaining items are independent follow-ons. **Epic A (self-hosted
-GC + runtime) is the active priority:** its whole lower stack is built — the self-hosted scheduler, the
-Immix and GenImmix collectors, modules, and the test harness — so the nearest action is the perf-benchmark
-run-up against MMTk (paired with 158/159) that gates retiring MMTk and starting LXR.
+Two epics are live. **Epic A (self-hosted GC + runtime) is the active priority.** Its next run of work is
+the **modules build-out** beneath the MMTk benchmark, which needs programs large enough to be meaningful and
+the perf-affecting module capabilities real: dev-productivity first (explicit module builds, then the build
+cache), then the perf-relevant capabilities (cross-module generics residuals, cross-module inlining). The
+GenImmix-vs-MMTk benchmark (with 158/159) sits above that, gating MMTk's retirement and the start of LXR.
+Epic B (strings) has only independent follow-ons left.
 
 ---
 
@@ -26,35 +28,33 @@ and smaller than Go and Swift."
 while changing the algorithm — so the two unknowns never multiply.
 
 ```
-   127    LXR — RC-primary reclamation, on Immix backing              ◀ end goal
-    ▲ requires
-   —      retire MMTk (kept live as the baseline until here)
-   158/159 GC packaging + observability (needs-design; the benchmark run-up)
-   150.*  perf-benchmark GenImmix vs MMTk                             ◀ next
-   ─────────────── everything below is built + green ───────────────
-   150.4  GenImmix — nursery + write barrier + remembered set         ✔
-   128.3  full-runtime STW root-scanning over the self-hosted carriers ✔
-   128.1/.2 scheduler self-host + bootstrap asm floor (NOMU_SCHED=nomu) ✔
-   150.3  Immix — evacuation + pointer fixup                          ✔
-   100    modules — separate compilation + witness baseline (100.5 dial left) ✔
-   155    test harness — the feedback loop for everything above        ✔
-   149    runtime-subset mechanism (slice 1)                           ✔
+127  LXR — RC-primary reclamation, on Immix backing                         ◀ end goal
+└── retire MMTk (kept live as the baseline until here)
+    └── 150  perf-benchmark GenImmix vs MMTk
+        ├── 158  GC packaging — self-contained plans behind one trigger protocol
+        ├── 159  GC observability — collection tracing, stats, pause timing
+        ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
+        │        complements 179 (value-level GC classification)
+        ├── 171  modules cleanup — cross-module generics residuals           (perf-accuracy)
+        │        interacts with 170 (method-level generics), 118 (associated types)
+        └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)
+            └── 190  explicit module builds — dep scan, one planned graph   ◀ next
 ```
 
-MMTk/GenImmix exists as the reference implementation each rung diffs against, which is what makes the
-incremental self-host tractable — and why MMTk stays live until the benchmark confirms the self-hosted
-collector before retirement. Two self-hosting-infra items branch off the modules rung and don't sit on
-the LXR chain: [174](tasks/174-prelude-as-packages.md) (prelude-as-packages — its three prerequisites are
-done, so it is the goal they were gating; couples with [149](tasks/149-runtime-subset.md) runtime-subset
-by module membership) and the **packaging sub-stack** off [173](tasks/173-package-model-driver-cli.md)
-(package model + the single-binary `nomu` driver — `compile`/`build`/`run`/`test`/`query`, **built**). Its
-cross-package concerns landed in [187](tasks/187-multi-package-builds.md) — **multi-package builds within one
-workspace, built and green** (graph spans packages, workspace-relative mangling identity, the package
-dependency DAG, and the full `products`/`package`-tier/`public`⟺product visibility boundary). The
-external-workspace continuation is deferred to its own rungs: [188](tasks/188-multi-local-workspace-builds.md)
-(cross-workspace linkage by local path — sidesteps dependency management) then
-[189](tasks/189-multi-remote-workspace-builds.md) (registries + version/dependency resolution + lockfile —
-the last rung).
+MMTk/GenImmix is the reference implementation each rung diffs against, which is what makes the incremental
+self-host tractable; MMTk stays live until the benchmark confirms the self-hosted collector. **The modules
+build-out sits on the LXR chain** because its purpose is a meaningful benchmark. It gates the benchmark two
+ways:
+
+- **Dev-productivity** — [190](tasks/190-explicit-module-builds.md) (explicit module builds: one planned
+  graph, each module compiled once), then [172](tasks/172-incremental-build-cache.md) (the content-addressed
+  module-granular cache, keyed on 190's jobs). These make building and iterating large programs bearable.
+- **Perf-accuracy** — [171](tasks/171-modules-cleanup.md) (cross-module generics residuals) and
+  [182](tasks/182-cross-module-inlining.md) (cross-module inlining + inlinable stdlib). They change
+  performance enough that a benchmark taken before them would mislead.
+
+Remote-workspace builds, [189](tasks/189-multi-remote-workspace-builds.md) (registries, version resolution,
+lockfile), stay off the chain as the last packaging rung; the benchmark does not need them.
 
 ---
 
@@ -64,25 +64,24 @@ the last rung).
 small-string optimization, zero-copy literals — retiring the leaking C-primitive builtin. A hand-rolled
 16-byte bit-stealing struct with 15-byte SSO and a moving heap buffer.
 
+The end goal is met (121's `String` is built). What remains extends it; none of it blocks anything else:
+
 ```
-   121    String — the bit-stealing stdlib type; retires the builtin   ✔ done (121.1 + 121.2 SSO)
-    ▲ requires
-   176    shaped GC roots — value-conditional scanning + relocation takeover   ✔ done (176.1–176.3)
+String follow-ons
+├── 185  Substring — zero-copy span (design decided)
+│        couples with 184, 183, 117
+├── 184  Unicode views — scalar / grapheme / normalization
+│        couples with 117; serves 163
+├── 183  precondition + bounds-check insertion — the checked String.byte(at:)
+│        complements 117
+├── 117  for … in iteration
+│   └── 120  stdlib core — iterator/sequence interface, String↔Array<UInt8> interop
+│       └── 115  error handling — the Result-returning I/O half of 120
+├── 123  copy-on-write — StringBuilder mutation path + COW elision
+└── 163  manifest/YAML parser (the motivating consumer)
 ```
 
-**Core landed + green.** 176 delivered the value-conditional scanning the bit-stealing word needs, and
-121 built the byte-level `String` on top: a Nomu value type off the C floor, with SSO and a moving heap
-buffer. The same shaped-root mechanism also cleared the addrspace-across-calls wall for interprocedural
-stack promotion ([148 §148.1](tasks/148-ssair-optimizer-tier.md)), so 176 paid off beyond strings.
-
-**Follow-ons** — each its own task, none blocking, pull as a consumer lands:
-
-- [123](tasks/123-copy-on-write.md) — compiler-inferred copy-on-write (a `StringBuilder` mutation path +
-  value-semantics COW elision); the general value-semantics effort the first mutation path motivates.
-- [185](tasks/185-substring.md) — zero-copy `Substring` span (GC-backed, design decided).
-- [184](tasks/184-string-unicode-views.md) — Unicode views (scalar / grapheme / normalization); couples
-  with [117 `for … in`](tasks/117-for-in-iteration.md).
-- [183](tasks/183-precondition-bounds-checks.md) — `precondition` primitive + bounds-check insertion, the
-  checked form of `String.byte(at:)`.
-- [120](tasks/120-stdlib-core.md) — `String`↔`Array<UInt8>` interop.
-- [163](tasks/163-manifest-yaml.md) — the hand-written manifest/YAML parser that motivated the epic.
+Task docs: [185](tasks/185-substring.md), [184](tasks/184-string-unicode-views.md),
+[183](tasks/183-precondition-bounds-checks.md), [117](tasks/117-for-in-iteration.md),
+[120](tasks/120-stdlib-core.md), [115](tasks/115-error-handling.md), [123](tasks/123-copy-on-write.md),
+[163](tasks/163-manifest-yaml.md).

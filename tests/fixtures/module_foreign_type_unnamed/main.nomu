@@ -1,0 +1,8 @@
+// No implicit re-export (task 174.7, modules.md §Re-export): `maker` uses `shapes.Point` in its signatures,
+// but naming `Point` here still needs `import pkg/shapes`.
+import pkg/maker
+
+fun main() {
+    let p: Point = origin(1, 2)
+    print(p.x)
+}

@@ -1,0 +1,5 @@
+// A non-prelude `std` name needs its import (task 174): `max` lives in `std/math`, outside the prelude, so
+// it is undefined here.
+fun main() {
+    print(max(1, 2))
+}

@@ -15,26 +15,28 @@ enum NOIRGen {
 
     // MARK: - String surface (task 121)
 
-    // The surface `String` type — the Nomu struct (core.nomu) wrapping the `StringBase` primitive.
-    static let stringType: Type = .named("String", .struct_)
-
     // The `StringBase` value the compiler-recognized byte-layer ops (`__string_*`, `print`, `concat`) consume.
     // A surface `String` is unwrapped to its `.base` field; a bare `StringBase` and any non-string pass through
     // unchanged. The unwrap is a single-field-wrapper field read, which the egress lowers to identity (the
     // wrapper and its field share the 16-byte `strTy` representation), so this is a type-level adapter with no
-    // runtime cost.
-    static func asStringBase(_ e: NOIRExpr) -> NOIRExpr {
-        if case .named("String", .struct_) = e.type {
+    // runtime cost. `String` may be the bare prepend type or the ambient `nomu/core@String` package type
+    // (task 174.2.3), so the match goes through `Sema.isStringType`.
+    static func asStringBase(_ s: inout Sema, _ e: NOIRExpr) -> NOIRExpr {
+        if s.isStringType(e.type) {
             return NOIRExpr(type: .stringBase, span: e.span, kind: .fieldAccess(base: e, field: "base"))
         }
         return e
     }
 
     // A `StringBase` value wrapped back into a surface `String` (the inverse of `asStringBase`) — for the
-    // results of builtins that produce a raw `StringBase` (`concat`, a string literal, `readLine`).
-    static func wrapString(_ e: NOIRExpr) -> NOIRExpr {
-        NOIRExpr(type: stringType, span: e.span,
-                 kind: .construct(typeName: "String", args: [NOIRArg(label: "base", value: e)]))
+    // results of builtins that produce a raw `StringBase` (`concat`, a string literal, `readLine`). The
+    // wrapper's `String` identity is resolved at the site (`Sema.stringType`) so a consumer-module literal
+    // carries the ambient `nomu/core@String` identity, matching the flipped package (task 174.2.3).
+    static func wrapString(_ s: inout Sema, _ e: NOIRExpr) -> NOIRExpr {
+        let ty = s.stringType(at: e.span)
+        let name = s.stringTypeName(at: e.span)
+        return NOIRExpr(type: ty, span: e.span,
+                        kind: .construct(typeName: name, args: [NOIRArg(label: "base", value: e)]))
     }
 
     // MARK: - Statements
@@ -390,7 +392,7 @@ enum NOIRGen {
             // A literal is an `immortal` `StringBase` (built in codegen — `fromStaticUTF8`, no runtime call)
             // wrapped into the surface `String` struct (task 121). The wrap lowers to identity in the egress —
             // `String` and `StringBase` share `strTy`.
-            return wrapString(NOIRExpr(type: .stringBase, span: span, kind: .stringLit(v)))
+            return wrapString(&s, NOIRExpr(type: .stringBase, span: span, kind: .stringLit(v)))
 
         case .ident(let name, let span):
             if let t = s.lookup(name) {
@@ -427,9 +429,10 @@ enum NOIRGen {
         case .member(let base, let field, let span):
             // Qualified no-payload enum construction: `EnumType.case` / `EnumType<Args>.case`.
             // (A payload case used bare falls through buildEnumInit as a wrong-arity error.)
-            if let (typeName, explicit) = s.typeNameAndArgs(base), s.lookup(typeName) == nil, s.enums[typeName] != nil {
-                if let (vis, file) = s.typeVisibility(typeName) { s.checkVisible(typeName, vis, declaredIn: file, at: span) }
-                return EnumConstruction.buildEnumInit(&s, typeName, field, [], explicit: explicit, expected: expected, at: span)
+            if let (typeName, explicit) = s.typeNameAndArgs(base), s.lookup(typeName) == nil,
+               let enumName = s.enumNameForConstruction(typeName, at: span) {
+                if let (vis, file) = s.typeVisibility(enumName) { s.checkVisible(enumName, vis, declaredIn: file, at: span) }
+                return EnumConstruction.buildEnumInit(&s, enumName, field, [], explicit: explicit, expected: expected, at: span)
             }
             // Pointer static properties (task 125): `RawPtr.null`, `Ptr<T>.null`.
             if let (tn, explicit) = s.typeNameAndArgs(base), s.lookup(tn) == nil, tn == "RawPtr" || tn == "Ptr" {
@@ -650,7 +653,11 @@ enum NOIRGen {
                 s.diags.error("'ManagedBuffer' needs two type arguments, e.g. 'ManagedBuffer<Header, Element>.\(method)(...)'", at: span)
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
-            return ManagedBufferIntrinsics.checkStatic(&s, header: gen[0], element: gen[1], method, args, span)
+            // `ManagedBuffer` is an ambient `nomu/core` package type (task 174.5.1): the create result's base
+            // must carry that per-origin key (`nomu/core@ManagedBuffer`) so monomorphization finds the
+            // external template and names the instantiation under the same identity.
+            let mbBase = s.externalTypeKey("ManagedBuffer", at: span) ?? "ManagedBuffer"
+            return ManagedBufferIntrinsics.checkStatic(&s, base: mbBase, header: gen[0], element: gen[1], method, args, span)
         }
         // `StringBase.allocHeap(count)` (task 121.1.3) — a fresh `heap` StringBase backed by a managed byte
         // buffer (a `ManagedBuffer<EmptyHeader, UInt8>`). The producer op the Nomu `concat` builds on.
@@ -686,9 +693,10 @@ enum NOIRGen {
         // Qualified enum construction: `EnumType.case(args)` or `EnumType<Args>.case(args)`. A
         // `static fun` of the same enum takes precedence over case construction for that name.
         if case .member(let base, let caseName, _) = callee,
-           let (typeName, explicit) = s.typeNameAndArgs(base), s.lookup(typeName) == nil, s.enums[typeName] != nil,
-           s.staticMethodDecl(typeName, .enum_, caseName) == nil {
-            return EnumConstruction.buildEnumInit(&s, typeName, caseName, args, explicit: explicit, expected: expected, at: span)
+           let (typeName, explicit) = s.typeNameAndArgs(base), s.lookup(typeName) == nil,
+           let enumName = s.enumNameForConstruction(typeName, at: span),
+           s.staticMethodDecl(enumName, .enum_, caseName) == nil {
+            return EnumConstruction.buildEnumInit(&s, enumName, caseName, args, explicit: explicit, expected: expected, at: span)
         }
         // Pointer static constructors (task 125): `RawPtr.alloc(...)`, `Ptr<T>.alloc(...)`.
         if case .member(let base, let method, _) = callee,
@@ -807,7 +815,9 @@ enum NOIRGen {
             }
             // ManagedBuffer instance accessors (task 180): capacity / headerPtr / elementPtr and the typed
             // reference accessors storeRef / ref / storeHeaderRef / headerRef.
-            if case .generic(let base, _) = recv.type, base == "ManagedBuffer" {
+            // The base is the `nomu/core` per-origin key once `ManagedBuffer` is a package type (174.5.1), so
+            // strip any `origin@` before matching.
+            if case .generic(let base, _) = recv.type, (ExternalName.decode(base)?.name ?? base) == "ManagedBuffer" {
                 return ManagedBufferIntrinsics.checkMethod(&s, recv, name, args, span)
             }
             // RawPtr instance methods (task 125): free / advanced / store / load / asPtr.
@@ -912,7 +922,7 @@ enum NOIRGen {
             if name == "print" {
                 // A `String` arg is unwrapped to its `StringBase` so the `print` builtin's string path reads
                 // the 16-byte value directly (task 121); other printable types pass through.
-                let irArgs = args.map { NOIRArg(label: $0.label, value: asStringBase(checkExpr(&s, $0.value))) }
+                let irArgs = args.map { NOIRArg(label: $0.label, value: asStringBase(&s, checkExpr(&s, $0.value))) }
                 return NOIRExpr(type: .void, span: span, kind: .call(callee: irVar(name, .void, span), args: irArgs, typeArgs: []))
             }
 

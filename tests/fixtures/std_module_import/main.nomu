@@ -1,0 +1,22 @@
+// The non-prelude `std` modules are reached by an explicit `import std/<module>` (task 174), bare or
+// through the module's leaf qualifier.
+import std/math
+import std/random
+import std/time
+
+fun main() {
+    print(abs(-3))
+    print("\n")
+    print(math.max(2, 8))
+    print("\n")
+    print(min(2, 8))
+    print("\n")
+    var r = SimpleRNG(seed: 1)
+    let a = r.next()
+    var r2 = SimpleRNG(seed: 1)
+    if a == r2.next() { print("seeded") } else { print("unseeded") }
+    print("\n")
+    let t = Time()
+    print(t.ns_diff(10, 25))
+    print("\n")
+}

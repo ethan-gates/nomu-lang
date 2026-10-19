@@ -283,6 +283,14 @@ final class SSAIRToLLVM {
             case .actorDecl(let a):  e.actorMap[a.name] = a
             }
         }
+        // `EmptyHeader` is compiler GC substrate (task 174.5.1): the zero-field `ManagedBuffer` header codegen
+        // names for a heap `String`'s byte buffer (`managedBufferTypeId(EmptyHeader, UInt8)`). It carries no
+        // symbols and is never written in source, so it is a compiler builtin — seed its zero-field layout so
+        // `slotCount`/`collectManagedOffsets` read headerSize 0, with no prepended decl.
+        if e.structMap["EmptyHeader"] == nil {
+            e.structMap["EmptyHeader"] = NOIRStruct(name: "EmptyHeader", fields: [], methods: [],
+                                                    span: Span(startOffset: -1, endOffset: -1, map: nil))
+        }
         // Synthesized closure/spawn environment layouts live only in the SSA module — register them as
         // classes so `classType`/`aggInfo`/`typeId` can lay them out and scan their captured fields.
         for agg in module.aggregates where e.classMap[agg.name] == nil && agg.kind == .class_ {
@@ -1681,15 +1689,11 @@ final class SSAIRToLLVM {
             let g = LLVMGetNamedGlobal(e.mod, "rt_nomu_sched") ?? LLVMAddGlobal(e.mod, e.i8ptr, "rt_nomu_sched")
             return LLVMBuildLoad2(b, e.i8ptr, g, "sched.handle")
         case "__gcSelfhostSpace":
-            // Task 150 rung 3: load the codegen-internal global `__nomu_selfhost_space` (the Immix space
-            // descriptor the alloc seam lazily creates under NOMU_GC_PLAN=nomu). Get-or-add with the same
-            // internal linkage + null initializer the seam uses, so both sites share one global.
-            let g = LLVMGetNamedGlobal(e.mod, "__nomu_selfhost_space") ?? {
-                let ng = LLVMAddGlobal(e.mod, e.i8ptr, "__nomu_selfhost_space")!
-                LLVMSetInitializer(ng, LLVMConstPointerNull(e.i8ptr))
-                LLVMSetLinkage(ng, LLVMInternalLinkage)
-                return ng
-            }()
+            // Task 150 rung 3: load the global `__nomu_selfhost_space` (the Immix space descriptor the alloc
+            // function lazily creates under NOMU_GC_PLAN=nomu). The space is defined in the C floor
+            // (`runtime.c`, task 174.3.1) and referenced here as an external global, so the tracer and the
+            // allocator — in any object — read one process-shared descriptor.
+            let g = e.getOrAddGlobal(e.i8ptr, "__nomu_selfhost_space")
             return LLVMBuildLoad2(b, e.i8ptr, g, "gc.selfhostspace")
         case "__gcSelfModBuf":
             // Task 150.4.2: this carrier's write-barrier mod-buffer (rt_self_modbuf_get, binding + registering

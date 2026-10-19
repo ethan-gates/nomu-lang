@@ -59,6 +59,25 @@ struct CaseRunner {
             return result(.fail, ["  compile failed", "  stderr:"] + indented(compile.stderr) + ["  repro: \(compileRepro)"])
         }
 
+        // Object-symbol assertions: checked once against the fixture's own object, before any run.
+        if !c.objectSymbols.isEmpty {
+            let obj = bin + ".o"
+            let nm = runProcess(path: "/usr/bin/nm", args: ["-U", obj], env: [:], timeout: 30)
+            if !nm.succeeded {
+                return result(.fail, ["  nm failed on '\(obj)'"] + indented(nm.stderr))
+            }
+            for m in c.objectSymbols {
+                let n = countOccurrences(nm.stdout, m.pattern)
+                let bad = (m.min.map { n < $0 } ?? false) ? "min \(m.min!)"
+                        : (m.max.map { n > $0 } ?? false) ? "max \(m.max!)" : nil
+                if let bound = bad {
+                    let hits = nm.stdout.split(separator: "\n").filter { $0.contains(m.pattern) }.prefix(10).map(String.init)
+                    return result(.fail, ["  object symbol assertion failed: '\(m.pattern)' matched \(n)× (\(bound)) in \(obj)"]
+                                         + hits.map { "    " + $0 } + ["  repro: nm -U \(obj)"])
+                }
+            }
+        }
+
         guard let want = loadGolden(c.expect) else {
             return result(.fail, ["  golden file missing for expect.stdout_file"])
         }

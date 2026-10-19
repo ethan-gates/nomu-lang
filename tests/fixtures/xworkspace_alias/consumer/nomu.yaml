@@ -1,0 +1,5 @@
+# Two external workspaces each ship a package named `util`; distinct pin aliases keep them apart (188.5).
+name: cons
+externals:
+  wsa: ../provA
+  wsb: ../provB

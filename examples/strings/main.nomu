@@ -6,9 +6,9 @@
 fun main() {
     let hello: String = "hello"
     let world: String = "world"
-    let greeting = concat(hello, concat(", ", world))
+    let greeting = hello.concat(", ".concat(world))
     print(greeting)
-    print(concat("length test: ", "abc"))
+    print("length test: ".concat("abc"))
 
     print("world".count)
 }

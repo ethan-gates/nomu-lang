@@ -10,7 +10,7 @@ interface Drawable {
     fun draw() -> String            // mandatory requirement
     var name: String { get }        // read-only property requirement
     fun label() -> String {         // overridable default
-        return concat(self.name, self.draw())
+        return self.name.concat(self.draw())
     }
 }
 

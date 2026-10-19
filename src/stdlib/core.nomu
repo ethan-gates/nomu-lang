@@ -1,17 +1,10 @@
-// Nomu standard library — core (M4.13).
+// Nomu standard library — core (task 174).
 //
-// The first Nomu-written stdlib: compiled alongside every user program (prepended
-// under the single compilation unit), so these are callable with no import. Seeded
-// with monomorphic Int helpers that need no generics or new primitives. `Option<T>`
-// is the first generic citizen (M5 5.2.4); `Result<T, E>` the second (M5 5.5).
-// (Design: generics.md §5 (Option), §9 (Result).)
-
-// A value that is present (`some`) or absent (`none`). Payloads are labelled, so the
-// spelling is `Option.some(value: x)` / `.some(value: x)` and `case .some(let v)`.
-enum Option<T> {
-    case some(value: T)
-    case none
-}
+// The native boundary + non-user-facing GC substrate: the types the compiler/runtime name but user programs
+// do not. The user-facing surface (`Option`, `Result`, `String`, `concat`, the numeric helpers, `Time`,
+// `SimpleRNG`, and future collections / IO) lives in the `std` package (moved there by the 174.3 content
+// split). `core` is ambient; it is also prepended into every module today (the prepend retires at 174.5), so
+// codegen's bare references to the substrate resolve to a local decl with the right layout.
 
 // A managed, relocatable single-object buffer: a fixed `Header` plus a variable-length tail of `Element`,
 // in one allocation (`{ type-id, cap, Header, Element[cap] }`). The shared storage primitive under `Array`,
@@ -19,174 +12,10 @@ enum Option<T> {
 // generic reference type for the type system; its four operations (`create`, `capacity`, `headerPtr`,
 // `elementPtr`) are compiler intrinsics — the magic is the tail-allocation + the GC descriptor, confined
 // there. Header and element access is raw (`RawPtr`); consumers build typed, bounds-checked APIs on top.
-class ManagedBuffer<Header, Element> {
+public class ManagedBuffer<Header, Element> {
 }
 
-// The zero-field header for a `ManagedBuffer` that needs no per-buffer metadata beyond `cap` — a
-// `headerSize = 0` buffer, byte-identical to the historical ad-hoc kind-1 buffer. Heap `String` storage is a
-// `ManagedBuffer<EmptyHeader, UInt8>` (task 180.4; 121 later grows this into a `StringHeader` carrying the
-// isASCII / scalar-count cache), and `Array`'s buffer migrates onto `ManagedBuffer<EmptyHeader, T>`.
-struct EmptyHeader {
-}
-
-// The Nomu `String` (task 121): a value-semantics UTF-8 string. Its one stored property is a `StringBase` —
-// the internal compiler-primitive carrying the 16-byte bit-stealing shaped value (`heap`/`immortal`/`small`;
-// task 121 Representation, 176 shape). A single-field wrapper is byte-identical to its field, so `String`
-// inherits `StringBase`'s two-register layout and shaped-root treatment with no String-specific GC code
-// (the *single-field-wrapper-is-shaped* rule). The byte-layer surface (`count`, `isEmpty`, `eq`, `lt`,
-// `byte(at:)`, `concat`, literals, `print`) is compiler-recognized today and moves to Nomu methods over the
-// four `StringBase` ops as the layering is completed.
-struct String {
-    let base: StringBase
-
-    // Byte count and emptiness (task 121.1.4) — Nomu computed properties over the `StringBase` `count` op.
-    var count: Int { self.base.count }
-    var isEmpty: Bool { self.base.count == 0 }
-
-    // Byte equality (task 121.1.4) — Nomu over the `StringBase` ops `count` + `bytePointer`. Equal length,
-    // then a byte-by-byte compare. (`a < b`/`a > b` stand in for `!=` on the byte.)
-    fun eq(other: String) -> Bool {
-        let n = self.base.count
-        if n != other.base.count { return false }
-        let pa = self.base.bytePointer()
-        let pb = other.base.bytePointer()
-        var i = 0
-        while i < n {
-            let a: UInt8 = pa.load(fromByteOffset: i)
-            let b: UInt8 = pb.load(fromByteOffset: i)
-            if a < b { return false }
-            if a > b { return false }
-            i = i + 1
-        }
-        return true
-    }
-
-    // Lexicographic byte ordering (`<` as a method until operators land): compare the shared prefix; on a tie
-    // the shorter string sorts first.
-    fun lt(other: String) -> Bool {
-        let an = self.base.count
-        let bn = other.base.count
-        var n = an
-        if bn < n { n = bn }
-        let pa = self.base.bytePointer()
-        let pb = other.base.bytePointer()
-        var i = 0
-        while i < n {
-            let a: UInt8 = pa.load(fromByteOffset: i)
-            let b: UInt8 = pb.load(fromByteOffset: i)
-            if a < b { return true }
-            if a > b { return false }
-            i = i + 1
-        }
-        return an < bn
-    }
-
-    // Byte at a UTF-8 offset. Unchecked today — the caller guarantees `at` is within `0..<count`,
-    // exactly like `RawPtr.load`. A bounds-checked form, a `precondition` primitive plus analysis-based
-    // removal (or forced omission), is task 183 (design/plans/tasks/183-precondition-bounds-checks.md);
-    // until it lands the stdlib/parser callers that drive the offset own the check.
-    fun byte(at: Int) -> UInt8 {
-        let p = self.base.bytePointer()
-        let b: UInt8 = p.load(fromByteOffset: at)
-        return b
-    }
-}
-
-// Concatenation (task 121.1.4 / 121.2). The representation is chosen by **result size**: a result of ≤ 15
-// bytes is a `small` inline value (no allocation, built by `StringBase.smallConcat`); a larger result is a
-// `heap` buffer (`allocHeap` + two gc-leaf copies). This is the small→heap graduation — upward only, since a
-// result that fits in `small` cannot contain a `heap` string's content. In the heap path `allocHeap` is the
-// one safepoint; `a` and `b` ride the shaped-root path across it (relocated if `heap`), and the copies run
-// with no safepoint between the alloc and the fill, so the fresh buffer stays put.
-fun concat(a: String, b: String) -> String {
-  let an = a.count
-  let bn = b.count
-  let n = an + bn
-  if n <= 15 {
-    return String(base: StringBase.smallConcat(a.base, b.base))
-  }
-  let dst = StringBase.allocHeap(n)
-  let dp = dst.bytePointer()
-  dp.copyBytes(from: a.base.bytePointer(), byteCount: an)
-  dp.advanced(by: an).copyBytes(from: b.base.bytePointer(), byteCount: bn)
-  return String(base: dst)
-}
-
-// The outcome of a failable operation: a success value (`ok`) or an error (`err`).
-// Error handling is explicit `match`/`switch` — no `?` operator, no typed throws
-// (deferred, generics.md §2). Payloads are labelled: `Result.ok(value: x)` /
-// `.err(error: e)`, matched as `case .ok(let v)` / `case .err(let e)`.
-enum Result<T, E> {
-    case ok(value: T)
-    case err(error: E)
-}
-
-fun abs(n: Int) -> Int {
-    if n < 0 { return -n }
-    return n
-}
-
-fun max(a: Int, b: Int) -> Int {
-    if a > b { return a }
-    return b
-}
-
-fun min(a: Int, b: Int) -> Int {
-    if a < b { return a }
-    return b
-}
-
-struct Time {
-    // A quick struct used for basic timing, needs actual design work
-
-    // lowers to `clock_gettime(CLOCK_MONOTONIC, &ts);` from time.h
-    var now: Int {
-        return time_monotonic()
-    }
-
-    fun ms_diff(t1: Int, t2: Int) -> Int {
-        let diff = t2 - t1
-        return diff / 1000000
-    }
-
-    fun micro_diff(t1: Int, t2: Int) -> Int {
-        let diff = t2 - t1
-        return diff / 1000
-    }
-
-    fun ns_diff(t1: Int, t2: Int) -> Int {
-        return t2 - t1
-    }
-
-    fun took(label: String, t1: Int) {
-        let t2 = self.now
-        print(label)
-        print(" took: ")
-        print(self.ms_diff(t1, t2))
-        print("ms ")
-        print(self.micro_diff(t1, t2))
-        print("µs ")
-        print(self.ns_diff(t1, t2))
-        print("ns\n")
-    }
-}
-
-struct SimpleRNG {
-    var seed: Int
-    // Smaller parameters to prevent native Int overflow crashes
-    // Generates the next pseudo-random Int
-    fun next() -> Int {
-        // Uses only standard multiplication, addition, and remainder operators
-        let t = 1103515245 * self.seed + 12345
-        self.seed = t % 2147483647
-        return self.seed
-    }
-
-    // Returns a random Int within a bounded range
-    fun nextInBound(min: Int, max: Int) -> Int {
-        let currentRandom = self.next()
-        let rangeSize = max - min + 1
-        let scaledValue = currentRandom % rangeSize
-        return scaledValue + min
-    }
-}
+// `EmptyHeader` (the zero-field `ManagedBuffer` header for a buffer needing no per-buffer metadata beyond
+// `cap` — heap `String` storage is a `ManagedBuffer<EmptyHeader, UInt8>`) is a compiler builtin (task
+// 174.5.1): codegen names it, it carries no symbols, and it is never written in source, so the egress seeds
+// its zero-field layout directly rather than a prepended decl.

@@ -22,7 +22,7 @@ fun strsum(s: String) -> Int {
   return acc
 }
 fun main() {
-  let p = Pair(s: concat("hello", " world"), n: 7)
+  let p = Pair(s: "hello".concat(" world"), n: 7)
   var i = 0
   var checksum = 0
   while i < 2000 {

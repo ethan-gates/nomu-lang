@@ -2,3 +2,10 @@
 # runtime package's genrule; they are not compiled by Bazel (nomuc compiles them
 # alongside user code at run time).
 exports_files(glob(["*.nomu"]))
+
+# The `std` package's modules, one leaf directory per module (`std/<module>/<module>.nomu`).
+filegroup(
+    name = "std_modules",
+    srcs = glob(["std/*/*.nomu"]),
+    visibility = ["//visibility:public"],
+)

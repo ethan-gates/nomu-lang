@@ -31,7 +31,7 @@ fun strsum(s: String) -> Int {
 }
 
 fun main() {
-  let h = Holder(s: concat("hello", " world"))
+  let h = Holder(s: "hello".concat(" world"))
   var i = 0
   var checksum = 0
   while i < 3000 {

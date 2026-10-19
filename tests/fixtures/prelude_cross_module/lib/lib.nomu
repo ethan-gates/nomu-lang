@@ -1,0 +1,11 @@
+// Returns the prelude's generic `Option`/`Result` across a module boundary. This module sees them through
+// its own implicit `import std`, like every module.
+package fun lookup(key: Int) -> Option<String> {
+    if key == 1 { return .some(value: "one") }
+    return .none
+}
+
+package fun parse(n: Int) -> Result<Int, String> {
+    if n < 0 { return .err(error: "negative") }
+    return .ok(value: n * 10)
+}

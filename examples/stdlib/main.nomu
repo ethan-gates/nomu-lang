@@ -1,6 +1,7 @@
-// M4.13 + M5 5.2.4: the Nomu standard library. `abs`, `max`, `min` and the generic
-// `Option<T>` are written in Nomu (src/stdlib/core.nomu), compiled alongside this
-// program, and usable with no import — the dogfooding of a Nomu-written stdlib.
+// The Nomu standard library, written in Nomu: `abs`, `max`, `min` come from `std/math` (an explicit
+// import); the generic `Option<T>` is in the prelude (`std`'s default module, implicitly imported).
+
+import std/math
 
 fun main() {
     print(abs(-7))             // 7
@@ -8,7 +9,7 @@ fun main() {
     print(min(3, 9))           // 3
     print(max(abs(-4), 2))     // 4  — composed
 
-    // `Option<T>` is a prelude citizen — no definition, no import (M5 5.2.4).
+    // `Option<T>` is a prelude citizen — no definition, no import.
     let found: Option<Int> = .some(value: max(2, 5))
     switch found {
     case .some(let v): print(v)      // 5

@@ -688,8 +688,10 @@ enum ManagedBufferIntrinsics {
         NOIRExpr(type: .error, span: span, kind: .intLit(0))
     }
 
-    // `ManagedBuffer<Header, Element>.create(capacity: Int) -> ManagedBuffer<Header, Element>`.
-    static func checkStatic(_ s: inout Sema, header: Type, element: Type,
+    // `ManagedBuffer<Header, Element>.create(capacity: Int) -> ManagedBuffer<Header, Element>`. `base` is the
+    // `ManagedBuffer` identity the result type carries — the `nomu/core` per-origin key (task 174.5.1), so
+    // the instantiation monomorphizes against the external template.
+    static func checkStatic(_ s: inout Sema, base: String, header: Type, element: Type,
                             _ method: String, _ args: [Arg], _ span: Span) -> NOIRExpr {
         switch method {
         case "create":
@@ -698,7 +700,7 @@ enum ManagedBufferIntrinsics {
             }
             let cap = PointerIntrinsics.intArg(&s, args[0].value, "ManagedBuffer.create", "capacity")
             return s.ptrIntrinsic("__managedBufferCreate",
-                                  .generic(base: "ManagedBuffer", args: [header, element]), [cap], span)
+                                  .generic(base: base, args: [header, element]), [cap], span)
         default:
             s.diags.error("'ManagedBuffer' has no static method '\(method)'", at: span)
             return err(span)

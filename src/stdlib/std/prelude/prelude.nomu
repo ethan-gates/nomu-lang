@@ -1,0 +1,104 @@
+// Nomu standard library — std/prelude (task 174).
+//
+// The `std` package's default module, implicitly imported into every module: each file behaves as if it
+// began with an invisible `import std`. It holds the pervasive surface (`Option`, `Result`, `String` and its
+// methods); the rest of `std` is reached by an explicit `import std/<module>`.
+
+// A value that is present (`some`) or absent (`none`). Payloads are labelled, so the
+// spelling is `Option.some(value: x)` / `.some(value: x)` and `case .some(let v)`.
+public enum Option<T> {
+    case some(value: T)
+    case none
+}
+
+// The outcome of a failable operation: a success value (`ok`) or an error (`err`).
+// Error handling is explicit `match`/`switch` — no `?` operator, no typed throws
+// (deferred, generics.md §2). Payloads are labelled: `Result.ok(value: x)` /
+// `.err(error: e)`, matched as `case .ok(let v)` / `case .err(let e)`.
+public enum Result<T, E> {
+    case ok(value: T)
+    case err(error: E)
+}
+
+// The Nomu `String` (task 121): a value-semantics UTF-8 string. Its one stored property is a `StringBase` —
+// the internal compiler-primitive carrying the 16-byte bit-stealing shaped value (`heap`/`immortal`/`small`;
+// task 121 Representation, 176 shape). A single-field wrapper is byte-identical to its field, so `String`
+// inherits `StringBase`'s two-register layout and shaped-root treatment with no String-specific GC code
+// (the *single-field-wrapper-is-shaped* rule). The byte-layer surface (`count`, `isEmpty`, `eq`, `lt`,
+// `byte(at:)`, `concat`, literals, `print`) is compiler-recognized today and moves to Nomu methods over the
+// four `StringBase` ops as the layering is completed.
+public struct String {
+    let base: StringBase
+
+    // Byte count and emptiness (task 121.1.4) — Nomu computed properties over the `StringBase` `count` op.
+    var count: Int { self.base.count }
+    var isEmpty: Bool { self.base.count == 0 }
+
+    // Byte equality (task 121.1.4) — Nomu over the `StringBase` ops `count` + `bytePointer`. Equal length,
+    // then a byte-by-byte compare. (`a < b`/`a > b` stand in for `!=` on the byte.)
+    fun eq(other: String) -> Bool {
+        let n = self.base.count
+        if n != other.base.count { return false }
+        let pa = self.base.bytePointer()
+        let pb = other.base.bytePointer()
+        var i = 0
+        while i < n {
+            let a: UInt8 = pa.load(fromByteOffset: i)
+            let b: UInt8 = pb.load(fromByteOffset: i)
+            if a < b { return false }
+            if a > b { return false }
+            i = i + 1
+        }
+        return true
+    }
+
+    // Lexicographic byte ordering (`<` as a method until operators land): compare the shared prefix; on a tie
+    // the shorter string sorts first.
+    fun lt(other: String) -> Bool {
+        let an = self.base.count
+        let bn = other.base.count
+        var n = an
+        if bn < n { n = bn }
+        let pa = self.base.bytePointer()
+        let pb = other.base.bytePointer()
+        var i = 0
+        while i < n {
+            let a: UInt8 = pa.load(fromByteOffset: i)
+            let b: UInt8 = pb.load(fromByteOffset: i)
+            if a < b { return true }
+            if a > b { return false }
+            i = i + 1
+        }
+        return an < bn
+    }
+
+    // Byte at a UTF-8 offset. Unchecked today — the caller guarantees `at` is within `0..<count`,
+    // exactly like `RawPtr.load`. A bounds-checked form, a `precondition` primitive plus analysis-based
+    // removal (or forced omission), is task 183 (design/plans/tasks/183-precondition-bounds-checks.md);
+    // until it lands the stdlib/parser callers that drive the offset own the check.
+    fun byte(at: Int) -> UInt8 {
+        let p = self.base.bytePointer()
+        let b: UInt8 = p.load(fromByteOffset: at)
+        return b
+    }
+
+    // Concatenation (task 121.1.4 / 121.2). The representation is chosen by **result size**: a result of ≤ 15
+    // bytes is a `small` inline value (no allocation, built by `StringBase.smallConcat`); a larger result is a
+    // `heap` buffer (`allocHeap` + two gc-leaf copies). This is the small→heap graduation — upward only, since
+    // a result that fits in `small` cannot contain a `heap` string's content. In the heap path `allocHeap` is
+    // the one safepoint; `self` and `other` ride the shaped-root path across it (relocated if `heap`), and the
+    // copies run with no safepoint between the alloc and the fill, so the fresh buffer stays put.
+    fun concat(other: String) -> String {
+        let an = self.count
+        let bn = other.count
+        let n = an + bn
+        if n <= 15 {
+            return String(base: StringBase.smallConcat(self.base, other.base))
+        }
+        let dst = StringBase.allocHeap(n)
+        let dp = dst.bytePointer()
+        dp.copyBytes(from: self.base.bytePointer(), byteCount: an)
+        dp.advanced(by: an).copyBytes(from: other.base.bytePointer(), byteCount: bn)
+        return String(base: dst)
+    }
+}

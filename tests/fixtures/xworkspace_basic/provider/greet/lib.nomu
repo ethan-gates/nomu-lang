@@ -1,0 +1,4 @@
+// A product of an external (local-path) workspace, consumed across the boundary (task 188).
+public fun greeting() -> Int {
+    return 42
+}

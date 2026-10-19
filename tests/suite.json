@@ -1,5 +1,5 @@
 {
-  "computed_order": ["scheduler-mc", "stw-collect", "scheduler-tls", "module-generic-producer", "gc-string", "gc-string-field", "gc-stress-evac", "gc-stress", "scheduler-poller", "scheduler-actor", "module-generic-producer-loop", "scheduler-timer", "gc-pressure", "module-generic-nonpod", "gen-minor", "gc-anybox", "gc-string-relocate-evac", "gc-concurrent", "enum-nonshaped-gc-evac", "module-generic-bound-nonpod", "module-generic-string-evac", "option-string-gc-evac", "gen-los", "pair-string-gc-evac", "gen-major", "module-generic-string", "immix-forward", "immix-defrag", "gen-barrier", "pingpong", "futex-subset", "rt-prelude", "selfhost-alloc-self", "module-generic-privcallee-mono", "raw-struct", "module-generic-method-wp", "module-generic-enum", "immix-region", "module-generic-class-method-wp", "module-generic-class-method", "module-generic-type", "multipackage-basic", "module-generic-nested-wp", "module-method", "module-test-import", "atomics", "module-reexport", "bump-alloc", "scheduler-lock", "module-generic-bound", "arr-gc-evac", "module-generic-enum-method", "module-static-computed", "immix-alloc", "module-generic-field-wp", "module-generic-nested-mono", "module-generic-mut-method", "asmswitch", "string-surface", "module-generic-field", "module-generic-enum-method-wp", "module-generic-mut-method-wp", "module-generic-fn-wp", "module-link-diamond", "module-collision-resolve", "module-generic-compose", "module-generic-method", "sysclock-subset", "fiber-registry", "scheduler", "subset-ok", "raw-mem", "managed-buffer-evac", "gen-nursery", "module-generic-privcallee-wp", "module-gc-deptype-evac", "typed-ptr", "module-generic-static-computed", "immix-los-self", "escape-nonleaf-evac", "scalar-carried-evac", "immix-line-mark", "multipackage-coexist", "immix-evac", "fiberswitch", "managed-buffer-ref-self", "module-generic-fn-mono", "futex", "module-qualified", "module-shared", "erased-generic-fn", "gc-gen-self", "immix-sweep", "module-generic-fold-mono", "selfhost-alloc", "managed-buffer-ref-evac", "pair-string-gc", "option-string-gc", "enum-nonshaped-gc", "arr-gc", "module-generic-privcallee", "scalar-carried", "fiberswitch-evac", "scheduler-evac", "managed-buffer-ref", "asmswitch-evac", "raw-mem-evac", "managed-buffer", "sysclock-evac", "immix-region-evac", "raw-struct-evac", "module-generic-fold", "module-generic-nested", "gc-gen", "module-generic-fn", "module-generic-nested-edge", "escape-nonleaf", "bump-alloc-evac", "module-gc-deptype", "scheduler-lock-evac", "rt-prelude-evac", "fiber-registry-evac", "immix-los", "typed-ptr-evac", "atomics-evac", "sysclock", "immix-alloc-self", "managed-buffer-scalar-ref-bad", "module-collision", "module-dup", "module-leaf-collision", "module-mut-method-bad", "module-perfile-import", "module-private", "module-public-nonproduct", "module-test-import-blackbox", "module-visibility", "multipackage-cycle", "multipackage-nonproduct", "multipackage-package-hidden", "multipackage-testimport-foreign", "multipackage-undeclared", "subset-bad"],
+  "computed_order": ["stw-collect", "scheduler-tls", "gc-anybox", "gc-string-field", "gc-string", "module-generic-producer", "gc-stress-evac", "gc-stress", "scheduler-mc", "gc-pressure", "module-generic-producer-loop", "pingpong", "gc-concurrent", "module-generic-nonpod", "gen-los", "gc-string-relocate-evac", "prelude-single-definition", "scheduler-timer", "scheduler-poller", "enum-nonshaped-gc-evac", "option-string-gc-evac", "module-generic-bound-nonpod", "module-generic-string-evac", "pair-string-gc-evac", "scheduler-actor", "futex-subset", "gen-major", "immix-evac", "gen-minor", "scheduler", "escape-nonleaf-evac", "immix-forward", "immix-defrag", "asmswitch", "module-generic-enum-method-wp", "module-link-diamond", "gen-nursery", "multipackage-basic", "fiberswitch", "module-shared", "immix-los-self", "erased-generic-fn", "module-generic-field-wp", "module-generic-class-method", "module-collision-resolve", "bump-alloc", "module-generic-fn-wp", "subset-ok", "module-generic-privcallee-mono", "module-test-import", "module-generic-bound", "scheduler-lock", "string-surface", "module-generic-nested-mono", "typed-ptr", "xworkspace-basic", "module-generic-fold-mono", "multipackage-coexist", "immix-line-mark", "atomics", "rt-prelude", "module-generic-compose", "module-static-computed", "module-generic-enum-method", "managed-buffer-evac", "module-gc-deptype-evac", "immix-region", "module-qualified", "module-generic-type", "module-reexport", "scalar-carried-evac", "module-generic-mut-method-wp", "sysclock-subset", "raw-mem", "module-generic-method-wp", "module-generic-fn-mono", "raw-struct", "selfhost-alloc-self", "module-generic-method", "xworkspace-alias", "module-generic-privcallee-wp", "module-generic-field", "prelude-cross-module", "prelude-core-ambient", "module-foreign-type", "module-generic-enum", "immix-alloc", "arr-gc-evac", "fiber-registry", "module-generic-static-computed", "module-generic-string", "module-generic-mut-method", "gc-gen-self", "module-generic-class-method-wp", "immix-sweep", "managed-buffer-ref-self", "module-generic-nested-wp", "prelude-implicit", "std-module-import", "gen-barrier", "module-method", "arr-gc", "futex", "managed-buffer-ref-evac", "pair-string-gc", "enum-nonshaped-gc", "option-string-gc", "raw-struct-evac", "gc-gen", "module-generic-fold", "module-generic-privcallee", "module-generic-nested", "module-gc-deptype", "module-generic-fn", "escape-nonleaf", "module-generic-nested-edge", "scalar-carried", "fiber-registry-evac", "immix-los", "scheduler-lock-evac", "managed-buffer", "managed-buffer-ref", "asmswitch-evac", "immix-region-evac", "scheduler-evac", "bump-alloc-evac", "typed-ptr-evac", "fiberswitch-evac", "sysclock-evac", "raw-mem-evac", "atomics-evac", "rt-prelude-evac", "sysclock", "immix-alloc-self", "selfhost-alloc", "managed-buffer-scalar-ref-bad", "module-collision", "module-dup", "module-foreign-type-unnamed", "module-leaf-collision", "module-mut-method-bad", "module-perfile-import", "module-private", "module-public-nonproduct", "module-test-import-blackbox", "module-visibility", "multipackage-cycle", "multipackage-nonproduct", "multipackage-package-hidden", "multipackage-testimport-foreign", "multipackage-undeclared", "reserved-pkg-pkg", "reserved-pkg-std", "std-module-missing", "subset-bad"],
   "defaults": { "timeout_sec": 60, "compile_timeout_sec": 120, "iterations": 1, "carriers": [1], "heavy": false },
   "cases": [
 
@@ -142,9 +142,9 @@
     { "name": "gc-stress-evac", "fixture": "examples/gc_stress", "compile_env": { "NOMU_NO_ESCAPE": "1" },
       "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "1024" }, "expect": { "stdout": "42\n7\n42\n499500\n" }, "carriers": [] },
 
-    { "name": "immix-region", "fixture": "examples/immix_region",
+    { "name": "immix-region", "fixture": "examples/immix_region", "compile_env": { "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "1\n1\n2\n261\n5\n2\n1\n0\n1\n0\n0\n1\n" }, "carriers": [] },
-    { "name": "immix-region-evac", "fixture": "examples/immix_region",
+    { "name": "immix-region-evac", "fixture": "examples/immix_region", "compile_env": { "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "1\n1\n2\n261\n5\n2\n1\n0\n1\n0\n0\n1\n" }, "carriers": [] },
 
     { "name": "raw-mem", "fixture": "examples/raw_mem",
@@ -157,9 +157,9 @@
     { "name": "raw-struct-evac", "fixture": "examples/raw_struct",
       "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "123\n456\n123\n1\n0\n1\n0\n" }, "carriers": [] },
 
-    { "name": "rt-prelude", "fixture": "examples/rt_prelude",
+    { "name": "rt-prelude", "fixture": "examples/rt_prelude", "compile_env": { "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "7\n11\n1\n" }, "carriers": [] },
-    { "name": "rt-prelude-evac", "fixture": "examples/rt_prelude",
+    { "name": "rt-prelude-evac", "fixture": "examples/rt_prelude", "compile_env": { "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" }, "expect": { "stdout": "7\n11\n1\n" }, "carriers": [] },
 
     { "name": "scalar-carried", "fixture": "examples/scalar_carried_nonleaf",
@@ -217,20 +217,20 @@
     { "name": "selfhost-alloc-self", "fixture": "examples/selfhost_gc",
       "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "42\n7\n100\n" }, "carriers": [] },
 
-    { "name": "immix-defrag", "fixture": "examples/immix_defrag", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+    { "name": "immix-defrag", "fixture": "examples/immix_defrag", "compile_env": { "NOMU_NO_ESCAPE": "1", "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "1\n1\n1000\n1\n1\n" }, "carriers": [], "iterations": 2 },
-    { "name": "immix-evac", "fixture": "examples/immix_evac", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+    { "name": "immix-evac", "fixture": "examples/immix_evac", "compile_env": { "NOMU_NO_ESCAPE": "1", "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "1\n1\n111\n1\n1\n" }, "carriers": [], "iterations": 2 },
-    { "name": "immix-forward", "fixture": "examples/immix_forward", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+    { "name": "immix-forward", "fixture": "examples/immix_forward", "compile_env": { "NOMU_NO_ESCAPE": "1", "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "12345\n1\n1\n0\n0\n" }, "carriers": [], "iterations": 2 },
-    { "name": "immix-line-mark", "fixture": "examples/immix_line_mark",
+    { "name": "immix-line-mark", "fixture": "examples/immix_line_mark", "compile_env": { "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "TOTAL 52\nLINECHECK 0\nLINES>0 1\n" }, "carriers": [], "iterations": 2 },
-    { "name": "immix-sweep", "fixture": "examples/immix_sweep", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+    { "name": "immix-sweep", "fixture": "examples/immix_sweep", "compile_env": { "NOMU_NO_ESCAPE": "1", "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "1\n1\n111\n222\n2\n" }, "carriers": [], "iterations": 2 },
 
-    { "name": "gen-barrier", "fixture": "examples/gen_barrier", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+    { "name": "gen-barrier", "fixture": "examples/gen_barrier", "compile_env": { "NOMU_NO_ESCAPE": "1", "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "1\n1\n1\n3\n" }, "carriers": [], "iterations": 2 },
-    { "name": "gen-nursery", "fixture": "examples/gen_nursery", "compile_env": { "NOMU_NO_ESCAPE": "1" },
+    { "name": "gen-nursery", "fixture": "examples/gen_nursery", "compile_env": { "NOMU_NO_ESCAPE": "1", "NOMU_RT_PRELUDE": "1" },
       "run_env": { "NOMU_GC_PLAN": "nomu" }, "expect": { "stdout": "1\n1\n1\n199990000\n" }, "carriers": [], "iterations": 2 },
 
     { "name": "scheduler", "fixture": "examples/scheduler",
@@ -419,7 +419,39 @@
     { "name": "module-gc-deptype-evac", "fixture": "tests/fixtures/module_gc_deptype",
       "compile_env": { "NOMU_NO_ESCAPE": "1" },
       "run_env": { "NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "512" },
-      "expect": { "stdout": "12345\n7\n4999950000\n" }, "carriers": [] }
+      "expect": { "stdout": "12345\n7\n4999950000\n" }, "carriers": [] },
+
+    { "name": "xworkspace-basic", "fixture": "tests/fixtures/xworkspace_basic/consumer/app",
+      "expect": { "stdout": "42\n" }, "carriers": [] },
+    { "name": "xworkspace-alias", "fixture": "tests/fixtures/xworkspace_alias/consumer/app",
+      "expect": { "stdout": "100\n200\n" }, "carriers": [] },
+
+    { "name": "reserved-pkg-std", "fixture": "tests/fixtures/reserved_pkg_std",
+      "compile": { "expect_error": "package name 'std' is reserved" } },
+    { "name": "reserved-pkg-pkg", "fixture": "tests/fixtures/reserved_pkg_pkg",
+      "compile": { "expect_error": "package name 'pkg' is reserved" } },
+
+    { "name": "prelude-implicit", "fixture": "tests/fixtures/prelude_implicit",
+      "expect": { "stdout": "7\n5\nodd\nabcdef\n6\nqualified\n" }, "carriers": [] },
+    { "name": "prelude-single-definition", "fixture": "tests/fixtures/prelude_implicit",
+      "object_symbols": [ { "pattern": "_nomu_main", "min": 1 },
+                          { "pattern": "_nomu_fn_rt", "max": 0 },
+                          { "pattern": "_nomu_fn_nomu_", "max": 0 },
+                          { "pattern": "_nomu_m_nomu_", "max": 0 } ],
+      "expect": { "stdout": "7\n5\nodd\nabcdef\n6\nqualified\n" }, "carriers": [] },
+    { "name": "prelude-core-ambient", "fixture": "tests/fixtures/prelude_core_ambient",
+      "run_env": { "NOMU_GC_PLAN": "nogc" }, "expect": { "stdout": "3\n9\n" }, "carriers": [] },
+    { "name": "std-module-import", "fixture": "tests/fixtures/std_module_import",
+      "expect": { "stdout": "3\n8\n2\nseeded\n15\n" }, "carriers": [] },
+    { "name": "std-module-missing", "fixture": "tests/fixtures/std_module_missing",
+      "compile": { "expect_error": "undefined name 'max'" } },
+    { "name": "prelude-cross-module", "fixture": "tests/fixtures/prelude_cross_module",
+      "expect": { "stdout": "one\nnone\n40\nnegative\n" }, "carriers": [] },
+
+    { "name": "module-foreign-type", "fixture": "tests/fixtures/module_foreign_type",
+      "expect": { "stdout": "3\n7\n5\n0\n" }, "carriers": [] },
+    { "name": "module-foreign-type-unnamed", "fixture": "tests/fixtures/module_foreign_type_unnamed",
+      "compile": { "expect_error": "'Point' is defined in module" } }
 
   ]
 }

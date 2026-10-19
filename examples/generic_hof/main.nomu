@@ -13,6 +13,6 @@ fun combine<A, B, C>(a: A, b: B, f: (A, B) -> C) -> C {
 
 fun main() {
     print(map(5, {(n: Int) -> Int in return n * 2}))                      // 10
-    print(map("nomu", {(s: String) -> String in return concat(s, "!")})) // nomu!
+    print(map("nomu", {(s: String) -> String in return s.concat("!")})) // nomu!
     print(combine(3, 4, {(a: Int, b: Int) -> Int in return a + b}))      // 7
 }

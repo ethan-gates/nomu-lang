@@ -24,7 +24,7 @@ fun strsum(s: String) -> Int {
 }
 
 fun run() -> Int {
-    let s = concat("hello world this is ", "a long heap string value")
+    let s = "hello world this is ".concat("a long heap string value")
     let r = hold(s)
     return strsum(r)
 }

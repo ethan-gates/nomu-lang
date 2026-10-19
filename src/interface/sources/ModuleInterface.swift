@@ -120,6 +120,13 @@ public func interfaceToDecls(_ iface: ModuleInterface) -> [TopDecl] {
 // shareability, task 100.4.5) are added when those phases land.
 
 public struct ModuleInterface: Codable, Equatable {
+    // The producing module's **workspace name** — the first segment of its canonical mangled identity
+    // (task 188). In-workspace a consumer recomputes this locally (every module shares the build's one
+    // workspace name), so it was left implicit; crossing a workspace boundary a consumer references symbols
+    // mangled under a *foreign* workspace name, so the producer must persist its own here and the consumer
+    // qualify imported references by it. Optional so a pre-188 `.nmi` (no field) still decodes — the
+    // consumer then falls back to its local workspace name, the in-workspace behavior.
+    public var workspace: String?
     public var package: String
     public var modulePath: [String]
     public var types: [InterfaceType]
@@ -131,13 +138,53 @@ public struct ModuleInterface: Codable, Equatable {
     // (so a re-exported call still links to the true producer). Recorded here so re-export resolution is
     // interface-mediated — a downstream sees the edge without the re-exporter's source.
     public var reexports: [InterfaceRef]
+    // The origin of each **foreign** type named in this interface's signatures (task 174.7): bare type name
+    // → the canonical origin (`workspace/…/module`) of the module that defines it, resolved in the producer,
+    // which knows its own imports. Type text stays bare (`Option<String>`); a consumer encodes each listed
+    // name to `origin@name`, the same identity the defining module's own types get, so a signature can name a
+    // type from a third module. Unlisted names are the module's own types, builtins and generic parameters.
+    // A name that resolves to more than one module in the producer is left out. Optional so an older `.nmi`
+    // still decodes.
+    public var foreignTypes: [String: String]?
     public init(package: String, modulePath: [String], types: [InterfaceType],
                 enums: [InterfaceEnum] = [], interfaces: [InterfaceProtocol] = [],
-                functions: [InterfaceFunc], reexports: [InterfaceRef] = []) {
+                functions: [InterfaceFunc], reexports: [InterfaceRef] = [], workspace: String? = nil) {
         self.package = package; self.modulePath = modulePath; self.types = types
         self.enums = enums; self.interfaces = interfaces; self.functions = functions
-        self.reexports = reexports
+        self.reexports = reexports; self.workspace = workspace
     }
+}
+
+// Every type name an interface's signatures mention (fields, parameters, returns, properties, enum payloads),
+// walking generic arguments and function types. Generic parameter names are excluded. The producer resolves
+// the foreign ones into `foreignTypes` (task 174.7).
+public func signatureTypeNames(_ iface: ModuleInterface) -> Set<String> {
+    var names = Set<String>()
+    func walk(_ t: TypeRef?) {
+        guard let t else { return }
+        if t.existentialOf == nil && t.opaqueOf == nil && t.fn == nil { names.insert(t.name) }
+        t.genericArgs?.forEach(walk)
+        if let fn = t.fn { fn.params.forEach(walk); walk(fn.ret) }
+    }
+    func text(_ s: String?) { if let s, let t = parseTypeText(s) { walk(t) } }
+    func fn(_ f: InterfaceFunc) { f.params.forEach { text($0.type) }; text(f.ret) }
+    var generics = Set<String>()
+    for f in iface.functions { fn(f); generics.formUnion(f.generics.map(\.name)) }
+    for t in iface.types {
+        generics.formUnion(t.generics.map(\.name))
+        t.fields.forEach { text($0.type) }; t.properties.forEach { text($0.type) }
+        for m in t.methods { fn(m); generics.formUnion(m.generics.map(\.name)) }
+    }
+    for e in iface.enums {
+        generics.formUnion(e.generics.map(\.name))
+        e.cases.forEach { $0.fields.forEach { text($0.type) } }; e.properties.forEach { text($0.type) }
+        for m in e.methods { fn(m); generics.formUnion(m.generics.map(\.name)) }
+    }
+    for p in iface.interfaces {
+        p.methods.forEach { m in m.params.forEach { text($0.type) }; text(m.ret) }
+        p.properties.forEach { text($0.type) }
+    }
+    return names.subtracting(generics)
 }
 
 // A reference to another module's interface: its package + relative module path (task 100.2.4).
@@ -300,6 +347,7 @@ private func renderConformances(_ cs: [Conformance]) -> [String] { cs.map(\.name
 // the same way the compile graph is. `reexportModulePath` resolves a `public import` to the re-exported
 // module's identity components (the driver owns cross-package resolution); a nil result skips that import.
 public func buildInterface(_ program: Program, package: String, module: ModuleID, moduleIDRoot: String,
+                           workspace: String? = nil,
                            facts: FactStore = FactStore(), whiteBox: Bool = false,
                            reexportModulePath: (ImportDecl) -> [String]? = { _ in nil }) -> ModuleInterface {
     func inModule(_ span: Span) -> Bool { moduleID(forFile: span.file, packageRoot: moduleIDRoot) == module }
@@ -360,7 +408,7 @@ public func buildInterface(_ program: Program, package: String, module: ModuleID
     interfaces.sort { $0.name < $1.name }
     funcs.sort { $0.name < $1.name }
     return ModuleInterface(package: package, modulePath: module.components, types: types, enums: enums,
-                           interfaces: interfaces, functions: funcs, reexports: reexports)
+                           interfaces: interfaces, functions: funcs, reexports: reexports, workspace: workspace)
 }
 
 // The `.nmi` bytes: pretty, key-sorted JSON, so the arrays' name-sort makes a byte diff mean a real

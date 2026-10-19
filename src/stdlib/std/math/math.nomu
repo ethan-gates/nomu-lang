@@ -1,0 +1,16 @@
+// Nomu standard library — std/math (task 174). Integer helpers; `import std/math`.
+
+public fun abs(n: Int) -> Int {
+    if n < 0 { return -n }
+    return n
+}
+
+public fun max(a: Int, b: Int) -> Int {
+    if a > b { return a }
+    return b
+}
+
+public fun min(a: Int, b: Int) -> Int {
+    if a < b { return a }
+    return b
+}

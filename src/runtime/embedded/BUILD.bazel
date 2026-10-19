@@ -11,6 +11,7 @@ genrule(
         "core.c",
         "//src/stdlib:core.nomu",
         "//src/stdlib:runtime.nomu",
+        "//src/stdlib:std_modules",
         "rtasm_arm64.s",
     ],
     outs = ["EmbeddedSources.swift"],
@@ -18,7 +19,8 @@ genrule(
     cmd = "bash $(location embed.sh) $@ " +
           "$(location runtime.h) $(location runtime.c) " +
           "$(location core.c) $(location //src/stdlib:core.nomu) " +
-          "$(location //src/stdlib:runtime.nomu) $(location rtasm_arm64.s)",
+          "$(location //src/stdlib:runtime.nomu) $(location rtasm_arm64.s) " +
+          "$(locations //src/stdlib:std_modules)",
 )
 
 swift_library(

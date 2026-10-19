@@ -18,7 +18,7 @@ struct Circle: Drawable, Named {
 
 // Requires both interfaces; requirements from each dispatch through the composite witness.
 fun show(x: any Drawable & Named) -> String {
-    return concat(x.name, x.draw())
+    return x.name.concat(x.draw())
 }
 
 fun main() {

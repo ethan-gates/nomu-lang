@@ -8,13 +8,13 @@
 interface Named {
     var name: String { get }
     fun greeting() -> String {          // default operating on a required property
-        return concat("hi ", self.name)
+        return "hi ".concat(self.name)
     }
 }
 
 interface Greeter: Named {
     fun greeting() -> String {          // overrides Named's default (most-specific wins)
-        return concat("hello ", self.name)
+        return "hello ".concat(self.name)
     }
 }
 
@@ -25,7 +25,7 @@ struct Person: Greeter {
 // Takes any Greeter; `name` (inherited) and `greeting` (overridden default) both
 // dispatch through the witness table.
 fun announce(g: any Greeter) -> String {
-    return concat(g.greeting(), concat(" / ", g.name))
+    return g.greeting().concat(" / ".concat(g.name))
 }
 
 // A base existential accepts a concrete refiner, boxed directly. Person has one

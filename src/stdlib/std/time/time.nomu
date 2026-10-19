@@ -1,0 +1,38 @@
+// Nomu standard library — std/time (task 174). Monotonic timing; `import std/time`.
+
+import pkg/prelude
+
+public struct Time {
+    // A quick struct used for basic timing, needs actual design work
+
+    // lowers to `clock_gettime(CLOCK_MONOTONIC, &ts);` from time.h
+    var now: Int {
+        return time_monotonic()
+    }
+
+    fun ms_diff(t1: Int, t2: Int) -> Int {
+        let diff = t2 - t1
+        return diff / 1000000
+    }
+
+    fun micro_diff(t1: Int, t2: Int) -> Int {
+        let diff = t2 - t1
+        return diff / 1000
+    }
+
+    fun ns_diff(t1: Int, t2: Int) -> Int {
+        return t2 - t1
+    }
+
+    fun took(label: String, t1: Int) {
+        let t2 = self.now
+        print(label)
+        print(" took: ")
+        print(self.ms_diff(t1, t2))
+        print("ms ")
+        print(self.micro_diff(t1, t2))
+        print("µs ")
+        print(self.ns_diff(t1, t2))
+        print("ns\n")
+    }
+}

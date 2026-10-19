@@ -7,7 +7,7 @@ class Holder {
 
 fun main() {
   var h = Holder(s: "Hello")
-  h.s = concat(h.s, ", world")        // field store of a concat result
+  h.s = h.s.concat(", world")        // field store of a concat result
   print(h.s)
   print("\n")
   print(h.s.count)                     // 12

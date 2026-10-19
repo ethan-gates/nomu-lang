@@ -18,7 +18,7 @@ fun strsum(s: String) -> Int {
   return acc
 }
 fun main() {
-  let o: Option<String> = Option<String>.some(value: concat("hello", " world"))
+  let o: Option<String> = Option<String>.some(value: "hello".concat(" world"))
   var i = 0
   var checksum = 0
   while i < 2000 {

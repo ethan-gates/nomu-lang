@@ -31,7 +31,7 @@ fun main() {
   var i = 0
   var checksum = 0
   while i < 3000 {
-    acc = concat(acc, "x")          // grow the String → a fresh immortal buffer per concat
+    acc = acc.concat("x")          // grow the String → a fresh immortal buffer per concat
     // Garbage to drive collection: 3000 × 8192 × 16 B ≈ 393 MiB ≫ the 256 MiB heap.
     var xs: Array<Box> = []
     var w = 0

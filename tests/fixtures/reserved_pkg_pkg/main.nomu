@@ -1,0 +1,5 @@
+// A user package may not take the reserved name `pkg` (modules.md §Imports).
+
+fun main() {
+    print(1)
+}

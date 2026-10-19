@@ -69,6 +69,15 @@ tree contains only modules.
 
 Same-package imports use the `pkg` root keyword (below); external-package imports name the package.
 
+**The implicit `import std`.** Every file behaves as if it began with an invisible `import std`, which names
+the standard library's default module, `std/prelude` (`Option`, `Result`, `String`). Everything else in
+`std` is an ordinary explicit import: `import std/math`, `import std/time`. The root `std` always means the
+compiler-embedded standard library; it needs no `dependencies` entry. The package names `std` and `pkg` are
+reserved: a user package named either is a compile error. A file that writes `import std`
+itself (to alias it) uses that import in place of the implicit one. The implicit import is the whole
+mechanism, so prelude names follow the normal import rules (`std.Option` qualifies), and moving a decl in or
+out of the prelude is moving it between `std` modules (task [174](../plans/tasks/174-prelude-as-packages.md) §174.3.2).
+
 **Leaning.** Type-directed resolution of a bare-name clash (Swift-style) is the intended model, and it
 depends on keeping expression-level inference cheap — see [Type inference dependency](#type-inference-dependency).
 
@@ -119,6 +128,15 @@ mechanism covers it.)
 `public import foo`. Plain `import foo` republishes nothing (file-local). Whole-module granularity
 (no per-symbol re-export or rename). Chaining composes, so a facade or prelude can flatten deep
 submodules into one import. Consumers disambiguate any resulting clash with `Module.Name`.
+
+**Types in a public signature are not re-exported** (the Rust rule). A module may name another module's type
+in its own public API — a parameter, return, field or payload — without re-exporting it. A consumer can use
+values of that type fully (read fields, call methods, match cases) with no import of the defining module;
+writing the type's *name* still needs that import. The interface records each such type's defining module
+(`foreignTypes`), so the consumer resolves it to the right identity and loads its declaration without
+bringing the module into scope. Rationale: re-exporting just to mention a dependency's type would make
+`public import` routine, and implicit re-export would let a dependency change add or remove names in its
+consumers' scope.
 
 A `package`-scoped re-export was considered and rejected: it cannot enforce indirection (siblings can
 always import the target directly), and within a package — refactored atomically — the decoupling a

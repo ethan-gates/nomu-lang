@@ -35,6 +35,15 @@ struct StderrMatch: Decodable {
     var max: Int?
 }
 
+// A symbol-count assertion over the fixture's own object (`<binary>.o`, `nm -U`): lines naming a defined
+// symbol that contains `pattern`. Pins what the program's object defines — e.g. that no runtime / `std`
+// definition is duplicated into it.
+struct SymbolMatch: Decodable {
+    var pattern: String
+    var min: Int?
+    var max: Int?
+}
+
 struct Case: Decodable {
     var name: String
     var fixture: String
@@ -50,6 +59,7 @@ struct Case: Decodable {
     var weight: Int?
     var compile: CompileSpec?
     var stderrMatch: [StderrMatch]?
+    var objectSymbols: [SymbolMatch]?
 }
 
 // A case with all defaults folded in — what the runner actually executes.
@@ -67,6 +77,7 @@ struct ResolvedCase {
     var weight: Int   // cores this case saturates (its pool lanes); derived from the run shape, below
     var compile: CompileSpec?
     var stderrMatch: [StderrMatch]
+    var objectSymbols: [SymbolMatch]
 
     // Key for shared compilation — a fixture built once per distinct (compile-env, compile-args).
     var compileKey: String {
@@ -107,7 +118,8 @@ extension Manifest {
                 compileTimeout: c.compileTimeoutSec ?? d?.compileTimeoutSec ?? 120,
                 weight: Manifest.weight(c, d, carriers: carriers, capacity: capacity),
                 compile: c.compile,
-                stderrMatch: c.stderrMatch ?? []
+                stderrMatch: c.stderrMatch ?? [],
+                objectSymbols: c.objectSymbols ?? []
             )
         }
     }

@@ -1,0 +1,6 @@
+import greetlib
+
+fun main() {
+    print(greeting())
+    print("\n")
+}

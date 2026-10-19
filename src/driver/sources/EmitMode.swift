@@ -56,5 +56,25 @@ public struct EmitOptions {
     // The dial in force, resolving the nil default against the optimization level (debug=none, release=all).
     public var effectiveMono: MonoMode { mono ?? (optimize ? .all : .none) }
 
+    // Compiler-internal (task 188): emit the entry module as a home-qualified **library object** (no `main`,
+    // no program-wide type maps, no runtime link) rather than a binary — the shape every cross-workspace
+    // build wants, since an external workspace's products are linked into a consumer, not run. Set by the
+    // driver when it builds an external workspace's products (the embedded `nomu` workspace, or a pinned
+    // local external). Never from the CLI.
+    public var emitLibrary = false
+    // Compiler-internal (task 174): this is the build of the embedded `nomu` workspace itself (`core`/
+    // `runtime`/`std`), not a user program. Beyond `emitLibrary` (which it implies), it links their symbols
+    // strong (no weak-origin, except the `runtime` package's own bare weak-ODR set). With the prepend retired
+    // (174.5/.5.1) it no longer gates a prepend; it still marks these as the prelude build (strong linkage,
+    // runtime-subset-by-membership source).
+    public var compilingPrelude = false
+    // Compiler-internal (task 174.4): designate every function in this `compilingPrelude` build runtime-subset
+    // by **package membership** — set for the `runtime` package. Replaces the file-designation (the prepend's
+    // `runtime.nomu` parse) as the subset source for the package build: its functions compile `noSafepoint`,
+    // so the package copy carries no stackmaps, is unpinned, and dead-strips — collapsing the inert duplicate
+    // the prepend's bare copies shadowed (the 100.4.4 interim). The prepend keeps its file-designation until
+    // the prepend itself retires (174.5).
+    public var runtimeSubsetByMembership = false
+
     public init() {}
 }

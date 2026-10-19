@@ -18,10 +18,17 @@ primitives + pure leaves). Test: `tools/subset.sh`.
 seeded in `lowerToSSAIR`), and `SSAIRToLLVM` elides the loop-header `__nomu_poll` for a subset function —
 so the self-hosted scheduler loop cannot recursively try to stop the world. Verified in the emitted
 machine code (the poll's slow-path call is present in an ordinary loop, absent in the same loop under
-`--runtime-subset`). Test: `tools/subset-poll.sh`. **Remaining slices:** the write-barrier codegen guard
-(runtime code works over `addrspace(0)` raw memory, which has no managed store to barrier, so it is inert
-today), the `nostackgrow fun` keyword (staged behind [104](104-fiber-stack-strategy.md)), and
-module-membership designation with [100](100-modules.md).
+`--runtime-subset`). Test: `tools/subset-poll.sh`.
+
+**► Built (module-membership designation, [174](174-prelude-as-packages.md).4).** The `runtime` package build
+designates its functions runtime-subset by **package membership** — the subset name set is sourced from the
+package's own functions, not the prepend's `runtime.nomu` parse. This is the designation swap the slice-1
+"designated file" framing anticipated. The prepend keeps its file-designation until it retires (174.5), since
+a prepended function has no package to belong to; the file-designation fully retires with the prepend.
+
+**Remaining slices:** the write-barrier codegen guard (runtime code works over `addrspace(0)` raw memory,
+which has no managed store to barrier, so it is inert today), and the `nostackgrow fun` keyword (staged
+behind [104](104-fiber-stack-strategy.md)).
 
 **► Design:** [`internals/runtime-subset.md`](../../internals/runtime-subset.md). Surface pinned with
 Ethan: **surface A — module-default subset + a narrow per-function keyword refinement** (`nosplit fun`);

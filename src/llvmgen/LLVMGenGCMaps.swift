@@ -244,7 +244,9 @@ extension LLVMGen {
     // name), but the specializer records them in `monoTypeArgs` keyed by that name. Returns nil if `t` is
     // not a `ManagedBuffer` instantiation.
     func managedBufferArgs(_ t: Type) -> (header: Type, element: Type)? {
-        guard case .named(let n, _) = t, n.hasPrefix("ManagedBuffer<"),
+        // The mono'd name carries the `nomu/core` origin once `ManagedBuffer` is a package type (174.5.1),
+        // e.g. `nomu/core@ManagedBuffer<EmptyHeader, UInt8>`; strip any `origin@` before the prefix match.
+        guard case .named(let n, _) = t, (ExternalName.decode(n)?.name ?? n).hasPrefix("ManagedBuffer<"),
               let args = monoTypeArgs[n], args.count == 2 else { return nil }
         return (args[0], args[1])
     }

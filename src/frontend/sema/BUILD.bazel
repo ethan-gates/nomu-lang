@@ -17,5 +17,5 @@ swift_library(
 swift_test(
     name = "frontend_tests",
     srcs = glob(["tests/*.swift"]),
-    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir", "//src/midend", "//src/frontend/sema", "//src/facts"],
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir", "//src/midend", "//src/frontend/sema", "//src/facts", "//src/runtime/embedded"],
 )

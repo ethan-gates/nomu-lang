@@ -5,7 +5,7 @@
 interface Named {
     var name: String { get }
     fun greeting() -> String {
-        return concat("hi ", name)            // bare requirement access (not self.name)
+        return "hi ".concat(name)            // bare requirement access (not self.name)
     }
 }
 
@@ -13,7 +13,7 @@ interface Named {
 interface Badge: Named {
     var count: Int { get set }
     fun greeting() -> String {
-        return concat("hello ", name)
+        return "hello ".concat(name)
     }
     fun stamp() {
         self.count = 1                        // property write inside a default

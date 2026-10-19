@@ -1,0 +1,27 @@
+// A prelude generic consumed across a module boundary (task 174): `lib` returns `Option<String>` and
+// `Result<Int, String>`, and this module matches them. Both modules resolve the generics to the one
+// compiled-once `std/prelude`, so the instances agree.
+import pkg/lib
+
+fun main() {
+    switch lookup(1) {
+    case .some(let s): print(s)
+    case .none: print("none")
+    }
+    print("\n")
+    switch lookup(2) {
+    case .some(let s): print(s)
+    case .none: print("none")
+    }
+    print("\n")
+    switch parse(4) {
+    case .ok(let v): print(v)
+    case .err(let e): print(e)
+    }
+    print("\n")
+    switch parse(-1) {
+    case .ok(let v): print(v)
+    case .err(let e): print(e)
+    }
+    print("\n")
+}

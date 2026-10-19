@@ -1,9 +1,36 @@
 # Multi–local-workspace builds — cross-workspace linkage by local path
 
-**Avenue:** Infra · **Type/Lifecycle:** `language-feature · needs-design` (build orchestration + a mangling/
-`.nmi` identity touch) · **Size:** M–L · **Status:** not-started · **Source:** split out of
-[187](187-multi-package-builds.md) §187.5 — the deferred external-workspace half, sliced to the part that
-sidesteps dependency management.
+**Avenue:** Infra · **Type/Lifecycle:** `language-feature · built` (build orchestration + a mangling/
+`.nmi` identity touch) · **Size:** M–L · **Status:** built — all phases done, suite 145/145 (two new
+cross-workspace fixtures `xworkspace-basic` + `xworkspace-alias`). Pulled onto the active chain ahead of
+172/171/182 because the [174](174-prelude-as-packages.md) `core` cutover (174.2) consumes it: the embedded
+`nomu` workspace is the first external workspace a user build references. **188.1 built** (full identity in
+the `.nmi`: `ModuleInterface.workspace` carries the producer's workspace name, serialized; consumer still
+uses its local name, so in-workspace behavior is unchanged — 143/143). **188.2 built** (`ModuleHome` carries
+the owning workspace name + root; `mangleOrigin` reads it per-module — a no-op in-workspace where every
+module shares the build's name — 143/143). **188.3 built** (`nomu.yaml` local-path pin reader: an
+`externals:` block of `<alias>: <path>` entries; additive). **188.4 built** (`.external` resolution against
+pinned workspaces + build-on-demand of their products as library objects + load the imported modules' `.nmi`
+and link the objects; verified end to end — a consumer workspace imports a package from a pinned provider
+workspace, links `greeting()` as `nomu_fn_prov_greet_greeting` under the *producer's* workspace name, runs;
+143/143). Phases: 188.1 `.nmi` identity ✓ · 188.2 per-module identity ✓ · 188.3 `nomu.yaml` local-path pins
+✓ · 188.4 `.external` resolution + external `.nmi`/`.o` loading ✓ · 188.5 external-workspace aliasing ✓
+(workspace-level only, by decision: the `nomu.yaml` pin key is a local alias for the whole external
+workspace, reached by an alias-qualified import `import <alias>/<package>[/<module>]`; the alias rewrites
+only the local import root, the symbol still mangles under the producer's own workspace name — no `pkg.json`
+schema change) · 188.6 separate-compilation discipline ✓ (the disk-only handoff invariant is satisfied by
+188.4's architecture — external modules are built in their own `compile()` and read back from disk, never
+compiled into the consumer's graph; the skip-rebuild-if-built optimization is deferred to the CAS cache,
+task 172) · 188.7 tests ✓ (`xworkspace-basic` unqualified import + `xworkspace-alias` two same-named packages
+under distinct pin aliases). **Open refinement:** external *generic* templates (`.bir`) are not yet loaded
+across the boundary — `importedTemplates` reads the local build root only — so an imported external generic
+stays on the erased witness path (correct, unspecialized); matters for the 174.2 `core` generics' perf,
+folded in there. **Known interim flake:** with no build cache (174.1; CAS is 172) each binary rebuilds the
+`nomu` workspace, widening the timing window for a pre-existing shared-`build/` `__mod_*.o` write race — a
+cold suite run can hit `ld: file is empty in __mod_*.o`; a warm re-run is deterministic (145/145). The
+durable fix is an atomic-rename on the dependency-object write (pre-existing, out of 188 scope). · **Source:** split
+out of [187](187-multi-package-builds.md) §187.5 — the deferred external-workspace half, sliced to the part
+that sidesteps dependency management.
 
 ## Deliverable
 

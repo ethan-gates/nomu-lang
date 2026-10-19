@@ -567,6 +567,45 @@ public struct Sema {
         return .notExternal
     }
 
+    // The `enums` key a construction base names: the bare name for a local enum, else the per-origin key of
+    // an imported/ambient external enum (task 174.2 — the `nomu/core` prelude `Option`/`Result`). Nil when
+    // the name is not a known enum. Quiet (no diagnostics), so a construction path may probe and fall through.
+    func enumNameForConstruction(_ typeName: String, at span: Span) -> String? {
+        if enums[typeName] != nil { return typeName }
+        if let k = externalTypeKey(typeName, at: span), enums[k] != nil { return k }
+        return nil
+    }
+
+    // The canonical name of the surface `String` type at a site (task 174.2.3). While `String` is a local
+    // decl — the prepend, or the `nomu/core` package compiling its own `String` — it is the bare name; once
+    // `String` is flipped to the ambient `nomu/core` package it is that package's per-origin key
+    // (`nomu/core@String`). The compiler-synthesized string-literal sites (`NOIRGen.wrapString`/`stringType`)
+    // route through here so a literal's `String` identity matches the external package's, exactly as
+    // `enumNameForConstruction` does for a flipped `Option`/`Result`.
+    func stringTypeName(at span: Span) -> String {
+        if structs["String"] != nil { return "String" }
+        return externalTypeKey("String", at: span) ?? "String"
+    }
+    func stringType(at span: Span) -> Type { .named(stringTypeName(at: span), .struct_) }
+
+    // Whether `t` is the surface `String` — the bare name, or its ambient external identity (`origin@String`)
+    // once flipped (task 174.2.3). Used by the `print`/unwrap path, which must recognize an external `String`
+    // the same as the historical bare one.
+    func isStringType(_ t: Type) -> Bool {
+        if case .named(let n, .struct_) = t { return n == "String" || ExternalName.decode(n)?.name == "String" }
+        return false
+    }
+
+    // The per-origin key (`origin@name`) of a bare type name that resolves to exactly one in-scope external
+    // module's type (an import, or the ambient `nomu/core` prelude — task 174.2), or nil. Quiet — unlike
+    // `resolveExternal` it emits no diagnostics, so a construction path may probe it and fall through.
+    func externalTypeKey(_ name: String, at span: Span) -> String? {
+        guard let inScope = fileVisibleModules[span.file] else { return nil }
+        let exporters = inScope.filter { moduleTypes[$0]?.contains(name) == true }
+        guard exporters.count == 1, let origin = exporters.first else { return nil }
+        return ExternalName.encode(origin: origin, name: name)
+    }
+
     // The declared visibility and origin file of a user type, or nil for a builtin / unknown name.
     func typeVisibility(_ name: String) -> (Visibility, String)? {
         if let d = structs[name] { return (d.visibility, d.span.file) }

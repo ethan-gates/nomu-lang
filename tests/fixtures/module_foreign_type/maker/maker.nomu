@@ -1,0 +1,11 @@
+// Puts `shapes` types in its own signatures, without re-exporting `shapes`.
+import pkg/shapes
+
+package fun origin(x: Int, y: Int) -> Point {
+    return Point(x: x, y: y)
+}
+
+package fun tag(n: Int) -> Tagged<Int> {
+    if n > 0 { return .some(value: n) }
+    return .empty
+}

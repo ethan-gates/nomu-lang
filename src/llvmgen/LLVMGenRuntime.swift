@@ -434,21 +434,20 @@ extension LLVMGen {
         let fn = LLVMAddFunction(mod, "__nomu_selfhost_alloc", ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         LLVMSetGC(fn, "statepoint-example")
-        // Get-or-add: `RawPtr.gcSelfhostSpace()` (the tracer's reach into this space) may have created the
-        // same global first, so share it rather than minting a duplicate symbol.
-        let gSpace = LLVMGetNamedGlobal(mod, "__nomu_selfhost_space") ?? {
-            let g = LLVMAddGlobal(mod, i8ptr, "__nomu_selfhost_space")!
-            LLVMSetInitializer(g, LLVMConstPointerNull(i8ptr))
-            LLVMSetLinkage(g, LLVMInternalLinkage)
-            return g
-        }()
-        // The runtime prelude is always compiled in, so its allocator functions are declared. Guard
-        // defensively: a missing prelude falls back to a null return rather than a codegen crash.
-        guard let immixNew = callables["f:rtImmixNew"], let tlabAlloc = callables["f:rtTlabAlloc"] else {
-            withStubBody(fn) { LLVMBuildRet(b, LLVMConstPointerNull(p1)) }
-            selfhostAllocFn = (fn, ty)
-            return selfhostAllocFn!
-        }
+        // The Immix space is a single process resource defined in the C floor (`runtime.c`, task 174.3.1), so
+        // every object — the entry, and a separately-compiled package that allocates — shares one heap.
+        // Reference it as an external global (no initializer); the double-checked lock below fills it once,
+        // process-wide. `RawPtr.gcSelfhostSpace()` (the tracer's reach) references the same symbol.
+        let gSpace = getOrAddGlobal(i8ptr, "__nomu_selfhost_space")
+        // The self-hosted allocator functions live in the runtime prelude. A normal build has them prepended
+        // (present in `callables`); a package/library build (task 174.3.1) suppresses the prepend, so declare
+        // them external by their bare runtime symbols — they resolve against the runtime's weak-ODR
+        // definitions in the final binary. Signatures: `rtImmixNew(numBlocks: Int) -> RawPtr`,
+        // `rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc: Int) -> RawPtr`.
+        let immixNew: (fn: LLVMValueRef, ty: LLVMTypeRef) = callables["f:rtImmixNew"].map { ($0.fn, $0.ty) }
+            ?? runtimeFn("nomu_fn_rtImmixNew", ret: i8ptr, params: [i64], varArg: false)
+        let tlabAlloc: (fn: LLVMValueRef, ty: LLVMTypeRef) = callables["f:rtTlabAlloc"].map { ($0.fn, $0.ty) }
+            ?? runtimeFn("nomu_fn_rtTlabAlloc", ret: i8ptr, params: [i8ptr, i8ptr, i64, i8ptr, i64], varArg: false)
         let numBlocks = LLVMConstInt(i64, UInt64(8192), 0)   // 8192 × 32 KiB = 256 MiB heap
         withStubBody(fn) {
             let size = LLVMGetParam(fn, 0)!

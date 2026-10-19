@@ -1,0 +1,9 @@
+import wsa/util
+import wsb/util as util2
+
+fun main() {
+    print(answerA())
+    print("\n")
+    print(answerB())
+    print("\n")
+}

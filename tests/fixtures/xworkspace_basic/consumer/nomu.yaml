@@ -1,0 +1,4 @@
+# Consumer workspace: pins the provider workspace by local path (task 188).
+name: cons
+externals:
+  prov: ../provider

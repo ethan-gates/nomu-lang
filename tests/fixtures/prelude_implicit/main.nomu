@@ -1,0 +1,41 @@
+// The implicit `import std` (task 174): `Option`, `Result` and `String` (with its methods) resolve with no
+// import, as if the file began with `import std`, and the `std.` qualifier names that prelude module. The
+// object-symbol assertions on this fixture pin single definition: the program's own object defines no
+// runtime, `core` or `std` function (those live once, in the embedded `nomu` workspace's objects).
+fun half(n: Int) -> Result<Int, String> {
+    if n % 2 == 0 { return .ok(value: n / 2) }
+    return .err(error: "odd")
+}
+
+fun show(r: Result<Int, String>) {
+    switch r {
+    case .ok(let v): print(v)
+    case .err(let e): print(e)
+    }
+    print("\n")
+}
+
+fun main() {
+    let o: Option<Int> = .some(value: 7)
+    switch o {
+    case .some(let v): print(v)
+    case .none: print(0)
+    }
+    print("\n")
+    show(half(10))
+    show(half(3))
+
+    let s = "abc".concat("def")
+    print(s)
+    print("\n")
+    print(s.count)
+    print("\n")
+
+    let q: std.Option<String> = .some(value: s)
+    switch q {
+    case .some(let v):
+        if v.eq("abcdef") { print("qualified") } else { print("mismatch") }
+    case .none: print("none")
+    }
+    print("\n")
+}

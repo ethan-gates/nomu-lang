@@ -104,6 +104,15 @@ extern int __ulock_wait(uint32_t operation, void* addr, uint64_t value, uint32_t
 // mutator as a thread-local global; null until the carrier's first allocation binds it (→ slow path).
 _Thread_local void* rt_mutator = NULL;
 
+// The self-hosted Immix space descriptor (task 174.3.1): a single process resource all carriers (and every
+// compiled object, including a separately-compiled package that allocates) share. The codegen-generated
+// self-hosted allocation function references this by name; it was formerly an internal per-object global,
+// which stood up a separate heap whenever a non-entry object allocated. Defined here in the C floor so there
+// is one definition process-wide. Null until the first self-hosted allocation creates the space under the
+// space lock and release-stores the descriptor here (the acquire/release pairing lives in the generated
+// function's double-checked lock). Zero in a NoGC/MMTk run, where the self-hosted path is never taken.
+void* __nomu_selfhost_space = NULL;
+
 // ---- Self-hosted allocator TLABs (task 150 · 150.3.10.1) ----
 // Each carrier owns a 32-byte TLAB { allocCursor@0, allocLimit@8, allocBlock@16, allocLine@24 } the codegen
 // self-hosted-alloc seam bumps within (rtTlabAlloc); on overflow it refills from the shared Immix pool under

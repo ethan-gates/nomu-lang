@@ -5,7 +5,8 @@
 
 ## What
 
-The hash map is concrete `String → Int` today (`examples/benchmarks/hashmap.nomu`, hand-written). The
+No hash map exists today; the earlier hand-written benchmark map (concrete keys, built on C builtins)
+was removed in favor of a real `std` one. The
 real generic map recreates the **category-3 FCA** case in two ways:
 - a generic value type,
 - reading a whole array element by value (`let e = a[i]` mixing values + refs).
@@ -23,5 +24,4 @@ in Nomu is undecided — see [SIMD](126-simd.md) (swiss-table control-byte scan)
 
 ## Refs
 
-deferred.md "Generic hash map / whole-aggregate element reads"; `c-types.md` §3.4 (D6 spill);
-`examples/benchmarks/hashmap.nomu`.
+deferred.md "Generic hash map / whole-aggregate element reads"; `c-types.md` §3.4 (D6 spill).

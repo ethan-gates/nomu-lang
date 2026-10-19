@@ -91,6 +91,16 @@ public func loadManifest(packageRoot: String) throws -> Manifest? {
     catch { throw ManifestError.malformed(path: path, detail: "\(error)") }
 }
 
+// Package names a user package may not take: `std` is the compiler-embedded standard library (the import root
+// `std` always resolves to it), and `pkg` is the same-package import root keyword. The embedded `nomu`
+// workspace's own `std` package is the one legitimate holder; the driver exempts it.
+public let reservedPackageNames: Set<String> = ["std", "pkg"]
+
+public func reservedPackageNameError(_ name: String, at path: String) -> String {
+    let what = name == "std" ? "the standard library" : "the same-package import root"
+    return "package name '\(name)' is reserved for \(what) — rename the package in '\(path)/pkg.json'"
+}
+
 // The default package identity when no manifest is present. `main` matches the implied package the
 // mangler assumes today; task 100.2.6 makes the encoding explicit.
 public let defaultPackageName = "main"
