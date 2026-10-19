@@ -1,0 +1,7 @@
+plan for me.app:p/main
+
+workspaces
+  me.app
+  nomu.nomu
+
+error @me.app/q/q.nomu:1:1: package dependency cycle: p → q → p

@@ -11,7 +11,7 @@ final class ArgParserTests: XCTestCase {
                           choices: ["none", "edge", "all"])],
             subcommands: [
                 Command("compile", summary: "compile source files",
-                    flags: [Flag("emit-ast"), Flag("verbose", short: "v")],
+                    flags: [Flag("emit-ast"), Flag("verbose", short: "v"), Flag("internal-switch", hidden: true)],
                     options: [
                         Opt("output", short: "o", valueName: "path", help: "output binary"),
                         Opt("runtime-subset", valueName: "names", isList: true, commaSplit: true),
@@ -118,6 +118,15 @@ final class ArgParserTests: XCTestCase {
             return XCTFail("expected version")
         }
         XCTAssertEqual(v, "nomu 0.1")
+    }
+
+    func testHiddenFlagParsesButStaysOutOfHelp() {
+        XCTAssertTrue(parsed(["compile", "--internal-switch", "a.nomu"]).has("internal-switch"))
+        guard case .help(let sub) = parse(root(), ["compile", "-h"], version: "nomu 0.1") else {
+            return XCTFail("expected subcommand help")
+        }
+        XCTAssertFalse(sub.contains("internal-switch"))
+        XCTAssertTrue(sub.contains("--emit-ast"))
     }
 
     func testBareGroupingCommandShowsHelp() {

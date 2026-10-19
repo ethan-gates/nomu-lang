@@ -19,9 +19,11 @@ The manifest path is a required positional argument. List tokens match a case `n
 wildcard; a trailing `*` matches by prefix. The pool is 8 lanes; a case occupies `weight` of them.
 Exit codes: 0 all pass · 1 a case failed/timed out · 2 usage · 3 deadline.
 
-**Compiler:** the harness prefers a release build of `nomuc` — it looks for a `bazel-out/*-opt/…`
+**Compiler:** the harness prefers a release build of `nomu` — it looks for a `bazel-out/*-opt/…`
 build first (a debug compiler is ~10× slower to run), falling back to `bazel-bin` with a warning.
-Build it once with `bazel build -c opt //src/nomu-cli:nomuc`. Override with `COMPILER_TEST_NOMUC`.
+Build it once with `bazel build -c opt //src/nomu-cli:nomu`. Override with `COMPILER_TEST_NOMU`.
+Each fixture builds with `nomu build <fixture dir>`; its binary is at `<workspace>/build/<module path>/<leaf>`,
+under the `build/` of the workspace holding the fixture (the nearest `nomu.yaml`).
 
 **Output:** on a terminal, a live status line pins the in-flight set and counts at the bottom
 (`[42/68] running · gc-string, stw-collect  ✓40`) while finished cases stream above it. Piped or in
@@ -31,8 +33,8 @@ CI (not a TTY) it prints a sorted, deterministic batch at the end instead.
 
 Add an object to `cases` in `tests/suite.json` and a `.nomu` fixture — no new shell script. Fields:
 
-- `name` (unique), `fixture` (path from the project root).
-- `compile_args` — extra `nomuc` flags, e.g. `["--runtime-subset=enqueue,dequeue"]` for a
+- `name` (unique), `fixture` (a module directory, path from the project root).
+- `compile_args` — extra `nomu build` flags, e.g. `["--runtime-subset=enqueue,dequeue"]` for a
   subset-legality build. Part of the compile key.
 - `compile_env` / `run_env` — the env is declared here, in exactly one place, so a run cannot
   silently forget or duplicate a flag. Compilation is shared: a fixture is built once per distinct

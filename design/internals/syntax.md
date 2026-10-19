@@ -63,6 +63,11 @@ Surface decisions that belong to a subsystem live with that subsystem, so the sy
   - `&` is bitwise-and in expression position and interface composition (`any A & B`) in type position — the two parse contexts are separate. `<<`/`>>` are recombined from two adjacent `<`/`>` tokens in the parser, so nested generic closes (`Box<Box<Int>>`) are unaffected.
   - `- ! ~` desugar in Sema to binary forms (`0 - x`, `x == false`, `x ^ allOnes`), so no unary node reaches NOIR/SSAIR.
   - Open: grouping parentheses `(a + b)` do not parse yet (`plans/tasks/114-grouping-parens.md`); operator overloading via interface conformance is deferred (`generics.md` §10).
+- **Identifiers and source text** — identifiers are ASCII, `[A-Za-z_][A-Za-z0-9_]*`. Comments and string
+  literals take any UTF-8; a non-ASCII character anywhere else is a lexical error. Unicode identifiers would
+  bring normalization, confusable-character policy and non-ASCII symbol mangling; ASCII names with
+  non-English comments and strings cover most of the need, and admitting Unicode later breaks no code.
+  — **Decided.**
 - **String literals** — two forms, both lowering to the same literal (the `String` type/representation is
   `plans/tasks/121-string-utf8-model.md`):
   - `"…"` single-line, with escapes `\n` `\t` `\\` `\"` (an unknown escape is the following byte, literally).

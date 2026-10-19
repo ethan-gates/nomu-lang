@@ -20,9 +20,7 @@ public final class Timings {
     public var bytes = 0
     public var tokens = 0
     public var egress = "ssair"   // the backend egress (SSAIR tier — the sole path since M7.7)
-    // Suppress the report entirely (task 174): the embedded `nomu`-workspace build runs nested compiles
-    // whose timing tables would spam a user build's stderr. Set for that internal build only.
-    public var silent = false
+    public var jobs: (compiled: Int, cached: Int)? = nil   // module jobs run, and taken from the host cache
 
     public init() { started = clock.now }
 
@@ -48,7 +46,6 @@ public final class Timings {
     // Print the phase-grouped breakdown to stderr. Called on the success path and before an error
     // exit, so every invocation reports (a failed run shows the phases it reached).
     public func report() {
-        if silent { return }
         let total = seconds(clock.now - started)
         var out = "── nomu timings ───────────────────────────\n"
         let name = (file as NSString).lastPathComponent
@@ -56,6 +53,7 @@ public final class Timings {
         out += "  package:   \(package)\n"
         out += "  egress:    \(egress)\n"
         out += "  optimize:  \(optimize ? "yes" : "no")\n"
+        if let j = jobs { out += "  jobs:      \(j.compiled) compiled, \(j.cached) from cache\n" }
 
         // Group by phase in first-appearance order.
         var order: [String] = []

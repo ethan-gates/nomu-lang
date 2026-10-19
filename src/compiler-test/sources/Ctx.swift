@@ -42,35 +42,27 @@ struct Ctx {
     func fixturePath(_ fixture: String) -> String {
         (fixture as NSString).isAbsolutePath ? fixture : projectRoot + "/" + fixture
     }
-    // Binary lands under <root>/build/<fixture dir>/<stem>, mirroring the compiler's output layout.
+    // Binary lands in the fixture module's own build directory, named after the module, under the build/
+    // of the workspace holding it (its nearest `nomu.yaml`): <workspace>/build/<module path>/<leaf> (the
+    // compiler's layout, task 190 D2).
     func binaryPath(_ fixture: String) -> String {
-        let dir = (fixture as NSString).deletingLastPathComponent
-        var p = projectRoot + "/build"
-        if !dir.isEmpty { p += "/" + dir }
-        return p + "/" + fixtureStem(fixture)
+        let dir = fixturePath(fixture)
+        var ws = dir
+        while ws != "/" && !FileManager.default.fileExists(atPath: ws + "/nomu.yaml") {
+            ws = (ws as NSString).deletingLastPathComponent
+        }
+        if ws == "/" { ws = projectRoot }
+        let rel = dir == ws ? "" : String(dir.dropFirst(ws.count + 1))
+        let leaf = rel.isEmpty ? fixtureStem(fixture) : (rel as NSString).lastPathComponent
+        return ws + "/build/" + (rel.isEmpty ? "" : rel + "/") + leaf
     }
     func fixtureStem(_ fixture: String) -> String {
         ((fixture as NSString).lastPathComponent as NSString).deletingPathExtension
     }
 
-    // A fixture that is a directory is one module (1 dir == 1 module): the harness passes its `.nomu`
-    // files as the file list. A file fixture is a single-file module.
-    func isModuleDir(_ fixture: String) -> Bool {
-        var isDir: ObjCBool = false
-        return FileManager.default.fileExists(atPath: fixturePath(fixture), isDirectory: &isDir) && isDir.boolValue
-    }
-    // The module's source files, sorted for a deterministic command (and stable compile key).
-    func moduleSources(_ fixture: String) -> [String] {
-        let dir = fixturePath(fixture)
-        let entries = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
-        return entries.filter { $0.hasSuffix(".nomu") }.sorted().map { dir + "/" + $0 }
-    }
-    // The compiler input arguments for a fixture: a module directory expands to an explicit `-o <bin>`
-    // plus its source files; a single-file fixture is just its path.
-    func compileInputs(_ fixture: String) -> [String] {
-        isModuleDir(fixture) ? ["-o", binaryPath(fixture)] + moduleSources(fixture)
-                             : [fixturePath(fixture)]
-    }
+    // The build target for a fixture: its module directory (`nomu build <dir>`; the compiler names and
+    // places the binary).
+    func compileInputs(_ fixture: String) -> [String] { [fixturePath(fixture)] }
 
     static func fromArgs() -> Ctx {
         let argv = Array(CommandLine.arguments.dropFirst())

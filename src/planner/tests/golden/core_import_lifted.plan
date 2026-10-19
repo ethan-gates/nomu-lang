@@ -1,0 +1,32 @@
+plan for me.app:(root)
+
+workspaces
+  me.app
+  nomu.nomu
+
+job nomu.nomu:runtime
+  package runtime at @nomu.nomu/runtime (product)
+  files runtime.nomu
+  library, host-cache, runtime-subset
+  out $cache/nomu/<key>/runtime/runtime
+job nomu.nomu:std/prelude
+  package std at @nomu.nomu/std (product)
+  files prelude.nomu
+  library, host-cache
+  out $cache/nomu/<key>/std/prelude/prelude
+job nomu.nomu:core
+  package core at @nomu.nomu/core (product)
+  files core.nomu
+  library, host-cache
+  out $cache/nomu/<key>/core/core
+job me.app:(root)
+  package main at @me.app
+  files main.nomu
+  binary
+  out @me.app/build/app
+  import main.nomu (implicit) std → nomu.nomu:std/prelude (package std)
+  import main.nomu:1:1 core → nomu.nomu:core (package core)
+  sees nomu.nomu:std/prelude, nomu.nomu:core
+
+runtime archive $cache/runtime/<key>/nomu-runtime.a
+link @me.app/build/app from 4 objects

@@ -31,7 +31,7 @@ struct CaseRunner {
         let bin = ctx.binaryPath(c.fixture)
         let fixArg = ctx.compileInputs(c.fixture).joined(separator: " ")
         let compileArgsStr = c.compileArgs.joined(separator: " ")
-        let compileRepro = "\(envPrefix(c.compileEnv)) \(ctx.nomu) compile \(compileArgsStr) \(fixArg)"
+        let compileRepro = "\(envPrefix(c.compileEnv)) \(ctx.nomu) build \(compileArgsStr) \(fixArg)"
             .replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespaces)
 
         func result(_ status: Status, _ detail: [String] = [], runTime: Double = 0) -> CaseResult {

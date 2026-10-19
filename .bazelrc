@@ -7,3 +7,7 @@
 # Tradeoff: `z` optimizes for size over speed. When M6 turns to GC throughput (6.3), revisit — a
 # faster level (`s`/`2`) on the collector hot path may be worth the size.
 build --@rules_rust//rust/settings:extra_rustc_flags=-Copt-level=z
+
+# The git commit the compiler is built from (`//src/buildinfo`), the compiler's identity in the per-host cache
+# key (design/plans/tasks/190-explicit-module-builds.md, D4).
+build --workspace_status_command=tools/workspace_status.sh

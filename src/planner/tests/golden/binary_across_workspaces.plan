@@ -1,0 +1,67 @@
+plan for me.app:app/cli
+
+workspaces
+  me.app  pins prov → them.prov
+  nomu.nomu
+  them.prov
+
+job nomu.nomu:runtime
+  package runtime at @nomu.nomu/runtime (product)
+  files runtime.nomu
+  library, host-cache, runtime-subset
+  out $cache/nomu/<key>/runtime/runtime
+job nomu.nomu:std/prelude
+  package std at @nomu.nomu/std (product)
+  files prelude.nomu
+  library, host-cache
+  out $cache/nomu/<key>/std/prelude/prelude
+job me.app:app/util/inner
+  package app at @me.app/app
+  files i.nomu
+  library
+  out @me.app/build/app/util/inner/inner
+  import i.nomu (implicit) std → nomu.nomu:std/prelude (package std)
+  sees nomu.nomu:std/prelude
+job me.app:app/util
+  package app at @me.app/app (product)
+  files u.nomu
+  library
+  out @me.app/build/app/util/util
+  import u.nomu (implicit) std → nomu.nomu:std/prelude (package std)
+  import u.nomu:1:1 public pkg/util/inner → me.app:app/util/inner
+  sees nomu.nomu:std/prelude, me.app:app/util/inner
+job them.prov:greet/inner
+  package greet at @them.prov/greet
+  files i.nomu
+  library
+  out @me.app/build/_external/them.prov/greet/inner/inner
+  import i.nomu (implicit) std → nomu.nomu:std/prelude (package std)
+  sees nomu.nomu:std/prelude
+job them.prov:greet
+  package greet at @them.prov/greet (product)
+  files g.nomu
+  library
+  out @me.app/build/_external/them.prov/greet/greet
+  import g.nomu (implicit) std → nomu.nomu:std/prelude (package std)
+  import g.nomu:1:1 pkg/inner → them.prov:greet/inner
+  sees nomu.nomu:std/prelude, them.prov:greet/inner
+job nomu.nomu:std/time
+  package std at @nomu.nomu/std (product)
+  files time.nomu
+  library, host-cache
+  out $cache/nomu/<key>/std/time/time
+  import time.nomu:3:1 pkg/prelude → nomu.nomu:std/prelude
+  sees nomu.nomu:std/prelude
+job me.app:app/cli
+  package app at @me.app/app
+  files main.nomu
+  binary
+  out @me.app/build/app/cli/cli
+  import main.nomu (implicit) std → nomu.nomu:std/prelude (package std)
+  import main.nomu:1:1 pkg/util → me.app:app/util
+  import main.nomu:2:1 greet as g → them.prov:greet (package greet)
+  import main.nomu:3:1 std/time → nomu.nomu:std/time (package std)
+  sees nomu.nomu:std/prelude, me.app:app/util/inner, me.app:app/util, them.prov:greet/inner, them.prov:greet, nomu.nomu:std/time
+
+runtime archive $cache/runtime/<key>/nomu-runtime.a
+link @me.app/build/app/cli/cli from 8 objects

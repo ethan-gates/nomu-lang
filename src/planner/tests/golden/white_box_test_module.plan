@@ -1,0 +1,43 @@
+plan for me.app:app/tests
+
+workspaces
+  me.app  pins prov → them.prov
+  nomu.nomu
+  them.prov
+
+job nomu.nomu:runtime
+  package runtime at @nomu.nomu/runtime (product)
+  files runtime.nomu
+  library, host-cache, runtime-subset
+  out $cache/nomu/<key>/runtime/runtime
+job nomu.nomu:std/prelude
+  package std at @nomu.nomu/std (product)
+  files prelude.nomu
+  library, host-cache
+  out $cache/nomu/<key>/std/prelude/prelude
+job me.app:app/util/inner
+  package app at @me.app/app
+  files i.nomu
+  library
+  out @me.app/build/app/util/inner/inner
+  import i.nomu (implicit) std → nomu.nomu:std/prelude (package std)
+  sees nomu.nomu:std/prelude
+job me.app:app/util
+  package app at @me.app/app (product)
+  files u.nomu
+  library, white-box
+  out @me.app/build/app/util/util
+  import u.nomu (implicit) std → nomu.nomu:std/prelude (package std)
+  import u.nomu:1:1 public pkg/util/inner → me.app:app/util/inner
+  sees nomu.nomu:std/prelude, me.app:app/util/inner
+job me.app:app/tests
+  package app at @me.app/app
+  files t.nomu
+  binary
+  out @me.app/build/app/tests/tests
+  import t.nomu (implicit) std → nomu.nomu:std/prelude (package std)
+  import t.nomu:1:1 test pkg/util → me.app:app/util
+  sees nomu.nomu:std/prelude, me.app:app/util/inner, me.app:app/util
+
+runtime archive $cache/runtime/<key>/nomu-runtime.a
+link @me.app/build/app/tests/tests from 5 objects

@@ -2,50 +2,50 @@ import Foundation
 import cli
 import driver
 
-// The `nomu` driver (task 173.5.1). Every entry is a subcommand; `compile` is the exposed primitive, the
-// easy path is `build`/`run`/`test`/`query`. The command tree is declared here and parsed by `src/cli`;
-// each subcommand owns its arguments, so compile's flags stay isolated from the orchestration flags.
+// The `nomu` driver (task 173.5.1). Every entry is a subcommand: `build`/`run`/`test`/`query` for people,
+// and `compile`, the per-module job for tools that divide a build into processes (task 190, D9). The command
+// tree is declared here and parsed by `src/cli`.
 
 let nomuVersion = "nomu 0.1.0-dev"
 
+// The flags and options every building command (`build`, `run`, `test`) takes. The debug views apply to the
+// entry module; the hidden switches serve the test suite.
+let buildFlags: [Flag] = [
+    Flag("release", short: "O", help: "optimize (LLVM -O2); default is a debug build"),
+    Flag("emit-ast", help: "also emit the entry module's parsed AST (<name>.ast)"),
+    Flag("emit-noir", help: "also emit the entry module's NOIR, the Nomu typed IR (<name>.noir)"),
+    Flag("emit-ssair", help: "also emit the entry module's SSAIR, the optimizer IR (<name>.ssair)"),
+    Flag("emit-nmi", help: "emit the entry module's public interface (<name>.nmi) and stop"),
+    Flag("emit-llvm", help: "also emit the entry module's LLVM IR from the egress, pre-opt (<name>.ll)"),
+    Flag("allow-core-import", help: "let user code import the embedded `core` package (test suite only)",
+         hidden: true),
+    Flag("emit-jobs", help: "write each module's job file beside its outputs", hidden: true),
+    Flag("report-jobs", help: "print each job as `compiled <module>` or `cached <module>`, then `binary <path>`",
+         hidden: true),
+]
+let buildOptionList: [Opt] = [
+    Opt("mono", valueName: "mode", help: "cross-module specialization depth", choices: ["none", "edge", "all"]),
+    Opt("runtime-subset", valueName: "names", help: "functions compiled under the runtime subset",
+        isList: true, commaSplit: true),
+    Opt("stop", valueName: "stage", help: "halt after STAGE (`plan` prints the build plan)",
+        choices: ["plan", "ast", "noir", "ssair", "llvm", "binary"]),
+]
+
 let tool = Command("nomu", summary: "The Nomu compiler and build driver.",
     subcommands: [
-        Command("compile", summary: "compile source files into a binary (the primitive)",
-            flags: [
-                Flag("release", short: "O", help: "optimize (LLVM -O2); default is a debug build"),
-                Flag("emit-ast", help: "also emit the parsed AST (<name>.ast)"),
-                Flag("emit-noir", help: "also emit NOIR, the Nomu typed IR (<name>.noir)"),
-                Flag("emit-ssair", help: "also emit SSAIR, the optimizer IR (<name>.ssair)"),
-                Flag("emit-nmi", help: "also emit the module's public interface (<name>.nmi)"),
-                Flag("emit-llvm", help: "also emit LLVM IR from the egress, pre-opt (<name>.ll)"),
-            ],
-            options: [
-                Opt("output", short: "o", valueName: "path", help: "output binary path (artifacts derive from it)"),
-                Opt("runtime-subset", valueName: "names", help: "functions compiled under the runtime subset",
-                    isList: true, commaSplit: true),
-                Opt("mono", valueName: "mode", help: "cross-module specialization depth",
-                    choices: ["none", "edge", "all"]),
-                Opt("stop", valueName: "stage", help: "halt after STAGE",
-                    choices: ["ast", "noir", "ssair", "llvm", "binary"]),
-            ],
-            positionals: [Positional("files", help: "source files (one module)", variadic: true)]),
+        Command("compile", summary: "compile one module from a job file (a tool interface; builds use `build`)",
+            positionals: [Positional("job", help: "the job file: one module's inputs, outputs and options")]),
         Command("build", summary: "build a module or package",
-            flags: [Flag("release", short: "O", help: "optimize (LLVM -O2); default is a debug build")],
-            options: [Opt("mono", valueName: "mode", help: "cross-module specialization depth",
-                          choices: ["none", "edge", "all"])],
+            flags: buildFlags, options: buildOptionList,
             positionals: [Positional("targets", help: "module or package directories (default: .)",
                                      variadic: true, required: false)]),
         Command("run", summary: "build and run an executable module",
-            flags: [Flag("release", short: "O", help: "optimize (LLVM -O2); default is a debug build")],
-            options: [Opt("mono", valueName: "mode", help: "cross-module specialization depth",
-                          choices: ["none", "edge", "all"])],
+            flags: buildFlags, options: buildOptionList,
             positionals: [Positional("target", help: "executable module directory (default: .)",
                                      required: false)],
             passthrough: true),
         Command("test", summary: "build and run test modules",
-            flags: [Flag("release", short: "O", help: "optimize (LLVM -O2); default is a debug build")],
-            options: [Opt("mono", valueName: "mode", help: "cross-module specialization depth",
-                          choices: ["none", "edge", "all"])],
+            flags: buildFlags, options: buildOptionList,
             positionals: [Positional("target", help: "module, or package dir for its declared tests (default: .)",
                                      required: false)]),
         Command("query", summary: "print package metadata as JSON",
@@ -85,9 +85,21 @@ func dispatch(_ args: Parsed) {
     }
 }
 
-// Translate the parsed `compile` arguments into `EmitOptions` and invoke the in-process primitive. Choice
-// options (`--mono`, `--stop`) are already validated by the parser, so the rawValue conversions hold.
+// `nomu compile <job file>` — the per-module job (D9 of task 190): compile exactly one module from the
+// inputs, outputs and options its job file names. No planning, discovery or linking.
 func runCompile(_ args: Parsed) -> Bool {
+    guard let path = args.positional("job") else { fputs("error: no job file given\n", stderr); return false }
+    let file: JobFile
+    do { file = try JobFile.decode(Data(contentsOf: URL(fileURLWithPath: path))) }
+    catch { fputs("error: cannot read job file '\(path)': \(error)\n", stderr); return false }
+    let timings = Timings()
+    timings.optimize = file.options.optimize
+    return compile(file.job, options: file.options, timings: timings)
+}
+
+// The options shared by `build`, `run` and `test`. Choice options (`--mono`, `--stop`) are already validated
+// by the parser, so the rawValue conversions hold.
+func buildOptions(_ args: Parsed) -> EmitOptions {
     var options = EmitOptions()
     options.optimize = args.has("release")
     options.ast = args.has("emit-ast")
@@ -95,31 +107,11 @@ func runCompile(_ args: Parsed) -> Bool {
     options.ssair = args.has("emit-ssair")
     options.nmi = args.has("emit-nmi")
     options.llvm = args.has("emit-llvm")
-    options.outputPath = args.value("output")
+    options.allowCoreImport = args.has("allow-core-import")
+    options.emitJobs = args.has("emit-jobs")
     options.subsetFuncs.formUnion(args.values("runtime-subset"))
     if let m = args.value("mono") { options.mono = MonoMode(rawValue: m) }
-    if let s = args.value("stop") {
-        switch s {
-        case "ast":    options.stopAt = .ast
-        case "noir":   options.stopAt = .noir
-        case "ssair":  options.stopAt = .ssair
-        case "llvm":   options.stopAt = .llvm
-        default:       options.stopAt = .binary
-        }
-    }
-    let files = args.positionals("files")
-    guard !files.isEmpty else {
-        fputs("error: no source files given\n", stderr)
-        return false
-    }
-    return compile(paths: files, options: options)
-}
-
-// The build-shaped options (`-O`, `--mono`) shared by `build` and `run`.
-func buildOptions(_ args: Parsed) -> EmitOptions {
-    var options = EmitOptions()
-    options.optimize = args.has("release")
-    if let m = args.value("mono") { options.mono = MonoMode(rawValue: m) }
+    if let s = args.value("stop") { options.stopAt = Stage(rawValue: s) ?? .binary }
     return options
 }
 
@@ -130,7 +122,15 @@ func runBuild(_ args: Parsed) -> Bool {
     var targets = args.positionals("targets")
     if targets.isEmpty { targets = ["."] }
     var ok = true
-    for target in targets where buildTarget(path: target, options: options) == nil { ok = false }
+    for target in targets {
+        let r = buildTargetResult(path: target, options: options)
+        if args.has("report-jobs") {
+            for m in r.compiled { print("compiled \(m)") }
+            for m in r.cached { print("cached \(m)") }
+            if let b = r.binary { print("binary \(b)") }
+        }
+        if r.binary == nil { ok = false }
+    }
     return ok
 }
 

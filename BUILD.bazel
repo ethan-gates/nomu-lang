@@ -9,3 +9,26 @@ alias(
     name = "install",
     actual = "//tools/install:install",
 )
+
+# Every Nomu source in the suite fixtures and examples, as test data (the import scanner's conformance test
+# reads them through runfiles).
+filegroup(
+    name = "nomu_source_corpus",
+    srcs = glob(
+        ["tests/fixtures/**/*.nomu", "examples/**/*.nomu"],
+        exclude = ["**/build/**"],
+    ),
+    visibility = ["//src:__subpackages__"],
+)
+
+# The suite's sources as trees: every fixture and example (sources plus `nomu.yaml` / `pkg.json`), the
+# repository's `nomu.yaml` above them, and the suite manifest. For tests that plan or discover them from disk.
+filegroup(
+    name = "suite_sources",
+    srcs = ["nomu.yaml", "tests/suite.json"] + glob(
+        [d + "/**/" + f for d in ["tests/fixtures", "examples"] for f in ["*.nomu", "nomu.yaml", "pkg.json"]],
+        exclude = ["**/build/**"],
+        allow_empty = True,
+    ),
+    visibility = ["//src:__subpackages__"],
+)

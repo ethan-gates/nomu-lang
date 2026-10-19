@@ -1,3 +1,4 @@
 # Workspace for the package-tier boundary test (task 187.4.4): `lib` exposes a product module with both a
 # `public` and a `package` symbol; a foreign consumer sees the `public` one but not the `package` one.
+scope: nomu
 name: mphidden

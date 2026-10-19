@@ -7,6 +7,8 @@
 // The references are stored through the typed managed accessors (`storeHeaderRef` / `storeRef`), which route
 // the store through the write barrier / p1 path — the facility a real consumer (`Array<SomeClass>`) uses to
 // put a reference in a buffer, exercised here end to end rather than seeded with raw address bits.
+import core
+
 class Box {
   var v: Int
 }

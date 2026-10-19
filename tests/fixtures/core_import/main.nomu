@@ -1,5 +1,7 @@
-// `core` is ambient (task 174): its substrate type `ManagedBuffer` resolves bare in every module, with no
-// import.
+// `import core` under the hidden `--allow-core-import` (the suite's way to test `core` directly): its
+// compiler-backed `ManagedBuffer` resolves through the import.
+import core
+
 fun main() {
     let b = ManagedBuffer<Int, Int>.create(capacity: 3)
     let e = b.elementPtr(at: 1)

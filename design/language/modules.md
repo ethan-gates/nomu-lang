@@ -78,6 +78,12 @@ itself (to alias it) uses that import in place of the implicit one. The implicit
 mechanism, so prelude names follow the normal import rules (`std.Option` qualifies), and moving a decl in or
 out of the prelude is moving it between `std` modules (task [174](../plans/tasks/174-prelude-as-packages.md) §174.3.2).
 
+**`std` is the gateway to the embedded library.** The implicit `import std` is the only implicit import. The
+embedded `core` package holds what depends on compiler internals (`ManagedBuffer`, whose tail allocation and
+operations are compiler intrinsics), so that `std` stays ordinary Nomu with as little magic as possible.
+Only `std`'s modules may import `core`; elsewhere `import core` is a compile error (unless the importing
+package lists a package of its own workspace named `core` in its `dependencies`, which the import then names). A user reaches anything in `core` through `std`.
+
 **Leaning.** Type-directed resolution of a bare-name clash (Swift-style) is the intended model, and it
 depends on keeping expression-level inference cheap — see [Type inference dependency](#type-inference-dependency).
 
@@ -178,12 +184,16 @@ module has none.
     external dependency's workspace is pinned (version + source) in `nomu.yaml`. Example:
     `"dependencies": ["libfoo", "netutil"]`.
 - **Workspace** — `nomu.yaml`, at the repo root, above the packages. The unit of **versioning and external
-  consumption**. It carries a **`name`** — the workspace's identity, which is the first segment of every
-  symbol's mangled identity (so a workspace's compiled objects are safe to link into another workspace) and
-  the handle a consumer pins an external by. It pins each external dependency to a **single version +
+  consumption**. It carries a **`scope`** and a **`name`**, which together are the workspace's identity:
+  the first segment of every symbol's mangled identity (so a workspace's compiled objects are safe to link
+  into another workspace), and how a build recognizes two copies of one project, whatever their version or
+  source. Both are required and follow the path-component rule (`[a-z][a-z0-9_]*`). The scope is chosen
+  once by the workspace's owner (`nomu init` proposes a default to confirm) and consumers never write it.
+  Identity rules: [189](../plans/tasks/189-multi-remote-workspace-builds.md) §Decided. It pins each external dependency to a **single version +
   source**, per *workspace* (the unit of external consumption is another repo's workspace, not a lone
   package), one version across the whole workspace — so the diamond problem cannot arise (the Bazel stance);
-  a consumer may bind an external under a **local alias** when two externals share a `name`. In-workspace
+  a consumer may bind an external under a **local alias** for its imports (`import <alias>/<package>`),
+  which never changes the external's identity or symbols. In-workspace
   packages are not listed here: they are discovered by their `pkg.json` markers in the tree. A consumed
   external workspace is self-describing the same way — its own `nomu.yaml` + markers define its packages.
   Its contents land with cross-package linkage ([187](../plans/tasks/187-multi-package-builds.md)); until
@@ -354,11 +364,12 @@ dependents, so it is ABI-relevant. The consumer derives the prebuilt symbol by m
 canonical type encoding.
 
 **Module artifacts.** A module compile produces `.o` (concrete code + the erased generic path), `.nmi`
-(interface), and `.bir` (generic and inlinable-non-generic body IR). They live under the **workspace**
-`build/` (the `nomu.yaml` root), not the package's — one workspace has a single build tree shared by its
-packages (the runtime archive is content-addressed and shared there; dependency `__mod_*` intermediates are
-keyed by workspace-relative module path so same-named modules in different packages do not collide). Absent a
-workspace marker, a loose package is its own build root.
+(interface), and `.bir` (generic and inlinable-non-generic body IR). Each module has its own directory under
+the building **workspace**'s `build/`, at its workspace-relative path (`build/app/cli/` holds `cli.o`,
+`cli.nmi`, and the binary `cli`); another workspace's modules sit under `build/_external/<scope>.<name>/`.
+The runtime archive and the embedded `nomu` workspace's modules live in a per-host cache instead. Absent a
+workspace marker, a loose package is its own build root. (Layout:
+[190](../plans/tasks/190-explicit-module-builds.md) D2, D4.)
 - `.nmi` is **body-free** and carries the API contract only: signatures, type layouts, generic
   signatures + bounds, conformances, witness / value-witness layouts + per-type GC trace metadata, and
   body-derived contract facts (mutating-ness, shareability). It holds no body and no body hash — that

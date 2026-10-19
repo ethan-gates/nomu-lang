@@ -1,0 +1,12 @@
+plan for me.app:app/cli
+
+workspaces
+  me.app  pins prov → them.prov
+  nomu.nomu
+  them.prov
+
+error @me.app/app/cli/main.nomu:1:1: no module found at 'none'
+error @me.app/app/cli/main.nomu:2:1: package 'other' is not listed in this package's 'dependencies'
+error @me.app/app/cli/main.nomu:3:1: module 'inner' is not a product of external package 'greet' — list it under 'products' in that package's pkg.json
+error @me.app/app/cli/main.nomu:4:1: 'test import' may not cross a package boundary — 'greet' is a foreign package, always black-box; use a plain 'import'
+error @me.app/app/cli/main.nomu:5:1: package 'core' is internal to the standard library — use 'std' instead

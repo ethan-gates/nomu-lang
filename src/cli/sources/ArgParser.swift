@@ -6,12 +6,14 @@
 // MARK: - Specification
 
 // A boolean, presence-only argument: `--verbose` / `-v`. Short flags compact: `-abc` ≡ `-a -b -c`.
+// A `hidden` flag parses normally but is left out of `--help` (internal switches the test suite uses).
 public struct Flag {
     public let long: String
     public let short: Character?
     public let help: String
-    public init(_ long: String, short: Character? = nil, help: String = "") {
-        self.long = long; self.short = short; self.help = help
+    public let hidden: Bool
+    public init(_ long: String, short: Character? = nil, help: String = "", hidden: Bool = false) {
+        self.long = long; self.short = short; self.help = help; self.hidden = hidden
     }
 }
 
@@ -293,10 +295,11 @@ func helpText(_ cmd: Command, path: [String], version: String?, flags: [Flag], o
         }
     }
 
-    if !options.isEmpty || !flags.isEmpty {
+    let shownFlags = flags.filter { !$0.hidden }
+    if !options.isEmpty || !shownFlags.isEmpty {
         out += "\noptions:\n"
         var rows = [(String, String)]()
-        for f in flags { rows.append((flagInvocation(f), f.help)) }
+        for f in shownFlags { rows.append((flagInvocation(f), f.help)) }
         for o in options { rows.append((optInvocation(o), optHelp(o))) }
         let w = rows.map { $0.0.count }.max() ?? 0
         for (inv, help) in rows {

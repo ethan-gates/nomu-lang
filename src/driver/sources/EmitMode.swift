@@ -8,7 +8,8 @@ import support
 // (default: run all the way to the binary). Stopping at a stage emits that stage's
 // artifact. More stop stages will be added as more intermediate formats appear.
 
-public enum Stage {
+public enum Stage: String, Codable {
+    case plan      // after planning: print the build plan (`Plan.dump()`) and stop
     case ast       // after parse
     case noir      // after the semantic pass (NOIR — the Nomu typed IR)
     case ssair     // after NOIR→SSAIR lowering (the optimizer IR, post-mono)
@@ -25,11 +26,11 @@ public enum Stage {
 // no `.bir` read); `edge` specializes directly-called instances (nested generic calls stay witness);
 // `all` specializes the whole instantiation tree (release default — recovers monomorphized performance).
 // A producer's advertised prespecialization still binds under `none` (it overrides the consumer dial).
-public enum MonoMode: String, Equatable {
+public enum MonoMode: String, Equatable, Codable {
     case none, edge, all
 }
 
-public struct EmitOptions {
+public struct EmitOptions: Codable {
     public var ast = false       // --emit-ast: emit the parsed AST (<name>.ast)
     public var noir = false      // --emit-noir: emit NOIR (<name>.noir)
     public var ssair = false     // --emit-ssair: emit SSAIR, the optimizer IR (<name>.ssair)
@@ -44,11 +45,6 @@ public struct EmitOptions {
     // rules (no implicit GC alloc / heap construct / non-subset call). A compiler input standing in for
     // module membership until the module system (task 100) lands. Set by `--runtime-subset=a,b`.
     public var subsetFuncs: Set<String> = []
-    // `-o <path>` — the output binary path. Artifacts derive from it (`<path>.o`, `<path>.ll`, …); its
-    // parent directory is created. When nil, the path is derived from the primary source's location
-    // under `build/`. The driver builds the file list; a module's identity/output name is given, not
-    // inferred from a filename.
-    public var outputPath: String? = nil
     // `--mono=none|edge|all` — the consumer specialization dial (task 100.5.2). Nil means "mode default":
     // resolved by `effectiveMono` to `none` for a debug build and `all` for a release (`-O`) build, so the
     // dial follows the optimization level unless set explicitly. Part of the build-cache key (task 172).
@@ -56,25 +52,17 @@ public struct EmitOptions {
     // The dial in force, resolving the nil default against the optimization level (debug=none, release=all).
     public var effectiveMono: MonoMode { mono ?? (optimize ? .all : .none) }
 
-    // Compiler-internal (task 188): emit the entry module as a home-qualified **library object** (no `main`,
-    // no program-wide type maps, no runtime link) rather than a binary — the shape every cross-workspace
-    // build wants, since an external workspace's products are linked into a consumer, not run. Set by the
-    // driver when it builds an external workspace's products (the embedded `nomu` workspace, or a pinned
-    // local external). Never from the CLI.
-    public var emitLibrary = false
-    // Compiler-internal (task 174): this is the build of the embedded `nomu` workspace itself (`core`/
-    // `runtime`/`std`), not a user program. Beyond `emitLibrary` (which it implies), it links their symbols
-    // strong (no weak-origin, except the `runtime` package's own bare weak-ODR set). With the prepend retired
-    // (174.5/.5.1) it no longer gates a prepend; it still marks these as the prelude build (strong linkage,
-    // runtime-subset-by-membership source).
+    // Compiler-internal (task 174): the job compiles a module of the embedded `nomu` workspace (`core`/
+    // `runtime`/`std`), not user code. Its symbols link strong (no weak origin, except the `runtime`
+    // package's own bare weak-ODR set), and no white-box runtime prelude is prepended.
     public var compilingPrelude = false
-    // Compiler-internal (task 174.4): designate every function in this `compilingPrelude` build runtime-subset
-    // by **package membership** — set for the `runtime` package. Replaces the file-designation (the prepend's
-    // `runtime.nomu` parse) as the subset source for the package build: its functions compile `noSafepoint`,
-    // so the package copy carries no stackmaps, is unpinned, and dead-strips — collapsing the inert duplicate
-    // the prepend's bare copies shadowed (the 100.4.4 interim). The prepend keeps its file-designation until
-    // the prepend itself retires (174.5).
-    public var runtimeSubsetByMembership = false
+    // Test-suite only (hidden `--allow-core-import`): let user code `import core`. The embedded `core` package
+    // is otherwise importable only from `std` (modules.md §Imports — `std` is the gateway to the embedded
+    // library); fixtures that exercise `core`'s compiler-backed types directly lift that gate with this.
+    public var allowCoreImport = false
+    // Hidden `--emit-jobs`: write each job's file (`<unit>/<stem>.job.json`, the `nomu compile` input) beside
+    // its outputs.
+    public var emitJobs = false
 
     public init() {}
 }

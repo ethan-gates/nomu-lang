@@ -1,4 +1,5 @@
 # Consumer workspace: pins the provider workspace by local path (task 188).
+scope: nomu
 name: cons
 externals:
   prov: ../provider

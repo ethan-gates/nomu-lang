@@ -1,3 +1,4 @@
 # Workspace for the strict-allow-list test (task 187.3): `app` imports `greetlib` without listing it in
 # its `dependencies`, so the import is rejected even though the package exists in the workspace.
+scope: nomu
 name: mpundecl

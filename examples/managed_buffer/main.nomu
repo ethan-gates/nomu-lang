@@ -2,6 +2,8 @@
 // capacity, and round-trips an Int header (via headerPtr) and Int elements (via elementPtr). A smoke test of
 // the four intrinsics: create / capacity / headerPtr / elementPtr.
 // Expected output: 4 / 42 / 10 / 20.
+import core
+
 fun main() {
   let b = ManagedBuffer<Int, Int>.create(capacity: 4)
   print(b.capacity())                    // 4

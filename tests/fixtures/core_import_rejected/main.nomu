@@ -1,0 +1,7 @@
+// User code may not import the embedded `core` package; it is reachable only through `std`
+// (modules.md §Imports).
+import core
+
+fun main() {
+    print("unreachable\n")
+}

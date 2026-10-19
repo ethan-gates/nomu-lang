@@ -346,11 +346,13 @@ private func renderConformances(_ cs: [Conformance]) -> [String] { cs.map(\.name
 // identity is measured from (the workspace root), so `inModule` and the recorded `modulePath` are keyed
 // the same way the compile graph is. `reexportModulePath` resolves a `public import` to the re-exported
 // module's identity components (the driver owns cross-package resolution); a nil result skips that import.
-public func buildInterface(_ program: Program, package: String, module: ModuleID, moduleIDRoot: String,
+// `modulePath` is the module's canonical identity; `ownFiles` are its source files (a declaration from any
+// other file, such as a prepended prelude, stays out of the interface).
+public func buildInterface(_ program: Program, package: String, modulePath: [String], ownFiles: Set<String>,
                            workspace: String? = nil,
                            facts: FactStore = FactStore(), whiteBox: Bool = false,
                            reexportModulePath: (ImportDecl) -> [String]? = { _ in nil }) -> ModuleInterface {
-    func inModule(_ span: Span) -> Bool { moduleID(forFile: span.file, packageRoot: moduleIDRoot) == module }
+    func inModule(_ span: Span) -> Bool { ownFiles.contains(span.file) }
     // What crosses the module boundary (task 187.4.4): `public` + `package` normally, widened to `internal`
     // for a white-box `test import` target. Each decl is tagged with its visibility so the consumer admits
     // it only where the tier allows — a cross-package consumer takes `public` only; a same-package sibling
@@ -407,7 +409,7 @@ public func buildInterface(_ program: Program, package: String, module: ModuleID
     enums.sort { $0.name < $1.name }
     interfaces.sort { $0.name < $1.name }
     funcs.sort { $0.name < $1.name }
-    return ModuleInterface(package: package, modulePath: module.components, types: types, enums: enums,
+    return ModuleInterface(package: package, modulePath: modulePath, types: types, enums: enums,
                            interfaces: interfaces, functions: funcs, reexports: reexports, workspace: workspace)
 }
 

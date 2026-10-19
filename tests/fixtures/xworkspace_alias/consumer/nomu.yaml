@@ -1,4 +1,5 @@
 # Two external workspaces each ship a package named `util`; distinct pin aliases keep them apart (188.5).
+scope: nomu
 name: cons
 externals:
   wsa: ../provA

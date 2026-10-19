@@ -30,9 +30,9 @@ final class CompileCache {
         gate.dispatch(jobs) { job in
             let stem = ctx.fixtureStem(job.fixture)
             progress.start(stem)
-            // `compile` is the subcommand name — the primitive under the `nomu` uber-CLI (task 173.5.1).
+            // `nomu build <fixture dir>`: plans the fixture's build, compiles every module, and links.
             let r = runProcess(path: ctx.nomu,
-                               args: ["compile"] + job.compileArgs + ctx.compileInputs(job.fixture),
+                               args: ["build"] + job.compileArgs + ctx.compileInputs(job.fixture),
                                env: job.compileEnv, timeout: job.compileTimeout)
             let res = CompileResult(ok: r.succeeded, timedOut: r.timedOut, stderr: r.stderr, duration: r.duration)
             self.lock.lock(); self.results[job.compileKey] = res; self.lock.unlock()

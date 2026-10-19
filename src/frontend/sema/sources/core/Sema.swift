@@ -568,7 +568,7 @@ public struct Sema {
     }
 
     // The `enums` key a construction base names: the bare name for a local enum, else the per-origin key of
-    // an imported/ambient external enum (task 174.2 — the `nomu/core` prelude `Option`/`Result`). Nil when
+    // an imported external enum (e.g. `std/prelude`'s `Option`/`Result`, via the implicit `import std`). Nil when
     // the name is not a known enum. Quiet (no diagnostics), so a construction path may probe and fall through.
     func enumNameForConstruction(_ typeName: String, at span: Span) -> String? {
         if enums[typeName] != nil { return typeName }
@@ -577,19 +577,19 @@ public struct Sema {
     }
 
     // The canonical name of the surface `String` type at a site (task 174.2.3). While `String` is a local
-    // decl — the prepend, or the `nomu/core` package compiling its own `String` — it is the bare name; once
-    // `String` is flipped to the ambient `nomu/core` package it is that package's per-origin key
-    // (`nomu/core@String`). The compiler-synthesized string-literal sites (`NOIRGen.wrapString`/`stringType`)
-    // route through here so a literal's `String` identity matches the external package's, exactly as
-    // `enumNameForConstruction` does for a flipped `Option`/`Result`.
+    // decl (`std/prelude` compiling its own `String`) it is the bare name; in a module that imports it it is
+    // the defining module's per-origin key (`nomu/std/prelude@String`). The compiler-synthesized
+    // string-literal sites (`NOIRGen.wrapString`/`stringType`) route through here so a literal's `String`
+    // identity matches the external package's, exactly as `enumNameForConstruction` does for an imported
+    // `Option`/`Result`.
     func stringTypeName(at span: Span) -> String {
         if structs["String"] != nil { return "String" }
         return externalTypeKey("String", at: span) ?? "String"
     }
     func stringType(at span: Span) -> Type { .named(stringTypeName(at: span), .struct_) }
 
-    // Whether `t` is the surface `String` — the bare name, or its ambient external identity (`origin@String`)
-    // once flipped (task 174.2.3). Used by the `print`/unwrap path, which must recognize an external `String`
+    // Whether `t` is the surface `String` — the bare name, or its imported external identity (`origin@String`)
+    // (task 174.2.3). Used by the `print`/unwrap path, which must recognize an external `String`
     // the same as the historical bare one.
     func isStringType(_ t: Type) -> Bool {
         if case .named(let n, .struct_) = t { return n == "String" || ExternalName.decode(n)?.name == "String" }
@@ -597,7 +597,7 @@ public struct Sema {
     }
 
     // The per-origin key (`origin@name`) of a bare type name that resolves to exactly one in-scope external
-    // module's type (an import, or the ambient `nomu/core` prelude — task 174.2), or nil. Quiet — unlike
+    // module's type (an explicit import, or the implicit `import std`), or nil. Quiet — unlike
     // `resolveExternal` it emits no diagnostics, so a construction path may probe it and fall through.
     func externalTypeKey(_ name: String, at span: Span) -> String? {
         guard let inScope = fileVisibleModules[span.file] else { return nil }

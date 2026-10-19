@@ -87,6 +87,11 @@ public enum ManifestError: Error, CustomStringConvertible {
 public func loadManifest(packageRoot: String) throws -> Manifest? {
     let path = packageRoot + "/pkg.json"
     guard let data = FileManager.default.contents(atPath: path) else { return nil }
+    return try decodeManifest(data, path: path)
+}
+
+// Decode a manifest's bytes; `path` names it in the error. For callers that read files themselves.
+public func decodeManifest(_ data: Data, path: String) throws -> Manifest {
     do { return try JSONDecoder().decode(Manifest.self, from: data) }
     catch { throw ManifestError.malformed(path: path, detail: "\(error)") }
 }

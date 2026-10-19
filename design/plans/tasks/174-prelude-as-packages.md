@@ -317,7 +317,8 @@ nomu_main` special-case); every other `runtime` symbol qualifies normally.
    - `prelude-implicit` — `Option`, `Result`, `String` methods and the `std.` qualifier with no import.
    - `prelude-single-definition` — the program's own object defines no runtime, `core` or `std` function or
      method (`nm -U` on `<binary>.o` via the harness's new `object_symbols` assertion).
-   - `prelude-core-ambient` — `ManagedBuffer` resolves bare.
+   - `core-import` (formerly `prelude-core-ambient`) — `ManagedBuffer` resolves through `import core`; `core`
+     is no longer ambient (190.1).
    - `prelude-cross-module` — `Option<String>` / `Result<Int, String>` returned by a dependency module and
      matched by the consumer (needed 174.7).
    - `std-module-import` / `std-module-missing` — `import std/math|random|time` works, bare and qualified;

@@ -1,0 +1,17 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# The import scanner (task 190, D5): reads a source file's import block as plain data for the planner. Depends
+# on nothing in the compiler; the conformance test checks it against the parser.
+swift_library(
+    name = "scanner",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "scanner",
+    visibility = ["//visibility:public"],
+)
+
+swift_test(
+    name = "scanner_tests",
+    srcs = glob(["tests/*.swift"]),
+    data = ["//:nomu_source_corpus"],
+    deps = [":scanner", "//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/runtime/embedded"],
+)

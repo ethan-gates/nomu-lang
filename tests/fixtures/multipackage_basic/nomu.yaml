@@ -1,4 +1,5 @@
 # Self-contained workspace for the cross-package build test (task 187.3). Its own `nomu.yaml` scopes the
 # package-registry marker scan to this subtree, so the two packages below resolve without tripping over
 # same-named packages elsewhere in the repo.
+scope: nomu
 name: mpbasic

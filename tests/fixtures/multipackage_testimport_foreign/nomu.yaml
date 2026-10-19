@@ -1,3 +1,4 @@
 # Workspace for the test-import boundary test (task 187.4.5): a test in `app` may white-box its own
 # package, but a `test import` of the foreign package `lib` is rejected — cross-package stays black-box.
+scope: nomu
 name: mptif

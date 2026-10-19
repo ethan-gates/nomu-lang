@@ -1,0 +1,18 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# The build planner (task 190, D5): reads workspaces, manifests and import blocks, and returns a plan of
+# module-level jobs. It reads through a source tree and never writes.
+swift_library(
+    name = "planner",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "planner",
+    deps = ["//src/planner/scanner", "//src/modules", "//src/runtime/embedded"],
+    visibility = ["//visibility:public"],
+)
+
+swift_test(
+    name = "planner_tests",
+    srcs = glob(["tests/*.swift"]),
+    data = ["//:suite_sources"] + glob(["tests/golden/*.plan"], allow_empty = True),
+    deps = [":planner", "//src/modules"],
+)

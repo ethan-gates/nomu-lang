@@ -3,8 +3,7 @@
 // The native boundary + non-user-facing GC substrate: the types the compiler/runtime name but user programs
 // do not. The user-facing surface (`Option`, `Result`, `String`, `concat`, the numeric helpers, `Time`,
 // `SimpleRNG`, and future collections / IO) lives in the `std` package (moved there by the 174.3 content
-// split). `core` is ambient; it is also prepended into every module today (the prepend retires at 174.5), so
-// codegen's bare references to the substrate resolve to a local decl with the right layout.
+// split). `core` is importable only from `std` (modules.md §Imports): user code reaches it through `std`.
 
 // A managed, relocatable single-object buffer: a fixed `Header` plus a variable-length tail of `Element`,
 // in one allocation (`{ type-id, cap, Header, Element[cap] }`). The shared storage primitive under `Array`,

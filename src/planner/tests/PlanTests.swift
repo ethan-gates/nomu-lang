@@ -1,0 +1,179 @@
+import XCTest
+@testable import planner
+
+final class PlanTests: XCTestCase {
+
+    private let me = WorkspaceIdentity(scope: "me", name: "app")
+    private let nomu = EmbeddedWorkspace.identity
+
+    private func plan(_ files: [String: String], entry: [String], product: ModuleJob.Product = .binary,
+                      outputOptions: [String] = []) -> Plan {
+        var options = PlanOptions()
+        options.product = product
+        options.cacheRoot = "/cache"
+        options.compilerIdentity = "abc123"
+        options.outputOptions = outputOptions
+        return Plan(entryFiles: entry, options: options, disk: MemoryTree(files))
+    }
+
+    private func key(_ ws: WorkspaceIdentity, _ path: String) -> ModuleKey {
+        ModuleKey(ws, path.isEmpty ? [] : path.split(separator: "/").map(String.init))
+    }
+
+    private let app: [String: String] = [
+        "/w/nomu.yaml": "scope: me\nname: app\nexternals:\n  prov: ../p\n",
+        "/w/app/pkg.json": "{\"name\": \"app\", \"dependencies\": [\"greet\"]}",
+        "/w/app/cli/main.nomu": "import pkg/util\nimport greet\nimport std/time\n",
+        "/w/app/util/u.nomu": "",
+        "/p/nomu.yaml": "scope: them\nname: prov\n",
+        "/p/greet/pkg.json": "{\"name\": \"greet\", \"products\": [\"\"]}",
+        "/p/greet/g.nomu": "import pkg/inner\n",
+        "/p/greet/inner/i.nomu": "",
+    ]
+
+    func testJobOrderAndOutputs() {
+        let p = plan(app, entry: ["/w/app/cli/main.nomu"])
+        XCTAssertEqual(p.diagnostics, [])
+        let them = WorkspaceIdentity(scope: "them", name: "prov")
+        // Each module after everything it imports.
+        XCTAssertEqual(p.jobs.map(\.module), [key(nomu, "runtime"), key(nomu, "std/prelude"), key(me, "app/util"), key(them, "greet/inner"),
+                                              key(them, "greet"), key(nomu, "std/time"), key(me, "app/cli")])
+        let byKey = Dictionary(uniqueKeysWithValues: p.jobs.map { ($0.module, $0) })
+
+        // D2: the building workspace's modules under `build/`; another workspace's under `_external/`.
+        let cli = byKey[key(me, "app/cli")]!
+        XCTAssertEqual(cli.product, .binary)
+        XCTAssertEqual(cli.binary, "/w/build/app/cli/cli")
+        XCTAssertEqual(cli.object, "/w/build/app/cli/cli.o")
+        XCTAssertEqual(cli.dependencies, [key(nomu, "std/prelude"), key(me, "app/util"), key(them, "greet"),
+                                          key(nomu, "std/time")])
+        XCTAssertEqual(byKey[key(me, "app/util")]?.interface, "/w/build/app/util/util.nmi")
+        // Every transitive import, in job order: `greet/inner` comes through `greet`.
+        XCTAssertEqual(cli.visibleDependencies, [key(nomu, "std/prelude"), key(me, "app/util"), key(them, "greet/inner"),
+                                                 key(them, "greet"), key(nomu, "std/time")])
+        XCTAssertEqual(byKey[key(them, "greet")]?.outputDir, "/w/build/_external/them.prov/greet")
+        XCTAssertEqual(byKey[key(them, "greet")]?.product, .library)
+
+        // D4: the embedded workspace's modules and the runtime archive in the per-host cache.
+        let prelude = byKey[key(nomu, "std/prelude")]!
+        XCTAssertTrue(prelude.inHostCache)
+        XCTAssertTrue(prelude.outputDir.hasPrefix("/cache/nomu/"))
+        XCTAssertTrue(prelude.outputDir.hasSuffix("/std/prelude"))
+        XCTAssertFalse(cli.inHostCache)
+        XCTAssertEqual(p.runtimeArchive?.outputDir, "/cache/runtime/" + HostCache.runtimeArchiveKey)
+
+        // The link takes every object the plan builds, plus the runtime archive.
+        XCTAssertEqual(p.link?.objects, p.jobs.map(\.object))
+        XCTAssertEqual(p.link?.runtimeArchive, p.runtimeArchive?.archive)
+        XCTAssertEqual(p.link?.output, "/w/build/app/cli/cli")
+    }
+
+    func testLibraryBuildHasNoLinkAndNoEmbeddedWorkspace() {
+        let p = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/lib/l.nomu": ""], entry: ["/w/lib/l.nomu"],
+                     product: .library)
+        XCTAssertEqual(p.diagnostics, [])
+        XCTAssertEqual(p.jobs.map(\.module), [key(me, "lib")])
+        XCTAssertEqual(p.jobs.first?.product, .library)
+        XCTAssertNil(p.link)
+        XCTAssertNil(p.runtimeArchive)
+    }
+
+    func testRootModuleAndFlags() {
+        let p = plan(["/w/nomu.yaml": "scope: me\nname: app\n",
+                      "/w/main.nomu": "test import pkg/lib\n",
+                      "/w/lib/l.nomu": ""],
+                     entry: ["/w/main.nomu"])
+        XCTAssertEqual(p.diagnostics, [])
+        let root = p.jobs.last!
+        XCTAssertEqual(root.module, key(me, ""))
+        XCTAssertEqual(root.binary, "/w/build/app")              // a workspace-root module is named after the workspace
+        XCTAssertEqual(p.jobs.first { $0.module == key(me, "lib") }?.whiteBox, true)
+        XCTAssertEqual(root.whiteBox, false)
+    }
+
+    func testEmbeddedKeyFollowsCompilerAndOptions() {
+        let a = HostCache.embeddedWorkspaceKey(compilerIdentity: "abc", outputOptions: [])
+        XCTAssertEqual(a, HostCache.embeddedWorkspaceKey(compilerIdentity: "abc", outputOptions: []))
+        XCTAssertNotEqual(a, HostCache.embeddedWorkspaceKey(compilerIdentity: "abd", outputOptions: []))
+        XCTAssertNotEqual(a, HostCache.embeddedWorkspaceKey(compilerIdentity: "abc", outputOptions: ["-O"]))
+        let plain = plan(app, entry: ["/w/app/cli/main.nomu"])
+        let optimized = plan(app, entry: ["/w/app/cli/main.nomu"], outputOptions: ["-O"])
+        XCTAssertNotEqual(plain.jobs.first?.outputDir, optimized.jobs.first?.outputDir)
+    }
+
+    func testRuntimePackageJob() {
+        var options = PlanOptions()
+        options.allowCoreImport = true
+        options.cacheRoot = "/cache"
+        let p = Plan(entryFiles: ["/w/main.nomu"], options: options,
+                     disk: MemoryTree(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/main.nomu": "import core\n"]))
+        XCTAssertEqual(p.diagnostics, [])
+        XCTAssertTrue(p.jobs.contains { $0.module == key(nomu, "core") })
+        // The embedded `runtime` package is in every binary build, first, though nothing imports it.
+        XCTAssertEqual(p.jobs.first?.module, key(nomu, "runtime"))
+        XCTAssertEqual(p.jobs.filter(\.runtimeSubsetByMembership).map(\.module), [key(nomu, "runtime")])
+        XCTAssertEqual(p.modules.implicitRoots, [key(nomu, "runtime")])
+    }
+
+    func testHostCacheRoot() {
+        XCTAssertEqual(HostCache.root(environment: ["NOMU_CACHE_DIR": "/x", "HOME": "/h"]), "/x")
+        #if os(macOS)
+        XCTAssertEqual(HostCache.root(environment: ["HOME": "/h"]), "/h/Library/Caches/nomu")
+        #else
+        XCTAssertEqual(HostCache.root(environment: ["HOME": "/h"]), "/h/.cache/nomu")
+        XCTAssertEqual(HostCache.root(environment: ["HOME": "/h", "XDG_CACHE_HOME": "/xdg"]), "/xdg/nomu")
+        #endif
+    }
+
+    func testTimings() {
+        let p = plan(app, entry: ["/w/app/cli/main.nomu"])
+        let t = p.timings
+        XCTAssertEqual(t.modules, p.jobs.count)
+        XCTAssertEqual(t.filesScanned, p.jobs.reduce(0) { $0 + $1.files.count })
+        XCTAssertGreaterThan(t.directoriesListed, 0)
+        // Every step ran and was timed; the total is their sum.
+        XCTAssertEqual(Set(t.seconds.keys), Set(PlanTimings.Step.allCases))
+        XCTAssertEqual(t.total, t.seconds.values.reduce(0, +))
+    }
+
+    // MARK: - Cycles
+
+    func testModuleCycle() {
+        let p = plan(["/w/nomu.yaml": "scope: me\nname: app\n",
+                      "/w/main.nomu": "import pkg/a\n",
+                      "/w/a/a.nomu": "import pkg/b\n",
+                      "/w/b/b.nomu": "// b\nimport pkg/a\n"],
+                     entry: ["/w/main.nomu"])
+        XCTAssertEqual(p.diagnostics.map(\.description), ["/w/b/b.nomu:2:1: error: module import cycle: a → b → a"])
+        XCTAssertEqual(p.jobs, [])
+        XCTAssertNil(p.link)
+    }
+
+    func testPackageCycle() {
+        // No module cycle (p/main → q → p/extra), but the packages form one.
+        let p = plan(["/w/nomu.yaml": "scope: me\nname: app\n",
+                      "/w/p/pkg.json": "{\"name\": \"p\", \"dependencies\": [\"q\"], \"products\": [\"extra\"]}",
+                      "/w/p/main/m.nomu": "import q\n",
+                      "/w/p/extra/e.nomu": "",
+                      "/w/q/pkg.json": "{\"name\": \"q\", \"dependencies\": [\"p\"], \"products\": [\"\"]}",
+                      "/w/q/q.nomu": "import p/extra\n"],
+                     entry: ["/w/p/main/m.nomu"])
+        XCTAssertEqual(p.diagnostics.map(\.description), ["/w/q/q.nomu:1:1: error: package dependency cycle: p → q → p"])
+    }
+
+    // MARK: - On disk
+
+    func testFixturePlanOnDisk() throws {
+        guard let srcdir = ProcessInfo.processInfo.environment["TEST_SRCDIR"] else { throw XCTSkip("not under bazel test") }
+        let app = srcdir + "/_main/tests/fixtures/xworkspace_basic/consumer/app"
+        let files = try FileManager.default.contentsOfDirectory(atPath: app).filter { $0.hasSuffix(".nomu") }
+            .sorted().map { app + "/" + $0 }
+        var options = PlanOptions()
+        options.cacheRoot = "/cache"
+        let p = Plan(entryFiles: files, options: options)
+        XCTAssertEqual(p.diagnostics, [])
+        XCTAssertTrue(p.jobs.contains { $0.outputDir.contains("/build/_external/nomu.prov/") })
+        XCTAssertEqual(p.jobs.last?.product, .binary)
+        XCTAssertEqual(p.link?.output.hasSuffix("/consumer/build/app/app"), true)
+    }
+}

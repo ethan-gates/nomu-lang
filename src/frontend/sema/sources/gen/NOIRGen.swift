@@ -19,7 +19,7 @@ enum NOIRGen {
     // A surface `String` is unwrapped to its `.base` field; a bare `StringBase` and any non-string pass through
     // unchanged. The unwrap is a single-field-wrapper field read, which the egress lowers to identity (the
     // wrapper and its field share the 16-byte `strTy` representation), so this is a type-level adapter with no
-    // runtime cost. `String` may be the bare prepend type or the ambient `nomu/core@String` package type
+    // runtime cost. `String` may be the bare local type (inside `std/prelude`) or its imported per-origin key
     // (task 174.2.3), so the match goes through `Sema.isStringType`.
     static func asStringBase(_ s: inout Sema, _ e: NOIRExpr) -> NOIRExpr {
         if s.isStringType(e.type) {
@@ -31,7 +31,7 @@ enum NOIRGen {
     // A `StringBase` value wrapped back into a surface `String` (the inverse of `asStringBase`) — for the
     // results of builtins that produce a raw `StringBase` (`concat`, a string literal, `readLine`). The
     // wrapper's `String` identity is resolved at the site (`Sema.stringType`) so a consumer-module literal
-    // carries the ambient `nomu/core@String` identity, matching the flipped package (task 174.2.3).
+    // carries the imported `String`'s per-origin identity (task 174.2.3).
     static func wrapString(_ s: inout Sema, _ e: NOIRExpr) -> NOIRExpr {
         let ty = s.stringType(at: e.span)
         let name = s.stringTypeName(at: e.span)
@@ -653,9 +653,9 @@ enum NOIRGen {
                 s.diags.error("'ManagedBuffer' needs two type arguments, e.g. 'ManagedBuffer<Header, Element>.\(method)(...)'", at: span)
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
-            // `ManagedBuffer` is an ambient `nomu/core` package type (task 174.5.1): the create result's base
-            // must carry that per-origin key (`nomu/core@ManagedBuffer`) so monomorphization finds the
-            // external template and names the instantiation under the same identity.
+            // `ManagedBuffer` is a `nomu/core` package type (task 174.5.1), visible through `import core`: the
+            // create result's base must carry that per-origin key (`nomu/core@ManagedBuffer`) so
+            // monomorphization finds the external template and names the instantiation under the same identity.
             let mbBase = s.externalTypeKey("ManagedBuffer", at: span) ?? "ManagedBuffer"
             return ManagedBufferIntrinsics.checkStatic(&s, base: mbBase, header: gen[0], element: gen[1], method, args, span)
         }

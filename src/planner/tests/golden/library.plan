@@ -1,0 +1,18 @@
+plan for me.app:app/util
+
+workspaces
+  me.app  pins prov → them.prov
+  them.prov
+
+job me.app:app/util/inner
+  package app at @me.app/app
+  files i.nomu
+  library
+  out @me.app/build/app/util/inner/inner
+job me.app:app/util
+  package app at @me.app/app (product)
+  files u.nomu
+  library
+  out @me.app/build/app/util/util
+  import u.nomu:1:1 public pkg/util/inner → me.app:app/util/inner
+  sees me.app:app/util/inner

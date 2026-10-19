@@ -2,9 +2,8 @@ import support
 import ast
 
 // The lexer scans over the source's UTF-8 bytes (`[UInt8]`), not `[Character]`. Tokens are ASCII, so
-// classification and dispatch are integer byte compares with ASCII fast-paths. Identifiers are ASCII
-// `[A-Za-z_][A-Za-z0-9_]*` (Unicode identifiers can be added later by decoding scalars in the ident
-// scanner); string literals and comments carry arbitrary UTF-8 through unchanged. Offsets, spans, and
+// classification and dispatch are integer byte compares. Identifiers are ASCII `[A-Za-z_][A-Za-z0-9_]*`;
+// string literals and comments carry arbitrary UTF-8 through unchanged. Offsets, spans, and
 // line/column are all in byte units — identical to character units for ASCII source.
 public struct Lexer {
     private let src: [UInt8]
@@ -44,26 +43,6 @@ public struct Lexer {
     @inline(__always) private func isIdentContASCII(_ b: UInt8) -> Bool { isAlpha(b) || isDigit(b) || b == 0x5F }
     @inline(__always) private func isSpace(_ b: UInt8) -> Bool {
         b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D || b == 0x0B || b == 0x0C   // space, tab, LF, CR, VT, FF
-    }
-
-    // The byte length of an identifier scalar at `i`, or 0 if none. ASCII is the fully-inlined fast
-    // path — a single `b < 0x80` test — so pure-ASCII source pays nothing for Unicode support. Only a
-    // byte >= 0x80 takes the out-of-line path that decodes a UTF-8 scalar and consults the Unicode
-    // identifier properties (XID_Start / XID_Continue, per UAX #31 — what Swift and Rust use).
-    @inline(__always) private func identStart(at i: Int) -> Int {
-        let b = src[i]
-        if b < 0x80 { return isIdentStartASCII(b) ? 1 : 0 }
-        return unicodeIdentLen(at: i, start: true)
-    }
-    @inline(__always) private func identCont(at i: Int) -> Int {
-        let b = src[i]
-        if b < 0x80 { return isIdentContASCII(b) ? 1 : 0 }
-        return unicodeIdentLen(at: i, start: false)
-    }
-    private func unicodeIdentLen(at i: Int, start: Bool) -> Int {
-        guard let (scalar, len) = decodeScalar(at: i) else { return 0 }
-        let p = scalar.properties
-        return (start ? p.isXIDStart : p.isXIDContinue) ? len : 0
     }
 
     // Decode one UTF-8 scalar at `i`, returning it with its byte length (1–4); nil for a malformed or
@@ -109,7 +88,7 @@ public struct Lexer {
 
         let c = src[pos]
         if isDigit(c) { return lexNumber() }
-        if identStart(at: pos) != 0 { return lexIdent() }
+        if isIdentStartASCII(c) { return lexIdent() }
         if c == 0x22 {   // "
             if pos + 2 < src.count && src[pos + 1] == 0x22 && src[pos + 2] == 0x22 {
                 return lexBlockString()   // """ … """
@@ -158,8 +137,8 @@ public struct Lexer {
         case 0x5E: return .caret      // ^
         case 0x7E: return .tilde      // ~
         default:
-            // Unhandled. A non-ASCII byte begins a multibyte scalar that is not an identifier
-            // (a symbol, emoji, …): consume the whole scalar and report it once, not per byte.
+            // Unhandled. A non-ASCII byte begins a multibyte scalar, which appears only in comments and
+            // string literals: consume the whole scalar and report it once, not per byte.
             if c >= 0x80 {
                 pos -= 1
                 let n = decodeScalar(at: pos)?.1 ?? 1
@@ -201,9 +180,8 @@ public struct Lexer {
                 while pos < src.count && isDigit(src[pos]) { pos += 1 }
                 return .doubleLit(Double(slice(start, pos))!)
             }
-            // A member name (ASCII or Unicode) after the dot leaves it for the parser (`3.foo`);
-            // anything else is a bare `3.`.
-            if !(hasNext && identStart(at: pos + 1) != 0) {
+            // A member name after the dot leaves it for the parser (`3.foo`); anything else is a bare `3.`.
+            if !(hasNext && isIdentStartASCII(src[pos + 1])) {
                 let digits = slice(start, digitsEnd)
                 error("a bare '\(digits).' is not a number: write '\(digits).0' for a Double, or '\(digits).<name>' for member access", at: pos)
                 pos += 1                            // skip the stray '.' so it doesn't cascade
@@ -214,15 +192,10 @@ public struct Lexer {
 
     private mutating func lexIdent() -> TokenKind {
         let start = pos
-        // The first scalar is an identifier start (checked by scanKind); continue over cont scalars.
-        // ASCII advances one byte per step; a Unicode scalar advances its 2–4 byte length.
-        while pos < src.count {
-            let n = identCont(at: pos)
-            if n == 0 { break }
-            pos += n
-        }
+        // The first byte is an identifier start (checked by scanKind).
+        while pos < src.count && isIdentContASCII(src[pos]) { pos += 1 }
         // Keywords are matched on the byte range with no allocation, so only real identifiers build a
-        // String. A Unicode identifier can never equal an ASCII keyword, so the byte compare is safe.
+        // String.
         if let kw = keyword(start, pos) { return kw }
         return .ident(slice(start, pos))
     }

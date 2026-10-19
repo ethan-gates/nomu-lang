@@ -1,0 +1,8 @@
+plan for me.app:(root)
+
+workspaces
+  me.app
+  nomu.nomu
+
+error @me.app/nomu.yaml:4:8: two workspaces in this build are both 'me.app': '/w' and '/d'
+error @me.app/nomu.yaml:5:9: pinned workspace 'gone' at '../nowhere' does not exist
