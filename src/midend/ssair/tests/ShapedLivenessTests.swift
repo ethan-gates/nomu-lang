@@ -85,16 +85,17 @@ final class ShapedLivenessTests: XCTestCase {
             "Empty":   [],
             "IntBox":  [.int],
         ]
-        let set = computeShapedStructs(fields)
-        XCTAssertTrue(set.contains("String"), "a single StringBase field is a shaped wrapper")
-        XCTAssertTrue(set.contains("Wrapped"), "a wrapper over a wrapper is shaped (fixpoint)")
-        XCTAssertFalse(set.contains("Pair"), "a multi-field struct is an aggregate, not a wrapper")
-        XCTAssertFalse(set.contains("Empty"), "a zero-field struct is not a wrapper")
-        XCTAssertFalse(set.contains("IntBox"), "a single non-shaped field is not a wrapper")
+        let env = ShapeEnv(structFields: { fields[$0] }, enumCases: { _ in nil })
+        func wraps(_ n: String) -> Bool { env.isWrapper(.named(n, .struct_)) }
+        XCTAssertTrue(wraps("String"), "a single StringBase field is a shaped wrapper")
+        XCTAssertTrue(wraps("Wrapped"), "a wrapper over a wrapper is shaped")
+        XCTAssertFalse(wraps("Pair"), "a multi-field struct is an aggregate, not a wrapper")
+        XCTAssertFalse(wraps("Empty"), "a zero-field struct is not a wrapper")
+        XCTAssertFalse(wraps("IntBox"), "a single non-shaped field is not a wrapper")
     }
 
-    // A wrapper-typed value is tracked by shaped liveness only when the wrapper set is supplied; with the
-    // default empty set the predicate stays at its StringBase-only base case (pre-wrapper behavior intact).
+    // A wrapper-typed value is tracked by shaped liveness only when the struct's fields are known; with no type
+    // context the predicate stays at the leaves alone.
     func testWrapperValueCrossesCallOnlyWithSet() {
         let strTy = Type.named("String", .struct_)
         let s0 = v(0, strTy), s1 = v(1, strTy)
@@ -104,7 +105,7 @@ final class ShapedLivenessTests: XCTestCase {
             SSAInst(result: s1, kind: .call(call("use", [s0])), span: sp),                    // inst 2: uses s0
         ], terminator: SSATerm(kind: .ret(nil), span: sp))
 
-        let wrappers = computeShapedStructs(["String": [.stringBase]])
+        let wrappers = ShapeEnv(structFields: { $0 == "String" ? [.stringBase] : nil }, enumCases: { _ in nil })
         let withSet = computeShapedLiveness(fn([bb0]), wrappers)
         XCTAssertTrue(withSet.liveOutInst[0]![1].contains(s0.id), "the wrapper value crosses the call when recognized as shaped")
 

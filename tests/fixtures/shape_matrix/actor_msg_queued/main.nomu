@@ -1,0 +1,58 @@
+class Box {
+  var v: Int
+}
+// Allocates a Box and spins, so a nursery collection lands between reads.
+fun churn(i: Int) -> Int {
+  let b = Box(v: i)
+  var k = 0
+  var t = 0
+  while k < 100 {
+    t = t + k
+    k = k + 1
+  }
+  return t + b.v
+}
+fun probe(s: String) -> Int {
+  return s.byte(at: 5).int + s.byte(at: 20).int
+}
+fun heapString() -> String {
+  return "seed".concat("-heap-string-xxxxxxxxxxxxxxxx")
+}
+fun report(bad: Int) {
+  print("bad ")
+  print(bad)
+  print("
+")
+}
+// Many messages carrying a String sit in the mailbox while earlier handlers allocate.
+actor Checker {
+  var bad: Int = 0
+  var want: Int = 0
+  on setWant(w: Int) {
+    want = w
+  }
+  on check(s: String, i: Int) {
+    var t = 0
+    var k = 0
+    while k < 20 {
+      t = t + churn(i + k)
+      k = k + 1
+    }
+    if probe(s) != want {
+      bad = bad + 1
+    }
+  }
+  on done(x: Int) {
+    report(bad)
+  }
+}
+fun main() {
+  let c = Checker()
+  c.setWant(w: probe(heapString()))
+  var i = 0
+  while i < 50000 {
+    c.check(s: heapString(), i: i)
+    i = i + 1
+  }
+  c.done(x: 0)
+}

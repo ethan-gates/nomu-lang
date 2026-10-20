@@ -18,6 +18,10 @@ While avoiding:
 - **Go's thin type system** — sum types and real generics are table stakes.
 - **Rust's friction** — no borrow checker, lifetimes, or ownership annotations. Fighting the compiler about memory is the thing Nomu exists to eliminate.
 
+## Priorities
+
+In order: **soundness**, then **performance**, then **user surface** (finesse). Each can be partly met and Nomu still succeed, but soundness allows very little to be given up. GC correctness is soundness.
+
 ## Memory: invisible
 
 The programmer never annotates memory — no ARC, `weak`/`unowned`, regions, or borrow checker.

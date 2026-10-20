@@ -1,0 +1,10 @@
+package struct Trio<T> {
+  var a: Bool
+  var v: T
+}
+package fun getV<T>(t: Trio<T>) -> T {
+  return t.v
+}
+package fun make<T>(v: T) -> Trio<T> {
+  return Trio<T>(a: true, v: v)
+}

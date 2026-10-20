@@ -36,9 +36,8 @@ extension LLVMGen {
         if let g = valueWitnessGlobals[key] { return g }
         let sizeBytes = Int32(slotCount(t) * 8)          // value layout is the uniform 8-byte-slot model
         let align = Int32(8)
-        var offsets: [Int32] = []
-        collectManagedOffsets(t, baseSlot: 0, into: &offsets)
-        let flags = offsets.isEmpty ? LLVMGen.vwtFlagPOD : 0
+        // POD iff the value holds no managed word at all, plain or conditional (a `String` is not POD).
+        let flags = shapes.shape(t).isEmpty ? LLVMGen.vwtFlagPOD : 0
         // The `type_id` is the value-layout GC descriptor's section offset (100.4.7.4), so a collector
         // handed this VWT reaches the T value's pointer map to scan an erased-T buffer.
         let typeIdVal = sectionOffset(of: descGlobalRef(typeSymbols[Int(valueDescId(t))].name),

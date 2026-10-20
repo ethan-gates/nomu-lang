@@ -1,0 +1,18 @@
+import pkg/lib
+
+fun main() {
+  let s = "seed".concat("-heap-string-xxxxxxxxxxxxxxxx")
+  let want = probe(s)
+  var i = 0
+  var bad = 0
+  while i < 1000000 {
+    let r = hold(s, i)
+    if probe(r) != want {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

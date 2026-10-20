@@ -55,14 +55,11 @@ extension LLVMGen {
     func messageTypeIdValue(_ actorName: String, _ h: NOIRHandler) -> UInt64 {
         let key = "\(actorName):\(h.name)"
         if let id = messageTypeIds[key] { return id }
-        var offsets: [Int32] = [8, 24]   // next, self
-        var slot = 4                     // args start past the 4-slot prefix
-        for p in h.params {
-            collectManagedOffsets(p.type, baseSlot: slot, into: &offsets)
-            slot += slotCount(p.type)
-        }
-        let id = registerMap(offsets, sizeBytes: Int32(slot * 8),
-                             symbol: descSymbol("msg_\(actorName)_\(h.name)"), foldable: true)
+        let params = h.params.map(\.type)
+        let d = descriptorEntries(shapes.fieldsShape(params, base: 32))   // args start past the 4-slot prefix
+        let slot = 4 + params.reduce(0) { $0 + slotCount($1) }
+        let id = registerMap([8, 24] + d.offsets, sizeBytes: Int32(slot * 8),   // next, self
+                             symbol: descSymbol("msg_\(actorName)_\(h.name)"), foldable: true, shaped: d.shaped)
         messageTypeIds[key] = id
         return id
     }

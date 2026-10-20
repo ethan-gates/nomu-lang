@@ -1,0 +1,53 @@
+class Box {
+  var v: Int
+}
+// Allocates a Box and spins, so a nursery collection lands between reads.
+fun churn(i: Int) -> Int {
+  let b = Box(v: i)
+  var k = 0
+  var t = 0
+  while k < 100 {
+    t = t + k
+    k = k + 1
+  }
+  return t + b.v
+}
+fun probe(s: String) -> Int {
+  return s.byte(at: 5).int + s.byte(at: 20).int
+}
+fun heapString() -> String {
+  return "seed".concat("-heap-string-xxxxxxxxxxxxxxxx")
+}
+fun report(bad: Int) {
+  print("bad ")
+  print(bad)
+  print("
+")
+}
+// The spawned fiber returns a String; the result box holds it until the join.
+fun make(i: Int) -> String {
+  var t = 0
+  var k = 0
+  while k < 1000 {
+    t = t + churn(i + k)
+    k = k + 1
+  }
+  return heapString()
+}
+fun main() {
+  let want = probe(heapString())
+  var bad = 0
+  var i = 0
+  while i < 2000 {
+    spawn let a = make(i)
+    spawn let b = make(i + 1)
+    if probe(a) != want {
+      bad = bad + 1
+    }
+    if probe(b) != want {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  report(bad)
+}

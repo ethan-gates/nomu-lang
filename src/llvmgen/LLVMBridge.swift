@@ -94,6 +94,7 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
     if let err = egress.error { return err }
     // The entry object must have `main`; a library object need not.
     if requireMain, !egress.loweredMain { return "LLVM: no `main` function to lower" }
+    if let err = checkHostSlotLayout(egress.e) { return err }
 
     var errorMessage: UnsafeMutablePointer<CChar>! = nil
     let verifyRC = cgStage("llvm", "verify", onStage) { LLVMVerifyModule(mod, LLVMReturnStatusAction, &errorMessage) }
@@ -113,6 +114,27 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
 
 /// Emit an already-built, verified module to a native object file for the host triple, via
 /// `llvm-c/TargetMachine.h`. Returns nil on success, else an error message.
+// Run the 8-byte-slot layout check (`LLVMGen.checkSlotLayout`) under the host target's data layout, the one
+// `emitModuleObject` stamps onto the module.
+private func checkHostSlotLayout(_ gen: LLVMGen) -> String? {
+    let triple = LLVMGetDefaultTargetTriple()!
+    defer { LLVMDisposeMessage(triple) }
+    var target: LLVMTargetRef? = nil
+    var tErr: UnsafeMutablePointer<CChar>? = nil
+    if LLVMGetTargetFromTriple(triple, &target, &tErr) != 0 {
+        let m = tErr.map { String(cString: $0) } ?? "unknown"
+        LLVMDisposeMessage(tErr)
+        return "LLVM: no target for host triple: \(m)"
+    }
+    guard let tm = LLVMCreateTargetMachine(target, triple, "", "", LLVMCodeGenLevelDefault, LLVMRelocPIC,
+                                           LLVMCodeModelDefault)
+    else { return "LLVM: failed to create target machine" }
+    defer { LLVMDisposeTargetMachine(tm) }
+    let dl = LLVMCreateTargetDataLayout(tm)!
+    defer { LLVMDisposeTargetData(dl) }
+    return gen.checkSlotLayout(dl)
+}
+
 private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: Bool,
                               onStage: StageSink? = nil) -> String? {
     let triple = LLVMGetDefaultTargetTriple()!

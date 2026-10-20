@@ -41,3 +41,16 @@ swift_library(
         "@llvm-project//llvm:Passes",
     ],
 )
+
+# The egress's shape consumers (task 176.5): read by `//src/midend/ssair:ssair_tests`, which checks that none
+# of them names a shaped leaf or a wrapper directly — only the leaf registry (`ssair/sources/Shape.swift`) does.
+filegroup(
+    name = "shape_consumers",
+    srcs = [
+        "LLVMGenActor.swift",
+        "LLVMGenGCMaps.swift",
+        "LLVMGenLayoutCheck.swift",
+        "LLVMGenValueWitness.swift",
+    ],
+    visibility = ["//src/midend/ssair:__pkg__"],
+)

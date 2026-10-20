@@ -33,6 +33,9 @@ unsafe extern "C" {
     // the per-element managed-pointer map read from `nomu_gc_typemap`.
     fn nomu_gc_typekind(type_id: u64) -> i32;
     fn nomu_gc_typestride(type_id: u64) -> u64;
+    // Count of shaped entries (task 176): an object's shaped fields, or each buffer element's. Nonzero means
+    // the live offsets depend on the value, so a buffer is enumerated per element.
+    fn nomu_gc_shaped_count(type_id: u64) -> i32;
     // Buffer user-header byte size (task 180): element 0 sits at `16 + header_size`; 0 for an array
     // buffer, so the sizing/scan geometry below stays byte-identical for arrays.
     fn nomu_gc_typeheadersize(type_id: u64) -> i32;
@@ -208,12 +211,24 @@ fn mv_obj_hash(base: Address, type_id: u64) -> i64 {
         h = h.wrapping_mul(PRIME).wrapping_add(ecap);
         let stride = unsafe { nomu_gc_typestride(type_id) } as usize;
         let elem_start = 16usize + unsafe { nomu_gc_typeheadersize(type_id) } as usize;
+        let elem_shaped = unsafe { nomu_gc_shaped_count(type_id) } > 0;
         let mut e: i64 = 0;
         while e < ecap {
             let elem_base = elem_start + (e as usize) * stride;
+            // An element with shaped fields has its own live set (it reads the element's tags).
+            let (ecount, eoffs) = if elem_shaped {
+                let mut c: i32 = 0;
+                let o = unsafe { nomu_gc_live_offsets(type_id, (base + elem_base).as_usize() as *const u8, &mut c) };
+                (c, o)
+            } else {
+                (count, offs)
+            };
+            let elem_managed = |w: usize| -> bool {
+                (0..ecount as isize).any(|i| unsafe { *eoffs.offset(i) } as usize == w)
+            };
             let mut w = 0usize;
             while w < stride {
-                if !managed(w) {
+                if !elem_managed(w) {
                     let word = unsafe { (base + elem_base + w).load::<i64>() };
                     h = h.wrapping_mul(PRIME).wrapping_add(word);
                 }
@@ -580,10 +595,20 @@ impl Scanning<NomuVM> for VMScanning {
                 let hoff = unsafe { nomu_gc_headeroffset(type_id, hk) } as usize;
                 slot_visitor.visit_slot(mmtk::vm::slot::SimpleSlot::from_address(base + 16usize + hoff));
             }
+            // Elements with shaped fields (an `Array<String>`) are enumerated one at a time: their live
+            // words depend on each element's tags. Plain elements share the static element map.
+            let elem_shaped = unsafe { nomu_gc_shaped_count(type_id) } > 0;
             for i in 0..cap {
                 let elem_base = base + elem_start + (i as usize) * stride;
-                for j in 0..count as isize {
-                    let off = unsafe { *offs.offset(j) } as usize;
+                let (ecount, eoffs) = if elem_shaped {
+                    let mut c: i32 = 0;
+                    let o = unsafe { nomu_gc_live_offsets(type_id, elem_base.as_usize() as *const u8, &mut c) };
+                    (c, o)
+                } else {
+                    (count, offs)
+                };
+                for j in 0..ecount as isize {
+                    let off = unsafe { *eoffs.offset(j) } as usize;
                     slot_visitor.visit_slot(mmtk::vm::slot::SimpleSlot::from_address(elem_base + off));
                 }
             }

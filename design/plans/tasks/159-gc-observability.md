@@ -35,6 +35,14 @@ are observability outputs), and it should be designed so it works across the pac
    block-state histogram — enough to explain a footprint number, and the seed for
    [139 memory/heap introspection](139-memory-heap-introspection.md).
 
+5. **GC tests prove collections ran.** Every suite leg that tests GC behavior asserts that collections
+   of the kinds it targets (nursery, mature, evacuating) actually ran, with a minimum count, on every
+   collector it runs under. Today a GC case can pass with no collection at all: under default heap sizing
+   the 176.5 reproduction never collects (`[gc-stats] no GC ran`), and the existing shaped oracles use evac
+   only, so they cannot see a missed reload. The runner's `stderr_match` (pattern count with `min`/`max`)
+   already carries a few such assertions; this makes it the rule and gives every collector a per-collection
+   record to count.
+
 ## Design axes
 
 - **One trace facility, not a knob per site.** A single gated trace/stat primitive with severity/category,

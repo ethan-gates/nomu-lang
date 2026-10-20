@@ -371,11 +371,12 @@ int32_t nomu_gc_typekind(uint64_t type_id) {
     return d ? d->kind : 0;
 }
 
-// Shaped fields (task 176 Stage 1 site 2): fields of an object that are themselves shaped values (a
-// `String`), which the collector recurses into via their sub-shape rather than scanning as a direct
-// managed pointer. The entries follow the `nptr` direct offsets in the map, two i32 each —
-// `(field byte offset, sub-shape type-id)`. `nshaped` is 0 for the ordinary object, so these are off the
-// hot path. The sub-shape type-id is a descriptor offset, handed straight to `nomu_gc_live_offsets`.
+// Shaped fields (task 176 Stage 1 site 2): fields of an object, or of each buffer element, with conditional
+// content (a `String`, an enum with managed payload), which the collector recurses into via their sub-shape
+// rather than scanning as a direct managed pointer. The entries follow the `nheader` header offsets and the
+// `nptr` direct offsets in the map, two i32 each — `(field byte offset, sub-shape type-id)`. `nshaped` is 0
+// for the ordinary object and buffer, so these are off the hot path. The sub-shape type-id is a descriptor
+// offset, handed straight to `nomu_gc_live_offsets`.
 int32_t nomu_gc_shaped_count(uint64_t type_id) {
     const nomu_gc_desc* d = gc_desc_at(type_id);
     return d ? d->nshaped : 0;
@@ -384,13 +385,13 @@ int32_t nomu_gc_shaped_offset(uint64_t type_id, int32_t k) {
     const nomu_gc_desc* d = gc_desc_at(type_id);
     if (!d || k < 0 || k >= d->nshaped) return 0;
     const int32_t* map = (const int32_t*)(gc_ptrmaps_base + (unsigned)d->ptrmap_off);
-    return map[d->nptr + 2 * k];
+    return map[d->nheader + d->nptr + 2 * k];
 }
 int32_t nomu_gc_shaped_shapeid(uint64_t type_id, int32_t k) {
     const nomu_gc_desc* d = gc_desc_at(type_id);
     if (!d || k < 0 || k >= d->nshaped) return 0;
     const int32_t* map = (const int32_t*)(gc_ptrmaps_base + (unsigned)d->ptrmap_off);
-    return map[d->nptr + 2 * k + 1];
+    return map[d->nheader + d->nptr + 2 * k + 1];
 }
 
 // Array element byte stride for an array-buffer type-id. 0 for a fixed type.
@@ -431,8 +432,10 @@ int32_t nomu_gc_headeroffset(uint64_t type_id, int32_t k) {
 
 // The shared shaped-root/field enumerator (task 176, shaped-roots.md Stage 5): resolve the live
 // managed-pointer byte offsets of a value at `base` for `type_id`, writing the count to `*out_count` and
-// returning a pointer to a contiguous `int32_t[*out_count]` offset array. For kind 0/1 this is the static
-// flat map (data-independent, identical to `nomu_gc_typemap`; `base` unused). For kind 2 (shaped) the map
+// returning a pointer to a contiguous `int32_t[*out_count]` offset array. For kind 0/1 with no shaped entries
+// this is the static flat map (data-independent, identical to `nomu_gc_typemap`; `base` unused). For a kind-1
+// buffer the offsets are an element's, relative to the element, and `base` is that element's address: a
+// buffer whose elements carry shaped entries is enumerated once per element. For kind 2 (shaped) the map
 // is discriminant-keyed — `[tag_off, tag_shift, ncases, (tag, count, off…)…]` — so the tag is read from the
 // value (`*(uint64_t*)(base + tag_off) >> tag_shift`) and the matching case's offsets returned; a tag in no
 // case (e.g. String `small` / `immortal`) yields count 0. Both the stackmap root path and the object-field
@@ -517,26 +520,27 @@ const int32_t* nomu_gc_live_offsets(uint64_t type_id, const void* base, int32_t*
     // kind 0/1 with no shaped fields — the common object/array: the static flat map, no work (178.1).
     // For a buffer the element map follows the `nheader` header offsets in the blob (task 180), so skip
     // that prefix; a fixed object and an array both have `nheader = 0`, so the skip is a no-op there.
-    if (!(d->kind == 0 && d->nshaped > 0)) {
+    const int32_t* flat = map + d->nheader;
+    if (d->nshaped == 0) {
         *out_count = d->nptr;
-        return map + d->nheader;
+        return flat;
     }
-    // A fixed object carrying shaped fields (task 176 Stage 1 site 2): a `String` field inside a
-    // class/actor. Fold each shaped field's live sub-offsets into the direct offsets so the one object-scan
-    // path reaches them — the flat `nptr` direct offsets, then for each of the `nshaped` `(field offset,
-    // sub-shape type-id)` entries, the enumerator recurses into the sub-shape at `base + field offset` (which
-    // reads its tag) and appends `field offset + sub offset` for each live word. A `heap` String field thus
-    // contributes its `word0`; an `immortal`/`small` one contributes nothing. The sub-shape is a kind-2 leaf
-    // (String), so its recursive call returns the static case map and never touches this scratch — a nested
-    // object-with-shaped-fields sub-shape would need a recursion-safe buffer. (Array-element shaped fields,
-    // kind 1, are not folded here — they need per-element tag reads the single-call contract can't express.)
+    // An object (kind 0) or a buffer element (kind 1) carrying shaped fields (task 176 Stage 1 site 2): a
+    // `String` field inside a class/actor or an `Array<String>` element. Fold each shaped field's live
+    // sub-offsets into the direct offsets so the one scan path reaches them — the flat `nptr` direct offsets,
+    // then for each of the `nshaped` `(field offset, sub-shape type-id)` entries, the enumerator recurses into
+    // the sub-shape at `base + field offset` (which reads its tag) and appends `field offset + sub offset` for
+    // each live word. A `heap` String field thus contributes its `word0`; an `immortal`/`small` one contributes
+    // nothing. The sub-shape is a kind-2 descriptor (a leaf, or an enum, which uses its own scratch), so its
+    // recursive call never touches this scratch — a nested object-with-shaped-fields sub-shape would need a
+    // recursion-safe buffer.
     int32_t base_n = d->nptr;
     int32_t* out = gc_live_scratch_ensure(base_n + d->nshaped);
     int32_t n = 0;
-    for (int32_t i = 0; i < base_n; i++) out[n++] = map[i];
+    for (int32_t i = 0; i < base_n; i++) out[n++] = flat[i];
     for (int32_t k = 0; k < d->nshaped; k++) {
-        int32_t field_off = map[base_n + 2 * k];
-        int32_t sub_id = map[base_n + 2 * k + 1];
+        int32_t field_off = flat[base_n + 2 * k];
+        int32_t sub_id = flat[base_n + 2 * k + 1];
         int32_t sub_cnt = 0;
         const int32_t* sub = nomu_gc_live_offsets((uint64_t)sub_id, (const uint8_t*)base + field_off, &sub_cnt);
         out = gc_live_scratch_ensure(n + sub_cnt);
@@ -1948,6 +1952,19 @@ int main(void) {
     int selfhost_alloc = runtime_selfhost || (gc_plan_env && strcmp(gc_plan_env, "nomu") == 0);
     // Scheduler self-hosted iff the umbrella selects it or the harness pinned NOMU_SCHED=nomu.
     int selfhost_sched = runtime_selfhost || (sched_env && strcmp(sched_env, "nomu") == 0);
+    // The other forbidden quadrant: the self-hosted scheduler's carriers and shadow stacks are walked only by
+    // the self-hosted collector, so a collecting MMTk plan cannot find their roots. The Nomu scheduler implies
+    // the Nomu collector: promote the allocator, and abort if a collecting MMTk plan was pinned. NoGC never
+    // collects, so it pairs with either scheduler.
+    if (selfhost_sched && !selfhost_alloc) {
+        if (gc_plan_env && strcmp(gc_plan_env, "nogc") != 0) {
+            fprintf(stderr, "nomu: (Nomu scheduler, MMTk collector '%s') is unsupported — the Nomu scheduler's "
+                            "roots are walked only by the Nomu collector. Use NOMU_RUNTIME=selfhost, or "
+                            "NOMU_GC_PLAN=nogc.\n", gc_plan_env);
+            abort();
+        }
+        if (!gc_plan_env) selfhost_alloc = 1;
+    }
     // The forbidden quadrant: a self-hosted allocator needs the Nomu stop-the-world/root-walk, so it
     // auto-promotes the scheduler. If the harness explicitly pinned the C scheduler, that pairing cannot
     // collect — abort rather than run an incoherent runtime.

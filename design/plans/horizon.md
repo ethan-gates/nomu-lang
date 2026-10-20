@@ -8,10 +8,11 @@ detail and status; this doc carries only the goals and their order. Everything n
 parallel/cheap work tracked in `tasks.md`.
 
 Two epics are live. **Epic A (self-hosted GC + runtime) is the active priority.** Its next run of work is
-the **modules build-out** beneath the MMTk benchmark, which needs programs large enough to be meaningful and
-the perf-affecting module capabilities real: dev-productivity first (explicit module builds, then the build
+retiring MMTk and the C scheduler (one runtime from here on), then GC correctness, then the **modules
+build-out** beneath the benchmark, which needs programs large enough to be meaningful and the
+perf-affecting module capabilities real: dev-productivity first (explicit module builds, then the build
 cache), then the perf-relevant capabilities (cross-module generics residuals, cross-module inlining). The
-GenImmix-vs-MMTk benchmark (with 158/159) sits above that, gating MMTk's retirement and the start of LXR.
+benchmark against Go and Swift (with 158/159) sits above that, when the language is complete.
 Epic B (strings) has only independent follow-ons left.
 
 ---
@@ -29,8 +30,8 @@ while changing the algorithm — so the two unknowns never multiply.
 
 ```
 127  LXR — RC-primary reclamation, on Immix backing                         ◀ end goal
-└── retire MMTk (kept live as the baseline until here)
-    └── 150  perf-benchmark GenImmix vs MMTk
+└── benchmark against Go and Swift (when the language is complete)
+    └── 150  self-hosted GC ladder
         ├── 158  GC packaging — self-contained plans behind one trigger protocol
         ├── 159  GC observability — collection tracing, stats, pause timing
         ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
@@ -38,12 +39,25 @@ while changing the algorithm — so the two unknowns never multiply.
         ├── 171  modules cleanup — cross-module generics residuals           (perf-accuracy)
         │        interacts with 170 (method-level generics), 118 (associated types)
         └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)
-            └── 190  explicit module builds — dep scan, one planned graph   ◀ next
+            └── 190  explicit module builds — dep scan, one planned graph
+                ├── 195  link-time GC frame index — 195.5 (driver-written signature) remains
+                └── 176  shaped GC roots — 176.5 one shape per type (GC correctness)
+                    └── 197  retire MMTk and the C scheduler — one runtime   ◀ next
 ```
 
-MMTk/GenImmix is the reference implementation each rung diffs against, which is what makes the incremental
-self-host tractable; MMTk stays live until the benchmark confirms the self-hosted collector. **The modules
-build-out sits on the LXR chain** because its purpose is a meaningful benchmark. It gates the benchmark two
+**Order of the next run:** 197, then 176.5, then 195.5, then 190, then 172, then 159. One runtime first, so
+the rest of the GC-correctness work is built and tested once; GC correctness then comes before the modules
+work (soundness is Nomu's first priority, `vision.md`); 190 closes only after all of 195 and 176.5.
+
+**What the benchmark needs from the language.** The goal is a language complete enough to benchmark against
+Go and Swift, with results that reflect the language, compiler, scheduling and memory as designed, and not
+gaps in them. MMTk retirement was decided without a GenImmix-vs-MMTk benchmark: it would only have measured
+distance, and keeping a second runtime doubled every GC change ([197](tasks/197-retire-mmtk-and-c-scheduler.md)).
+
+MMTk/GenImmix was the reference implementation each self-hosting rung diffed against; with the self-hosted
+runtime passing the suite on its own, 197 removes it, and [159](tasks/159-gc-observability.md)'s
+correctness matrix takes over the cross-check. **The modules build-out sits on the LXR chain** because its
+purpose is a meaningful benchmark. It gates the benchmark two
 ways:
 
 - **Dev-productivity** — [190](tasks/190-explicit-module-builds.md) (explicit module builds: one planned

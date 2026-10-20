@@ -1,0 +1,8 @@
+import pkg/lib
+
+fun main() {
+  let s = "seed".concat("-heap-string-xxxxxxxxxxxxxxxx")
+  print("bad ")
+  print(loopCheck(s, probe(s), 1000000))
+  print("\n")
+}

@@ -1,5 +1,6 @@
 import noir
 import support
+import ssair
 import Foundation
 import LLVM_C
 
@@ -132,40 +133,18 @@ final class LLVMGen {
     var structMap: [String: NOIRStruct] = [:]
     var structTypes: [String: LLVMTypeRef] = [:]
 
-    // Single-field shaped wrappers (task 121.1.1): struct names with exactly one stored field that is shaped
-    // (a `StringBase`, or itself such a wrapper), so the struct is byte-identical to the 16-byte shaped value.
-    // Its value is lowered as the field's type directly (two registers, the kind-2 descriptor) and rides the
-    // shaped-root path, inheriting `StringBase`'s treatment with no per-type code — `struct String { let base:
-    // StringBase }` is the motivating case. Memoized once `structMap` is populated (before any function is
-    // lowered). Mirrors `computeShapedStructs` in the `ssair` module (kept parallel like
-    // `transitivelyContainsShaped`), so the egress and the midend agree on the shaped set.
-    private var _shapedStructs: Set<String>?
-    var shapedStructs: Set<String> {
-        if let s = _shapedStructs { return s }
-        var set = Set<String>()
-        func fieldShaped(_ t: Type) -> Bool {
-            switch t {
-            case .stringBase:             return true
-            case .named(let n, .struct_): return set.contains(n)
-            default:                      return false
-            }
-        }
-        var changed = true
-        while changed {
-            changed = false
-            for (name, s) in structMap where !set.contains(name) {
-                if s.fields.count == 1, fieldShaped(s.fields[0].type) { set.insert(name); changed = true }
-            }
-        }
-        _shapedStructs = set
-        return set
-    }
+    // One shape per type (task 176.5): every shapedness and layout question the egress asks — whether a value
+    // is a shaped leaf or a wrapper of one, where an aggregate's managed and conditional words sit, how many
+    // slots a type fills — is answered by `shape(T)` over the module's struct and enum maps, the same
+    // derivation the SSAIR verifier reads. The lookups read the live maps, which only grow while lowering.
+    lazy var shapes: ShapeEnv = ShapeEnv(
+        structFields: { [unowned self] in self.structMap[$0]?.fields.map(\.type) },
+        enumCases: { [unowned self] in self.enumMap[$0]?.cases.map { $0.fields.map(\.type) } },
+        resolveOpaque: { [unowned self] in self.concreteUnderlying($0) })
 
-    // Whether `t` is a single-field shaped wrapper (above): its value is the 16-byte shaped representation.
-    func isShapedWrapper(_ t: Type) -> Bool {
-        if case .named(let n, .struct_) = t { return shapedStructs.contains(n) }
-        return false
-    }
+    // Whether `t` is a struct wrapping a shaped leaf (`struct String { let base: StringBase }`): byte-identical
+    // to the leaf, so it lowers to the leaf's type and rides the shaped-value path.
+    func isShapedWrapper(_ t: Type) -> Bool { shapes.isWrapper(t) }
     var enumMap: [String: NOIREnum] = [:]
     var enumTypes: [String: LLVMTypeRef] = [:]
     var classMap: [String: NOIRClass] = [:]
@@ -203,21 +182,20 @@ final class LLVMGen {
     var managedBufferMapIds: [String: UInt64] = [:]  // "Header$Element" → managed-buffer type-id (task 180)
     var valueDescIds: [String: UInt64] = [:]     // type description → value-layout descriptor id (VWT type_id, 100.4.7.4)
     // Frame-root shape ordinals (task 176.3): a shaped-containing value aggregate recorded in a deopt bundle
-    // carries an ordinal the walker maps to its descriptor through this object's `__nomu_shape_table`. Ordinal 0 is String;
-    // aggregates get 1+ in first-recorded order. `shapeOrdinalDescIds[i]` is ordinal `i+1`'s value-layout id.
+    // carries an ordinal the walker maps to its descriptor through this object's `__nomu_shape_table`. The shaped
+    // leaves take the first ordinals (`ShapeLeaf.allCases` order); aggregates follow in first-recorded order, so
+    // `shapeOrdinalDescIds[i]` is ordinal `ShapeLeaf.allCases.count + i`'s descriptor id.
     var shapeOrdinalForType: [String: Int32] = [:]
     var shapeOrdinalDescIds: [UInt64] = []
     // Enum shaped (kind-2) descriptors (task 176.3b): a discriminant-conditional value whose payload carries
     // managed/shaped content only in some cases. Keyed by descriptor id; serialized at `emitDescriptors`
     // (deferred, because a nested shaped sub-entry's id becomes a link-time section offset). `enumShapeIds`
-    // memoizes by type; `enumShapeInProgress` fails-stops a nested enum-in-enum payload (unsupported — it
-    // would alias the enumerator's recursion scratch).
+    // memoizes by enum name.
     var enumKind2Descs: [UInt64: (tagOff: Int32, tagShift: Int32,
                                   cases: [(tag: Int32, flat: [Int32], shaped: [(offset: Int32, shapeId: UInt64)])])] = [:]
     var enumShapeIds: [String: UInt64] = [:]
-    var enumShapeInProgress: Set<String> = []
     var anyBoxMapId: UInt64?                      // one shared map for every `any I` box (payload at byte 16)
-    var stringShapeMapId: UInt64?                 // one shared kind-2 shaped descriptor for every String (task 121/176)
+    var leafShapeIds: [ShapeLeaf: UInt64] = [:]   // one shared kind-2 descriptor per shaped leaf (task 176.5)
     var arrayHandleMapId: UInt64?                 // one shared type-id for every Array handle (bufptr at byte 16)
     var mailboxTypeId: UInt64?                    // one shared type-id for every mailbox object
 

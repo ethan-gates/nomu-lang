@@ -69,8 +69,10 @@ public struct Inline: SSAPass {
                       callee.params.count == c.args.count else {
                     out.append(inst); continue
                 }
+                // An argument may be an earlier spliced call's result in this pass (`f(g())`); bind the
+                // param to what that result was replaced by, so `subst` entries are always final values.
                 var vmap: [Int: SSAValue] = [:]
-                for (p, a) in zip(callee.params, c.args) { vmap[p.id] = a }
+                for (p, a) in zip(callee.params, c.args) { vmap[p.id] = subst[a.id] ?? a }
                 let body = callee.blocks[0]
                 for cinst in body.insts {
                     let kind = remapOperands(cinst.kind) { vmap[$0.id] ?? $0 }

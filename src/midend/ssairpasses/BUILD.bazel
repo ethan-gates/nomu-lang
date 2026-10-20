@@ -18,3 +18,10 @@ swift_test(
     srcs = glob(["tests/*.swift"]),
     deps = ["//src/support", "//src/frontend/ast", "//src/midend/ssair", "//src/inference", "//src/facts", ":ssairpasses"],
 )
+
+# The verifier, a shape consumer (task 176.5): read by `//src/midend/ssair:ssair_tests`'s direct-match check.
+filegroup(
+    name = "shape_consumers",
+    srcs = ["sources/SSAIRVerify.swift"],
+    visibility = ["//src/midend/ssair:__pkg__"],
+)

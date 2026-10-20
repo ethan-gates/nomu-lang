@@ -208,14 +208,16 @@ The budget is under 1 ms of GC setup for a 2M-line program. Any runtime build re
   - **Found along the way, not 195's:** a heap `String` held in a frame, alone or inside a struct, comes out
     wrong under self-hosted minor collections with a small nursery (`NOMU_RUNTIME=selfhost` with
     `NOMU_NURSERY_RESERVE=8`), as a single module too, with a different value each run; major-only and the
-    default nursery are correct. So the `-self` cases use pressure collection.
+    default nursery are correct. So the `-self` cases use pressure collection. Cause found and tracked as
+    [176](176-shaped-gc-roots.md) 176.5: the reload after a safepoint misses the `struct String` wrapper,
+    in both collectors; it predates 195.
 - **195.5 — the driver writes the ad-hoc signature.** Replace the `codesign` process with a code
   directory of SHA-256 page hashes written by the driver, as Go's linker does: no extra process, one hash
   of the file. Taken up once 195.2–195.4 work, with the signing cost measured.
 
 ## Dependencies & triggers
 
-- 190 depends on it: 190 closes after it.
+- 190 depends on all of it, 195.5 included: 190 closes after it.
 - See also [194](194-gc-frame-metadata.md) (whether to keep LLVM statepoints; the compact frame format).
 
 ## Refs

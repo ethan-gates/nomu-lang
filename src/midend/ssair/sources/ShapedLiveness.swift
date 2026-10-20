@@ -19,42 +19,6 @@ public struct ShapedLiveness {
     public let liveOutInst: [Int: [Set<Int>]]
 }
 
-// A *shaped* type is one whose value is the 16-byte bit-stealing shaped representation — `StringBase`, or a
-// **single-field struct that wraps a shaped value** (task 121.1.1). A single-field wrapper is
-// representationally identical to its field (one field at offset 0, the same 16 bytes, two registers), so it
-// is itself shaped: it rides the shaped-root path and takes the kind-2 descriptor directly, rather than the
-// frame-slot aggregate path a multi-field shaped-containing struct takes (task 176.3a). This is how
-// `struct String { let base: StringBase }` inherits `StringBase`'s treatment with no String-specific code; the
-// rule generalizes to any newtype over a shaped value. `shapedStructs` is the precomputed set of such wrapper
-// names (`computeShapedStructs`); it is empty when there is no struct context (the low-level liveness tests),
-// which leaves the predicate at its `StringBase`-only base case.
-public func isShapedType(_ t: Type, _ shapedStructs: Set<String> = []) -> Bool {
-    switch t {
-    case .stringBase:                 return true
-    case .named(let n, .struct_):     return shapedStructs.contains(n)
-    default:                          return false
-    }
-}
-
-// The single-field-shaped-wrapper set over a module's struct layouts: every struct with exactly one stored
-// field whose type is shaped (a `StringBase`, or itself such a wrapper). A fixpoint so a wrapper-over-a-wrapper
-// is included; iteration count is bounded by the struct count. A struct with zero or several stored fields is
-// never a wrapper (a multi-field struct holding a shaped field rides the aggregate path, task 176.3a).
-public func computeShapedStructs(_ structFields: [String: [Type]]) -> Set<String> {
-    var set = Set<String>()
-    var changed = true
-    while changed {
-        changed = false
-        for (name, fields) in structFields where !set.contains(name) {
-            if fields.count == 1, isShapedType(fields[0], set) {
-                set.insert(name)
-                changed = true
-            }
-        }
-    }
-    return set
-}
-
 // Liveness of a given set of SSA value ids — used for shaped-containing value-aggregate *slots* (task 176.3a):
 // which `stackAlloc` slots carrying shaped content are live across which safepoints, so the egress records
 // each live slot's base + aggregate shape there. Same backward dataflow as `computeShapedLiveness`, but the
@@ -117,8 +81,8 @@ public func isSafepointInst(_ k: SSAInstKind) -> Bool {
 }
 
 // The shaped-typed SSA value operands (uses) of an instruction.
-private func shapedUses(_ kind: SSAInstKind, _ shapedStructs: Set<String>) -> [SSAValue] {
-    func s(_ vs: SSAValue...) -> [SSAValue] { vs.filter { isShapedType($0.type, shapedStructs) } }
+private func shapedUses(_ kind: SSAInstKind, _ shapes: ShapeEnv) -> [SSAValue] {
+    func s(_ vs: SSAValue...) -> [SSAValue] { vs.filter { shapes.isShapedValue($0.type) } }
     switch kind {
     case .constInt, .constDouble, .constBool, .constString,
          .alloc, .stackAlloc, .spawnJoin, .funcAddr:
@@ -135,33 +99,33 @@ private func shapedUses(_ kind: SSAInstKind, _ shapedStructs: Set<String>) -> [S
         var vs = c.args
         if case .witness(let receiver, _, _) = c.kind { vs.append(receiver) }
         if case .indirect(let callee) = c.kind { vs.append(callee) }
-        return vs.filter { isShapedType($0.type, shapedStructs) }
+        return vs.filter { shapes.isShapedValue($0.type) }
     case .mailboxInit(let a):                      return s(a)
-    case .actorSend(let receiver, _, let args):   return (args + [receiver]).filter { isShapedType($0.type, shapedStructs) }
-    case .spawn(_, _, let env, _):                return [env].compactMap { $0 }.filter { isShapedType($0.type, shapedStructs) }
-    case .makeStruct(_, let fields):              return fields.filter { isShapedType($0.type, shapedStructs) }
-    case .makeEnum(_, _, let fields):             return fields.filter { isShapedType($0.type, shapedStructs) }
+    case .actorSend(let receiver, _, let args):   return (args + [receiver]).filter { shapes.isShapedValue($0.type) }
+    case .spawn(_, _, let env, _):                return [env].compactMap { $0 }.filter { shapes.isShapedValue($0.type) }
+    case .makeStruct(_, let fields):              return fields.filter { shapes.isShapedValue($0.type) }
+    case .makeEnum(_, _, let fields):             return fields.filter { shapes.isShapedValue($0.type) }
     case .extractField(let base, _):              return s(base)
     case .enumTag(let a):                          return s(a)
     case .extractPayload(let base, _, _):         return s(base)
     case .box(let value, _, _):                   return s(value)
-    case .arrayLit(let elements, _):              return elements.filter { isShapedType($0.type, shapedStructs) }
-    case .makeClosure(_, let env, _):             return [env].compactMap { $0 }.filter { isShapedType($0.type, shapedStructs) }
+    case .arrayLit(let elements, _):              return elements.filter { shapes.isShapedValue($0.type) }
+    case .makeClosure(_, let env, _):             return [env].compactMap { $0 }.filter { shapes.isShapedValue($0.type) }
     }
 }
 
-private func shapedUses(_ term: SSATermKind, _ shapedStructs: Set<String>) -> [SSAValue] {
+private func shapedUses(_ term: SSATermKind, _ shapes: ShapeEnv) -> [SSAValue] {
     switch term {
     case .br(_, let args):
-        return args.filter { isShapedType($0.type, shapedStructs) }
+        return args.filter { shapes.isShapedValue($0.type) }
     case .condBr(let cond, _, let thenArgs, _, let elseArgs):
-        return ([cond] + thenArgs + elseArgs).filter { isShapedType($0.type, shapedStructs) }
+        return ([cond] + thenArgs + elseArgs).filter { shapes.isShapedValue($0.type) }
     case .switchOn(let scrutinee, let cases, _, let defaultArgs):
         var vs = [scrutinee] + defaultArgs
         for c in cases { vs += c.args }
-        return vs.filter { isShapedType($0.type, shapedStructs) }
+        return vs.filter { shapes.isShapedValue($0.type) }
     case .ret(let v):
-        return v.flatMap { isShapedType($0.type, shapedStructs) ? [$0] : [] } ?? []
+        return v.flatMap { shapes.isShapedValue($0.type) ? [$0] : [] } ?? []
     case .unreachable:
         return []
     }
@@ -176,10 +140,11 @@ private func termSuccessors(_ term: SSATermKind) -> [Int] {
     }
 }
 
-// Backward dataflow to a fixpoint. Shaped values only; ids are enough for the consumer to key on.
-// `shapedStructs` (default empty) extends the shaped set to single-field shaped wrappers (task 121.1.1); with
-// it empty the tracked set is `StringBase` values alone, matching the pre-wrapper behavior exactly.
-public func computeShapedLiveness(_ f: SSAFunction, _ shapedStructs: Set<String> = []) -> ShapedLiveness {
+// Backward dataflow to a fixpoint. Shaped values only (`ShapeEnv.isShapedValue`: a shaped leaf or a wrapper of
+// one); ids are enough for the consumer to key on. With no type context (`shapes` defaulted, the low-level
+// liveness tests) no struct is a wrapper, so the tracked set is the leaves alone.
+public func computeShapedLiveness(_ f: SSAFunction,
+                                  _ shapes: ShapeEnv = ShapeEnv(structFields: { _ in nil }, enumCases: { _ in nil })) -> ShapedLiveness {
     // `prop` is the live-in propagated to predecessors (block params removed — a param is defined by the
     // incoming edge, not live-in). `entry` is live-at-entry *including* live params — the poll record set.
     var prop: [Int: Set<Int>] = [:]
@@ -194,19 +159,19 @@ public func computeShapedLiveness(_ f: SSAFunction, _ shapedStructs: Set<String>
         for b in f.blocks.reversed() {
             var cur = Set<Int>()
             for s in termSuccessors(b.terminator.kind) { cur.formUnion(prop[s] ?? []) }
-            cur.formUnion(shapedUses(b.terminator.kind, shapedStructs).map(\.id))
+            cur.formUnion(shapedUses(b.terminator.kind, shapes).map(\.id))
 
             var perInst = [Set<Int>](repeating: [], count: b.insts.count)
             for i in b.insts.indices.reversed() {
                 perInst[i] = cur                      // live immediately after inst i
-                if let r = b.insts[i].result, isShapedType(r.type, shapedStructs) { cur.remove(r.id) }
-                cur.formUnion(shapedUses(b.insts[i].kind, shapedStructs).map(\.id))
+                if let r = b.insts[i].result, shapes.isShapedValue(r.type) { cur.remove(r.id) }
+                cur.formUnion(shapedUses(b.insts[i].kind, shapes).map(\.id))
             }
             liveOutInst[b.id] = perInst
             entry[b.id] = cur                         // includes live params (the loop-header poll set)
 
             var p = cur
-            for bp in b.params where isShapedType(bp.type, shapedStructs) { p.remove(bp.id) }
+            for bp in b.params where shapes.isShapedValue(bp.type) { p.remove(bp.id) }
             if p != prop[b.id] {
                 prop[b.id] = p
                 changed = true
@@ -214,4 +179,97 @@ public func computeShapedLiveness(_ f: SSAFunction, _ shapedStructs: Set<String>
         }
     }
     return ShapedLiveness(liveInBlock: entry, liveOutInst: liveOutInst)
+}
+
+// The frame slots the collector must be told about (task 176.5), and how every slot-derived address maps to
+// its slot. A `stackAlloc` slot is recorded when its type has conditional content (managed words the
+// statepoint rewrite cannot see: a shaped leaf, an enum payload), or when its type has any managed word and
+// its address escapes — it, or an address derived from it (`fieldAddr`, `elementAddr`, a block parameter it
+// flows into), is an operand of any instruction other than a load, store or address computation through it.
+// A slot that does not escape is promoted to SSA by SROA, where the statepoint rewrite sees its plain managed
+// pointers; an escaped one stays in memory, where it does not. Recording every non-empty slot would block
+// SROA for every struct holding a reference.
+public struct RecordedSlots {
+    public let types: [Int: Type]            // recorded slot id → its type
+    public let root: [Int: Int]              // recorded slot, or an address derived from one → the slot id
+    // A block parameter that receives addresses of two different slots: its uses cannot be attributed to
+    // one slot. Reported as a compile error rather than recorded imprecisely.
+    public let ambiguous: [Int]
+
+    public init(types: [Int: Type] = [:], root: [Int: Int] = [:], ambiguous: [Int] = []) {
+        self.types = types; self.root = root; self.ambiguous = ambiguous
+    }
+
+    // The recorded slots a set of slot or slot-derived address ids refer to.
+    public func roots(_ ids: Set<Int>) -> Set<Int> { Set(ids.compactMap { root[$0] }) }
+}
+
+public func recordedSlots(_ f: SSAFunction, _ shapes: ShapeEnv) -> RecordedSlots {
+    var slotType: [Int: Type] = [:]
+    var root: [Int: Int] = [:]
+    for blk in f.blocks {
+        for inst in blk.insts {
+            if case .stackAlloc(let t) = inst.kind, let r = inst.result { slotType[r.id] = t; root[r.id] = r.id }
+        }
+    }
+    var paramsOf: [Int: [SSAValue]] = [:]
+    for blk in f.blocks { paramsOf[blk.id] = blk.params }
+    var ambiguous = Set<Int>()
+    // Derived addresses, to a fixpoint (block order need not be dominance order).
+    func flow(_ target: Int, _ args: [SSAValue]) -> Bool {
+        var grew = false
+        for (k, a) in args.enumerated() {
+            guard let s = root[a.id], let ps = paramsOf[target], k < ps.count else { continue }
+            let p = ps[k].id
+            if let have = root[p] { if have != s { ambiguous.insert(p) } }
+            else { root[p] = s; grew = true }
+        }
+        return grew
+    }
+    var changed = true
+    while changed {
+        changed = false
+        for blk in f.blocks {
+            for inst in blk.insts {
+                guard let r = inst.result, root[r.id] == nil else { continue }
+                switch inst.kind {
+                case .fieldAddr(let base, _), .elementAddr(let base, _):
+                    if let s = root[base.id] { root[r.id] = s; changed = true }
+                default: break
+                }
+            }
+            switch blk.terminator.kind {
+            case .br(let t, let args):
+                if flow(t, args) { changed = true }
+            case .condBr(_, let th, let ta, let el, let ea):
+                if flow(th, ta) { changed = true }
+                if flow(el, ea) { changed = true }
+            case .switchOn(_, let cases, let d, let da):
+                for c in cases where flow(c.target, c.args) { changed = true }
+                if flow(d, da) { changed = true }
+            case .ret, .unreachable:
+                break
+            }
+        }
+    }
+    var escaped = Set<Int>()
+    for blk in f.blocks {
+        for inst in blk.insts {
+            switch inst.kind {
+            case .load, .fieldAddr, .elementAddr:
+                continue   // reads through, or computes an address in, the slot
+            case .store(_, let value):
+                if let s = root[value.id] { escaped.insert(s) }   // the address itself stored somewhere
+            default:
+                _ = remapOperands(inst.kind) { if let s = root[$0.id] { escaped.insert(s) }; return $0 }
+            }
+        }
+        if case .ret(let v?) = blk.terminator.kind, let s = root[v.id] { escaped.insert(s) }
+    }
+    var types: [Int: Type] = [:]
+    for (id, t) in slotType {
+        if shapes.hasConditional(t) || (escaped.contains(id) && !shapes.shape(t).isEmpty) { types[id] = t }
+    }
+    return RecordedSlots(types: types, root: root.filter { types[$0.value] != nil },
+                         ambiguous: ambiguous.filter { root[$0].map { types[$0] != nil } ?? false }.sorted())
 }

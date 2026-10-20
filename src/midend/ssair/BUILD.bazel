@@ -18,4 +18,10 @@ swift_test(
     name = "ssair_tests",
     srcs = glob(["tests/*.swift"]),
     deps = ["//src/support", "//src/frontend/ast", "//src/frontend/noir", ":ssair"],
+    # The shape consumers the direct-match check reads (`ShapeConsumerTests`).
+    data = [
+        "sources/ShapedLiveness.swift",
+        "//src/llvmgen:shape_consumers",
+        "//src/midend/ssairpasses:shape_consumers",
+    ],
 )

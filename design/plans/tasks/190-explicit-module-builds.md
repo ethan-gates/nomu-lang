@@ -434,7 +434,9 @@ pinned workspace.
   (embedded `nomu` workspace).
 - Precedes 172: the cache keys on 190's jobs.
 - Precedes 191: threaded execution schedules 190's jobs.
-- Depends on [195](195-link-time-gc-frame-index.md): GC stack scanning across objects (190.6 F1).
+- Depends on all of [195](195-link-time-gc-frame-index.md), 195.5 included: GC stack scanning across objects (190.6 F1).
+- Depends on [176](176-shaped-gc-roots.md) 176.5: one shape per type (stale `String` buffer pointers after a moving
+  collection). GC correctness is soundness, Nomu's first priority, so 190 closes after both.
 
 ## Refs
 

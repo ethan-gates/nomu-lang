@@ -96,15 +96,21 @@ fun rtObjHash(obj: RawPtr, tid: Int) -> Int {
     h = h + ecap
     let stride = RawPtr.gcTypeStride(tid)
     let elemStart = rtBufElemStart(tid)
+    let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
     var e = 0
     while e < ecap {
       let elemBase = elemStart + e * stride
+      let elemPtr = obj.advanced(by: elemBase)
+      var en = nptr
+      if elemShaped {
+        en = RawPtr.gcLiveCount(tid, elemPtr)
+      }
       var w = 0
       while w < stride {
         var managed = false
         var i = 0
-        while i < nptr {
-          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        while i < en {
+          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
           if off == w {
             managed = true
           }
@@ -201,11 +207,17 @@ fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
         hk = hk + 1
       }
       var e = 0
+      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap {
         let elemBase = elemStart + e * stride
+        let elemPtr = obj.advanced(by: elemBase)
+        var en = nptr
+        if elemShaped {
+          en = RawPtr.gcLiveCount(tid, elemPtr)
+        }
         var i = 0
-        while i < nptr {
-          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        while i < en {
+          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
@@ -1494,11 +1506,17 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
         hk = hk + 1
       }
       var e = 0
+      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap {
         let elemBase = elemStart + e * stride
+        let elemPtr = obj.advanced(by: elemBase)
+        var en = nptr
+        if elemShaped {
+          en = RawPtr.gcLiveCount(tid, elemPtr)
+        }
         var i = 0
-        while i < nptr {
-          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        while i < en {
+          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
@@ -1644,11 +1662,17 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
         hk = hk + 1
       }
       var ee = 0
+      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
       while ee < ecap2 {
         let elemBase = elemStart + ee * stride2
+        let elemPtr = obj.advanced(by: elemBase)
+        var en = nptr
+        if elemShaped {
+          en = RawPtr.gcLiveCount(tid, elemPtr)
+        }
         var i2 = 0
-        while i2 < nptr {
-          let off2 = RawPtr.gcLiveOffsetAt(tid, obj, i2)
+        while i2 < en {
+          let off2 = RawPtr.gcLiveOffsetAt(tid, elemPtr, i2)
           let at = elemBase + off2
           let child2: RawPtr = obj.load(fromByteOffset: at)
           if rtUnmarkIfMarked(child2) {
@@ -1765,11 +1789,17 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
         hk = hk + 1
       }
       var e = 0
+      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap2 {
         let elemBase = elemStart + e * stride2
+        let elemPtr = obj.advanced(by: elemBase)
+        var en = nptr
+        if elemShaped {
+          en = RawPtr.gcLiveCount(tid, elemPtr)
+        }
         var i = 0
-        while i < nptr {
-          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        while i < en {
+          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
@@ -1905,11 +1935,17 @@ fun rtImmixUnmark(root: RawPtr) {
         hk = hk + 1
       }
       var e = 0
+      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap {
         let elemBase = elemStart + e * stride
+        let elemPtr = obj.advanced(by: elemBase)
+        var en = nptr
+        if elemShaped {
+          en = RawPtr.gcLiveCount(tid, elemPtr)
+        }
         var i = 0
-        while i < nptr {
-          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        while i < en {
+          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           if rtUnmarkIfMarked(child) {
@@ -1982,11 +2018,17 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
         hk = hk + 1
       }
       var e = 0
+      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap {
         let elemBase = elemStart + e * stride
+        let elemPtr = obj.advanced(by: elemBase)
+        var en = nptr
+        if elemShaped {
+          en = RawPtr.gcLiveCount(tid, elemPtr)
+        }
         var i = 0
-        while i < nptr {
-          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        while i < en {
+          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           if rtUnmarkIfMarked(child) {
@@ -2253,11 +2295,17 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
         hk = hk + 1
       }
       var e = 0
+      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap2 {
         let elemBase = elemStart + e * stride2
+        let elemPtr = obj.advanced(by: elemBase)
+        var en = nptr
+        if elemShaped {
+          en = RawPtr.gcLiveCount(tid, elemPtr)
+        }
         var i = 0
-        while i < nptr {
-          let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        while i < en {
+          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
@@ -2527,11 +2575,17 @@ fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
       hk = hk + 1
     }
     var e = 0
+    let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
     while e < ecap {
       let elemBase = elemStart + e * stride
+      let elemPtr = obj.advanced(by: elemBase)
+      var en = nptr
+      if elemShaped {
+        en = RawPtr.gcLiveCount(tid, elemPtr)
+      }
       var i = 0
-      while i < nptr {
-        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+      while i < en {
+        let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
         count = rtMinorForward(space, obj.advanced(by: elemBase + off), q, count)
         i = i + 1
       }

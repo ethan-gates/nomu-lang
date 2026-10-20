@@ -1,0 +1,9 @@
+import pkg/lib
+
+fun main() {
+  let u = make(7)
+  print(u.v)
+  print(" ")
+  print(getV(u))
+  print("\n")
+}

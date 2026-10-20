@@ -14,7 +14,7 @@ extension LLVMGen {
         // directly (task 121.1.1) — `struct String` is `strTy`, not `{ strTy }`. This is what lets a wrapper
         // value stay a two-register shaped SSA value on the shaped-root path (its `makeStruct`/`extractField`
         // are identity in the egress) instead of a nested aggregate forced to a frame slot.
-        if shapedStructs.contains(name), let ft = llvmType(s.fields[0].type, s.fields[0].span) {
+        if isShapedWrapper(.named(name, .struct_)), let ft = llvmType(s.fields[0].type, s.fields[0].span) {
             structTypes[name] = ft
             return ft
         }
@@ -22,7 +22,7 @@ extension LLVMGen {
         structTypes[name] = st   // cache before filling (value structs never self-nest, but be safe)
         var elems: [LLVMTypeRef] = []
         for f in s.fields {
-            guard let ft = llvmType(f.type, f.span) else { return nil }
+            guard let ft = fieldStorageType(f.type, f.span) else { return nil }
             elems.append(ft)
         }
         // A zero-field struct (e.g. a method-only `Time`) would lower to LLVM's empty type `{}`, which
@@ -31,6 +31,40 @@ extension LLVMGen {
         if elems.isEmpty { elems.append(i8) }
         setStructBody(st, elems)
         return st
+    }
+
+    // The LLVM type of a field inside an aggregate (struct, class, actor, enum case). Every Nomu layout
+    // reads fields as whole 8-byte slots (`slotCount`: the GC descriptors, enum payloads, array strides, the
+    // erased path's offsets), so a field narrower than a slot is stored widened to one. Its register type
+    // stays narrow (`llvmType`); `toFieldStorage`/`fromFieldStorage` convert at `insertvalue`/`extractvalue`.
+    // A load or store through a field address keeps the narrow type, which reads or writes the slot's low
+    // bytes (little-endian targets). `checkSlotLayout` rejects any aggregate whose LLVM layout differs.
+    func fieldStorageType(_ t: Type, _ span: Span) -> LLVMTypeRef? {
+        switch smallFieldBase(t) {
+        case .bool, .uint8: return i64
+        default:            return llvmType(t, span)
+        }
+    }
+
+    // A `some I` field stores its concrete underlying type, so a small underlying widens too.
+    private func smallFieldBase(_ t: Type) -> Type {
+        if case .opaque = t { return concreteUnderlying(t) }
+        return t
+    }
+
+    func toFieldStorage(_ v: LLVMValueRef, _ t: Type) -> LLVMValueRef {
+        switch smallFieldBase(t) {
+        case .bool, .uint8: return LLVMBuildZExt(b, v, i64, "fld.wide")!
+        default:            return v
+        }
+    }
+
+    func fromFieldStorage(_ v: LLVMValueRef, _ t: Type) -> LLVMValueRef {
+        switch smallFieldBase(t) {
+        case .bool:  return LLVMBuildTrunc(b, v, i1, "fld.narrow")!
+        case .uint8: return LLVMBuildTrunc(b, v, i8, "fld.narrow")!
+        default:     return v
+        }
     }
 
     func llvmType(_ t: Type, _ span: Span) -> LLVMTypeRef? {
@@ -93,7 +127,7 @@ extension LLVMGen {
         classTypes[name] = ct
         var elems: [LLVMTypeRef] = [i64]   // ObjectHeader
         for f in c.fields {
-            guard let ft = llvmType(f.type, f.span) else { return nil }
+            guard let ft = fieldStorageType(f.type, f.span) else { return nil }
             elems.append(ft)
         }
         setStructBody(ct, elems)
@@ -110,7 +144,7 @@ extension LLVMGen {
         actorTypes[name] = at
         var elems: [LLVMTypeRef] = [i64]   // ObjectHeader
         for f in a.fields {
-            guard let ft = llvmType(f.type, f.span) else { return nil }
+            guard let ft = fieldStorageType(f.type, f.span) else { return nil }
             elems.append(ft)
         }
         elems.append(p1)   // mailbox
@@ -148,7 +182,7 @@ extension LLVMGen {
     func caseStructType(_ enumName: String, _ c: NOIREnumCase) -> LLVMTypeRef? {
         var elems: [LLVMTypeRef] = []
         for f in c.fields {
-            guard let t = llvmType(f.type, f.span) else { return nil }
+            guard let t = fieldStorageType(f.type, f.span) else { return nil }
             elems.append(t)
         }
         return structTy(elems)
@@ -160,21 +194,8 @@ extension LLVMGen {
     // stack-allocated closure env holding only such captures needs no barrier or stack-map scanning.
     func isScalarLeaf(_ ty: LLVMTypeRef) -> Bool { ty == i64 || ty == f64 || ty == i1 }
 
-    // 8-byte slots a value occupies in an enum payload. Every supported leaf is 8-aligned.
-    func slotCount(_ t: Type) -> Int {
-        switch t {
-        case .int, .uint8, .uint64, .double, .bool: return 1
-        case .rawPtr, .ptr: return 1   // an addrspace(0) pointer word (task 125)
-        case .stringBase:     return 2
-        case .function:   return 1   // a managed pointer to a heap { fn, caps… } box (8.4.1)
-        case .existential, .composition: return 1   // a managed pointer to a heap { witness, payload } box
-        case .opaque:     return slotCount(concreteUnderlying(t))
-        case .named(_, .class_), .named(_, .actor_): return 1   // a pointer
-        case .named(let n, .struct_): return structMap[n]?.fields.reduce(0) { $0 + slotCount($1.type) } ?? 1
-        case .named(let n, .enum_):   return 1 + (enumMap[n]?.cases.map { caseSlots($0) }.max() ?? 0)
-        default: return 1
-        }
-    }
+    // 8-byte slots a value occupies: the layout every component shares (`ShapeEnv.slots`).
+    func slotCount(_ t: Type) -> Int { shapes.slots(t) }
 
     func typeMethods(_ typeName: String) -> [NOIRFunc] {
         structMap[typeName]?.methods ?? enumMap[typeName]?.methods ?? classMap[typeName]?.methods ?? []

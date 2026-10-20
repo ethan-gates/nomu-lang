@@ -2,6 +2,7 @@ import noir
 import ast
 import support
 import LLVM_C
+import ssair
 
 // M6 GC pointer-map machinery (moved into the shared emitter, ssair.md): assign a type-id +
 // managed-field offset map to each heap type (class/actor/closure/`any`-box/array-buffer/mailbox),
@@ -25,14 +26,15 @@ extension LLVMGen {
 
     // Register an array-buffer type-id: `elementOffsets` are the managed-pointer byte offsets within
     // one element, `stride` its byte size (total size comes from `cap`/`len` at run time).
-    func registerArrayMap(_ elementOffsets: [Int32], stride: Int32, symbol: String, foldable: Bool) -> UInt64 {
+    func registerArrayMap(_ elementOffsets: [Int32], stride: Int32, symbol: String, foldable: Bool,
+                          shaped: [(offset: Int32, shapeId: UInt64)] = []) -> UInt64 {
         let id = UInt64(typeMaps.count)
         typeMaps.append(elementOffsets)
         typeSizes.append(0)
         typeKinds.append(1)      // array
         typeStrides.append(stride)
         typeSymbols.append((symbol, foldable))
-        typeShaped.append([])    // array-element shaped fields are a later cut (step 5 / 176.2)
+        typeShaped.append(shaped)   // each element's shaped fields, enumerated per element
         typeHeaderSizes.append(0)   // a plain array buffer has no user header (the empty-header case, task 180)
         typeHeaderMaps.append([])
         return id
@@ -45,14 +47,15 @@ extension LLVMGen {
     // offsets are emitted as the prefix of the pointer map, before the element offsets. A `ManagedBuffer`
     // instance uses this; the plain array buffer stays the `headerSize = 0` case via `registerArrayMap`.
     func registerBufferMap(headerSize: Int32, headerOffsets: [Int32], elementOffsets: [Int32],
-                           stride: Int32, symbol: String, foldable: Bool) -> UInt64 {
+                           stride: Int32, symbol: String, foldable: Bool,
+                           shaped: [(offset: Int32, shapeId: UInt64)] = []) -> UInt64 {
         let id = UInt64(typeMaps.count)
         typeMaps.append(elementOffsets)
         typeSizes.append(0)
         typeKinds.append(1)      // buffer (kind 1, generalized with a header)
         typeStrides.append(stride)
         typeSymbols.append((symbol, foldable))
-        typeShaped.append([])
+        typeShaped.append(shaped)   // each element's shaped fields, enumerated per element
         typeHeaderSizes.append(headerSize)
         typeHeaderMaps.append(headerOffsets)
         return id
@@ -115,46 +118,26 @@ extension LLVMGen {
         let fieldTypes: [Type] = classMap[name].map { $0.fields.map(\.type) }
             ?? actorMap[name].map { $0.fields.map(\.type) } ?? []
         let isActor = actorMap[name] != nil
-        var offsets: [Int32] = []
-        var shaped: [(offset: Int32, shapeId: UInt64)] = []
-        var slot = 1   // header occupies slot 0; fields (and the actor's trailing mailbox) follow
-        for ft in fieldTypes {
-            collectManagedOffsets(ft, baseSlot: slot, into: &offsets, shaped: &shaped)
-            slot += slotCount(ft)
-        }
-        if isActor { offsets.append(Int32(slot * 8)) }   // trailing mailbox pointer is scanned
+        var d = descriptorEntries(shapes.fieldsShape(fieldTypes, base: 8))   // header is slot 0; fields follow
+        let slot = 1 + fieldTypes.reduce(0) { $0 + slotCount($1) }
+        if isActor { d.offsets.append(Int32(slot * 8)) }   // trailing mailbox pointer is scanned
         let totalSlots = slot + (isActor ? 1 : 0)
-        let id = registerMap(offsets, sizeBytes: Int32(totalSlots * 8),
-                             symbol: descSymbol(name), foldable: true, shaped: shaped)
+        let id = registerMap(d.offsets, sizeBytes: Int32(totalSlots * 8),
+                             symbol: descSymbol(name), foldable: true, shaped: d.shaped)
         typeIds[name] = id
         return id
     }
 
-    // Type-id for a fused closure object `{ header, fn, caps… }`: managed captures (scalar `p1`) are
-    // scanned, `fn` (addr0) is skipped. Each closure site is its own shape, so a fresh map per closure.
-    func closureTypeId(_ caps: [Capture]) -> UInt64 {
-        var offsets: [Int32] = []
-        var slot = 2   // header(0) + fn(1); captures follow
-        for cap in caps {
-            if cap.local.ty == p1 { offsets.append(Int32(slot * 8)) }
-            slot += abiSlots(cap.local.ty)
-        }
-        // Each closure site is a distinct shape; a uniquified local symbol never folds across modules.
-        return registerMap(offsets, sizeBytes: Int32(slot * 8),
-                           symbol: descSymbol("closure_\(typeMaps.count)"), foldable: false)
-    }
-
-    // The shared shaped descriptor for every `String` value (task 121 / 176): a 16-byte bit-stealing
-    // `{ i64 word0, i64 word1 }` whose `word0` is a managed buffer pointer only in the `heap` case. The
-    // discriminant is the top nibble of `word1` (`tagOff 8, tagShift 60`): `small = 0`, `immortal = 1`,
-    // `heap = 2`. Only `heap` carries a managed, relocatable pointer (at offset 0); `small` holds inline
-    // bytes and `immortal` points at never-moved immortal space, so both contribute no managed offset.
-    func stringShapeId() -> UInt64 {
-        if let id = stringShapeMapId { return id }
-        let id = registerShapedMap(tagOff: 8, tagShift: 60, sizeBytes: 16,
-                                   cases: [(tag: 2, offsets: [0])],
-                                   symbol: descSymbol("string"), foldable: true)
-        stringShapeMapId = id
+    // The kind-2 descriptor for a shaped leaf, built from the leaf registry (`ShapeLeaf`): the discriminant's
+    // word and shift, and the managed word offsets under each tag that has any. For `StringBase`: tag in
+    // `word1`'s top bits (`immortal = 0`, `small = 1`, `heap = 2`), `word0` managed only in the `heap` case.
+    func leafShapeId(_ leaf: ShapeLeaf) -> UInt64 {
+        if let id = leafShapeIds[leaf] { return id }
+        let id = registerShapedMap(tagOff: Int32(leaf.tagOffset), tagShift: Int32(leaf.tagShift),
+                                   sizeBytes: Int32(leaf.slots * 8),
+                                   cases: leaf.managedCases.map { (tag: Int32($0.tag), offsets: $0.offsets.map(Int32.init)) },
+                                   symbol: descSymbol(leaf.name), foldable: true)
+        leafShapeIds[leaf] = id
         return id
     }
 
@@ -178,11 +161,10 @@ extension LLVMGen {
     // (shifted past slot 0). A managed result is scanned so it survives + is fixed up too. One shape per result
     // type; the set is small, so a fresh map per call is fine.
     func spawnBoxTypeId(_ t: Type) -> UInt64 {
-        var offsets: [Int32] = []
-        collectManagedOffsets(t, baseSlot: 1, into: &offsets)   // result at slot 1 (header is slot 0)
+        let d = descriptorEntries(shapes.shape(t).shifted(by: 8))   // result at slot 1 (header is slot 0)
         let slots = 1 + slotCount(t)
-        return registerMap(offsets, sizeBytes: Int32(slots * 8),
-                           symbol: descSymbol("spawnbox_\(t.description)"), foldable: true)
+        return registerMap(d.offsets, sizeBytes: Int32(slots * 8),
+                           symbol: descSymbol("spawnbox_\(t.description)"), foldable: true, shaped: d.shaped)
     }
 
     // The shared type-id for every mailbox object `{ header, mb_head, mb_tail, scheduled, sched_next }`:
@@ -207,10 +189,9 @@ extension LLVMGen {
     func arrayBufTypeId(_ elem: Type) -> UInt64 {
         let key = elem.description
         if let id = arrayBufMapIds[key] { return id }
-        var elemOffsets: [Int32] = []
-        collectManagedOffsets(elem, baseSlot: 0, into: &elemOffsets)
-        let id = registerArrayMap(elemOffsets, stride: Int32(arrayElemStride(elem)),
-                                  symbol: descSymbol("arraybuf_\(key)"), foldable: true)
+        let d = descriptorEntries(shapes.shape(elem))
+        let id = registerArrayMap(d.offsets, stride: Int32(arrayElemStride(elem)),
+                                  symbol: descSymbol("arraybuf_\(key)"), foldable: true, shaped: d.shaped)
         arrayBufMapIds[key] = id
         return id
     }
@@ -220,21 +201,25 @@ extension LLVMGen {
     // The managed-buffer type-id for `ManagedBuffer<Header, Element>` (task 180): a kind-1 buffer whose
     // header is `Header` (byte size + managed map) and whose elements are `Element` (packed stride +
     // managed map). `headerSize` is `Header`'s value-layout byte size (elements begin at `16 + headerSize`);
-    // the header/element managed offsets come from `collectManagedOffsets` exactly as the array buffer
+    // the header/element managed offsets come from `shape(T)` exactly as the array buffer
     // derives its element map. Element stride is the packed natural size (`rawStride` — `UInt8` → 1, a
     // reference → 8), the footprint-dense model (180's stride decision), distinct from the array buffer's
     // 8-slot `arrayElemStride`. Registered once per `(Header, Element)` pair.
     func managedBufferTypeId(header: Type, element: Type) -> UInt64 {
         let key = header.description + "$" + element.description
         if let id = managedBufferMapIds[key] { return id }
-        var headerOffsets: [Int32] = []
-        collectManagedOffsets(header, baseSlot: 0, into: &headerOffsets)
-        var elemOffsets: [Int32] = []
-        collectManagedOffsets(element, baseSlot: 0, into: &elemOffsets)
+        let headerShape = shapes.shape(header)
+        if !headerShape.conditional.isEmpty {
+            // A header is scanned once through plain offsets; a shaped header would need its own entry list.
+            fail("ManagedBuffer header \(header) holds conditional content (a String or a managed enum), which buffer descriptors do not scan", zeroSpan)
+        }
+        let headerOffsets = headerShape.managed.map(Int32.init)
+        let elem = descriptorEntries(shapes.shape(element))
+        let elemOffsets = elem.offsets
         let id = registerBufferMap(headerSize: Int32(slotCount(header) * 8),
                                    headerOffsets: headerOffsets, elementOffsets: elemOffsets,
                                    stride: Int32(rawStride(element)),
-                                   symbol: descSymbol("managedbuffer_\(key)"), foldable: true)
+                                   symbol: descSymbol("managedbuffer_\(key)"), foldable: true, shaped: elem.shaped)
         managedBufferMapIds[key] = id
         return id
     }
@@ -263,49 +248,48 @@ extension LLVMGen {
         // buffer (the `kind 0` + `nshaped` fold the shared enumerator already recurses). Discarding them
         // would leave a `String` inside an erased `T` invisible to the typed-root walk (the erased-generic
         // shaped typed-root gap — `internals/gc-model-upgrade.md`).
-        var offsets: [Int32] = []
-        var shaped: [(offset: Int32, shapeId: UInt64)] = []
-        collectManagedOffsets(t, baseSlot: 0, into: &offsets, shaped: &shaped)
-        let id = registerMap(offsets, sizeBytes: Int32(slotCount(t) * 8),
-                             symbol: descSymbol("val_\(key)"), foldable: true, shaped: shaped)
+        let d = descriptorEntries(shapes.shape(t))
+        let id = registerMap(d.offsets, sizeBytes: Int32(slotCount(t) * 8),
+                             symbol: descSymbol("val_\(key)"), foldable: true, shaped: d.shaped)
         valueDescIds[key] = id
         return id
     }
 
-    // The frame-root shape ordinal for a value recorded in a deopt bundle (task 176.3). String is ordinal 0
-    // (its kind-2 descriptor); a shaped-containing value aggregate gets the next ordinal and its value-layout
-    // descriptor registered, so this object's `__nomu_shape_table` resolves it. The ordinal is a compile-time
-    // i32 constant the stackmap can hold; the descriptor's section offset (a link-time value it cannot hold)
-    // lives in the table. Ordinals are numbered per object, so they mean something only with their object's
-    // table.
+    // The frame-root shape ordinal for a value recorded in a deopt bundle (task 176.3). The shaped leaves take
+    // the first ordinals, in registry order (`String` is 0), and a wrapper takes its leaf's; any other recorded
+    // type gets the next ordinal and its descriptor registered, so this object's `__nomu_shape_table` resolves
+    // it. The ordinal is a compile-time i32 constant the stackmap can hold; the descriptor's section offset (a
+    // link-time value it cannot hold) lives in the table. Ordinals are numbered per object, so they mean
+    // something only with their object's table.
     func shapeOrdinal(_ t: Type) -> Int32 {
-        if case .stringBase = t { return 0 }
-        // A single-field shaped wrapper takes its field's ordinal (task 121.1.1): `struct String` is shaped
-        // ordinal 0, the string kind-2 descriptor, exactly like the `StringBase` it wraps.
-        if isShapedWrapper(t), case .named(let n, .struct_) = t, let f = structMap[n]?.fields.first {
-            return shapeOrdinal(f.type)
-        }
+        if let leaf = shapes.leaf(t) { return Int32(ShapeLeaf.allCases.firstIndex(of: leaf)!) }
         let key = t.description
         if let o = shapeOrdinalForType[key] { return o }
-        // An enum value's shape is its kind-2 descriptor (discriminant-conditional); any other aggregate uses
-        // its flat value-layout descriptor (task 176.3a/.3b).
-        let desc: UInt64 = { if case .named(_, .enum_) = t { return enumShapeDescId(t) } else { return valueDescId(t) } }()
+        // An enum value's descriptor is its kind-2 enum descriptor (discriminant-conditional); any other
+        // aggregate uses its flat value-layout descriptor (task 176.3a/.3b).
+        let desc: UInt64 = {
+            if case .named(let n, .enum_) = t, let c = shapes.shape(t).conditional.first,
+               case .enumCases(_, let cases) = c.kind {
+                return enumShapeDescId(n, cases)
+            }
+            return valueDescId(t)
+        }()
+        let ord = Int32(ShapeLeaf.allCases.count + shapeOrdinalDescIds.count)
         shapeOrdinalDescIds.append(desc)
-        let ord = Int32(shapeOrdinalDescIds.count)   // 1-based; ordinal i resolves to shapeOrdinalDescIds[i-1]
         shapeOrdinalForType[key] = ord
         return ord
     }
 
     // Emit this object's `__nomu_shape_table` — the ordinal→descriptor-offset table for the shape ordinals
-    // in its stackmap records (task 176.3): word 0 is the ordinal count, then one entry per ordinal. Ordinal
-    // 0 is the String kind-2 descriptor; ordinal i>0 is the i-th recorded aggregate's value-layout descriptor.
+    // in its stackmap records (task 176.3): word 0 is the ordinal count, then one entry per ordinal: the
+    // shaped leaves' kind-2 descriptors first (`String` is ordinal 0), then each recorded aggregate's.
     // The entries are link-time offsets from the `__nomu_descs` section start (the `type_id`
     // `nomu_gc_live_offsets` consumes). Local to the object and kept from dead stripping (`llvm.used`): the
     // driver's frame index (task 195) points each object's stackmap records at its own table, found by this
-    // name and the object in the link map. Its references also keep the String descriptor, which no object
+    // name and the object in the link map. Its references also keep the leaf descriptors, which no object
     // header stamps, from being stripped.
     func emitShapeOrdinalTable() {
-        var entries: [LLVMValueRef?] = [descOffsetHeader(stringShapeId())]
+        var entries: [LLVMValueRef?] = ShapeLeaf.allCases.map { descOffsetHeader(leafShapeId($0)) }
         for d in shapeOrdinalDescIds { entries.append(descOffsetHeader(d)) }
         entries.insert(LLVMConstInt(i64, UInt64(entries.count), 0), at: 0)
         let count = UInt64(entries.count)
@@ -334,79 +318,39 @@ extension LLVMGen {
         }
     }
 
-    // Append the byte offsets of managed (`p1`) pointers within a field of type `t` laid out starting at
-    // `baseSlot`, and the byte offsets of *shaped* fields (a `String`, or an `enum` whose payload is managed
-    // only in some cases) into `shaped` with their sub-shape's type-id. Recurses into inline value structs.
-    // A `String` field becomes a shaped entry the collector recurses into (task 176 Stage 1 site 2); an enum
-    // field with conditional managed content becomes a nested kind-2 shaped entry (task 176.3b).
-    func collectManagedOffsets(_ t: Type, baseSlot: Int, into offsets: inout [Int32],
-                               shaped: inout [(offset: Int32, shapeId: UInt64)]) {
-        switch t {
-        case .named(_, .class_), .named(_, .actor_), .function, .existential, .composition, .array:
-            offsets.append(Int32(baseSlot * 8))
-        case .stringBase:
-            shaped.append((Int32(baseSlot * 8), stringShapeId()))
-        case .named(let n, .struct_):
-            var s = baseSlot
-            for sf in (structMap[n]?.fields ?? []) {
-                collectManagedOffsets(sf.type, baseSlot: s, into: &offsets, shaped: &shaped)
-                s += slotCount(sf.type)
+    // A shape as descriptor entries: its plain managed offsets, and each conditional sub-value as an
+    // `(offset, sub-descriptor id)` pair the shared enumerator recurses into — a leaf's kind-2 descriptor, or an
+    // enum's (task 176.5).
+    func descriptorEntries(_ s: Shape) -> (offsets: [Int32], shaped: [(offset: Int32, shapeId: UInt64)]) {
+        var shaped: [(offset: Int32, shapeId: UInt64)] = []
+        for c in s.conditional {
+            switch c.kind {
+            case .leaf(let leaf):
+                shaped.append((Int32(c.offset), leafShapeId(leaf)))
+            case .enumCases(let name, let cases):
+                shaped.append((Int32(c.offset), enumShapeDescId(name, cases)))
             }
-        case .named(let n, .enum_):
-            guard enumHasManagedOrShaped(t) else { break }   // a plain-data enum carries nothing
+        }
+        return (s.managed.map(Int32.init), shaped)
+    }
+
+    // The kind-2 descriptor for an enum with managed content in some cases (task 176.3b): tag is the case
+    // index at offset 0; each case's entries come from its payload shape (`ShapeCase`, offsets from the enum's
+    // start). Memoized by enum name.
+    func enumShapeDescId(_ name: String, _ shapeCases: [ShapeCase]) -> UInt64 {
+        if let id = enumShapeIds[name] { return id }
+        var cases: [(tag: Int32, flat: [Int32], shaped: [(offset: Int32, shapeId: UInt64)])] = []
+        for c in shapeCases {
             // A nested enum-in-enum payload would alias the enumerator's recursion scratch; fail-stop rather
             // than scan it unsoundly (task 176.3b — the deferred half).
-            if !enumShapeInProgress.isEmpty {
-                fail("176.3b: an enum payload that itself contains a managed enum (\(n)) is not yet supported", zeroSpan)
-                break
+            if c.shape.conditional.contains(where: { if case .enumCases = $0.kind { return true }; return false }) {
+                fail("176.3b: an enum payload that itself contains a managed enum (\(name)) is not yet supported", zeroSpan)
+                continue
             }
-            shaped.append((Int32(baseSlot * 8), enumShapeDescId(t)))
-        case .opaque:
-            collectManagedOffsets(concreteUnderlying(t), baseSlot: baseSlot, into: &offsets, shaped: &shaped)
-        default:
-            break   // int, bool
+            let d = descriptorEntries(c.shape)
+            cases.append((tag: Int32(c.tag), flat: d.offsets, shaped: d.shaped))
         }
-    }
-
-    // Whether a type transitively carries a managed pointer or shaped value — used to decide if an enum case
-    // (or an enum field) contributes to a descriptor. Pure predicate (builds no descriptor), so it is safe to
-    // call while a descriptor is mid-construction. A value graph can only recurse through a reference (which
-    // short-circuits to `true`), so the recursion is bounded.
-    func enumHasManagedOrShaped(_ t: Type) -> Bool {
-        switch t {
-        case .stringBase, .named(_, .class_), .named(_, .actor_), .function, .existential, .composition, .array:
-            return true
-        case .named(let n, .struct_):
-            return (structMap[n]?.fields ?? []).contains { enumHasManagedOrShaped($0.type) }
-        case .named(let n, .enum_):
-            return (enumMap[n]?.cases ?? []).contains { $0.fields.contains { enumHasManagedOrShaped($0.type) } }
-        case .opaque:
-            return enumHasManagedOrShaped(concreteUnderlying(t))
-        default:
-            return false
-        }
-    }
-
-    // The kind-2 shaped descriptor for an `enum` whose payload is managed/shaped only in some cases (task
-    // 176.3b). Tag is the case index at offset 0; each case's managed/shaped entries come from
-    // `collectManagedOffsets` over its payload fields (payload starts at slot 1, past the tag word). Memoized.
-    func enumShapeDescId(_ t: Type) -> UInt64 {
-        guard case .named(let name, .enum_) = t, let en = enumMap[name] else { return stringShapeId() }
-        if let id = enumShapeIds[name] { return id }
-        enumShapeInProgress.insert(name)
-        defer { enumShapeInProgress.remove(name) }
-        var cases: [(tag: Int32, flat: [Int32], shaped: [(offset: Int32, shapeId: UInt64)])] = []
-        for (ci, c) in en.cases.enumerated() {
-            var flat: [Int32] = []
-            var shaped: [(offset: Int32, shapeId: UInt64)] = []
-            var slot = 1   // the tag word is slot 0; the payload begins at slot 1
-            for f in c.fields {
-                collectManagedOffsets(f.type, baseSlot: slot, into: &flat, shaped: &shaped)
-                slot += slotCount(f.type)
-            }
-            if !flat.isEmpty || !shaped.isEmpty { cases.append((tag: Int32(ci), flat: flat, shaped: shaped)) }
-        }
-        let id = registerEnumShapedMap(sizeBytes: Int32(slotCount(t) * 8), cases: cases,
+        let id = registerEnumShapedMap(sizeBytes: Int32(slotCount(.named(name, .enum_)) * 8), cases: cases,
                                        symbol: descSymbol("enum_\(name)"), foldable: true)
         enumShapeIds[name] = id
         return id
@@ -424,14 +368,6 @@ extension LLVMGen {
         typeHeaderSizes.append(0); typeHeaderMaps.append([])
         enumKind2Descs[id] = (tagOff: 0, tagShift: 0, cases: cases)
         return id
-    }
-
-    // Overload for callers that do not yet consume shaped fields (array buffers, value-layout descriptors):
-    // collect only the direct managed offsets, discarding shaped entries. A shaped value inside these
-    // aggregates is a later cut (step 5 / 176.2).
-    func collectManagedOffsets(_ t: Type, baseSlot: Int, into offsets: inout [Int32]) {
-        var discard: [(offset: Int32, shapeId: UInt64)] = []
-        collectManagedOffsets(t, baseSlot: baseSlot, into: &offsets, shaped: &discard)
     }
 
     // 8-slot ABI count of an LLVM type (a pointer/int is one slot; a struct is the sum of its parts).
@@ -559,9 +495,8 @@ extension LLVMGen {
                     header: [Int32] = [],
                     shaped: [(offset: Int32, shapeId: UInt64)] = [], foldable: Bool) -> LLVMValueRef {
         // Blob layout (task 180): header managed offsets first (the `nHeaderPtr` prefix the element map
-        // reads past), then the `nptr` element/direct offsets, then the shaped-field pairs. Header and
-        // shaped never coexist (a buffer has no shaped fields; an object has no header), so the shaped
-        // accessors reading at `nptr + 2k` stay correct.
+        // reads past), then the `nptr` element/direct offsets, then the shaped-field pairs (an object's, or
+        // each buffer element's), which the accessors read at `nHeaderPtr + nptr + 2k`.
         var consts: [LLVMValueRef?] = header.map { LLVMConstInt(i32, UInt64(bitPattern: Int64($0)), 0) }
         consts.append(contentsOf: offsets.map { LLVMConstInt(i32, UInt64(bitPattern: Int64($0)), 0) })
         for entry in shaped {

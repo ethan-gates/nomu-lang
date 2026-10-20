@@ -1,0 +1,26 @@
+class Box {
+  var v: Int
+}
+fun main() {
+  let s = "seed".concat("-heap-string-xxxxxxxxxxxxxxxx")
+  let want = s.byte(at: 5).int + s.byte(at: 20).int
+  var i = 0
+  var bad = 0
+  var t = 0
+  while i < 3000000 {
+    let b = Box(v: i)
+    var k = 0
+    while k < 100 {
+      t = t + k
+      k = k + 1
+    }
+    t = t + b.v
+    if s.byte(at: 5).int + s.byte(at: 20).int != want {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

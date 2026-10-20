@@ -332,6 +332,11 @@ rule and the frame-region generalization into two `verifySSAIR` invariants and a
   writeback is observed. **I11b:** a zero-init def dominates every safepoint the region is live across, and
   the all-zero pattern decodes to "no managed pointer" (String `small = 0`; a kind-0 managed offset is null,
   which both walkers skip) — a partially-constructed region scans safely.
+  **Known gap:** the egress applies the I11a reload to loads typed `StringBase` only, so a load of a
+  `struct String` slot (the wrapper) or of an aggregate holding one is forwarded from before the safepoint
+  and reads a stale buffer pointer. Tracked, with the fix (one structural `shape(T)` read by every consumer,
+  the reload making exactly its shaped `word0`s volatile), in [176](../plans/tasks/176-shaped-gc-roots.md)
+  176.5.
 - **I12** (`ssair.md`) — no interior/derived pointer into a managed/shaped base is live across a safepoint.
 - **`Tn` forced-GC obligations:** a `String` in each case (`small` / `immortal` / `heap`), held live across a
   forced collection, both as a local and as a `class`/`actor` field, survives and (for `heap`) relocates

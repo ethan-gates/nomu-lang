@@ -1,0 +1,49 @@
+class Box {
+  var v: Int
+}
+// Allocates a Box and spins, so a nursery collection lands between reads.
+fun churn(i: Int) -> Int {
+  let b = Box(v: i)
+  var k = 0
+  var t = 0
+  while k < 100 {
+    t = t + k
+    k = k + 1
+  }
+  return t + b.v
+}
+fun probe(s: String) -> Int {
+  return s.byte(at: 5).int + s.byte(at: 20).int
+}
+fun heapString() -> String {
+  return "seed".concat("-heap-string-xxxxxxxxxxxxxxxx")
+}
+fun report(bad: Int) {
+  print("bad ")
+  print(bad)
+  print("
+")
+}
+// A mutating method reads `self.s` through the caller's slot address across collections.
+struct Pair {
+  var s: String
+  var n: Int
+  fun run(want: Int, count: Int) -> Int {
+    var i = 0
+    var bad = 0
+    var t = 0
+    while i < count {
+      t = t + churn(i)
+      if probe(s) != want {
+        bad = bad + 1
+      }
+      n = n + 1
+      i = i + 1
+    }
+    return bad
+  }
+}
+fun main() {
+  var p = Pair(s: heapString(), n: 0)
+  report(p.run(want: probe(heapString()), count: 1000000))
+}
