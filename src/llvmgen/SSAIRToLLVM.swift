@@ -1690,8 +1690,7 @@ final class SSAIRToLLVM {
             // Immix heap + side tables are addrspace(0)); the collector uses it for addr→index math (150.3.1).
             return LLVMBuildPtrToInt(b, val(args[0]), e.i64, "raw.toint")
         // GC type-table reads (task 150 rung 2): reach the codegen-emitted per-type-id side tables from
-        // Nomu through the existing runtime accessors (`c-types.md` §1/§3.2). Pure gc-leaf reads — the
-        // Nomu tracer describes an object's layout through the same tables the MMTk binding reads.
+        // Nomu through the existing runtime accessors (`c-types.md` §1/§3.2). Pure gc-leaf reads.
         case "__gcObjAddr":
             // A managed object (addrspace(1) p1) → its raw address as a RawPtr (addrspace(0)). ptrtoint
             // then inttoptr — the same bit-preserving step the alloc path uses in reverse. Sound only on
@@ -1722,30 +1721,15 @@ final class SSAIRToLLVM {
             let (fn, fty) = e.runtimeFn("llvm.returnaddress.p0", ret: e.i8ptr, params: [e.i32], varArg: false)
             let ra = e.buildCall(fn, fty, [LLVMConstInt(e.i32, 0, 0)])!
             return LLVMBuildPtrToInt(b, ra, e.i64, "retaddr")
-        case "__gcForceCollect":
-            // Drive one collection at a clean point (task 150 rung 2, mark-verify oracle) via the C
-            // runtime, which forwards the current carrier's mutator to MMTk's user-collection request.
-            let (fn, fty) = e.runtimeFn("rt_gc_force_collect", ret: e.voidTy, params: [], varArg: false)
-            return e.buildCall(fn, fty, [])
-        case "__gcParkedAnchors":
-            // Task 128.3.1: fetch each parked fiber's saved frame-pointer anchor from the C fiber registry.
-            let (fn, fty) = e.runtimeFn("rt_gc_parked_anchors", ret: e.i64, params: [e.i8ptr, e.i64], varArg: false)
-            return e.buildCall(fn, fty, [val(args[0]), val(args[1])])
-        case "__gcSchedHead":
-            // Task 128.3.1 (scheduler root): load the C global `rt_sched_head` — the scheduled-mailbox queue
-            // head, a single managed root. Reference it directly as an extern global (defined in runtime.c and
-            // linked in); the load yields the mailbox object pointer the C root scan reports at the same point.
-            let g = LLVMGetNamedGlobal(e.mod, "rt_sched_head") ?? LLVMAddGlobal(e.mod, e.i8ptr, "rt_sched_head")
-            return LLVMBuildLoad2(b, e.i8ptr, g, "gc.schedhead")
         case "__schedHandle":
             // Task 128.3.2: load the C global `rt_nomu_sched` — the self-hosted scheduler's Sched handle,
-            // bound at boot under NOMU_SCHED=nomu (null under the C plan). Lets a driver reach the scheduler
-            // to run the self-hosted STW walk (nomuSchedWalkParked). Same direct-extern-load shape as __gcSchedHead.
+            // bound at boot. Lets a driver reach the scheduler to run the self-hosted STW walk
+            // (nomuSchedWalkParked).
             let g = LLVMGetNamedGlobal(e.mod, "rt_nomu_sched") ?? LLVMAddGlobal(e.mod, e.i8ptr, "rt_nomu_sched")
             return LLVMBuildLoad2(b, e.i8ptr, g, "sched.handle")
         case "__gcSelfhostSpace":
             // Task 150 rung 3: load the global `__nomu_selfhost_space` (the Immix space descriptor the alloc
-            // function lazily creates under NOMU_GC_PLAN=nomu). The space is defined in the C floor
+            // function lazily creates on the first managed allocation). The space is defined in the C floor
             // (`runtime.c`, task 174.3.1) and referenced here as an external global, so the tracer and the
             // allocator — in any object — read one process-shared descriptor.
             let g = e.getOrAddGlobal(e.i8ptr, "__nomu_selfhost_space")
@@ -1762,7 +1746,7 @@ final class SSAIRToLLVM {
             return e.buildCall(fn, fty, [val(args[0]), val(args[1])])
         case "__gcNurseryReserve":
             // Task 150.4.3: load the C global `__nomu_nursery_reserve` (the env-set nursery reserve in blocks,
-            // 0 = default). rtImmixNew reads it at space creation. Same direct-extern-load shape as __gcSchedHead.
+            // 0 = default). rtImmixNew reads it at space creation. A direct extern-global load.
             let g = LLVMGetNamedGlobal(e.mod, "__nomu_nursery_reserve") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_nursery_reserve")
             return LLVMBuildLoad2(b, e.i64, g, "gc.nurseryreserve")
         case "__gcMatureFloor":
@@ -1771,6 +1755,11 @@ final class SSAIRToLLVM {
             // shape as __gcNurseryReserve.
             let g = LLVMGetNamedGlobal(e.mod, "__nomu_mature_floor") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_mature_floor")
             return LLVMBuildLoad2(b, e.i64, g, "gc.maturefloor")
+        case "__gcStress":
+            // Load the C global `__nomu_gc_stress` (the env-set allocation-stress interval in bytes, 0 = off).
+            // rtTlabAlloc reads it. Same direct-extern-load shape as __gcNurseryReserve.
+            let g = LLVMGetNamedGlobal(e.mod, "__nomu_gc_stress") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_gc_stress")
+            return LLVMBuildLoad2(b, e.i64, g, "gc.stress")
         case "__gcExternalDriver":
             // Load the C global `__nomu_gc_ext_driver` (nonzero when an external STW driver owns collection so
             // the default minor coordinator is not running). rtGenReserve gates generational off on it.

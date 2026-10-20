@@ -15,7 +15,7 @@
 //
 // Each Worker sums the values it receives; `report` prints `tag sum`. The per-actor add sequence is fixed
 // (0..nMsgs-1 by single-drain FIFO), so every sum is deterministic and independent of GC and scheduling —
-// checksum-identical to MMTk NoGC. Run with NOMU_NO_ESCAPE=1 so the garbage Boxes are real heap objects.
+// checksum-identical to a run that never collects. Run with NOMU_NO_ESCAPE=1 so the garbage Boxes are real heap objects.
 class Box {
   var v: Int
 }

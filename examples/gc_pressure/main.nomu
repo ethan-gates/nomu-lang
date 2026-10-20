@@ -3,7 +3,7 @@
 // 256 MiB self-hosted heap — so the overwritten Boxes become garbage. Under NOMU_GC_PRESSURE the GC
 // thread collects when the heap fills (a defrag collection at a scheduler STW), relocating the survivors,
 // fixing up the array buffer's element pointers and the root, and reclaiming the garbage — so the program
-// survives and its checksum matches MMTk NoGC. Without collection the heap would exhaust.
+// survives with the same checksum as a run that never collects. Without collection the heap would exhaust.
 class Box {
   var v: Int
 }

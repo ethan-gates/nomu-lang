@@ -1,0 +1,32 @@
+// Collections while a fiber is parked in `readLine` (suite case `read-line-gc`, NOMU_GC_STRESS, stdin fed
+// late): `main` holds a heap Box and a heap String across the park while `churn` allocates and forces
+// collections. The STW walks `main` from the anchor `rt_read_line` recorded, so both survive the moves.
+class Box {
+  var v: Int
+}
+
+fun churn() -> Int {
+  var sum = 0
+  var i = 0
+  while i < 60000 {
+    let b = Box(v: i)
+    sum = sum + b.v % 7
+    i = i + 1
+  }
+  return sum
+}
+
+fun main() {
+  let keep = Box(v: 4242)
+  let name = "held".concat(" string")
+  spawn let c = churn()
+  let line = readLine()
+  print(keep.v)
+  print(" ")
+  print(name)
+  print(" ")
+  print(line)
+  print(" ")
+  print(c)
+  print("\n")
+}

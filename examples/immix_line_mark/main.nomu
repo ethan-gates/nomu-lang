@@ -6,9 +6,8 @@
 // lines) + the 50 Box objects (fixed, one line each, packed a few per line) — exercising both the fixed
 // (kind 0) and variable-size (kind 1) span computations. rtLineMarkCheck then re-derives the line set
 // independently and confirms completeness (every live object sits on marked lines) and soundness (no line
-// marked beyond the live footprint). Runs under NOMU_GC_PLAN=nomu — line marking is a self-hosted-heap
-// concept (the space descriptor is null under MMTk plans). Object marking + fingerprint are the same logic
-// rung 2's mark-verify already checks cross-plan.
+// marked beyond the live footprint). Object marking + fingerprint are the same logic rung 2's mark-verify
+// already checks.
 //
 // Expected output: TOTAL 52 / LINECHECK 0 / LINES>0 1.
 class Box {

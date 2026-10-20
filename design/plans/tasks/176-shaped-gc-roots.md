@@ -52,9 +52,8 @@ rather than a property fixed entirely by its LLVM `addrspace(1)` type. Three cap
    instead of taking the `addrspace(1)` heap representation. This clears the addrspace-across-calls wall
    that blocks interprocedural stack promotion today.
 
-Both collectors consume the shape descriptor identically: the MMTk-binding codegen type-maps
-(`LLVMGenGCMaps`) and the self-hosted tracer (`rtWalkFrom` + the flat offset loops in
-`src/stdlib/runtime.nomu`) must agree on it.
+The codegen type-maps (`LLVMGenGCMaps`) and the collector (`rtWalkFrom` + the flat offset loops in
+`src/stdlib/runtime.nomu`) must agree on the shape descriptor. (Until 197 an MMTk binding consumed it too.)
 
 ## Why
 
@@ -405,19 +404,17 @@ collector still finds and fixes up exactly the references that are live.
       caller-side buffers; callee-side `T` values still need the shadow stack.
 
     **Decided: (a)**, since it covers the callee side, which (b) leaves to the shadow stack anyway.
-    **Superseded by [197](197-retire-mmtk-and-c-scheduler.md)** (retire MMTk and the C scheduler): with one
-    runtime, 176.5.6 reduces to confirming erased buffers are rooted on the Nomu runtime, where
-    `xmod_erased` already passes; neither option is built.
+    **Closed by [197](197-retire-mmtk-and-c-scheduler.md)** (MMTk and the C scheduler retired): on the one
+    runtime erased buffers are rooted through the shadow stack, and `xmod_erased` / `xmod_erased_fresh` read
+    `bad 0` on every shape-matrix leg (default, nursery, stress-minor, stress-major). Neither option is built.
     - **Scheduler and collector pair.** The Nomu scheduler implies the Nomu collector and the reverse: MMTk
       with the Nomu scheduler was wrong for every case, including a class field (`class_field`: 995750 wrong
       reads; `array_string` trapped), because only the Nomu collector walks the Nomu scheduler's carriers
-      and shadow stacks. Built: `main` in `runtime.c` promotes the allocator when `NOMU_SCHED=nomu` pins no
-      plan, and aborts when it pins a collecting MMTk plan (`immix`, `genimmix`); NoGC pairs with either. The
-      reverse quadrant (Nomu allocator, C scheduler) already aborted. So (a) concerns MMTk with the C
-      scheduler only: a thread running no fiber gets a shadow head, and MMTk's root scan walks it.
-  - **176.5.7 — tests.** The matrix into the suite with nursery legs (MMTk GenImmix stress and the
-    self-hosted minor); nursery legs added to the existing shaped oracles, which today use only evac and
-    cannot see a missed reload; a nested-call inlining case (`f(g())`).
+      and shadow stacks. The pairing guard built here was deleted with the runtime selector in 197.
+  - **176.5.7 — tests.** The matrix into the suite with collecting legs (the `run.sh` set: a 64-block
+    nursery, `NOMU_GC_STRESS` minor, `NOMU_GC_STRESS` + `NOMU_MATURE_FLOOR` major); nursery legs added to the
+    existing shaped oracles, which today use only stress and cannot see a missed reload; a no-inline leg
+    (`COMPILE_ENV=NOMU_NO_INLINE=1`); a nested-call inlining case (`f(g())`).
 
 ## Dependencies & relationships
 

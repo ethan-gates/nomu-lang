@@ -3,7 +3,7 @@
 // `p` is the only heap candidate in this program: a leaf `Point` (all-`Int` fields) that is used
 // solely through field reads and never returned, stored, passed to a call, or captured. Escape
 // analysis proves it does not escape its frame, so codegen allocates it on the stack (one entry-block
-// slot reused across the loop) instead of the GC heap — the emitted object references no `rt_alloc`.
+// slot reused across the loop) instead of the GC heap — the emitted object defines no `__nomu_selfhost_alloc`.
 // `NOMU_NO_ESCAPE=1` restores the heap allocation. The result is identical either way: the analysis
 // affects speed only, never correctness. (tools/escape.sh checks both.)
 

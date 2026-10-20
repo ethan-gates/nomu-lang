@@ -47,25 +47,46 @@ private func drain(_ fd: Int32) -> Data {
     return data
 }
 
+// Bytes fed to a child's stdin through a pipe, written `delayMs` after the launch and then closed (so the
+// child sees end of input). A delay lets a case observe a program waiting on input that has not arrived.
+struct StdinFeed {
+    var data: Data
+    var delayMs: Int
+}
+
 // Launch `path args…` with `env` overlaid on the current environment, capturing stdout and
-// stderr, bounded by `timeout` seconds.
+// stderr, bounded by `timeout` seconds. stdin is /dev/null unless `stdin` supplies a feed.
 //
 // The child is made its own process-group leader (POSIX_SPAWN_SETPGROUP, pgroup 0). On timeout
 // the whole group is SIGKILLed, so a wedged binary and every thread/child it spawned (carriers,
 // the GC-sync thread) is reaped rather than orphaned — a bare per-process kill can leak the
 // runtime's helper threads.
-func runProcess(path: String, args: [String], env: [String: String], timeout: Double) -> RunOutcome {
+func runProcess(path: String, args: [String], env: [String: String], timeout: Double,
+                stdin: StdinFeed? = nil) -> RunOutcome {
     let start = Date()
 
     var outPipe: [Int32] = [0, 0]
     var errPipe: [Int32] = [0, 0]
     _ = pipe(&outPipe)
     _ = pipe(&errPipe)
+    var inPipe: [Int32] = [-1, -1]
+    if stdin != nil {
+        _ = pipe(&inPipe)
+        #if canImport(Darwin)
+        _ = fcntl(inPipe[1], F_SETNOSIGPIPE, 1)   // a child that exits early must not SIGPIPE the harness
+        #endif
+    }
 
     var fileActions: posix_spawn_file_actions_t? = nil
     posix_spawn_file_actions_init(&fileActions)
-    // stdin from /dev/null — fixtures never read it; avoids a stray inherited terminal.
-    posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+    if stdin != nil {
+        posix_spawn_file_actions_adddup2(&fileActions, inPipe[0], STDIN_FILENO)
+        posix_spawn_file_actions_addclose(&fileActions, inPipe[0])
+        posix_spawn_file_actions_addclose(&fileActions, inPipe[1])
+    } else {
+        // stdin from /dev/null — avoids a stray inherited terminal.
+        posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+    }
     posix_spawn_file_actions_adddup2(&fileActions, outPipe[1], STDOUT_FILENO)
     posix_spawn_file_actions_adddup2(&fileActions, errPipe[1], STDERR_FILENO)
     posix_spawn_file_actions_addclose(&fileActions, outPipe[0])
@@ -75,7 +96,13 @@ func runProcess(path: String, args: [String], env: [String: String], timeout: Do
 
     var attr: posix_spawnattr_t? = nil
     posix_spawnattr_init(&attr)
+    // Close every inherited fd except the three set up above: without this a child also inherits the pipe
+    // ends of cases spawned concurrently, so their readers (and a fed stdin's end of input) wait for it.
+    #if canImport(Darwin)
+    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
+    #else
     posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP))
+    #endif
     posix_spawnattr_setpgroup(&attr, 0)   // 0 → new group, gid == child pid
 
     // Merge overrides onto the current environment; build a NULL-terminated char**.
@@ -101,12 +128,30 @@ func runProcess(path: String, args: [String], env: [String: String], timeout: Do
     // Parent keeps only the read ends; closing the write ends lets the readers see EOF.
     close(outPipe[1])
     close(errPipe[1])
+    if stdin != nil { close(inPipe[0]) }
 
     if rc != 0 {
         close(outPipe[0]); close(errPipe[0])
+        if stdin != nil { close(inPipe[1]) }
         return RunOutcome(timedOut: false, exitCode: nil, signal: nil,
                           stdout: "", stderr: "spawn failed: \(String(cString: strerror(rc)))",
                           duration: Date().timeIntervalSince(start))
+    }
+
+    // Feed stdin on a background queue: wait the delay, write everything, close (end of input).
+    if let feed = stdin {
+        let fd = inPipe[1]
+        DispatchQueue.global().async {
+            if feed.delayMs > 0 { usleep(useconds_t(feed.delayMs) * 1000) }
+            feed.data.withUnsafeBytes { raw in
+                var off = 0
+                while off < raw.count {
+                    let n = write(fd, raw.baseAddress! + off, raw.count - off)
+                    if n > 0 { off += n } else if n < 0 && errno == EINTR { continue } else { break }
+                }
+            }
+            close(fd)
+        }
     }
 
     let outBox = Box(Data())

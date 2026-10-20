@@ -8,7 +8,8 @@ stack (frame #0 only). Ad-hoc `RawPtr.gcDbg` breadcrumbs localized both bugs, th
 
 Give the collector a real observability surface: structured per-collection stats, phase tracing, heap/space
 occupancy, and pause timing — enough to debug a fault without hand-adding prints, and to feed the GC
-benchmarking that gates MMTk removal.
+side of the benchmark against Go and Swift. MMTk's footprint report (`NOMU_GC_STATS`) went with MMTk
+([197](197-retire-mmtk-and-c-scheduler.md)); the Nomu collector has no stats report yet.
 
 ## Why now
 

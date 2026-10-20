@@ -3,8 +3,8 @@
 // loop. While it runs, the forced-collect coordinator (NOMU_STW_COLLECT) stops the world and runs a
 // force-all evacuating collection over the self-hosted Immix space: the live Box moves to fresh to-space,
 // the worker's stack slot is fixed up in place, and the garbage blocks are reclaimed. The worker resumes
-// and reads the (moved) Box → 111. Output is unchanged vs MMTk/NoGC (moving is transparent) — the
-// fixup-correctness proof. Run with NOMU_SCHED=nomu NOMU_GC_PLAN=nomu NOMU_STW_COLLECT=1 NOMU_NO_ESCAPE=1.
+// and reads the (moved) Box → 111. Output is unchanged by the collection (moving is transparent) — the
+// fixup-correctness proof. Run with NOMU_STW_COLLECT=1, compiled with NOMU_NO_ESCAPE=1.
 class Box {
   var v: Int
 }

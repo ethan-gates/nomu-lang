@@ -4,7 +4,8 @@
 // that poll would be self-referential — under `--runtime-subset=ramp` the loop header carries no poll
 // (runtime-subset.md §4). The result is identical either way; suppression is a codegen property, not a
 // semantic one. `ramp` stays subset-legal: integer arithmetic only, no heap allocation, no outside call.
-// Expected output: 45. Checked by tools/subset-poll.sh (which also inspects the binary for the poll).
+// Expected output: 45. Suite case `subset-poll` checks the object references no `__nomu_gc_poll_slow`;
+// `escape-stack` is the control (an ordinary loop does reference it).
 fun ramp(limit: Int) -> Int {
   var acc = 0
   var i = 0

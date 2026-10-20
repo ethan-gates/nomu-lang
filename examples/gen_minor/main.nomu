@@ -1,5 +1,4 @@
-// Task 150 · rung 4 (GenImmix), increment 150.4.3 — minor (generational) collection. Under
-// NOMU_GC_PLAN=nomu the nursery fills to its reserve and a minor GC fires (rtImmixRefill → rtSelfhostMinorGc
+// Task 150 · rung 4 (GenImmix), increment 150.4.3 — minor (generational) collection. The nursery fills to its reserve and a minor GC fires (rtImmixRefill → rtSelfhostMinorGc
 // → the STW coordinator runs nomuSchedStwCollectMinor): the nursery is promoted into mature Immix using the
 // stopped mutator's stack roots plus the drained write-barrier remembered set (selfhosted-gc.md §11.4). The
 // mature space is never scanned — a mature→young pointer survives only because the barrier remembered it.
@@ -12,9 +11,8 @@
 // the final read would be wrong. Prints 42 / 4242 / a window checksum iff the generational collector is sound.
 //
 // The nursery reserve is set small via NOMU_NURSERY_RESERVE (the driver) so minor GCs fire on allocation
-// count, not wall clock — deterministic and independent of program speed. The same fixture runs unchanged
-// under MMTk GenImmix (the differential oracle: MMTk ignores the env and drives its own generational
-// collection). Compiled with NOMU_NO_ESCAPE=1 so the objects are real heap objects.
+// count, not wall clock — deterministic and independent of program speed. Compiled with NOMU_NO_ESCAPE=1 so
+// the objects are real heap objects.
 class Box {
   var v: Int
 }
@@ -51,6 +49,6 @@ fun main() {
   print("\n")
   print(h.tag)              // 4242 — the mature object itself survived intact
   print("\n")
-  print(sum % 100000)       // window checksum — identical under MMTk GenImmix and the self-hosted minor GC
+  print(sum % 100000)       // window checksum — identical whether or not a minor GC fires
   print("\n")
 }

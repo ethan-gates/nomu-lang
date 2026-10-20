@@ -22,7 +22,7 @@ Steering docs (`vision.md`, this index) stay at the root. Docs cross-reference e
 
 ## Internals (as-built design)
 
-- [internals/memory-model.md](internals/memory-model.md) — the value/reference split, the GC (MMTk), immutability, escape analysis, the performance recipe, and every binding form's memory meaning.
+- [internals/memory-model.md](internals/memory-model.md) — the value/reference split, the GC (the Nomu collector; MMTk until task 197), immutability, escape analysis, the performance recipe, and every binding form's memory meaning.
 - [internals/types.md](internals/types.md) — type system apart from interfaces: generics + dispatch, sum types + exhaustive matching, error handling.
 - [internals/generics.md](internals/generics.md) — **authoritative as-built spec** for generics: parameters, inference, checking, witness-passing + monomorphization, generic types, the `shared` bound + conditional conformance, exhaustiveness, `Result`.
 - [internals/interfaces.md](internals/interfaces.md) — conformance, dispatch, extensions, and composition.

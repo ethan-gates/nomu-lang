@@ -3,7 +3,7 @@
 //   - reachability: root → its children are counted live;
 //   - shared child: root.left and root.right are the same Leaf, counted once (the header mark bit);
 //   - dead exclusion: `dead` is a heap Node never linked into root's graph, so it must NOT be counted.
-// Type-ids (from mark_types): Node = 0 (managed at 8,16), Leaf = 1. Live from root: {root, leaf} → total 2,
+// Type-ids: Node = 0 (managed at 8,16), Leaf = 1. Live from root: {root, leaf} → total 2,
 // Node count 1, Leaf count 1. `dead` (another Node) stays unmarked.
 class Leaf {
   var v: Int
@@ -48,7 +48,7 @@ fun main() {
     t = t + 1
   }
   // The address-independent content fingerprint: same value under any allocator (no address enters it),
-  // so it is identical across GC plans and is the term the MMTk cross-run diff will match.
+  // so it is identical across runs.
   let fpv: Int = fp.load(fromByteOffset: 0)
   print("FP ")
   print(fpv)

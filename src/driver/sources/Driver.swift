@@ -645,36 +645,17 @@ func shippedTemplates(_ module: NOIRModule, ownNames: Set<String>) -> [NOIRDecl]
     return shipped
 }
 
-// Link a binary: the entry object, every dependency object, the runtime archive and the GC archive.
+// Link a binary: the entry object, every dependency object and the runtime archive.
 // Returns false on failure (message on stderr).
 func linkBinary(objects: [String], output binPath: String, runtimeArchive: String, timings: Timings) -> Bool {
     let archive = timings.measure("runtime", "archive") { cachedRuntimeArchive(at: runtimeArchive) }
     guard let archive = archive else { return false }
-    // `-dead_strip` drops code unreachable from the program's entry — most of MMTk's plan/scheduler
-    // machinery is never reached on the NoGC alloc path — and `-x` strips local symbols. (6.1.1 size.)
+    // `-dead_strip` drops code unreachable from the program's entry, and `-x` strips local symbols.
     // The binary is linked, indexed and signed under a temporary name, then renamed into place, so it
     // appears complete in one step (two builds of one program can share the output path).
     let staging = binPath + ".link-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString.prefix(8))"
     defer { try? FileManager.default.removeItem(atPath: staging) }
     var linkArgs = ["-o", staging, "-Wl,-dead_strip", "-Wl,-x"] + objects + [archive]
-    // The GC archive (the Rust/MMTk collector) is required: the runtime calls into it from `main`. It
-    // rides inside the `nomu` executable as a Mach-O section (the compiler stays one file) and is extracted
-    // to a file here; `NOMU_GC_ARCHIVE` names a different archive instead (development). A static archive
-    // pulls in only the members that resolve referenced symbols; MMTk's deps (sysinfo → CoreFoundation/
-    // IOKit/objc) are named so those members resolve. (No `-u` force-link — that dragged the whole MMTk
-    // closure into every binary regardless of use.)
-    let gcArchive: String
-    if let override = ProcessInfo.processInfo.environment["NOMU_GC_ARCHIVE"] {
-        guard FileManager.default.fileExists(atPath: override) else {
-            fputs("error: NOMU_GC_ARCHIVE names '\(override)', which does not exist\n", stderr)
-            return false
-        }
-        gcArchive = override
-    } else {
-        guard let extracted = embeddedGCArchivePath() else { return false }
-        gcArchive = extracted
-    }
-    linkArgs += [gcArchive, "-framework", "CoreFoundation", "-framework", "IOKit", "-lobjc"]
     // The GC frame index (FrameIndex.swift): the link reserves its section and writes a link map; afterwards
     // the index is written into the binary, which is then signed (unsigned until the patch is in).
     let scratch = NSTemporaryDirectory() + "nomu-link-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
@@ -774,36 +755,6 @@ private func buildRuntimeArchive(inDir dir: String) -> String? {
         fputs("error: failed to archive runtime\n", stderr); return nil
     }
     return archive
-}
-
-// M6 · 6.1.0 — the embedded-section reader (src/gcembed): pointer to nomuc's `__DATA,__nomu_gc`
-// bytes (nil if absent), *size = length. Bound by symbol name to avoid a module import.
-@_silgen_name("nomu_gc_embedded_section")
-private func nomu_gc_embedded_section(_ size: UnsafeMutablePointer<UInt>) -> UnsafeRawPointer?
-
-// Materialize the running executable's embedded GC archive to a cache file (once) and return its path; nil,
-// with the error reported, when the executable carries none or the extraction fails. The external linker
-// needs a file path, so the section bytes are written to a temp cache and reused across invocations.
-private func embeddedGCArchivePath() -> String? {
-    var size: UInt = 0
-    guard let base = nomu_gc_embedded_section(&size), size > 0 else {
-        let exe = CommandLine.arguments.first ?? "this executable"
-        fputs("error: cannot link: '\(exe)' carries no GC archive (its `__DATA,__nomu_gc` section is missing). "
-            + "The `nomu` binary built by `//src/nomu-cli:nomu` embeds one; another program running the driver "
-            + "must set NOMU_GC_ARCHIVE to a GC archive (`//src/runtime/gcbinding:nomu_gc`)\n", stderr)
-        return nil
-    }
-    let cache = NSTemporaryDirectory() + "nomu-gc-\(size).a"
-    if let attrs = try? FileManager.default.attributesOfItem(atPath: cache),
-       (attrs[.size] as? Int) == Int(size) {
-        return cache  // already extracted at this size — reuse
-    }
-    let data = Data(bytes: base, count: Int(size))
-    guard (try? data.write(to: URL(fileURLWithPath: cache))) != nil else {
-        fputs("error: failed to extract embedded GC archive to \(cache)\n", stderr)
-        return nil
-    }
-    return cache
 }
 
 // Run `exe args`, wait, and return its exit status (or 1 if it could not be launched).

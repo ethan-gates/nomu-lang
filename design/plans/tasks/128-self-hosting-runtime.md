@@ -2,7 +2,9 @@
 
 **Avenue:** Risk (author north-star, the core bet) · **Type/Lifecycle:** `perf · refactor · needs-design`
 (runtime + language subset + compiler + GC) · **Size:** XL · **Status:** build now — core bet;
-decomposes into 125 → 149 → 150 → 127 · **Source:** deferred.md (2026-08-18)
+decomposes into 125 → 149 → 150 → 127. The Nomu scheduler and collector are the only runtime: MMTk, the
+Rust binding and the C scheduler are retired ([197](197-retire-mmtk-and-c-scheduler.md)), and the selector
+knobs the phase logs below name (`NOMU_RUNTIME`, `NOMU_SCHED`, `NOMU_GC_PLAN`) no longer exist · **Source:** deferred.md (2026-08-18)
 
 ## What
 
@@ -233,9 +235,10 @@ The parts this task owns directly (the delegated prerequisites 125/149/150/127 k
   - *One carrier-boot path.* Fold the scheduler-carrier boot and the allocator's per-carrier binding into a
     single "boot a carrier in the self-hosted runtime" path, so the 150.3.10 per-carrier TLAB hangs off one
     boot site rather than two independently-gated ones. This is why 128.4 precedes 150.3.10.
-  - *Making `selfhost` the default* (retiring the `native` lever) waits for the self-hosted runtime to reach
+  - *Making `selfhost` the default* (retiring the `native` lever) waited for the self-hosted runtime to reach
     feature parity — multi-carrier allocation (150.3.10), the production pressure path (150.3.11), and broader
-    roots (150.3.12) — and ultimately MMTk retirement after 150.4.
+    roots (150.3.12). [197](197-retire-mmtk-and-c-scheduler.md) then made it the default and deleted the
+    lever, the oracle overrides and the support matrix along with MMTk and the C scheduler.
 
 ## Refs
 

@@ -4,7 +4,7 @@
 // collection is non-moving and seeds the fragmentation histogram (defragTable), and the second selects those
 // fragmented blocks and compacts their survivors into fresh to-space.
 //
-// Compiled NOMU_NO_ESCAPE=1 (heap objects), run under NOMU_GC_PLAN=nomu (the self-hosted Immix heap).
+// Compiled NOMU_NO_ESCAPE=1 (heap objects in the self-hosted Immix heap).
 // Single-threaded with a controlled root set; rtImmixCollectDefrag returns the root's new address, which the
 // fixture reads the compacted survivors through.
 //

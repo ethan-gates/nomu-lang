@@ -21,16 +21,17 @@ the runtime in `src/runtime/` (`runtime.c`, `core.c`, `runtime.h`); the GC bindi
 
 ## 1. The allocation + GC seam
 
-Every heap object these types allocate goes through one of two runtime seams, both returning
-zero-initialized memory:
+Every heap object these types allocate goes through one of two homes, both zero-initialized:
 
-- **`rt_alloc(size)`** — the moving GC heap (Immix). The object participates in collection: it is
-  traced, relocated, and its managed fields updated. Backed by MMTk's per-carrier mutator.
-- **`rt_alloc_immortal(size)`** — non-moving, never-collected space, for buffers a moving collector
-  must not relocate (the String interim, §2).
+- **The moving GC heap (Immix)** — codegen's `__nomu_gc_alloc` seam, which forwards to
+  `__nomu_selfhost_alloc` (a per-carrier TLAB bump, refilled by the Nomu allocator's `rtTlabAlloc`). The
+  object participates in collection: it is traced, relocated, and its managed fields updated.
+- **Immortal memory** — non-moving, never-collected off-heap buffers a moving collector must not relocate
+  (string literals in rodata; `rt_read_line`'s buffer). Until task 197 this was MMTk's immortal space
+  (`rt_alloc_immortal`).
 
 An object placed in the moving heap must be describable to the collector by its **header type-id** (low
-32 bits of the 8-byte object header). Codegen emits per-type-id side tables the binding reads:
+32 bits of the 8-byte object header). Codegen emits per-type-id side tables the collector reads:
 the managed-pointer map (`nomu_gc_typemap`), the fixed size
 (`nomu_gc_typesize`), and — for variable-size objects — a kind + element stride (`nomu_gc_typekind` /
 `nomu_gc_typestride`, §3.2). A C-backed type is GC-correct exactly when its heap objects carry a
@@ -163,7 +164,7 @@ Not yet built; listed so the doc is the map when they land.
 The build realizes a three-layer separation (positioning in `vision.md` → "Library tiers"); the C runtime floor these types live in is the middle tier, from the M4.13 split:
 
 - **Language** — the compiler-known surface (type system, generics, interfaces, linear types, and a small named set of blessed intrinsics such as the continuation).
-- **Runtime** — the mandatory floor: GC (MMTk) + the M:N scheduler/poller. **Always linked** — there is no runtime-less build, because Nomu declines to define reference types or heap allocation without it.
+- **Runtime** — the mandatory floor: the GC + the M:N scheduler, both written in Nomu (MMTk and the C scheduler retired, task 197). **Always linked** — there is no runtime-less build, because Nomu declines to define reference types or heap allocation without it.
 - **Standard library** — ordinary Nomu code with no compiler privilege, and **elidable**.
 
 Two deployment shapes fall out: **language + runtime** (no batteries; minimal footprint) and **+ stdlib**. The consequence for the compiler: privileged capabilities (`park`/`unpark`, GC intrinsics) are reached only through **language/runtime intrinsics**, never handed to a stdlib function that user code couldn't itself call — that is what keeps the stdlib pure and elidable.

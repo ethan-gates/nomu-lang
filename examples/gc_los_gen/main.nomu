@@ -8,7 +8,7 @@
 // `big` holds 6000 Boxes → a ~48 KiB buffer in the large-object space. `big[0]` is overwritten with a fresh
 // young Box(777); then a sliding-window allocator drives many minor GCs. Without the LOS root scan the young
 // Box(777) is lost and the final read is wrong. Prints 777 iff the LOS remembered-set path is sound.
-// Checksum-identical under MMTk GenImmix. Run with NOMU_NO_ESCAPE=1 so the Boxes are real heap objects.
+// Run with NOMU_NO_ESCAPE=1 so the Boxes are real heap objects.
 class Box {
   var v: Int
 }

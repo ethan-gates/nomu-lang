@@ -1,5 +1,5 @@
-// Task 150 · rung 4 (GenImmix), increment 150.4.4 — minor/major interplay + trigger policy. Under
-// NOMU_GC_PLAN=nomu a small nursery reserve fires frequent minor GCs, and a mature-pressure floor
+// Task 150 · rung 4 (GenImmix), increment 150.4.4 — minor/major interplay + trigger policy. A small nursery
+// reserve fires frequent minor GCs, and a mature-pressure floor
 // (NOMU_MATURE_FLOOR) makes a nursery-full trigger escalate to a full defrag major once free mature blocks run
 // low (rtImmixRefill → rtSelfhostOom → the STW coordinator runs the generational defrag major). A minor never
 // reclaims dead mature objects, so promote-all leaks mature garbage every cycle; the major reclaims it, so the
@@ -15,8 +15,7 @@
 //
 // The sliding window of 100 live Boxes forces real allocation (each new Box escapes into `xs`, the overwritten
 // one becomes garbage), so the nursery fills and both collections fire on allocation count — deterministic and
-// independent of program speed. The same fixture runs unchanged under MMTk GenImmix (the differential oracle:
-// it ignores the env and drives its own generational collection). Compiled with NOMU_NO_ESCAPE=1 so the
+// independent of program speed. Compiled with NOMU_NO_ESCAPE=1 so the
 // objects are real heap objects. Prints 77 / 4242 / a window checksum iff the interplay is sound.
 class Box {
   var v: Int
@@ -56,6 +55,6 @@ fun main() {
   print("\n")
   print(h.tag)                // 4242 — the mature object itself survived every major intact
   print("\n")
-  print(sum % 100000)         // window checksum — identical under MMTk GenImmix and the self-hosted collector
+  print(sum % 100000)         // window checksum — identical whether or not collections fire
   print("\n")
 }

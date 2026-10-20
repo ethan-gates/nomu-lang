@@ -22,10 +22,9 @@ interface modules hold each IR's format, implementation modules hold the code;
 - **nomu-cli** — `nomuc` binary; argument parsing, calls into driver
 
 **runtime/** — the mandatory floor, linked into every emitted program (`c-types.md`)
-- **runtime/embedded** — the C runtime (M:N scheduler, poller, timer, actor mailbox, allocator
-  seam) + the C core floor (`core.c`: String, primitives), bundled into `nomuc`
-- **runtime/gcbinding** — the thin MMTk `VMBinding` (Rust static archive)
-- **runtime/gcembed** — extracts the GC archive from `nomuc`'s embedded section at link time
+- **runtime/embedded** — the C floor under the Nomu runtime (process entry, GC driver threads, TLAB and
+  mod-buffer registries, GC descriptor accessors, raw memory) + the C core floor (`core.c`: String,
+  primitives), bundled into `nomuc`. The scheduler and collector are Nomu code in `stdlib/runtime.nomu`.
 
 **stdlib** — the Nomu-written standard library (compiled alongside user code)
 

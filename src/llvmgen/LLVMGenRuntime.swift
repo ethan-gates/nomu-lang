@@ -169,15 +169,12 @@ extension LLVMGen {
     // where a fiber's `env` re-enters managed code (the SSAIR spawn thunk, D1/D4).
     func toManaged(_ v: LLVMValueRef) -> LLVMValueRef { LLVMBuildAddrSpaceCast(b, v, p1, "to1")! }
 
-    func rtAlloc() -> LLVMValueRef { runtimeFn("rt_alloc", ret: p1, params: [i64], varArg: false).0 }
-    func rtAllocTy() -> LLVMTypeRef { runtimeFn("rt_alloc", ret: p1, params: [i64], varArg: false).1 }
-
     // Allocate a managed (GC-heap) object of `bytes` bytes through the `__nomu_gc_alloc` seam.
     //
     // When shaped roots are live across this allocation (task 176), route through the `noinline` rooted-alloc
     // variant instead of the `alwaysinline` seam. A GC can fire at the allocation, so the shaped roots must be
     // recorded on a statepoint that covers this frame. The always-inliner drops a `"deopt"` operand bundle when
-    // it collapses `__nomu_gc_alloc`, so the bundle would never reach the inner `rt_alloc` statepoint. The
+    // it collapses `__nomu_gc_alloc`, so the bundle would never reach the inner allocation statepoint. The
     // `noinline` variant survives both pipelines' inlining untouched, so RS4GC statepoint-converts the call site
     // in place and threads the bundle onto it — the walker then finds the shaped roots in this frame when a GC
     // fires inside the allocation. (`buildCall` attaches the pending bundle; the fast-path bump still lives
@@ -318,9 +315,8 @@ extension LLVMGen {
         LLVMPositionBuilderAtEnd(b, contBB)
     }
 
-    // The `__nomu_gc_alloc` seam: the inline bump-pointer fast path, tail-calling `rt_alloc` (a
-    // statepoint) on the slow path. Returned memory is zeroed. `inlineAlloc` off reverts to the
-    // out-of-line body for A/B measurement.
+    // The `__nomu_gc_alloc` seam: forwards to the self-hosted allocation function (`__nomu_selfhost_alloc`),
+    // whose inline TLAB bump is the fast path. Returned memory is zeroed.
     func nomuGcAlloc() -> (LLVMValueRef, LLVMTypeRef) {
         if let g = gcAllocFn { return g }
         let g = buildGcAllocFn("__nomu_gc_alloc", alwaysInline: true)
@@ -347,80 +343,15 @@ extension LLVMGen {
         let ty = fnType(p1, [i64])
         let fn = LLVMAddFunction(mod, name, ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
-        LLVMSetGC(fn, "statepoint-example")   // its slow-path `rt_alloc` call is a statepoint
+        LLVMSetGC(fn, "statepoint-example")   // its allocation call is a statepoint
         if alwaysInline { addAlwaysInline(fn) } else { addNoInline(fn) }
-        guard inlineAlloc else {
-            withStubBody(fn) { LLVMBuildRet(b, buildCall(rtAlloc(), rtAllocTy(), [LLVMGetParam(fn, 0)])!) }
-            return (fn, ty)
-        }
-        // Get-or-add: this body is built for both the `alwaysinline` and the `noinline` (rooted) alloc
-        // variants, so these externs may already exist — minting them afresh would produce suffixed
-        // duplicates that no longer resolve against the runtime symbols.
-        let gOff = getOrAddGlobal(i64, "__nomu_bump_offset")
-        let gMax = getOrAddGlobal(i64, "__nomu_max_non_los")
-        let gMut = getOrAddGlobal(i8ptr, "rt_mutator")
-        LLVMSetThreadLocal(gMut, 1)
-        // task 150 — under `NOMU_GC_PLAN=nomu` this extern flag (set at init) routes allocation at the
-        // self-hosted Nomu allocator: the MMTk-TLAB fast path is disabled and the slow path branches to it.
-        let gSelf = getOrAddGlobal(i8, "__nomu_selfhosted_alloc")
-        let memset = runtimeFn("memset", ret: i8ptr, params: [i8ptr, i32, i64], varArg: false)
-        withStubBody(fn) {
-            let size = LLVMGetParam(fn, 0)!
-            let fastBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.fast")!
-            let bumpBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.bump")!
-            let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.slow")!
-            let selfBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.self")!
-            let mmtkBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.mmtk")!
-            let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "alloc.done")!
-            let off = LLVMBuildLoad2(b, i64, gOff, "bump.off")!
-            let offOk = LLVMBuildICmp(b, LLVMIntNE, off, LLVMConstInt(i64, .max, 0), "off.ok")!
-            let mut = LLVMBuildLoad2(b, i8ptr, gMut, "mutator")!
-            let mutOk = LLVMBuildICmp(b, LLVMIntNE, mut, LLVMConstPointerNull(i8ptr), "mut.ok")!
-            let maxlos = LLVMBuildLoad2(b, i64, gMax, "maxlos")!
-            let sizeOk = LLVMBuildICmp(b, LLVMIntULE, size, maxlos, "size.ok")!
-            let selfOn = LLVMBuildLoad2(b, i8, gSelf, "selfhost")!
-            let selfOff = LLVMBuildICmp(b, LLVMIntEQ, selfOn, LLVMConstInt(i8, 0, 0), "self.off")!
-            let g12 = LLVMBuildAnd(b, LLVMBuildAnd(b, offOk, mutOk, "g1"), sizeOk, "g12")!
-            let canFast = LLVMBuildAnd(b, g12, selfOff, "canfast")!   // self-hosted plan never fast-paths
-            LLVMBuildCondBr(b, canFast, fastBB, slowBB)
-            LLVMPositionBuilderAtEnd(b, fastBB)
-            let cursorPtr = gepByte(mut, off)
-            let cursor = LLVMBuildLoad2(b, i64, cursorPtr, "cursor")!
-            let aligned = LLVMBuildAnd(b, LLVMBuildAdd(b, cursor, LLVMConstInt(i64, 7, 0), "c+7"),
-                                       LLVMConstInt(i64, ~UInt64(7), 0), "aligned")!
-            let off8 = LLVMBuildAdd(b, off, LLVMConstInt(i64, 8, 0), "off+8")!
-            let limit = LLVMBuildLoad2(b, i64, gepByte(mut, off8), "limit")!
-            let newCursor = LLVMBuildAdd(b, aligned, size, "newcursor")!
-            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntULE, newCursor, limit, "fits"), bumpBB, slowBB)
-            LLVMPositionBuilderAtEnd(b, bumpBB)
-            LLVMBuildStore(b, newCursor, cursorPtr)
-            let obj = LLVMBuildIntToPtr(b, aligned, p1, "obj")!
-            _ = buildCall(memset.0, memset.1, [toUnmanaged(obj), LLVMConstInt(i32, 0, 0), size])
-            LLVMBuildBr(b, doneBB)
-            LLVMPositionBuilderAtEnd(b, slowBB)
-            LLVMBuildCondBr(b, selfOff, mmtkBB, selfBB)   // flag off → MMTk; on → self-hosted
-            LLVMPositionBuilderAtEnd(b, selfBB)
-            let selfP = buildCall(nomuSelfhostAlloc().0, nomuSelfhostAlloc().1, [size])!
-            LLVMBuildBr(b, doneBB)
-            LLVMPositionBuilderAtEnd(b, mmtkBB)
-            let mmtkP = buildCall(rtAlloc(), rtAllocTy(), [size])!
-            LLVMBuildBr(b, doneBB)
-            LLVMPositionBuilderAtEnd(b, doneBB)
-            let phi = LLVMBuildPhi(b, p1, "obj")!
-            var vals: [LLVMValueRef?] = [obj, selfP, mmtkP]
-            var blks: [LLVMBasicBlockRef?] = [bumpBB, selfBB, mmtkBB]
-            vals.withUnsafeMutableBufferPointer { vp in
-                blks.withUnsafeMutableBufferPointer { bp in
-                    LLVMAddIncoming(phi, vp.baseAddress, bp.baseAddress, 3)
-                }
-            }
-            LLVMBuildRet(b, phi)
-        }
+        let alloc = nomuSelfhostAlloc()
+        withStubBody(fn) { LLVMBuildRet(b, buildCall(alloc.0, alloc.1, [LLVMGetParam(fn, 0)])!) }
         return (fn, ty)
     }
 
-    // The self-hosted allocation slow path (task 150): route allocation at the Nomu Immix allocator in the
-    // runtime prelude (`rtImmixNew` / `rtTlabAlloc`). On first call it creates one Immix space and caches its
+    // The self-hosted allocation function (task 150): allocation at the Nomu Immix allocator in the runtime
+    // prelude (`rtImmixNew` / `rtTlabAlloc`). On first call it creates one Immix space and caches its
     // descriptor in `__nomu_selfhost_space`; each call bumps within the carrier's per-carrier TLAB (150.3.10.1,
     // refilling a whole block from the shared pool under the space lock on overflow) and produces the managed object
     // via `ptrtoint`→`inttoptr` to `p1` — the same integer→`p1` step the fast path uses, which
@@ -473,14 +404,13 @@ extension LLVMGen {
             LLVMBuildCondBr(b, isNull1, mkBB, unlockBB)
             LLVMPositionBuilderAtEnd(b, mkBB)
             let made = buildCall(immixNew.fn, immixNew.ty, [numBlocks])!
-            // Arm the object-remembering write barrier for the self-hosted plan (task 150.4.2). The inline
-            // fast path (`__nomu_write_barrier`) reads three globals MMTk owns under its plans; under
-            // NOMU_GC_PLAN=nomu the self-hosted init owns them. Point them at the descriptor's log-bit table
+            // Arm the object-remembering write barrier (task 150.4.2). The inline fast path
+            // (`__nomu_write_barrier`) reads globals defined in the C floor, 0 (barrier off) until here. Point
+            // them at the descriptor's log-bit table
             // (@144) with a base that makes the fast path's absolute-address indexing (`(objInt>>3)>>3 + base`)
             // land in the table: `base = tableInt − (heapBaseInt>>6)`. log_region = 3 (one bit per 8-byte
-            // region — matching the Nomu accessors and MMTk's global unlog-bit granularity). Set once here,
-            // under the space-creation lock, after the first managed allocation — so it stays 0 (nomu_gc_init's
-            // NoGC default) until then, keeping the barrier inert for a non-self-hosted run.
+            // region — matching the Nomu accessors). Set once here, under the space-creation lock, on the first
+            // managed allocation.
             let i8t = LLVMInt8TypeInContext(ctx)!
             let tableInt = LLVMBuildLoad2(b, i64, gepByte(made, LLVMConstInt(i64, 144, 0)), "logbit.table")!
             let heapBaseForBarrier = LLVMBuildLoad2(b, i64, gepByte(made, LLVMConstInt(i64, 40, 0)), "logbit.heapbase")!
@@ -530,7 +460,8 @@ extension LLVMGen {
             let tlabGet = runtimeFn("rt_self_tlab_get", ret: i8ptr, params: [], varArg: false)
             let tlab = buildCall(tlabGet.0, tlabGet.1, [])!
             // Inline TLAB bump fast path (150.3.10.2): load the carrier's private cursor/limit and bump within
-            // the current hole with no call and no lock — the self-hosted analogue of the MMTk fast path above.
+            // the current hole with no call and no lock. `NOMU_NO_INLINE_ALLOC` turns it off (every allocation
+            // calls rtTlabAlloc) for A/B measurement; NOMU_GC_STRESS leaves the limit 0 so it always misses.
             // cursor/limit (@0/@8) are heap-relative byte offsets; `need` is the 8-aligned request. A hole never
             // spans more than one 32 KiB block, so a large-object request (need > block) can never satisfy
             // `cursor + need <= limit` and falls to the slow call, which routes it to LOS — no inline LOS check.
@@ -545,7 +476,9 @@ extension LLVMGen {
             let need = LLVMBuildAnd(b, LLVMBuildAdd(b, size, LLVMConstInt(i64, 7, 0), "sz+7"),
                                     LLVMConstInt(i64, ~UInt64(7), 0), "need")!
             let newCur = LLVMBuildAdd(b, cur, need, "tlab.new")!
-            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntULE, newCur, lim, "tlab.fits"), bumpBB, slowBB)
+            let fits = inlineAlloc ? LLVMBuildICmp(b, LLVMIntULE, newCur, lim, "tlab.fits")!
+                                   : LLVMConstInt(LLVMInt1TypeInContext(ctx), 0, 0)!
+            LLVMBuildCondBr(b, fits, bumpBB, slowBB)
             LLVMPositionBuilderAtEnd(b, bumpBB)
             LLVMBuildStore(b, newCur, tlab)
             let heapBaseInt = LLVMBuildLoad2(b, i64, gepByte(space, LLVMConstInt(i64, 40, 0)), "heapbaseint")!
@@ -609,10 +542,9 @@ extension LLVMGen {
             LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, active, LLVMConstInt(i8, 0, 0), "bar.on?"), onBB, doneBB)
             LLVMPositionBuilderAtEnd(b, onBB)
             let objInt = LLVMBuildPtrToInt(b, obj, i64, "obj.int")
-            // Heap-range guard: the log-bit table only covers [heap_lo, heap_hi). Under MMTk this is [0, MAX)
-            // (its side metadata is global), so the guard never trips; under the self-hosted plan it is the
-            // Immix heap range, so a store into an off-heap object (LOS / immortal) skips the barrier rather
-            // than indexing the table out of bounds.
+            // Heap-range guard: the log-bit table only covers [heap_lo, heap_hi), the Immix heap range, so a
+            // store into an off-heap object (LOS / immortal) skips the barrier rather than indexing the table
+            // out of bounds.
             let lo = LLVMBuildLoad2(b, i64, gLo, "heap.lo")
             let hi = LLVMBuildLoad2(b, i64, gHi, "heap.hi")
             let below = LLVMBuildICmp(b, LLVMIntULT, objInt, lo, "obj.below")

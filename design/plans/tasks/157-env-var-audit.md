@@ -19,8 +19,11 @@ against.
 
 ## The principle
 
-One product lever, not many. `NOMU_RUNTIME={native,selfhost}` already exists as the umbrella that
-selects self-hosted scheduler + allocator + collector together (task 128.4). Everything else should be
+No product lever: there is one runtime (the Nomu scheduler and collector), so nothing selects an
+implementation. `NOMU_RUNTIME`, `NOMU_SCHED` and `NOMU_GC_PLAN` were deleted with MMTk and the C scheduler
+([197](197-retire-mmtk-and-c-scheduler.md)), along with MMTk's `NOMU_GC_HEAP`, `NOMU_GC_MARKVERIFY`,
+`NOMU_GC_STATS`, the C-scheduler smoke knobs (`NOMU_GC_SMOKE*`, `NOMU_GC_STW_SMOKE`) and the driver's
+`NOMU_GC_ARCHIVE`. `NOMU_GC_STRESS` survives with a Nomu-collector meaning. Everything else should be
 either (a) an internal default with no env at all, (b) a dev/test-only override clearly marked as
 such, or (c) removed. Product selection stays a single flag; behavior tuning lives in the code with a
 sensible default, overridable only where a test genuinely needs it.
@@ -30,9 +33,9 @@ sensible default, overridable only where a test genuinely needs it.
 Enumerate every `NOMU_*` var (grep `getenv` / `environment[` across `src/`, plus any referenced only
 in `tools/`), and for each classify + decide:
 
-- **Product selection.** `NOMU_RUNTIME` (keep — the one lever). `NOMU_SCHED` / `NOMU_GC_PLAN` are
-  temporary differential-oracle overrides kept only to diff against MMTk; they retire with MMTk
-  (§7 Open in `selfhosted-gc.md`). Confirm nothing else selects an implementation.
+- **Product selection.** None remains (197). Confirm nothing else selects an implementation.
+- **GC test drivers.** `NOMU_GC_STRESS` (a collection every N allocated bytes), `NOMU_GC_PRESSURE`,
+  `NOMU_STW_COLLECT`, `NOMU_STW_SELFHOST`, `NOMU_GC_DEBUG_PRESSURE` — dev/test-only, set by suite cases.
 - **GC/scheduler tuning.** `NOMU_NURSERY_RESERVE`, `NOMU_MATURE_FLOOR`, `NOMU_CARRIERS`,
   `NOMU_GC_TRIGGER_RESERVE`, and the like. Each should carry an internal default (the descriptor
   already holds `nurseryReserve = numBlocks/4`, for instance) and drop the env, or demote it to a
@@ -56,17 +59,17 @@ nearly all are internalized or removed.
   conscious edit to a reviewed list rather than a stray `getenv`.
 - Codegen-affecting flags moved to compiler `--flags`.
 - Test-only knobs expressed through the harness (task 155) fixture directives, not scattered exports.
-- The default `NOMU_RUNTIME=selfhost` (or bare native) run needs no other environment.
+- The default run needs no environment.
 
 ## Dependencies / ordering
 
 Ties to **155** (integration-suite harness — fixture-declared env removes most test-time exports) and
 lands cleanly after **150.4.5** (when the generational reserve/floor become internal defaults). The
-oracle-override vars (`NOMU_SCHED` / `NOMU_GC_PLAN`) retire with MMTk. Do the audit + policy now; sweep
-the removals as each dependency clears.
+oracle-override vars retired with MMTk (197). Do the audit + policy now; sweep the removals as each
+dependency clears.
 
 ## Refs
 
 [155 integration-suite harness](155-integration-suite-harness.md);
 [150 GC ladder](150-selfhosted-gc-ladder.md); [128 self-hosting runtime](128-self-hosting-runtime.md)
-(the `NOMU_RUNTIME` umbrella, task 128.4); `internals/selfhosted-gc.md` §7 (MMTk retirement).
+(the former `NOMU_RUNTIME` umbrella, task 128.4); [197](197-retire-mmtk-and-c-scheduler.md) (MMTk retirement).

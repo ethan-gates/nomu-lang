@@ -1,12 +1,12 @@
 // Task 150.3.10.1 / 150.3.13 — multi-carrier self-hosted allocation, with collection. Four worker fibers
 // each keep a sliding window of 64 live Boxes while allocating 6M Boxes (the rest garbage). Under
-// NOMU_RUNTIME=selfhost NOMU_CARRIERS=4 they run on four carriers at once, bumping per-carrier TLABs and
+// NOMU_CARRIERS=4 they run on four carriers at once, bumping per-carrier TLABs and
 // refilling the shared Immix block pool CONCURRENTLY — the race the 150.3.10.1 split closes. Total
 // live+garbage (4 × 6M × 16 B = 384 MiB ≫ 256 MiB heap) forces repeated defrag collections while all four
 // carriers allocate: the collector stops every carrier, evacuates survivors across four stacks, resets all
 // four TLABs, and (150.3.13) keeps each completed-but-unjoined worker's result box rooted until main joins it.
 // Each worker returns a checksum over its live window; the sum is order/address-independent, so it must match
-// MMTk NoGC exactly. Run with NOMU_NO_ESCAPE=1 so the Boxes are real heap objects.
+// a run that never collects. Run with NOMU_NO_ESCAPE=1 so the Boxes are real heap objects.
 class Box {
   var v: Int
 }
@@ -37,6 +37,6 @@ fun main() {
   spawn let b = worker(2)
   spawn let c = worker(3)
   spawn let d = worker(4)
-  print((a + b + c + d) % 1000000)   // deterministic — identical under MMTk and the self-hosted allocator
+  print((a + b + c + d) % 1000000)   // deterministic — independent of collection and carrier count
   print("\n")
 }

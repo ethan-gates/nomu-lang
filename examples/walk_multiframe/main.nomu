@@ -1,7 +1,7 @@
 // Task 150 rung 2 — multi-frame pcsp walk validated against the C libunwind walk. Roots live in two
 // frames: inner holds c(33), d(44); outer holds a(11), b(22) across the inner call. rtCollectRoots (the
-// Nomu pcsp walk) runs immediately before sleep(0); under NOMU_GC_SMOKE the C walk runs at that same
-// sleep safepoint. Both see the same live set, so the distinct root .v values must match: {11,22,33,44}.
+// Nomu pcsp walk) runs immediately before sleep(0) and must recover the distinct root .v values
+// {11,22,33,44} (suite case `walk-multiframe`).
 // Distinct v's identify objects (no shared object), so this checks the walk steps inner -> outer -> main.
 class Box {
   var v: Int

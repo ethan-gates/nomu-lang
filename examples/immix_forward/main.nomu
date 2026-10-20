@@ -3,8 +3,8 @@
 // the original (header bit 33 + new address in payload word 0), and read it back. No tracing, no live
 // evacuation yet — just the primitive.
 //
-// Compiled with NOMU_NO_ESCAPE=1 (heap object for addrOf), run under NOMU_GC_PLAN=nomu (the self-hosted
-// heap the copy is allocated into).
+// Compiled with NOMU_NO_ESCAPE=1 (heap object for addrOf in the self-hosted heap the copy is allocated
+// into).
 //
 // Expected output: 12345 / 1 / 1 / 0 / 0.
 class Box {

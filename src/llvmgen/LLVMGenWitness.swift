@@ -344,7 +344,7 @@ extension LLVMGen {
     }
 
     // The `any I` payload for a value: a reference type is its pointer; a value type is copied to a
-    // fresh heap allocation so the pointer outlives the temporary (rt_alloc, leaked until the M6 GC).
+    // fresh managed allocation so the pointer outlives the temporary.
     func boxPayload(_ v: LLVMValueRef, _ t: Type) -> LLVMValueRef? {
         switch t {
         case .named(_, .class_), .named(_, .actor_):

@@ -9,7 +9,7 @@
 // `items` keeps 64 boxed Pt values live while garbage over-allocation forces defrag collections that
 // relocate payloads; dispatching `total()` afterward reads each Pt back through the (relocated) payload.
 // Each Pt k has x=k, y=k+100, so total = 2k+100; the grand total over k = 0..63 is 10432 — deterministic
-// and checksum-identical to MMTk NoGC. Run with NOMU_NO_ESCAPE=1 so the boxes are real heap objects.
+// and checksum-identical to a run that never collects. Run with NOMU_NO_ESCAPE=1 so the boxes are real heap objects.
 interface Metric {
     fun total() -> Int
 }

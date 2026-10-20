@@ -224,8 +224,8 @@ final class LLVMGen {
     var intFmt: LLVMValueRef?
     var uintFmt: LLVMValueRef?
     var strFmt: LLVMValueRef?
-    // §6.6 — inline the allocation bump fast path; `NOMU_NO_INLINE_ALLOC` reverts to the out-of-line
-    // `rt_alloc` tail-call for A/B measurement.
+    // §6.6 — inline the allocation TLAB bump fast path; `NOMU_NO_INLINE_ALLOC` sends every allocation to the
+    // out-of-line `rtTlabAlloc` for A/B measurement.
     let inlineAlloc = ProcessInfo.processInfo.environment["NOMU_NO_INLINE_ALLOC"] == nil
 
     init(ctx: LLVMContextRef, mod: LLVMModuleRef) {

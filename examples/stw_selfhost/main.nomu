@@ -1,6 +1,6 @@
 // Task 128.3.2 spike — self-hosted STW root walk over the 128.1.9 scheduler, no libunwind. `worker` builds
 // two live class objects and one dead one, then parks at `sleep(200)` holding the live pair across the
-// safepoint. Under NOMU_SCHED=nomu the sleep shim captured worker's user-frame anchor (a statepoint return
+// safepoint. The sleep shim captured worker's user-frame anchor (a statepoint return
 // address) into its fiber; while it is parked, `main` reaches the scheduler handle and runs
 // `nomuSchedWalkParked`, which iterates the live-fiber registry and runs the self-hosted pcsp walk
 // (rtWalkFrom) from each parked fiber's anchor. Expected recovered set: {111, 222}; the dead 999 is

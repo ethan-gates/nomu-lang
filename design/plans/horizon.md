@@ -7,8 +7,8 @@ not a hard prerequisite is noted inline. Identity numbers point into [`tasks.md`
 detail and status; this doc carries only the goals and their order. Everything not on an epic here is
 parallel/cheap work tracked in `tasks.md`.
 
-Two epics are live. **Epic A (self-hosted GC + runtime) is the active priority.** Its next run of work is
-retiring MMTk and the C scheduler (one runtime from here on), then GC correctness, then the **modules
+Two epics are live. **Epic A (self-hosted GC + runtime) is the active priority.** MMTk and the C scheduler
+are retired (one runtime: the Nomu scheduler and collector). Its next run of work is GC correctness, then the **modules
 build-out** beneath the benchmark, which needs programs large enough to be meaningful and the
 perf-affecting module capabilities real: dev-productivity first (explicit module builds, then the build
 cache), then the perf-relevant capabilities (cross-module generics residuals, cross-module inlining). The
@@ -41,13 +41,13 @@ while changing the algorithm — so the two unknowns never multiply.
         └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)
             └── 190  explicit module builds — dep scan, one planned graph
                 ├── 195  link-time GC frame index — 195.5 (driver-written signature) remains
-                └── 176  shaped GC roots — 176.5 one shape per type (GC correctness)
-                    └── 197  retire MMTk and the C scheduler — one runtime   ◀ next
+                └── 176  shaped GC roots — 176.5 one shape per type (GC correctness)   ◀ next
 ```
 
-**Order of the next run:** 197, then 176.5, then 195.5, then 190, then 172, then 159. One runtime first, so
-the rest of the GC-correctness work is built and tested once; GC correctness then comes before the modules
-work (soundness is Nomu's first priority, `vision.md`); 190 closes only after all of 195 and 176.5.
+**Order of the next run:** 176.5 (from 176.5.5), then 195.5, then 190, then 172, then 159. GC correctness
+comes before the modules work (soundness is Nomu's first priority, `vision.md`); 190 closes only after all of
+195 and 176.5. [197](tasks/197-retire-mmtk-and-c-scheduler.md) (retire MMTk and the C scheduler) is done;
+197.6 (the stdin poller and a working `readLine`) closed it.
 
 **What the benchmark needs from the language.** The goal is a language complete enough to benchmark against
 Go and Swift, with results that reflect the language, compiler, scheduling and memory as designed, and not
@@ -55,8 +55,8 @@ gaps in them. MMTk retirement was decided without a GenImmix-vs-MMTk benchmark: 
 distance, and keeping a second runtime doubled every GC change ([197](tasks/197-retire-mmtk-and-c-scheduler.md)).
 
 MMTk/GenImmix was the reference implementation each self-hosting rung diffed against; with the self-hosted
-runtime passing the suite on its own, 197 removes it, and [159](tasks/159-gc-observability.md)'s
-correctness matrix takes over the cross-check. **The modules build-out sits on the LXR chain** because its
+runtime passing the suite on its own, 197 removed it. Collecting legs on the Nomu collector (allocation
+stress, small nurseries) and [159](tasks/159-gc-observability.md)'s correctness matrix carry the cross-check. **The modules build-out sits on the LXR chain** because its
 purpose is a meaningful benchmark. It gates the benchmark two
 ways:
 

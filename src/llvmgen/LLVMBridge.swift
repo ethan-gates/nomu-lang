@@ -165,8 +165,7 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     // it by name at load time via getsectiondata), and its anchor `__LLVM_StackMaps` is a *local*
     // symbol in this object, so nothing in another object can pin it and global dead-strip would drop
     // it — silently defeating precise root scanning. A module-level `.no_dead_strip` directive marks
-    // that one atom non-strippable while the rest of dead-strip's win (the unreachable MMTk closure)
-    // is unaffected. Harmless no-op for a statepoint-free program (the symbol is simply absent).
+    // that one atom non-strippable while the rest of dead-strip's win is unaffected. Harmless no-op for a statepoint-free program (the symbol is simply absent).
     let keepStackmaps = ".no_dead_strip __LLVM_StackMaps\n"
     keepStackmaps.withCString { LLVMAppendModuleInlineAsm(mod, $0, keepStackmaps.utf8.count) }
 

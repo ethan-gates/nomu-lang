@@ -4,12 +4,11 @@
 // repeated `concat` (a fresh immortal buffer each time) while over-allocating garbage Boxes far past the
 // 256 MiB heap, forcing collections while the String is live, and folds a content hash of the String on
 // every iteration — reading back through the immortal buffer. If the self-hosted collector moved, swept,
-// or mis-scanned an immortal buffer, the hash would diverge from MMTk or the readback would fault.
+// or mis-scanned an immortal buffer, the hash would diverge or the readback would fault.
 //
 // The immortal buffers live off-heap relative to the self-hosted Immix space, so the evacuator's off-heap
-// guard leaves them in place and the self-hosted sweep never touches them — the interim immortal path
-// (MMTk immortal space) holds under NOMU_RUNTIME=selfhost. The folded hash is content-deterministic, so it
-// is checksum-identical to MMTk NoGC. Run with NOMU_NO_ESCAPE=1 so the garbage Boxes are real heap objects.
+// guard leaves them in place and the self-hosted sweep never touches them. The folded hash is
+// content-deterministic, so it is checksum-identical to a run that never collects. Run with NOMU_NO_ESCAPE=1 so the garbage Boxes are real heap objects.
 class Box {
   var v: Int
 }

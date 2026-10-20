@@ -117,12 +117,12 @@ final class BuildTests: XCTestCase {
     }
 
     // The GC frame index (task 195): a built binary carries it, version 2 with entries, and collects
-    // correctly across modules; with the index erased, the first stack walk aborts with a message instead of
-    // missing roots. A run that never collects never walks, so it still runs.
+    // correctly across modules; with the index erased, the program aborts at startup with a message instead
+    // of missing roots, whether or not it would collect.
     func testBinaryWithoutFrameIndexAborts() throws {
         let r = try build("tests/fixtures/gc_roots_across_modules")
         let binary = try XCTUnwrap(r.binary)
-        let gc = ["NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "65536"]
+        let gc = ["NOMU_GC_STRESS": "65536"]
         XCTAssertEqual(try run(binary, env: gc).stdout, "2014000\n6042\n")
 
         var data = try Data(contentsOf: URL(fileURLWithPath: binary))
@@ -139,7 +139,9 @@ final class BuildTests: XCTestCase {
         let erased = try run(binary, env: gc)
         XCTAssertNotEqual(erased.status, 0)
         XCTAssertTrue(erased.stderr.contains("no GC frame index"), erased.stderr)
-        XCTAssertEqual(try run(binary).stdout, "2014000\n6042\n")
+        let quiet = try run(binary)
+        XCTAssertNotEqual(quiet.status, 0)
+        XCTAssertTrue(quiet.stderr.contains("no GC frame index"), quiet.stderr)
     }
 
     private func run(_ exe: String, _ args: [String] = [], env: [String: String] = [:]) throws

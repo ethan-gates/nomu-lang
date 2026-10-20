@@ -59,27 +59,37 @@ struct CaseRunner {
             return result(.fail, ["  compile failed", "  stderr:"] + indented(compile.stderr) + ["  repro: \(compileRepro)"])
         }
 
-        // Object-symbol assertions: checked once against the fixture's own object, before any run.
-        if !c.objectSymbols.isEmpty {
+        // Object-symbol assertions: checked once against the fixture's own object, before any run —
+        // defined symbols (`nm -U`) and undefined references (`nm -u`).
+        for (flag, kind, matches) in [("-U", "symbol", c.objectSymbols), ("-u", "reference", c.objectReferences)]
+            where !matches.isEmpty {
             let obj = bin + ".o"
-            let nm = runProcess(path: "/usr/bin/nm", args: ["-U", obj], env: [:], timeout: 30)
+            let nm = runProcess(path: "/usr/bin/nm", args: [flag, obj], env: [:], timeout: 30)
             if !nm.succeeded {
                 return result(.fail, ["  nm failed on '\(obj)'"] + indented(nm.stderr))
             }
-            for m in c.objectSymbols {
+            for m in matches {
                 let n = countOccurrences(nm.stdout, m.pattern)
                 let bad = (m.min.map { n < $0 } ?? false) ? "min \(m.min!)"
                         : (m.max.map { n > $0 } ?? false) ? "max \(m.max!)" : nil
                 if let bound = bad {
                     let hits = nm.stdout.split(separator: "\n").filter { $0.contains(m.pattern) }.prefix(10).map(String.init)
-                    return result(.fail, ["  object symbol assertion failed: '\(m.pattern)' matched \(n)× (\(bound)) in \(obj)"]
-                                         + hits.map { "    " + $0 } + ["  repro: nm -U \(obj)"])
+                    return result(.fail, ["  object \(kind) assertion failed: '\(m.pattern)' matched \(n)× (\(bound)) in \(obj)"]
+                                         + hits.map { "    " + $0 } + ["  repro: nm \(flag) \(obj)"])
                 }
             }
         }
 
         guard let want = loadGolden(c.expect) else {
             return result(.fail, ["  golden file missing for expect.stdout_file"])
+        }
+
+        var stdinFeed: StdinFeed? = nil
+        if let f = c.stdinFile {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: ctx.fixturePath(f))) else {
+                return result(.fail, ["  stdin_file '\(f)' missing"])
+            }
+            stdinFeed = StdinFeed(data: data, delayMs: c.stdinDelayMs)
         }
 
         var totalRun = 0.0
@@ -90,7 +100,7 @@ struct CaseRunner {
             for iter in 1...c.iterations {
                 var env = c.runEnv
                 if let carrier = carrier { env["NOMU_CARRIERS"] = String(carrier) }
-                let r = runProcess(path: bin, args: [], env: env, timeout: c.runTimeout)
+                let r = runProcess(path: bin, args: [], env: env, timeout: c.runTimeout, stdin: stdinFeed)
                 totalRun += r.duration
                 let runRepro = "\(envPrefix(env)) \(bin)".trimmingCharacters(in: .whitespaces)
                 let at = "carrier=\(carrier.map(String.init) ?? "-") iter=\(iter)"

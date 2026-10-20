@@ -1,6 +1,6 @@
 // Task 150 rung 1 slice B — real managed objects allocated by the self-hosted Nomu allocator.
-// Class instances (heap-allocated GC objects) built + read back; under NOMU_GC_PLAN=nomu the allocation
-// routes through the Nomu bump allocator instead of MMTk. Expected: 42 / 7 / 100.
+// Class instances (heap-allocated GC objects) built + read back through the Nomu allocator.
+// Expected: 42 / 7 / 100.
 class Box {
   var v: Int
 }

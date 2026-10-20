@@ -1,0 +1,31 @@
+// `readLine` parks the calling fiber until stdin has a line, so its carrier keeps running other fibers. The
+// suite feeds stdin late (suite case `read-line`): on one carrier the ticker's three ticks must all print
+// while `main` waits for its first line. Then: a second line, an unterminated last line returned whole, and
+// end of input as an empty string.
+fun ticker() -> Int {
+  var i = 0
+  while i < 3 {
+    sleep(50)
+    print("tick\n")
+    i = i + 1
+  }
+  return i
+}
+
+fun show(s: String) {
+  print("got '")
+  print(s)
+  print("' ")
+  print(s.count)
+  print("\n")
+}
+
+fun main() {
+  spawn let t = ticker()
+  show(readLine())
+  show(readLine())
+  show(readLine())
+  show(readLine())
+  print(t)
+  print("\n")
+}

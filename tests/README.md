@@ -39,10 +39,10 @@ Add an object to `cases` in `tests/suite.json` and a `.nomu` fixture — no new 
 - `compile_env` / `run_env` — the env is declared here, in exactly one place, so a run cannot
   silently forget or duplicate a flag. Compilation is shared: a fixture is built once per distinct
   `(compile_env, compile_args)`; a case's runs vary only `run_env` / `carriers`. Two cases sharing a
-  fixture and compile config (e.g. a `nogc` leg and an `immix`-evacuation leg) compile once.
+  fixture and compile config (e.g. a default leg and a `NOMU_GC_STRESS` leg) compile once.
 - `expect` — `{ "stdout": "…" }` (literal, exact) or `{ "stdout_file": "tests/expected/x.txt" }`
-  (golden file, for computed/large output). Oracle cases store the MMTk output as the golden,
-  captured once and refreshed only when the correct output legitimately changes. Omit `expect` to
+  (golden file, for computed/large output). A golden is captured once and refreshed only when the
+  correct output legitimately changes. Omit `expect` to
   only require a clean exit.
 - `iterations` (repeat; all must pass), `carriers` (one run per count, sets `NOMU_CARRIERS`). Set
   `"carriers": []` to run once without setting `NOMU_CARRIERS` — for fixtures that manage their own
@@ -52,6 +52,11 @@ Add an object to `cases` in `tests/suite.json` and a `.nomu` fixture — no new 
 - `object_symbols` — `[ { "pattern": "_nomu_fn_rt", "max": 0 } ]`, a count of defined symbols (`nm -U`)
   containing the substring in the fixture's own object (`<binary>.o`), checked once after compile. `min` /
   `max` both optional. Pins what the program's object defines, e.g. no duplicated runtime / `std` copies.
+- `object_references` — the same shape over undefined symbols (`nm -u`): what the object calls out to,
+  e.g. `__nomu_gc_poll_slow` absent from runtime-subset code.
+- `stdin_file` / `stdin_delay_ms` — a repo-relative file fed to the program's stdin through a pipe, written
+  `stdin_delay_ms` after launch and then closed (end of input). Without it stdin is `/dev/null`. The delay
+  lets a case observe a program waiting on input (`read-line`: other fibers run meanwhile).
 - `timeout_sec` / `compile_timeout_sec` — per-run and per-compile caps (defaults 60 / 120). Every
   run is bounded; on expiry the whole process group is killed and the case reports `TIMEOUT`.
 - `weight` — lanes the case occupies in the fixed-8 pool (default 1). A self-parallelizing case
@@ -62,6 +67,17 @@ Add an object to `cases` in `tests/suite.json` and a `.nomu` fixture — no new 
   substring, and no run happens.
 
 Unset fields fall back to `defaults`.
+
+## GC legs
+
+Every program runs on the Nomu runtime (the Nomu scheduler and collector). A fixture's plain case runs it
+with no knob; its collecting legs force collections and check with `stderr_match` that one fired
+(`NOMU_GC_DEBUG_PRESSURE=1` prints each collection):
+- `-evac` — `NOMU_GC_STRESS=<bytes>`: a collection every N bytes a carrier allocates, so every
+  allocation site is a collection point (minor; `NOMU_MATURE_FLOOR` above the heap size makes it major).
+- `NOMU_NURSERY_RESERVE=<blocks>` — minor collections when the nursery fills that many 32 KiB blocks.
+- `NOMU_GC_PRESSURE` / `NOMU_STW_COLLECT` / `NOMU_STW_SELFHOST` — external driver threads (heap-pressure
+  defrag, timed forced evacuation, timed root-walk STW).
 
 ## Scheduling order
 
@@ -86,8 +102,8 @@ NOMU_NO_ESCAPE=1 build/examples/gc_string > tests/expected/gc_string.txt
 
 Phase 1 (MVP) is built: compile-once/run-many, golden compare, `stderr_match`, hardened timeouts,
 a weight-packed 8-lane pool with longest-first dispatch, live TTY output, `--enable`/`--disable`.
-68 cases cover ~42 retired `tools/*.sh` drivers (the whole
-run-and-check families: plan-differential golden, self-hosted GC oracle, scheduler/runtime stdout).
+The cases cover the retired `tools/*.sh` drivers (the run-and-check families: captured golden, GC
+root-walk and collection checks, scheduler/runtime stdout).
 The remaining `tools/` scripts are the tail the schema does not yet express (precise root-set
 assertions, artifact inspection, perf/corpus matrices) — see `tools/README.md`. Phase 2 (perf
 output, slowest-N, machine-readable/CI, regression gate) is pending.

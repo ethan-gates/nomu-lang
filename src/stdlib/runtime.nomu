@@ -37,8 +37,8 @@ fun rtBumpAlloc(ctl: RawPtr, n: Int) -> RawPtr {
 // object, without reclaiming or moving anything (the NoGC heap only grows). The mark lives in the object
 // header: the 8-byte header holds the type-id in its low 32 bits with the high bits zero, so setting bit
 // 32 (adding 2^32) marks the object and leaves the type-id recoverable. Subset code — RawPtr plus the
-// gc-leaf type-table reads, no managed allocation. The object model is read through the same per-type-id
-// tables the MMTk binding reads (c-types.md §1/§3.2): a fixed object scans its managed-offset map; an
+// gc-leaf type-table reads, no managed allocation. The object model is read through the per-type-id
+// descriptor tables (c-types.md §1/§3.2): a fixed object scans its managed-offset map; an
 // array buffer { header, cap, elems } scans the per-element map at each of `cap` slots.
 //
 // 2^32 = 4294967296 (no grouping parens yet, task 114 — kept as intermediate `let`s).
@@ -532,14 +532,10 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
   return n
 }
 
-// ---- Parked-fiber root scan (task 128.3.1) ----
-// Scan every parked fiber's stack for GC roots. The C runtime hands us each parked fiber's innermost Nomu
-// frame anchor as a (sp, pc) pair (`rt_gc_parked_anchors`) — it crosses the C park frames (swapcontext /
-// `rt_sleep_ms`) with its unwinder, which is unavoidable while parking goes through Darwin's asm
-// `swapcontext` (no clean frame-pointer chain, no pcsp table for C frames). From each Nomu anchor the pcsp
-// walk (`rtWalkFrom`) reads root slots and steps between Nomu frames self-hosted. Oracle: the C
-// `nomu_gc_scan_parked_fibers` walk (`gc-smoke-parked` shape), diffed in-process. A fully self-hosted entry
-// waits on the self-hosted context switch (128.1); driving this at a real STW over all mutators is 128.3.2.
+// ---- Stopped-fiber root walk (task 128.3) ----
+// Scan a stopped fiber's stack for GC roots from the user-frame (sp, pc) anchor the scheduler recorded when it
+// parked or stopped at a safepoint: the pcsp walk (`rtWalkFrom`) reads root slots and steps between Nomu
+// frames self-hosted.
 
 // The pcsp walk from an explicit (sp, pc) anchor over a *saved* context — a parked fiber now, an STW-stopped
 // carrier later — appending live root object addresses into `outBuf` (up to `cap`, from index `n0`), one
@@ -577,7 +573,7 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitS
         let savedFp: RawPtr = sp.load(fromByteOffset: -16)
         frameFp = savedFp
       }
-      // Shaped roots (task 176 Stage 4), mirroring the C walker's `nomu_gc_walk_context`. The 3rd meta
+      // Shaped roots (task 176 Stage 4). The 3rd meta
       // location's inline Constant value is NumDeopt; the deopt range that follows (before the ordinary
       // GC pointers) is our shaped roots — (shape-id Constant, slot Direct) pairs. For each, resolve the
       // ordinal to its kind-2 descriptor and run the shared enumerator over the 16-byte value at the slot:
@@ -668,25 +664,6 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitS
       sp = cfa
     }
   }
-  return n
-}
-
-// Scan every parked fiber, appending its live roots into `outBuf` (up to `cap`). Returns the total. The C
-// runtime hands each parked fiber's innermost Nomu frame anchor as a (sp, pc) pair (`rt_gc_parked_anchors`,
-// crossing the C park frames with its unwinder); `rtWalkFrom` runs the pcsp walk from each, self-hosted.
-fun rtScanParkedFibers(outBuf: RawPtr, cap: Int) -> Int {
-  let anchorCap = 128
-  let anchors = RawPtr.alloc(bytes: anchorCap * 8, align: 8)
-  let nf = RawPtr.gcParkedAnchors(anchors, anchorCap)
-  var n = 0
-  var i = 0
-  while i < nf {
-    let sp: RawPtr = anchors.load(fromByteOffset: i * 16)
-    let pc: Int = anchors.load(fromByteOffset: i * 16 + 8)
-    n = rtWalkFrom(sp, pc, outBuf, n, cap, 0)
-    i = i + 1
-  }
-  anchors.free()
   return n
 }
 
@@ -992,7 +969,7 @@ fun rtNextHole(space: RawPtr, need: Int) -> Bool {
 // within the current hole, and on exhaustion advance to the next hole/block (rtNextHole), reusing reclaimed
 // and recyclable space produced by collection (150.3.5). An object larger than a block routes to the
 // large-object space (150.3.3). Returns a RawPtr into the heap (or a LOS chunk), or RawPtr.null when the
-// heap is exhausted. This is the target the codegen self-hosted-alloc seam routes to under NOMU_GC_PLAN=nomu.
+// heap is exhausted. The collector's single-threaded copy allocator; mutators allocate through rtTlabAlloc.
 fun rtImmixAlloc(space: RawPtr, n: Int) -> RawPtr {
   let bumped = n + 7
   let need = bumped / 8 * 8
@@ -1095,6 +1072,52 @@ fun rtSelfhostMinorGc(anchorSp: RawPtr, anchorPc: Int) -> Bool {
   return true
 }
 
+// Run a generational collection at the alloc-site anchor: a minor, or a major when mature headroom is short
+// (150.4.4, §11.4). `minorTrigger` is the active nursery reserve in blocks (rtGenReserve, > 0). A minor
+// promotes the whole nursery into mature; when mature lacks headroom the copy allocator would return null
+// mid-promotion (a null stored into a slot — corruption), and a minor never reclaims dead mature objects, so
+// mature fills over time. When the free mature blocks fall below a floor, run a full defrag major instead — it
+// reclaims mature garbage and collects the nursery, so it handles both failed promotion and mature pressure.
+// The floor is the worst-case promotion (the whole nursery, minorTrigger blocks) plus a fragmentation margin,
+// raised by NOMU_MATURE_FLOOR (the mature-pressure knob) when set higher. The defrag major is
+// heap-pressure-safe (it selects sources within the copy reserve), so it runs even when the minor could not
+// place its promotions. Called without the pool lock held. Returns whether a collection ran.
+fun rtGenCollect(minorTrigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+  let avail = nomuGcSpaceAvail()
+  var floor = minorTrigger + minorTrigger        // 2× the reserve: promotion headroom + fragmentation margin
+  let matureFloor = RawPtr.gcMatureFloor()
+  if matureFloor > floor {
+    floor = matureFloor
+  }
+  if avail < floor {
+    return rtSelfhostOom(anchorSp, anchorPc)     // escalate → major (collection kind 0)
+  }
+  return rtSelfhostMinorGc(anchorSp, anchorPc)   // minor (collection kind 1)
+}
+
+// Allocation stress (env NOMU_GC_STRESS): count `need` bytes against this carrier's stress interval and, once
+// the interval is reached, request a collection at the alloc-site anchor — a generational one (rtGenCollect)
+// when generational is on, else a major. Off under an external STW driver, which runs no coordinator to service
+// the request. The collection resets every TLAB, so the caller re-reads it.
+fun rtStressTick(space: RawPtr, tlab: RawPtr, need: Int, stress: Int, anchorSp: RawPtr, anchorPc: Int) {
+  if RawPtr.gcExternalDriver() != 0 {
+    return
+  }
+  let counted: Int = tlab.load(fromByteOffset: 40)
+  let total = counted + need
+  if total < stress {
+    tlab.store(total, toByteOffset: 40)
+    return
+  }
+  tlab.store(0, toByteOffset: 40)
+  let minorTrigger = rtGenReserve(space)
+  if minorTrigger > 0 {
+    let ran = rtGenCollect(minorTrigger, anchorSp, anchorPc)
+  } else {
+    let ran = rtSelfhostOom(anchorSp, anchorPc)
+  }
+}
+
 // Refill the carrier's TLAB with the next hole big enough for `need` bytes, pulling blocks from the shared
 // pool under poolLock. The hole scan matches rtNextHole (skips live lines so recyclable-block holes are
 // respected) but runs on the TLAB's private block/line/cursor/limit. Whole-block-per-carrier: a fresh block
@@ -1119,27 +1142,8 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
       let nurseryNow: Int = space.load(fromByteOffset: 136)
       var didGc = false
       if minorTrigger > 0 && nurseryNow >= minorTrigger {
-        // Minor vs. major (150.4.4, §11.4). A minor promotes the whole nursery into mature; when mature lacks
-        // headroom the copy allocator would return null mid-promotion (a null stored into a slot — corruption),
-        // and a minor never reclaims dead mature objects, so mature fills over time. When the free mature blocks
-        // fall below a floor, run a full defrag major instead — it reclaims mature garbage and collects the
-        // nursery, so it handles both failed promotion and mature pressure. The floor is the worst-case
-        // promotion (the whole nursery, minorTrigger blocks) plus a fragmentation margin, raised by
-        // NOMU_MATURE_FLOOR (the mature-pressure knob) when set higher. The defrag major is heap-pressure-safe
-        // (it selects sources within the copy reserve), so it runs even when the minor could not place its
-        // promotions.
-        let avail = nomuGcSpaceAvail()
-        var floor = minorTrigger + minorTrigger        // 2× the reserve: promotion headroom + fragmentation margin
-        let matureFloor = RawPtr.gcMatureFloor()
-        if matureFloor > floor {
-          floor = matureFloor
-        }
         rtSchedMutexUnlockAt(space.advanced(by: 120))
-        if avail < floor {
-          didGc = rtSelfhostOom(anchorSp, anchorPc)     // escalate → major (collection kind 0)
-        } else {
-          didGc = rtSelfhostMinorGc(anchorSp, anchorPc) // minor (collection kind 1)
-        }
+        didGc = rtGenCollect(minorTrigger, anchorSp, anchorPc)
         rtSchedMutexLockAt(space.advanced(by: 120))
       }
       if didGc {
@@ -1201,7 +1205,7 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
             let startOff = ab * 32768 + al * 256
             let endOff = ab * 32768 + e * 256
             // Bulk-zero the hole before handing it to the carrier (150.4.5.1). A reclaimed block/line holds the
-            // previous occupant's bytes; the self-hosted allocator (unlike the fresh-mmap NoGC path) reuses it,
+            // previous occupant's bytes; the allocator reuses it,
             // so an over-allocated array buffer's unwritten tail would otherwise carry stale words the tracer
             // reads as pointers. Zeroing on acquire restores the zero-init contract, matching Immix/MMTk.
             let heap: RawPtr = space.load(fromByteOffset: 0)
@@ -1228,6 +1232,12 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
 fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
   let bumped = n + 7
   let need = bumped / 8 * 8
+  // Under NOMU_GC_STRESS the hole end lives at stressLimit (@32) and the inline limit (@8) stays 0, so every
+  // allocation reaches here and counts toward the carrier's stress interval.
+  let stress = RawPtr.gcStress()
+  if stress > 0 {
+    rtStressTick(space, tlab, need, stress, anchorSp, anchorPc)
+  }
   if need > 32768 {
     rtSchedMutexLockAt(space.advanced(by: 120))
     let los = rtLosAlloc(space, need)          // larger than a block → shared large-object space (off-heap malloc)
@@ -1236,9 +1246,13 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
   }
   var done = false
   var result = RawPtr.null
+  var limOff = 8
+  if stress > 0 {
+    limOff = 32
+  }
   while !done {
     let cur: Int = tlab.load(fromByteOffset: 0)
-    let lim: Int = tlab.load(fromByteOffset: 8)
+    let lim: Int = tlab.load(fromByteOffset: limOff)
     if cur + need <= lim {
       let heap: RawPtr = space.load(fromByteOffset: 0)
       result = heap.advanced(by: cur)
@@ -1251,6 +1265,10 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
       if !ok {
         result = RawPtr.null
         done = true
+      } else if stress > 0 {
+        let holeEnd: Int = tlab.load(fromByteOffset: 8)
+        tlab.store(holeEnd, toByteOffset: 32)    // move the hole end out of the inline fast path's reach
+        tlab.store(0, toByteOffset: 8)
       }
     }
   }
@@ -1370,8 +1388,8 @@ fun rtModBufAppend(mb: RawPtr, obj: RawPtr) {
   mb.store(count + 1, toByteOffset: 0)
 }
 
-// The barrier slow path (§11.2). Called from the C write-barrier seam (rt_gc_write_barrier) under
-// NOMU_GC_PLAN=nomu with the carrier's mod-buffer and the mutated object. The inline fast path already tested
+// The barrier slow path (§11.2). Called from the C write-barrier seam (rt_gc_write_barrier) with the
+// carrier's mod-buffer and the mutated object. The inline fast path already tested
 // the log bit, but the actor/mailbox path (runtime.c) calls the seam directly, bypassing that test, so
 // re-check here: a logged (young, bit 0) object contributes nothing to the remembered set. On an unlogged
 // (mature) object, mark it logged so subsequent stores elide the slow path, then remember it — the minor GC
@@ -2695,10 +2713,10 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
 }
 
 // Drive a self-hosted collection at an STW: walk every stopped mutator's root SLOTS and run the evacuating
-// collection over the self-hosted Immix space (NOMU_GC_PLAN=nomu). `forceAll != 0` moves every live object
+// collection over the self-hosted Immix space. `forceAll != 0` moves every live object
 // (a maximal-move fixup stress, needs free to-space); else the defrag collector (heap-pressure-safe). Called
-// by the STW coordinator with the world stopped. Returns the number of roots processed (0 off the self-hosted
-// GC plan — the space is null under MMTk/NoGC).
+// by the STW coordinator with the world stopped. Returns the number of roots processed (0 before the first
+// managed allocation, while the space is null).
 fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
   let space = RawPtr.gcSelfhostSpace()
   let spaceNull = space.eq(RawPtr.null)
@@ -2736,7 +2754,7 @@ fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
 
 // Drive a minor (generational) collection at an STW (task 150.4.3): the stopped mutators' stack root slots
 // plus the drained per-carrier remembered set (the write barrier's mod-buffers) are the root set; the nursery
-// is promoted into mature Immix. Returns the number of objects promoted (0 off the self-hosted GC plan). The
+// is promoted into mature Immix. Returns the number of objects promoted (0 while the space is null). The
 // drain (RawPtr.gcDrainModBufs) both collects and resets the mod-buffers, so the coordinator does not also
 // reset them; it does reset the mutator TLABs (their nursery blocks were reclaimed).
 fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
@@ -2758,7 +2776,7 @@ fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
 }
 
 // Available empty blocks in the self-hosted Immix space (never-used + reclaimed-free) — the heap-pressure
-// gauge the GC-trigger thread polls. Returns -1 when the self-hosted space does not exist (MMTk/NoGC plan).
+// gauge the GC-trigger thread polls. Returns -1 before the space exists (no managed allocation yet).
 fun nomuGcSpaceAvail() -> Int {
   let space = RawPtr.gcSelfhostSpace()
   let spaceNull = space.eq(RawPtr.null)
@@ -2790,7 +2808,7 @@ fun nomuGcSpaceBlocks() -> Int {
 // selecting at most (available − reserve) sources leaves the reserve free even if a source turned out full —
 // the guarantee that evacuation never runs out of to-space mid-collection. When the heap is near-full
 // (budget 0) no sources are selected and the collection is non-moving. Selection is deterministic (scan
-// order), so the collector diffs against MMTk Immix run to run.
+// order), so a collection is reproducible run to run.
 
 // Half a block — a block with at most this many live lines (more than half holes) is fragmented enough to
 // evacuate. The fragmentation threshold; tuning it (and the block-selection order) is the defrag policy knob.
@@ -2860,34 +2878,12 @@ fun rtImmixCollectDefrag(space: RawPtr, root: RawPtr) -> RawPtr {
   return newRoot
 }
 
-// ---- Scheduler root (task 128.3.1) ----
-// The global scheduled-mailbox queue head (`rt_sched_head`) is a single managed GC root: rooting it keeps
-// the whole `sched_next` chain — every queued mailbox, its pending messages, and each receiver actor — alive
-// even when the actor is otherwise unreferenced, so fire-and-forget outstanding work survives GC. The C root
-// scan (`nomu_gc_scan_parked_fibers`) reports it alongside the parked fibers; this reads the same global
-// self-hosted (`RawPtr.gcSchedHead()` loads it directly) and appends it into `outBuf` when the queue is
-// non-empty. Returns the new count. The chain past the head is reached through the mailbox pointer map (a
-// scanned field), so reporting the head alone suffices — the tracer follows `sched_next` from there.
-fun rtScanSchedRoot(outBuf: RawPtr, n0: Int, cap: Int) -> Int {
-  var n = n0
-  let head = RawPtr.gcSchedHead()
-  let headNull = head.eq(RawPtr.null)
-  if !headNull {
-    if n < cap {
-      outBuf.store(head, toByteOffset: n * 8)
-      n = n + 1
-    }
-  }
-  return n
-}
-
-// ---- Self-hosted M:N scheduler (task 128.1.9 — the production scheduler behind NOMU_SCHED=nomu) ----
+// ---- The M:N scheduler (task 128.1.9) ----
 // The machinery proved rung-by-rung in the examples/scheduler_*.nomu fixtures, consolidated here into one
 // canonical scheduler that runs real GC-registered user programs. The C entry points fiber_spawn /
-// spawn_join / main (runtime.c) dispatch into the `nomuSched*` functions below when the Nomu plan is
-// selected; codegen is unchanged. Scope for this rung is NoGC — the default MMTk plan never collects, so
-// there is no stop-the-world over these carriers yet (that is 128.3.2, which adds a Nomu-readable saved
-// context and drives rtWalkFrom over the live-fiber registry).
+// spawn_join / rt_sleep_ms / main (runtime.c) forward to the `nomuSched*` functions below. A stop-the-world
+// over the carriers (128.3.2) parks each fiber at a recorded user-frame anchor, and the collector runs
+// rtWalkFrom over the live-fiber registry.
 //
 // The lock protocol is the lock-coupled park (concurrency.md §2): the carrier switches into a fiber with
 // the scheduler lock HELD; the fiber releases it only after switch-in, runs lock-free, then re-acquires it
@@ -2911,8 +2907,7 @@ fun rtScanSchedRoot(outBuf: RawPtr, n0: Int, cap: Int) -> Int {
 //   state: 0 ready · 1 running · 2 parked · 3 done      mutex-word: 0 unlocked · 1 locked · 2 contended
 //   anchor-sp/anchor-pc (task 128.3.2): the user-frame (sp, pc) captured by the C dispatch shim at the
 //   point the fiber stopped (a park at join/sleep, or a safepoint poll) — a statepoint return address the
-//   pcsp walk (rtWalkFrom) can match. Set before the fiber parks; the STW walk reads it. This retires the
-//   C libunwind crossing (gcParkedAnchors) that 128.3.1 used while the scheduler was still C.
+//   pcsp walk (rtWalkFrom) can match. Set before the fiber parks; the STW walk reads it.
 
 // A 3-state futex mutex on the word at `m` (Drepper "mutex1": uncontended CAS fast path, a __ulock_wait
 // slow path). Used for both the scheduler lock (sched+16) and the timer lock (sched+48).
@@ -3004,7 +2999,7 @@ fun rtSchedSignalStop(sched: RawPtr) {
 }
 
 // ---- Timer heap (min-heap on the timer-entries buffer; entry i at i*16: expiry +0, fiber +8). Touched
-// only under the timer lock at sched+48. Backs fiberSleep, mirroring the C rt_timer_thread / rt_sleep_ms. ----
+// only under the timer lock at sched+48. Backs fiberSleep (rt_sleep_ms). ----
 
 fun rtSchedHeapSwap(ents: RawPtr, a: Int, b: Int) {
   let ea = a * 16
@@ -3089,7 +3084,7 @@ fun rtSchedTimerPopMin(sched: RawPtr, out: RawPtr) {
 
 // The timer thread: sleep on the timer-gen futex until the earliest deadline (or a push), then unpark the
 // due fiber. Exits on the stop flag. A raw thread that touches only off-heap memory (no user code), so it
-// needs no mutator registration (NoGC scope). Mirrors the C rt_timer_thread.
+// needs no mutator registration.
 fun rtSchedTimerMain(sched: RawPtr) -> RawPtr {
   let out = RawPtr.alloc(bytes: 16, align: 8)
   var go = true
@@ -3245,10 +3240,9 @@ fun rtSchedCarrierMain(carg: RawPtr) -> RawPtr {
 // ---- Actor mailbox + capped mailbox-fiber pool (task 128.1.8 machinery, consolidated). Fire-and-forget
 // message send: nomuSchedActorSend enqueues a message and returns; a pool of ≤64 reusable mailbox fibers
 // drains scheduled mailboxes by running the codegen-emitted nomu_actor_drain (which pops via the C
-// rt_mailbox_pop → nomuSchedMailboxPop and runs each message's thunk). Mirrors the C rt_actor_send /
-// rt_mailbox_pool. The mailbox/message byte offsets are the runtime.h ABI (codegen allocates them).
-// NoGC scope: the global scheduled-mailbox queue lives in the Sched here rather than the C rt_sched_head
-// GC root — reconciling the root for a moving collection is 128.3.2 (there is no GC scan under NoGC). ----
+// rt_mailbox_pop → nomuSchedMailboxPop and runs each message's thunk). The mailbox/message byte offsets are
+// the runtime.h ABI (codegen allocates them). The global scheduled-mailbox queue lives in the Sched; the STW
+// walk roots its head and tail (nomuSchedStwCollectPlan). ----
 
 // Pop the head of the global scheduled-mailbox queue (mailbox sched_next at +32), or null. Caller holds
 // the scheduler lock; the returned mailbox stays scheduled — the caller is now its drainer.
@@ -3267,8 +3261,7 @@ fun rtSchedMboxSchedPop(sched: RawPtr) -> RawPtr {
 }
 
 // A mailbox fiber: seeded to land here on first switch-in, resumed inside the loop thereafter. Unlike a
-// user fiber, it runs with the scheduler lock HELD at every loop top (the C rt_mailbox_fiber_main
-// invariant): it pops a scheduled mailbox under the lock, drops the lock to drain it, re-takes it; when
+// user fiber, it runs with the scheduler lock HELD at every loop top: it pops a scheduled mailbox under the lock, drops the lock to drain it, re-takes it; when
 // none remain it parks on the free-list (switching to the carrier holding the lock).
 fun rtSchedMailboxFiberMain(fib: RawPtr) -> RawPtr {
   let sched: RawPtr = fib.load(fromByteOffset: 200)
@@ -3466,16 +3459,19 @@ fun rtWalkShadow(fib: RawPtr, outBuf: RawPtr, n0: Int, cap: Int, emitSlots: Int)
 // A carrier acknowledges the stop-the-world and waits for resume. Called by a carrier that has reached a
 // quiescent point under an active STW (idle at the loop top, or after its running fiber parked at a
 // safepoint). Bumps the ack count (waking the initiator, which waits on it) and sleeps on the stw-gen
-// futex until the initiator clears the request. One ack per carrier per STW.
+// futex until the initiator bumps it at resume. One ack per carrier per STW.
+//
+// Resume is the stw-gen bump, read before the ack. Waiting on the request flag (+136) instead loses a round:
+// a carrier still waking from one STW can find the next STW's request already set, keep waiting without
+// acking it, and the initiator — which reset the ack count at resume — waits for that ack forever.
 fun rtSchedStwParkCarrier(sched: RawPtr) {
+  let gw = sched.advanced(by: 152)
+  let g: Int = gw.atomicLoad(fromByteOffset: 0)
   let ack = sched.advanced(by: 144)
   ack.atomicFetchAdd(1, atByteOffset: 0)
   ack.futexWake(all: true)                       // the initiator waits on the ack count
-  var g: Int = sched.atomicLoad(fromByteOffset: 152)
-  while sched.atomicLoad(fromByteOffset: 136) != 0 {
-    let gw = sched.advanced(by: 152)
+  while gw.atomicLoad(fromByteOffset: 0) == g {
     gw.futexWait(expected: g, timeoutMicros: 1000000)
-    g = sched.atomicLoad(fromByteOffset: 152)
   }
 }
 
@@ -3534,9 +3530,8 @@ fun nomuSchedWalkRoots(sched: RawPtr, outBuf: RawPtr, cap: Int, emitSlots: Int) 
     }
     cur = cur.load(fromByteOffset: 240)
   }
-  // The scheduled-mailbox queue root. Under the self-hosted scheduler the queue head/tail live
-  // in this Sched (sched+80 / sched+88), not the C rt_sched_head that rtScanSchedRoot reads — so the STW
-  // walk must root them here or a collection mid-drain reclaims/moves every queued mailbox (and each
+  // The scheduled-mailbox queue root. The queue head/tail live in this Sched (sched+80 / sched+88), so the
+  // STW walk must root them here or a collection mid-drain reclaims/moves every queued mailbox (and each
   // message's `self` receiver + args). Mailbox and message objects carry real type-id pointer maps
   // (mailboxTypeIdValue: mb_head/mb_tail/sched_next; the message type-id: next/self/args), so rooting the
   // head propagates through the whole chain — the tracer follows sched_next between scheduled mailboxes and
@@ -3625,6 +3620,24 @@ fun nomuSchedSleep(sched: RawPtr, ms: Int, anchorSp: RawPtr, anchorPc: Int) -> I
   self.ctxSwitchTo(carrierCtx)
   rtSchedUnlock(sched)
   return ms
+}
+
+// The running fiber's handle — for the C floor, which records it before parking it (the stdin waiter list).
+fun nomuSchedCurrent() -> RawPtr {
+  return RawPtr.tlsGet()
+}
+
+// Park the running fiber until some feeder unparks it (rtSchedUnpark). The caller holds the scheduler lock,
+// taken after it registered the fiber with that feeder, so the feeder's unpark cannot re-queue the fiber
+// before its context is saved — the lock handoff nomuSchedSleep uses. Returns with the lock released. The
+// anchor is the user frame the C shim captured, for the STW walk. Used by rt_read_line (the stdin poller).
+fun nomuSchedParkLocked(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
+  let self = RawPtr.tlsGet()
+  rtSchedSetAnchor(self, anchorSp, anchorPc)
+  self.store(2, toByteOffset: 168)
+  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
+  self.ctxSwitchTo(carrierCtx)
+  rtSchedUnlock(sched)
 }
 
 // Spawn a runnable fiber over the given C-ABI entry (void*(void*)). Returns the fiber handle, which the C
@@ -3733,7 +3746,7 @@ fun nomuSchedMailboxPop(sched: RawPtr, mailbox: RawPtr) -> RawPtr {
 
 // Boot the scheduler: record the actor drain function, spawn the main fiber over the user entry, start
 // ncarriers-1 carrier threads + the timer thread, run the scheduler loop on the calling thread too, and
-// return once quiescent (all carriers exited). Called from C main when NOMU_SCHED=nomu.
+// return once quiescent (all carriers exited). Called from C main.
 fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int, drainFn: RawPtr) {
   sched.store(drainFn, toByteOffset: 120)             // nomu_actor_drain, called by mailbox fibers
   sched.store(ncarriers, toByteOffset: 160)           // total carriers, for the STW ack count (128.3.2)

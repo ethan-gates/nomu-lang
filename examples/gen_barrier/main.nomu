@@ -1,5 +1,5 @@
 // Task 150 · rung 4 (GenImmix), increment 150.4.2 — self-hosted log-bit table + write-barrier activation.
-// Under NOMU_GC_PLAN=nomu the alloc seam arms the object-remembering barrier at space creation: it points the
+// The alloc seam arms the object-remembering barrier at space creation: it points the
 // inline fast path's globals (__nomu_barrier_active / __nomu_logbit_base / __nomu_logbit_log_region) at the
 // descriptor's log-bit side table, and the C seam routes the slow path to the Nomu remembering routine
 // (rtGcRemember), which fills this carrier's mod-buffer (the remembered set, selfhosted-gc.md §11.2/§11.3).

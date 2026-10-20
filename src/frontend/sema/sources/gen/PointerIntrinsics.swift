@@ -92,8 +92,7 @@ enum PointerIntrinsics {
             return s.ptrIntrinsic("__rawAlloc", .rawPtr, [bytes, align], span)
         // GC type-table reads (task 150 rung 2). Reach the codegen-emitted per-type-id side tables
         // (`c-types.md` §1/§3.2) from Nomu: each lowers to a call to the existing runtime accessor. All
-        // are gc-leaf pure reads — no managed heap, no alloc — so the Nomu tracer reads its object model
-        // through the same tables the MMTk binding reads.
+        // are gc-leaf pure reads — no managed heap, no alloc.
         case "gcTypeCount":
             guard checkArgLabels(&s, args, [], "RawPtr.gcTypeCount", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
@@ -199,45 +198,16 @@ enum PointerIntrinsics {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return s.ptrIntrinsic("__gcReturnAddr", .int, [], span)
-        // Force one collection at a clean program point (task 150 rung 2, mark-verify oracle): drive a
-        // deterministic GC so MMTk emits its live-set fingerprint (`MMTK-FP`, under NOMU_GC_MARKVERIFY),
-        // the independent oracle the self-hosted Nomu tracer's fingerprint is diffed against.
-        case "gcForceCollect":
-            guard checkArgLabels(&s, args, [], "RawPtr.gcForceCollect", span) else {
-                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
-            }
-            return s.ptrIntrinsic("__gcForceCollect", .void, [], span)
-        // Task 128.3.1 (parked-fiber root scan): fetch each parked fiber's saved frame-pointer anchor from
-        // the C fiber registry into `outBuf` (up to `cap` words), returning the count. The self-hosted walk
-        // (`rtScanParkedFibers`) chains past the C park frames from each anchor and runs the pcsp walk.
-        case "gcParkedAnchors":
-            guard checkArgLabels(&s, args, [nil, nil], "RawPtr.gcParkedAnchors", span) else {
-                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
-            }
-            let outBuf = NOIRGen.checkExpr(&s, args[0].value)
-            if outBuf.type != .error, outBuf.type != .rawPtr {
-                s.diags.error("RawPtr.gcParkedAnchors expects a RawPtr buffer, got '\(outBuf.type)'", at: outBuf.span)
-            }
-            let cap = intArg(&s, args[1].value, "RawPtr.gcParkedAnchors", "cap")
-            return s.ptrIntrinsic("__gcParkedAnchors", .int, [outBuf, cap], span)
-        // Task 128.3.1 (scheduler root): read the global scheduled-mailbox queue head (`rt_sched_head`), a
-        // single managed GC root that keeps every queued mailbox's pending work alive. Returns its value as a
-        // RawPtr (null when the queue is empty). The self-hosted scan (`rtScanSchedRoot`) reports it as a root.
-        case "gcSchedHead":
-            guard checkArgLabels(&s, args, [], "RawPtr.gcSchedHead", span) else {
-                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
-            }
-            return s.ptrIntrinsic("__gcSchedHead", .rawPtr, [], span)
-        // Task 128.3.2: the self-hosted scheduler's Sched handle (`rt_nomu_sched`), bound at boot under
-        // NOMU_SCHED=nomu (null under the C plan). Lets a driver run the self-hosted STW walk.
+        // Task 128.3.2: the scheduler's Sched handle (`rt_nomu_sched`), bound at boot. Lets a driver run the
+        // self-hosted STW walk.
         case "schedHandle":
             guard checkArgLabels(&s, args, [], "RawPtr.schedHandle", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return s.ptrIntrinsic("__schedHandle", .rawPtr, [], span)
         // The self-hosted Immix space descriptor (task 150 rung 3): the codegen-internal global
-        // `__nomu_selfhost_space` the alloc seam lazily creates under NOMU_GC_PLAN=nomu. Null under other
-        // plans (MMTk allocates). The self-hosted tracer reads it to mark lines in the space objects live in.
+        // `__nomu_selfhost_space` the alloc seam lazily creates on the first managed allocation (null before
+        // it). The tracer reads it to mark lines in the space objects live in.
         case "gcSelfhostSpace":
             guard checkArgLabels(&s, args, [], "RawPtr.gcSelfhostSpace", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
@@ -267,6 +237,13 @@ enum PointerIntrinsics {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return s.ptrIntrinsic("__gcMatureFloor", .int, [], span)
+        // The allocation-stress interval in bytes (env NOMU_GC_STRESS): 0 = off; positive = each carrier requests
+        // a collection after every that many allocated bytes (rtTlabAlloc). A gc-leaf pure read of the C global.
+        case "gcStress":
+            guard checkArgLabels(&s, args, [], "RawPtr.gcStress", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__gcStress", .int, [], span)
         // Nonzero when an external STW driver (NOMU_STW_SELFHOST / NOMU_STW_COLLECT / NOMU_GC_PRESSURE) owns
         // collection, so the default minor coordinator is not running. rtGenReserve returns 0 in that case so
         // the generational minor trigger doesn't park a carrier on a coordinator that never runs. Pure read.
@@ -277,7 +254,7 @@ enum PointerIntrinsics {
             return s.ptrIntrinsic("__gcExternalDriver", .int, [], span)
         // Drain every carrier's write-barrier mod-buffer into `outBuf` (task 150.4.3): the minor GC's
         // remembered set. Copies each remembered object pointer (up to `cap`), resets the buffers, and
-        // returns the total count. Same shape as gcParkedAnchors.
+        // returns the total count.
         case "gcDrainModBufs":
             guard checkArgLabels(&s, args, [nil, nil], "RawPtr.gcDrainModBufs", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))

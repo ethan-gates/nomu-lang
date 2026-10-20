@@ -1,7 +1,14 @@
 # Self-Hosted GC
 
 **Status:** design draft (task 150). Bringing the garbage collector up in Nomu itself, one mechanism per
-rung, each rung diffed against the matching MMTk plan as a correctness oracle. This is the GC half of
+rung, each rung diffed against the matching MMTk plan as a correctness oracle while it was built.
+
+**The Nomu collector is the only collector.** MMTk, its Rust binding and the C scheduler were retired
+([197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md)); every program runs on the Nomu scheduler and
+collector. The rung logs below record the MMTk oracle each increment was diffed against when it was built;
+the plan knobs they name (`NOMU_GC_PLAN`, `NOMU_SCHED`, `NOMU_RUNTIME`, `NOMU_GC_HEAP`, `NOMU_GC_MARKVERIFY`)
+no longer exist. Correctness legs now run the Nomu collector itself: `NOMU_GC_STRESS` (a collection every N
+allocated bytes), `NOMU_NURSERY_RESERVE`, `NOMU_MATURE_FLOOR`, and the driver threads (`tests/README.md`). This is the GC half of
 self-hosting the runtime ([128](../plans/tasks/128-self-hosting-runtime.md)); the scheduler half stays
 under 128, and [127 LXR](../plans/tasks/127-lxr-collector.md) is the final rung. Status tags:
 **Decided**, **Leaning**, **Deferred**, **Open**.
@@ -257,22 +264,12 @@ across GC plans; `tools/arr-gc.sh`, `tools/gc-stress.sh`):
   revisit if a later rung needs the fast path in Nomu. — **Deferred.**
 - **Returning OS memory.** NoGC never frees blocks; whether the mature collector returns empty blocks to
   the OS (madvise/decommit) is a rung 3+ footprint question. — **Open.**
-- **MMTk retirement.** MMTk stays linked as the differential oracle across the ladder. When the
-  self-hosted collector fully replaces it (and whether the `VMBinding` is kept as a permanent test
-  oracle) settles at/after LXR. — **Open.**
-- **Perf benchmark before retirement (gate).** Retirement is not correctness-only: before MMTk is dropped
-  as the production collector, benchmark self-hosted GenImmix against MMTk GenImmix — mutator throughput,
-  GC pause-time distribution, and peak heap footprint — on the GC-heavy fixtures and ideally a larger
-  workload. This must run while both plans are live and selectable (`NOMU_GC_PLAN=nomu` vs the MMTk plan),
-  because retiring MMTk removes the baseline. Falling behind is tuning work (or an LXR argument), not a
-  hard blocker, but the numbers are recorded first. There is no benchmark harness yet — building one is
-  part of the retirement pass (a candidate for the task-155 integration harness's perf mode). — **Open.**
-- **Passenger co-running for concurrent liveness.** The ladder keeps the collectors cleanly separated —
-  one per process, compared across runs (§1). The single case a cross-run fingerprint diff cannot serve is
-  validating liveness under a **nondeterministic (concurrent) program**, whose two runs may reach
-  different heap states. Running the self-hosted tracer as a read-only passenger inside an MMTk process
-  (same-instant heap, per-object diff) is held as a fallback for that case only; the ladder does not use
-  it, and mark-verify stays on deterministic fixtures. — **Deferred.**
+- **MMTk retirement.** Retired by [197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md), without a
+  GenImmix-vs-MMTk benchmark: retirement was decided regardless of its result, so it would only have
+  measured distance. Performance is benchmarked against Go and Swift once the language is complete. The
+  last commit with MMTk stays in history. — **Decided.**
+- **Passenger co-running for concurrent liveness.** Moot with MMTk retired: there is no second collector
+  to co-run. Liveness under concurrent programs is checked by collecting legs and output checksums.
 
 ## 8. Open questions
 
@@ -899,14 +896,14 @@ Rung 4 comes up one mechanism at a time, each diffed against MMTk GenImmix, mirr
 5. **150.4.5 — multi-carrier remset correctness.** The full suite (gc-concurrent / gc-oom / gc-actor /
    gc-string / gc-anybox) under self-hosted GenImmix at 1/2/4/8 carriers, checksum-identical to MMTk.
 
-After rung 4 matches its oracle: retire MMTk as the production collector (kept as a test oracle, §7 Open),
-then [127 LXR](../plans/tasks/127-lxr-collector.md) on rung 3's region machinery.
+Rung 4 matched its oracle and MMTk was retired ([197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md));
+next is [127 LXR](../plans/tasks/127-lxr-collector.md) on rung 3's region machinery.
 
 ### 11.6 What rung 4 reuses vs adds
 
 - **Reused:** block pool + side tables (§10.2), per-carrier TLAB (150.3.10), `rtEvacuate` + forwarding
   record (§10.6–10.8), the STW + slot-emitting root walk (150.3.9), the OOM-driven collection coordinator
-  (150.3.11), the inline barrier fast path (`backend.md`), and the MMTk GenImmix oracle.
+  (150.3.11), and the inline barrier fast path (`backend.md`).
 - **Added:** the `NURSERY` block state + nursery reserve accounting, the self-hosted log-bit table + barrier
   slow path, the per-carrier mod-buffers, and the minor-collection driver (a restricted-from-space
   `rtEvacuate` with the remembered set as an extra root source).

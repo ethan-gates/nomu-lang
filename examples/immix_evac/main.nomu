@@ -4,8 +4,8 @@
 // Interleaved garbage fills several from-space blocks, which the collection reclaims once the live set has
 // moved out.
 //
-// Compiled NOMU_NO_ESCAPE=1 (heap objects, so addrOf sees real heap addresses), run under NOMU_GC_PLAN=nomu
-// (the self-hosted Immix heap the copies are allocated into). Single-threaded with a controlled root set: the
+// Compiled NOMU_NO_ESCAPE=1 (heap objects, so addrOf sees real heap addresses in the self-hosted Immix heap
+// the copies are allocated into). Single-threaded with a controlled root set: the
 // returned pointer is the root's new address, which the fixture reads the moved live set through.
 //
 // Checks: the root moved (evacuation happened); a live Box moved and its value reads back through the

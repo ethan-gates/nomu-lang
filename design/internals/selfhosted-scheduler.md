@@ -6,6 +6,15 @@ scheduler half of self-hosting the runtime ([128](../plans/tasks/128-self-hostin
 half is [150](../plans/tasks/150-selfhosted-gc-ladder.md), climbed the same way. Status tags:
 **Decided**, **Leaning**, **Deferred**, **Open**.
 
+**The Nomu scheduler is the only scheduler.** The C scheduler and MMTk were retired
+([197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md)); `fiber_spawn`, `spawn_join`, `rt_sleep_ms`, the
+actor mailbox and `main` in `runtime.c` forward to the `nomuSched*` functions in `runtime.nomu`. The rung logs
+below record the C-scheduler oracle each rung was diffed against when built; the `NOMU_SCHED` plan knob they
+name no longer exists. The kqueue I/O poller came back in 197.6 as a third feeder beside the timer: a C
+poller thread for stdin that unparks fibers waiting in `readLine` through `rtSchedUnpark`; the fiber parks
+with `nomuSchedParkLocked` under the same lock handoff as `nomuSchedSleep`. General fd readiness (sockets,
+files) waits on the I/O stdlib.
+
 **The two framing decisions (agreed with Ethan).**
 
 1. **Full scheduler now.** 128.1 replaces the *entire* C scheduler in Nomu — context switch, run queue,
@@ -390,8 +399,8 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
 
    This is the rung that lets 150.4 (GenImmix) land on the self-hosted scheduler.
 
-128.1.9 makes the self-hosted scheduler the production path behind `NOMU_SCHED=nomu` (the C scheduler stays
-as the differential oracle, the same open question as retiring MMTk, `selfhosted-gc.md` §7). 128.3.2 then
+128.1.9 made the self-hosted scheduler the production path behind `NOMU_SCHED=nomu`; 197 later retired the
+C scheduler and made it the only one. 128.3.2 then
 lets 150.4 land on the self-hosted scheduler, and the generational write barrier co-designs with the
 now-self-hosted carrier/mutator path.
 
@@ -497,5 +506,5 @@ bound a runaway, and wrap every driver in a `timeout` so a deadlock fails the te
   there buys a portability trap rather than a no-libc win. The no-libc north star is a Linux property.
 - **Remote-wake primitive** — eventfd / self-pipe / futex for waking an all-idle carrier set (`runtime.md`
   §3, still Open there); the futex path is the natural fit given the substrate.
-- **Keeping the C scheduler as an oracle** after retirement — same shape as the MMTk-retirement question
-  (`selfhosted-gc.md` §7).
+- **Keeping the C scheduler as an oracle** after retirement — deleted with MMTk
+  ([197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md)). — **Decided.**

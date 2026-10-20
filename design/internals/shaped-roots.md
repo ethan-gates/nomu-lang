@@ -286,8 +286,9 @@ Findings:
 
 ## Stage 5 — collector consumption
 
-Both collectors consume the shape descriptor: the MMTk-binding path (`gcbinding/lib.rs` + the C stack
-walker in `runtime.c`) and the self-hosted collector (`runtime.nomu`). The self-hosted tracer runs the
+Both collectors consumed the shape descriptor: the MMTk-binding path (`gcbinding/lib.rs` + the C stack
+walker in `runtime.c`, both deleted with MMTk in task 197) and the self-hosted collector (`runtime.nomu`),
+now the only one. The self-hosted tracer runs the
 pointer-map loop in **ten phase functions** — `rtObjHash`, `rtMarkVerify`, `rtMarkVerifyImmix`,
 `rtLineMarkCheck`, `rtImmixMark`, `rtImmixUnmark`, `rtGenUnmarkAndUnlog`, `rtImmixEvacMark`,
 `rtMinorScanObj`, `rtWalkShadow` — each with its own per-reference action, and the MMTk side has its own

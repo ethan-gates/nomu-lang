@@ -4,10 +4,13 @@
 **Size:** XL · **Status:** 150.3 (Immix) complete as a whole-program moving collector on the self-hosted
 scheduler (150.3.1–150.3.13); **150.4 (GenImmix) complete** — nursery + write barrier + remembered set,
 generational on by default, full suite green single- and multi-carrier against the MMTk GenImmix oracle
-(design in `selfhosted-gc.md` §11). Correctness-complete, unbenchmarked; MMTk stays live as the baseline
-until the perf-benchmark step (horizon "after GenImmix" run-up). Full-runtime root-scanning integration
-(multi-mutator STW) landed via [128](128-self-hosting-runtime.md) (128.3). **Next: perf-benchmark vs MMTk
-(GC packaging [158] + observability [159] land there), then MMTk retirement, then 127 LXR.** ·
+(design in `selfhosted-gc.md` §11). Correctness-complete, unbenchmarked. Full-runtime root-scanning
+integration (multi-mutator STW) landed via [128](128-self-hosting-runtime.md) (128.3). **MMTk is retired
+([197](197-retire-mmtk-and-c-scheduler.md)) without the GenImmix-vs-MMTk benchmark; the Nomu collector is
+the only collector. Next on this chain: GC packaging [158] and observability [159], the benchmark against
+Go and Swift once the language is complete, then 127 LXR.** The increment logs below name the MMTk oracle
+and plan knobs (`NOMU_GC_PLAN`, `NOMU_SCHED`, `NOMU_RUNTIME`) each was validated with when built; those
+knobs no longer exist. ·
 **Source:** distilled from [128 self-hosting](128-self-hosting-runtime.md), 2026-08-25
 
 The ladder's rungs are the subtasks: **150.1** NoGC, **150.2** mark-verify, **150.3** Immix, **150.4**
@@ -91,14 +94,11 @@ Immix is a real functioning collector (reclaims + moves), so it is a natural pau
 turns to the scheduler half ([128.1](128-self-hosting-runtime.md)) before GenImmix, because GenImmix's
 STW-over-all-mutators root scan ([128.3.2](128-self-hosting-runtime.md)) reads every carrier's saved
 safepoint context (the self-hosted scheduler's machinery) and the generational barrier co-designs with the
-carrier path. Order: **150.3 → 128.1 → 150.4 → perf-benchmark vs MMTk → retire MMTk → 127**. Immix runs
-hosted on the existing C scheduler; GenImmix lands on the self-hosted one. MMTk retires as the production
-collector once self-hosted GenImmix (a) matches its oracle for correctness and (b) is benchmarked competitive
-against MMTk GenImmix — throughput, GC pause distribution, and heap footprint on the GC-heavy fixtures (and
-ideally a larger workload). The benchmark must run **before** retirement, while both collectors are live and
-selectable (`NOMU_GC_PLAN=nomu` vs the MMTk plan) — retiring MMTk removes the perf baseline. If the
-self-hosted collector is behind, that is tuning work (or an LXR argument), not a retirement blocker, but the
-numbers should be recorded first. MMTk is kept as a test oracle after retirement (`selfhosted-gc.md` §7, Open).
+carrier path. Order: **150.3 → 128.1 → 150.4 → retire MMTk (197) → 127**. Immix ran hosted on the C
+scheduler; GenImmix landed on the self-hosted one. Rung 4 matched its oracle; MMTk and the C scheduler were
+then retired without the planned GenImmix-vs-MMTk benchmark, since retirement was decided regardless of its
+result ([197](197-retire-mmtk-and-c-scheduler.md)). Performance is benchmarked against Go and Swift once
+the language is complete.
 
 ## Why this shape
 

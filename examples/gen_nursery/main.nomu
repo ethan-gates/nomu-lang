@@ -1,4 +1,4 @@
-// Task 150 · rung 4 (GenImmix), increment 150.4.1 — nursery substrate. Under NOMU_GC_PLAN=nomu every
+// Task 150 · rung 4 (GenImmix), increment 150.4.1 — nursery substrate. Every
 // mutator allocation draws from a per-carrier TLAB; a clean block the TLAB pulls (free/never-used) is tagged
 // NURSERY — the minor GC's from-space (selfhosted-gc.md §11.1) — and counted in nurseryUsed. This increment
 // lands the tagging + bounded-reserve accounting non-collecting: no minor GC yet (150.4.3), so the nursery

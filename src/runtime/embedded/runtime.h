@@ -15,8 +15,8 @@
 // The in-object GC header (M6 · 6.1.2): one 8-byte word. `type_id` (codegen-assigned) keys the
 // per-type pointer map `scan_object` dispatches through (6.1.3); `reserved` is spare header space
 // (32 bits is plenty for the type-id — the word is 8 bytes only for field alignment, so the other
-// half is free for future in-object GC metadata / flags). Mark/log/forwarding bits live in MMTk side
-// metadata, not here. Replaces the vestigial `refcount` (was written =1, never read).
+// half is free for future in-object GC metadata / flags). Mark/log bits live in the collector's side tables,
+// not here.
 typedef struct { uint32_t type_id; uint32_t reserved; } ObjectHeader;
 
 // A closure value: code pointer + captured environment (heap-allocated, bump-and-leak).
@@ -51,14 +51,14 @@ typedef struct Fiber Fiber;
 // A structured spawn handle: a fiber whose result we will join.
 typedef struct { Fiber* fiber; } SpawnHandle;
 
-// ---- Allocation seam (privileged; the heap alloc/free the generated code uses) ----
-void* rt_alloc(size_t size);
-void* rt_alloc_immortal(size_t size);   // M6 · 6.2.4 — non-moving String buffers (immortal interim)
+// ---- Memory (privileged) ----
+// Managed allocation is codegen's self-hosted seam (`__nomu_selfhost_alloc` → the Nomu Immix allocator);
+// nothing here allocates on the managed heap.
 void  rt_free(void* p);
 void* rt_raw_alloc(int64_t bytes, int64_t align);   // task 125 — unmanaged off-heap memory (RawPtr/Ptr<T>)
 void  rt_raw_free(void* p);                          // task 125 — free rt_raw_alloc memory
 void  rt_bounds_trap(int64_t idx, int64_t len);   // M6 stdlib — array subscript out-of-range trap
-void  rt_gc_write_barrier(void* obj, void* slot, void* val);   // M6 · 6.3.1 — generational write barrier
+void  rt_gc_write_barrier(void* obj, void* slot, void* val);   // generational write barrier slow path
 
 // ---- Core floor: pure value primitives ----
 // The `String` type is off the C floor (task 121): literals, `allocHeap`, `count`, and `bytePointer` are all
@@ -67,7 +67,7 @@ void   rt_print_double(double x);   // M6 stdlib — print a Double: shortest ro
 
 // ---- Privileged: blocking primitives + structured concurrency ----
 int64_t rt_sleep_ms(int64_t ms);
-String  rt_read_line(int fd);
+String  rt_read_line(int fd);   // one stdin line; parks the fiber until input arrives (the stdin poller)
 Fiber*  fiber_spawn(void* (*fn)(void*), void* arg);
 void*   spawn_join(SpawnHandle* h, int64_t final);   // final: structured scope-exit join (150.3.13)
 
@@ -79,9 +79,9 @@ void* rt_mutex_new(void);
 void  rt_mutex_lock(void* m);
 void  rt_mutex_unlock(void* m);
 
-// ---- Actor mailbox (M6 · 6.4 · fire-and-forget message-send, LLVM backend) ----
-// The decided actor model (`concurrency.md` §9, fire-and-forget revision 2026-08-12): a send enqueues
-// a message on the actor's mailbox and RETURNS immediately (the sender never waits, gets no reply).
+// ---- Actor mailbox (fire-and-forget message-send) ----
+// The decided actor model (`concurrency.md` §9): a send enqueues a message on the actor's mailbox and
+// RETURNS immediately (the sender never waits, gets no reply).
 // Handlers run on fibers rented from a program-global pool, one drain per actor at a time (serial,
 // non-reentrant). There is no reply/ask of any kind — fire-and-forget is the only actor operation
 // (§9). Teardown is structural — actor + mailbox are ordinary GC objects, so the runtime allocates
@@ -90,8 +90,8 @@ void  rt_mutex_unlock(void* m);
 // ABI contract with codegen (`Lowering.swift`). The mailbox and message are GC-allocated objects
 // with fixed layouts this C code reaches without knowing the actor's fields / the handler's args.
 // The actor object is unchanged (class-shaped) except its last slot holds a pointer to its mailbox;
-// codegen loads that at the call site, so this code never parses the actor. Codegen supplies the GC
-// pointer maps.
+// codegen loads that at the call site, so the runtime never parses the actor. Codegen supplies the GC
+// pointer maps. The Nomu scheduler (nomuSchedActorSend / nomuSchedMailboxPop) reads these layouts.
 //
 //   mailbox object { i64 header; Msg* mb_head; Msg* mb_tail; i64 scheduled; Mailbox* sched_next; }
 //   message object { i64 header; Msg* next; void(*thunk)(void* msg); void* self; args… }
@@ -107,29 +107,5 @@ void  rt_mutex_unlock(void* m);
 // each message until the mailbox is empty.
 void  rt_actor_send(void* mailbox, void* msg);
 void* rt_mailbox_pop(void* mailbox);
-
-// ---- GC root scanning (design: backend.md GC backend substrate; runtime.md §6) ----
-// Parse the process's `__llvm_stackmaps` section into a return-address → live-GC-slot index.
-// Idempotent; called lazily by the walk. Inert until M6 turns on collection.
-void nomu_gc_stackmap_init(void);
-// Called once per distinct live GC root found while walking a stack: `slot` is the stack address
-// the pointer lives at, `value` is the pointer. (M6's collector updates `*slot` on relocation.)
-typedef void (*nomu_root_visitor)(void** slot, void* value, void* userdata);
-// Walk the current stack for GC roots, from the caller's frame up, invoking `visit` per root
-// (D4 single-stack walk). Shaped for M6 reuse: it drives a libunwind cursor, so a parked fiber's
-// saved context can be walked the same way (M6 passes the fiber's context instead of the current).
-void nomu_gc_walk_current(nomu_root_visitor visit, void* userdata);
-// M6 · 6.2.1 — walk a stopped carrier's stack for GC roots. `carrier_tls` is the carrier's opaque
-// token (the `pthread_self` handed to `nomu_gc_bind_mutator`). At STW the carrier is parked at a
-// safepoint and its register context saved; this walks that context the same way as the current
-// stack. The MMTk binding calls this from `scan_roots_in_mutator_thread`. Until the STW handshake
-// saves contexts (6.2.3) no carrier is ever stopped for GC, so this reports no roots.
-void nomu_gc_walk_carrier(void* carrier_tls, nomu_root_visitor visit, void* userdata);
-// M6 · 6.2.2 — walk one parked fiber's stack (seeded from its saved `ucontext`), and over the whole
-// live-fiber registry, every parked fiber's stack (only PARKED has a root-bearing saved context; the
-// on-CPU fiber is scanned via its carrier, a never-run RUNNABLE fiber holds no roots). The MMTk
-// binding calls the latter from `scan_vm_specific_roots`. Inert until collection turns on.
-void nomu_gc_walk_fiber(Fiber* f, nomu_root_visitor visit, void* userdata);
-void nomu_gc_scan_parked_fibers(nomu_root_visitor visit, void* userdata);
 
 #endif

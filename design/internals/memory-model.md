@@ -8,7 +8,7 @@
 
 ## Memory model in brief
 
-- **Reference types are GC-managed.** Backend is MMTk (generational Immix to start; an LXR-style reference-counting collector as the footprint endgame — a collector swap, not a language change). Cycles are collected automatically; there is no `weak`/`unowned`, no refcount in the surface, no manual break.
+- **Reference types are GC-managed.** Backend is the Nomu collector, generational Immix written in Nomu (MMTk until [197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md); an LXR-style reference-counting collector as the footprint endgame — a collector swap, not a language change). Cycles are collected automatically; there is no `weak`/`unowned`, no refcount in the surface, no manual break.
 - **Value types are copied**, laid out inline. Escape analysis keeps non-escaping objects off the heap (invisible optimization).
 - **Memory is invisible.** No `shared` keyword, no region/uniqueness annotations, no `send`-for-memory. The programmer does not annotate memory. (Uniqueness is inferred as an invisible perf optimization, like escape — §6.3 — never an annotation.)
 - **Performance** comes from value types + escape analysis + monomorphized generics, plus a quality collector — the same recipe as C# with Native AOT, not from manual memory control.
@@ -44,6 +44,11 @@ This is the primary performance lever. Value types pay no allocation and no coll
 ---
 
 ## 3. Garbage collection via MMTk
+
+**Now the Nomu collector.** The GC described here shipped on MMTk; the generational Immix collector was then
+re-implemented in Nomu (`selfhosted-gc.md`) and MMTk was retired
+([197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md)). The model below (tracing, moving, generational,
+precise roots, the LXR endgame) holds unchanged; read "MMTk" as the collector it was first built on.
 
 Reference-type memory is managed by a **tracing garbage collector**, integrated via **MMTk** (the Memory Management Toolkit). Ship on **generational Immix** first; an **LXR-style reference-counting collector** (Zhao/Blackburn/McKinley, PLDI 2022 — RC-primary + Immix backing + backup tracing) is the footprint endgame. Swapping collectors is a runtime choice, not a language change. — **Decided.**
 

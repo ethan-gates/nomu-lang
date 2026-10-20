@@ -234,6 +234,11 @@ pinned workspace.
     write the same files at once. D2 accepts this for now. The binary itself is published by rename
     ([195](195-link-time-gc-frame-index.md) 195.3). Better: stage and rename every unit, as the
     cache does, or a per-workspace build lock.
+    The suite harness has a sharper form of this: it finds a case's binary by fixture path alone, so cases
+    that build one fixture with different compile flags all run whichever binary was built last. Today that
+    is `sysclock`/`sysclock-subset`, `futex`/`futex-subset` and the `module-generic-{fn,nested,fold,privcallee}`
+    `-mono`/`-edge` legs, so one config of each is untested. Fix with F3 (a per-config output location the
+    harness can name), or meanwhile give each config its own fixture directory.
   - **F4 — `-O` and `--mono` do not reach other workspaces' modules.** Pinned and embedded modules compile
     with default options (inherited from the nested builds), so a release build links debug `std`, and
     `PlanOptions.outputOptions` is never filled, so the embedded cache key ignores options. Better: pass

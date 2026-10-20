@@ -1,7 +1,7 @@
 # Retire MMTk and the C scheduler
 
 **Avenue:** Risk · **Type/Lifecycle:** `runtime · infra · ready-to-build` · **Size:** M–L ·
-**Status:** ready-to-build · **Source:** the decision to drop the GenImmix-vs-MMTk benchmark and benchmark
+**Status:** done — 197.1–197.6 · **Source:** the decision to drop the GenImmix-vs-MMTk benchmark and benchmark
 against Go and Swift instead, raised while [176](176-shaped-gc-roots.md) 176.5 found MMTk-only bugs.
 
 ## Deliverable
@@ -60,6 +60,82 @@ only, with collection-forcing legs that exercise it.
   [128](128-self-hosting-runtime.md), [157](157-env-var-audit.md), [158](158-gc-packaging.md),
   [176](176-shaped-gc-roots.md) 176.5.6) say the Nomu runtime is the only runtime. MMTk-only findings in
   176.5 close as moot.
+
+## Built
+
+- **197.1 — done.** The Nomu runtime became the default ahead of the deletion. Suite before/after: 69.1 s → 72.2 s
+  wall, user CPU 108 s → 101 s, summed run time 255 s both ways; no case slowed outside load noise
+  (`scheduler-tls` swings 20–55 s in the parallel run but is 0.03 s alone on either runtime).
+- **197.2 — done.**
+  - **Allocation stress on the Nomu collector.** `NOMU_GC_STRESS=<bytes>` now means a collection every N
+    bytes a carrier allocates. Under it the TLAB's inline limit stays 0 (the hole end moves to a new
+    TLAB word), so every allocation reaches `rtTlabAlloc`, which counts bytes and requests a collection at
+    the allocation's anchor: a minor, or a major when `NOMU_MATURE_FLOOR` says mature headroom is short
+    (`rtGenCollect`, shared with the nursery-full trigger).
+  - **A scheduler bug the stress knob found.** `rtSchedStwParkCarrier` waited for the request flag (+136)
+    to clear. A carrier still waking from one stop could see the next stop's request already set, keep
+    waiting without acking it, and the coordinator (which reset the ack count at resume) waited forever.
+    It now reads the stw generation (+152) before acking and waits for it to change.
+  - **Suite legs.** `-evac` legs run `NOMU_GC_STRESS` on the Nomu collector and assert a collection fired;
+    plain legs run with no knob; redundant selector knobs are gone. 14 `-evac` legs whose fixtures do
+    almost no managed allocation were retired: they never collected under MMTk either (MMTk's stats
+    reported no GC), so each duplicated its plain leg. The `-self` duplicates of `immix-alloc`,
+    `immix-los` and `selfhost-alloc` were retired. `gc-gen-self` (an MMTk small-heap leg) became
+    `gc-gen-evac` on a one-block nursery.
+  - **Tail scripts ported.** `gc-actor`, `gc-oom`, `gen-multicarrier`, `mark-verify`, `walk-mark`,
+    `walk-multiframe`, `stw-selfhost` and `escape` became suite cases (with fixed expectations in place of
+    their MMTk/C oracles); the T6 inlined-loop safepoint check became `stw-inlined-loop` under
+    `NOMU_STW_SELFHOST`.
+  - **Shape matrix.** `run.sh` legs: default, a 64-block nursery, stress-minor, stress-major.
+- **197.3 — done.** Deleted: `src/runtime/gcbinding/` (Rust/MMTk), `src/runtime/gcembed/`, `rules_rust` and
+  the MMTk crates in `MODULE.bazel` and `.bazelrc`, the `nomu` binary's embedded archive and the driver's
+  extraction/link of it, and in `runtime.c` the C scheduler, timer heap, kqueue poller, C actor mailbox,
+  libunwind root walker, C STW handshake, the C GC smokes and the runtime selector. Removed intrinsics:
+  `gcForceCollect`, `gcParkedAnchors`, `gcSchedHead` (with `rtScanParkedFibers` / `rtScanSchedRoot`).
+  Retired examples and scripts that only exercised the C scheduler or MMTk: `sched_root`, `walk_parked`,
+  `mark_verify_oracle`, `gc_smoke`, `gc_smoke_parked`, `gc_smoke_stw`, and `gc-smoke*.sh`,
+  `gc-t6-stw.sh`, `sched-integration.sh`, `selfhost-gc.sh`, `gc-corpus-matrix.sh`,
+  `gc-actor-teardown.sh`, `mark-verify-oracle.sh`. The write-barrier globals moved to `runtime.c`; the
+  allocation seam forwards to `__nomu_selfhost_alloc`, and `NOMU_NO_INLINE_ALLOC` now disables its inline
+  TLAB bump. A program binary went from about 3 MB to 190 KB (`escape_nonleaf`).
+- **197.4 — done.** The horizon, task index, `selfhosted-gc.md`, `selfhosted-scheduler.md`, `runtime.md`,
+  `memory-model.md`, `c-types.md`, `shaped-roots.md`, `tests/README.md`, `tools/README.md` and specs 128,
+  150, 157, 158, 159 and 176 say the Nomu runtime is the only runtime; build logs that name MMTk oracles
+  stay as history.
+- **197.5 — done: the stale tool scripts.** Seven scripts called `nomuc` and single-file example paths that no
+  longer existed (true before 197).
+  - **Fixed:** `escape-diff.sh` (the corpus differential, escape analysis on vs off: 85 examples identical;
+    runs on one carrier, since multi-carrier `print` interleaving made `gc_actor` differ run to run) and
+    `perf-tier.py` (the optimizer-pass perf matrix).
+  - **Folded into the suite:** `subset.sh` (`subset-bad-call` adds the second expected error) and
+    `subset-poll.sh` (`subset-poll` asserts runtime-subset code references no `__nomu_gc_poll_slow`;
+    `escape-stack` is the control). This adds `object_references` (`nm -u`) to the manifest schema.
+  - **Retired:** `mark-types.sh` with `examples/mark_types` and the `NOMU_GC_TYPEMAPS` dump (the dump printed
+    shaped descriptors as flat offsets, and every collecting case reads the tables), `stackmap-probe.sh`
+    with `examples/stackmap_probe` (an early bring-up step; every collecting case walks stackmaps through
+    the frame index), and `ir-golden.sh` (task 156 replaces it).
+- **197.6 — done: I/O readiness on the Nomu scheduler.** The C kqueue poller left with the C scheduler, and
+  `readLine` was unusable from source (its builtin returned a legacy `String` type that did not bind to the
+  prelude `String`). Now:
+  - **Surface.** `readLine()` lowers like a string literal: the runtime's `StringBase` wrapped into the
+    surface `String` (`NOIRGen`); the stale prototype is gone.
+  - **Lines.** `rt_read_line` reads stdin through one buffer and returns one line per call without its
+    newline; at end of input, the unterminated remainder, then empty strings. (The old C version returned
+    whatever one `read(2)` produced.)
+  - **Parking.** With no line buffered and stdin not readable (`poll(2)`), the fiber joins a stdin waiter
+    list and parks (`nomuSchedParkLocked`, the `nomuSchedSleep` lock handoff); a poller thread started on
+    first use blocks in `kevent(2)` on one shared one-shot read event and unparks every waiter
+    (`rtSchedUnpark`). One shared registration fixes a bug the C poller had: kqueue keys events by
+    (fd, filter), so arming per fiber overwrote the earlier waiter's wake-up.
+  - **Suite.** `stdin_file` / `stdin_delay_ms` feed a case's stdin late. `read-line` (a ticker fiber runs
+    while `main` waits, on 1 and 4 carriers; line splitting; end of input), `read-line-readers` (three
+    concurrent readers), `read-line-gc` (stress collections while `main` is parked holding heap values).
+  - **Harness fd leak.** `posix_spawn` children inherited every open fd of the harness, including the pipe
+    ends of cases running alongside, so a case's output readers (and a fed stdin's end of input) waited on
+    unrelated processes. `POSIX_SPAWN_CLOEXEC_DEFAULT` closes them. The suite went from 97 s to 55 s
+    (`stw-collect` 60 s → 12 s); the per-case swings 197.1 put down to load were this leak.
+  - **Scope.** stdin only (readLine's one source); general fd readiness (sockets, files) belongs with the
+    I/O stdlib.
 
 ## Risks
 

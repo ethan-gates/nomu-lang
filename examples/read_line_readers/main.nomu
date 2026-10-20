@@ -1,0 +1,14 @@
+// Three fibers wait in `readLine` at once (suite case `read-line-readers`, stdin fed late). They share one
+// poller registration for stdin, and each receives one whole line: 1 + 2 + 4 bytes = 7 in any order.
+fun reader() -> Int {
+  let s = readLine()
+  return s.count
+}
+
+fun main() {
+  spawn let a = reader()
+  spawn let b = reader()
+  spawn let c = reader()
+  print(a + b + c)
+  print("\n")
+}

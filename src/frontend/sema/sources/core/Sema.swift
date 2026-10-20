@@ -378,7 +378,6 @@ public struct Sema {
         }
         // Prototype builtins (print is special-cased in checkCall — it is variadic-ish).
         // `concat` is a Nomu function (core.nomu) over `StringBase.allocHeap` (task 121.1.4); no builtin proto.
-        funcs["readLine"] = FnSig(params: [], ret: .named("String", .struct_))
         funcs["sleep"]    = FnSig(params: [.int], ret: .int)
     }
 

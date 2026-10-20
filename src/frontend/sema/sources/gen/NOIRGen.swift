@@ -943,6 +943,16 @@ enum NOIRGen {
             if name == "time_monotonic" {
                 return NOIRExpr(type: .int, span: span, kind: .call(callee: irVar("__void_timemonotonic_int", .int, span), args: [], typeArgs:[]))
             }
+            // readLine() — one line from stdin, without its newline (empty at end of input). The runtime returns
+            // a raw `StringBase`; it is wrapped into the surface `String` like a literal.
+            if name == "readLine" {
+                if !args.isEmpty {
+                    s.diags.error("readLine takes no arguments", at: span)
+                }
+                let raw = NOIRExpr(type: .stringBase, span: span,
+                                   kind: .call(callee: irVar(name, .stringBase, span), args: [], typeArgs: []))
+                return wrapString(&s, raw)
+            }
             // addrOf(obj) — the raw address of a heap (reference-type) object as a RawPtr (task 150 rung 2).
             // A GC-internal seed for the mark-verify tracer: it hands the Nomu tracer a root to walk from.
             // Valid only on a non-moving heap (rung 2 NoGC); a moving collector would invalidate the alias.

@@ -1,13 +1,3 @@
-# M6 · 6.1.1 — build the Rust graph (MMTk + the GC binding) for size. The GC static archive is
-# embedded in nomuc and linked into every emitted program, so its code size is a direct floor on
-# every Nomu binary. `-Copt-level=z` cut a hello-world from ~15.6 MB (opt-level=0) to ~2.8 MB (with
-# the driver's `-dead_strip`). Applies to Rust only; C++/Swift/LLVM keep their compilation_mode, so
-# LLVM/Swift stay cached for fast iteration.
-#
-# Tradeoff: `z` optimizes for size over speed. When M6 turns to GC throughput (6.3), revisit — a
-# faster level (`s`/`2`) on the collector hot path may be worth the size.
-build --@rules_rust//rust/settings:extra_rustc_flags=-Copt-level=z
-
 # The git commit the compiler is built from (`//src/buildinfo`), the compiler's identity in the per-host cache
 # key (design/plans/tasks/190-explicit-module-builds.md, D4).
 build --workspace_status_command=tools/workspace_status.sh

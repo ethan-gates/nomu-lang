@@ -17,9 +17,10 @@ Configurations (all on the SSAIR egress — the sole backend path; passes A/B-to
 Usage:
   tools/perf-tier.py [--iters N] [--release] [workload ...]
 
-`workload` is a path to a .nomu file, or a bare name resolved under examples/benchmarks/.
-Default workloads are the tier microbenchmarks plus binary-tree. Compilation goes through
-the built `nomuc` (run `bazel build //src/nomu-cli:nomuc` first).
+`workload` is a module directory, or a bare name resolved under examples/benchmarks/.
+Default workloads are the tier microbenchmarks plus binary_tree. Compilation goes through
+the built `nomu` (run `bazel build -c opt //src/nomu-cli:nomu` first). Runs use one carrier
+(NOMU_CARRIERS=1) so timings and output are free of scheduling noise.
 """
 
 import os
@@ -28,7 +29,7 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NOMUC = os.path.join(ROOT, "bazel-bin", "src", "nomu-cli", "nomuc")
+NOMU = os.path.join(ROOT, "bazel-bin", "src", "nomu-cli", "nomu")
 BENCH_DIR = os.path.join(ROOT, "examples", "benchmarks")
 
 # name -> extra environment (on top of the SSAIR egress, except `noir`). A pass is *enabled*
@@ -42,29 +43,29 @@ CONFIGS = [
 ]
 
 # The tier microbenchmarks plus real GC/compute workloads.
-DEFAULT_WORKLOADS = ["micro_dispatch", "micro_alloc", "micro_carried", "hashmap", "gc_barrier", "gc_footprint", "binary-tree"]
+DEFAULT_WORKLOADS = ["micro_dispatch", "micro_alloc", "micro_carried", "gc_barrier", "gc_footprint", "binary_tree"]
 
 
 def resolve(name):
-    """A workload path from a bare name or an explicit path."""
-    if os.path.isfile(name):
+    """A workload module directory from a bare name or an explicit path."""
+    if os.path.isdir(name):
         return os.path.abspath(name)
-    cand = os.path.join(BENCH_DIR, name if name.endswith(".nomu") else name + ".nomu")
-    if os.path.isfile(cand):
+    cand = os.path.join(BENCH_DIR, name)
+    if os.path.isdir(cand):
         return cand
     sys.exit(f"perf-tier: workload not found: {name}")
 
 
 def binary_path(src):
-    """Where the compiler drops the linked binary: <root>/build/<relpath-without-ext>."""
+    """Where the compiler drops the linked binary: <root>/build/<module path>/<leaf>."""
     rel = os.path.relpath(src, ROOT)
-    return os.path.join(ROOT, "build", os.path.splitext(rel)[0])
+    return os.path.join(ROOT, "build", rel, os.path.basename(src))
 
 
 def compile_config(src, env_extra, release):
     env = dict(os.environ)
     env.update(env_extra)
-    cmd = [NOMUC, src]
+    cmd = [NOMU, "build", src]
     if release:
         cmd.append("-O")
     r = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -106,8 +107,9 @@ def main():
         workloads.append(a); i += 1
     if not workloads:
         workloads = DEFAULT_WORKLOADS
-    if not os.path.exists(NOMUC):
-        sys.exit(f"perf-tier: {NOMUC} not found — run `bazel build //src/nomu-cli:nomuc` first")
+    if not os.path.exists(NOMU):
+        sys.exit(f"perf-tier: {NOMU} not found — run `bazel build -c opt //src/nomu-cli:nomu` first")
+    os.environ["NOMU_CARRIERS"] = "1"
 
     names = [c[0] for c in CONFIGS]
     header = f"{'workload':<16}" + "".join(f"{n:>9}" for n in names) + f"{'all/off':>10}"

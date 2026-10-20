@@ -4,7 +4,9 @@
 
 **API scope:** this doc is about runtime *mechanism*, below the surface language. Nothing here is user-facing API. The user-facing concurrency *model* and the abstract suspension primitive (`park`/`unpark`/`current` + permit) live in `concurrency.md` (§1, §2); this doc is how the runtime realizes them.
 
-**Runtime is mandatory.** Per `vision.md` → "Library tiers," there is no runtime-less configuration; the GC (MMTk) and this scheduler are the always-present floor.
+**Runtime is mandatory.** Per `vision.md` → "Library tiers," there is no runtime-less configuration; the GC and this scheduler are the always-present floor.
+
+**One runtime: the Nomu scheduler and collector.** Both are Nomu code (`src/stdlib/runtime.nomu`) over a thin C floor (`runtime.c`: process entry, GC driver threads, TLAB/mod-buffer registries, descriptor accessors). The C scheduler and MMTk were retired ([197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md)). §6's MMTk mechanics and §8's C implementation record are history; the mechanisms themselves live in `selfhosted-scheduler.md` and `selfhosted-gc.md`.
 
 ---
 

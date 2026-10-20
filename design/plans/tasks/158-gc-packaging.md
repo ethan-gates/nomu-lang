@@ -1,7 +1,7 @@
 # GC packaging — self-contained collector plans behind one trigger protocol
 
 **Avenue:** Risk · **Type/Lifecycle:** `runtime · architecture · needs-design` · **Size:** L ·
-**Status:** needs-design (do with the GC-benchmarking step — horizon "after GenImmix" run-up, step 3) ·
+**Status:** needs-design (on the horizon chain under the Go/Swift benchmark) ·
 **Source:** grounded during 150.4.5.3 (flipping generational on by default) — the GenImmix nursery-full
 minor trigger deadlocked against the legacy `NOMU_GC_PRESSURE` poller.
 
@@ -23,7 +23,8 @@ carrier forever waiting to be resumed. A trigger fired into a void.
 
 The deeper problem is lever multiplicity: ~10 `NOMU_*` knobs influence *when and how* collection fires
 (`NOMU_NURSERY_RESERVE`, `NOMU_MATURE_FLOOR`, `NOMU_GC_TRIGGER_RESERVE`, `NOMU_GC_PRESSURE`,
-`NOMU_STW_COLLECT`, `NOMU_STW_SELFHOST`, the `NOMU_GC_SMOKE*` drivers, plus `NOMU_GC_PLAN`), and their
+`NOMU_STW_COLLECT`, `NOMU_STW_SELFHOST`, `NOMU_GC_STRESS`; until 197 also the `NOMU_GC_SMOKE*` drivers and
+`NOMU_GC_PLAN`), and their
 combinations produce states no one modeled. Predicting the interactions by hand does not scale.
 
 ## What — the shared / per-plan split
@@ -38,7 +39,7 @@ stop-the-world — into a pause shape it is designed to escape, biasing any comp
   coordinator services every trigger that plan can raise.* This layer is plan-independent.
 - **Per-plan — the coordinator implementation.** GenImmix, non-generational Immix, and simple mark-sweep
   are stop-the-world tracing collectors and may share an STW coordinator. LXR brings its own concurrent
-  coordinator. MMTk (while it remains a benchmarking oracle) is another plan. A plan declares the triggers
+  coordinator. A plan declares the triggers
   it raises and provides the servicer for them.
 
 Each plan is then exercised on its native coordinator — the apples-to-apples comparison the language's
@@ -49,7 +50,8 @@ memory-model experiment needs (proven programmer surfaces over unproven internal
 1. **A plan is a package.** One place defines allocator + collector + coordinator + trigger set + default
    trigger policy for a GC. Adding a GC (e.g. simple mark-sweep, later LXR) is adding a package, not
    threading new env levers through boot.
-2. **Selecting a GC is one lever.** `NOMU_GC_PLAN` (or its successor product lever) picks a plan; the plan
+2. **Selecting a GC is one lever.** One lever picks a plan (`NOMU_GC_PLAN` was deleted with MMTk in
+   [197](197-retire-mmtk-and-c-scheduler.md); a second Nomu plan brings its successor); the plan
    supplies its own defaults. No secondary knobs must be co-set for a plan to work, and no combination of
    them can wedge two mechanisms together. This is the structural version of task 157's env collapse.
 3. **No trigger fires into a void.** Boot guarantees exactly one coordinator for the active plan, and that
@@ -72,7 +74,7 @@ check) comes out.
   request queue. The current flags are a single slot (`@136` request, `@176` kind); adding a
   STW-vs-concurrent bit and a clear precedence rule may suffice without a full queue.
 - **Where a plan is declared.** A Nomu-side plan table vs. a C-side registry vs. a hybrid; how it composes
-  with `NOMU_GC_PLAN` and the self-hosted-vs-MMTk selection.
+  with the plan-selection lever.
 - **Legacy driver disposition.** The `NOMU_GC_PRESSURE` poller and the `NOMU_STW_*`/`NOMU_GC_SMOKE*` smoke
   drivers are pre-generational mechanisms generational subsumes; folding them into plans (the poller becomes
   a trigger source, not a coordinator) or retiring them (with tests migrated to the 155 harness) is decided
@@ -91,4 +93,4 @@ check) comes out.
 
 [150 GC ladder](150-selfhosted-gc-ladder.md), [127 LXR](127-lxr-collector.md),
 [157 env-var audit](157-env-var-audit.md), [155 integration-suite harness](155-integration-suite-harness.md)
-(where migrated GC tests land); horizon "after GenImmix — the ordered run-up to MMTk removal", step 3.
+(where migrated GC tests land); [197](197-retire-mmtk-and-c-scheduler.md) (MMTk retirement).

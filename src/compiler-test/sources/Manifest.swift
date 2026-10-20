@@ -35,9 +35,10 @@ struct StderrMatch: Decodable {
     var max: Int?
 }
 
-// A symbol-count assertion over the fixture's own object (`<binary>.o`, `nm -U`): lines naming a defined
-// symbol that contains `pattern`. Pins what the program's object defines — e.g. that no runtime / `std`
-// definition is duplicated into it.
+// A symbol-count assertion over the fixture's own object (`<binary>.o`): lines naming a symbol that contains
+// `pattern`. `object_symbols` counts defined symbols (`nm -U`) — what the object defines, e.g. that no
+// runtime / `std` definition is duplicated into it; `object_references` counts undefined ones (`nm -u`) —
+// what the object calls out to, e.g. whether a safepoint slow path is reachable from its code.
 struct SymbolMatch: Decodable {
     var pattern: String
     var min: Int?
@@ -60,6 +61,9 @@ struct Case: Decodable {
     var compile: CompileSpec?
     var stderrMatch: [StderrMatch]?
     var objectSymbols: [SymbolMatch]?
+    var objectReferences: [SymbolMatch]?
+    var stdinFile: String?
+    var stdinDelayMs: Int?
 }
 
 // A case with all defaults folded in — what the runner actually executes.
@@ -78,6 +82,9 @@ struct ResolvedCase {
     var compile: CompileSpec?
     var stderrMatch: [StderrMatch]
     var objectSymbols: [SymbolMatch]
+    var objectReferences: [SymbolMatch]
+    var stdinFile: String?   // repo-relative file fed to the program's stdin (default: /dev/null)
+    var stdinDelayMs: Int    // how long after start the file's bytes are written into the stdin pipe
 
     // Key for shared compilation — a fixture built once per distinct (compile-env, compile-args).
     var compileKey: String {
@@ -119,7 +126,10 @@ extension Manifest {
                 weight: Manifest.weight(c, d, carriers: carriers, capacity: capacity),
                 compile: c.compile,
                 stderrMatch: c.stderrMatch ?? [],
-                objectSymbols: c.objectSymbols ?? []
+                objectSymbols: c.objectSymbols ?? [],
+                objectReferences: c.objectReferences ?? [],
+                stdinFile: c.stdinFile,
+                stdinDelayMs: c.stdinDelayMs ?? 0
             )
         }
     }

@@ -1,4 +1,4 @@
-// M6 · 6.3.1 — generational write-barrier test. Under NOMU_GC_HEAP=<small> the collector runs many
+// M6 · 6.3.1 — generational write-barrier test. Under a small nursery the collector runs many
 // real nursery GCs. `h` is allocated first, then a garbage loop forces nursery collections that
 // promote `h` to the mature space. Only *after* it is mature do we store a fresh (nursery) Box into
 // `h.item` — the exact cross-generation pointer the write barrier must remember. A second garbage loop
@@ -6,7 +6,7 @@
 // from mature `h`) would be reclaimed or relocated without updating `h.item`, so the final read would
 // be wrong or crash. Prints 42 / 4242 iff the barrier kept and relocated the young objects.
 //
-// Run: NOMU_GC_HEAP=4000000 build/examples/gc_gen  → prints 42, then 4242.
+// Run: NOMU_NURSERY_RESERVE=1 build/examples/gc_gen/gc_gen  → prints 42, then 4242 (suite case `gc-gen-evac`).
 class Box {
   var v: Int
 }

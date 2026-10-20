@@ -2,8 +2,9 @@
 
 Coverage matrix for one shape per type (task 176.5): a heap `String`, held in each position a program can
 hold one, read back across collections that reuse moved-from memory. Each case prints `bad N`, the count of
-reads that saw wrong bytes; correct is `bad 0`. `run.sh` builds and runs every case (or the ones named) under
-NoGC, MMTk GenImmix stress, and the self-hosted minor collection. Not yet wired into `tests/suite.json`; the
+reads that saw wrong bytes; correct is `bad 0`. `run.sh` builds and runs every case (or the ones named) on the
+Nomu collector four ways: default, minor collections every 64 nursery blocks, a minor every 4 KiB allocated
+(`NOMU_GC_STRESS`), and a defrag major every 4 KiB allocated. Not yet wired into `tests/suite.json`; the
 176.5 tests phase does that once the cases pass.
 
 - `layout_*` hold `Bool` fields before a managed field, where the descriptor's 8-byte-slot offsets and the

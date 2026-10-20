@@ -26,7 +26,7 @@ In order: **soundness**, then **performance**, then **user surface** (finesse). 
 
 The programmer never annotates memory — no ARC, `weak`/`unowned`, regions, or borrow checker.
 
-- **Reference types are garbage-collected** via MMTk (generational Immix now, an LXR-style RC collector as the footprint endgame). Cycles collect automatically.
+- **Reference types are garbage-collected** generational Immix now, an LXR-style RC collector as the footprint endgame. Cycles collect automatically.
 - **Value types are copied and inline**; escape analysis keeps non-escaping ones off the heap.
 - **Non-memory resources** (files, sockets, locks) release deterministically via `defer` / linear resource types.
 

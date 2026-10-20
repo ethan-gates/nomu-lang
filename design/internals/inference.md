@@ -47,7 +47,7 @@ earned by isolation, region/uniqueness inference, the `send`/`consuming` and `we
 — is retired by the MMTk pivot (`memory-model.md`). Reference counting still runs *inside the collector*
 (the LXR endgame is RC-primary + backup tracing), invisible to the language; the retirement is of RC as a
 programmer-facing discipline. The compiler's own memory choice is placement (stack/frame promotion,
-fiber-local allocation); the collector (MMTk — generational Immix now, LXR later) owns the heap and
+fiber-local allocation); the collector (the Nomu collector — generational Immix now, LXR later) owns the heap and
 reclaims cycles automatically, so cycle potential reserves no slot. Two retired items re-enter above as
 *inferred, optimization-enabling perf facts*, the move escape makes: **transfer/handoff** (the inferred
 form of `send`/`consuming`, enabling fiber-local allocation + a sync-free move) and **reference

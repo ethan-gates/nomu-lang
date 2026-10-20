@@ -3,8 +3,8 @@
 // collection. The collection marks only what `live` reaches, reclaims every dead block back to the pool,
 // and resets the allocator, so the second garbage batch reuses reclaimed space instead of growing the heap.
 //
-// Compiled with NOMU_NO_ESCAPE=1 so the Boxes are heap-allocated (not stack-promoted). Runs under
-// NOMU_GC_PLAN=nomu — collection operates on the self-hosted Immix heap. Single-threaded with a controlled
+// Compiled with NOMU_NO_ESCAPE=1 so the Boxes are heap-allocated (not stack-promoted); collection operates
+// on the self-hosted Immix heap. Single-threaded with a controlled
 // root set (as mark-verify), since sweep reclaims the whole heap: everything live must be reachable from the
 // root passed to rtImmixCollect.
 //
