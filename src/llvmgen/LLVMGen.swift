@@ -203,7 +203,7 @@ final class LLVMGen {
     var managedBufferMapIds: [String: UInt64] = [:]  // "Header$Element" → managed-buffer type-id (task 180)
     var valueDescIds: [String: UInt64] = [:]     // type description → value-layout descriptor id (VWT type_id, 100.4.7.4)
     // Frame-root shape ordinals (task 176.3): a shaped-containing value aggregate recorded in a deopt bundle
-    // carries an ordinal the walker maps to its descriptor through `__nomu_shape_table`. Ordinal 0 is String;
+    // carries an ordinal the walker maps to its descriptor through this object's `__nomu_shape_table`. Ordinal 0 is String;
     // aggregates get 1+ in first-recorded order. `shapeOrdinalDescIds[i]` is ordinal `i+1`'s value-layout id.
     var shapeOrdinalForType: [String: Int32] = [:]
     var shapeOrdinalDescIds: [UInt64] = []

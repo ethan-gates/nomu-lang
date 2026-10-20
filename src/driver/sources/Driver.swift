@@ -652,7 +652,11 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Strin
     guard let archive = archive else { return false }
     // `-dead_strip` drops code unreachable from the program's entry — most of MMTk's plan/scheduler
     // machinery is never reached on the NoGC alloc path — and `-x` strips local symbols. (6.1.1 size.)
-    var linkArgs = ["-o", binPath, "-Wl,-dead_strip", "-Wl,-x"] + objects + [archive]
+    // The binary is linked, indexed and signed under a temporary name, then renamed into place, so it
+    // appears complete in one step (two builds of one program can share the output path).
+    let staging = binPath + ".link-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString.prefix(8))"
+    defer { try? FileManager.default.removeItem(atPath: staging) }
+    var linkArgs = ["-o", staging, "-Wl,-dead_strip", "-Wl,-x"] + objects + [archive]
     // The GC archive (the Rust/MMTk collector) is required: the runtime calls into it from `main`. It
     // rides inside the `nomu` executable as a Mach-O section (the compiler stays one file) and is extracted
     // to a file here; `NOMU_GC_ARCHIVE` names a different archive instead (development). A static archive
@@ -671,9 +675,45 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Strin
         gcArchive = extracted
     }
     linkArgs += [gcArchive, "-framework", "CoreFoundation", "-framework", "IOKit", "-lobjc"]
+    // The GC frame index (FrameIndex.swift): the link reserves its section and writes a link map; afterwards
+    // the index is written into the binary, which is then signed (unsigned until the patch is in).
+    let scratch = NSTemporaryDirectory() + "nomu-link-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
+    try? FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: scratch) }
+    let reserveFile = scratch + "/frameidx.bin", mapFile = scratch + "/link.map"
+    do {
+        let size = try FrameIndex.reserveSize(objects: objects)
+        guard FileManager.default.createFile(atPath: reserveFile, contents: Data(count: size)) else {
+            fputs("error: cannot write '\(reserveFile)'\n", stderr)
+            return false
+        }
+    } catch {
+        fputs("error: frame index: \(error)\n", stderr)
+        return false
+    }
+    linkArgs += ["-Wl,-sectcreate,\(FrameIndex.segment),\(FrameIndex.section),\(reserveFile)",
+                 "-Wl,-map,\(mapFile)", "-Wl,-no_adhoc_codesign"]
     let linkStatus = timings.measure("link", "cc") { runProcess("/usr/bin/cc", linkArgs) }
     if linkStatus != 0 {
         fputs("error: link failed\n", stderr)
+        return false
+    }
+    let indexed = timings.measure("link", "frame index") { Result { try FrameIndex.write(binary: staging, linkMap: mapFile) } }
+    if case .failure(let error) = indexed {
+        fputs("error: frame index: \(error)\n", stderr)
+        return false
+    }
+    // The signature's identifier is the binary's name, as the linker's own ad-hoc signature would give it.
+    let identifier = (binPath as NSString).lastPathComponent
+    let signStatus = timings.measure("link", "codesign") {
+        runProcess("/usr/bin/codesign", ["-s", "-", "-f", "-i", identifier, staging])
+    }
+    if signStatus != 0 {
+        fputs("error: codesign failed for '\(binPath)'\n", stderr)
+        return false
+    }
+    guard rename(staging, binPath) == 0 else {
+        fputs("error: cannot move the linked binary to '\(binPath)': \(String(cString: strerror(errno)))\n", stderr)
         return false
     }
     fputs(binPath + "\n", stderr)

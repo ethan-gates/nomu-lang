@@ -274,9 +274,10 @@ extension LLVMGen {
 
     // The frame-root shape ordinal for a value recorded in a deopt bundle (task 176.3). String is ordinal 0
     // (its kind-2 descriptor); a shaped-containing value aggregate gets the next ordinal and its value-layout
-    // descriptor registered, so `__nomu_shape_table[ordinal]` resolves to it. The ordinal is a compile-time
+    // descriptor registered, so this object's `__nomu_shape_table` resolves it. The ordinal is a compile-time
     // i32 constant the stackmap can hold; the descriptor's section offset (a link-time value it cannot hold)
-    // lives in the table.
+    // lives in the table. Ordinals are numbered per object, so they mean something only with their object's
+    // table.
     func shapeOrdinal(_ t: Type) -> Int32 {
         if case .stringBase = t { return 0 }
         // A single-field shaped wrapper takes its field's ordinal (task 121.1.1): `struct String` is shaped
@@ -295,24 +296,31 @@ extension LLVMGen {
         return ord
     }
 
-    // Emit `__nomu_shape_table` — the ordinal→descriptor-offset table both walkers read through
-    // `nomu_shape_desc_for_ordinal` (task 176.3). Entry 0 is the String kind-2 descriptor; entry i>0 is the
-    // i-th recorded aggregate's value-layout descriptor. The entries are link-time offsets from the
-    // `__nomu_descs` section start (the `type_id` `nomu_gc_live_offsets` consumes). One table per compilation
-    // (whole-program mono); cross-module ordinal unification is deferred with the erased-shaped path.
+    // Emit this object's `__nomu_shape_table` — the ordinal→descriptor-offset table for the shape ordinals
+    // in its stackmap records (task 176.3): word 0 is the ordinal count, then one entry per ordinal. Ordinal
+    // 0 is the String kind-2 descriptor; ordinal i>0 is the i-th recorded aggregate's value-layout descriptor.
+    // The entries are link-time offsets from the `__nomu_descs` section start (the `type_id`
+    // `nomu_gc_live_offsets` consumes). Local to the object and kept from dead stripping (`llvm.used`): the
+    // driver's frame index (task 195) points each object's stackmap records at its own table, found by this
+    // name and the object in the link map. Its references also keep the String descriptor, which no object
+    // header stamps, from being stripped.
     func emitShapeOrdinalTable() {
         var entries: [LLVMValueRef?] = [descOffsetHeader(stringShapeId())]
         for d in shapeOrdinalDescIds { entries.append(descOffsetHeader(d)) }
+        entries.insert(LLVMConstInt(i64, UInt64(entries.count), 0), at: 0)
         let count = UInt64(entries.count)
         let arrTy = LLVMArrayType2(i64, count)
-        let g = LLVMGetNamedGlobal(mod, "__nomu_shape_table") ?? LLVMAddGlobal(mod, arrTy, "__nomu_shape_table")!
+        let g = LLVMAddGlobal(mod, arrTy, "__nomu_shape_table")!
         LLVMSetInitializer(g, entries.withUnsafeMutableBufferPointer { LLVMConstArray2(i64, $0.baseAddress, count) })
         LLVMSetGlobalConstant(g, 1)
-        LLVMSetLinkage(g, LLVMWeakODRLinkage)
-        let cg = LLVMGetNamedGlobal(mod, "__nomu_shape_table_count") ?? LLVMAddGlobal(mod, i64, "__nomu_shape_table_count")!
-        LLVMSetInitializer(cg, LLVMConstInt(i64, UInt64(entries.count), 0))
-        LLVMSetGlobalConstant(cg, 1)
-        LLVMSetLinkage(cg, LLVMWeakODRLinkage)
+        LLVMSetLinkage(g, LLVMInternalLinkage)
+        LLVMSetAlignment(g, 8)
+        var used: [LLVMValueRef?] = [g]
+        let usedTy = LLVMArrayType2(i8ptr, 1)
+        let u = LLVMAddGlobal(mod, usedTy, "llvm.used")!
+        LLVMSetInitializer(u, used.withUnsafeMutableBufferPointer { LLVMConstArray2(i8ptr, $0.baseAddress, 1) })
+        LLVMSetLinkage(u, LLVMAppendingLinkage)
+        LLVMSetSection(u, "llvm.metadata")
     }
 
     // The byte stride of a `Ptr<T>` element (task 125): the natural size of a scalar `T`, so raw typed

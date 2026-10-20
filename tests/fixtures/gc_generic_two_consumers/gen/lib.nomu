@@ -1,0 +1,16 @@
+// A generic specialized by two consumer modules (task 195). Under `--mono=all` each consumer's object holds
+// its own copy of `churnKeep<Cell>`, weak, and the linker keeps one; every copy's stackmap records stay in
+// the binary, bound to the kept copy. The frame index keeps only the kept copy's records.
+package class Cell {
+  var v: Int
+}
+
+// Holds `x` across allocating calls, so the function has statepoints with live roots.
+package fun churnKeep<T>(x: T, n: Int) -> T {
+  var i = 0
+  while i < n {
+    let c = Cell(v: i)
+    i = i + c.v - i + 1
+  }
+  return x
+}

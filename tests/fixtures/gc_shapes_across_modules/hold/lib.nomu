@@ -1,0 +1,39 @@
+// A library module holding a shaped value (a struct holding a `String`) in a frame across collections (task
+// 195). Its shape ordinal 1 is `Tail`, with the String's managed word at offset 8; the entry's ordinal 1 is
+// `Head`, with it at offset 0. Ordinals are numbered per object, so each must resolve in its own object's
+// table.
+class Box {
+  var v: Int
+}
+
+struct Tail {
+  let n: Int
+  let s: String
+}
+
+fun strsum(s: String) -> Int {
+  var acc = 0
+  var i = 0
+  while i < s.count {
+    acc = acc + s.byte(at: i).int
+    i = i + 1
+  }
+  return acc
+}
+
+package fun tailAcrossGc() -> Int {
+  var t = Tail(n: 7, s: "seed".concat("-heap-string-xxxxxxxxxxxxxxxx"))
+  var sum = 0
+  var i = 0
+  while i < 2000 {
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 256 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+    sum = sum + t.n + strsum(t.s) + xs[1].v
+    i = i + 1
+  }
+  return sum
+}

@@ -1,0 +1,12 @@
+import pkg/gen
+
+package fun fromB(n: Int) -> Int {
+  var t = 0
+  var i = 0
+  while i < 3 {
+    let c = churnKeep(Cell(v: 7), n)
+    t = t + c.v
+    i = i + 1
+  }
+  return t
+}

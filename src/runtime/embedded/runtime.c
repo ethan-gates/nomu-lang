@@ -393,29 +393,6 @@ int32_t nomu_gc_shaped_shapeid(uint64_t type_id, int32_t k) {
     return map[d->nptr + 2 * k + 1];
 }
 
-// Map a frame-root shape ordinal (deopt bundle, task 176 Stage 4) to its kind-2 descriptor type-id. The
-// stackmap carries the ordinal as a compile-time constant (a descriptor offset is a link-time value, which
-// a stackmap Constant cannot hold). One shaped type exists today — String, ordinal 0 — found by scanning
-// the descriptor section for the sole kind-2 record and cached. A second shape will need an ordinal table.
-// Exported (not `static`) so the self-hosted walker reaches it through the `RawPtr.gcShapeDescForOrdinal`
-// builtin — both walkers resolve the ordinal through this one function, so the ordinal→descriptor mapping
-// (and the future ordinal table) lives in a single place (task 176 Stage 5 lockstep). Ordinal 0 is String;
-// its descriptor type-id is read from the compiler-emitted `__nomu_string_shape_typeid` (a reloc that also
-// keeps the otherwise-unreferenced kind-2 descriptor alive — a String value has no header to stamp it). A
-// second shaped type will extend this to an ordinal table.
-extern uint64_t __nomu_string_shape_typeid __attribute__((weak));
-// The compiler-emitted ordinal→descriptor-offset table (task 176.3a): entry 0 is String, entries 1+ are the
-// shaped-containing value aggregates. Weak so a program with no shaped values links without it (the String
-// fallback then serves the sole ordinal 0). Both walkers resolve ordinals through here (Stage 5 lockstep).
-extern uint64_t __nomu_shape_table[] __attribute__((weak));
-extern uint64_t __nomu_shape_table_count __attribute__((weak));
-uint64_t nomu_shape_desc_for_ordinal(int32_t ordinal) {
-    if (&__nomu_shape_table_count && (uint64_t)ordinal < __nomu_shape_table_count) {
-        return __nomu_shape_table[ordinal];
-    }
-    return &__nomu_string_shape_typeid ? __nomu_string_shape_typeid : 0;
-}
-
 // Array element byte stride for an array-buffer type-id. 0 for a fixed type.
 uint64_t nomu_gc_typestride(uint64_t type_id) {
     const nomu_gc_desc* d = gc_desc_at(type_id);
@@ -1254,36 +1231,15 @@ String rt_read_line(int fd) {
 #endif
 
 // ---- GC root scanning (design: backend.md GC backend substrate; runtime.md §6) ----
-// Parse the `__llvm_stackmaps` section (stackmap v3) into a return-address → live-GC-slot index,
-// then walk a stack (libunwind) mapping each frame's return address to its record and reading the
-// live roots. Inert now — nothing calls this except the smoke path (M6 drives it from the
-// collector). The layout follows llvm/Object/StackMapParser.h.
-typedef struct {
-    int reg;
-    int32_t off;
-} gc_slot; // Indirect [dwarf reg + off]; reg 31=SP, 29=FP
-
-// A shaped root (task 176 Stage 4): a 16-byte shaped value (a `String`) pinned to a frame slot and
-// recorded through the statepoint's `"deopt"` operand bundle as a `(shape-id Constant, slot Direct)` pair.
-// `Direct[reg+off]` gives the value's frame address; `shapeid` is its kind-2 descriptor offset. The walker
-// reads the tag at that address and relocates the conditional word only in the case that holds a pointer.
-typedef struct {
-    int reg;
-    int32_t off;
-    int32_t shapeid;
-} gc_shaped;
-
-typedef struct {
-    uintptr_t addr;
-    int nslots;
-    gc_slot* slots;
-    int nshaped;
-    gc_shaped* shaped;
-} gc_record; // one statepoint
-
-static gc_record* gc_records = NULL;
-static int gc_nrecords = 0;
-static int gc_inited = 0;
+// Map a frame's return address to its `__llvm_stackmaps` (stackmap v3) record through the frame index the
+// driver writes into the binary after the link (`__DATA_CONST,__nomu_frameidx`, layout in the driver's
+// FrameIndex.swift), then read the record's live roots. The section holds one blob per object; the index
+// covers every blob, sorted by function, with folded weak copies removed, so a lookup is a binary search
+// over functions and a short step through one function's records. After the entries, one word per blob
+// locates that object's shape-ordinal table (`__nomu_shape_table`: count, then a descriptor type-id per
+// ordinal), so a frame's shape ordinals resolve in the table of the object its record came from. The
+// record layout follows llvm/Object/StackMapParser.h. `rtFrameLookup` (runtime.nomu) reads the same index
+// for the self-hosted walk.
 
 static uint16_t gc_rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 
@@ -1293,93 +1249,87 @@ static uint32_t gc_rd32(const uint8_t* p) {
 
 static uint64_t gc_rd64(const uint8_t* p) { return (uint64_t)gc_rd32(p) | ((uint64_t)gc_rd32(p + 4) << 32); }
 
+// One index entry: function address and record offset relative to the stackmaps section start.
+typedef struct {
+    int64_t func;
+    uint32_t recoff, nrec, stack, blob;
+} gc_frame_entry;
+
+static const uint8_t* gc_stackmaps = NULL;        // __llvm_stackmaps start
+static const gc_frame_entry* gc_frames = NULL;    // the index's entries
+static uint64_t gc_nframes = 0;
+static const int64_t* gc_shape_tables = NULL;     // per blob: its object's shape table − stackmaps start
+static int gc_inited = 0;
+
+#define GC_FRAMEIDX_MAGIC 0x5849464Eu // "NFIX"
+
+// Locate the stackmaps and the frame index (lazily, at the first walk). A binary with stackmaps but no
+// index was linked without the driver's frame-index step; its frames' roots cannot be found, so abort.
 void nomu_gc_stackmap_init(void) {
-    if (gc_inited) {
+    if (__atomic_load_n(&gc_inited, __ATOMIC_ACQUIRE)) {
         return;
     }
-    gc_inited = 1;
 #ifdef __APPLE__
-    unsigned long size = 0;
-    const uint8_t* sm = getsectiondata(&_mh_execute_header, "__LLVM_STACKMAPS", "__llvm_stackmaps", &size);
-    if (!sm || size < 16 || sm[0] != 3) {
-        return; // no section, or unsupported version
-    }
-    uint32_t nfuncs = gc_rd32(sm + 4), nconsts = gc_rd32(sm + 8), nrecs = gc_rd32(sm + 12);
-    const uint8_t* funcs = sm + 16;
-    const uint8_t* recs = funcs + (size_t)nfuncs * 24 + (size_t)nconsts * 8; // records follow funcs+consts
-    gc_records = (gc_record*)calloc(nrecs ? nrecs : 1, sizeof(gc_record));
-    // Function records own their statepoint records in order (each says how many it has). The
-    // record's absolute address = function address + instruction offset = the call's return address.
-    const uint8_t* r = recs;
-    for (uint32_t fi = 0; fi < nfuncs; fi++) {
-        uint64_t faddr = gc_rd64(funcs + (size_t)fi * 24);
-        uint64_t frecs = gc_rd64(funcs + (size_t)fi * 24 + 16);
-        for (uint64_t k = 0; k < frecs; k++) {
-            uint32_t ioff = gc_rd32(r + 8);
-            uint16_t nloc = gc_rd16(r + 14);
-            const uint8_t* locs = r + 16;
-            gc_record* gr = &gc_records[gc_nrecords++];
-            gr->addr = (uintptr_t)(faddr + ioff);
-            gr->slots = (gc_slot*)calloc(nloc ? nloc : 1, sizeof(gc_slot));
-            gr->nslots = 0;
-            gr->shaped = NULL;
-            gr->nshaped = 0;
-            // The 3 leading meta constants are (calling conv, flags, #deopt); the 3rd's inline value is
-            // NumDeopt (task 176 Stage 4). The NumDeopt deopt locations follow — our shaped roots, each a
-            // (shape-id Constant, slot Direct) pair — then the live GC pointers as (base, derived) pairs.
-            uint32_t num_deopt = nloc > 2 ? gc_rd32(locs + 2 * 12 + 8) : 0;
-            if (num_deopt >= 2) {
-                gr->shaped = (gc_shaped*)calloc(num_deopt / 2, sizeof(gc_shaped));
-                for (int li = 3; li + 1 < 3 + (int)num_deopt; li += 2) {
-                    const uint8_t* Lc = locs + (size_t)li * 12;        // Constant: shape-id (value in offset field)
-                    const uint8_t* Ld = locs + (size_t)(li + 1) * 12;  // Direct[reg+off]: the value's frame slot
-                    if (Lc[0] != 4 /*Constant*/ || Ld[0] != 2 /*Direct*/) {
-                        continue;
-                    }
-                    gr->shaped[gr->nshaped].shapeid = (int32_t)gc_rd32(Lc + 8);
-                    gr->shaped[gr->nshaped].reg = gc_rd16(Ld + 4);
-                    gr->shaped[gr->nshaped].off = (int32_t)gc_rd32(Ld + 8);
-                    gr->nshaped++;
-                }
-            }
-            // Live GC pointers begin after the meta constants and the deopt range.
-            for (int li = 3 + (int)num_deopt; li < nloc; li++) {
-                const uint8_t* L = locs + (size_t)li * 12;
-                uint8_t kind = L[0];
-                if (kind != 3 /*Indirect*/ && kind != 1 /*Register*/) {
-                    continue;
-                }
-                int reg = gc_rd16(L + 4);
-                int32_t off = (int32_t)gc_rd32(L + 8);
-                int dup = 0;
-                for (int s = 0; s < gr->nslots; s++) {
-                    if (gr->slots[s].reg == reg && gr->slots[s].off == off) {
-                        dup = 1;
-                        break;
-                    }
-                }
-                if (!dup) {
-                    gr->slots[gr->nslots].reg = reg;
-                    gr->slots[gr->nslots].off = off;
-                    gr->nslots++;
-                }
-            }
-            // Advance to the next record: locations, align 8, then NumLiveOuts (u16) + live-outs.
-            size_t locend = (size_t)((locs + (size_t)nloc * 12) - r);
-            locend = (locend + 7) & ~(size_t)7;
-            uint16_t nlive = gc_rd16(r + locend);
-            size_t recsz = (locend + 2 + (size_t)nlive * 4 + 7) & ~(size_t)7;
-            r += recsz;
+    unsigned long smsize = 0, fxsize = 0;
+    const uint8_t* sm = getsectiondata(&_mh_execute_header, "__LLVM_STACKMAPS", "__llvm_stackmaps", &smsize);
+    const uint8_t* fx = getsectiondata(&_mh_execute_header, "__DATA_CONST", "__nomu_frameidx", &fxsize);
+    if (sm && smsize > 0) {
+        // The index starts at the section's first 8-aligned address (the section itself is byte-aligned).
+        uintptr_t at = ((uintptr_t)fx + 7) & ~(uintptr_t)7;
+        if (!fx || at + 16 > (uintptr_t)fx + fxsize || gc_rd32((const uint8_t*)at) != GC_FRAMEIDX_MAGIC ||
+            gc_rd32((const uint8_t*)at + 4) != 2) {
+            fprintf(stderr, "nomu: this binary has no GC frame index (it was linked without `nomu build`)\n");
+            abort();
         }
+        gc_stackmaps = sm;
+        gc_nframes = gc_rd64((const uint8_t*)at + 8);
+        gc_frames = (const gc_frame_entry*)(at + 16);
+        // The blob directory: a count, then one table position per blob.
+        gc_shape_tables = (const int64_t*)(at + 16 + gc_nframes * sizeof(gc_frame_entry) + 8);
     }
 #endif
+    __atomic_store_n(&gc_inited, 1, __ATOMIC_RELEASE);
 }
 
-static gc_record* gc_lookup(uintptr_t ip) {
-    for (int i = 0; i < gc_nrecords; i++) {
-        if (gc_records[i].addr == ip) {
-            return &gc_records[i];
+// A stackmap v3 record's byte length: header, locations, padding, live-outs, padding.
+static size_t gc_record_size(const uint8_t* r) {
+    uint16_t nloc = gc_rd16(r + 14);
+    size_t le = ((size_t)16 + (size_t)nloc * 12 + 7) & ~(size_t)7;
+    uint16_t nlive = gc_rd16(r + le);
+    return (le + 2 + (size_t)nlive * 4 + 7) & ~(size_t)7;
+}
+
+// The stackmap record of the statepoint returning to `ip`, or NULL when `ip` is no statepoint's return
+// address (a C or runtime frame). The index entry is the last function starting at or below `ip`; it is
+// stored to `*entry` when `entry` is non-NULL.
+static const uint8_t* gc_lookup(uintptr_t ip, const gc_frame_entry** entry) {
+    if (gc_nframes == 0) {
+        return NULL;
+    }
+    int64_t key = (int64_t)(ip - (uintptr_t)gc_stackmaps);
+    uint64_t lo = 0, hi = gc_nframes;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        if (gc_frames[mid].func <= key) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
+    }
+    if (lo == 0) {
+        return NULL;
+    }
+    const gc_frame_entry* e = &gc_frames[lo - 1];
+    uintptr_t faddr = (uintptr_t)gc_stackmaps + (uintptr_t)e->func;
+    const uint8_t* r = gc_stackmaps + e->recoff;
+    for (uint32_t k = 0; k < e->nrec; k++) {
+        if (faddr + gc_rd32(r + 8) == ip) {
+            if (entry) {
+                *entry = e;
+            }
+            return r;
+        }
+        r += gc_record_size(r);
     }
     return NULL;
 }
@@ -1398,29 +1348,55 @@ static void nomu_gc_walk_context(unw_context_t* ctx, nomu_root_visitor visit, vo
         unw_word_t ip = 0, sp = 0;
         unw_get_reg(&cur, UNW_REG_IP, &ip);
         unw_get_reg(&cur, UNW_REG_SP, &sp);
-        gc_record* rec = gc_lookup((uintptr_t)ip);
+        const gc_frame_entry* entry = NULL;
+        const uint8_t* rec = gc_lookup((uintptr_t)ip, &entry);
         if (!rec) {
             continue;
         }
-        for (int s = 0; s < rec->nslots; s++) {
-            unw_word_t base = sp;
-            if (rec->slots[s].reg == UNW_ARM64_FP) {
-                unw_get_reg(&cur, UNW_ARM64_FP, &base);
+        unw_word_t fp = 0;
+        unw_get_reg(&cur, UNW_ARM64_FP, &fp);
+        // Locations: 3 leading meta constants (calling conv, flags, #deopt — the 3rd's inline value is
+        // NumDeopt, task 176 Stage 4), then the NumDeopt deopt locations — our shaped roots, each a
+        // (shape-id Constant, slot Direct) pair — then the live GC pointers as (base, derived) pairs.
+        uint16_t nloc = gc_rd16(rec + 14);
+        const uint8_t* locs = rec + 16;
+        uint32_t num_deopt = nloc > 2 ? gc_rd32(locs + 2 * 12 + 8) : 0;
+        // Live GC pointers: each distinct Indirect/Register slot once (a base and its derived pointer can
+        // name the same slot; visiting it twice would relocate it twice).
+        for (int li = 3 + (int)num_deopt; li < nloc; li++) {
+            const uint8_t* L = locs + (size_t)li * 12;
+            if (L[0] != 3 /*Indirect*/ && L[0] != 1 /*Register*/) {
+                continue;
             }
-            void** slot = (void**)((char*)base + rec->slots[s].off);
+            int reg = gc_rd16(L + 4);
+            int32_t off = (int32_t)gc_rd32(L + 8);
+            int dup = 0;
+            for (int pj = 3 + (int)num_deopt; pj < li && !dup; pj++) {
+                const uint8_t* P = locs + (size_t)pj * 12;
+                dup = (P[0] == 3 || P[0] == 1) && gc_rd16(P + 4) == reg && (int32_t)gc_rd32(P + 8) == off;
+            }
+            if (dup) {
+                continue;
+            }
+            unw_word_t base = reg == UNW_ARM64_FP ? fp : sp;
+            void** slot = (void**)((char*)base + off);
             visit(slot, *slot, userdata);
         }
-        // Shaped roots (task 176): resolve the 16-byte value's live managed-pointer offsets through the
-        // shared enumerator (reads the tag), then relocate each via the ordinary root visitor — so for an
+        // Shaped roots (task 176): resolve the shape ordinal in the record's object's table (the driver
+        // checked every ordinal against it), then the 16-byte value's live managed-pointer offsets through
+        // the shared enumerator (reads the tag), and relocate each via the ordinary root visitor — so for an
         // `immortal`/`small` String nothing is visited, and for `heap` the one buffer word is relocated.
-        for (int s = 0; s < rec->nshaped; s++) {
-            unw_word_t base = sp;
-            if (rec->shaped[s].reg == UNW_ARM64_FP) {
-                unw_get_reg(&cur, UNW_ARM64_FP, &base);
+        const uint64_t* shapes = (const uint64_t*)(gc_stackmaps + gc_shape_tables[entry->blob]);
+        for (int li = 3; li + 1 < 3 + (int)num_deopt; li += 2) {
+            const uint8_t* Lc = locs + (size_t)li * 12;       // Constant: shape-id (value in offset field)
+            const uint8_t* Ld = locs + (size_t)(li + 1) * 12; // Direct[reg+off]: the value's frame slot
+            if (Lc[0] != 4 /*Constant*/ || Ld[0] != 2 /*Direct*/) {
+                continue;
             }
-            const uint8_t* valbase = (const uint8_t*)base + rec->shaped[s].off;
+            unw_word_t base = gc_rd16(Ld + 4) == UNW_ARM64_FP ? fp : sp;
+            const uint8_t* valbase = (const uint8_t*)base + (int32_t)gc_rd32(Ld + 8);
             int32_t cnt = 0;
-            uint64_t shapeDesc = nomu_shape_desc_for_ordinal(rec->shaped[s].shapeid);
+            uint64_t shapeDesc = shapes[1 + gc_rd32(Lc + 8)];
             const int32_t* offs = nomu_gc_live_offsets(shapeDesc, valbase, &cnt);
             for (int k = 0; k < cnt; k++) {
                 void** slot = (void**)(valbase + offs[k]);
@@ -1657,7 +1633,7 @@ int64_t rt_gc_parked_anchors(void* outBuf, int64_t cap) {
             unw_word_t ip = 0, sp = 0;
             unw_get_reg(&cur, UNW_REG_IP, &ip);
             unw_get_reg(&cur, UNW_REG_SP, &sp);
-            if (gc_lookup((uintptr_t)ip)) {
+            if (gc_lookup((uintptr_t)ip, NULL)) {
                 out[n++] = (uint64_t)sp;
                 out[n++] = (uint64_t)ip;
                 break;
@@ -1996,6 +1972,9 @@ int main(void) {
         // and bind an MMTk mutator lazily on first allocation (rt_gc_alloc), the same as the C carriers.
         // NoGC scope: no stop-the-world over these carriers yet (128.3.2). The timer/poller feeders are not
         // consolidated into the Nomu scheduler yet, so this path serves spawn/join programs.
+        // The self-hosted walk reads the GC frame index (`rtFrameLookup`); check here that the binary has one,
+        // aborting if it was linked without it, since that walk has no C step of its own to check from.
+        nomu_gc_stackmap_init();
         int nc = 4;
         const char* nc_env = getenv("NOMU_CARRIERS");
         if (nc_env) { int v = atoi(nc_env); if (v >= 1) nc = v; }

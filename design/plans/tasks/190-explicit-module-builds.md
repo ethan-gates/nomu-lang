@@ -220,10 +220,10 @@ pinned workspace.
   the issue, what stands now, and the better fix where one is known.
 
   *Correctness hazards*
-  - **F1 — the GC shape table depends on link order.** `__nomu_shape_table` (and `_count`) is a weak symbol
-    in every object, each with its own contents; only the entry's copy describes the whole program. The
-    link puts the entry object first so its copy wins (190.4.2). Better: one definition, emitted only by
-    the binary job, with library objects referencing it as an external symbol.
+  - **F1 — GC stack scanning is unsound across objects.** Lost stackmaps (only the first object's are read,
+    in both walkers), colliding shape ordinals, linear record lookup, duplicate copies' records. Moved to
+    its own task, [195](195-link-time-gc-frame-index.md) (a frame index built by the driver after the link);
+    190 closes after it.
   - **F2 — symbol qualifiers can collide.** `Mangle.qualifier` joins origin components with `_`, and
     components may contain `_`, so `a_b/c` and `a/b_c` give the same qualifier. Origins now carry the
     workspace scope and name (`nomu_nomu_lang_…`), so there are more underscores in play. Better: an
@@ -231,7 +231,8 @@ pinned workspace.
   - **F3 — concurrent builds share workspace unit directories.** Host-cache entries publish atomically
     (190.4.3), but a building workspace's unit directories are written in place, so two builds in one
     workspace that share a module (two `nomu build`s, or suite fixtures with a common dependency) can
-    write the same files at once. D2 accepts this for now. Better: stage and rename every unit, as the
+    write the same files at once. D2 accepts this for now. The binary itself is published by rename
+    ([195](195-link-time-gc-frame-index.md) 195.3). Better: stage and rename every unit, as the
     cache does, or a per-workspace build lock.
   - **F4 — `-O` and `--mono` do not reach other workspaces' modules.** Pinned and embedded modules compile
     with default options (inherited from the nested builds), so a release build links debug `std`, and
@@ -252,9 +253,15 @@ pinned workspace.
     for `import a/` at end of file the scanner reports the next line. Better: a conformance test over
     malformed headers comparing positions.
   - **F9 — the timing report lost its byte and token counts.** Parsing moved into jobs (190.4.2) and the
-    counts were not carried along. Fixed in 190.4.4 (each job adds its counts); close on review.
+    counts were not carried along. **Resolved:** the counts were restored in 190.4.4 (each job adds its
+    own), and the report's redesign for the job model is [193](193-compiler-performance-report.md).
   - **F10 — embedded diagnostics name virtual paths.** An error in an embedded source reads
     `<nomu>/std/time/time.nomu:…`. Acceptable for compiler-internal code; worth a deliberate format.
+  - **F29 — loose builds reject imports of their own modules.** A build with no `nomu.yaml` above it,
+    rooted at its `pkg.json`, fails on `import pkg/left` with "'…/left' lies outside workspace
+    'local.main'". A copy of `tests/fixtures/module_link_diamond` outside the repository fails this way;
+    inside it, the repository's `nomu.yaml` makes it a workspace build. Whether it predates 190 is
+    unchecked. Workaround: add a `nomu.yaml`.
 
   *Behavior changes to review*
   - **F11 — implicit `import std` in pinned workspaces.** Their modules now get it (one path for every
@@ -427,6 +434,7 @@ pinned workspace.
   (embedded `nomu` workspace).
 - Precedes 172: the cache keys on 190's jobs.
 - Precedes 191: threaded execution schedules 190's jobs.
+- Depends on [195](195-link-time-gc-frame-index.md): GC stack scanning across objects (190.6 F1).
 
 ## Refs
 

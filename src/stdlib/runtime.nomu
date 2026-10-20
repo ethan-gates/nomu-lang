@@ -235,48 +235,63 @@ fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
 }
 
 // ---- Stack-map parsing (task 150 · rung 2, the pcsp root walk) ----
-// Parse the `__llvm_stackmaps` (v3) section — reached libc-free via the linker section-bracket symbols
-// (RawPtr.gcStackmapBase / gcStackmapSize) — to recover, per statepoint, its return address, its
-// SP/FP-relative root slots, and its function's frame size. Format: llvm/Object/StackMapParser.h; the C
-// runtime parses the same bytes in `nomu_gc_stackmap_init`. Little-endian scalar reads: load 8 bytes and
-// take the low 16/32 bits by modulo (2^16 = 65536, 2^32 = 4294967296 — no grouping parens yet, task 114).
+// Read the `__llvm_stackmaps` (v3) records — reached libc-free via the linker section-bracket symbols
+// (RawPtr.gcStackmapBase / gcStackmapSize) — for a statepoint's SP/FP-relative root slots; the GC frame index
+// below maps a return address to its record and gives the function's frame size. Format:
+// llvm/Object/StackMapParser.h; the C walker reads the same records. Little-endian scalar reads: load 8 bytes
+// and take the low 16/32 bits by modulo (2^16 = 65536, 2^32 = 4294967296 — no grouping parens yet, task 114).
 
+// The remainder is taken toward zero, so a word whose upper bytes make it negative leaves a negative
+// remainder; adding the modulus restores the unsigned low bits.
 fun rtU16(base: RawPtr, off: Int) -> Int {
   let w: Int = base.load(fromByteOffset: off)
   let hi = w / 65536
-  return w - hi * 65536
+  let lo = w - hi * 65536
+  if lo < 0 {
+    return lo + 65536
+  }
+  return lo
 }
 fun rtU32(base: RawPtr, off: Int) -> Int {
   let w: Int = base.load(fromByteOffset: off)
   let hi = w / 4294967296
-  return w - hi * 4294967296
+  let lo = w - hi * 4294967296
+  if lo < 0 {
+    return lo + 4294967296
+  }
+  return lo
 }
 fun rtAlign8(x: Int) -> Int {
   let a = x + 7
   return a / 8 * 8
 }
 
-// Parse the whole structure and return the byte offset one past the last record. A structural self-check:
-// it equals the section size exactly when every record's variable length was computed correctly. Header
-// (16 bytes) + nfuncs StkSizeRecords (24 each) + nconsts constants (8 each), then nrecs records:
+// Parse the whole section and return the byte offset one past the last record. A structural self-check: it
+// equals the section size exactly when every record's variable length was computed correctly. The section
+// holds one blob per object, back to back. Each blob: header (16 bytes) + nfuncs StkSizeRecords (24 each)
+// + nconsts constants (8 each), then nrecs records:
 //   +0 u64 id, +8 u32 instr-offset, +14 u16 NumLocations, +16 locations (12 each), align8,
 //   then u16 NumLiveOuts, live-outs (4 each), align8.
 fun rtStackmapEnd() -> Int {
   let base = RawPtr.gcStackmapBase()
-  let nfuncs = rtU32(base, 4)
-  let nconsts = rtU32(base, 8)
-  let nrecs = rtU32(base, 12)
-  var cur = 16 + nfuncs * 24 + nconsts * 8
-  var k = 0
-  while k < nrecs {
-    let nloc = rtU16(base, cur + 14)
-    let locBytes = 16 + nloc * 12
-    let locEnd = rtAlign8(locBytes)
-    let nlive = rtU16(base, cur + locEnd)
-    let recBytes = locEnd + 2 + nlive * 4
-    let recSize = rtAlign8(recBytes)
-    cur = cur + recSize
-    k = k + 1
+  let size = RawPtr.gcStackmapSize()
+  var cur = 0
+  while cur < size {
+    let nfuncs = rtU32(base, cur + 4)
+    let nconsts = rtU32(base, cur + 8)
+    let nrecs = rtU32(base, cur + 12)
+    cur = cur + 16 + nfuncs * 24 + nconsts * 8
+    var k = 0
+    while k < nrecs {
+      let nloc = rtU16(base, cur + 14)
+      let locBytes = 16 + nloc * 12
+      let locEnd = rtAlign8(locBytes)
+      let nlive = rtU16(base, cur + locEnd)
+      let recBytes = locEnd + 2 + nlive * 4
+      let recSize = rtAlign8(recBytes)
+      cur = cur + recSize
+      k = k + 1
+    }
   }
   return cur
 }
@@ -289,6 +304,93 @@ fun rtI32(base: RawPtr, off: Int) -> Int {
     return u - 4294967296
   }
   return u
+}
+
+// ---- The GC frame index (task 195) ----
+// The driver writes a sorted index of every function with stackmap records into the binary after the link
+// (`__DATA_CONST,__nomu_frameidx`; layout in the driver's FrameIndex.swift), at the section's first 8-aligned
+// address: header { u32 magic, u32 version, u64 count }, then entries { i64 function address − stackmaps
+// start, u32 record offset, u32 record count, u32 stack size, u32 blob }, then a blob directory { u64 count,
+// then per blob the position of its object's shape-ordinal table − stackmaps start }. A stack size of
+// 2^32 − 1 marks a frame of dynamic size (a runtime-sized alloca); the pcsp walk finds its FP from its
+// callee's frame record instead. A
+// shape table (`__nomu_shape_table`, one per object) is { count, then a descriptor type-id per ordinal }. The
+// C walker reads the same index (`gc_lookup`, runtime.c).
+
+// The index's start, or null when the binary has none (the C runtime aborts on a missing index).
+fun rtFrameIndex() -> RawPtr {
+  let raw = RawPtr.gcFrameIndexBase()
+  let mis = raw.toInt() - raw.toInt() / 8 * 8
+  var pad = 0
+  if mis != 0 {
+    pad = 8 - mis
+  }
+  let idx = raw.advanced(by: pad)
+  if rtU32(idx, 0) != 1481197134 {                 // "NFIX"
+    return RawPtr.null
+  }
+  if rtU32(idx, 4) != 2 {
+    return RawPtr.null
+  }
+  return idx
+}
+
+// The stackmap record of the statepoint returning to `pc`: its byte offset into the stackmaps section, with
+// its index entry's number above it (`entry * 2^32 + offset`), or -1 when `pc` is no statepoint's return
+// address. Binary search for the last function starting at or below `pc`, then a step through its records.
+fun rtFrameLookup(pc: Int) -> Int {
+  let idx = rtFrameIndex()
+  if idx.isNull {
+    return -1
+  }
+  let sm = RawPtr.gcStackmapBase()
+  let count: Int = idx.load(fromByteOffset: 8)
+  let key = pc - sm.toInt()
+  var lo = 0
+  var hi = count
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    let f: Int = idx.load(fromByteOffset: 16 + mid * 24)
+    if f <= key {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  if lo == 0 {
+    return -1
+  }
+  let e = 16 + (lo - 1) * 24
+  let fdelta: Int = idx.load(fromByteOffset: e)
+  var recCur = rtU32(idx, e + 8)
+  let nrec = rtU32(idx, e + 12)
+  var k = 0
+  while k < nrec {
+    if fdelta + rtU32(sm, recCur + 8) == key {
+      return (lo - 1) * 4294967296 + recCur
+    }
+    let nloc = rtU16(sm, recCur + 14)
+    let locEnd = rtAlign8(16 + nloc * 12)
+    let nlive = rtU16(sm, recCur + locEnd)
+    recCur = recCur + rtAlign8(locEnd + 2 + nlive * 4)
+    k = k + 1
+  }
+  return -1
+}
+
+// An index entry's function frame size.
+fun rtFrameStack(entry: Int) -> Int {
+  return rtU32(rtFrameIndex(), 16 + entry * 24 + 16)
+}
+
+// An index entry's shape-ordinal table: the table of the object its records came from. A shape ordinal `o`
+// in those records resolves to the descriptor type-id at word `1 + o` (the driver checked every ordinal).
+fun rtFrameShapes(entry: Int) -> RawPtr {
+  let idx = rtFrameIndex()
+  let count: Int = idx.load(fromByteOffset: 8)
+  let blob = rtU32(idx, 16 + entry * 24 + 20)
+  let delta: Int = idx.load(fromByteOffset: 16 + count * 24 + 8 + blob * 8)
+  return RawPtr.gcStackmapBase().advanced(by: delta)
 }
 
 // ---- The pcsp stack walk (task 150 · rung 2) — recover the live roots from a stack ----
@@ -309,9 +411,6 @@ fun rtI32(base: RawPtr, off: Int) -> Int {
 // effect and the caller stops spilling its roots — they vanish from the statepoint (task 150 rung 2).
 fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
   let base = RawPtr.gcStackmapBase()
-  let nfuncs = rtU32(base, 4)
-  let nconsts = rtU32(base, 8)
-  let recStart = 16 + nfuncs * 24 + nconsts * 8
   var n = 0
   let fp0 = RawPtr.gcFrameAddr()
   var sp = fp0.advanced(by: 16)
@@ -319,106 +418,100 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
   var walking = true
   while walking {
     var found = false
-    var frameSize = 0
-    var recCur = recStart
-    var fi = 0
-    while fi < nfuncs {
-      let fRec = 16 + fi * 24
-      let funcAddr: Int = base.load(fromByteOffset: fRec)
-      let fStackSize: Int = base.load(fromByteOffset: fRec + 8)
-      let recCount: Int = base.load(fromByteOffset: fRec + 16)
-      var ri = 0
-      while ri < recCount {
-        let ioff = rtU32(base, recCur + 8)
-        let retAddr = funcAddr + ioff
-        let nloc = rtU16(base, recCur + 14)
-        let locEnd = rtAlign8(16 + nloc * 12)
-        let nlive = rtU16(base, recCur + locEnd)
-        let recSize = rtAlign8(locEnd + 2 + nlive * 4)
-        if retAddr == pc {
-          found = true
-          frameSize = fStackSize
-          let frameFp = sp.advanced(by: fStackSize - 16)
-          // Shaped roots (task 176 Stage 4) — the NumDeopt deopt range before the ordinary GC pointers, kept
-          // in lockstep with `rtWalkFrom` and the C walker. The 3rd meta location's inline Constant value is
-          // NumDeopt; the range is (shape-id Constant, slot Direct) pairs. Each is resolved to its kind-2
-          // descriptor and run through the shared enumerator over the 16-byte value at the slot — the tag read
-          // yields no offset for an `immortal`/`small` String and the one buffer word for a `heap` one. This
-          // walk emits root VALUES (its counting/marking contract), so the buffer pointer is marked.
-          var numDeopt = 0
-          if nloc > 2 {
-            numDeopt = rtU32(base, recCur + 16 + 2 * 12 + 8)
+    var frameFp = sp
+    // The record of the statepoint returning to `pc`, through the GC frame index; none at the first frame
+    // that is not a statepoint's return address (the Nomu→C boundary).
+    let hit = rtFrameLookup(pc)
+    if hit >= 0 {
+      found = true
+      let entry = hit / 4294967296
+      let recCur = hit - entry * 4294967296
+      let frameSize = rtFrameStack(entry)
+      let shapes = rtFrameShapes(entry)
+      let nloc = rtU16(base, recCur + 14)
+      // A frame's record { saved FP, saved LR } sits at its CFA − 16, so a fixed-size frame's FP is
+      // SP + size − 16. A frame of dynamic size (2^32 − 1) has no recorded size; its FP is the one its
+      // callee saved, in the callee's frame record just below this frame's SP.
+      frameFp = sp.advanced(by: frameSize - 16)
+      if frameSize == 4294967295 {
+        let savedFp: RawPtr = sp.load(fromByteOffset: -16)
+        frameFp = savedFp
+      }
+      // Shaped roots (task 176 Stage 4) — the NumDeopt deopt range before the ordinary GC pointers, kept
+      // in lockstep with `rtWalkFrom` and the C walker. The 3rd meta location's inline Constant value is
+      // NumDeopt; the range is (shape-id Constant, slot Direct) pairs. Each is resolved to its kind-2
+      // descriptor and run through the shared enumerator over the 16-byte value at the slot — the tag read
+      // yields no offset for an `immortal`/`small` String and the one buffer word for a `heap` one. This
+      // walk emits root VALUES (its counting/marking contract), so the buffer pointer is marked.
+      var numDeopt = 0
+      if nloc > 2 {
+        numDeopt = rtU32(base, recCur + 16 + 2 * 12 + 8)
+      }
+      let deoptEnd = 3 + numDeopt
+      var di = 3
+      while di + 1 < deoptEnd {
+        let cLoc = recCur + 16 + di * 12
+        let dLoc = recCur + 16 + (di + 1) * 12
+        let cw: Int = base.load(fromByteOffset: cLoc)
+        let cKind = cw - cw / 256 * 256
+        let dw: Int = base.load(fromByteOffset: dLoc)
+        let dKind = dw - dw / 256 * 256
+        if cKind == 4 && dKind == 2 {           // Constant (shape ordinal) + Direct[reg+off] (slot)
+          let ordinal = rtU32(base, cLoc + 8)
+          let dReg = rtU16(base, dLoc + 4)
+          let dOff = rtI32(base, dLoc + 8)
+          var vbBase = sp
+          if dReg == 29 {
+            vbBase = frameFp
           }
-          let deoptEnd = 3 + numDeopt
-          var di = 3
-          while di + 1 < deoptEnd {
-            let cLoc = recCur + 16 + di * 12
-            let dLoc = recCur + 16 + (di + 1) * 12
-            let cw: Int = base.load(fromByteOffset: cLoc)
-            let cKind = cw - cw / 256 * 256
-            let dw: Int = base.load(fromByteOffset: dLoc)
-            let dKind = dw - dw / 256 * 256
-            if cKind == 4 && dKind == 2 {           // Constant (shape ordinal) + Direct[reg+off] (slot)
-              let ordinal = rtU32(base, cLoc + 8)
-              let dReg = rtU16(base, dLoc + 4)
-              let dOff = rtI32(base, dLoc + 8)
-              var vbBase = sp
-              if dReg == 29 {
-                vbBase = frameFp
-              }
-              let valbase = vbBase.advanced(by: dOff)
-              let descId = RawPtr.gcShapeDescForOrdinal(ordinal)
-              let cnt = RawPtr.gcLiveCount(descId, valbase)
-              var sk = 0
-              while sk < cnt {
-                let soff = RawPtr.gcLiveOffsetAt(descId, valbase, sk)
-                let wordPtr = valbase.advanced(by: soff)
-                let sroot: RawPtr = wordPtr.load(fromByteOffset: 0)
-                if sroot.isNull == false {
-                  if n < cap {
-                    outBuf.store(sroot, toByteOffset: n * 8)
-                    n = n + 1
-                  }
-                }
-                sk = sk + 1
+          let valbase = vbBase.advanced(by: dOff)
+          let descId: Int = shapes.load(fromByteOffset: 8 + ordinal * 8)
+          let cnt = RawPtr.gcLiveCount(descId, valbase)
+          var sk = 0
+          while sk < cnt {
+            let soff = RawPtr.gcLiveOffsetAt(descId, valbase, sk)
+            let wordPtr = valbase.advanced(by: soff)
+            let sroot: RawPtr = wordPtr.load(fromByteOffset: 0)
+            if sroot.isNull == false {
+              if n < cap {
+                outBuf.store(sroot, toByteOffset: n * 8)
+                n = n + 1
               }
             }
-            di = di + 2
-          }
-          var li = 3                              // skip the 3 leading meta locations
-          while li < nloc {
-            let locOff = recCur + 16 + li * 12
-            let w0: Int = base.load(fromByteOffset: locOff)
-            let kind = w0 - w0 / 256 * 256          // u8 kind at +0
-            if kind == 3 {                          // Indirect [reg + offset] — a stack slot
-              let reg = rtU16(base, locOff + 4)
-              let slotOff = rtI32(base, locOff + 8)
-              var slotBase = sp
-              if reg == 29 {                        // DWARF x29 = frame pointer
-                slotBase = frameFp
-              }
-              let slotPtr = slotBase.advanced(by: slotOff)
-              let root: RawPtr = slotPtr.load(fromByteOffset: 0)
-              let rootNull = root.eq(RawPtr.null)
-              if !rootNull {
-                if n < cap {
-                  outBuf.store(root, toByteOffset: n * 8)
-                  n = n + 1
-                }
-              }
-            }
-            li = li + 1
+            sk = sk + 1
           }
         }
-        recCur = recCur + recSize
-        ri = ri + 1
+        di = di + 2
       }
-      fi = fi + 1
+      var li = 3                              // skip the 3 leading meta locations
+      while li < nloc {
+        let locOff = recCur + 16 + li * 12
+        let w0: Int = base.load(fromByteOffset: locOff)
+        let kind = w0 - w0 / 256 * 256          // u8 kind at +0
+        if kind == 3 {                          // Indirect [reg + offset] — a stack slot
+          let reg = rtU16(base, locOff + 4)
+          let slotOff = rtI32(base, locOff + 8)
+          var slotBase = sp
+          if reg == 29 {                        // DWARF x29 = frame pointer
+            slotBase = frameFp
+          }
+          let slotPtr = slotBase.advanced(by: slotOff)
+          let root: RawPtr = slotPtr.load(fromByteOffset: 0)
+          let rootNull = root.eq(RawPtr.null)
+          if !rootNull {
+            if n < cap {
+              outBuf.store(root, toByteOffset: n * 8)
+              n = n + 1
+            }
+          }
+        }
+        li = li + 1
+      }
     }
     if !found {
       walking = false
     } else {
-      let cfa = sp.advanced(by: frameSize)
+      let cfa = frameFp.advanced(by: 16)
       let nextPc: Int = cfa.load(fromByteOffset: -8)
       pc = nextPc
       sp = cfa
@@ -447,126 +540,117 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
 // park/safepoint — so factoring the loop here is sound; only rtCollectRoots must keep it inline.
 fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitSlots: Int) -> Int {
   let base = RawPtr.gcStackmapBase()
-  let nfuncs = rtU32(base, 4)
-  let nconsts = rtU32(base, 8)
-  let recStart = 16 + nfuncs * 24 + nconsts * 8
   var n = n0
   var sp = spIn
   var pc = pcIn
   var walking = true
   while walking {
     var found = false
-    var frameSize = 0
-    var recCur = recStart
-    var fi = 0
-    while fi < nfuncs {
-      let fRec = 16 + fi * 24
-      let funcAddr: Int = base.load(fromByteOffset: fRec)
-      let fStackSize: Int = base.load(fromByteOffset: fRec + 8)
-      let recCount: Int = base.load(fromByteOffset: fRec + 16)
-      var ri = 0
-      while ri < recCount {
-        let ioff = rtU32(base, recCur + 8)
-        let retAddr = funcAddr + ioff
-        let nloc = rtU16(base, recCur + 14)
-        let locEnd = rtAlign8(16 + nloc * 12)
-        let nlive = rtU16(base, recCur + locEnd)
-        let recSize = rtAlign8(locEnd + 2 + nlive * 4)
-        if retAddr == pc {
-          found = true
-          frameSize = fStackSize
-          let frameFp = sp.advanced(by: fStackSize - 16)
-          // Shaped roots (task 176 Stage 4), mirroring the C walker's `nomu_gc_walk_context`. The 3rd meta
-          // location's inline Constant value is NumDeopt; the deopt range that follows (before the ordinary
-          // GC pointers) is our shaped roots — (shape-id Constant, slot Direct) pairs. For each, resolve the
-          // ordinal to its kind-2 descriptor and run the shared enumerator over the 16-byte value at the slot:
-          // it reads the tag and yields the live managed-word offsets, so an `immortal`/`small` String
-          // contributes nothing and a `heap` String yields its one buffer word (emitted slot-mode so a moving
-          // collection rewrites `word0` in place, which the mutator's volatile reload then observes).
-          var numDeopt = 0
-          if nloc > 2 {
-            numDeopt = rtU32(base, recCur + 16 + 2 * 12 + 8)
+    var frameFp = sp
+    // The record of the statepoint returning to `pc`, through the GC frame index; none at the first frame
+    // that is not a statepoint's return address (the Nomu→C boundary).
+    let hit = rtFrameLookup(pc)
+    if hit >= 0 {
+      found = true
+      let entry = hit / 4294967296
+      let recCur = hit - entry * 4294967296
+      let frameSize = rtFrameStack(entry)
+      let shapes = rtFrameShapes(entry)
+      let nloc = rtU16(base, recCur + 14)
+      // A frame's record { saved FP, saved LR } sits at its CFA − 16, so a fixed-size frame's FP is
+      // SP + size − 16. A frame of dynamic size (2^32 − 1) has no recorded size; its FP is the one its
+      // callee saved, in the callee's frame record just below this frame's SP.
+      frameFp = sp.advanced(by: frameSize - 16)
+      if frameSize == 4294967295 {
+        let savedFp: RawPtr = sp.load(fromByteOffset: -16)
+        frameFp = savedFp
+      }
+      // Shaped roots (task 176 Stage 4), mirroring the C walker's `nomu_gc_walk_context`. The 3rd meta
+      // location's inline Constant value is NumDeopt; the deopt range that follows (before the ordinary
+      // GC pointers) is our shaped roots — (shape-id Constant, slot Direct) pairs. For each, resolve the
+      // ordinal to its kind-2 descriptor and run the shared enumerator over the 16-byte value at the slot:
+      // it reads the tag and yields the live managed-word offsets, so an `immortal`/`small` String
+      // contributes nothing and a `heap` String yields its one buffer word (emitted slot-mode so a moving
+      // collection rewrites `word0` in place, which the mutator's volatile reload then observes).
+      var numDeopt = 0
+      if nloc > 2 {
+        numDeopt = rtU32(base, recCur + 16 + 2 * 12 + 8)
+      }
+      let deoptEnd = 3 + numDeopt
+      var di = 3
+      while di + 1 < deoptEnd {
+        let cLoc = recCur + 16 + di * 12
+        let dLoc = recCur + 16 + (di + 1) * 12
+        let cw: Int = base.load(fromByteOffset: cLoc)
+        let cKind = cw - cw / 256 * 256
+        let dw: Int = base.load(fromByteOffset: dLoc)
+        let dKind = dw - dw / 256 * 256
+        if cKind == 4 && dKind == 2 {               // Constant (shape ordinal) + Direct[reg+off] (slot)
+          let ordinal = rtU32(base, cLoc + 8)
+          let dReg = rtU16(base, dLoc + 4)
+          let dOff = rtI32(base, dLoc + 8)
+          var vbBase = sp
+          if dReg == 29 {
+            vbBase = frameFp
           }
-          let deoptEnd = 3 + numDeopt
-          var di = 3
-          while di + 1 < deoptEnd {
-            let cLoc = recCur + 16 + di * 12
-            let dLoc = recCur + 16 + (di + 1) * 12
-            let cw: Int = base.load(fromByteOffset: cLoc)
-            let cKind = cw - cw / 256 * 256
-            let dw: Int = base.load(fromByteOffset: dLoc)
-            let dKind = dw - dw / 256 * 256
-            if cKind == 4 && dKind == 2 {               // Constant (shape ordinal) + Direct[reg+off] (slot)
-              let ordinal = rtU32(base, cLoc + 8)
-              let dReg = rtU16(base, dLoc + 4)
-              let dOff = rtI32(base, dLoc + 8)
-              var vbBase = sp
-              if dReg == 29 {
-                vbBase = frameFp
-              }
-              let valbase = vbBase.advanced(by: dOff)
-              let descId = RawPtr.gcShapeDescForOrdinal(ordinal)
-              let cnt = RawPtr.gcLiveCount(descId, valbase)
-              var sk = 0
-              while sk < cnt {
-                let soff = RawPtr.gcLiveOffsetAt(descId, valbase, sk)
-                let wordPtr = valbase.advanced(by: soff)
-                let sroot: RawPtr = wordPtr.load(fromByteOffset: 0)
-                if sroot.isNull == false {
-                  if n < cap {
-                    if emitSlots != 0 {
-                      outBuf.store(wordPtr, toByteOffset: n * 8)
-                    } else {
-                      outBuf.store(sroot, toByteOffset: n * 8)
-                    }
-                    n = n + 1
-                  }
+          let valbase = vbBase.advanced(by: dOff)
+          let descId: Int = shapes.load(fromByteOffset: 8 + ordinal * 8)
+          let cnt = RawPtr.gcLiveCount(descId, valbase)
+          var sk = 0
+          while sk < cnt {
+            let soff = RawPtr.gcLiveOffsetAt(descId, valbase, sk)
+            let wordPtr = valbase.advanced(by: soff)
+            let sroot: RawPtr = wordPtr.load(fromByteOffset: 0)
+            if sroot.isNull == false {
+              if n < cap {
+                if emitSlots != 0 {
+                  outBuf.store(wordPtr, toByteOffset: n * 8)
+                } else {
+                  outBuf.store(sroot, toByteOffset: n * 8)
                 }
-                sk = sk + 1
+                n = n + 1
               }
             }
-            di = di + 2
-          }
-          var li = 3
-          while li < nloc {
-            let locOff = recCur + 16 + li * 12
-            let w0: Int = base.load(fromByteOffset: locOff)
-            let kind = w0 - w0 / 256 * 256
-            if kind == 3 {
-              let reg = rtU16(base, locOff + 4)
-              let slotOff = rtI32(base, locOff + 8)
-              var slotBase = sp
-              if reg == 29 {
-                slotBase = frameFp
-              }
-              let slotPtr = slotBase.advanced(by: slotOff)
-              let root: RawPtr = slotPtr.load(fromByteOffset: 0)
-              let rootNull = root.eq(RawPtr.null)
-              if !rootNull {
-                if n < cap {
-                  // emitSlots != 0: store the slot ADDRESS (a moving collection rewrites it in place with
-                  // the forwarded pointer); else store the root VALUE (for counting / non-moving scans).
-                  if emitSlots != 0 {
-                    outBuf.store(slotPtr, toByteOffset: n * 8)
-                  } else {
-                    outBuf.store(root, toByteOffset: n * 8)
-                  }
-                  n = n + 1
-                }
-              }
-            }
-            li = li + 1
+            sk = sk + 1
           }
         }
-        recCur = recCur + recSize
-        ri = ri + 1
+        di = di + 2
       }
-      fi = fi + 1
+      var li = 3
+      while li < nloc {
+        let locOff = recCur + 16 + li * 12
+        let w0: Int = base.load(fromByteOffset: locOff)
+        let kind = w0 - w0 / 256 * 256
+        if kind == 3 {
+          let reg = rtU16(base, locOff + 4)
+          let slotOff = rtI32(base, locOff + 8)
+          var slotBase = sp
+          if reg == 29 {
+            slotBase = frameFp
+          }
+          let slotPtr = slotBase.advanced(by: slotOff)
+          let root: RawPtr = slotPtr.load(fromByteOffset: 0)
+          let rootNull = root.eq(RawPtr.null)
+          if !rootNull {
+            if n < cap {
+              // emitSlots != 0: store the slot ADDRESS (a moving collection rewrites it in place with
+              // the forwarded pointer); else store the root VALUE (for counting / non-moving scans).
+              if emitSlots != 0 {
+                outBuf.store(slotPtr, toByteOffset: n * 8)
+              } else {
+                outBuf.store(root, toByteOffset: n * 8)
+              }
+              n = n + 1
+            }
+          }
+        }
+        li = li + 1
+      }
     }
     if !found {
       walking = false
     } else {
-      let cfa = sp.advanced(by: frameSize)
+      let cfa = frameFp.advanced(by: 16)
       let nextPc: Int = cfa.load(fromByteOffset: -8)
       pc = nextPc
       sp = cfa

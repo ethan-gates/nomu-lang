@@ -1,0 +1,14 @@
+// GC roots across separately compiled modules (task 195): the walk must find roots in a library module's
+// frames (case A) and in the entry's frame across a call that collects inside the library (case B). With
+// only one object's stackmaps read, one of the two is missed: a crash, or a wrong value with no crash.
+// 2000 × (1000 + 7) = 2014000; 42 + 2000 × 3 = 6042.
+import pkg/hold
+
+fun main() {
+  print(holdAcrossGc(seed: 1000))
+  print("\n")
+  let mine = Box(v: 42)
+  let t = churn()
+  print(mine.v + t)
+  print("\n")
+}

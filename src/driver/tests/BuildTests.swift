@@ -116,6 +116,67 @@ final class BuildTests: XCTestCase {
         XCTAssertEqual(try output(of: binary), "42\n")
     }
 
+    // The GC frame index (task 195): a built binary carries it, version 2 with entries, and collects
+    // correctly across modules; with the index erased, the first stack walk aborts with a message instead of
+    // missing roots. A run that never collects never walks, so it still runs.
+    func testBinaryWithoutFrameIndexAborts() throws {
+        let r = try build("tests/fixtures/gc_roots_across_modules")
+        let binary = try XCTUnwrap(r.binary)
+        let gc = ["NOMU_GC_PLAN": "immix", "NOMU_GC_STRESS": "65536"]
+        XCTAssertEqual(try run(binary, env: gc).stdout, "2014000\n6042\n")
+
+        var data = try Data(contentsOf: URL(fileURLWithPath: binary))
+        let (address, fileOffset, size) = try XCTUnwrap(section(of: data, "__DATA_CONST", "__nomu_frameidx"))
+        let at = fileOffset + Int((8 - address % 8) % 8)
+        XCTAssertLessThanOrEqual(at + 16, fileOffset + size)
+        XCTAssertEqual(data.subdata(in: at..<(at + 4)), Data("NFIX".utf8), "index magic")
+        XCTAssertEqual(data[at + 4], 2, "index version")
+        XCTAssertGreaterThan(data[at + 8], 0, "index entries")
+
+        data.replaceSubrange(at..<(at + 16), with: Data(count: 16))
+        try data.write(to: URL(fileURLWithPath: binary))
+        XCTAssertEqual(try run("/usr/bin/codesign", ["-f", "-s", "-", binary]).status, 0)
+        let erased = try run(binary, env: gc)
+        XCTAssertNotEqual(erased.status, 0)
+        XCTAssertTrue(erased.stderr.contains("no GC frame index"), erased.stderr)
+        XCTAssertEqual(try run(binary).stdout, "2014000\n6042\n")
+    }
+
+    private func run(_ exe: String, _ args: [String] = [], env: [String: String] = [:]) throws
+        -> (status: Int32, stdout: String, stderr: String)
+    {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = args
+        p.environment = ProcessInfo.processInfo.environment.merging(env) { $1 }
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+        try p.run()
+        let o = out.fileHandleForReading.readDataToEndOfFile(), e = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: e, as: UTF8.self))
+    }
+
+    // A 64-bit Mach-O section's address, file offset and size.
+    private func section(of d: Data, _ segment: String, _ name: String) -> (UInt64, Int, Int)? {
+        func u32(_ o: Int) -> UInt32 { d.subdata(in: o..<(o + 4)).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) } }
+        func u64(_ o: Int) -> UInt64 { d.subdata(in: o..<(o + 8)).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) } }
+        func str(_ o: Int) -> String { String(decoding: d.subdata(in: o..<(o + 16)).prefix { $0 != 0 }, as: UTF8.self) }
+        var off = 32
+        for _ in 0..<Int(u32(16)) {
+            if u32(off) == 0x19 {   // LC_SEGMENT_64
+                var s = off + 72
+                for _ in 0..<Int(u32(off + 64)) {
+                    if str(s) == name && str(s + 16) == segment { return (u64(s + 32), Int(u32(s + 48)), Int(u64(s + 40))) }
+                    s += 80
+                }
+            }
+            off += Int(u32(off + 4))
+        }
+        return nil
+    }
+
     // Copy `entries` of `from` (files and trees, following symlinks) into `to`.
     private func copyTree(from: String, to: String, entries: [String]) throws {
         let fm = FileManager.default

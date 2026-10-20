@@ -1,0 +1,41 @@
+// A library module whose frames hold GC roots across collections (task 195). Each object carries its own
+// stackmap blob; these frames' records are in this module's blob, not the entry's, so the collector finds
+// their roots only through the frame index over every blob.
+package class Box {
+  var v: Int
+}
+
+// Holds `keep` live across a loop of garbage allocation that drives collections.
+package fun holdAcrossGc(seed: Int) -> Int {
+  let keep = Box(v: seed)
+  var sum = 0
+  var i = 0
+  while i < 2000 {
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 256 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+    sum = sum + keep.v + xs[7].v
+    i = i + 1
+  }
+  return sum
+}
+
+// Allocates garbage only; any root it must keep belongs to its caller.
+package fun churn() -> Int {
+  var t = 0
+  var i = 0
+  while i < 2000 {
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 256 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+    t = t + xs[3].v
+    i = i + 1
+  }
+  return t
+}

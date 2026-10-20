@@ -1,0 +1,6 @@
+import pkg/gen
+
+package fun fromA(n: Int) -> Int {
+  let c = churnKeep(Cell(v: 5), n)
+  return c.v
+}

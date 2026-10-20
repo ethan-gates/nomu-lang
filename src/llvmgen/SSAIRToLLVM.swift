@@ -323,21 +323,10 @@ final class SSAIRToLLVM {
         // discriminant-keyed map is serialized and emitted (weak-folded across modules). The collector
         // consumes it once String flows as a root/field (176.1); emitting it here exercises the kind-2
         // serialization path and lands the descriptor in the binary.
-        // The String kind-2 shaped descriptor + a global holding its type-id. A String *value* carries no
-        // object header, so nothing stamps this descriptor's symbol — without a reference the linker would
-        // dead-strip it, and the walker's ordinal→descriptor resolution would find no kind-2 record. The
-        // global both pins it (its initializer is a reloc against the descriptor) and lets the runtime resolve
-        // shape ordinal 0 → String by a direct read instead of scanning for "the sole kind-2" (task 176.2).
-        let shapeId = e.stringShapeId()
-        let shapeTypeIdGlobal = LLVMGetNamedGlobal(e.mod, "__nomu_string_shape_typeid")
-            ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_string_shape_typeid")!
-        LLVMSetInitializer(shapeTypeIdGlobal, e.descOffsetHeader(shapeId))
-        LLVMSetGlobalConstant(shapeTypeIdGlobal, 1)
-        LLVMSetLinkage(shapeTypeIdGlobal, LLVMWeakODRLinkage)
-
-        // The ordinal→descriptor table the frame-root walk reads (task 176.3a): entry 0 = String, entries 1+ =
-        // the shaped-containing value aggregates recorded during this compilation. Emitted after all functions
-        // are lowered, so every recorded ordinal is known.
+        // The ordinal→descriptor table the frame-root walk reads (task 176.3a): ordinal 0 = String, 1+ = the
+        // shaped-containing value aggregates recorded during this compilation. Emitted after all functions are
+        // lowered, so every recorded ordinal is known. Its String entry also pins the String kind-2
+        // descriptor, which a String value (no object header) never stamps.
         e.emitShapeOrdinalTable()
 
         // Register the heap `String` byte-buffer descriptor — a `ManagedBuffer<EmptyHeader, UInt8>` (task
@@ -1660,6 +1649,11 @@ final class SSAIRToLLVM {
             let sb = LLVMBuildPtrToInt(b, start, e.i64, "sm.b")!
             let se = LLVMBuildPtrToInt(b, end, e.i64, "sm.e")!
             return LLVMBuildSub(b, se, sb, "sm.size")
+        case "__gcFrameIndexBase":
+            // The GC frame index section's start, through its linker section-bracket symbol, as for
+            // `__gcStackmapBase` (the driver always creates the section).
+            let name = "\u{01}section$start$__DATA_CONST$__nomu_frameidx"
+            return LLVMGetNamedGlobal(e.mod, name) ?? LLVMAddGlobal(e.mod, e.i8ptr, name)
         case "__gcFrameAddr":
             let (fn, fty) = e.runtimeFn("llvm.frameaddress.p0", ret: e.i8ptr, params: [e.i32], varArg: false)
             return e.buildCall(fn, fty, [LLVMConstInt(e.i32, 0, 0)])
@@ -1853,11 +1847,6 @@ final class SSAIRToLLVM {
             let (fn, fty) = e.runtimeFn("nomu_gc_shaped_shapeid", ret: e.i32, params: [e.i64, e.i32], varArg: false)
             let k = LLVMBuildTrunc(b, val(args[1]), e.i32, "gc.sh.k2")!
             return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0]), k])!, e.i64, "gc.sh.sid")
-        case "__gcShapeDescForOrdinal":
-            // nomu_shape_desc_for_ordinal(ordinal) → the kind-2 descriptor type-id (shared with the C walker).
-            let (fn, fty) = e.runtimeFn("nomu_shape_desc_for_ordinal", ret: e.i64, params: [e.i32], varArg: false)
-            let ord = LLVMBuildTrunc(b, val(args[0]), e.i32, "gc.ord")!
-            return e.buildCall(fn, fty, [ord])
         case "__int_double_double": return LLVMBuildSIToFP(b, val(args[0]), e.f64, "i2d")
         case "__double_int_int":
             let (fn, fty) = e.runtimeFn("llvm.round.f64", ret: e.f64, params: [e.f64], varArg: false)

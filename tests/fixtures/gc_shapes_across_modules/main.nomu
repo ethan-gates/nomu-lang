@@ -1,0 +1,15 @@
+// Shape ordinals across separately compiled modules (task 195): the entry and the library both use shape
+// ordinal 1, for different struct layouts. Resolved in the wrong object's table, the library's heap String
+// is relocated at the wrong word: a wrong checksum, with no crash.
+import pkg/hold
+
+struct Head {
+  let s: String
+  let n: Int
+}
+
+fun main() {
+  let h = Head(s: "main".concat("-heap"), n: 3)
+  print(tailAcrossGc() + h.n + h.s.count)
+  print("\n")
+}

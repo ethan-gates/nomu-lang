@@ -165,16 +165,6 @@ enum PointerIntrinsics {
             let id = intArg(&s, args[0].value, "RawPtr.\(method)", "id")
             let k = intArg(&s, args[1].value, "RawPtr.\(method)", "k")
             return s.ptrIntrinsic("__" + method, .int, [id, k], span)   // __gcShapedOffset / __gcShapedShapeId
-        // Map a frame-root shape ordinal (a `"deopt"`-bundle Constant, task 176 Stage 4) to its kind-2
-        // descriptor type-id. The self-hosted stackmap walker (`rtWalkFrom`) resolves each shaped root
-        // through this, the same C `nomu_shape_desc_for_ordinal` the C walker uses — one ordinal→descriptor
-        // mapping for both collectors.
-        case "gcShapeDescForOrdinal":
-            guard checkArgLabels(&s, args, [nil], "RawPtr.gcShapeDescForOrdinal", span) else {
-                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
-            }
-            let ord = intArg(&s, args[0].value, "RawPtr.gcShapeDescForOrdinal", "ordinal")
-            return s.ptrIntrinsic("__gcShapeDescForOrdinal", .int, [ord], span)
         // The `__llvm_stackmaps` section (task 150 rung 2, the pcsp root walk): base address + byte size,
         // reached through the linker-provided section-bracket symbols (no libc, no new runtime C). The Nomu
         // pcsp walk parses this section (return-address → SP-relative root slots + per-function frame size).
@@ -188,6 +178,14 @@ enum PointerIntrinsics {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return s.ptrIntrinsic("__gcStackmapSize", .int, [], span)
+        // The GC frame index the driver writes after the link (task 195): the start of its section
+        // (`__DATA_CONST,__nomu_frameidx`; the index begins at the first 8-aligned address in it). The
+        // self-hosted walk maps a return address to its stackmap record through it (`rtFrameLookup`).
+        case "gcFrameIndexBase":
+            guard checkArgLabels(&s, args, [], "RawPtr.gcFrameIndexBase", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__gcFrameIndexBase", .rawPtr, [], span)
         // Stack-walk anchors (task 150 rung 2, pcsp walk): the caller frame's frame pointer (as a RawPtr)
         // and the return address into the caller (as an Int) — `llvm.frameaddress`/`llvm.returnaddress`.
         // From these the pcsp walk derives each frame's SP and steps by the stackmap's per-function size.
