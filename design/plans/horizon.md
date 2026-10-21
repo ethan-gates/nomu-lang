@@ -8,8 +8,9 @@ detail and status; this doc carries only the goals and their order. Everything n
 parallel/cheap work tracked in `tasks.md`.
 
 Two epics are live. **Epic A (self-hosted GC + runtime) is the active priority.** MMTk and the C scheduler
-are retired (one runtime: the Nomu scheduler and collector). Its next run of work is GC correctness, then the **modules
-build-out** beneath the benchmark, which needs programs large enough to be meaningful and the
+are retired ([197](tasks/197-retire-mmtk-and-c-scheduler.md)): one runtime, the Nomu scheduler and collector.
+The GC-correctness run ([176](tasks/176-shaped-gc-roots.md) 176.5) is done; next are the link-time GC frame
+index's last phase (195.5) and then the **modules build-out** beneath the benchmark, which needs programs large enough to be meaningful and the
 perf-affecting module capabilities real: dev-productivity first (explicit module builds, then the build
 cache), then the perf-relevant capabilities (cross-module generics residuals, cross-module inlining). The
 benchmark against Go and Swift (with 158/159) sits above that, when the language is complete.
@@ -26,12 +27,14 @@ and smaller than Go and Swift."
 
 **Order rule:** self-hosting is a *location* change (MMTk/Rust → Nomu); LXR is an *algorithm* change
 (GenImmix → RC-hybrid). Hold the algorithm constant while moving location, then hold location constant
-while changing the algorithm — so the two unknowns never multiply.
+while changing the algorithm — so the two unknowns never multiply. The location change is complete: 197
+retired MMTk, the Rust binding and the C scheduler, leaving the Nomu scheduler and collector over a small C
+floor (`runtime.c`). LXR is the algorithm change that remains.
 
 ```
 127  LXR — RC-primary reclamation, on Immix backing                         ◀ end goal
 └── benchmark against Go and Swift (when the language is complete)
-    └── 150  self-hosted GC ladder
+    └── 150  self-hosted GC ladder — GenImmix correctness-complete on the one runtime (197)
         ├── 158  GC packaging — self-contained plans behind one trigger protocol
         ├── 159  GC observability — collection tracing, stats, pause timing
         ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
@@ -40,14 +43,14 @@ while changing the algorithm — so the two unknowns never multiply.
         │        interacts with 170 (method-level generics), 118 (associated types)
         └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)
             └── 190  explicit module builds — dep scan, one planned graph
-                ├── 195  link-time GC frame index — 195.5 (driver-written signature) remains
-                └── 176  shaped GC roots — 176.5 one shape per type (GC correctness)   ◀ next
+                └── 195  link-time GC frame index — 195.5 (driver-written signature)  ◀ next
 ```
 
-**Order of the next run:** 176.5 (from 176.5.5), then 195.5, then 190, then 172, then 159. GC correctness
-comes before the modules work (soundness is Nomu's first priority, `vision.md`); 190 closes only after all of
-195 and 176.5. [197](tasks/197-retire-mmtk-and-c-scheduler.md) (retire MMTk and the C scheduler) is done;
-197.6 (the stdin poller and a working `readLine`) closed it.
+**Order of the next run:** 195.5, then 190, then 172, then 159. GC correctness came before the modules work
+(soundness is Nomu's first priority, `vision.md`). Retiring MMTk and the C scheduler (197) was moved ahead of
+the rest of 176.5, so 176.5 was finished and tested against one runtime; 176.5 is done (176.5.1–176.5.8), and
+190 now closes after 195. 176.4 (the escape-promotion placement route) stays with
+[148](tasks/148-ssair-optimizer-tier.md) / [179](tasks/179-value-level-gc-classification.md), off this chain.
 
 **What the benchmark needs from the language.** The goal is a language complete enough to benchmark against
 Go and Swift, with results that reflect the language, compiler, scheduling and memory as designed, and not

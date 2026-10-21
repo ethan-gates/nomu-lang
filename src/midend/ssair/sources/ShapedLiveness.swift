@@ -1,11 +1,12 @@
 import support   // Type
 
-// Shaped-value liveness (task 176 Stage 2). A *shaped* value is a 16-byte bit-stealing value whose
-// managed-ness is per-value and dynamic — today only `String`, whose `word0` is a GC buffer pointer in the
-// `heap` case. Such a value cannot ride the `addrspace(1)` statepoint root set, so when it is live across a
-// safepoint the collector must be told where it sits (the frame-root path, shaped-roots.md Stages 3–4).
-// This analysis answers *which shaped values are live at each point*, so codegen can pin and record exactly
-// those it needs to and leave non-crossing ones as pure SSA pairs (materialization is safepoint-gated).
+// Shaped-value liveness (task 176 Stage 2). A *shaped* value has conditional content (`Shape.conditional`):
+// managed words whose managed-ness depends on a discriminant in the value, typed `i64` — a `String`, whose
+// `word0` is a GC buffer pointer in the `heap` case, or a struct or enum holding one, or an enum with a
+// managed payload. Such a value cannot ride the `addrspace(1)` statepoint root set, so when it is live across
+// a safepoint the collector must be told where it sits (the frame-root path, shaped-roots.md Stages 3–4).
+// This analysis answers *which shaped values are live at each point*, so codegen can home and record exactly
+// those it needs to and leave non-crossing ones as pure SSA values (materialization is safepoint-gated).
 //
 // It is per-point liveness restricted to shaped values. The consumer decides which points are safepoints
 // (a non-leaf `call`, the loop-header poll) and reads the live set there:
@@ -17,6 +18,9 @@ import support   // Type
 public struct ShapedLiveness {
     public let liveInBlock: [Int: Set<Int>]
     public let liveOutInst: [Int: [Set<Int>]]
+    // `crossingInst[blockId][i]` — for a safepoint instruction `i`, the values that must be rooted at its
+    // safepoint (`computeShapedLiveness` only; the homing and recording set).
+    public var crossingInst: [Int: [Int: Set<Int>]] = [:]
 }
 
 // Liveness of a given set of SSA value ids — used for shaped-containing value-aggregate *slots* (task 176.3a):
@@ -80,55 +84,79 @@ public func isSafepointInst(_ k: SSAInstKind) -> Bool {
     }
 }
 
-// The shaped-typed SSA value operands (uses) of an instruction.
-private func shapedUses(_ kind: SSAInstKind, _ shapes: ShapeEnv) -> [SSAValue] {
-    func s(_ vs: SSAValue...) -> [SSAValue] { vs.filter { shapes.isShapedValue($0.type) } }
-    switch kind {
-    case .constInt, .constDouble, .constBool, .constString,
-         .alloc, .stackAlloc, .spawnJoin, .funcAddr:
-        return []
-    case .binary(_, let a, let b):                return s(a, b)
-    case .load(let a):                            return s(a)
-    case .store(let addr, let value):             return s(addr, value)
-    case .writeBarrier(let object, let value):    return s(object, value)
-    case .fieldAddr(let base, _):                 return s(base)
-    case .elementAddr(let base, let index):       return s(base, index)
-    case .arrayLen(let a):                         return s(a)
-    case .boundscheck(let index, let length):     return s(index, length)
+// The operands an instruction stores into an object it allocates (an array literal's elements, a boxed
+// value, an actor message's arguments, an appended element when the append grows the buffer). The lowering
+// reads them after its allocation, so they are live at that safepoint even when the instruction is their
+// last use.
+public func storedOperands(_ k: SSAInstKind) -> [SSAValue] {
+    switch k {
+    case .arrayLit(let elements, _):        return elements
+    case .box(let value, _, _):             return [value]
+    case .actorSend(_, _, let args):        return args
     case .call(let c):
-        var vs = c.args
-        if case .witness(let receiver, _, _) = c.kind { vs.append(receiver) }
-        if case .indirect(let callee) = c.kind { vs.append(callee) }
-        return vs.filter { shapes.isShapedValue($0.type) }
-    case .mailboxInit(let a):                      return s(a)
-    case .actorSend(let receiver, _, let args):   return (args + [receiver]).filter { shapes.isShapedValue($0.type) }
-    case .spawn(_, _, let env, _):                return [env].compactMap { $0 }.filter { shapes.isShapedValue($0.type) }
-    case .makeStruct(_, let fields):              return fields.filter { shapes.isShapedValue($0.type) }
-    case .makeEnum(_, _, let fields):             return fields.filter { shapes.isShapedValue($0.type) }
-    case .extractField(let base, _):              return s(base)
-    case .enumTag(let a):                          return s(a)
-    case .extractPayload(let base, _, _):         return s(base)
-    case .box(let value, _, _):                   return s(value)
-    case .arrayLit(let elements, _):              return elements.filter { shapes.isShapedValue($0.type) }
-    case .makeClosure(_, let env, _):             return [env].compactMap { $0 }.filter { shapes.isShapedValue($0.type) }
+        if case .direct("__arrayAppend") = c.kind, c.args.count == 2 { return [c.args[1]] }
+        return []
+    default:                                return []
     }
 }
 
-private func shapedUses(_ term: SSATermKind, _ shapes: ShapeEnv) -> [SSAValue] {
-    switch term {
-    case .br(_, let args):
-        return args.filter { shapes.isShapedValue($0.type) }
-    case .condBr(let cond, _, let thenArgs, _, let elseArgs):
-        return ([cond] + thenArgs + elseArgs).filter { shapes.isShapedValue($0.type) }
-    case .switchOn(let scrutinee, let cases, _, let defaultArgs):
-        var vs = [scrutinee] + defaultArgs
-        for c in cases { vs += c.args }
-        return vs.filter { shapes.isShapedValue($0.type) }
-    case .ret(let v):
-        return v.flatMap { shapes.isShapedValue($0.type) ? [$0] : [] } ?? []
-    case .unreachable:
-        return []
+// The SSA values that are frame addresses rather than values, though typed with their pointee: address-op
+// results (`stackAlloc`, `fieldAddr`, `elementAddr`), a struct or enum method's by-pointer `self` (a mutating
+// method's receiver is its caller's slot), and block parameters that receive an address.
+public func addressValues(_ f: SSAFunction) -> Set<Int> {
+    var addrs = Set<Int>()
+    if f.isMutating, f.name.hasPrefix("m:"), let s = f.params.first {
+        switch s.type {
+        case .named(_, .struct_), .named(_, .enum_): addrs.insert(s.id)
+        default: break
+        }
     }
+    for blk in f.blocks {
+        for inst in blk.insts {
+            guard let r = inst.result else { continue }
+            switch inst.kind {
+            case .stackAlloc, .fieldAddr, .elementAddr: addrs.insert(r.id)
+            default: break
+            }
+        }
+    }
+    var paramsOf: [Int: [SSAValue]] = [:]
+    for blk in f.blocks { paramsOf[blk.id] = blk.params }
+    var changed = true
+    while changed {
+        changed = false
+        for blk in f.blocks {
+            for (target, args) in termEdges(blk.terminator.kind) {
+                guard let ps = paramsOf[target] else { continue }
+                for (k, a) in args.enumerated() where k < ps.count && addrs.contains(a.id) {
+                    if addrs.insert(ps[k].id).inserted { changed = true }
+                }
+            }
+        }
+    }
+    return addrs
+}
+
+private func termEdges(_ term: SSATermKind) -> [(Int, [SSAValue])] {
+    switch term {
+    case .br(let t, let args):                    return [(t, args)]
+    case .condBr(_, let th, let ta, let el, let ea): return [(th, ta), (el, ea)]
+    case .switchOn(_, let cases, let d, let da):  return cases.map { ($0.target, $0.args) } + [(d, da)]
+    case .ret, .unreachable:                      return []
+    }
+}
+
+// The tracked SSA value operands (uses) of an instruction or terminator.
+private func operandIds(_ kind: SSAInstKind, _ tracked: (SSAValue) -> Bool) -> [Int] {
+    var out: [Int] = []
+    _ = remapOperands(kind) { if tracked($0) { out.append($0.id) }; return $0 }
+    return out
+}
+
+private func operandIds(_ term: SSATermKind, _ tracked: (SSAValue) -> Bool) -> [Int] {
+    var out: [Int] = []
+    _ = remapOperands(term) { if tracked($0) { out.append($0.id) }; return $0 }
+    return out
 }
 
 private func termSuccessors(_ term: SSATermKind) -> [Int] {
@@ -140,11 +168,15 @@ private func termSuccessors(_ term: SSATermKind) -> [Int] {
     }
 }
 
-// Backward dataflow to a fixpoint. Shaped values only (`ShapeEnv.isShapedValue`: a shaped leaf or a wrapper of
-// one); ids are enough for the consumer to key on. With no type context (`shapes` defaulted, the low-level
-// liveness tests) no struct is a wrapper, so the tracked set is the leaves alone.
+// Backward dataflow to a fixpoint over the values with conditional content (`ShapeEnv.hasConditional`: a
+// shaped leaf, a wrapper of one, or a struct or enum holding one or a managed enum payload), excluding frame
+// addresses (`addressValues`), which are typed with their pointee. ids are enough for the consumer to key on.
+// With no type context (`shapes` defaulted, the low-level liveness tests) no struct has content, so the
+// tracked set is the leaves alone.
 public func computeShapedLiveness(_ f: SSAFunction,
                                   _ shapes: ShapeEnv = ShapeEnv(structFields: { _ in nil }, enumCases: { _ in nil })) -> ShapedLiveness {
+    let addrs = addressValues(f)
+    func tracked(_ v: SSAValue) -> Bool { !addrs.contains(v.id) && shapes.hasConditional(v.type) }
     // `prop` is the live-in propagated to predecessors (block params removed — a param is defined by the
     // incoming edge, not live-in). `entry` is live-at-entry *including* live params — the poll record set.
     var prop: [Int: Set<Int>] = [:]
@@ -159,26 +191,37 @@ public func computeShapedLiveness(_ f: SSAFunction,
         for b in f.blocks.reversed() {
             var cur = Set<Int>()
             for s in termSuccessors(b.terminator.kind) { cur.formUnion(prop[s] ?? []) }
-            cur.formUnion(shapedUses(b.terminator.kind, shapes).map(\.id))
+            cur.formUnion(operandIds(b.terminator.kind, tracked))
 
             var perInst = [Set<Int>](repeating: [], count: b.insts.count)
             for i in b.insts.indices.reversed() {
                 perInst[i] = cur                      // live immediately after inst i
-                if let r = b.insts[i].result, shapes.isShapedValue(r.type) { cur.remove(r.id) }
-                cur.formUnion(shapedUses(b.insts[i].kind, shapes).map(\.id))
+                if let r = b.insts[i].result, tracked(r) { cur.remove(r.id) }
+                cur.formUnion(operandIds(b.insts[i].kind, tracked))
             }
             liveOutInst[b.id] = perInst
             entry[b.id] = cur                         // includes live params (the loop-header poll set)
 
             var p = cur
-            for bp in b.params where shapes.isShapedValue(bp.type) { p.remove(bp.id) }
+            for bp in b.params where tracked(bp) { p.remove(bp.id) }
             if p != prop[b.id] {
                 prop[b.id] = p
                 changed = true
             }
         }
     }
-    return ShapedLiveness(liveInBlock: entry, liveOutInst: liveOutInst)
+    // The values crossing each safepoint instruction: live after it, less its own result (new, so it does
+    // not cross), plus the operands it stores into the object it allocates (read after that allocation).
+    var crossing: [Int: [Int: Set<Int>]] = [:]
+    for b in f.blocks {
+        for (i, inst) in b.insts.enumerated() where isSafepointInst(inst.kind) {
+            var c = liveOutInst[b.id]?[i] ?? []
+            if let r = inst.result { c.remove(r.id) }
+            for v in storedOperands(inst.kind) where tracked(v) { c.insert(v.id) }
+            crossing[b.id, default: [:]][i] = c
+        }
+    }
+    return ShapedLiveness(liveInBlock: entry, liveOutInst: liveOutInst, crossingInst: crossing)
 }
 
 // The frame slots the collector must be told about (task 176.5), and how every slot-derived address maps to

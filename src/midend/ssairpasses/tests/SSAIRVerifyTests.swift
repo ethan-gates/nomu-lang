@@ -137,12 +137,12 @@ final class SSAIRVerifyTests: XCTestCase {
             SSAInst(result: nil, kind: .call(SSACall(kind: .direct("h"), args: [slot])), span: sp), // uses slot after
         ], terminator: SSATerm(kind: .ret(nil), span: sp))
         let m = fnAgg(SSAFunction(name: "f", params: [], returnType: .void, blocks: [bb], isMutating: false, span: sp), [pairAggregate])
-        XCTAssertFalse(verifySSAIR(m).contains { $0.contains("aggregate") }, "\(verifySSAIR(m))")
+        XCTAssertFalse(verifySSAIR(m).contains { $0.contains("I11") }, "\(verifySSAIR(m))")
     }
 
-    // I11a — a value aggregate containing a `String` crossing a safepoint as a first-class SSA value (a
-    // `makeStruct` result, not a slot) has no record path and leaves its shaped buffer un-relocated; caught.
-    func testUnrootedShapedAggregateCaught() {
+    // I11 — a value aggregate containing a `String` crossing a safepoint as a first-class SSA value (a
+    // `makeStruct` result) is a shaped root codegen homes; it passes clean.
+    func testShapedAggregateValueAcrossCallPassesClean() {
         let pair = Type.named("Pair", .struct_)
         let str = v(0, .stringBase), n = v(1, .int), p = v(2, pair), r = v(3, .int)
         let bb = SSABlock(id: 0, params: [str, n], insts: [
@@ -151,12 +151,24 @@ final class SSAIRVerifyTests: XCTestCase {
             SSAInst(result: nil, kind: .call(SSACall(kind: .direct("h"), args: [p])), span: sp),  // uses p after
         ], terminator: SSATerm(kind: .ret(nil), span: sp))
         let m = fnAgg(SSAFunction(name: "f", params: [str, n], returnType: .void, blocks: [bb], isMutating: false, span: sp), [pairAggregate])
-        XCTAssertTrue(verifySSAIR(m).contains { $0.contains("aggregate") && $0.contains("%2") }, "\(verifySSAIR(m))")
+        XCTAssertFalse(verifySSAIR(m).contains { $0.contains("I11") }, "\(verifySSAIR(m))")
+    }
+
+    // I11 — an undefined shaped aggregate spanning a safepoint is caught, as for a bare `String`.
+    func testUndefinedShapedAggregateRootCaught() {
+        let pair = Type.named("Pair", .struct_)
+        let r = v(0, .int)
+        let bb = SSABlock(id: 0, params: [], insts: [
+            SSAInst(result: r, kind: .call(SSACall(kind: .direct("g"), args: [])), span: sp),               // safepoint
+            SSAInst(result: nil, kind: .call(SSACall(kind: .direct("h"), args: [v(99, pair)])), span: sp),   // %99 undefined
+        ], terminator: SSATerm(kind: .ret(nil), span: sp))
+        let m = fnAgg(SSAFunction(name: "f", params: [], returnType: .void, blocks: [bb], isMutating: false, span: sp), [pairAggregate])
+        XCTAssertTrue(verifySSAIR(m).contains { $0.contains("I11") && $0.contains("%99") }, "\(verifySSAIR(m))")
     }
 
     // I11 (task 176.3b) — an `enum` with a `String` payload (`Opt`) crossing a safepoint as a first-class
-    // `makeEnum` value, rather than a frame slot, is caught — same rooting precondition as the struct case.
-    func testUnrootedShapedEnumCaught() {
+    // `makeEnum` value is a shaped root codegen homes; it passes clean.
+    func testShapedEnumValueAcrossCallPassesClean() {
         let opt = Type.named("Opt", .enum_)
         let str = v(0, .stringBase), o = v(1, opt), r = v(2, .int)
         let bb = SSABlock(id: 0, params: [str], insts: [
@@ -170,7 +182,7 @@ final class SSAIRVerifyTests: XCTestCase {
         ], span: sp)
         let m = SSAModule(functions: [SSAFunction(name: "f", params: [str], returnType: .void, blocks: [bb], isMutating: false, span: sp)],
                           enums: [optEnum])
-        XCTAssertTrue(verifySSAIR(m).contains { $0.contains("aggregate") && $0.contains("%1") }, "\(verifySSAIR(m))")
+        XCTAssertFalse(verifySSAIR(m).contains { $0.contains("I11") }, "\(verifySSAIR(m))")
     }
 
     // I1 — a value id used at a type different from its definition.

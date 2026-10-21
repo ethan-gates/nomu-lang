@@ -1,0 +1,52 @@
+class Box {
+  var v: Int
+}
+// Allocates a Box and spins, so a nursery collection lands between reads.
+fun churn(i: Int) -> Int {
+  let b = Box(v: i)
+  var k = 0
+  var t = 0
+  while k < 100 {
+    t = t + k
+    k = k + 1
+  }
+  return t + b.v
+}
+fun probe(s: String) -> Int {
+  return s.byte(at: 5).int + s.byte(at: 20).int
+}
+fun heapString() -> String {
+  return "seed".concat("-heap-string-xxxxxxxxxxxxxxxx")
+}
+fun report(bad: Int) {
+  print("bad ")
+  print(bad)
+  print("\n")
+}
+// A Holder made mature by churn, then given young Strings: the store must be remembered.
+class Holder {
+  var s: String
+}
+fun main() {
+  let h = Holder(s: "x")
+  var t = 0
+  var k = 0
+  while k < 2000 {
+    t = t + churn(k)
+    k = k + 1
+  }
+  let want = probe(heapString())
+  var bad = 0
+  var i = 0
+  while i < 200000 {
+    if i % 100 == 0 {
+      h.s = heapString()
+    }
+    t = t + churn(i)
+    if probe(h.s) != want {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  report(bad)
+}

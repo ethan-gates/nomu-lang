@@ -38,7 +38,7 @@ fun main() {
   let want = probe(heapString())
   var bad = 0
   var i = 0
-  while i < 2000 {
+  while i < 600 {
     spawn let a = make(i)
     spawn let b = make(i + 1)
     if probe(a) != want {

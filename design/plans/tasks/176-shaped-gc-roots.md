@@ -15,7 +15,7 @@ tests) and forced/evac oracles (`pair_string_gc`, `option_string_gc`, `enum_nons
 payloads — fail-stopped at build today, not silent; and cross-module shape-table ordinals — the erased-shaped
 path roots through the VWT, a different channel) are absorbed into
 [179](179-value-level-gc-classification.md), whose unified descriptor path is their natural home. **176.5 is
-open — a correctness bug:** a `String` local (or a struct holding one) read after a safepoint uses a stale
+done (176.5.1–176.5.8) — it was a correctness bug:** a `String` local (or a struct holding one) read after a safepoint uses a stale
 buffer pointer (the I11a reload misses the `struct String` wrapper), found closing
 [195](195-link-time-gc-frame-index.md). The escape-promotion placement route is now 176.4
 (stays with [148 §148.1](148-ssair-optimizer-tier.md)/[179](179-value-level-gc-classification.md)) ·
@@ -382,13 +382,39 @@ collector still finds and fixes up exactly the references that are live.
       `mono_generic`, `readonly_self2`, `layout_struct_local`, `struct_array_mutating`. The suite is 162/162,
       and `gc-shapes-across-modules-self` passes 20 of 20 on two carriers (3 of 10 failed before).
       `xmod_erased` keeps exactly one wrong read under GenImmix stress (176.5.6).
-  - **176.5.5 — value homes for every shaped type.** A value whose shape is non-empty and that crosses a
-    safepoint gets a frame home, as a `String` does today: aggregate parameters, temporaries, and `self`,
-    so the I11-rejected cases build. Every producer writes its home through `define`, including the spawn
-    join (`spawn_result`). An instruction that allocates and then stores its operands (`actorSend`,
-    `arrayLit`, `box`, `makeClosure`, `spawn`) has its shaped operands recorded at that allocation and read
-    after it: the egress now reads them first (`args.map { val($0) }` before `emitActorSend`), so a collection
-    at the allocation stores a stale `String` into the message (`actor_msg_queued`).
+  - **176.5.5 — value homes for every shaped type. Done.** A value whose shape has conditional content and
+    that crosses a safepoint gets a frame home, as a `String` does: aggregate parameters, temporaries, and
+    `self`, so the I11-rejected cases build. Every producer writes its home through `define`, including the
+    spawn join (`spawn_result`). An instruction that allocates and then stores its operands has its shaped
+    operands recorded at that allocation and read after it.
+    - **Built.**
+      - `computeShapedLiveness` (`ShapedLiveness.swift`) tracks every value with conditional content
+        (`ShapeEnv.hasConditional`). It excludes frame addresses (`addressValues`: address-op results, a struct
+        or enum method's by-pointer `self`, block parameters that receive an address), which carry their
+        pointee's type. It also gives `crossingInst`, the values to root at each safepoint instruction: live
+        after it, less its result, plus `storedOperands`. Those are the operands an instruction stores into an
+        object it allocates: `arrayLit` elements, the `box` value, `actorSend` arguments, and the element of
+        `__arrayAppend`, which may grow its buffer. The egress homes and records `crossingInst`, and the
+        verifier checks the same set.
+      - The egress home holds the value's type (it used to hold a leaf). Reads go through `loadReloading`, the
+        deopt ordinal is the type's `shapeOrdinal`, and the home is zero-initialized at entry.
+      - `emitActorSend` and `boxPayload` take their values as closures, called after the allocation.
+        `emitArrayAppend` reads its element after the grow.
+      - In the spawn thunk, a shaped result crosses the result box's allocation in a recorded frame slot, as
+        a home does. The join writes its result through `define`. (Allocating the box before the body instead
+        added a root to every spawn frame, which the suite's root-count assertions caught.)
+      - The I11 aggregate check ("spans a safepoint as a first-class value") is gone. One I11 check covers
+        every shaped root. Its teeth tests became pass-clean tests, plus an undefined-aggregate check.
+    - **Found and fixed: no write barrier for a non-pointer value.** `storeField` barriered only a `p1`
+      value. A `String`, or a struct or enum holding managed words, stored into a mature object was not
+      remembered, so a minor collection moved its buffer and left the object stale. Seen while trying an
+      early-allocated spawn box (it matures while the body runs) and reproduced directly by
+      `mature_field_store` (`bad 38459` under stress-minor). `__nomu_remember` is the barrier without its store; the barrier remembers the object, so
+      a plain store followed by it is the same barrier. `storeField` uses it for an aggregate value: when the
+      caller gives the Nomu type, only for a non-empty shape; when it does not, for every aggregate.
+    - **Result.** Every shape-matrix case reads `bad 0` on every leg under debug, `-O` and inliner off,
+      including `agg_param`, `array_pair`, `mutating_self`, `readonly_self`, `spawn_result`,
+      `actor_msg_queued` and the new `mature_field_store`. Suite 163/163; unit tests pass.
   - **176.5.6 — erased-generic buffers under MMTk.** An erased call's argument buffer (`erased.arg`) is
     registered only on the fiber's shadow stack (`rtShadowPush`), which only the self-hosted collector walks
     (`rtWalkShadow`); the C walker never reads it, and `rtShadowPush` returns early when no fiber is bound (the
@@ -411,10 +437,50 @@ collector still finds and fixes up exactly the references that are live.
       with the Nomu scheduler was wrong for every case, including a class field (`class_field`: 995750 wrong
       reads; `array_string` trapped), because only the Nomu collector walks the Nomu scheduler's carriers
       and shadow stacks. The pairing guard built here was deleted with the runtime selector in 197.
-  - **176.5.7 — tests.** The matrix into the suite with collecting legs (the `run.sh` set: a 64-block
+  - **176.5.7 — tests. Done.** The matrix into the suite with collecting legs (the `run.sh` set: a 64-block
     nursery, `NOMU_GC_STRESS` minor, `NOMU_GC_STRESS` + `NOMU_MATURE_FLOOR` major); nursery legs added to the
     existing shaped oracles, which today use only stress and cannot see a missed reload; a no-inline leg
-    (`COMPILE_ENV=NOMU_NO_INLINE=1`); a nested-call inlining case (`f(g())`).
+    (`COMPILE_ENV=NOMU_NO_INLINE=1`); a nested-call inlining case (`f(g())`). It needs harness work first,
+    designed as [155](155-integration-suite-harness.md) Phase 3: a matrix declared once in the manifest
+    (pipelines and GC legs applied to a group of fixtures), one binary per build configuration (a quick version
+    there; the real one is [198](198-compiler-flag-system.md)), named settings, stable names for expanded runs,
+    tiers, and `run.sh` retired.
+    **Built.** The `shape` group (`tests/fixtures/shape_matrix/*`) runs every case across the `pipeline` and
+    `gc` dimensions ([155](155-integration-suite-harness.md) Phase 3); the erased-layout cases, which allocate
+    nothing, are the `layout` group across `pipeline`. `run.sh` is deleted. Nursery legs
+    (`*-nursery`, `nursery_blocks: 1`) were added to `gc-string-relocate`, `pair-string-gc`,
+    `option-string-gc` and `enum-nonshaped-gc`, and `nested-call-inline` covers `f(g())`. Seven slow cases
+    were shortened. Against the pre-fix compiler (HEAD before 176.5.5), `agg_param`, `array_pair`,
+    `mutating_self`, `readonly_self`, `spawn_result`, `mature_field_store` and (on `nursery-tight`)
+    `actor_msg_queued` fail; the 176.5.1–176.5.4 fixes predate that compiler, so their cases were not checked
+    that way.
+  - **176.5.8 — managed addresses hoisted past safepoints under release. Done.** Found by the
+    `nursery-tight` leg (`nursery_blocks: 1`): `shape/mature_field_store/release/nursery-tight` read
+    `bad 4788` every run; debug and no-inline passed.
+    - **Cause.** The write barrier's fast path is inlined before the statepoint rewrite (RS4GC), and it turns
+      the object pointer into an integer (`ptrtoint`) for its heap-range and log-bit tests. Before RS4GC an
+      object held across a loop is one SSA value, so `default<O3>` hoisted the `ptrtoint` (and the slow path's
+      `addrspacecast`) out of the loop. RS4GC relocates pointers, not integers derived from them, so after a
+      collection promoted the object the barrier tested its old nursery address, whose log bit is clear, and
+      never remembered the store. The collection log's new counts showed it: release made 0 slow-path calls
+      and remembered 0 objects per collection, debug 1 and 1. The pointer barrier has the same code, so any
+      release-mode loop storing into an object promoted after the loop began could miss its barrier.
+    - **Fix.** Options were (a) keep the barrier out of line until after RS4GC and inline it then, (b) never
+      inline it, and (c) hide the address computation from the optimizer. (b) was ruled out for its per-store
+      call; (c) was chosen as the faster of the two left, since O3 still sees the whole fast path.
+      `pinnedAddress` (`LLVMGenRuntime.swift`) takes a managed pointer's address through a side-effecting
+      one-instruction inline asm (a register move, marked `gc-leaf-function` so RS4GC leaves it a plain
+      call), which the optimizer cannot hoist or merge. `managedAddress` uses it for every managed pointer;
+      the barrier, `toUnmanaged` (the erased-copy casts, the spawn env, the witness payload),
+      `__gcObjAddr` and the `ManagedBuffer` raw header and element pointers all go through it.
+    - **Measured** (release, best of runs): a barrier-bound loop of 300 M stores into old objects (class
+      field, `String` field, array element) runs 0.33–0.34 s before and after; `perf-tier.py --release`
+      matches within noise on every workload (`gc_barrier` 24–25 ms, `gc_footprint` 18 ms, `binary_tree`
+      ~815 ms).
+    - **Diagnostics kept.** The `gc_log` collection line now reports `N remembered, M barrier slow calls`.
+    - **Result.** `mature_field_store` passes on every pipeline and leg, 3 of 3. The `nursery-tight` leg stays
+      in the `gc` dimension (fast tier): it is the one leg that catches `actor_msg_queued`'s bug against the
+      pre-fix compiler. Full tier 729/729 in 117 s, fast tier 318/318 in 62 s; unit tests pass.
 
 ## Dependencies & relationships
 

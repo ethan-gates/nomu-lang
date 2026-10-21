@@ -180,6 +180,9 @@ void rt_modbuf_reset_all(void) {
 // carrier's remembered object pointers (up to `cap` total), reset every buffer's count, and return the total.
 // Called under STW by the minor collector (via RawPtr.gcDrainModBufs), so the table read needs no lock. The
 // drain both collects and resets, so the coordinator does not also call rt_modbuf_reset_all.
+// The remembered-set size the last drain returned, for the collection log.
+static int64_t rt_dbg_last_drain = 0;
+
 int64_t rt_modbuf_drain(void* outBuf, int64_t cap) {
     int64_t* out = (int64_t*)outBuf;
     int64_t total = 0;
@@ -192,6 +195,7 @@ int64_t rt_modbuf_drain(void* outBuf, int64_t cap) {
         }
         m[0] = 0;   // reset — the remembered set is consumed by this collection
     }
+    rt_dbg_last_drain = total;
     return total;
 }
 
@@ -212,9 +216,13 @@ void rt_selfhost_space_lock_release(void) { pthread_mutex_unlock(&rt_selfhost_sp
 // `gc-leaf`.
 extern void nomu_fn_rtGcRemember(void* modbuf, void* obj);
 
+// Slow-path calls since the last collection, for the `NOMU_GC_DEBUG_PRESSURE` collection log.
+static int64_t rt_dbg_barrier_slow = 0;
+
 void rt_gc_write_barrier(void* obj, void* slot, void* val) {
     (void)slot;
     (void)val;
+    __atomic_fetch_add(&rt_dbg_barrier_slow, 1, __ATOMIC_RELAXED);
     nomu_fn_rtGcRemember(rt_self_modbuf_get(), obj);
 }
 
@@ -918,6 +926,7 @@ static void* rt_gc_sync_thread(void* _) {
             struct timespec s = {0, 200 * 1000}; nanosleep(&s, NULL);
         }
         int64_t nr;
+        rt_dbg_last_drain = 0;
         if (kind == 1) {
             // Minor (generational) collection (150.4.3): promote the nursery, using the drained remembered set.
             nr = nomu_fn_nomuSchedStwCollectMinor(rt_nomu_sched);
@@ -932,8 +941,11 @@ static void* rt_gc_sync_thread(void* _) {
         collections++;
         if (dbg) {
             int64_t after = nomu_fn_nomuGcSpaceAvail();
-            fprintf(stderr, "nomu-gc-sync: collection %d (%s), %lld roots, avail -> %lld\n",
-                    collections, kind == 1 ? "minor" : "major", (long long)nr, (long long)after);
+            int64_t slow = __atomic_exchange_n(&rt_dbg_barrier_slow, 0, __ATOMIC_RELAXED);
+            fprintf(stderr, "nomu-gc-sync: collection %d (%s), %lld roots, avail -> %lld, "
+                    "%lld remembered, %lld barrier slow calls\n",
+                    collections, kind == 1 ? "minor" : "major", (long long)nr, (long long)after,
+                    (long long)rt_dbg_last_drain, (long long)slow);
         }
         rt_stw_st(144, 0);
         rt_stw_st(136, 0);

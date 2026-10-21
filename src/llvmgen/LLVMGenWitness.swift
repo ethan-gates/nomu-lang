@@ -258,7 +258,7 @@ extension LLVMGen {
         if case .existential = m.ret {
             // Covariant `Self`: the impl returns the concrete conformer; re-box it as `any iface`.
             guard let w = witnessInstance(type, iface),
-                  let pl = boxPayload(result, .named(type, namedKind(type))) else { return nil }
+                  let pl = boxPayload({ result }, .named(type, namedKind(type))) else { return nil }
             LLVMBuildRet(b, makeAnyBox(w, pl))
         } else if m.ret == .void {
             LLVMBuildRetVoid(b)
@@ -345,10 +345,12 @@ extension LLVMGen {
 
     // The `any I` payload for a value: a reference type is its pointer; a value type is copied to a
     // fresh managed allocation so the pointer outlives the temporary.
-    func boxPayload(_ v: LLVMValueRef, _ t: Type) -> LLVMValueRef? {
+    // `v` is called after the payload's allocation, so a shaped value is read from its home once a collection
+    // there has run.
+    func boxPayload(_ v: () -> LLVMValueRef, _ t: Type) -> LLVMValueRef? {
         switch t {
         case .named(_, .class_), .named(_, .actor_):
-            return v
+            return v()
         default:
             // A value payload is a proper GC object `{ header, value }`: type-id header at offset 0, value
             // at offset 8, carrying the value's managed-pointer map (the 150.3.13 pattern — the `{header,
@@ -358,7 +360,7 @@ extension LLVMGen {
             let bytes = (1 + slotCount(t)) * 8
             let p = rtAllocManaged(LLVMConstInt(i64, UInt64(bytes), 0))
             writeTypeIdHeaderRaw(p, spawnBoxTypeId(t))
-            LLVMBuildStore(b, v, payloadValue(p))
+            LLVMBuildStore(b, v(), payloadValue(p))
             return p
         }
     }

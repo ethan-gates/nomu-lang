@@ -1,0 +1,22 @@
+// A nested call whose callee and argument producer are both single-block functions: inlining `hold` binds
+// its parameter to the inlined `s0`'s result, so the splice must resolve the argument through the
+// substitution (`Inlining.swift`, `spliceSingleBlock`). It failed SSAIR verification (I3, use of an
+// undefined value) before, for any type.
+fun s0() -> Int {
+  return 41
+}
+fun hold(x: Int) -> Int {
+  return x + 1
+}
+fun name() -> String {
+  return "nomu"
+}
+fun shout(s: String) -> String {
+  return s.concat("!")
+}
+fun main() {
+  print(hold(s0()))
+  print("\n")
+  print(shout(name()))
+  print("\n")
+}

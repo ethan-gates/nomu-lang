@@ -13,7 +13,11 @@ bazel-bin/src/compiler-test/compiler-test tests/suite.json   # the manifest path
 Flags:
 - `--enable a,b,gc-*` — run only these (base becomes empty, then these are added).
 - `--disable a,b,gc-*` — run everything except these.
-- `--deadline SEC` — overall wall-clock backstop (default 300).
+- `--where axis=value,…` — run only group runs with these dimension values (`--where gc=stress-major`).
+- `--tier fast|full` — `fast` (the default) or `full` (fast plus the expensive legs). See "Tiers".
+- `--repeat N` — run the selection N times and report each case's pass rate (for hunting flakes).
+- `--compiler PATH` — the `nomu` to test, e.g. an older build to check that a case catches its bug.
+- `--deadline SEC` — overall wall-clock backstop (default 300, scaled by `--repeat`).
 
 The manifest path is a required positional argument. List tokens match a case `name`; `all` is the
 wildcard; a trailing `*` matches by prefix. The pool is 8 lanes; a case occupies `weight` of them.
@@ -21,9 +25,15 @@ Exit codes: 0 all pass · 1 a case failed/timed out · 2 usage · 3 deadline.
 
 **Compiler:** the harness prefers a release build of `nomu` — it looks for a `bazel-out/*-opt/…`
 build first (a debug compiler is ~10× slower to run), falling back to `bazel-bin` with a warning.
-Build it once with `bazel build -c opt //src/nomu-cli:nomu`. Override with `COMPILER_TEST_NOMU`.
-Each fixture builds with `nomu build <fixture dir>`; its binary is at `<workspace>/build/<module path>/<leaf>`,
-under the `build/` of the workspace holding the fixture (the nearest `nomu.yaml`).
+Build it once with `bazel build -c opt //src/nomu-cli:nomu`. Override with `--compiler`.
+Each fixture builds with `nomu build <fixture dir>`, and each configuration (a fixture plus its compile
+settings) keeps its own binary at `build/compiler-test/<fixture>-<hash>/<leaf>`. `nomu build` writes one
+output path per module whatever its settings, so configurations of one fixture compile one after another
+and the harness copies each binary out; different fixtures compile in parallel. (Task 198 moves this into
+the driver.)
+
+**Hermetic runs:** compiles and runs see only `PATH`, `HOME`, `TMPDIR` and the case's declared settings.
+Any `NOMU_*` variable in your shell is dropped.
 
 **Output:** on a terminal, a live status line pins the in-flight set and counts at the bottom
 (`[42/68] running · gc-string, stw-collect  ✓40`) while finished cases stream above it. Piped or in
@@ -36,10 +46,10 @@ Add an object to `cases` in `tests/suite.json` and a `.nomu` fixture — no new 
 - `name` (unique), `fixture` (a module directory, path from the project root).
 - `compile_args` — extra `nomu build` flags, e.g. `["--runtime-subset=enqueue,dequeue"]` for a
   subset-legality build. Part of the compile key.
-- `compile_env` / `run_env` — the env is declared here, in exactly one place, so a run cannot
-  silently forget or duplicate a flag. Compilation is shared: a fixture is built once per distinct
-  `(compile_env, compile_args)`; a case's runs vary only `run_env` / `carriers`. Two cases sharing a
-  fixture and compile config (e.g. a default leg and a `NOMU_GC_STRESS` leg) compile once.
+- `compile_settings` / `run_settings` — named settings (see "Settings"), declared here and nowhere else,
+  so a run cannot silently forget or duplicate one. Compilation is shared: a fixture is built once per
+  distinct compile configuration; a case's runs vary only `run_settings` / `carriers`. Two cases sharing a
+  fixture and compile settings (e.g. a default leg and a stress leg) compile once.
 - `expect` — `{ "stdout": "…" }` (literal, exact) or `{ "stdout_file": "tests/expected/x.txt" }`
   (golden file, for computed/large output). A golden is captured once and refreshed only when the
   correct output legitimately changes. Omit `expect` to
@@ -65,19 +75,61 @@ Add an object to `cases` in `tests/suite.json` and a `.nomu` fixture — no new 
   couple of which then overlap. The legacy `heavy: true` still works and maps to weight 8.
 - `compile: { "expect_error": "<substring>" }` — a negative case: the compile must fail with that
   substring, and no run happens.
+- `tier` — `fast` (default) or `full`; a `full` case runs only under `--tier full`.
+- `full_iterations` — repetitions under `--tier full`, when more than `iterations`: a case repeated to catch
+  a timing-dependent race runs `iterations` times in the fast tier and `full_iterations` in the full tier.
+  Groups take it too.
+- `timing_sensitive` — run the case alone after the rest, with the pool otherwise idle (a delayed stdin
+  feed racing other fibers, an external driver thread that must fire before a short program exits). There are no automatic retries; use `--repeat` to measure a flake.
+
+Unknown keys are an error, at every level of the manifest.
 
 Unset fields fall back to `defaults`.
+
+## Settings
+
+A case changes how its fixture is compiled or run only through named settings. The table, with each
+setting's stage and today's mechanism, is `src/compiler-test/sources/Settings.swift`; an unknown name, or a
+setting at the wrong stage, is an error. Task 198 turns these into compiler flags; the names stay.
+- Compile: `optimize` (`--release`), `inline`, `escape`, `scalar`, `devirt` (each default `true`; `false`
+  turns the pass off), `rt_prelude` (fixtures that call `rt*` directly).
+- Run: `gc_log` (log each collection: `nomu-gc-sync: collection N (minor|major)`), `gc_stress_bytes` (a
+  collection every N bytes a carrier allocates), `nursery_blocks` (a minor collection when the nursery
+  fills N 32 KiB blocks), `mature_floor` (every collection major below this mature size),
+  `gc_trigger_reserve`, and the external driver threads `gc_pressure_driver` (heap-pressure defrag),
+  `stw_collect_driver` (timed forced evacuation) and `stw_selfhost_driver` (timed root-walk STW).
 
 ## GC legs
 
 Every program runs on the Nomu runtime (the Nomu scheduler and collector). A fixture's plain case runs it
-with no knob; its collecting legs force collections and check with `stderr_match` that one fired
-(`NOMU_GC_DEBUG_PRESSURE=1` prints each collection):
-- `-evac` — `NOMU_GC_STRESS=<bytes>`: a collection every N bytes a carrier allocates, so every
-  allocation site is a collection point (minor; `NOMU_MATURE_FLOOR` above the heap size makes it major).
-- `NOMU_NURSERY_RESERVE=<blocks>` — minor collections when the nursery fills that many 32 KiB blocks.
-- `NOMU_GC_PRESSURE` / `NOMU_STW_COLLECT` / `NOMU_STW_SELFHOST` — external driver threads (heap-pressure
-  defrag, timed forced evacuation, timed root-walk STW).
+with no setting; its collecting legs force collections and check with `stderr_match` (or a dimension's
+`require_collections`) that they fired: `-evac` cases use `gc_stress_bytes`, `-nursery` cases
+`nursery_blocks`.
+
+## Dimensions and groups
+
+A matrix is declared once. `dimensions` names axes; each value carries `compile_settings`, `run_settings`,
+`require_collections` (at least N collections logged; turns on `gc_log`) and a `tier`:
+- `pipeline` — `debug`; `release` (`optimize`) and `noinline` (`inline: false`), both `full`.
+- `gc` — `default`; `nursery` (64 blocks); `nursery-tight` (1 block: collections land at points the larger
+  nursery never reaches); `stress-minor` (a collection every 4 KiB); `stress-major` (the same, every
+  collection major), `full`.
+
+A `group` names fixtures by a directory glob (`dir/*`, every subdirectory), the axes it spans (`across`),
+shared settings and a default `expect`. It expands to one run per fixture and combination of values, named
+`group/fixture/value/…` (`shape/local_string/release/stress-major`). A fixture's own `expected.txt`, beside
+its source, wins over the group's `expect`. A run's tier is the highest of its group's and its values'.
+- `shape` — `tests/fixtures/shape_matrix/*` across `pipeline` × `gc`: a heap `String` held in every
+  position a program can hold one, read back across collections (task 176.5). Each prints `bad 0`.
+- `layout` — `tests/fixtures/layout_matrix/*` across `pipeline`: value layouts a mono caller and an erased
+  body must agree on.
+
+## Tiers
+
+`fast` is the default run: every flat case, plus group runs on the debug pipeline with the `default`,
+`nursery` and `stress-minor` legs. Budget about 60 s wall. `full` (`--tier full`) adds the `release` and
+`noinline` pipelines and `stress-major`; budget about 5 minutes. A whole-tier run reports when it exceeds
+its budget, and every run lists its five slowest cases.
 
 ## Scheduling order
 
@@ -85,7 +137,8 @@ The runner dispatches longest-first (LPT), so the long tails start early and ove
 draining the pool at the end. The order lives in the manifest as an optional top-level
 `computed_order` (the longest-first list of case names), written back as a single line — failures and
 timeouts included, so a slow-failing case keeps its front-of-line slot. Never-measured cases sort
-first (run early, get ranked next time). It is rewritten only on a full run (every manifest case ran),
+first (run early, get ranked next time). It is rewritten only on a whole-tier run (no `--enable`, `--disable` or `--where`; cases outside the tier
+keep their earlier ranking after the measured ones),
 sorted by that run's measured times, so a subset run reads the order but never rewrites it from partial
 data. Safe to commit (CI/fresh checkouts inherit the order) or to delete (a full run rebuilds it).
 

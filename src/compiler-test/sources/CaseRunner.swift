@@ -8,6 +8,8 @@ struct CaseResult {
     var compileTime: Double
     var runTime: Double
     var detail: [String]     // failure diagnostics (empty on pass)
+    var passes = 1           // rounds passed, under `--repeat`
+    var rounds = 1
 
     func line() -> String {
         let tag: String
@@ -17,7 +19,8 @@ struct CaseResult {
         case .timeout: tag = "TIMEOUT"
         }
         let padded = name.padding(toLength: max(24, name.count + 1), withPad: " ", startingAt: 0)
-        return "\(tag.padding(toLength: 8, withPad: " ", startingAt: 0)) \(padded) compile \(fmt(compileTime))  run \(fmt(runTime))"
+        let rate = rounds > 1 ? "  passed \(passes)/\(rounds)" : ""
+        return "\(tag.padding(toLength: 8, withPad: " ", startingAt: 0)) \(padded) compile \(fmt(compileTime))  run \(fmt(runTime))\(rate)"
     }
 }
 
@@ -28,14 +31,15 @@ struct CaseRunner {
     let ctx: Ctx
 
     func run(_ c: ResolvedCase, compile: CompileResult) -> CaseResult {
-        let bin = ctx.binaryPath(c.fixture)
+        let bin = ctx.configBinaryPath(c)
         let fixArg = ctx.compileInputs(c.fixture).joined(separator: " ")
         let compileArgsStr = c.compileArgs.joined(separator: " ")
         let compileRepro = "\(envPrefix(c.compileEnv)) \(ctx.nomu) build \(compileArgsStr) \(fixArg)"
             .replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespaces)
 
         func result(_ status: Status, _ detail: [String] = [], runTime: Double = 0) -> CaseResult {
-            CaseResult(name: c.name, status: status, compileTime: compile.duration, runTime: runTime, detail: detail)
+            CaseResult(name: c.name, status: status, compileTime: compile.duration, runTime: runTime, detail: detail,
+                       passes: status == .pass ? 1 : 0)
         }
 
         // Negative case: the compile itself is the test.

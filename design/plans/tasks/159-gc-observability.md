@@ -56,6 +56,33 @@ are observability outputs), and it should be designed so it works across the pac
 - **Structured output for benchmarking.** A machine-readable emission (JSON or similar) the step-3 benchmark
   harness consumes, aligned with the 155 harness's `--json`.
 
+## Deterministic GC tests
+
+Accepted for now, recorded here: some suite cases decide pass or fail by thread timing. The rule to reach is
+that a case's result depends only on the program. Timing may decide where a collection lands, but every
+assertion holds for every timing, and what the case exists to exercise is guaranteed to happen.
+
+- **Found.** With the long cases shortened ([155](155-integration-suite-harness.md) Phase 3), the three
+  `-self` heap-pressure cases (`gc-roots-across-modules-self`, `gc-shapes-across-modules-self`,
+  `gc-generic-two-consumers-self`) each failed once under suite load: the driver thread fired 0 collections
+  before the 0.1 s program exited, so the `min 2` collection check failed. Output was correct each time; the
+  runs exercised no collection. Alone they pass 20 of 20. They are marked `timing_sensitive` (run alone at the
+  end), as is `read-line`; that lowers the odds without removing the race.
+- **Where the suite relies on timing.** `gc_pressure_driver` (5 cases: a polling thread must reach its
+  threshold before exit), `stw_collect_driver` (7) and `stw_selfhost_driver` (2: a timer must fire while the
+  interesting frames are live), and `stdin_delay_ms` (3: other fibers must print before a delayed feed).
+  Multi-carrier interleaving is intended nondeterminism for race hunting; outputs do not depend on it.
+- **Options for the driver cases.** (a) Fire on program progress, not wall time: after N allocated bytes or N
+  safepoint polls, through the real trigger protocol (as `gc_stress_bytes` already does). (b) A hand-off: at
+  the threshold the mutator signals the driver and waits at its next safepoint until the collection completes,
+  so the trigger-thread path runs exactly every time. (c) An exit hold until N collections ran, which can pass
+  while testing nothing (the frames are gone by exit). (d) Longer programs, which keeps the race. The trigger
+  protocol is [158](158-gc-packaging.md)'s scope.
+- **Options for the stdin cases.** (e) An event-driven feed: the harness writes stdin once stdout has shown a
+  given text (`stdin_after`). (f) Keep the delay.
+- **Harness support.** `timing_sensitive` as a temporary marker with a removal phase, and a full-tier
+  determinism check that runs every case several times under load and fails a case whose result changes.
+
 ## Non-goals
 
 - Not the collector packaging itself ([158](158-gc-packaging.md)) — this observes plans; 158 structures them.

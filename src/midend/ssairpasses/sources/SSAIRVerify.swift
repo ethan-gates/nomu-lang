@@ -35,17 +35,16 @@ import support
 //    live across a safepoint. Held by construction: Option B keeps mutable value aggregates in slots
 //    (§7.2), and the statepoint rewriter rejects a GC pointer nested in an FCA. A liveness-based check
 //    belongs with the transform that could introduce such a sink (inlining, 7.5).
-//  • I11 — a shaped value (`String`, task 176, shaped-roots.md Stage 2) live across a safepoint is
-//    recorded as a shaped root there. Codegen homes a shaped value and records it on the safepoint's
-//    statepoint iff the shaped liveness says it crosses an `isSafepointInst` site or is live at a loop
-//    header (the poll). The verifier recomputes that root set from the shared liveness and checks each
-//    member is a well-defined `String` value, so a transform that drops the definition of a live shaped
-//    root, or retypes it out of the shaped set while it still crosses a safepoint, is rejected. A value
-//    *aggregate* that transitively contains a `String` is rooted via its frame slot (task 176.3a): the
-//    second I11 check requires such an aggregate crossing a safepoint to be an address op (a `stackAlloc`
-//    slot, or a `fieldAddr`/`elementAddr` into one) — a first-class SSA aggregate has no record path, so it
-//    is flagged. The by-construction obligations the recording relies on — the `volatile` `word0` reload
-//    (I11a) and the slot zero-init (I11b, shaped-roots.md Stage 3b) — live in the egress, below SSAIR.
+//  • I11 — a shaped value (one with conditional content: a `String`, or a struct or enum holding one or a
+//    managed enum payload; task 176, shaped-roots.md Stage 2) live across a safepoint is recorded as a
+//    shaped root there. Codegen homes a shaped value and records it on the safepoint's statepoint iff the
+//    shaped liveness says it crosses an `isSafepointInst` site or is live at a loop header (the poll). The
+//    verifier recomputes that root set from the shared liveness and checks each member is a well-defined
+//    shaped value, so a transform that drops the definition of a live shaped root, or retypes it out of the
+//    shaped set while it still crosses a safepoint, is rejected. A shaped value in a frame slot is rooted
+//    through the slot (`recordedSlots`). The by-construction obligations the recording relies on — the
+//    volatile reload of conditional words (I11a) and the home and slot zero-init (I11b, shaped-roots.md
+//    Stage 3b) — live in the egress, below SSAIR.
 //
 // Returns a list of human-readable violations; empty means the module is well-formed.
 public func verifySSAIR(_ module: SSAModule) -> [String] {
@@ -202,79 +201,31 @@ private func verifyFunction(_ f: SSAFunction, _ shapes: ShapeEnv,
         }
     }
 
-    // I11 — the shaped-root set codegen will home and record is well-formed. The set is reconstructed from
-    // the shared shaped-value liveness the same way codegen derives it: the shaped values crossing each
-    // `isSafepointInst` site (the inst's own result excluded — it is new, so it does not cross) plus those
-    // live at a loop header (recorded by the header poll). Each member must be a defined `String` value, so a
+    // I11 — the shaped-root set codegen will home and record is well-formed. The set is the shared shaped
+    // liveness's, the same codegen homes and records: the shaped values crossing each `isSafepointInst` site
+    // (`crossingInst`) plus those live at a loop header (recorded by the header poll). A shaped value is one
+    // with conditional content — a `String`, or a struct or enum holding one or a managed enum payload — and
+    // codegen gives each crossing one a frame home. Each member must be a defined value of such a type, so a
     // transform that drops a live shaped root's definition or retypes it out of the shaped set while it still
-    // spans a safepoint is caught here with a GC-precision diagnostic (the shaped companion to I1/I3, as I5/I6
-    // specialize the escape analysis). A shaped value embedded in a *value aggregate* is rooted via the
-    // aggregate's frame slot (task 176.3a): the slot base + shape ordinal are recorded, so the collector
-    // reaches the shaped sub-field through the value-layout descriptor. The second check below enforces the
-    // precondition that makes that sound — a shaped-containing aggregate crossing a safepoint is a frame slot
-    // (an address op), never a first-class SSA value the record path cannot reach.
+    // spans a safepoint is caught here with a GC-precision diagnostic (the shaped companion to I1/I3, as
+    // I5/I6 specialize the escape analysis).
     let shaped = computeShapedLiveness(f, shapes)
     func checkShapedRoot(_ id: Int, _ site: String) {
         guard let t = typeOf[id] else {
             errs.append("[\(f.name)] I11: shaped root %\(id) spans a safepoint (\(site)) but is undefined")
             return
         }
-        if !shapes.isShapedValue(t) {
+        if !shapes.hasConditional(t) {
             errs.append("[\(f.name)] I11: shaped root %\(id) spanning a safepoint (\(site)) is \(t), not a shaped value")
         }
     }
     for blk in f.blocks {
-        for (i, inst) in blk.insts.enumerated() where isSafepointInst(inst.kind) {
-            var crossing = shaped.liveOutInst[blk.id]?[i] ?? []
-            if let r = inst.result { crossing.remove(r.id) }
-            for id in crossing.sorted() { checkShapedRoot(id, "bb\(blk.id) safepoint") }
+        for (_, c) in (shaped.crossingInst[blk.id] ?? [:]).sorted(by: { $0.key < $1.key }) {
+            for id in c.sorted() { checkShapedRoot(id, "bb\(blk.id) safepoint") }
         }
     }
     for h in loopHeaders(f).sorted() {
         for id in (shaped.liveInBlock[h] ?? []).sorted() { checkShapedRoot(id, "bb\(h) loop-header poll") }
-    }
-
-    // I11a (task 176.3a) — a value aggregate with conditional content (a shaped leaf, or an enum payload with
-    // managed words, which the statepoint rewrite cannot see as `i64` payload words), live across a safepoint,
-    // is rooted only if it is a frame slot whose base codegen records (a `stackAlloc`, or an interior
-    // `fieldAddr`/`elementAddr` into one). A shaped-containing aggregate crossing a safepoint as a first-class
-    // SSA value (a `makeStruct`/call/`extractField` result, say) has no record path and would leave its
-    // shaped buffer un-relocated — the same silent corruption the slot path fixes. Flag it, mirroring the
-    // bare-`String` check above over the aggregate liveness.
-    var addrOp = Set<Int>()
-    var aggTracked = Set<Int>()
-    for blk in f.blocks {
-        for inst in blk.insts {
-            guard let r = inst.result else { continue }
-            switch inst.kind {
-            case .stackAlloc, .fieldAddr, .elementAddr: addrOp.insert(r.id)
-            default: break
-            }
-            if !shapes.isShapedValue(r.type), shapes.hasConditional(r.type) { aggTracked.insert(r.id) }
-        }
-    }
-    for p in f.params {
-        if !shapes.isShapedValue(p.type), shapes.hasConditional(p.type) { aggTracked.insert(p.id) }
-    }
-    let agg = computeSlotLiveness(f, tracked: aggTracked)
-    func checkAggRoot(_ id: Int, _ site: String) {
-        guard let t = typeOf[id] else {
-            errs.append("[\(f.name)] I11: shaped-containing aggregate %\(id) spans a safepoint (\(site)) but is undefined")
-            return
-        }
-        if !addrOp.contains(id) {
-            errs.append("[\(f.name)] I11: shaped-containing aggregate %\(id) (\(t)) spans a safepoint (\(site)) as a first-class value; it must be a frame slot (address op) to be rooted")
-        }
-    }
-    for blk in f.blocks {
-        for (i, inst) in blk.insts.enumerated() where isSafepointInst(inst.kind) {
-            var crossing = agg.liveOutInst[blk.id]?[i] ?? []
-            if let r = inst.result { crossing.remove(r.id) }
-            for id in crossing.sorted() { checkAggRoot(id, "bb\(blk.id) safepoint") }
-        }
-    }
-    for h in loopHeaders(f).sorted() {
-        for id in (agg.liveInBlock[h] ?? []).sorted() { checkAggRoot(id, "bb\(h) loop-header poll") }
     }
 }
 

@@ -55,9 +55,27 @@ enum EgressConcurrency {
             // the box, which the self-hosted STW walk roots at fib+216 until the join; its pointer map scans a
             // managed result so that survives + is fixed up too. Result lives after the 8-byte header.
             let slots = 1 + g.e.slotCount(resultType)
-            let box = g.e.rtAllocManaged(LLVMConstInt(g.e.i64, UInt64(slots * 8), 0))
+            let bytes = LLVMConstInt(g.e.i64, UInt64(slots * 8), 0)!
+            let box: LLVMValueRef
+            var result = r
+            if g.e.shapes.hasConditional(resultType), let lt = g.ty(resultType, span) {
+                // A shaped result crosses the box's allocation in a recorded frame slot, as a home does: stored
+                // before, recorded in the allocation's deopt bundle, reloaded after. The thunk is built while
+                // `currentFn` is the spawning function, so it is this function's for the allocation.
+                let savedFn = g.e.currentFn, savedDeopt = g.e.pendingDeopt
+                g.e.currentFn = thunk
+                let home = g.e.entryAlloca(lt, "spawn.res.home")
+                LLVMBuildStore(g.b, r, home)
+                g.e.pendingDeopt = [LLVMConstInt(g.e.i32, UInt64(bitPattern: Int64(g.e.shapeOrdinal(resultType))), 0), home]
+                box = g.e.rtAllocManaged(bytes)
+                g.e.pendingDeopt = savedDeopt
+                g.e.currentFn = savedFn
+                result = g.loadReloading(home, resultType, lt)
+            } else {
+                box = g.e.rtAllocManaged(bytes)
+            }
             g.e.writeTypeIdHeaderRaw(box, g.e.spawnBoxTypeId(resultType))
-            g.e.storeField(box, g.e.gepByte(box, LLVMConstInt(g.e.i64, 8, 0)), r)
+            g.e.storeField(box, g.e.gepByte(box, LLVMConstInt(g.e.i64, 8, 0)), result, type: resultType)
             LLVMBuildRet(g.b, g.e.toUnmanaged(box))
         }
         let (spawn, sty) = g.e.runtimeFn("fiber_spawn", ret: g.e.i8ptr, params: [g.e.i8ptr, g.e.i8ptr], varArg: false)
@@ -77,7 +95,7 @@ enum EgressConcurrency {
         let box = g.e.buildCall(sj, sty, [handleSlot, LLVMConstInt(g.e.i64, final ? 1 : 0, 0)])!
         if let result = inst.result, let rt = g.ty(resultType, span) {
             let payload = g.e.gepByte(box, LLVMConstInt(g.e.i64, 8, 0))   // result after the 8-byte header (150.3.13)
-            g.values[result.id] = LLVMBuildLoad2(g.b, rt, payload, "spawn.res")
+            g.define(inst, LLVMBuildLoad2(g.b, rt, payload, "spawn.res"))
         }
     }
 }

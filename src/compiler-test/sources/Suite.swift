@@ -78,23 +78,51 @@ final class Suite {
         if selected.isEmpty { die("no cases selected") }
 
         cache.compileAll(selected, ctx: ctx, gate: gate, progress: progress)
-        guard runPhase(selected) else {
-            FileHandle.standardError.write(Data(
-                "error: suite deadline (\(fmt(ctx.deadline))) exceeded — a case cap failed to fire\n".utf8))
-            return 3
+        // Timing-sensitive cases run after the rest, one at a time, each taking the whole pool, so no other
+        // run competes with them for the host.
+        let pooled = selected.filter { !$0.timingSensitive }
+        let alone = selected.filter { $0.timingSensitive }
+        var rounds: [[CaseResult]] = []
+        for _ in 0..<ctx.repeatCount {
+            results = []
+            guard runPhase(pooled, weight: { max(1, $0.weight) }),
+                  runPhase(alone, weight: { _ in self.ctx.poolCapacity }) else {
+                FileHandle.standardError.write(Data(
+                    "error: suite deadline (\(fmt(ctx.deadline))) exceeded — a case cap failed to fire\n".utf8))
+                return 3
+            }
+            rounds.append(results)
         }
+        results = merge(rounds)
         writeBackOrder(ran: selected)
         return report()
+    }
+
+    // One result per case across `--repeat` rounds: the worst status, the detail of its first failure, the
+    // mean times, and the count of rounds it passed.
+    private func merge(_ rounds: [[CaseResult]]) -> [CaseResult] {
+        guard rounds.count > 1 else { return rounds.first ?? [] }
+        var byName: [String: [CaseResult]] = [:]
+        for round in rounds { for r in round { byName[r.name, default: []].append(r) } }
+        return byName.map { name, rs in
+            let failed = rs.first { $0.status != .pass }
+            let n = Double(rs.count)
+            return CaseResult(name: name, status: failed?.status ?? .pass,
+                              compileTime: rs[0].compileTime, runTime: rs.reduce(0) { $0 + $1.runTime } / n,
+                              detail: failed?.detail ?? [],
+                              passes: rs.filter { $0.status == .pass }.count, rounds: rs.count)
+        }
     }
 
     // Dispatch the run matrix across the pool (LPT-ordered admission). Each case occupies `weight` cores.
     // The acquire-before-dispatch discipline that keeps this from wedging lives once, in `WeightedGate.dispatch`.
     // Returns false if the suite-level deadline fires.
-    private func runPhase(_ selected: [ResolvedCase]) -> Bool {
+    private func runPhase(_ selected: [ResolvedCase], weight: @escaping (ResolvedCase) -> Int) -> Bool {
+        guard !selected.isEmpty else { return true }
         let runner = CaseRunner(ctx: ctx)
         progress.beginPhase("running", total: selected.count)
         let backstop = DispatchTime.now() + .milliseconds(Int(ctx.deadline * 1000))
-        let finished = gate.dispatch(selected, weight: { max(1, $0.weight) }, deadline: backstop) { c in
+        let finished = gate.dispatch(selected, weight: weight, deadline: backstop) { c in
             self.progress.start(c.name)
             let r = runner.run(c, compile: self.cache.result(for: c.compileKey))
             self.resultsLock.lock(); self.results.append(r); self.resultsLock.unlock()
@@ -110,11 +138,16 @@ final class Suite {
         return finished
     }
 
-    // Persist the longest-first order into the manifest — only on a full run (every manifest case ran),
-    // so a subset run reads the order but never rewrites it from partial data.
+    // Persist the longest-first order into the manifest — only when the selection is a whole tier, so a
+    // filtered run reads the order but never rewrites it from partial data. Cases the tier did not run (the
+    // `full` tier's extra legs, on a `fast` run) keep their earlier ranking, after the measured ones.
     private func writeBackOrder(ran selected: [ResolvedCase]) {
-        guard Set(selected.map { $0.name }) == Set(ctx.cases.map { $0.name }) else { return }
-        writeComputedOrder(computeOrder(results), to: ctx.configPath)
+        guard ctx.selectsWholeTier, ctx.repeatCount == 1 else { return }
+        let measured = computeOrder(results)
+        let ran = Set(measured)
+        let known = Set(ctx.cases.map { $0.name })
+        let rest = (ctx.manifest.computedOrder ?? []).filter { !ran.contains($0) && known.contains($0) }
+        writeComputedOrder(measured + rest, to: ctx.configPath)
     }
 
     private func report() -> Int32 {
@@ -125,8 +158,20 @@ final class Suite {
         let passed = results.filter { $0.status == .pass }.count
         let failed = results.filter { $0.status == .fail }.count
         let timedOut = results.filter { $0.status == .timeout }.count
+        let wall = Date().timeIntervalSince(start)
+        let slowest = results.sorted { $0.runTime > $1.runTime }.prefix(5)
         print("")
-        print("== \(passed) passed, \(failed) failed, \(timedOut) timed out in \(fmt(Date().timeIntervalSince(start))) ==")
+        print("slowest: " + slowest.map { "\($0.name) \(fmt($0.runTime))" }.joined(separator: ", "))
+        if ctx.repeatCount > 1 {
+            let flaky = results.filter { $0.passes > 0 && $0.passes < $0.rounds }
+            if !flaky.isEmpty {
+                print("flaky: " + flaky.map { "\($0.name) \($0.passes)/\($0.rounds)" }.joined(separator: ", "))
+            }
+        }
+        if ctx.selectsWholeTier, ctx.repeatCount == 1, wall > ctx.tier.budgetSec {
+            print("note: the \(ctx.tier.rawValue) tier took \(fmt(wall)), over its \(fmt(ctx.tier.budgetSec)) budget")
+        }
+        print("== \(passed) passed, \(failed) failed, \(timedOut) timed out in \(fmt(wall)) (tier \(ctx.tier.rawValue)) ==")
         return failed + timedOut == 0 ? 0 : 1
     }
 }

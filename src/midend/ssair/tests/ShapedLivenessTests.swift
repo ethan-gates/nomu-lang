@@ -112,4 +112,47 @@ final class ShapedLivenessTests: XCTestCase {
         let noSet = computeShapedLiveness(fn([bb0]))
         XCTAssertFalse(noSet.liveOutInst[0]![1].contains(s0.id), "with no wrapper set the value is not shaped (default base case)")
     }
+
+    private let pairEnv = ShapeEnv(structFields: { $0 == "Pair" ? [.stringBase, .int] : nil }, enumCases: { _ in nil })
+
+    // A multi-field struct holding a `String` is a shaped value too: a `makeStruct` result live across a call
+    // crosses it. A slot of the same type is an address and is not tracked (it is rooted as a recorded slot).
+    func testAggregateValueCrossesCallAndAddressDoesNot() {
+        let pair = Type.named("Pair", .struct_)
+        let p = v(0, pair), slot = v(1, pair)
+        let bb0 = SSABlock(id: 0, params: [], insts: [
+            SSAInst(result: p, kind: .makeStruct(pair, fields: [v(5, .stringBase), v(6, .int)]), span: sp),
+            SSAInst(result: slot, kind: .stackAlloc(pair), span: sp),
+            SSAInst(result: nil, kind: .call(call("sideEffect", [])), span: sp),       // inst 2: a safepoint
+            SSAInst(result: nil, kind: .call(call("use", [p, slot])), span: sp),
+        ], terminator: SSATerm(kind: .ret(nil), span: sp))
+        let live = computeShapedLiveness(fn([bb0]), pairEnv)
+        XCTAssertEqual(live.crossingInst[0]?[2], [p.id], "the aggregate value crosses; its slot address does not")
+    }
+
+    // An instruction that allocates and then stores its operands (an array literal) roots them at its own
+    // safepoint, though it is their last use.
+    func testStoredOperandCrossesItsOwnAllocation() {
+        let s0 = v(0, .stringBase), arr = v(1, .array(.stringBase))
+        let bb0 = SSABlock(id: 0, params: [], insts: [
+            SSAInst(result: s0, kind: .constString("hi"), span: sp),
+            SSAInst(result: arr, kind: .arrayLit(elements: [s0], elem: .stringBase), span: sp),   // inst 1
+        ], terminator: SSATerm(kind: .ret(nil), span: sp))
+        let live = computeShapedLiveness(fn([bb0]))
+        XCTAssertFalse(live.liveOutInst[0]![1].contains(s0.id), "s0 is dead after the literal")
+        XCTAssertEqual(live.crossingInst[0]?[1], [s0.id], "s0 is rooted at the literal's allocation")
+    }
+
+    // A mutating method's `self` is its caller's slot address, not a value.
+    func testMutatingSelfIsAnAddress() {
+        let pair = Type.named("Pair", .struct_)
+        let me = v(0, pair)
+        let bb0 = SSABlock(id: 0, params: [], insts: [
+            SSAInst(result: nil, kind: .call(call("sideEffect", [])), span: sp),
+            SSAInst(result: nil, kind: .call(call("use", [me])), span: sp),
+        ], terminator: SSATerm(kind: .ret(nil), span: sp))
+        let f = SSAFunction(name: "m:Pair:run", params: [me], returnType: .void, blocks: [bb0], isMutating: true, span: sp)
+        XCTAssertEqual(addressValues(f), [me.id])
+        XCTAssertEqual(computeShapedLiveness(f, pairEnv).crossingInst[0]?[0], [], "a by-pointer self is not homed")
+    }
 }

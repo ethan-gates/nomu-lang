@@ -163,8 +163,19 @@ extension LLVMGen {
         return withUnsafeMutablePointer(to: &idx) { LLVMBuildGEP2(b, i8, ptr, $0, 1, "aoff")! }
     }
 
-    // The C-ABI boundary cast (D1): a managed reference handed to a C `void*` is cast (1 → 0).
-    func toUnmanaged(_ v: LLVMValueRef) -> LLVMValueRef { LLVMBuildAddrSpaceCast(b, v, i8ptr, "to0")! }
+    // The C-ABI boundary cast (D1): a managed reference handed to a C `void*` is converted (1 → 0). The
+    // address goes through `pinnedAddress`, so the raw pointer is taken where it is used: a plain
+    // `addrspacecast` of a loop-invariant reference can be hoisted out of a loop with safepoints, and would
+    // then name where the object was before a collection moved it.
+    func toUnmanaged(_ v: LLVMValueRef) -> LLVMValueRef {
+        LLVMBuildIntToPtr(b, managedAddress(v), i8ptr, "to0")!
+    }
+
+    // The integer address of a pointer. A managed (`addrspace(1)`) pointer's address is pinned to its use
+    // (`pinnedAddress`); any other pointer converts directly.
+    func managedAddress(_ v: LLVMValueRef) -> LLVMValueRef {
+        LLVMGetPointerAddressSpace(LLVMTypeOf(v)) == 1 ? pinnedAddress(v) : LLVMBuildPtrToInt(b, v, i64, "addr")!
+    }
     // The reverse boundary cast: a runtime-held `void*` (addrspace 0) back to a managed `p1` — used
     // where a fiber's `env` re-enters managed code (the SSAIR spawn thunk, D1/D4).
     func toManaged(_ v: LLVMValueRef) -> LLVMValueRef { LLVMBuildAddrSpaceCast(b, v, p1, "to1")! }
@@ -517,9 +528,30 @@ extension LLVMGen {
     // path (barrier off / already-remembered) and an out-of-line slow path on first mutation.
     func nomuWriteBarrier() -> (LLVMValueRef, LLVMTypeRef) {
         if let g = barrierFn { return g }
-        let i8 = LLVMInt8TypeInContext(ctx)!
         let ty = fnType(voidTy, [p1, p1, p1])
         let fn = LLVMAddFunction(mod, "__nomu_write_barrier", ty)!
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        markGCLeaf(fn)
+        addAlwaysInline(fn)
+        let remember = nomuRememberBarrier()
+        withStubBody(fn) {
+            let obj = LLVMGetParam(fn, 0)!, slot = LLVMGetParam(fn, 1)!, val = LLVMGetParam(fn, 2)!
+            LLVMBuildStore(b, val, slot)   // *slot = val (barrier is post-store)
+            _ = buildCall(remember.0, remember.1, [obj])
+            LLVMBuildRetVoid(b)
+        }
+        barrierFn = (fn, ty)
+        return barrierFn!
+    }
+
+    // `__nomu_remember`: the barrier without its store, for a value stored as words rather than one `p1`
+    // (a `String`, or a struct or enum holding managed words). The barrier remembers the object, not the
+    // slot, so the caller's plain store followed by this is the same barrier.
+    func nomuRememberBarrier() -> (LLVMValueRef, LLVMTypeRef) {
+        if let g = rememberFn { return g }
+        let i8 = LLVMInt8TypeInContext(ctx)!
+        let ty = fnType(voidTy, [p1])
+        let fn = LLVMAddFunction(mod, "__nomu_remember", ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         markGCLeaf(fn)
         addAlwaysInline(fn)
@@ -532,8 +564,13 @@ extension LLVMGen {
         let gLo = LLVMGetNamedGlobal(mod, "__nomu_logbit_heap_lo") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_heap_lo")!
         let gHi = LLVMGetNamedGlobal(mod, "__nomu_logbit_heap_hi") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_heap_hi")!
         withStubBody(fn) {
-            let obj = LLVMGetParam(fn, 0)!, slot = LLVMGetParam(fn, 1)!, val = LLVMGetParam(fn, 2)!
-            LLVMBuildStore(b, val, slot)   // *slot = val (barrier is post-store)
+            // The object's address as an integer comes from a side-effecting inline asm (`pinnedAddress`). The
+            // barrier is inlined before the statepoint rewrite, where the object is one unchanging SSA value
+            // across a loop, so a plain `ptrtoint` (and the slow path's `addrspacecast`) would be hoisted out
+            // of the loop, and the rewrite cannot relocate an integer: the barrier would test where the object
+            // was before a collection moved it (task 176.5.8). The asm is neither hoisted nor merged, so the
+            // address is taken from the current, relocated pointer at every store.
+            let obj = LLVMGetParam(fn, 0)!
             let onBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.on")!
             let inRangeBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.inrange")!
             let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.slow")!
@@ -541,7 +578,7 @@ extension LLVMGen {
             let active = LLVMBuildLoad2(b, i8, gActive, "bar.active")
             LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, active, LLVMConstInt(i8, 0, 0), "bar.on?"), onBB, doneBB)
             LLVMPositionBuilderAtEnd(b, onBB)
-            let objInt = LLVMBuildPtrToInt(b, obj, i64, "obj.int")
+            let objInt = managedAddress(obj)
             // Heap-range guard: the log-bit table only covers [heap_lo, heap_hi), the Immix heap range, so a
             // store into an off-heap object (LOS / immortal) skips the barrier rather than indexing the table
             // out of bounds.
@@ -561,23 +598,62 @@ extension LLVMGen {
             let bit = LLVMBuildAnd(b, LLVMBuildLShr(b, byte, bitpos, "sh"), LLVMConstInt(i8, 1, 0), "bit")
             LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, bit, LLVMConstInt(i8, 0, 0), "unlogged"), slowBB, doneBB)
             LLVMPositionBuilderAtEnd(b, slowBB)
-            _ = buildCall(rtBarrier.0, rtBarrier.1, [toUnmanaged(obj), toUnmanaged(slot), toUnmanaged(val)])
+            let null = LLVMConstNull(i8ptr)!
+            _ = buildCall(rtBarrier.0, rtBarrier.1, [LLVMBuildIntToPtr(b, objInt, i8ptr, "obj.raw"), null, null])
             LLVMBuildBr(b, doneBB)
             LLVMPositionBuilderAtEnd(b, doneBB)
             LLVMBuildRetVoid(b)
         }
-        barrierFn = (fn, ty)
-        return barrierFn!
+        rememberFn = (fn, ty)
+        return rememberFn!
     }
 
-    // Store `val` into a field at `slot` of object `objBase`. A managed reference stored into a heap
-    // object goes through the write-barrier seam; everything else is a plain store.
-    func storeField(_ objBase: LLVMValueRef!, _ slot: LLVMValueRef!, _ val: LLVMValueRef!) {
-        if LLVMTypeOf(val) == p1, LLVMGetPointerAddressSpace(LLVMTypeOf(objBase)) == 1 {
+    // The integer address of managed pointer `p`, produced by a one-instruction side-effecting inline asm
+    // (a register move) rather than `ptrtoint`, so the optimizer can neither prove it loop-invariant nor
+    // merge it: it is computed where it is used, from the current (relocated) pointer. The host is the
+    // target, so the move is spelled for the host architecture.
+    func pinnedAddress(_ p: LLVMValueRef) -> LLVMValueRef {
+        let ty = fnType(i64, [p1])
+        #if arch(arm64)
+        let text = "mov $0, $1"
+        #else
+        let text = "mov $1, $0"
+        #endif
+        let constraints = "=r,r"
+        let asm = text.withCString { a in
+            constraints.withCString { c in
+                LLVMGetInlineAsm(ty, UnsafeMutablePointer(mutating: a), text.utf8.count,
+                                 UnsafeMutablePointer(mutating: c), constraints.utf8.count,
+                                 1, 0, LLVMInlineAsmDialectATT, 0)
+            }
+        }!
+        var args: [LLVMValueRef?] = [p]
+        let call = args.withUnsafeMutableBufferPointer {
+            LLVMBuildCall2(b, ty, asm, $0.baseAddress, 1, "bar.addr")!
+        }
+        // Never a safepoint: the statepoint rewrite must leave the asm a plain call.
+        let name = "gc-leaf-function"
+        LLVMAddCallSiteAttribute(call, funcAttrIndex, LLVMCreateStringAttribute(ctx, name, UInt32(name.utf8.count), "", 0))
+        return call
+    }
+
+    // Store `val` into a field at `slot` of object `objBase`. A store into a heap object goes through the
+    // write barrier when the value can hold a managed word: a managed reference (`p1`) takes the barrier
+    // seam, and an aggregate (a `String`, or a struct or enum value) is stored plainly and its object
+    // remembered. `type` refines the aggregate case: given, only a type with a non-empty shape is
+    // remembered; absent, every aggregate is. Everything else is a plain store.
+    func storeField(_ objBase: LLVMValueRef!, _ slot: LLVMValueRef!, _ val: LLVMValueRef!, type: Type? = nil) {
+        let heap = LLVMGetPointerAddressSpace(LLVMTypeOf(objBase)) == 1
+        if LLVMTypeOf(val) == p1, heap {
             let bar = nomuWriteBarrier()
             _ = buildCall(bar.0, bar.1, [objBase, slot, val])
-        } else {
-            LLVMBuildStore(b, val, slot)
+            return
         }
+        LLVMBuildStore(b, val, slot)
+        let kind = LLVMGetTypeKind(LLVMTypeOf(val))
+        guard heap, kind == LLVMStructTypeKind || kind == LLVMArrayTypeKind else { return }
+        if let t = type, shapes.shape(t).isEmpty { return }
+        let remember = nomuRememberBarrier()
+        _ = buildCall(remember.0, remember.1, [objBase])
     }
 }

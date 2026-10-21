@@ -1,7 +1,7 @@
 # Integration-suite harness (one entry, rich output, source-declared env, no script sprawl)
 
 **Avenue:** Infra · **Type/Lifecycle:** `tooling · observability` · **Size:** L ·
-**Status:** Phase 1 (MVP) built and green — `src/compiler-test/` Swift tool (`bazel build //src/compiler-test:compiler-test`),
+**Status:** Phase 3 (matrix, named settings, hermetic runs, tiers) built: `tests/suite.json` uses named settings throughout, the `shape` and `layout` groups expand to 450 full-tier runs, and the fast tier runs in about 40 s. Phase 1 (MVP) built and green — `src/compiler-test/` Swift tool (`bazel build //src/compiler-test:compiler-test`),
 `tests/suite.json` manifest, `tests/README.md`, `tools/README.md`. 68 cases cover ~42 retired `tools/*.sh`
 drivers (the run-and-check families: plan-differential golden, self-hosted GC oracle, scheduler/runtime stdout);
 full run 68/68 green in ~49s with a release compiler (~78s with a debug one; the old serial loop was ~273s for a
@@ -165,6 +165,54 @@ and matrix runs exist ad hoc. This task folds them into one harness.
 perf-regression baseline/gate, and live progress output (the pending/running/done status above). This is the
 harness the GC-benchmarking step (horizon "after GenImmix") and tasks 158/159 report through. (Tiering and a
 live `diff` mode fold in here only if the suite ever needs them.)
+
+**Phase 3 — the matrix, named settings, hermetic runs, tiers.** Built for [176](176-shaped-gc-roots.md)
+176.5.7 (the shape matrix in the suite), which needs pipelines and GC legs across a directory of fixtures.
+Retires `tests/fixtures/shape_matrix/run.sh`.
+- **Goals.** One binary per build configuration of a module; quick iteration (a run is long only when long
+  running is what it tests); one paved path (no side scripts); the matrix declared once, applied to groups;
+  settings declared in the manifest and nowhere else; every collecting leg proves it collected; stable names
+  for expanded runs, with selection by dimension; a one-command repro per failure; tiers with time budgets;
+  visible flakes.
+- **Named settings.** A case or dimension value sets named settings: compile settings (`optimize`, `inline`,
+  `escape`, `scalar`) and run settings (`gc_stress_bytes`, `nursery_blocks`, `mature_floor`, `gc_log`). One
+  table in the harness maps each name to its stage and to today's mechanism (an environment variable, or
+  `--release` for `optimize`). Raw `compile_env` / `run_env` are removed; a knob a case needs gets a table
+  entry. [198](198-compiler-flag-system.md) turns the table's targets into compiler flags and leaves the
+  manifest as it is.
+- **Dimensions.** A top-level `dimensions` block declares named axes once. Each value carries settings, a
+  collection requirement (`require_collections`: at least N collections logged, with `gc_log` implied) and a
+  tier. The first axes are `pipeline` (`debug`, `release`, `noinline`) and `gc` (`default`, `nursery`,
+  `stress-minor`, `stress-major`).
+- **Groups.** A group names fixtures by a directory glob, the axes it spans (`across`) and a default
+  expectation. It expands to one run per fixture and axis value, named `group/fixture/value/value` (for
+  example `shape/local_string/release/stress-major`). A fixture's own expected stdout sits beside its source
+  as `expected.txt` and wins over the group default; when these fixtures become `nomu test` tests (once Nomu
+  has an in-language test harness and reporting), the expectation is already beside them. Flat `cases` stay
+  as they are.
+- **One binary per configuration.** A configuration is a fixture plus its compile settings. The harness
+  compiles the configurations of one fixture one after another and copies each binary to
+  `build/compiler-test/<configuration>/<leaf>`; different fixtures still compile in parallel. 198 places
+  outputs by configuration in the driver, and the harness then compiles them in parallel again.
+- **Hermetic runs.** Compiles and runs start from `PATH`, `HOME` and `TMPDIR` plus the declared settings; any
+  `NOMU_*` variable in the caller's environment is dropped.
+- **Selection and repro.** `--enable` matches expanded names; `--where axis=value[,axis=value]` selects by
+  dimension. A failure prints its exact compile command and run command, with the configuration's binary.
+- **Tiers.** Each case and dimension value has a tier: `fast` (the default run) or `full` (`--tier full`).
+  `fast` is the debug pipeline with the `default`, `nursery` and `stress-minor` legs, budget about 60 s wall;
+  `full` adds `release`, `noinline` and `stress-major`, budget about 5 minutes. A run reports when it exceeds
+  its tier's budget and lists the slowest runs.
+- **Repetition by tier.** `full_iterations` gives a race-hunting case its full repetition count under
+  `--tier full`; the fast tier runs `iterations`. The long GC oracles (`gc-string`, `gc-string-field`,
+  `stw-collect`, `gc-pressure`, `module-generic-producer*` and the `-evac` legs) run 1–3 times in `fast` and
+  their earlier counts in `full`; `gc_stress`'s 10 s `sleep` is 100 ms. Fast tier 63 s → about 40 s.
+- **Flakes.** `timing_sensitive: true` runs a case alone at the end with the pool otherwise idle (`read-line`,
+  and the three `-self` heap-pressure cases, whose driver thread must fire twice before a 0.1 s program
+  exits).
+  No automatic retries; `--repeat N` runs the selection N times and reports each run's pass rate.
+- **Teeth.** `--compiler <path>` runs against another `nomu` build, so a matrix run against a pre-fix compiler
+  shows which runs catch the bug. The shape-matrix cases are shortened so each stress leg takes about a
+  second, and each keeps catching its bug under `--compiler` on a pre-fix build.
 
 ## Manifest schema (the config)
 

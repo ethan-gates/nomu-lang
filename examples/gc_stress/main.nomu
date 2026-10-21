@@ -30,7 +30,7 @@ fun main() {
     sum = sum + g.v
     i = i + 1
   }
-  sleep(10000)
+  sleep(100)                   // main parks with `inner` and `pair` live
   print(pair.a.v)              // 42 — interior ref relocated + field updated
   print("\n")
   print(pair.b.v)              // 7

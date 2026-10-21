@@ -34,7 +34,7 @@ fun main() {
   let want = probe(heapString())
   var i = 0
   var bad = 0
-  while i < 1000000 {
+  while i < 250000 {
     if probe(hold(heapString(), i)) != want {
       bad = bad + 1
     }

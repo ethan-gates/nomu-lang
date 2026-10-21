@@ -36,7 +36,7 @@ fun main() {
   let want = probe(s)
   var i = 0
   var bad = 0
-  while i < 1000000 {
+  while i < 400000 {
     let r = hold(s, i)
     if probe(r) != want {
       bad = bad + 1

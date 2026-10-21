@@ -220,6 +220,7 @@ final class LLVMGen {
     var gcAllocRootedFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // task 176 — `noinline` shaped-root alloc variant
     var selfhostAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // task 150 — self-hosted alloc slow path
     var barrierFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
+    var rememberFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var stopWorldGlobalCache: LLVMValueRef?
     var intFmt: LLVMValueRef?
     var uintFmt: LLVMValueRef?

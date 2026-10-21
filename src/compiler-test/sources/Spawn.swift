@@ -54,7 +54,16 @@ struct StdinFeed {
     var delayMs: Int
 }
 
-// Launch `path args…` with `env` overlaid on the current environment, capturing stdout and
+// The host variables every child gets: the tool search path (`cc`, `nm`), the home directory (the host
+// cache lives under it) and the temporary directory.
+let hermeticBase: [String: String] = {
+    let host = ProcessInfo.processInfo.environment
+    var base: [String: String] = [:]
+    for k in ["PATH", "HOME", "TMPDIR"] { if let v = host[k] { base[k] = v } }
+    return base
+}()
+
+// Launch `path args…` with `env` overlaid on the hermetic base environment, capturing stdout and
 // stderr, bounded by `timeout` seconds. stdin is /dev/null unless `stdin` supplies a feed.
 //
 // The child is made its own process-group leader (POSIX_SPAWN_SETPGROUP, pgroup 0). On timeout
@@ -105,8 +114,10 @@ func runProcess(path: String, args: [String], env: [String: String], timeout: Do
     #endif
     posix_spawnattr_setpgroup(&attr, 0)   // 0 → new group, gid == child pid
 
-    // Merge overrides onto the current environment; build a NULL-terminated char**.
-    var merged = ProcessInfo.processInfo.environment
+    // A hermetic environment: the few variables a compile or run needs from the host, plus the case's
+    // declared settings. Nothing else in the caller's environment (a stray `NOMU_*` in a developer's shell)
+    // reaches the child. Build a NULL-terminated char**.
+    var merged = hermeticBase
     for (k, v) in env { merged[k] = v }
     let argv: [UnsafeMutablePointer<CChar>?] = ([path] + args).map { strdup($0) } + [nil]
     let envp: [UnsafeMutablePointer<CChar>?] = merged.map { strdup("\($0.key)=\($0.value)") } + [nil]

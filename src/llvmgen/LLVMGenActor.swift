@@ -124,12 +124,13 @@ extension LLVMGen {
         return actorDrainFn!
     }
 
-    // Build + enqueue a handler message from the already-lowered receiver + argument values (M6 ·
-    // 6.4): allocate the message, stamp header/thunk/self/args, and hand it to `rt_actor_send`, which
-    // enqueues it and returns. Fire-and-forget — the only actor operation (§9) — so it yields no
-    // value. The egress lowers the receiver + arg exprs and calls in with the resulting values.
+    // Build + enqueue a handler message from the lowered receiver and argument values (M6 · 6.4): allocate
+    // the message, stamp header/thunk/self/args, and hand it to `rt_actor_send`, which enqueues it and
+    // returns. Fire-and-forget — the only actor operation (§9) — so it yields no value. `argVals` is called
+    // after the allocation: a shaped argument is read from its home then, so a collection at the allocation
+    // that moves its buffer is observed.
     func emitActorSend(_ actorName: String, _ handler: String, _ recvValue: LLVMValueRef,
-                       _ argVals: [LLVMValueRef], _ span: Span) -> LLVMValueRef? {
+                       _ argVals: () -> [LLVMValueRef], _ span: Span) -> LLVMValueRef? {
         guard let a = actorMap[actorName],
               let h = a.handlers.first(where: { $0.name == handler }) else {
             fail("8.2.6: unknown handler '\(actorName).\(handler)'", span); return nil
@@ -145,7 +146,7 @@ extension LLVMGen {
         writeTypeIdHeaderRaw(msg, messageTypeIdValue(actorName, h))
         LLVMBuildStore(b, thunk, structGEP(mt, msg, 2))         // thunk (code ptr, not managed)
         storeField(msg, structGEP(mt, msg, 3), recvValue)       // self (managed)
-        for (i, v) in argVals.enumerated() {
+        for (i, v) in argVals().enumerated() {
             storeField(msg, structGEP(mt, msg, msgArgIndex(i)), v)
         }
         let mailbox = LLVMBuildLoad2(b, p1, structGEP(at, recvValue, actorMailboxIndex(actorName)), "mailbox")!
