@@ -8,10 +8,6 @@ public struct WorkspaceIdentity: Hashable, Comparable, CustomStringConvertible {
     public static func < (a: Self, b: Self) -> Bool { (a.scope, a.name) < (b.scope, b.name) }
 }
 
-// The identity of a build with no `nomu.yaml` above its entry (a loose file or package). Such a build has
-// no pins, so nothing else can claim this identity.
-public let looseWorkspaceIdentity = WorkspaceIdentity(scope: "local", name: "main")
-
 // A workspace's `nomu.yaml`: its identity and its pins. Read with a minimal line reader until the manifest
 // moves to real YAML (task 163): top-level `key: value` lines, and an `externals:` block of indented
 // `<alias>: <path>` entries. `#` starts a comment line; a value may be double-quoted.

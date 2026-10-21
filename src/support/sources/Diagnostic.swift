@@ -39,7 +39,7 @@ public final class DiagnosticSink {
     public func render() -> String {
         diagnostics.map { d in
             let kind = d.severity == .error ? "error" : "warning"
-            return "\(d.span.file):\(d.span.begin.line):\(d.span.begin.col): \(kind): \(d.message)"
+            return "\(d.span.displayFile):\(d.span.begin.line):\(d.span.begin.col): \(kind): \(d.message)"
         }.joined(separator: "\n")
     }
 }

@@ -12,6 +12,17 @@ final class LexerTests: XCTestCase {
         return lexer.tokenize().map(\.kind)
     }
 
+    // A file's reported path (`displayName`) is what diagnostics print; its identity (`file`) is what spans
+    // compare.
+    func testDiagnosticsReportTheDisplayName() {
+        let diags = DiagnosticSink()
+        var lexer = Lexer("import café\n", file: "<nomu>/std/x/x.nomu", displayName: "/cache/source/std/x/x.nomu",
+                          diagnostics: diags)
+        let tokens = lexer.tokenize()
+        XCTAssertEqual(tokens.first?.span.file, "<nomu>/std/x/x.nomu")
+        XCTAssertTrue(diags.render().hasPrefix("/cache/source/std/x/x.nomu:1:11: error:"), diags.render())
+    }
+
     func testKeywords() {
         let kinds = lex("struct enum class actor fun let var on spawn switch case return if else")
         XCTAssertEqual(kinds, [

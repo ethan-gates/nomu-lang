@@ -17,7 +17,8 @@ public struct ModuleJob: Equatable {
     public let stem: String
     // Built with its white-box interface: some module in the build `test import`s it.
     public let whiteBox: Bool
-    // A module of the embedded `runtime` package (its functions are a runtime subset by membership).
+    // A module of the language workspace's `runtime` package: its functions are a runtime subset by
+    // membership.
     public let runtimeSubsetByMembership: Bool
     // Outputs live in the per-host cache (D4); a present entry means the job can be skipped.
     public let inHostCache: Bool
@@ -66,20 +67,22 @@ public struct PlanOptions {
     public var product: ModuleJob.Product = .binary
     // The per-host cache root (D4).
     public var cacheRoot: String = HostCache.root(environment: ProcessInfo.processInfo.environment)
-    // The compiler's identity for the embedded workspace's cache key: the git commit it was built from.
+    // The compiler's identity for the language workspace's cache key: the git commit it was built from.
     public var compilerIdentity = "unstamped"
-    // Every option that changes compiled output (e.g. `-O`), as it enters the embedded workspace's key.
+    // Every option that changes compiled output (e.g. `-O`), as it enters the language workspace's key.
     public var outputOptions: [String] = []
+    // The commands that build the runtime archive, as the driver runs them; they enter the archive's key.
+    public var runtimeRecipe: [[String]] = []
     public init() {}
 }
 
 extension Plan {
     // Plan a build from a resolved module table.
     // Plan a build entered at `entryFiles` (one module's files), reading from `disk`. A binary build includes
-    // the embedded `nomu` workspace.
+    // the language workspace.
     public init(entryFiles: [String], options: PlanOptions = PlanOptions(), disk: SourceTree = DiskTree()) {
         let workspaces = WorkspaceSet(entry: entryFiles.first ?? ".", disk: disk,
-                                      includeEmbedded: options.product == .binary)
+                                      includeLanguageWorkspace: options.product == .binary)
         self.init(modules: ModuleTable(workspaces: workspaces, entryFiles: entryFiles, options: options),
                   workspaces: workspaces, options: options)
     }
@@ -104,12 +107,12 @@ extension Plan {
         guard diagnostics.isEmpty else { return ([], nil, nil, diagnostics) }
 
         let root = workspaces.root
-        let embeddedDir = settings.cacheRoot + "/nomu/"
-            + HostCache.embeddedWorkspaceKey(compilerIdentity: settings.compilerIdentity,
+        let languageDir = settings.cacheRoot + "/nomu/"
+            + HostCache.languageWorkspaceKey(compilerIdentity: settings.compilerIdentity,
                                              outputOptions: settings.outputOptions)
         func outputDir(_ key: ModuleKey) -> String {
             let base: String
-            if key.workspace == EmbeddedWorkspace.identity { base = embeddedDir }
+            if key.workspace == LanguageWorkspace.identity { base = languageDir }
             else if key.workspace == root.identity { base = root.root + "/build" }
             else { base = root.root + "/build/_external/\(key.workspace)" }
             return key.path.isEmpty ? base : base + "/" + key.path.joined(separator: "/")
@@ -129,21 +132,24 @@ extension Plan {
             let m = table.modules[key]!
             var deps: [ModuleKey] = []
             for imp in m.imports where !deps.contains(imp.target) { deps.append(imp.target) }
-            let isEmbedded = key.workspace == EmbeddedWorkspace.identity
+            let isLanguageWorkspace = key.workspace == LanguageWorkspace.identity
             jobs.append(ModuleJob(
                 module: key, files: m.files, dependencies: deps,
                 visibleDependencies: closure[key]!.sorted { position[$0]! < position[$1]! },
                 product: key == table.entry ? settings.product : .library,
-                outputDir: outputDir(key), stem: key.path.last ?? key.workspace.name,
+                // A module is named by its last path component. Every module has one: packages, and so modules,
+                // live below their workspace's root (resolution rejects a module at the root).
+                outputDir: outputDir(key), stem: key.path.last!,
                 whiteBox: table.testImportTargets.contains(key),
-                runtimeSubsetByMembership: isEmbedded && m.package.name == "runtime",
-                inHostCache: isEmbedded))
+                runtimeSubsetByMembership: isLanguageWorkspace && m.package.name == "runtime",
+                inHostCache: isLanguageWorkspace))
         }
 
         var archive: RuntimeArchiveJob? = nil
         var link: LinkJob? = nil
         if settings.product == .binary {
-            let a = RuntimeArchiveJob(outputDir: settings.cacheRoot + "/runtime/" + HostCache.runtimeArchiveKey)
+            let a = RuntimeArchiveJob(outputDir: settings.cacheRoot + "/runtime/"
+                                  + HostCache.runtimeArchiveKey(recipe: settings.runtimeRecipe))
             let entry = jobs.last { $0.module == table.entry }!
             archive = a
             link = LinkJob(objects: jobs.map(\.object), runtimeArchive: a.archive, output: entry.binary)

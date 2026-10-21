@@ -37,6 +37,11 @@ wanted. Settle the pinning + safepoint-transition model before the surface is bu
 FFI enters only under [self-hosting](128-self-hosting-runtime.md) (pure-Nomu I/O calling libc) or for
 user bindings.
 
+**C modules (later, low priority).** A user-facing way to designate a module as a C module, built only
+from C source files. The language itself should not depend on it: the C floor (`runtime.c`, `core.c`)
+moves to Nomu, assembly or LLVM rather than becoming the first C module. Designed with this task's
+binding surface.
+
 ## Roadmap assessment
 
 **Yes — promote from "Ongoing" to a first-class design question.** All three heads; the moving

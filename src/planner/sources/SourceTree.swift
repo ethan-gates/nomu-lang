@@ -6,7 +6,7 @@ import Glibc
 import scanner
 
 // Where a workspace's files come from (task 190, D5). The planner reads only through this interface, so an
-// on-disk workspace and the compiler's embedded `nomu` workspace are planned the same way and nothing is
+// on-disk workspace and the compiler's language workspace are planned the same way and nothing is
 // written to disk to plan a build. Paths are absolute `/`-separated strings within the tree.
 public protocol SourceTree: AnyObject {
     // A directory's entries, sorted by name; nil when `path` is not a readable directory.
@@ -123,7 +123,7 @@ private func posixRead(_ fd: Int32, _ buf: UnsafeMutableRawPointer, _ count: Int
 }
 
 // A tree held in memory: a map from file path to contents, with directories implied by the paths. Backs the
-// embedded `nomu` workspace, and tests.
+// language workspace, and tests.
 public final class MemoryTree: SourceTree {
     private var files: [String: [UInt8]] = [:]
     private var dirs: [String: Set<String>] = [:]          // directory → child names

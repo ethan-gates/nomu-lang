@@ -55,8 +55,8 @@ public struct PlannedModule {
 // scanned once. All errors are collected in `diagnostics` (the workspace set's own come first).
 public struct ModuleTable {
     public let entry: ModuleKey
-    // Modules the build needs without any import naming them: the embedded `runtime` package, whose
-    // functions `std` and generated code call by their bare names. Planned before the entry.
+    // Modules the build needs without any import naming them: the language workspace's `runtime` package,
+    // whose functions `std` and generated code call by their bare names. Planned before the entry.
     public private(set) var implicitRoots: [ModuleKey] = []
     public private(set) var modules: [ModuleKey: PlannedModule] = [:]
     // Modules in the order resolution reached them (the entry first).
@@ -66,6 +66,11 @@ public struct ModuleTable {
     public private(set) var diagnostics: [PlanDiagnostic] = []
 
     public init(workspaces: WorkspaceSet, entryFiles: [String], options: PlanOptions = PlanOptions()) {
+        guard !workspaces.missingWorkspace else {
+            entry = ModuleKey(workspaces.root.identity, [])
+            diagnostics = workspaces.diagnostics
+            return
+        }
         var r = Resolver(workspaces: workspaces, options: options)
         entry = workspaces.clock.measure(.resolve) { r.run(entryFiles: entryFiles) }
         implicitRoots = r.implicitRoots
@@ -121,12 +126,25 @@ private struct Resolver {
         let rawDir = given.pathParent
         let dir = ws.tree.canonical(rawDir) ?? rawDir
         let files = entryFiles.map { dir + "/" + $0.pathLastComponent }
-        let pkgRoot = packageRoot(containing: dir, in: ws)
         let key = ModuleKey(ws.identity, relativePath(dir, in: ws) ?? [])
+        // Every module is in a package (modules.md §Manifest): a `pkg.json` at or above it, within its workspace,
+        // and never at the workspace root.
+        if workspaces.hasRootPackage(ws) { return key }
+        if dir == ws.root {
+            diagnostics.append(PlanDiagnostic("module '\(dir)' sits at the root of workspace '\(ws.identity)' — "
+                                              + "modules live in packages, in subdirectories of the workspace"))
+            return key
+        }
+        guard let pkgRoot = packageRoot(containing: dir, in: ws) else {
+            diagnostics.append(PlanDiagnostic("module '\(dir)' is in no package — a module needs a pkg.json "
+                                              + "declaring its package's 'name', at or above it within workspace "
+                                              + "'\(ws.identity)'"))
+            return key
+        }
         add(key, dir: dir, files: files, package: package(at: pkgRoot, in: ws))
-        if let embedded = workspaces.byIdentity[EmbeddedWorkspace.identity],
-           case .success(let rt) = inPackage("runtime", path: [], of: embedded, external: true) {
-            if modules[rt.key] == nil { add(rt.key, dir: rt.dir, files: embedded.moduleFiles(rt.dir), package: (rt.package, rt.deps)) }
+        if let language = workspaces.byIdentity[LanguageWorkspace.identity],
+           case .success(let rt) = inPackage("runtime", path: [], of: language, external: true) {
+            if modules[rt.key] == nil { add(rt.key, dir: rt.dir, files: language.moduleFiles(rt.dir), package: (rt.package, rt.deps)) }
             implicitRoots = [rt.key]
         }
         while !queue.isEmpty { resolveImports(of: queue.removeFirst()) }
@@ -156,9 +174,9 @@ private struct Resolver {
             for e in scanned.errors {
                 diagnostics.append(PlanDiagnostic(file: file, line: e.location.line, column: e.location.column, e.message))
             }
-            // The implicit `import std` (modules.md §Imports): every file outside the embedded workspace imports
-            // `std`'s default module, unless it names `std` bare itself.
-            if !ws.isEmbedded, workspaces.byIdentity[EmbeddedWorkspace.identity] != nil,
+            // The implicit `import std` (modules.md §Imports): every file outside the language workspace
+            // imports `std`'s default module, unless it names `std` bare itself.
+            if !ws.isLanguageWorkspace, workspaces.byIdentity[LanguageWorkspace.identity] != nil,
                !scanned.imports.contains(where: { $0.root == .package("std") && $0.path.isEmpty }) {
                 if let r = resolve(ImportRequest(implicitStd: ()), from: m, in: ws, file: file) { m.imports.append(r) }
             }
@@ -222,20 +240,19 @@ private struct Resolver {
             return found(dir: dir, in: ws, package: m.package, deps: m.declaredDeps)
 
         case .package(let name):
-            let embedded = workspaces.byIdentity[EmbeddedWorkspace.identity]
-            // `std` is the embedded standard library: it needs no `dependencies` entry, and a user package
-            // may not take the name.
-            if name == "std", !ws.isEmbedded {
-                guard let embedded else { return .failure(Message("this build has no standard library")) }
-                return inPackage("std", path: imp.path, of: embedded, external: true)
+            let language = workspaces.byIdentity[LanguageWorkspace.identity]
+            // `std` is the language workspace's standard library: it needs no `dependencies` entry, and a user
+            // package may not take the name.
+            if name == "std", !ws.isLanguageWorkspace {
+                guard let language else { return .failure(Message("this build has no standard library")) }
+                return inPackage("std", path: imp.path, of: language, external: true)
             }
-            // `core` is importable only from `std` (modules.md §Imports). A package that lists `core` in its
-            // `dependencies` names its workspace's own `core` package, resolved below like any other.
-            if name == "core", !ws.isEmbedded, !m.declaredDeps.contains("core"), let embedded {
-                guard options.allowCoreImport else {
-                    return .failure(Message("package 'core' is internal to the standard library — use 'std' instead"))
-                }
-                return inPackage("core", path: imp.path, of: embedded, external: true)
+            // The language workspace's `core` is importable only from `std` (modules.md §Imports): to a user
+            // workspace it does not exist, so `core` resolves below like any other package name and no
+            // diagnostic names the language workspace's. The hidden `--allow-core-import` lets suite fixtures
+            // reach it when the importing package lists no `core` of its own.
+            if name == "core", !ws.isLanguageWorkspace, options.allowCoreImport, !m.declaredDeps.contains("core"), let language {
+                return inPackage("core", path: imp.path, of: language, external: true)
             }
             // A pin alias names another workspace explicitly: `import <alias>/<package>[/<module>]`.
             if let pinned = ws.pins[name], let other = workspaces.byIdentity[pinned] {
@@ -299,26 +316,26 @@ private struct Resolver {
 
     // MARK: - Packages and paths
 
-    // The package root holding `dir`: its nearest ancestor (within the workspace) with a `pkg.json`, else the
-    // workspace root.
-    func packageRoot(containing dir: String, in ws: Workspace) -> String {
+    // The package root holding `dir`: its nearest ancestor below the workspace root with a `pkg.json`; nil when
+    // there is none.
+    func packageRoot(containing dir: String, in ws: Workspace) -> String? {
         var d = dir
-        while d.count >= ws.root.count {
+        while d.count > ws.root.count {
             if ws.tree.kind(of: d + "/pkg.json") == .file { return d }
-            if d == ws.root { break }
             d = d.pathParent
         }
-        return ws.root
+        return nil
     }
 
-    // The entry's package and its dependencies; a root with no manifest is the default package. Other packages
-    // come from the package walk, which checks their names; the entry's is checked here.
+    // The entry's package and its dependencies. Other packages come from the package walk, which checks their
+    // names; the entry's is checked here. An unreadable manifest is already reported; its package gets an empty
+    // name.
     mutating func package(at root: String, in ws: Workspace) -> (PackageRef, [String]) {
         let m = workspaces.manifest(in: ws, packageRoot: root)
-        if let m, !ws.isEmbedded, reservedPackageNames.contains(m.name) {
-            diagnostics.append(PlanDiagnostic(file: root + "/pkg.json", reservedPackageNameError(m.name, at: root)))
+        if let m, !ws.isLanguageWorkspace, let problem = packageNameProblem(m.name, at: root) {
+            diagnostics.append(PlanDiagnostic(file: root + "/pkg.json", problem))
         }
-        return (PackageRef(workspace: ws.identity, name: m?.name ?? defaultPackageName, root: root), m?.dependencies ?? [])
+        return (PackageRef(workspace: ws.identity, name: m?.name ?? "", root: root), m?.dependencies ?? [])
     }
 
     func relativePath(_ dir: String, in ws: Workspace) -> [String]? {

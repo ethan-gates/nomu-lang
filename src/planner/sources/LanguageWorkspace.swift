@@ -1,6 +1,6 @@
 import embedded
 
-// The embedded `nomu` workspace (task 174): the language's own Nomu sources, carried in the compiler binary.
+// The language workspace (task 174): the language's own Nomu sources, carried in the compiler binary.
 // The planner reads it as an in-memory tree with the same layout an on-disk workspace has (a `nomu.yaml`,
 // one `pkg.json` per package), so it is planned like any other workspace.
 //
@@ -8,7 +8,7 @@ import embedded
 // a multi-module package (one leaf directory per module) whose `default-module` is `prelude`, the module the
 // implicit `import std` names. Every module is a product, and `std` lists `core` in its `dependencies`
 // (only `std` may import `core`).
-public enum EmbeddedWorkspace {
+public enum LanguageWorkspace {
     public static let identity = WorkspaceIdentity(scope: "nomu", name: "nomu")
     // The tree's root. Never a real directory: the tree serves every path under it from memory.
     public static let root = "<nomu>"

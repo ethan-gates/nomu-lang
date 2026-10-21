@@ -32,7 +32,7 @@ job nomu.nomu:std/time
   import time.nomu:3:1 pkg/prelude → nomu.nomu:std/prelude
   sees nomu.nomu:std/prelude
 job nomu.nomu_lang:tests/fixtures/std_module_import
-  package main at @nomu.nomu_lang
+  package std_module_import at @nomu.nomu_lang/tests/fixtures/std_module_import
   files main.nomu
   binary
   out @nomu.nomu_lang/build/tests/fixtures/std_module_import/std_module_import

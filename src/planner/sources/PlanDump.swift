@@ -1,6 +1,6 @@
 // A plan as text (190.5.1): one block per job, one line per fact, in plan order, so a test compares a whole
 // plan against a checked-in golden file and a reviewer reads its diff. Paths are machine-independent: a
-// workspace's files render under `@<scope>.<name>` (the embedded workspace's under `@nomu.nomu`), the host
+// workspace's files render under `@<scope>.<name>` (the language workspace's under `@nomu.nomu`), the host
 // cache's under `$cache`, and cache keys as `<key>`, so a golden holds on any machine and across compiler
 // changes.
 //

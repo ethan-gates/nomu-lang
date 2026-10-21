@@ -52,13 +52,14 @@ public struct EmitOptions: Codable {
     // The dial in force, resolving the nil default against the optimization level (debug=none, release=all).
     public var effectiveMono: MonoMode { mono ?? (optimize ? .all : .none) }
 
-    // Compiler-internal (task 174): the job compiles a module of the embedded `nomu` workspace (`core`/
+    // Compiler-internal (task 174): the job compiles a module of the language workspace (`core`/
     // `runtime`/`std`), not user code. Its symbols link strong (no weak origin, except the `runtime`
     // package's own bare weak-ODR set), and no white-box runtime prelude is prepended.
     public var compilingPrelude = false
-    // Test-suite only (hidden `--allow-core-import`): let user code `import core`. The embedded `core` package
-    // is otherwise importable only from `std` (modules.md §Imports — `std` is the gateway to the embedded
-    // library); fixtures that exercise `core`'s compiler-backed types directly lift that gate with this.
+    // Test-suite only (hidden `--allow-core-import`): let user code `import core`. The language workspace's
+    // `core` package is otherwise importable only from `std` (modules.md §Imports — `std` is the gateway to
+    // the language workspace); fixtures that exercise `core`'s compiler-backed types directly lift that gate
+    // with this.
     public var allowCoreImport = false
     // Hidden `--emit-jobs`: write each job's file (`<unit>/<stem>.job.json`, the `nomu compile` input) beside
     // its outputs.

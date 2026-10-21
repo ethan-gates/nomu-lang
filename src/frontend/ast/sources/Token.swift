@@ -62,6 +62,37 @@ public struct Token {
     }
 }
 
+extension TokenKind {
+    // The source spelling of a keyword (`true`/`false` included, which lex as literals), or nil.
+    public var keywordSpelling: String? {
+        switch self {
+        case .kwStruct: return "struct"
+        case .kwEnum: return "enum"
+        case .kwClass: return "class"
+        case .kwActor: return "actor"
+        case .kwInterface: return "interface"
+        case .kwExtension: return "extension"
+        case .kwFunc: return "fun"
+        case .kwLet: return "let"
+        case .kwVar: return "var"
+        case .kwStatic: return "static"
+        case .kwOn: return "on"
+        case .kwSpawn: return "spawn"
+        case .kwSwitch: return "switch"
+        case .kwCase: return "case"
+        case .kwReturn: return "return"
+        case .kwIf: return "if"
+        case .kwElse: return "else"
+        case .kwIn: return "in"
+        case .kwWhile: return "while"
+        case .kwBreak: return "break"
+        case .kwContinue: return "continue"
+        case .boolLit(let b): return b ? "true" : "false"
+        default: return nil
+        }
+    }
+}
+
 extension Token: CustomStringConvertible {
     public var description: String { "\(span.begin.line): \(kind)" }
 }

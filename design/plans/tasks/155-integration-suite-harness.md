@@ -178,8 +178,8 @@ Retires `tests/fixtures/shape_matrix/run.sh`.
   `escape`, `scalar`) and run settings (`gc_stress_bytes`, `nursery_blocks`, `mature_floor`, `gc_log`). One
   table in the harness maps each name to its stage and to today's mechanism (an environment variable, or
   `--release` for `optimize`). Raw `compile_env` / `run_env` are removed; a knob a case needs gets a table
-  entry. [198](198-compiler-flag-system.md) turns the table's targets into compiler flags and leaves the
-  manifest as it is.
+  entry. [198](198-build-configuration.md) turns the table's targets into settings of the build
+  configuration and leaves the manifest as it is.
 - **Dimensions.** A top-level `dimensions` block declares named axes once. Each value carries settings, a
   collection requirement (`require_collections`: at least N collections logged, with `gc_log` implied) and a
   tier. The first axes are `pipeline` (`debug`, `release`, `noinline`) and `gc` (`default`, `nursery`,

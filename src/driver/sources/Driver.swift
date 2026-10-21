@@ -46,6 +46,7 @@ public func build(paths: [String], options: EmitOptions = EmitOptions()) -> Buil
     var planOptions = PlanOptions()
     planOptions.allowCoreImport = options.allowCoreImport
     planOptions.compilerIdentity = BuildInfo.gitCommit
+    planOptions.runtimeRecipe = runtimeArchiveRecipe
     let plan = Plan(entryFiles: paths, options: planOptions)
     for step in PlanTimings.Step.allCases {
         timings.record(phase: "plan", name: step.rawValue, seconds: plan.timings.seconds[step] ?? 0)
@@ -62,7 +63,7 @@ public func build(paths: [String], options: EmitOptions = EmitOptions()) -> Buil
     }
     let table = plan.modules
     guard let entryJob = plan.jobs.first(where: { $0.module == table.entry }) else { return result }
-    timings.package = table.modules[table.entry]?.package.name ?? defaultPackageName
+    timings.package = table.modules[table.entry]?.package.name ?? ""
     timings.file = plan.jobs.count == 1 ? primary : "\(plan.jobs.count) modules"
 
     let stem = entryJob.binary
@@ -99,6 +100,10 @@ public func build(paths: [String], options: EmitOptions = EmitOptions()) -> Buil
         return "\(p.workspace)|\(p.root)"
     }
     let jobByKey = Dictionary(uniqueKeysWithValues: plan.jobs.map { ($0.module, $0) })
+    // The language workspace's sources on disk, for reporting (diagnostics, debug info): kept current
+    // whenever a build uses that workspace, compiled or cached.
+    let sourceCopy = plan.jobs.contains(where: \.inHostCache)
+        ? timings.measure("plan", "source copy") { LanguageSourceCopy.ensure(cacheRoot: plan.cacheRoot) } : nil
     var objects: [String] = []
     for j in plan.jobs {
         let m = table.modules[j.module]!
@@ -130,13 +135,14 @@ public func build(paths: [String], options: EmitOptions = EmitOptions()) -> Buil
         }
         let outputs = CompileJob.Outputs(object: staged(j.object), interface: staged(j.interface), bir: staged(j.bir),
                                          debugStem: isEntry ? stem : nil)
-        let job = CompileJob(origin: origin(j.module), files: j.files, packageName: m.package.name,
+        var job = CompileJob(origin: origin(j.module), files: j.files, packageName: m.package.name,
                              packageKey: packageKey(j.module), isProduct: m.isProduct, imports: imports,
                              dependencies: dependencies, product: j.product == .binary ? .binary : .library,
                              whiteBox: j.whiteBox, runtimeSubsetByMembership: j.runtimeSubsetByMembership,
                              outputs: outputs)
+        if j.inHostCache, let sourceCopy { job.reportedPaths = LanguageSourceCopy.reportedPaths(j.files, copy: sourceCopy) }
         // The building workspace's modules take the build's options; another workspace's modules, and the
-        // embedded workspace's, compile with the defaults.
+        // language workspace's, compile with the defaults.
         var jobOptions = EmitOptions()
         if j.module.workspace == table.entry.workspace { jobOptions = options }
         jobOptions.compilingPrelude = j.inHostCache
@@ -189,14 +195,19 @@ public struct ResolvedModule {
     public let id: ModuleID         // the module's identity, package-root-relative
 }
 
-// Resolve a target directory to a single module, or nil (with a diagnostic) if it is not a directory, names
-// a container package with no `default-module`, or holds no `.nomu` source.
+// Resolve a target directory to a single module, or nil (with a diagnostic) if it is not a directory, lies in
+// no workspace (no `nomu.yaml` at or above it; modules.md §Manifest), names a container package with no
+// `default-module`, or holds no `.nomu` source.
 public func resolveModule(path rawPath: String) -> ResolvedModule? {
     let fm = FileManager.default
     let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
     var isDir: ObjCBool = false
     guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
         fputs("error: target '\(rawPath)' is not a directory\n", stderr)
+        return nil
+    }
+    guard WorkspaceSet.workspaceRoot(above: path) != nil else {
+        fputs("error: \(WorkspaceSet.missingWorkspaceMessage(path))\n", stderr)
         return nil
     }
 
@@ -323,7 +334,7 @@ private func testModuleID(_ rel: String) -> ModuleID {
 public func queryPackage(target rawPath: String) -> Bool {
     guard let entry = resolveModule(path: rawPath) else { return false }
     let files = scanModuleFiles(entry.dir)
-    let workspaces = WorkspaceSet(entry: files.first ?? entry.dir, includeEmbedded: true)
+    let workspaces = WorkspaceSet(entry: files.first ?? entry.dir, includeLanguageWorkspace: true)
     let table = ModuleTable(workspaces: workspaces, entryFiles: files)
     for d in table.diagnostics { fputs(d.description + "\n", stderr) }
 
@@ -340,7 +351,7 @@ public func queryPackage(target rawPath: String) -> Bool {
         }
     }
     let entryModule = table.modules[table.entry]
-    let out = QueryOutput(package: entryModule?.package.name ?? defaultPackageName,
+    let out = QueryOutput(package: entryModule?.package.name ?? "",
                           root: entryModule?.package.root ?? entry.packageRoot, entry: pathOf(table.entry),
                           modules: local.map(pathOf),
                           dependencies: edges.sorted { $0.lexicographicallyPrecedes($1) }.map { QueryDep(from: $0[0], to: $0[1]) },
@@ -358,7 +369,7 @@ public func queryPackage(target rawPath: String) -> Bool {
 // The `nomu query` JSON shape (task 173.6). Deterministic: modules + edges are emitted in sorted order and
 // keys are sorted, so the output is stable for tooling and golden comparison.
 private struct QueryOutput: Codable {
-    let package: String        // the package identity (manifest `name`, or the default)
+    let package: String        // the package identity (manifest `name`)
     let root: String           // the package root directory (nearest `pkg.json` ancestor)
     let entry: String          // the queried module's path ("" = the root module)
     let modules: [String]      // every module of the entry's workspace reachable from the entry
@@ -722,8 +733,8 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Strin
 // per-file `cc` co-compile. Returns the archive path, or nil on failure (message on stderr).
 // The runtime `.a` is identical across programs (the C floor is embedded in nomuc), so it lives in the
 // per-host cache at the path the plan gives (D4), under a key over the embedded runtime sources, the host
-// architecture and a recipe version (`HostCache.runtimeArchiveKey`): editing the runtime rebuilds the
-// compiler, which changes the key. A present archive is reused.
+// architecture and `runtimeArchiveRecipe` (`HostCache.runtimeArchiveKey`): editing the runtime rebuilds the
+// compiler, which changes the key, and so does editing a command. A present archive is reused.
 private func cachedRuntimeArchive(at cached: String) -> String? {
     let fm = FileManager.default
     let dir = (cached as NSString).deletingLastPathComponent
@@ -745,39 +756,39 @@ private func cachedRuntimeArchive(at cached: String) -> String? {
     return cached
 }
 
-private func buildRuntimeArchive(inDir dir: String) -> String? {
-    let runtimeO = dir + "/runtime.o"
-    let coreO = dir + "/core.o"
-    let archive = dir + "/libnomuruntime.a"
-    if runProcess("/usr/bin/cc", ["-w", "-I", dir, "-c", dir + "/runtime.c", "-o", runtimeO]) != 0 {
-        fputs("error: failed to compile runtime.c\n", stderr); return nil
-    }
-    if runProcess("/usr/bin/cc", ["-w", "-I", dir, "-c", dir + "/core.c", "-o", coreO]) != 0 {
-        fputs("error: failed to compile core.c\n", stderr); return nil
-    }
-    var members = [runtimeO, coreO]
+// The commands that build the runtime archive, run in order in a directory holding the runtime sources
+// (`writeRuntimeSources`). The plan hashes them into the archive's key, so changing one rebuilds the archive.
+let runtimeArchiveRecipe: [[String]] = {
+    var commands = [["/usr/bin/cc", "-w", "-I", ".", "-c", "runtime.c", "-o", "runtime.o"],
+                    ["/usr/bin/cc", "-w", "-I", ".", "-c", "core.c", "-o", "core.o"]]
+    var members = ["runtime.o", "core.o"]
     // The asm floor (task 128.2): assemble the per-arch `.s` (clang assembles `.s` directly) and archive
     // it beside the C objects, so its symbols (rtSwitch, rtFiberInit) resolve in every emitted binary.
     if HostCache.hostArch == "arm64" {
-        let asmO = dir + "/rtasm.o"
-        if runProcess("/usr/bin/cc", ["-c", dir + "/rtasm.s", "-o", asmO]) != 0 {
-            fputs("error: failed to assemble rtasm.s\n", stderr); return nil
+        commands.append(["/usr/bin/cc", "-c", "rtasm.s", "-o", "rtasm.o"])
+        members.append("rtasm.o")
+    }
+    // `rcs` creates + indexes the archive; the directory is fresh, so no stale members accumulate.
+    commands.append(["/usr/bin/ar", "rcs", "libnomuruntime.a"] + members)
+    return commands
+}()
+
+private func buildRuntimeArchive(inDir dir: String) -> String? {
+    for command in runtimeArchiveRecipe {
+        if runProcess(command[0], Array(command.dropFirst()), in: dir) != 0 {
+            fputs("error: failed to build the runtime archive: \(command.joined(separator: " "))\n", stderr)
+            return nil
         }
-        members.append(asmO)
     }
-    // Rebuild from scratch so stale members never accumulate; `rcs` creates + indexes the archive.
-    try? FileManager.default.removeItem(atPath: archive)
-    if runProcess("/usr/bin/ar", ["rcs"] + [archive] + members) != 0 {
-        fputs("error: failed to archive runtime\n", stderr); return nil
-    }
-    return archive
+    return dir + "/libnomuruntime.a"
 }
 
-// Run `exe args`, wait, and return its exit status (or 1 if it could not be launched).
-private func runProcess(_ exe: String, _ args: [String]) -> Int32 {
+// Run `exe args` (in `dir` when given), wait, and return its exit status (or 1 if it could not be launched).
+private func runProcess(_ exe: String, _ args: [String], in dir: String? = nil) -> Int32 {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
+    if let dir { p.currentDirectoryURL = URL(fileURLWithPath: dir) }
     do {
         try p.run()
         p.waitUntilExit()

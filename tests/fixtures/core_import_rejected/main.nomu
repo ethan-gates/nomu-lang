@@ -1,5 +1,5 @@
-// User code may not import the embedded `core` package; it is reachable only through `std`
-// (modules.md §Imports).
+// The language workspace's `core` package does not exist to user code (modules.md §Imports): `import core`
+// fails as any unlisted package name does, and the error does not mention the language workspace's package.
 import core
 
 fun main() {

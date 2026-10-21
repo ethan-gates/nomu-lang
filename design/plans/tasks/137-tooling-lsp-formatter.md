@@ -18,6 +18,10 @@ The tooling milestone:
 - **Rests on:** the query architecture direction already committed in `tooling.md`; the live frontend
   blocker (lexer/parser/typechecker `exit(1)` on first error, contra the query-server commitment) has
   a backlog in [parser/frontend error recovery](143-parser-error-recovery.md).
+- **Revisit:** how stdlib sources are presented to editors. Today the driver keeps one on-disk copy of the
+  embedded sources for reporting, at `<cache root>/source/`, which diagnostics and debug info name
+  ([190](190-explicit-module-builds.md) 190.6 F10). Go-to-definition into the stdlib, and matching a binary
+  to the exact sources it was built from, may want something else.
 
 ## Refs
 

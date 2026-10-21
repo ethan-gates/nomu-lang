@@ -4,11 +4,11 @@ import XCTest
 final class ResolutionTests: XCTestCase {
 
     private let me = WorkspaceIdentity(scope: "me", name: "app")
-    private let nomu = EmbeddedWorkspace.identity
+    private let nomu = LanguageWorkspace.identity
 
-    private func plan(_ files: [String: String], entry: [String], embedded: Bool = true,
+    private func plan(_ files: [String: String], entry: [String], languageWorkspace: Bool = true,
                       allowCore: Bool = false) -> ModuleTable {
-        let ws = WorkspaceSet(entry: entry[0], disk: MemoryTree(files), includeEmbedded: embedded)
+        let ws = WorkspaceSet(entry: entry[0], disk: MemoryTree(files), includeLanguageWorkspace: languageWorkspace)
         var options = PlanOptions()
         options.allowCoreImport = allowCore
         return ModuleTable(workspaces: ws, entryFiles: entry, options: options)
@@ -43,21 +43,21 @@ final class ResolutionTests: XCTestCase {
         XCTAssertTrue(entry.imports[0].isImplicit)
         XCTAssertEqual(entry.imports[1].line, 1)
         XCTAssertNil(entry.imports[1].crossPackage)
-        // The embedded workspace's modules carry no implicit import.
+        // The language workspace's modules carry no implicit import.
         XCTAssertEqual(t.modules[key(nomu, "std/prelude")]?.imports, [])
     }
 
     func testExplicitBareStdReplacesImplicit() {
-        let t = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/main.nomu": "import std as s\n"],
-                     entry: ["/w/main.nomu"])
+        let t = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/pkg.json": "{\"name\": \"app\"}", "/w/app/main.nomu": "import std as s\n"],
+                     entry: ["/w/app/main.nomu"])
         XCTAssertEqual(errors(t), [])
         XCTAssertEqual(t.modules[t.entry]?.imports.count, 1)
         XCTAssertEqual(t.modules[t.entry]?.imports.first?.alias, "s")
     }
 
     func testStdModulesResolveTheirOwnImports() {
-        let t = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/main.nomu": "import std/time\n"],
-                     entry: ["/w/main.nomu"])
+        let t = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/pkg.json": "{\"name\": \"app\"}", "/w/app/main.nomu": "import std/time\n"],
+                     entry: ["/w/app/main.nomu"])
         XCTAssertEqual(errors(t), [])
         let time = t.modules[key(nomu, "std/time")]
         XCTAssertEqual(time?.imports.map(\.target), [key(nomu, "std/prelude")])
@@ -65,26 +65,26 @@ final class ResolutionTests: XCTestCase {
     }
 
     func testMissingPkgModuleAndScanErrors() {
-        let t = plan(["/w/nomu.yaml": "scope: me\nname: app\n",
-                      "/w/main.nomu": "import pkg/nope\nimport pkg/Bad\n",
-                      "/w/Bad/x.nomu": ""],
-                     entry: ["/w/main.nomu"])
+        let t = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/pkg.json": "{\"name\": \"app\"}",
+                      "/w/app/main.nomu": "import pkg/nope\nimport pkg/Bad\n",
+                      "/w/app/Bad/x.nomu": ""],
+                     entry: ["/w/app/main.nomu"])
         XCTAssertEqual(errors(t), [
-            "/w/main.nomu:1:1: error: no module found at 'nope'",
-            "/w/main.nomu:2:1: error: module path component 'Bad' must match [a-z][a-z0-9_]*",
+            "/w/app/main.nomu:1:1: error: no module found at 'nope'",
+            "/w/app/main.nomu:2:1: error: module path component 'Bad' must match [a-z][a-z0-9_]*",
         ])
-        let s = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/main.nomu": "import a/\n"], entry: ["/w/main.nomu"])
-        // A scan error is reported where the scanner stops: here the end of input.
-        XCTAssertEqual(errors(s), ["/w/main.nomu:2:1: error: expected a name after '/'"])
+        let s = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/pkg.json": "{\"name\": \"app\"}", "/w/app/main.nomu": "import a/\n"], entry: ["/w/app/main.nomu"])
+        // A scan error is reported just past the token that wants a name, on the import's own line.
+        XCTAssertEqual(errors(s), ["/w/app/main.nomu:1:10: error: expected a name after '/'"])
     }
 
     func testSamePackageTestImport() {
-        let t = plan(["/w/nomu.yaml": "scope: me\nname: app\n",
-                      "/w/tests/t.nomu": "test import pkg/lib\n",
-                      "/w/lib/l.nomu": ""],
-                     entry: ["/w/tests/t.nomu"])
+        let t = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/pkg.json": "{\"name\": \"app\"}",
+                      "/w/app/tests/t.nomu": "test import pkg/lib\n",
+                      "/w/app/lib/l.nomu": ""],
+                     entry: ["/w/app/tests/t.nomu"])
         XCTAssertEqual(errors(t), [])
-        XCTAssertEqual(t.testImportTargets, [key(me, "lib")])
+        XCTAssertEqual(t.testImportTargets, [key(me, "app/lib")])
     }
 
     // MARK: - Across packages
@@ -112,6 +112,45 @@ final class ResolutionTests: XCTestCase {
         XCTAssertEqual(t.modules[key(me, "multi/core")]?.package.name, "multi")
     }
 
+    // Every module is in a package (modules.md §Manifest): with no `pkg.json` at or above the entry within its
+    // workspace, planning stops at one error.
+    func testModuleInNoPackage() {
+        let t = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/main.nomu": "import pkg/a\n"],
+                     entry: ["/w/app/main.nomu"])
+        XCTAssertEqual(errors(t), ["error: module '/w/app' is in no package — a module needs a pkg.json declaring "
+                                   + "its package's 'name', at or above it within workspace 'me.app'"])
+        XCTAssertTrue(t.modules.isEmpty)
+    }
+
+    // Packages live in subdirectories of their workspace: a `pkg.json` at the root is reported once and stops
+    // planning, and a module at the root is in no package.
+    func testNothingAtTheWorkspaceRoot() {
+        let rooted = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/pkg.json": "{\"name\": \"app\"}",
+                           "/w/main.nomu": "import pkg/a\n", "/w/a/a.nomu": ""], entry: ["/w/main.nomu"])
+        XCTAssertEqual(errors(rooted), ["/w/pkg.json: error: a package may not sit at the root of workspace 'me.app' — "
+                                        + "move its pkg.json and modules into a subdirectory"])
+        XCTAssertTrue(rooted.modules.isEmpty)
+        let bare = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/main.nomu": ""], entry: ["/w/main.nomu"])
+        XCTAssertEqual(errors(bare), ["error: module '/w' sits at the root of workspace 'me.app' — modules live in "
+                                      + "packages, in subdirectories of the workspace"])
+    }
+
+    // A package name follows the path-component rule, for the entry's package and for one found by the walk.
+    func testPackageNamesFollowThePathComponentRule() {
+        let entry = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/pkg.json": "{\"name\": \"My-App\"}",
+                          "/w/app/main.nomu": ""], entry: ["/w/app/main.nomu"])
+        XCTAssertEqual(errors(entry), ["/w/app/pkg.json: error: package name 'My-App' must match [a-z][a-z0-9_]* — "
+                                       + "rename the package in '/w/app/pkg.json'"])
+        let walked = plan(["/w/nomu.yaml": "scope: me\nname: app\n",
+                           "/w/app/pkg.json": "{\"name\": \"app\", \"dependencies\": [\"lib\"]}",
+                           "/w/app/main.nomu": "import lib\n",
+                           "/w/lib/pkg.json": "{\"name\": \"2lib\", \"products\": [\"\"]}",
+                           "/w/lib/l.nomu": ""], entry: ["/w/app/main.nomu"])
+        XCTAssertTrue(errors(walked).contains("/w/lib/pkg.json: error: package name '2lib' must match "
+                                              + "[a-z][a-z0-9_]* — rename the package in '/w/lib/pkg.json'"),
+                      "\(errors(walked))")
+    }
+
     func testCrossPackageErrors() {
         var files = twoPackages
         files["/w/app/main.nomu"] = "import other\nimport multi/hidden\nimport multi/none\ntest import greet\n"
@@ -128,23 +167,36 @@ final class ResolutionTests: XCTestCase {
 
     // MARK: - `core`
 
+    // The language workspace's `core` does not exist to a user workspace: `import core` fails as any unlisted
+    // name does, and no diagnostic names the language workspace's package.
     func testCoreGate() {
-        let files = ["/w/nomu.yaml": "scope: me\nname: app\n", "/w/main.nomu": "import core\n"]
-        XCTAssertEqual(errors(plan(files, entry: ["/w/main.nomu"])),
-                       ["/w/main.nomu:1:1: error: package 'core' is internal to the standard library — use 'std' instead"])
-        let lifted = plan(files, entry: ["/w/main.nomu"], allowCore: true)
+        let files = ["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/pkg.json": "{\"name\": \"app\"}", "/w/app/main.nomu": "import core\n"]
+        XCTAssertEqual(errors(plan(files, entry: ["/w/app/main.nomu"])),
+                       ["/w/app/main.nomu:1:1: error: package 'core' is not listed in this package's 'dependencies'"])
+        let lifted = plan(files, entry: ["/w/app/main.nomu"], allowCore: true)
         XCTAssertEqual(errors(lifted), [])
         XCTAssertEqual(lifted.modules[lifted.entry]?.imports.last?.target, key(nomu, "core"))
 
-        // A workspace's own package named `core` is an ordinary package.
-        let own = plan(["/w/nomu.yaml": "scope: me\nname: app\n",
+        // A workspace's own package named `core` is an ordinary package: listed, it resolves; unlisted, it
+        // gets the ordinary message.
+        var ownFiles = ["/w/nomu.yaml": "scope: me\nname: app\n",
                         "/w/app/pkg.json": "{\"name\": \"app\", \"dependencies\": [\"core\"]}",
                         "/w/app/main.nomu": "import core\n",
                         "/w/core/pkg.json": "{\"name\": \"core\", \"products\": [\"\"]}",
-                        "/w/core/c.nomu": ""],
-                       entry: ["/w/app/main.nomu"])
+                        "/w/core/c.nomu": ""]
+        let own = plan(ownFiles, entry: ["/w/app/main.nomu"])
         XCTAssertEqual(errors(own), [])
         XCTAssertEqual(own.modules[own.entry]?.imports.last?.target, key(me, "core"))
+        ownFiles["/w/app/pkg.json"] = "{\"name\": \"app\"}"
+        XCTAssertEqual(errors(plan(ownFiles, entry: ["/w/app/main.nomu"])),
+                       ["/w/app/main.nomu:1:1: error: package 'core' is not listed in this package's 'dependencies'"])
+        // Listed but present in no workspace: the ordinary message for a missing package.
+        let missing = plan(["/w/nomu.yaml": "scope: me\nname: app\n",
+                            "/w/app/pkg.json": "{\"name\": \"app\", \"dependencies\": [\"core\"]}",
+                            "/w/app/main.nomu": "import core\n"],
+                           entry: ["/w/app/main.nomu"])
+        XCTAssertEqual(errors(missing),
+                       ["/w/app/main.nomu:1:1: error: package 'core' is external but no workspace pinned in nomu.yaml provides it"])
     }
 
     // MARK: - Across workspaces
@@ -197,7 +249,7 @@ final class ResolutionTests: XCTestCase {
         func planFixture(_ dir: String) -> ModuleTable {
             let files = (try? FileManager.default.contentsOfDirectory(atPath: dir))?
                 .filter { $0.hasSuffix(".nomu") }.sorted().map { dir + "/" + $0 } ?? []
-            return ModuleTable(workspaces: WorkspaceSet(entry: files[0], includeEmbedded: true), entryFiles: files)
+            return ModuleTable(workspaces: WorkspaceSet(entry: files[0], includeLanguageWorkspace: true), entryFiles: files)
         }
         let alias = planFixture(fixtures + "/xworkspace_alias/consumer/app")
         XCTAssertEqual(errors(alias), [])

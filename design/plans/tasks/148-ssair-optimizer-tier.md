@@ -32,7 +32,9 @@ LLVM leaves (`NOMU_DUMP_LLVM` → `.post.ll`) before adding a pass.
   cross-module seeded across the import boundary ([164](164-formal-inference-stage.md) complete). What
   remains — formerly 164.5 — is **consuming** it in codegen: wire `StackPromotion` (provider injectable
   since [165.2](165-midend-pipeline-prefactor.md)) to read the stored interprocedural summary instead of
-  recomputing intraprocedurally, gated by the GC-stress suite. The wiring is thin (the per-instance summary
+  recomputing intraprocedurally, gated by the GC-stress suite. **Depends on
+  [202](202-one-inference-phase.md)**, which computes the escape results once into the fact store; today
+  codegen's copy is computed without dependency results and read by nothing. The wiring is thin (the per-instance summary
   shares `computeEscapeSummaries`'s `external:` parameter); the blocker is the placement mechanism below,
   since the promotions the summary adds are exactly the ones that trip I4 + the addrspace wall. A
   **post-inline EA re-run** (inline already runs; promote again after so EA/scalar-promotion reach across

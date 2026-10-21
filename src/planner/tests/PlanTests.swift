@@ -4,7 +4,7 @@ import XCTest
 final class PlanTests: XCTestCase {
 
     private let me = WorkspaceIdentity(scope: "me", name: "app")
-    private let nomu = EmbeddedWorkspace.identity
+    private let nomu = LanguageWorkspace.identity
 
     private func plan(_ files: [String: String], entry: [String], product: ModuleJob.Product = .binary,
                       outputOptions: [String] = []) -> Plan {
@@ -54,13 +54,13 @@ final class PlanTests: XCTestCase {
         XCTAssertEqual(byKey[key(them, "greet")]?.outputDir, "/w/build/_external/them.prov/greet")
         XCTAssertEqual(byKey[key(them, "greet")]?.product, .library)
 
-        // D4: the embedded workspace's modules and the runtime archive in the per-host cache.
+        // D4: the language workspace's modules and the runtime archive in the per-host cache.
         let prelude = byKey[key(nomu, "std/prelude")]!
         XCTAssertTrue(prelude.inHostCache)
         XCTAssertTrue(prelude.outputDir.hasPrefix("/cache/nomu/"))
         XCTAssertTrue(prelude.outputDir.hasSuffix("/std/prelude"))
         XCTAssertFalse(cli.inHostCache)
-        XCTAssertEqual(p.runtimeArchive?.outputDir, "/cache/runtime/" + HostCache.runtimeArchiveKey)
+        XCTAssertEqual(p.runtimeArchive?.outputDir, "/cache/runtime/" + HostCache.runtimeArchiveKey(recipe: []))
 
         // The link takes every object the plan builds, plus the runtime archive.
         XCTAssertEqual(p.link?.objects, p.jobs.map(\.object))
@@ -68,9 +68,9 @@ final class PlanTests: XCTestCase {
         XCTAssertEqual(p.link?.output, "/w/build/app/cli/cli")
     }
 
-    func testLibraryBuildHasNoLinkAndNoEmbeddedWorkspace() {
-        let p = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/lib/l.nomu": ""], entry: ["/w/lib/l.nomu"],
-                     product: .library)
+    func testLibraryBuildHasNoLinkAndNoLanguageWorkspace() {
+        let p = plan(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/lib/pkg.json": "{\"name\": \"lib\"}",
+                      "/w/lib/l.nomu": ""], entry: ["/w/lib/l.nomu"], product: .library)
         XCTAssertEqual(p.diagnostics, [])
         XCTAssertEqual(p.jobs.map(\.module), [key(me, "lib")])
         XCTAssertEqual(p.jobs.first?.product, .library)
@@ -78,24 +78,32 @@ final class PlanTests: XCTestCase {
         XCTAssertNil(p.runtimeArchive)
     }
 
-    func testRootModuleAndFlags() {
+    func testPackageRootModuleAndFlags() {
         let p = plan(["/w/nomu.yaml": "scope: me\nname: app\n",
-                      "/w/main.nomu": "test import pkg/lib\n",
-                      "/w/lib/l.nomu": ""],
-                     entry: ["/w/main.nomu"])
+                      "/w/app/pkg.json": "{\"name\": \"tool\"}",
+                      "/w/app/main.nomu": "test import pkg/lib\n",
+                      "/w/app/lib/l.nomu": ""],
+                     entry: ["/w/app/main.nomu"])
         XCTAssertEqual(p.diagnostics, [])
         let root = p.jobs.last!
-        XCTAssertEqual(root.module, key(me, ""))
-        XCTAssertEqual(root.binary, "/w/build/app")              // a workspace-root module is named after the workspace
-        XCTAssertEqual(p.jobs.first { $0.module == key(me, "lib") }?.whiteBox, true)
+        XCTAssertEqual(root.module, key(me, "app"))
+        XCTAssertEqual(root.binary, "/w/build/app/app")          // named after its last path component
+        XCTAssertEqual(p.jobs.first { $0.module == key(me, "app/lib") }?.whiteBox, true)
         XCTAssertEqual(root.whiteBox, false)
     }
 
-    func testEmbeddedKeyFollowsCompilerAndOptions() {
-        let a = HostCache.embeddedWorkspaceKey(compilerIdentity: "abc", outputOptions: [])
-        XCTAssertEqual(a, HostCache.embeddedWorkspaceKey(compilerIdentity: "abc", outputOptions: []))
-        XCTAssertNotEqual(a, HostCache.embeddedWorkspaceKey(compilerIdentity: "abd", outputOptions: []))
-        XCTAssertNotEqual(a, HostCache.embeddedWorkspaceKey(compilerIdentity: "abc", outputOptions: ["-O"]))
+    func testRuntimeArchiveKeyFollowsRecipe() {
+        let a = HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "runtime.c"]])
+        XCTAssertEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "runtime.c"]]))
+        XCTAssertNotEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-O2", "-c", "runtime.c"]]))
+        XCTAssertNotEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-c"], ["runtime.c"]]))
+    }
+
+    func testLanguageWorkspaceKeyFollowsCompilerAndOptions() {
+        let a = HostCache.languageWorkspaceKey(compilerIdentity: "abc", outputOptions: [])
+        XCTAssertEqual(a, HostCache.languageWorkspaceKey(compilerIdentity: "abc", outputOptions: []))
+        XCTAssertNotEqual(a, HostCache.languageWorkspaceKey(compilerIdentity: "abd", outputOptions: []))
+        XCTAssertNotEqual(a, HostCache.languageWorkspaceKey(compilerIdentity: "abc", outputOptions: ["-O"]))
         let plain = plan(app, entry: ["/w/app/cli/main.nomu"])
         let optimized = plan(app, entry: ["/w/app/cli/main.nomu"], outputOptions: ["-O"])
         XCTAssertNotEqual(plain.jobs.first?.outputDir, optimized.jobs.first?.outputDir)
@@ -105,11 +113,12 @@ final class PlanTests: XCTestCase {
         var options = PlanOptions()
         options.allowCoreImport = true
         options.cacheRoot = "/cache"
-        let p = Plan(entryFiles: ["/w/main.nomu"], options: options,
-                     disk: MemoryTree(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/main.nomu": "import core\n"]))
+        let p = Plan(entryFiles: ["/w/app/main.nomu"], options: options,
+                     disk: MemoryTree(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/pkg.json": "{\"name\": \"app\"}", "/w/app/main.nomu": "import core\n"]))
         XCTAssertEqual(p.diagnostics, [])
         XCTAssertTrue(p.jobs.contains { $0.module == key(nomu, "core") })
-        // The embedded `runtime` package is in every binary build, first, though nothing imports it.
+        // The language workspace's `runtime` package is in every binary build, first, though nothing
+        // imports it.
         XCTAssertEqual(p.jobs.first?.module, key(nomu, "runtime"))
         XCTAssertEqual(p.jobs.filter(\.runtimeSubsetByMembership).map(\.module), [key(nomu, "runtime")])
         XCTAssertEqual(p.modules.implicitRoots, [key(nomu, "runtime")])
@@ -140,11 +149,12 @@ final class PlanTests: XCTestCase {
 
     func testModuleCycle() {
         let p = plan(["/w/nomu.yaml": "scope: me\nname: app\n",
-                      "/w/main.nomu": "import pkg/a\n",
-                      "/w/a/a.nomu": "import pkg/b\n",
-                      "/w/b/b.nomu": "// b\nimport pkg/a\n"],
-                     entry: ["/w/main.nomu"])
-        XCTAssertEqual(p.diagnostics.map(\.description), ["/w/b/b.nomu:2:1: error: module import cycle: a → b → a"])
+                      "/w/app/pkg.json": "{\"name\": \"app\"}",
+                      "/w/app/main.nomu": "import pkg/a\n",
+                      "/w/app/a/a.nomu": "import pkg/b\n",
+                      "/w/app/b/b.nomu": "// b\nimport pkg/a\n"],
+                     entry: ["/w/app/main.nomu"])
+        XCTAssertEqual(p.diagnostics.map(\.description), ["/w/app/b/b.nomu:2:1: error: module import cycle: app/a → app/b → app/a"])
         XCTAssertEqual(p.jobs, [])
         XCTAssertNil(p.link)
     }

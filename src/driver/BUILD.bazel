@@ -14,7 +14,7 @@ swift_library(
 )
 
 # Builds of real suite fixtures with the `nomu` binary: each module compiles once, the host cache serves the
-# embedded workspace, and planning errors stop a build before any compile.
+# language workspace, and planning errors stop a build before any compile.
 swift_test(
     name = "build_tests",
     srcs = glob(["tests/*.swift"]),

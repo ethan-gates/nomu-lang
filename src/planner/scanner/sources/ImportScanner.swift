@@ -261,11 +261,13 @@ private struct Scan {
         return true
     }
 
-    // An identifier (never a keyword) after `what`, or nil with an error recorded.
+    // An identifier (never a keyword) after `what`, or nil with an error recorded. Called right after `what` is
+    // consumed; an error is reported there, just past `what` on the import's own line (the parser's
+    // `expectImportName` reports the same position and wording).
     mutating func expectComponent(after what: String) -> String? {
+        let at = location
         skipTrivia()
         if truncated || failed { return nil }
-        let at = location
         guard let r = identRange() else {
             if !truncated { result.errors.append(ScanError(location: at, message: "expected a name after \(what)")) }
             return nil

@@ -41,7 +41,10 @@ CI (not a TTY) it prints a sorted, deterministic batch at the end instead.
 
 ## Add a case
 
-Add an object to `cases` in `tests/suite.json` and a `.nomu` fixture — no new shell script. Fields:
+Add an object to `cases` in `tests/suite.json` and a fixture directory — no new shell script. A fixture is a
+package: a `pkg.json` declaring its `name` (the directory's name, matching `[a-z][a-z0-9_]*`) beside its
+`.nomu` files. A fixture that is its own workspace (a `nomu.yaml`) keeps its packages in subdirectories,
+since no package may sit at a workspace root. Fields:
 
 - `name` (unique), `fixture` (a module directory, path from the project root).
 - `compile_args` — extra `nomu build` flags, e.g. `["--runtime-subset=enqueue,dequeue"]` for a

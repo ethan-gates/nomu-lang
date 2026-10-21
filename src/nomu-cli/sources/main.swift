@@ -17,7 +17,7 @@ let buildFlags: [Flag] = [
     Flag("emit-ssair", help: "also emit the entry module's SSAIR, the optimizer IR (<name>.ssair)"),
     Flag("emit-nmi", help: "emit the entry module's public interface (<name>.nmi) and stop"),
     Flag("emit-llvm", help: "also emit the entry module's LLVM IR from the egress, pre-opt (<name>.ll)"),
-    Flag("allow-core-import", help: "let user code import the embedded `core` package (test suite only)",
+    Flag("allow-core-import", help: "let user code import the language workspace's `core` package (test suite only)",
          hidden: true),
     Flag("emit-jobs", help: "write each module's job file beside its outputs", hidden: true),
     Flag("report-jobs", help: "print each job as `compiled <module>` or `cached <module>`, then `binary <path>`",

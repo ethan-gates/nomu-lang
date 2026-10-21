@@ -167,6 +167,37 @@ consumer specializes; specialization cannot exceed what the producer compiles. B
 method-call lowering + the "unsupported method-call receiver" guard (171.7.2); the §100.5.4 probes
 (`relay` → private `echo`; `unboxed` → `Box<T>.get`).
 
+### 171.8 — Specialized bodies that call into a module the consumer does not import
+
+**Release builds fail on a three-module generic chain** (found reviewing 190.6 F15). `main` imports `pkg/a`;
+`a`'s generic calls a generic of `pkg/b`, which `main` does not import:
+
+```
+// app/b/b.nomu
+package fun idb<T>(x: T) -> T { return x }
+// app/a/a.nomu
+import pkg/b
+package fun ida<T>(x: T) -> T { return idb(x) }
+// app/main.nomu
+import pkg/a
+fun main() { print(ida(41) + 1) }
+```
+
+`--mono=none` builds and prints `42`; `--mono=edge`, `--mono=all` and `-O` fail at
+`a.nomu: 7.2.3: unknown call target 't/f15/app/b@idb'`. §100.5 decided the release input set is the
+transitive `.nmi` closure ("to resolve a shipped body's references the consumer loads the transitive `.nmi`
+closure the body reaches"), and the planner supplies it (`ModuleJob.visibleDependencies`). The compile
+declares functions only from its `visible` set (direct imports and their re-exports, `externals()` in
+`CompileJob.swift`); from the rest of the closure it declares only the struct/class/enum types visible
+signatures name (the foreign-type loop). An injected `.bir` body that calls into a module outside `visible`
+therefore has no declaration for the callee.
+- Fix: declare the functions (and the templates, for further specialization) of the modules injected bodies
+  reference, from the loaded transitive interfaces, as the foreign-type loop does for types; the names stay
+  out of the consumer's scope, as foreign types do.
+- Test: a suite fixture for the chain above (and one with a generic type from the indirect module), run
+  across the `--mono` values. The suite has none today: `module_generic_nested` keeps both generics in one
+  module, and in `module_generic_fold` the consumer imports both.
+
 ## Dependencies & triggers
 
 - **Rides:** the erased witness/VWT machinery and the typed-root GC path (§100.4.3, present).

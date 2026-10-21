@@ -64,25 +64,31 @@ final class WorkspaceTests: XCTestCase {
         func canonical(_ path: String) -> String? { inner.canonical(path) }
     }
 
-    private func load(_ files: [String: String], entry: String, embedded: Bool = false) -> (WorkspaceSet, CountingTree) {
+    private func load(_ files: [String: String], entry: String, languageWorkspace: Bool = false) -> (WorkspaceSet, CountingTree) {
         let tree = CountingTree(files)
-        return (WorkspaceSet(entry: entry, disk: tree, includeEmbedded: embedded), tree)
+        return (WorkspaceSet(entry: entry, disk: tree, includeLanguageWorkspace: languageWorkspace), tree)
     }
 
     func testRootFoundAboveEntry() {
-        let (ws, _) = load(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/cli/main.nomu": "fun main() {}\n"],
+        let (ws, _) = load(["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/pkg.json": "{\"name\": \"app\"}", "/w/app/cli/main.nomu": "fun main() {}\n"],
                            entry: "/w/app/cli/main.nomu")
         XCTAssertEqual(ws.diagnostics, [])
         XCTAssertEqual(ws.root.identity, WorkspaceIdentity(scope: "me", name: "app"))
         XCTAssertEqual(ws.root.root, "/w")
     }
 
-    func testLooseBuild() {
-        let (ws, _) = load(["/loose/pkg/pkg.json": "{\"name\": \"p\"}", "/loose/pkg/src/a.nomu": ""],
-                           entry: "/loose/pkg/src/a.nomu")
-        XCTAssertEqual(ws.diagnostics, [])
-        XCTAssertEqual(ws.root.identity, looseWorkspaceIdentity)
-        XCTAssertEqual(ws.root.root, "/loose/pkg")
+    // A build needs a workspace: with no `nomu.yaml` above the entry, planning stops at one error, whether or
+    // not a `pkg.json` is present, and resolution adds nothing.
+    func testNoWorkspaceIsAnError() {
+        let files = ["/loose/pkg/pkg.json": "{\"name\": \"p\"}", "/loose/pkg/src/a.nomu": "import pkg/b\n"]
+        let (ws, _) = load(files, entry: "/loose/pkg/src/a.nomu")
+        XCTAssertTrue(ws.missingWorkspace)
+        XCTAssertEqual(ws.diagnostics.map(\.description),
+                       ["error: no nomu.yaml found at or above '/loose/pkg/src' — a build needs a workspace: a "
+                        + "nomu.yaml declaring its 'scope' and 'name'"])
+        let table = ModuleTable(workspaces: ws, entryFiles: ["/loose/pkg/src/a.nomu"])
+        XCTAssertEqual(table.diagnostics, ws.diagnostics)
+        XCTAssertTrue(table.modules.isEmpty)
     }
 
     func testPinsAtAnyDepth() {
@@ -112,19 +118,19 @@ final class WorkspaceTests: XCTestCase {
         ])
     }
 
-    func testEmbeddedWorkspace() {
-        let (ws, _) = load(["/w/nomu.yaml": "scope: me\nname: app\n"], entry: "/w", embedded: true)
+    func testLanguageWorkspace() {
+        let (ws, _) = load(["/w/nomu.yaml": "scope: me\nname: app\n"], entry: "/w", languageWorkspace: true)
         XCTAssertEqual(ws.diagnostics, [])
-        guard let nomu = ws.byIdentity[EmbeddedWorkspace.identity] else { return XCTFail("no embedded workspace") }
-        XCTAssertTrue(nomu.isEmbedded)
+        guard let nomu = ws.byIdentity[LanguageWorkspace.identity] else { return XCTFail("no language workspace") }
+        XCTAssertTrue(nomu.isLanguageWorkspace)
         let pkgs = ws.packages(in: nomu)
         XCTAssertEqual(pkgs.keys.sorted(), ["core", "runtime", "std"])
         XCTAssertEqual(pkgs["std"]?.manifest.defaultModule, "prelude")
         XCTAssertFalse(nomu.moduleFiles(pkgs["std"]!.root + "/prelude").isEmpty)
-        XCTAssertEqual(nomu.moduleFiles(pkgs["core"]!.root), [EmbeddedWorkspace.root + "/core/core.nomu"])
+        XCTAssertEqual(nomu.moduleFiles(pkgs["core"]!.root), [LanguageWorkspace.root + "/core/core.nomu"])
 
-        // A user workspace may not claim the embedded workspace's identity.
-        let (clash, _) = load(["/w/nomu.yaml": "scope: nomu\nname: nomu\n"], entry: "/w", embedded: true)
+        // A user workspace may not claim the language workspace's identity.
+        let (clash, _) = load(["/w/nomu.yaml": "scope: nomu\nname: nomu\n"], entry: "/w", languageWorkspace: true)
         XCTAssertEqual(clash.diagnostics.count, 1)
         XCTAssertTrue(clash.diagnostics[0].message.hasPrefix("two workspaces in this build are both 'nomu.nomu'"))
     }
@@ -184,7 +190,7 @@ final class WorkspaceTests: XCTestCase {
     func testFixtureWorkspacesOnDisk() throws {
         guard let srcdir = ProcessInfo.processInfo.environment["TEST_SRCDIR"] else { throw XCTSkip("not under bazel test") }
         let consumer = srcdir + "/_main/tests/fixtures/xworkspace_alias/consumer"
-        let ws = WorkspaceSet(entry: consumer, includeEmbedded: true)
+        let ws = WorkspaceSet(entry: consumer, includeLanguageWorkspace: true)
         XCTAssertEqual(ws.diagnostics, [])
         XCTAssertEqual(ws.byIdentity.keys.map(\.description).sorted(), ["nomu.cons", "nomu.nomu", "nomu.pa", "nomu.pb"])
         XCTAssertEqual(ws.root.pins.keys.sorted(), ["wsa", "wsb"])

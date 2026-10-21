@@ -2,7 +2,7 @@
 
 **Avenue:** Infra (+ self-hosting) · **Type/Lifecycle:** `language-feature · ready-to-build` (name
 resolution + codegen + linkage + runtime-subset) · **Size:** L · **Status:** done (174.1–174.7 built) — **the prepend is
-completely gone.** `core`/`runtime`/`std` are ordinary packages compiled once under the embedded `nomu`
+completely gone.** `core`/`runtime`/`std` are ordinary packages compiled once under the language
 workspace and referenced externally: user-facing decls live in `std` (a multi-module package; every file
 implicitly imports its default module `std/prelude`, the rest by `import std/<module>`), the runtime
 in the `runtime` package (bare + weak-ODR, the C-ABI boundary the C floor and codegen reference by bare
@@ -256,14 +256,14 @@ nomu_main` special-case); every other `runtime` symbol qualifies normally.
      The boundary is expected to move as `std` grows; moving a decl is a file move between module
      directories.
 
-     *Mechanism.* The driver materializes the embedded `nomu` workspace before discovery, so the root token
+     *Mechanism.* The driver materializes the language workspace before discovery, so the root token
      `std` resolves against it like a pinned external workspace (`std` needs no `dependencies` entry). The
      package names `std` and `pkg` are reserved: a user package named either is a compile error. The implicit import is injected per file unless the file names
      bare `std` itself (e.g. to alias it); it also gives the `std.` qualifier. `core` stays ambient (whole
      module, for `ManagedBuffer`). Each `std` module compiles to its own object; all of them link, and
      `-dead_strip` drops what the program never reaches. Sources live at `src/stdlib/std/<module>/`,
      embedded as `EmbeddedSources.stdModules`. Library (`emitLibrary`) builds carry no implicit import,
-     since they have no embedded workspace — the same scope ambient `std` had.
+     since they have no language workspace — the same scope ambient `std` had.
 4. **174.4 — runtime-subset by membership, built** ([149](149-runtime-subset.md) designation swap). The
    `runtime` package build designates every function it defines runtime-subset by **package membership**
    (`EmitOptions.runtimeSubsetByMembership`, set for `p.name == "runtime"` in `buildNomuWorkspace`): the subset

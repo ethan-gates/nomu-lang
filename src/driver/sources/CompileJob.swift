@@ -99,10 +99,14 @@ public struct CompileJob: Codable {
     public var product: Product
     // Publish the white-box interface: some module in the build `test import`s this one.
     public var whiteBox: Bool
-    // A module of the embedded `runtime` package: its functions are the runtime subset by membership, and
-    // emit bare and weak.
+    // A module of the language workspace's `runtime` package: its functions are the runtime subset by
+    // membership, and emit bare and weak.
     public var runtimeSubsetByMembership: Bool
     public var outputs: Outputs
+    // The path to report for a file in `files` whose reported path differs from it: a language-workspace
+    // `<nomu>/…` file's on-disk copy (Driver, `LanguageSourceCopy`). Diagnostics and debug info use it; the job
+    // still reads the file by its `files` path. Nil or missing entries report the path itself.
+    public var reportedPaths: [String: String]?
 
     public init(origin: [String], files: [String], packageName: String, packageKey: String, isProduct: Bool,
                 imports: [String: [Import]], dependencies: [Dependency], product: Product, whiteBox: Bool,
@@ -164,7 +168,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
             fputs("error: cannot read '\(path)'\n", stderr); return false
         }
         let tokens = timings.measure("parse", "lex") { () -> [Token] in
-            var lexer = Lexer(text, file: path, diagnostics: parseDiags)
+            var lexer = Lexer(text, file: path, displayName: job.reportedPaths?[path], diagnostics: parseDiags)
             return lexer.tokenize()
         }
         timings.bytes += text.utf8.count
@@ -413,7 +417,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     // The module's interface, from the pre-merge surface, carrying the inferred facts.
     let ownFiles = Set(job.files)
     var iface = buildInterface(ownSurface, package: job.packageName, modulePath: job.origin, ownFiles: ownFiles,
-                               workspace: job.origin.first, facts: factStore, whiteBox: job.whiteBox,
+                               facts: factStore, whiteBox: job.whiteBox,
                                reexportModulePath: { imp in target(of: imp).map { $0.split(separator: "/").map(String.init) } })
     iface.foreignTypes = foreignTypeOrigins(iface)
 
@@ -426,8 +430,13 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     // A library publishes its interface (with escape summaries, so a consumer seeds across the boundary) and
     // its shipped generic templates.
     if job.product == .library {
-        let perf = escapePerfSection(iface, semaResult.module, subsetFuncs: subset, external: externalEscape())
-        guard (try? serialize(iface, perf: perf).write(toFile: job.outputs.interface, atomically: true, encoding: .utf8)) != nil else {
+        let perf = timings.measure("interface", "escape") {
+            escapePerfSection(iface, semaResult.module, subsetFuncs: subset, external: externalEscape())
+        }
+        let text = timings.measure("interface", "serialize") { serialize(iface, perf: perf) }
+        guard timings.measure("interface", "write", {
+            (try? text.write(toFile: job.outputs.interface, atomically: true, encoding: .utf8)) != nil
+        }) else {
             fputs("error: cannot write '\(job.outputs.interface)'\n", stderr); return false
         }
     }
@@ -499,11 +508,11 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     return true
 }
 
-// A source file's text. A path under the embedded workspace's root (`<nomu>/…`) is served from the sources
-// the compiler carries, so a job can name the embedded workspace's files in any process.
+// A source file's text. A path under the language workspace's root (`<nomu>/…`) is served from the sources
+// the compiler carries, so a job can name the language workspace's files in any process.
 private func readSource(_ path: String) -> String? {
-    if path.hasPrefix(EmbeddedWorkspace.root + "/") {
-        return EmbeddedWorkspace.tree.read(path).map { String(decoding: $0, as: UTF8.self) }
+    if path.hasPrefix(LanguageWorkspace.root + "/") {
+        return LanguageWorkspace.tree.read(path).map { String(decoding: $0, as: UTF8.self) }
     }
     return try? String(contentsOfFile: path, encoding: .utf8)
 }

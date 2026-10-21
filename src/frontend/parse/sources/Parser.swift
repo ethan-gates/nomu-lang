@@ -55,16 +55,27 @@ public struct Parser {
 
         // The leading identifier is the root: `pkg` (this package) or an external package name.
         // Subsequent `/`-separated identifiers are the module path within that root.
-        let first = expectIdent()
+        let first = expectImportName(after: "import")
         let root: ImportRoot = (first == "pkg") ? .pkg : .package_(first)
         var path: [String] = []
-        while eat(.slash) { path.append(expectIdent()) }
+        while eat(.slash) { path.append(expectImportName(after: "/")) }
 
         var alias: String? = nil
-        if isContextual("as") { advance(); alias = expectIdent() }
+        if isContextual("as") { advance(); alias = expectImportName(after: "as") }
 
         return ImportDecl(root: root, path: path, alias: alias, isPublic: isPublic, isTest: isTest,
                           span: spanFrom(start))
+    }
+
+    // A name in an import, after `what`. A missing name is reported just past `what`, on the import's own
+    // line, with the wording the import scanner uses (the planner reports the scanner's errors for the same
+    // headers; ImportScannerTests holds the two in step).
+    private mutating func expectImportName(after what: String) -> String {
+        if case .ident(let name) = currentKind { advance(); return name }
+        let at = Span(startOffset: prevSpan.endOffset, endOffset: prevSpan.endOffset, map: prevSpan.map)
+        let got = currentKind.keywordSpelling.map { ", got keyword '\($0)'" } ?? ""
+        error("expected a name after '\(what)'\(got)", at: at)
+        return "<error>"
     }
 
     private func isContextual(_ word: String) -> Bool {
@@ -1124,9 +1135,9 @@ public struct Parser {
     // Report an error at the current token and enter panic mode. While panicking, further
     // errors are suppressed (one diagnostic per broken construct); a loop-top reset or a
     // `recover(to:)` clears it at the next boundary.
-    private mutating func error(_ msg: String) {
+    private mutating func error(_ msg: String, at span: Span? = nil) {
         guard !panicking else { return }
-        diags.error(msg, at: currentSpan)
+        diags.error(msg, at: span ?? currentSpan)
         panicking = true
     }
 

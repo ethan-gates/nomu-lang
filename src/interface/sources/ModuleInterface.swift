@@ -120,13 +120,6 @@ public func interfaceToDecls(_ iface: ModuleInterface) -> [TopDecl] {
 // shareability, task 100.4.5) are added when those phases land.
 
 public struct ModuleInterface: Codable, Equatable {
-    // The producing module's **workspace name** — the first segment of its canonical mangled identity
-    // (task 188). In-workspace a consumer recomputes this locally (every module shares the build's one
-    // workspace name), so it was left implicit; crossing a workspace boundary a consumer references symbols
-    // mangled under a *foreign* workspace name, so the producer must persist its own here and the consumer
-    // qualify imported references by it. Optional so a pre-188 `.nmi` (no field) still decodes — the
-    // consumer then falls back to its local workspace name, the in-workspace behavior.
-    public var workspace: String?
     public var package: String
     public var modulePath: [String]
     public var types: [InterfaceType]
@@ -148,10 +141,10 @@ public struct ModuleInterface: Codable, Equatable {
     public var foreignTypes: [String: String]?
     public init(package: String, modulePath: [String], types: [InterfaceType],
                 enums: [InterfaceEnum] = [], interfaces: [InterfaceProtocol] = [],
-                functions: [InterfaceFunc], reexports: [InterfaceRef] = [], workspace: String? = nil) {
+                functions: [InterfaceFunc], reexports: [InterfaceRef] = []) {
         self.package = package; self.modulePath = modulePath; self.types = types
         self.enums = enums; self.interfaces = interfaces; self.functions = functions
-        self.reexports = reexports; self.workspace = workspace
+        self.reexports = reexports
     }
 }
 
@@ -349,7 +342,6 @@ private func renderConformances(_ cs: [Conformance]) -> [String] { cs.map(\.name
 // `modulePath` is the module's canonical identity; `ownFiles` are its source files (a declaration from any
 // other file, such as a prepended prelude, stays out of the interface).
 public func buildInterface(_ program: Program, package: String, modulePath: [String], ownFiles: Set<String>,
-                           workspace: String? = nil,
                            facts: FactStore = FactStore(), whiteBox: Bool = false,
                            reexportModulePath: (ImportDecl) -> [String]? = { _ in nil }) -> ModuleInterface {
     func inModule(_ span: Span) -> Bool { ownFiles.contains(span.file) }
@@ -410,7 +402,7 @@ public func buildInterface(_ program: Program, package: String, modulePath: [Str
     interfaces.sort { $0.name < $1.name }
     funcs.sort { $0.name < $1.name }
     return ModuleInterface(package: package, modulePath: modulePath, types: types, enums: enums,
-                           interfaces: interfaces, functions: funcs, reexports: reexports, workspace: workspace)
+                           interfaces: interfaces, functions: funcs, reexports: reexports)
 }
 
 // The `.nmi` bytes: pretty, key-sorted JSON, so the arrays' name-sort makes a byte diff mean a real

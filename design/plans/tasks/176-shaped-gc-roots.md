@@ -443,7 +443,7 @@ collector still finds and fixes up exactly the references that are live.
     (`COMPILE_ENV=NOMU_NO_INLINE=1`); a nested-call inlining case (`f(g())`). It needs harness work first,
     designed as [155](155-integration-suite-harness.md) Phase 3: a matrix declared once in the manifest
     (pipelines and GC legs applied to a group of fixtures), one binary per build configuration (a quick version
-    there; the real one is [198](198-compiler-flag-system.md)), named settings, stable names for expanded runs,
+    there; the real one is [198](198-build-configuration.md)), named settings, stable names for expanded runs,
     tiers, and `run.sh` retired.
     **Built.** The `shape` group (`tests/fixtures/shape_matrix/*`) runs every case across the `pipeline` and
     `gc` dimensions ([155](155-integration-suite-harness.md) Phase 3); the erased-layout cases, which allocate

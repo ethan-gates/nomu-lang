@@ -32,7 +32,7 @@ public func checkDuplicates(_ program: Program, into diags: DiagnosticSink) {
 
 private func record(_ name: String, _ span: Span, _ table: inout [String: Span], _ what: String, _ diags: DiagnosticSink) {
     if let first = table[name] {
-        diags.error("duplicate \(what) '\(name)' — already declared at \(first.file):\(first.begin.line):\(first.begin.col)", at: span)
+        diags.error("duplicate \(what) '\(name)' — already declared at \(first.displayFile):\(first.begin.line):\(first.begin.col)", at: span)
     } else {
         table[name] = span
     }

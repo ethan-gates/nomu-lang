@@ -7,8 +7,8 @@ public final class Workspace {
     public let identity: WorkspaceIdentity
     public let root: String
     public let tree: SourceTree
-    public let isEmbedded: Bool
-    // The `nomu.yaml` it was read from; nil for a loose build.
+    public let isLanguageWorkspace: Bool
+    // The `nomu.yaml` it was read from; nil only for the placeholder root of a build with no workspace.
     public let configFile: String?
     // This workspace's pins: alias → the pinned workspace's identity. Filled as pins load.
     public internal(set) var pins: [String: WorkspaceIdentity] = [:]
@@ -18,9 +18,9 @@ public final class Workspace {
     private var missing: Set<String> = []
     let clock: PlanClock
 
-    init(identity: WorkspaceIdentity, root: String, tree: SourceTree, isEmbedded: Bool, configFile: String?,
+    init(identity: WorkspaceIdentity, root: String, tree: SourceTree, isLanguageWorkspace: Bool, configFile: String?,
          configPins: [WorkspaceConfig.Pin], clock: PlanClock) {
-        self.identity = identity; self.root = root; self.tree = tree; self.isEmbedded = isEmbedded
+        self.identity = identity; self.root = root; self.tree = tree; self.isLanguageWorkspace = isLanguageWorkspace
         self.configFile = configFile; self.configPins = configPins; self.clock = clock
     }
 
@@ -48,12 +48,15 @@ public struct Package {
 }
 
 // The workspaces a build reaches: the one it starts in, every workspace pinned from there (pins at any depth,
-// D6), and the embedded `nomu` workspace. Loading reads each `nomu.yaml` once and checks identities;
+// D6), and the language workspace. Loading reads each `nomu.yaml` once and checks identities;
 // packages and module listings are read on demand and cached. Every error is collected in `diagnostics`.
 public final class WorkspaceSet {
     public private(set) var root: Workspace
     public private(set) var byIdentity: [WorkspaceIdentity: Workspace] = [:]
     public private(set) var diagnostics: [PlanDiagnostic] = []
+    // No `nomu.yaml` at or above the entry: a build needs a workspace (modules.md §Manifest), so planning
+    // stops at the error in `diagnostics`.
+    public private(set) var missingWorkspace = false
 
     private let disk: SourceTree
     private var byRoot: [String: Workspace] = [:]
@@ -63,30 +66,38 @@ public final class WorkspaceSet {
     public let clock: PlanClock
 
     // Load the workspaces for a build entered at `entry` (a source file or a module directory on `disk`).
-    // `includeEmbedded` adds the embedded `nomu` workspace.
-    public init(entry: String, disk: SourceTree = DiskTree(), includeEmbedded: Bool, clock: PlanClock = PlanClock()) {
+    // `includeLanguageWorkspace` adds the language workspace.
+    public init(entry: String, disk: SourceTree = DiskTree(), includeLanguageWorkspace: Bool, clock: PlanClock = PlanClock()) {
         self.disk = disk
         self.clock = clock
         let start = Self.directory(of: entry, in: disk)
         // A placeholder until the real root loads.
-        root = Workspace(identity: looseWorkspaceIdentity, root: start, tree: disk, isEmbedded: false,
+        root = Workspace(identity: WorkspaceIdentity(scope: "", name: ""), root: start, tree: disk, isLanguageWorkspace: false,
                          configFile: nil, configPins: [], clock: clock)
-        clock.measure(.workspaces) { load(from: start, includeEmbedded: includeEmbedded) }
+        clock.measure(.workspaces) { load(from: start, includeLanguageWorkspace: includeLanguageWorkspace) }
     }
 
-    private func load(from start: String, includeEmbedded: Bool) {
-        if let wsRoot = Self.ancestor(of: start, containing: "nomu.yaml", in: disk) {
-            let canonical = disk.canonical(wsRoot) ?? wsRoot
-            if let ws = loadDiskWorkspace(at: canonical, pinnedFrom: nil) { root = ws }
-        } else {
-            // A loose build: rooted at the entry's package (its nearest `pkg.json`), else the entry's directory.
-            let looseRoot = Self.ancestor(of: start, containing: "pkg.json", in: disk) ?? start
-            root = Workspace(identity: looseWorkspaceIdentity, root: looseRoot, tree: disk, isEmbedded: false,
-                             configFile: nil, configPins: [], clock: clock)
-            register(root, claimedAt: nil)
+    private func load(from start: String, includeLanguageWorkspace: Bool) {
+        guard let wsRoot = Self.ancestor(of: start, containing: "nomu.yaml", in: disk) else {
+            missingWorkspace = true
+            report(PlanDiagnostic(Self.missingWorkspaceMessage(start)))
+            return
         }
-        if includeEmbedded { loadEmbedded() }
+        let canonical = disk.canonical(wsRoot) ?? wsRoot
+        if let ws = loadDiskWorkspace(at: canonical, pinnedFrom: nil) { root = ws }
+        if includeLanguageWorkspace { loadLanguageWorkspace() }
         loadPins()
+    }
+
+    // The root of the workspace holding `dir`: the nearest directory at or above it with a `nomu.yaml`; nil
+    // when there is none (a build then fails with `missingWorkspaceMessage`).
+    public static func workspaceRoot(above dir: String, disk: SourceTree = DiskTree()) -> String? {
+        ancestor(of: dir, containing: "nomu.yaml", in: disk)
+    }
+
+    public static func missingWorkspaceMessage(_ dir: String) -> String {
+        "no nomu.yaml found at or above '\(dir)' — a build needs a workspace: a nomu.yaml declaring its 'scope' "
+            + "and 'name'"
     }
 
     // MARK: - Loading
@@ -106,16 +117,16 @@ public final class WorkspaceSet {
         let (config, errors) = WorkspaceConfig.parse(bytes, file: file)
         diagnostics += errors
         guard let config else { return nil }
-        let ws = Workspace(identity: config.identity, root: canonicalRoot, tree: disk, isEmbedded: false,
+        let ws = Workspace(identity: config.identity, root: canonicalRoot, tree: disk, isLanguageWorkspace: false,
                            configFile: file, configPins: config.pins, clock: clock)
         guard register(ws, claimedAt: pin) else { return nil }
         return ws
     }
 
-    private func loadEmbedded() {
-        let tree = EmbeddedWorkspace.tree
-        let ws = Workspace(identity: EmbeddedWorkspace.identity, root: EmbeddedWorkspace.root, tree: tree,
-                           isEmbedded: true, configFile: EmbeddedWorkspace.root + "/nomu.yaml", configPins: [], clock: clock)
+    private func loadLanguageWorkspace() {
+        let tree = LanguageWorkspace.tree
+        let ws = Workspace(identity: LanguageWorkspace.identity, root: LanguageWorkspace.root, tree: tree,
+                           isLanguageWorkspace: true, configFile: LanguageWorkspace.root + "/nomu.yaml", configPins: [], clock: clock)
         register(ws, claimedAt: nil)
     }
 
@@ -175,7 +186,7 @@ public final class WorkspaceSet {
 
     // The workspace's packages by name, found by one walk of its tree the first time they are needed. The
     // walk stops at each package root (packages do not nest) and at nested workspaces, and skips `build/`,
-    // dot-directories and symlinks. A duplicate package name, or a reserved one outside the embedded
+    // dot-directories and symlinks. A duplicate package name, or a reserved one outside the language
     // workspace, is reported and the later package dropped.
     public func packages(in ws: Workspace) -> [String: Package] {
         if let r = registries[ws.identity] { return r }
@@ -188,12 +199,14 @@ public final class WorkspaceSet {
             guard let entries = ws.entries(dir) else { return }
             if !isRoot, entries.contains(where: { $0.name == "nomu.yaml" && $0.kind == .file }) { return }
             if entries.contains(where: { $0.name == "pkg.json" && $0.kind == .file }) {
+                // Packages live in subdirectories of their workspace (modules.md §Manifest).
+                if isRoot { _ = hasRootPackage(ws); return }
                 guard let m = manifest(in: ws, packageRoot: dir) else { return }
                 if let prev = registry[m.name] {
                     report(PlanDiagnostic(file: dir + "/pkg.json", "two packages in workspace '\(ws.identity)' are "
                                           + "both named '\(m.name)': '\(prev.root)' and '\(dir)'"))
-                } else if !ws.isEmbedded, reservedPackageNames.contains(m.name) {
-                    report(PlanDiagnostic(file: dir + "/pkg.json", reservedPackageNameError(m.name, at: dir)))
+                } else if !ws.isLanguageWorkspace, let problem = packageNameProblem(m.name, at: dir) {
+                    report(PlanDiagnostic(file: dir + "/pkg.json", problem))
                 } else {
                     registry[m.name] = Package(name: m.name, root: dir, manifest: m)
                 }
@@ -211,6 +224,17 @@ public final class WorkspaceSet {
     // MARK: - Helpers
 
     private func report(_ d: PlanDiagnostic) { diagnostics.append(d) }
+
+    // Whether `ws` has a `pkg.json` at its root, which is an error (packages live in subdirectories,
+    // modules.md §Manifest); reported once per workspace.
+    private var rootPackageChecked: [WorkspaceIdentity: Bool] = [:]
+    func hasRootPackage(_ ws: Workspace) -> Bool {
+        if let known = rootPackageChecked[ws.identity] { return known }
+        let found = ws.tree.kind(of: ws.root + "/pkg.json") == .file
+        rootPackageChecked[ws.identity] = found
+        if found { report(PlanDiagnostic(file: ws.root + "/pkg.json", packageAtWorkspaceRootError(ws))) }
+        return found
+    }
 
     // The directory an entry names: the entry itself if it is a directory, else its parent.
     private static func directory(of entry: String, in tree: SourceTree) -> String {

@@ -30,6 +30,10 @@ and in-workspace builds do not depend on it.
   constraints, the lockfile carries the resolution.
 - **Fetch + cache.** A content-addressed local cache of fetched workspaces (a natural fit with the planned
   mini-Bazel CAS); offline/vendored mode.
+  - *Disk size:* keep one normalized copy of each fetched workspace in the cache and give builds read-only
+    symlinks to it, so no workspace is copied per project or per checkout. This relies on the planner's
+    symlink policy ([192](192-bazel-friendliness.md), from 190.6 F12) following symlinked directories, and
+    on nothing writing through the links.
 - **Trust / integrity / supply chain.** Hash pinning, and whatever verification the ecosystem needs.
 
 ## Decided — workspace identity

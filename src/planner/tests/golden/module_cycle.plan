@@ -1,7 +1,7 @@
-plan for me.app:(root)
+plan for me.app:app
 
 workspaces
   me.app
   nomu.nomu
 
-error @me.app/b/b.nomu:1:1: module import cycle: a → b → a
+error @me.app/app/b/b.nomu:1:1: module import cycle: app/a → app/b → app/a

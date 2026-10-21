@@ -8,12 +8,19 @@
 
 // Resolves byte offsets in one source file to 1-based line/column, and names the file. One per
 // lexed source; a `Span` holds a reference so any consumer can resolve on demand.
+//
+// `name` is the file's identity inside the compiler (modules and interfaces key on it). `displayName` is the
+// path reported to people and tools — diagnostics and debug info. They differ for the language workspace's
+// sources, whose identity is a virtual `<nomu>/…` path and whose reported path is the on-disk copy the driver
+// keeps for reporting.
 public final class SourceMap {
     public let name: String
+    public let displayName: String
     private let lineStarts: [Int]   // byte offset of the start of each line
 
-    public init(name: String, bytes: [UInt8]) {
+    public init(name: String, bytes: [UInt8], displayName: String? = nil) {
         self.name = name
+        self.displayName = displayName ?? name
         var starts = [0]
         for i in 0..<bytes.count where bytes[i] == 0x0A { starts.append(i + 1) }   // '\n'
         lineStarts = starts
@@ -65,6 +72,8 @@ public struct Span: Equatable {
     public var begin: Pos { Pos(offset: startOffset, map: map) }
     public var end: Pos { Pos(offset: endOffset, map: map) }
     public var file: String { map?.name ?? "" }
+    // The path reported for this span's file (diagnostics, debug info); see `SourceMap.displayName`.
+    public var displayFile: String { map?.displayName ?? "" }
 
     // A span reaching from the start of `a` to the end of `b` (same file). Used to give a parent
     // node the range of its first..last child.
@@ -79,7 +88,7 @@ public struct Span: Equatable {
 
 extension Span: CustomStringConvertible {
     // `file:line:col` at the start — the usual diagnostic prefix.
-    public var description: String { "\(file):\(begin.line):\(begin.col)" }
+    public var description: String { "\(displayFile):\(begin.line):\(begin.col)" }
 }
 
 // A `Span` crosses a serialization boundary (the `.bir` body-IR, task 100.5.1) carrying only its byte

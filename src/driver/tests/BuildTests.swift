@@ -2,7 +2,7 @@ import XCTest
 import Foundation
 
 // Builds of real suite fixtures with the `nomu` binary (190.5.2): each module compiles once per build, the
-// host cache serves the embedded workspace on the next build, and a planning error stops the build before
+// host cache serves the language workspace on the next build, and a planning error stops the build before
 // any module compiles. Each test runs `nomu build --report-jobs` on a copy of the fixtures (a build writes
 // under their `build/`) with its own host cache.
 final class BuildTests: XCTestCase {
@@ -79,17 +79,18 @@ final class BuildTests: XCTestCase {
         XCTAssertEqual(try output(of: binary), "23\n")
     }
 
-    // The second build takes every embedded module from the host cache and compiles only the workspace's own.
-    func testHostCacheServesTheEmbeddedWorkspace() throws {
+    // The second build takes every language-workspace module from the host cache and compiles only the
+    // workspace's own.
+    func testHostCacheServesTheLanguageWorkspace() throws {
         let first = try build("tests/fixtures/std_module_import")
         XCTAssertNotNil(first.binary)
-        let embedded = first.compiled.filter { $0.hasPrefix("nomu.nomu:") }
-        XCTAssertTrue(embedded.contains("nomu.nomu:std/prelude"))
-        XCTAssertTrue(embedded.contains("nomu.nomu:runtime"))
+        let language = first.compiled.filter { $0.hasPrefix("nomu.nomu:") }
+        XCTAssertTrue(language.contains("nomu.nomu:std/prelude"))
+        XCTAssertTrue(language.contains("nomu.nomu:runtime"))
 
         let second = try build("tests/fixtures/std_module_import")
         XCTAssertNotNil(second.binary)
-        XCTAssertEqual(second.cached, embedded)
+        XCTAssertEqual(second.cached, language)
         XCTAssertEqual(second.compiled, first.compiled.filter { !$0.hasPrefix("nomu.nomu:") })
     }
 
@@ -154,6 +155,44 @@ final class BuildTests: XCTestCase {
         let details = try run("/usr/bin/codesign", ["-d", "-v", binary]).stderr
         XCTAssertTrue(details.contains("Identifier=\((binary as NSString).lastPathComponent)\n"), details)
         XCTAssertTrue(details.contains("adhoc,linker-signed"), details)
+    }
+
+    // The language workspace's sources are copied under the host cache for reporting, and its modules' debug
+    // info names the copy; a copy holding other sources (a `.digest` mismatch) is replaced.
+    func testLanguageSourcesCopiedForReporting() throws {
+        let r = try build("tests/fixtures/gc_roots_across_modules")
+        XCTAssertNotNil(r.binary)
+        let copy = cache + "/source"
+        let prelude = copy + "/std/prelude/prelude.nomu"
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prelude))
+        let digest = try String(contentsOfFile: copy + "/.digest", encoding: .utf8)
+        let objects = FileManager.default.enumerator(atPath: cache + "/nomu")?.compactMap { $0 as? String }
+            .filter { $0.hasSuffix("prelude.o") } ?? []
+        let object = try Data(contentsOf: URL(fileURLWithPath: cache + "/nomu/" + XCTUnwrap(objects.first)))
+        XCTAssertNotNil(object.range(of: Data((copy + "/std/prelude").utf8)), "debug info names the copy")
+        XCTAssertNil(object.range(of: Data("<nomu>/".utf8)), "no virtual path in debug info")
+
+        try "stale".write(toFile: copy + "/.digest", atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(atPath: prelude)
+        XCTAssertNotNil(try build("tests/fixtures/gc_roots_across_modules").binary)
+        XCTAssertEqual(try String(contentsOfFile: copy + "/.digest", encoding: .utf8), digest)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prelude))
+    }
+
+    // `build`, `run`, `test` and `query` need a workspace (modules.md §Manifest): a package with no `nomu.yaml`
+    // above it fails with one message and compiles nothing.
+    func testCommandsRequireAWorkspace() throws {
+        let dir = (repo as NSString).deletingLastPathComponent + "/loose-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try "{ \"name\": \"loose\" }".write(toFile: dir + "/pkg.json", atomically: true, encoding: .utf8)
+        try "fun main() {}\n".write(toFile: dir + "/main.nomu", atomically: true, encoding: .utf8)
+        for command in ["build", "run", "test", "query"] {
+            let r = try run(nomu, [command, dir], env: ["NOMU_CACHE_DIR": cache])
+            XCTAssertNotEqual(r.status, 0, command)
+            XCTAssertTrue(r.stderr.contains("no nomu.yaml found at or above"), "\(command): \(r.stderr)")
+            XCTAssertEqual(r.stdout, "", command)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir + "/build"))
     }
 
     private func run(_ exe: String, _ args: [String] = [], env: [String: String] = [:]) throws

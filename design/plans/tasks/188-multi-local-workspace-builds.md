@@ -3,8 +3,8 @@
 **Avenue:** Infra · **Type/Lifecycle:** `language-feature · built` (build orchestration + a mangling/
 `.nmi` identity touch) · **Size:** M–L · **Status:** built — all phases done, suite 145/145 (two new
 cross-workspace fixtures `xworkspace-basic` + `xworkspace-alias`). Pulled onto the active chain ahead of
-172/171/182 because the [174](174-prelude-as-packages.md) `core` cutover (174.2) consumes it: the embedded
-`nomu` workspace is the first external workspace a user build references. **188.1 built** (full identity in
+172/171/182 because the [174](174-prelude-as-packages.md) `core` cutover (174.2) consumes it: the language
+workspace is the first external workspace a user build references. **188.1 built** (full identity in
 the `.nmi`: `ModuleInterface.workspace` carries the producer's workspace name, serialized; consumer still
 uses its local name, so in-workspace behavior is unchanged — 143/143). **188.2 built** (`ModuleHome` carries
 the owning workspace name + root; `mangleOrigin` reads it per-module — a no-op in-workspace where every

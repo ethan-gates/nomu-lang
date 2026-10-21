@@ -70,19 +70,22 @@ tree contains only modules.
 Same-package imports use the `pkg` root keyword (below); external-package imports name the package.
 
 **The implicit `import std`.** Every file behaves as if it began with an invisible `import std`, which names
-the standard library's default module, `std/prelude` (`Option`, `Result`, `String`). Everything else in
-`std` is an ordinary explicit import: `import std/math`, `import std/time`. The root `std` always means the
-compiler-embedded standard library; it needs no `dependencies` entry. The package names `std` and `pkg` are
-reserved: a user package named either is a compile error. A file that writes `import std`
-itself (to alias it) uses that import in place of the implicit one. The implicit import is the whole
-mechanism, so prelude names follow the normal import rules (`std.Option` qualifies), and moving a decl in or
-out of the prelude is moving it between `std` modules (task [174](../plans/tasks/174-prelude-as-packages.md) §174.3.2).
+the standard library's default module, `std/prelude` (`Option`, `Result`, `String`). Everything else in `std`
+is an ordinary explicit import: `import std/math`, `import std/time`. The root `std` always means the standard
+library in the language workspace (below); it needs no `dependencies` entry. The package names `std` and `pkg`
+are reserved: a user package named either is a compile error. A file that writes `import std` itself (to alias
+it) uses that import in place of the implicit one. The implicit import is the whole mechanism, so prelude
+names follow the normal import rules (`std.Option` qualifies), and moving a decl in or out of the prelude is
+moving it between `std` modules (task [174](../plans/tasks/174-prelude-as-packages.md) §174.3.2).
 
-**`std` is the gateway to the embedded library.** The implicit `import std` is the only implicit import. The
-embedded `core` package holds what depends on compiler internals (`ManagedBuffer`, whose tail allocation and
-operations are compiler intrinsics), so that `std` stays ordinary Nomu with as little magic as possible.
-Only `std`'s modules may import `core`; elsewhere `import core` is a compile error (unless the importing
-package lists a package of its own workspace named `core` in its `dependencies`, which the import then names). A user reaches anything in `core` through `std`.
+**`std` is the gateway to the language workspace.** The *language workspace* is the workspace the compiler
+carries: its packages are `core`, `runtime` and `std`, and its identity is `nomu.nomu`. The implicit
+`import std` is the only implicit import. The `core` package holds what depends on compiler internals
+(`ManagedBuffer`, whose tail allocation and operations are compiler intrinsics), so that `std` stays ordinary
+Nomu with as little magic as possible. Only `std`'s modules may import `core`. To every user workspace the
+language workspace's `core` does not exist: `core` is an ordinary package name there, resolved like any other
+(it names the workspace's own or a pinned workspace's `core` package when listed in `dependencies`), and no
+diagnostic confirms the language workspace's. A user reaches anything in `core` through `std`.
 
 **Leaning.** Type-directed resolution of a bare-name clash (Swift-style) is the intended model, and it
 depends on keeping expression-level inference cheap — see [Type inference dependency](#type-inference-dependency).
@@ -167,6 +170,16 @@ other packages.
 
 **Decided (two files, one per level).** The package and the workspace each have their own file; a
 module has none.
+
+**A workspace is required.** `nomu build`, `run`, `test` and `query` need a `nomu.yaml` at or above the
+target, and fail with a clear message when there is none; there are no loose builds. **So is a package:**
+every module needs a `pkg.json` at or above it within its workspace, declaring the package's `name`, which
+follows the path-component rule (`[a-z][a-z0-9_]*`); there is no implicit package. **Packages live in
+subdirectories of their workspace:** a `pkg.json` at the workspace root is an error, so no module sits at
+the root, every module has a path, and its binary is named after its last path component. A new project is
+`nomu.yaml` plus `<name>/pkg.json` and `<name>/main.nomu`, and a second package is a sibling directory.
+`nomu compile`, the per-module job, needs neither `nomu.yaml` nor `pkg.json`: its job file carries
+everything it reads.
 
 - **Package** — `pkg.json`, at the package root. Holds package name, version, dependencies, the
   **default module** (the leaf module a bare package name forwards to, for `import`/`build`/`run`; a
@@ -367,8 +380,7 @@ canonical type encoding.
 (interface), and `.bir` (generic and inlinable-non-generic body IR). Each module has its own directory under
 the building **workspace**'s `build/`, at its workspace-relative path (`build/app/cli/` holds `cli.o`,
 `cli.nmi`, and the binary `cli`); another workspace's modules sit under `build/_external/<scope>.<name>/`.
-The runtime archive and the embedded `nomu` workspace's modules live in a per-host cache instead. Absent a
-workspace marker, a loose package is its own build root. (Layout:
+The runtime archive and the language workspace's modules live in a per-host cache instead. (Layout:
 [190](../plans/tasks/190-explicit-module-builds.md) D2, D4.)
 - `.nmi` is **body-free** and carries the API contract only: signatures, type layouts, generic
   signatures + bounds, conformances, witness / value-witness layouts + per-type GC trace metadata, and

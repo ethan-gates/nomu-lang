@@ -17,7 +17,7 @@ Three findings in the stackmap handling of both stack walkers: the C walker (`no
 `gc_lookup`, `nomu_gc_walk_context` in `runtime.c`, used under the default `RT_SCHED_C` plan) and the
 self-hosted walker (`rtCollectRoots`, `rtWalkFrom` in `src/stdlib/runtime.nomu`, used under
 `RT_SCHED_NOMU`), plus the ordinals emitted in `LLVMGenGCMaps.swift`. All hold since modules became
-separate objects (100.4) and the embedded workspace did (174); 190 made them visible by changing the link
+separate objects (100.4) and the language workspace did (174); 190 made them visible by changing the link
 order.
 
 - **Lost stackmaps (serious).** Every object carries its own `__llvm_stackmaps` blob, and the linker places
@@ -230,8 +230,9 @@ The budget is under 1 ms of GC setup for a 2M-line program. Any runtime build re
 
 ## Refs
 
-- `src/runtime/embedded/runtime.c` — `nomu_gc_stackmap_init`, `gc_lookup`, `nomu_gc_walk_context`,
-  `nomu_shape_desc_for_ordinal`, `rt_gc_parked_anchors`.
-- `src/stdlib/runtime.nomu` — `rtStackmapEnd`, `rtCollectRoots`, `rtWalkFrom`.
+- `src/stdlib/runtime.nomu` — the one stack walker since 197 retired the C one: `rtFrameIndex`,
+  `rtFrameLookup`, `rtFrameShapes`, `rtCollectRoots`, `rtWalkFrom`, `rtStackmapEnd`.
+- `src/runtime/embedded/runtime.c` — `nomu_gc_frameidx_check` (aborts at startup when the index is missing).
 - `src/llvmgen/LLVMGenGCMaps.swift` — `shapeOrdinal`, `emitShapeOrdinalTable`.
-- `src/driver/sources/Driver.swift` — `linkBinary`.
+- `src/driver/sources/FrameIndex.swift` — the index step; `CodeSignature.swift` — re-signing;
+  `Driver.swift` — `linkBinary`.

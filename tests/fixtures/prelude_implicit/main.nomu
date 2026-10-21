@@ -1,7 +1,7 @@
 // The implicit `import std` (task 174): `Option`, `Result` and `String` (with its methods) resolve with no
 // import, as if the file began with `import std`, and the `std.` qualifier names that prelude module. The
 // object-symbol assertions on this fixture pin single definition: the program's own object defines no
-// runtime, `core` or `std` function (those live once, in the embedded `nomu` workspace's objects).
+// runtime, `core` or `std` function (those live once, in the language workspace's objects).
 fun half(n: Int) -> Result<Int, String> {
     if n % 2 == 0 { return .ok(value: n / 2) }
     return .err(error: "odd")

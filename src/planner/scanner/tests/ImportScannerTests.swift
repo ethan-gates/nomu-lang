@@ -60,7 +60,9 @@ final class ImportScannerTests: XCTestCase {
         let missing = scan("import\nfun main() {}\n")
         XCTAssertEqual(missing.imports, [])
         XCTAssertEqual(missing.errors.first?.message, "expected a name after 'import', got keyword 'fun'")
-        XCTAssertEqual(missing.errors.first?.location.line, 2)
+        // Reported just past `import`, on the import's own line.
+        XCTAssertEqual(missing.errors.first?.location.line, 1)
+        XCTAssertEqual(missing.errors.first?.location.column, 7)
 
         let slash = scan("import a/\n")
         XCTAssertEqual(slash.errors.first?.message, "expected a name after '/'")
@@ -185,6 +187,38 @@ final class ImportScannerTests: XCTestCase {
         XCTAssertEqual(scan("import café\n").imports, [])
     }
 
+    // Malformed import headers: the scanner and the parser reject each one with the same message at the same
+    // position (just past the token that wants a name). The planner reports the scanner's error, so this is
+    // what a user sees; the parser must agree for files that reach it another way.
+    func testMalformedHeadersMatchParser() {
+        let sources = [
+            "import a/",
+            "import a/\n\nfun main() {}\n",
+            "import a as\nfun main() {}\n",
+            "import fun\n",
+            "import\n",
+            "public import\nfun main() {}\n",
+            "test import a/true\n",
+            "import a as 3\nimport b\n",
+            "import a/ /b\n",
+            "import pkg/{\n",
+        ]
+        for source in sources {
+            let diags = DiagnosticSink()
+            var lexer = Lexer(source, file: "t", diagnostics: diags)
+            var parser = Parser(lexer.tokenize(), diagnostics: diags)
+            _ = parser.parse()
+            guard let parsed = diags.diagnostics.first else { XCTFail("parser accepted \(source)"); continue }
+            let scanned = scan(source)
+            XCTAssertEqual(scanned.errors.count, 1, source)
+            XCTAssertEqual(scanned.errors.first?.message, parsed.message, source)
+            XCTAssertEqual(scanned.errors.first?.location.offset, parsed.span.startOffset, source)
+            XCTAssertEqual(scanned.errors.first?.location.line, parsed.span.begin.line, source)
+            XCTAssertEqual(scanned.errors.first?.location.column, parsed.span.begin.col, source)
+            XCTAssertEqual(scanned.errors.first?.location.line, 1, source)
+        }
+    }
+
     // The suite's fixtures and examples, through runfiles.
     func testConformsOnCorpus() throws {
         let env = ProcessInfo.processInfo.environment
@@ -204,7 +238,7 @@ final class ImportScannerTests: XCTestCase {
         XCTAssertGreaterThan(checked, 100)
     }
 
-    // The embedded library the compiler carries (`core`, `runtime`, `std`).
+    // The language workspace's sources, which the compiler carries (`core`, `runtime`, `std`).
     func testConformsOnEmbeddedSources() {
         var sources = [(EmbeddedSources.preludeName, EmbeddedSources.preludeSource),
                        (EmbeddedSources.runtimePreludeName, EmbeddedSources.runtimePreludeSource)]

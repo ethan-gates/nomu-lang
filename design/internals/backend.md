@@ -35,6 +35,10 @@ The facts the moving GC rests on, folded here when the M6 spec retired (the ship
 
 ## 3. Symbol mangling — Decided (M4.15)
 
+**Not yet built as specified:** `Mangle.sanitize` folds separators to `_`, which collides, and generic
+instances keep raw `/`, `@`, `<`, `>`. [190](../plans/tasks/190-explicit-module-builds.md) 190.6 F2 builds
+this scheme, extends its code table (`<` 93, `>` 94, `,` 95, `:` 96) and adds a demangler.
+
 Generated Nomu symbols share C's global namespace, so an unmangled name matching a libc symbol (`abs`, `read`, `free`, `time`, …) is a compile/link collision (surfaced when the prelude's `abs` clashed with libc `abs`). Every **globally-visible generated identifier** is therefore mangled.
 
 **Stale-doc correction (found during modules planning, `plans/tasks/100-modules.md`):** the intended "one module — `src/codegen/sources/Mangle.swift`, the single swap point" no longer exists. There is no `src/codegen/` and no `Mangle.swift`; the logic is **spread** — generic-argument 9-encoding lives in `midend/sources/Monomorphize.swift`, and `nomu_` name construction is scattered across `llvmgen/*` (`LLVMGenCallables`, `SSAIRToLLVM`, `LLVMGen`, …), with "Mangle" surviving only in comments. Task 100.2 (which extends mangling to encode the package + module path) should **consolidate mangling back into a single capability module** (154-style caseless-enum namespace) to restore the swap point.

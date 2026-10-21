@@ -14,6 +14,16 @@ whose inputs changed, plus the modules whose dependencies changed in a way that 
 boundary, and reuses cached artifacts (`.nmi`, `.o`, escape summaries) for everything else. The output of an
 incremental build is bit-for-bit the output of a clean build.
 
+**Two parts.** [190](190-explicit-module-builds.md) guarantees a normalized build graph for a single
+`nomu build` of one root module: each module compiles once, and nothing persists across invocations except
+the per-host cache. 172 extends that in two parts:
+1. **Several root modules in one build.** `nomu build` takes several root modules and plans one graph over
+   all of them, so a module they share compiles once and their jobs run together.
+2. **Caching modules across builds.** Module outputs are kept in a store keyed by a hash of their inputs,
+   and a build reuses every entry whose key matches (the rest of this doc).
+
+Both parts reshape `build/`, so the layout questions 190 deferred land here (190.6 F3, F6).
+
 The invalidation lever already exists: the `.nmi` is sectioned with an **ABI hash** and a **perf hash**
 (164.4.2 — `ModuleInterface.abiHash`/`perfHash`), where `abiHash` is a function of the ABI section alone. A
 module body or perf-fact edit that leaves the ABI section byte-identical must **not** rebuild its dependents.
@@ -35,6 +45,20 @@ reuses 172's keying + store. 172 ships first and stands alone; 136 is its succes
 a competitor.
 
 ## Design surface — decisions to settle in the design session
+
+**From [190](190-explicit-module-builds.md) 190.6: the `build/` layout.**
+- *Overlapping invocations (F3).* Today's unit directories are written in place, so two `nomu build`
+  invocations running at once in one workspace can tear reads, mix configurations and mix sources;
+  accepted until the store lands. A store whose outputs are immutable once published, published
+  atomically, at paths keyed by their inputs, makes overlapping invocations safe by construction: same
+  inputs share a result, different inputs never touch each other's files. **Direction:** at most one `nomu`
+  invocation at a time per workspace, with several root modules allowed in one build (part 1), so shared
+  work such as the runtime archive is planned once instead of raced (190.6 F22). How `build/` presents the store (links, a manifest) is
+  too.
+- *Stale layouts (F6).* A file left by an older layout where a unit directory now goes fails the build with
+  an opaque "File exists". The redesigned layout should say how a stale or foreign layout is detected and
+  cleared. (F6's other half, a clash between the workspace-root module's binary and a child module's
+  directory, is gone: packages, and so modules, live below their workspace's root; 190.6 F14.)
 
 Each item lists the options, then the current lean. Nothing here is locked; this is the agenda.
 
@@ -131,6 +155,9 @@ command, add a size-bounded LRU once the cache is shared.**
 
 ## Dependencies & triggers
 
+- **Depends on:** [198](198-build-configuration.md) (build configuration). Every setting that changes compiled
+  output enters the key through the configuration's canonical form, and every workspace compiles under a
+  defined configuration; the key is designed against 198's settings.
 - **Rides:** [164](164-formal-inference-stage.md) §164.4.2 (sectioned `.nmi`, independent ABI/perf hashes —
   the invalidation lever) + §164.4.3 (per-definition perf section); the content-addressed runtime-archive
   cache (the store model); [100](100-modules.md) §100.4.1/.2 (`.nmi` + per-module objects).
@@ -147,9 +174,39 @@ command, add a size-bounded LRU once the cache is shared.**
 2. Shared/global cache layer + RBE action-cache mapping — now or deferred behind the same key.
 3. Granularity floor: module-level only here, or a first step toward per-definition keying (the bridge to
    136).
-4. Eviction policy and cache-size governance once shared.
+4. Eviction policy and cache-size governance once shared (with [199](199-cache-management.md), cache
+   management).
 5. Whether the cache key folds in the GC/runtime archive key (so a runtime change invalidates module objects
    that inlined runtime-subset code).
+6. **Which dependency interfaces enter a module's key** ([190](190-explicit-module-builds.md) 190.6 F15). A
+   release compile needs the transitive `.nmi` closure plus its dependencies' `.bir` (§100.5: specialized
+   bodies reach anything their producers could see), so its key covers them; an ABI change deep in the graph
+   then invalidates every module above it. A debug compile needs only direct `.nmi` (and the types visible
+   signatures name), so its key could be narrower; whether to key the two modes differently is open.
+7. **The key hash** ([190](190-explicit-module-builds.md) 190.6 F16). The cache serves one execution host;
+   remote caching and remote execution are Bazel's ([192](192-bazel-friendliness.md)), so collisions matter
+   only by accident and the hash need not be cryptographic. Today it is 64-bit FNV-1a (`Hasher64`). A
+   replacement must meet all of:
+   - no dependencies: implementable in Swift, and later in Nomu, at a reasonable size (ideally under 20 KB
+     and 1000 lines);
+   - overall throughput at least FNV-1a's;
+   - acceptable latency on small inputs (it need not beat FNV-1a there, but nothing egregious);
+   - collision probability similar to 64-bit FNV-1a or better.
+
+   Candidates to measure: FNV-1a at 128 bits (same code, wider state) and an in-tree XXH3 (64 or 128 bits).
+   Accidental-collision odds for a 64-bit key: about N²/2⁶⁵ for N entries (about 3 × 10⁻⁸ at a million).
+8. **Re-audit how key inputs are hashed** (190.6 F25): the embedded sources, the runtime key and the
+   embedded tree are hashed once per process today; check that every input of the new keys is too.
+9. **The compiler's identity in the key** ([190](190-explicit-module-builds.md) 190.6 F5). Today it is the git
+   commit the compiler was built from, so uncommitted compiler changes reuse stale entries. The identity
+   must change whenever compiled output can, and should stay put when it cannot, since most compiler
+   rebuilds leave output unchanged and every identity change rebuilds the whole cache. Candidates: a hash of
+   the compiler binary (exact, about 20 ms for 59 MB and nearly free when remembered per inode, size and
+   modification time, but it changes on every compiler rebuild); the commit plus a hash of the dirty tree
+   (cheap; no protection outside git; needs limiting to compiler paths); a Bazel-computed hash of the
+   compiler's sources (exact to source, independent of git; misses toolchain changes unless included);
+   manual format and ABI versions (stable, but misses changes nobody versioned). A combination may fit:
+   for example, a coarse identity for the cache plus a format/ABI check at load.
 
 ## Refs
 

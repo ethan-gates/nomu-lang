@@ -21,8 +21,8 @@ import Foundation
 // A record's shape ordinals are numbered per object, so they resolve in the shape table of the object its
 // blob came from (`{ count, then a descriptor type-id per ordinal }`); the step checks every ordinal against
 // it. Positions are relative to the stackmaps section, so the index holds no pointers to relocate (the image
-// slides as a whole). Readers: `nomu_gc_stackmap_init`/`gc_lookup` (runtime.c), `rtFrameLookup`
-// (runtime.nomu).
+// slides as a whole). Reader: `rtFrameLookup` (runtime.nomu); `nomu_gc_frameidx_check` (runtime.c) aborts at
+// startup when the index is missing.
 enum FrameIndex {
     static let segment = "__DATA_CONST"
     static let section = "__nomu_frameidx"

@@ -82,8 +82,8 @@ public enum ManifestError: Error, CustomStringConvertible {
     }
 }
 
-// Load `<packageRoot>/pkg.json`. Returns nil when absent (an unmanifested tree still compiles under a
-// default identity); throws on a present-but-invalid manifest.
+// Load `<packageRoot>/pkg.json`. Returns nil when absent (a build then reports the module as in no package);
+// throws on a present-but-invalid manifest.
 public func loadManifest(packageRoot: String) throws -> Manifest? {
     let path = packageRoot + "/pkg.json"
     guard let data = FileManager.default.contents(atPath: path) else { return nil }
@@ -96,8 +96,8 @@ public func decodeManifest(_ data: Data, path: String) throws -> Manifest {
     catch { throw ManifestError.malformed(path: path, detail: "\(error)") }
 }
 
-// Package names a user package may not take: `std` is the compiler-embedded standard library (the import root
-// `std` always resolves to it), and `pkg` is the same-package import root keyword. The embedded `nomu`
+// Package names a user package may not take: `std` is the language workspace's standard library (the
+// import root `std` always resolves to it), and `pkg` is the same-package import root keyword. The language
 // workspace's own `std` package is the one legitimate holder; the driver exempts it.
 public let reservedPackageNames: Set<String> = ["std", "pkg"]
 
@@ -106,6 +106,3 @@ public func reservedPackageNameError(_ name: String, at path: String) -> String 
     return "package name '\(name)' is reserved for \(what) — rename the package in '\(path)/pkg.json'"
 }
 
-// The default package identity when no manifest is present. `main` matches the implied package the
-// mangler assumes today; task 100.2.6 makes the encoding explicit.
-public let defaultPackageName = "main"

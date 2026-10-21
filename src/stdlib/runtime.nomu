@@ -326,8 +326,7 @@ fun rtI32(base: RawPtr, off: Int) -> Int {
 // then per blob the position of its object's shape-ordinal table − stackmaps start }. A stack size of
 // 2^32 − 1 marks a frame of dynamic size (a runtime-sized alloca); the pcsp walk finds its FP from its
 // callee's frame record instead. A
-// shape table (`__nomu_shape_table`, one per object) is { count, then a descriptor type-id per ordinal }. The
-// C walker reads the same index (`gc_lookup`, runtime.c).
+// shape table (`__nomu_shape_table`, one per object) is { count, then a descriptor type-id per ordinal }.
 
 // The index's start, or null when the binary has none (the C runtime aborts on a missing index).
 fun rtFrameIndex() -> RawPtr {

@@ -41,14 +41,18 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
         │        complements 179 (value-level GC classification)
         ├── 171  modules cleanup — cross-module generics residuals           (perf-accuracy)
         │        interacts with 170 (method-level generics), 118 (associated types)
+        ├── 203  symbol encoding — one injective mangling for every family   (correctness) ◀ next
         └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)
-            └── 190  explicit module builds — dep scan, one planned graph        ◀ next
+            └── 198  build configuration — modes, per-workspace settings, the cache-key input
 ```
 
-**Order of the next run:** 190, then 172, then 159. GC correctness came before the modules work
+**Order of the next run:** 203, then 198, then 172, then 159. 190 (explicit module builds) is done;
+203 is its last correctness finding (a weak-symbol collision silently links the wrong definition), so it
+goes first. 198 (build configuration) precedes 172,
+whose key takes the configuration's canonical form. GC correctness came before the modules work
 (soundness is Nomu's first priority, `vision.md`). Retiring MMTk and the C scheduler (197) was moved ahead of
 the rest of 176.5, so 176.5 was finished and tested against one runtime; 176.5 is done (176.5.1–176.5.8), and
-195 is done (195.1–195.5), so nothing on this chain now blocks 190 from closing. 176.4 (the escape-promotion placement route) stays with
+195 is done (195.1–195.5), and 190 closed on them. 176.4 (the escape-promotion placement route) stays with
 [148](tasks/148-ssair-optimizer-tier.md) / [179](tasks/179-value-level-gc-classification.md), off this chain.
 
 **What the benchmark needs from the language.** The goal is a language complete enough to benchmark against
@@ -63,7 +67,7 @@ purpose is a meaningful benchmark. It gates the benchmark two
 ways:
 
 - **Dev-productivity** — [190](tasks/190-explicit-module-builds.md) (explicit module builds: one planned
-  graph, each module compiled once), then [172](tasks/172-incremental-build-cache.md) (the content-addressed
+  graph, each module compiled once; done), then [172](tasks/172-incremental-build-cache.md) (the content-addressed
   module-granular cache, keyed on 190's jobs). These make building and iterating large programs bearable.
 - **Perf-accuracy** — [171](tasks/171-modules-cleanup.md) (cross-module generics residuals) and
   [182](tasks/182-cross-module-inlining.md) (cross-module inlining + inlinable stdlib). They change

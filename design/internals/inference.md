@@ -13,6 +13,50 @@ program structure rather than annotated.
 
 ---
 
+## Terms
+
+Each term is defined within the one that encloses it. Code and the rest of this doc are moving to these
+names ([202](../plans/tasks/202-one-inference-phase.md)); older text says "summary" for a declaration's
+escape result and "external" for dependency results.
+
+- **Module inference** — the phase of one module's compile that analyzes the module's lowered code and
+  determines properties of its declarations. It runs once per module, after lowering and before the
+  transforms that use its output (stack promotion, and later others).
+  - **Inputs:**
+    - **the module's lowered code** — the module's one lowering.
+    - **dependency results** — the published results (below) of the modules this module imports, read
+      from their `.nmi`. Module inference reads them wherever the module calls into a dependency; without
+      them such a call takes the worst case.
+  - **Output: the module's inference results** — one collection per module, held in the fact store
+    during the compile. A file is no unit here: a module's files share one namespace and one call graph.
+    - **A declaration's results** — inference results are keyed per declaration (function, method,
+      closure, type, interface requirement) by its symbol. A declaration's results hold one entry per
+      analysis that applies to its kind:
+      - **escape result** (functions, methods, closures) — per parameter, whether an argument passed
+        there can escape; for the return, whether it is fresh, aliases a parameter, or escaped.
+      - **mutating-ness** (methods) and **shareability** (types) — computed by Sema today.
+      - later analyses (uniqueness, fiber locality) add entries.
+    - **Published results** — the part of a module's inference results its `.nmi` carries: those of its
+      public surface, one per definition; a generic definition's result is computed over its erased body.
+      Published results become their consumers' dependency results.
+    - **Local results** — inference results only this compile uses: those of specialized instances,
+      closures and private functions, and per-value facts the transforms read.
+
+**Recursion.** Module inference solves mutually recursive functions together (one call-graph SCC iterated
+to a fixpoint, §Summary and composition); once solved, each declaration's results stand alone. Modules do
+not recurse (the module graph is acyclic), so a module's dependency results are complete before its
+inference runs.
+
+**Parametric results (future shape, open).** A result may relate a function's own parameters and return
+(parameter 0 flows into the return) and stay per declaration. What it cannot express today is dependence
+on what a caller supplies: a closure parameter (whether `map`'s argument escapes depends on the closure),
+an erased generic's conformer, a witness or indirect call in the body. These take the worst case now. A
+precise result for them is parametric: it names unknowns ("escapes if the closure argument's parameter 0
+escapes") that the caller fills in. It still belongs to one declaration; the escape result's shape is what
+grows. §Dynamic dispatch's result slot on interface methods and function types is the start of this.
+
+---
+
 ## Inference inventory
 
 Every dimension Nomu infers (or plans to), with the attributes that drive the design. "Shape" is the

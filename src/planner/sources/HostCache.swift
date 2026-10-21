@@ -1,7 +1,7 @@
 import embedded
 
 // The per-host cache (task 190, D4): language-level artifacts shared by every build on the host and kept
-// across `git clean -dfx`, namely the runtime archive and the embedded `nomu` workspace's modules. Entries are
+// across `git clean -dfx`, namely the runtime archive and the language workspace's modules. Entries are
 // content-keyed, so a present entry is always the right one for its key.
 public enum HostCache {
     // The cache root: `NOMU_CACHE_DIR` when set, else the platform user cache directory
@@ -35,37 +35,48 @@ public enum HostCache {
         #endif
     }
 
-    // The runtime archive's key: the embedded runtime sources, the host architecture and the recipe version.
-    // Editing the runtime rebuilds the compiler, which changes the embedded content and so the key. (The
+    // The runtime archive's key: the embedded runtime sources, the host architecture and the recipe (the
+    // driver's commands that build the archive, `PlanOptions.runtimeRecipe`). Editing the runtime rebuilds the
+    // compiler, which changes the embedded content and so the key; editing a command changes the recipe. (The
     // local `cc` version is deliberately left out: an archive built by an older `cc` still links and runs.)
-    public static let runtimeArchiveKey: String = {
+    public static func runtimeArchiveKey(recipe: [[String]]) -> String {
         var h = Hasher64()
-        h.mix(EmbeddedSources.runtimeHeader)
-        h.mix(EmbeddedSources.runtimeC)
-        h.mix(EmbeddedSources.coreC)
-        h.mix(EmbeddedSources.rtAsmArm64)   // the asm floor is archived in
+        h.mix(runtimeSourcesDigest)
         h.mix(hostArch)
-        h.mix("recipe-2")   // bump when the driver's runtime compile/archive commands change
+        for command in recipe { h.mix(String(command.count)); for arg in command { h.mix(arg) } }
         return h.hex
-    }()
+    }
 
-    // The embedded workspace's key: its sources, the compiler's identity (the git commit it was built from;
+    // The language workspace's key: its sources, the compiler's identity (the git commit it was built from;
     // `.nmi` / `.bir` formats change with the compiler), the host target, and every option that changes the
     // compiled output.
-    public static func embeddedWorkspaceKey(compilerIdentity: String, outputOptions: [String]) -> String {
+    public static func languageWorkspaceKey(compilerIdentity: String, outputOptions: [String]) -> String {
         var h = Hasher64()
-        h.mix(embeddedSourcesDigest)
+        h.mix(languageSourcesDigest)
         h.mix(compilerIdentity)
         h.mix(hostTarget)
         for o in outputOptions { h.mix(o) }
         return h.hex
     }
+
+    // A digest of the language workspace's files (their paths and text).
+    public static var languageSourcesDigest: String { planner.languageSourcesDigest }
 }
 
-// The embedded workspace's files, hashed once per process.
-private let embeddedSourcesDigest: String = {
+// The runtime's C and asm sources, hashed once per process.
+private let runtimeSourcesDigest: String = {
     var h = Hasher64()
-    for f in EmbeddedWorkspace.files() { h.mix(f.path); h.mix(f.text) }
+    h.mix(EmbeddedSources.runtimeHeader)
+    h.mix(EmbeddedSources.runtimeC)
+    h.mix(EmbeddedSources.coreC)
+    h.mix(EmbeddedSources.rtAsmArm64)   // the asm floor is archived in
+    return h.hex
+}()
+
+// The language workspace's files, hashed once per process.
+private let languageSourcesDigest: String = {
+    var h = Hasher64()
+    for f in LanguageWorkspace.files() { h.mix(f.path); h.mix(f.text) }
     return h.hex
 }()
 

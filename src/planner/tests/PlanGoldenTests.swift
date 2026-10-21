@@ -38,8 +38,9 @@ final class PlanGoldenTests: XCTestCase {
     }
 
     func testCoreImportLifted() throws {
-        let files = ["/w/nomu.yaml": "scope: me\nname: app\n", "/w/main.nomu": "import core\n"]
-        try check("core_import_lifted", plan(files, ["/w/main.nomu"], allowCore: true))
+        let files = ["/w/nomu.yaml": "scope: me\nname: app\n", "/w/app/pkg.json": "{\"name\": \"app\"}",
+                     "/w/app/main.nomu": "import core\n"]
+        try check("core_import_lifted", plan(files, ["/w/app/main.nomu"], allowCore: true))
     }
 
     func testResolutionErrors() throws {
@@ -50,9 +51,10 @@ final class PlanGoldenTests: XCTestCase {
 
     func testModuleCycle() throws {
         try check("module_cycle", plan(["/w/nomu.yaml": "scope: me\nname: app\n",
-                                         "/w/main.nomu": "import pkg/a\n",
-                                         "/w/a/a.nomu": "import pkg/b\n",
-                                         "/w/b/b.nomu": "import pkg/a\n"], ["/w/main.nomu"]))
+                                         "/w/app/pkg.json": "{\"name\": \"app\"}",
+                                         "/w/app/main.nomu": "import pkg/a\n",
+                                         "/w/app/a/a.nomu": "import pkg/b\n",
+                                         "/w/app/b/b.nomu": "import pkg/a\n"], ["/w/app/main.nomu"]))
     }
 
     func testPackageCycle() throws {
@@ -69,9 +71,10 @@ final class PlanGoldenTests: XCTestCase {
     func testWorkspaceErrors() throws {
         try check("workspace_errors", plan([
             "/w/nomu.yaml": "scope: me\nname: app\nexternals:\n  dup: ../d\n  gone: ../nowhere\n",
-            "/w/main.nomu": "",
+            "/w/app/pkg.json": "{\"name\": \"app\"}",
+            "/w/app/main.nomu": "",
             "/d/nomu.yaml": "scope: me\nname: app\n",
-        ], ["/w/main.nomu"]))
+        ], ["/w/app/main.nomu"]))
     }
 
     // MARK: - Suite fixtures on disk
