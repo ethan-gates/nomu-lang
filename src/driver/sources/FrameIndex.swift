@@ -9,8 +9,7 @@ import Foundation
 // link map names the object of every blob and of every kept definition, which tells the copies apart.
 //
 // The link reserves a zero-filled `__DATA_CONST,__nomu_frameidx` section (`-sectcreate`); afterwards the
-// index is written into it and the binary is signed (the link runs with `-no_adhoc_codesign`, since a
-// signature made before the patch no longer matches the file).
+// index is written into it and the linker's signature is redone over the patched pages (CodeSignature.swift).
 //
 // Layout, at the first 8-aligned address in the section (`-sectcreate` gives the section byte alignment):
 //   header    { u32 magic 'NFIX', u32 version, u64 count }

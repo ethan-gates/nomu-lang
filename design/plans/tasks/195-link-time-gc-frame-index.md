@@ -1,7 +1,7 @@
 # Link-time GC frame index
 
 **Avenue:** Risk · **Type/Lifecycle:** `correctness · ready-to-build` (driver link step + both stack
-walkers + codegen) · **Size:** L · **Status:** 195.1–195.4 done; 195.5 (the driver writes the signature) remains · **Source:** split
+walkers + codegen) · **Size:** L · **Status:** done (195.1–195.5) · **Source:** split
 from [190](190-explicit-module-builds.md) 190.6 F1 (GC stack scanning unsound across objects). 190 depends
 on it.
 
@@ -88,9 +88,8 @@ The budget is under 1 ms of GC setup for a 2M-line program. Any runtime build re
   `-Wl,-map,<file>`. After the link it reads the binary's `__llvm_stackmaps` and the map, builds the index,
   writes it into the reserved section and signs the binary.
 - **Signing.** On arm64 macOS the linker ad-hoc signs every binary (page hashes) as its last step, and
-  patching afterwards invalidates that signature. The driver links with `-Wl,-no_adhoc_codesign`, patches,
-  then signs once with `codesign -s -` (verified in 195.1: unsigned after the link, valid after signing,
-  correct under GC). Writing the ad-hoc signature in the driver itself, as Go's linker does, is 195.5.
+  patching afterwards invalidates that signature. The patch changes no page count, so the driver keeps the
+  linker's signature and rehashes the pages into its hash slots in place (195.5, `CodeSignature.swift`).
 - **Index.** One sorted entry per function, positions relative to the section start (ASLR slides the image
   as a whole): function address, record offset into `__llvm_stackmaps`, record count, stack size, and the
   source object. The records stay LLVM's; the walkers decode the records of the frames on the stack only.
@@ -211,13 +210,22 @@ The budget is under 1 ms of GC setup for a 2M-line program. Any runtime build re
     default nursery are correct. So the `-self` cases use pressure collection. Cause found and tracked as
     [176](176-shaped-gc-roots.md) 176.5: the reload after a safepoint misses the `struct String` wrapper,
     in both collectors; it predates 195.
-- **195.5 — the driver writes the ad-hoc signature.** Replace the `codesign` process with a code
-  directory of SHA-256 page hashes written by the driver, as Go's linker does: no extra process, one hash
-  of the file. Taken up once 195.2–195.4 work, with the signing cost measured.
+- **195.5 — the driver writes the ad-hoc signature. Done.** Two routes were weighed: keep the linker's
+  signature and redo its page hashes after the patch, or link with `-no_adhoc_codesign` and write the whole
+  signature (load command, `__LINKEDIT` growth, superblob), as Go's linker does. The first was taken: the
+  patch changes no page count, so the code directory keeps its size and layout.
+  - `CodeSignature.resign` (driver) checks that the signature is the linker's form (one code directory,
+    linker-signed ad hoc, SHA-256 over 4 KB pages, no special slots, covering the file up to the signature),
+    hashes every page and writes the hashes over the old ones. Any other form falls back to `codesign`.
+  - The link no longer passes `-no_adhoc_codesign`. The binary is staged in a directory beside the output
+    under its final name, since the linker takes the signature's identifier from the output name.
+  - **Cost** (`gc_roots_across_modules`, opt build, cached modules): signing ~67 ms → ~0.15 ms; the build
+    ~154 ms → ~83 ms. `codesign -v --strict` verifies the result (build test
+    `testBinarySignatureVerifies`).
 
 ## Dependencies & triggers
 
-- 190 depends on all of it, 195.5 included: 190 closes after it.
+- 190 depended on all of it, 195.5 included.
 - See also [194](194-gc-frame-metadata.md) (whether to keep LLVM statepoints; the compact frame format).
 
 ## Refs

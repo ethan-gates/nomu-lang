@@ -651,13 +651,20 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Strin
     let archive = timings.measure("runtime", "archive") { cachedRuntimeArchive(at: runtimeArchive) }
     guard let archive = archive else { return false }
     // `-dead_strip` drops code unreachable from the program's entry, and `-x` strips local symbols.
-    // The binary is linked, indexed and signed under a temporary name, then renamed into place, so it
-    // appears complete in one step (two builds of one program can share the output path).
-    let staging = binPath + ".link-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString.prefix(8))"
-    defer { try? FileManager.default.removeItem(atPath: staging) }
+    // The binary is linked, indexed and signed in a temporary directory beside the output, then renamed into
+    // place, so it appears complete in one step (two builds of one program can share the output path). It
+    // keeps its final name there, since the linker's signature takes its identifier from the output name.
+    let outputDir = (binPath as NSString).deletingLastPathComponent
+    let stagingDir = (outputDir.isEmpty ? "." : outputDir) + "/.link-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString.prefix(8))"
+    guard (try? FileManager.default.createDirectory(atPath: stagingDir, withIntermediateDirectories: true)) != nil else {
+        fputs("error: cannot create '\(stagingDir)'\n", stderr)
+        return false
+    }
+    defer { try? FileManager.default.removeItem(atPath: stagingDir) }
+    let staging = stagingDir + "/" + (binPath as NSString).lastPathComponent
     var linkArgs = ["-o", staging, "-Wl,-dead_strip", "-Wl,-x"] + objects + [archive]
     // The GC frame index (FrameIndex.swift): the link reserves its section and writes a link map; afterwards
-    // the index is written into the binary, which is then signed (unsigned until the patch is in).
+    // the index is written into the binary and its signature's page hashes are redone (CodeSignature.swift).
     let scratch = NSTemporaryDirectory() + "nomu-link-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
     try? FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(atPath: scratch) }
@@ -673,7 +680,7 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Strin
         return false
     }
     linkArgs += ["-Wl,-sectcreate,\(FrameIndex.segment),\(FrameIndex.section),\(reserveFile)",
-                 "-Wl,-map,\(mapFile)", "-Wl,-no_adhoc_codesign"]
+                 "-Wl,-map,\(mapFile)"]
     let linkStatus = timings.measure("link", "cc") { runProcess("/usr/bin/cc", linkArgs) }
     if linkStatus != 0 {
         fputs("error: link failed\n", stderr)
@@ -684,14 +691,23 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Strin
         fputs("error: frame index: \(error)\n", stderr)
         return false
     }
-    // The signature's identifier is the binary's name, as the linker's own ad-hoc signature would give it.
-    let identifier = (binPath as NSString).lastPathComponent
-    let signStatus = timings.measure("link", "codesign") {
-        runProcess("/usr/bin/codesign", ["-s", "-", "-f", "-i", identifier, staging])
-    }
-    if signStatus != 0 {
-        fputs("error: codesign failed for '\(binPath)'\n", stderr)
+    let resigned = timings.measure("link", "sign") { Result { try CodeSignature.resign(binary: staging) } }
+    switch resigned {
+    case .failure(let error):
+        fputs("error: signing: \(error)\n", stderr)
         return false
+    case .success(.signed):
+        break
+    case .success(.unsupported):
+        // A signature in a form the driver does not rewrite: sign with `codesign`, under the same identifier.
+        let identifier = (binPath as NSString).lastPathComponent
+        let signStatus = timings.measure("link", "codesign") {
+            runProcess("/usr/bin/codesign", ["-s", "-", "-f", "-i", identifier, staging])
+        }
+        if signStatus != 0 {
+            fputs("error: codesign failed for '\(binPath)'\n", stderr)
+            return false
+        }
     }
     guard rename(staging, binPath) == 0 else {
         fputs("error: cannot move the linked binary to '\(binPath)': \(String(cString: strerror(errno)))\n", stderr)

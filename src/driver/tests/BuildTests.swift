@@ -144,6 +144,18 @@ final class BuildTests: XCTestCase {
         XCTAssertTrue(quiet.stderr.contains("no GC frame index"), quiet.stderr)
     }
 
+    // The driver redoes the linker's signature after writing the frame index (CodeSignature.swift): the
+    // signature verifies, stays linker-signed ad hoc, and names the binary.
+    func testBinarySignatureVerifies() throws {
+        let r = try build("tests/fixtures/gc_roots_across_modules")
+        let binary = try XCTUnwrap(r.binary)
+        let verify = try run("/usr/bin/codesign", ["-v", "--strict", binary])
+        XCTAssertEqual(verify.status, 0, verify.stderr)
+        let details = try run("/usr/bin/codesign", ["-d", "-v", binary]).stderr
+        XCTAssertTrue(details.contains("Identifier=\((binary as NSString).lastPathComponent)\n"), details)
+        XCTAssertTrue(details.contains("adhoc,linker-signed"), details)
+    }
+
     private func run(_ exe: String, _ args: [String] = [], env: [String: String] = [:]) throws
         -> (status: Int32, stdout: String, stderr: String)
     {

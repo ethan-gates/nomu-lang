@@ -9,8 +9,8 @@ parallel/cheap work tracked in `tasks.md`.
 
 Two epics are live. **Epic A (self-hosted GC + runtime) is the active priority.** MMTk and the C scheduler
 are retired ([197](tasks/197-retire-mmtk-and-c-scheduler.md)): one runtime, the Nomu scheduler and collector.
-The GC-correctness run ([176](tasks/176-shaped-gc-roots.md) 176.5) is done; next are the link-time GC frame
-index's last phase (195.5) and then the **modules build-out** beneath the benchmark, which needs programs large enough to be meaningful and the
+The GC-correctness run ([176](tasks/176-shaped-gc-roots.md) 176.5) and the link-time GC frame index
+([195](tasks/195-link-time-gc-frame-index.md)) are done; next is the **modules build-out** beneath the benchmark, which needs programs large enough to be meaningful and the
 perf-affecting module capabilities real: dev-productivity first (explicit module builds, then the build
 cache), then the perf-relevant capabilities (cross-module generics residuals, cross-module inlining). The
 benchmark against Go and Swift (with 158/159) sits above that, when the language is complete.
@@ -42,14 +42,13 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
         ├── 171  modules cleanup — cross-module generics residuals           (perf-accuracy)
         │        interacts with 170 (method-level generics), 118 (associated types)
         └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)
-            └── 190  explicit module builds — dep scan, one planned graph
-                └── 195  link-time GC frame index — 195.5 (driver-written signature)  ◀ next
+            └── 190  explicit module builds — dep scan, one planned graph        ◀ next
 ```
 
-**Order of the next run:** 195.5, then 190, then 172, then 159. GC correctness came before the modules work
+**Order of the next run:** 190, then 172, then 159. GC correctness came before the modules work
 (soundness is Nomu's first priority, `vision.md`). Retiring MMTk and the C scheduler (197) was moved ahead of
 the rest of 176.5, so 176.5 was finished and tested against one runtime; 176.5 is done (176.5.1–176.5.8), and
-190 now closes after 195. 176.4 (the escape-promotion placement route) stays with
+195 is done (195.1–195.5), so nothing on this chain now blocks 190 from closing. 176.4 (the escape-promotion placement route) stays with
 [148](tasks/148-ssair-optimizer-tier.md) / [179](tasks/179-value-level-gc-classification.md), off this chain.
 
 **What the benchmark needs from the language.** The goal is a language complete enough to benchmark against
