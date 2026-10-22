@@ -250,7 +250,7 @@ struct StructureBuilder {
             return
         }
         if level > top.level {
-            if lastPlain {
+            if lastPlain && bare {
                 report(.multilinePlainScalar, contentSpan(r), "a plain scalar cannot continue onto the next line",
                        fix: "use a block scalar (`|` or `>`) for multi-line text")
             } else {
@@ -266,11 +266,19 @@ struct StructureBuilder {
     // A line stage 2 rejected: it reported already, so this only keeps the walk in step.
     private mutating func invalidLine(_ i: Int) {
         guard !stopped && !ended else { return }
-        sawContent = true
         let r = records[i]
+        let start = Int(r.contentStart)
+        // A directive (`%YAML`) is not content: the `---` after it starts the one document.
+        if start < Int(r.contentEnd) && b[start] == 0x25 { return }
+        sawContent = true
         var indent = 0
-        while Int(r.contentStart) + indent < Int(r.contentEnd) && b[Int(r.contentStart) + indent] == 0x20 {
-            indent += 1
+        while start + indent < Int(r.contentEnd) && b[start + indent] == 0x20 { indent += 1 }
+        // A line indented with a tab was meant to be nested, though how deep is unknown: it stands in for an
+        // owed value rather than leaving it reported missing as well.
+        if start + indent < Int(r.contentEnd) && b[start + indent] == 0x09 {
+            slot?.erred = true
+            lastPlain = false
+            return
         }
         let level = (indent + 1) / 2
         if skipping(level, dash: false) { return }

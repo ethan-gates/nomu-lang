@@ -1,0 +1,6 @@
+map
+  "a": map
+    "b": map
+      "c": str "d"
+    "e": str "f"
+  "g": str "h"

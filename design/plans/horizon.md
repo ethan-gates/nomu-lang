@@ -43,14 +43,13 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
         │        interacts with 170 (method-level generics), 118 (associated types)
         ├── 203  symbol encoding — one injective mangling for every family   (correctness)
         └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)
-            └── 198  build configuration — modes, per-workspace settings, the cache-key input (design firm)
-                └── 200  YAML parser — Nomu's own strict YAML subset                 ◀ next
+            └── 198  build configuration — modes, per-workspace settings, the cache-key input  ◀ next
 ```
 
-**Order of the next run:** 200, then 198, then 203, then 172, then 159. 190 (explicit module builds) is
-done. 200 (the YAML parser) is foremost because 198's configuration files are YAML; 198 is designed
-alongside it and built once it lands. 198 went ahead of 203 by choice; 203 is 190's last correctness finding
-(a weak-symbol collision silently links the wrong definition) and follows it. 198 precedes 172,
+**Order of the next run:** 198, then 203, then 172, then 159. 190 (explicit module builds) and 200 (the
+YAML parser, which 198's configuration files needed) are done; 200's open items are
+[204](tasks/204-yaml-parser-upgrades.md), off this chain. 198 went ahead of 203 by choice; 203 is 190's
+last correctness finding (a weak-symbol collision silently links the wrong definition) and follows it. 198 precedes 172,
 whose key takes the configuration's canonical form. GC correctness came before the modules work
 (soundness is Nomu's first priority, `vision.md`). Retiring MMTk and the C scheduler (197) was moved ahead of
 the rest of 176.5, so 176.5 was finished and tested against one runtime; 176.5 is done (176.5.1–176.5.8), and

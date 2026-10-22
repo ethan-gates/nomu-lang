@@ -1,0 +1,7 @@
+map
+  "k": seq
+    - map
+      "a": int 1
+      "b": seq
+        - int 2
+    - str "c"

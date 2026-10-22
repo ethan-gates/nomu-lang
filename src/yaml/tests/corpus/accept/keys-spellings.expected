@@ -1,0 +1,11 @@
+map
+  "plain key": int 1
+  "double": int 2
+  "single": int 3
+  "": int 4
+  "tab\tkey": int 5
+  "k:x": int 6
+  "-k": int 7
+  "42": int 8
+  "true": int 9
+  "é": int 10

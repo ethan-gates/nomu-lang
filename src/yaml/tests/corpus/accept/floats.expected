@@ -1,0 +1,13 @@
+map
+  "a": float 1.5
+  "b": float -0.5
+  "c": float 0.5
+  "d": float 1.0
+  "e": float 1000.0
+  "f": float -2500.0
+  "g": float inf
+  "h": float -inf
+  "i": float 0.0
+  "j": float 0.0
+  "k": float -0.5
+  "l": float 100000.0

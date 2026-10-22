@@ -69,6 +69,7 @@ public struct YAMLError: Error, Equatable {
         case contentOnBlockHeader
         case blockScalarIndentation     // first content line not exactly two spaces deeper
         case emptyBlockScalar           // a header with no non-blank content line
+        case blockScalarAtEndOfFile     // the file ends inside a block scalar without a final line break
 
         // Scalar typing (spec §11–§16).
         case booleanCase                // `True`, `FALSE`

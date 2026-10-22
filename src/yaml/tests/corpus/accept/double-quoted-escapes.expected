@@ -1,0 +1,6 @@
+map
+  "a": str "\u0000\u0007\u0008\t\n\u000b\u000c\u000d\u001b \"/\\\u0085\u00a0\u2028\u2029Aé😀"
+  "b": str "plain"
+  "c": str ""
+  "d": str "it's # here"
+  "e": str "A~"

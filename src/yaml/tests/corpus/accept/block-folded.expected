@@ -1,0 +1,3 @@
+map
+  "a": str "one two\nthree\n  indented\nfour\n"
+  "b": str "x y"

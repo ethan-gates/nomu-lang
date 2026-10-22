@@ -1,0 +1,4 @@
+seq
+  - str "a\n"
+  - map
+    "k": str "b c"

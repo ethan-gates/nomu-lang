@@ -144,8 +144,10 @@ final class ResolveTests: XCTestCase {
         XCTAssertEqual(block("v: |\n  a\n\n  b\n\n\n"), "a\n\nb\n")
         XCTAssertEqual(block("v: |-\n  a\n\n  b\n\n\n"), "a\n\nb")
         XCTAssertEqual(block("v: |+\n  a\n\n  b\n\n\n"), "a\n\nb\n\n\n")
-        XCTAssertEqual(block("v: |\n  a"), "a")
-        XCTAssertEqual(block("v: |+\n  a"), "a")
+        // A block scalar at the end of a file needs a final line break (spec §20).
+        XCTAssertEqual(parse("v: |\n  a").codes, [.blockScalarAtEndOfFile])
+        XCTAssertEqual(parse("v: |+\n  a\n   ").codes, [.blockScalarAtEndOfFile])
+        XCTAssertEqual(parse("v: |\n  a\n\n").codes, [])
         XCTAssertEqual(block("v: |\n  a\nw: 1\n"), "a\n")
     }
 

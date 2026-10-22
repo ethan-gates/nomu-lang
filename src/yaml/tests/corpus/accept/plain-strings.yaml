@@ -1,0 +1,24 @@
+a: hello world
+b: it's
+c: a:b
+d: a#b
+e: x # comment
+f: -x
+g: ?x
+h: :x
+i: 12:30
+j: 1.2.3
+k: ~a
+l: yes
+m: on
+n: No
+o: Off
+p: y
+q: café
+r: trueish
+s: nullable
+t: 0x
+u: 1e
+v: .
+w: inf
+x: nan

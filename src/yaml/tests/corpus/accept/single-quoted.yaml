@@ -1,0 +1,6 @@
+a: 'it''s'
+b: ''
+c: 'a # b'
+d: '  spaced  '
+e: 'tab	here'
+f: 'back\slash'

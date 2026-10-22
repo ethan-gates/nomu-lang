@@ -1,0 +1,7 @@
+map
+  "a": str "42"
+  "b": str "true"
+  "c": str "null"
+  "d": str ".inf"
+  "e": str "1.5"
+  "f": str "~"

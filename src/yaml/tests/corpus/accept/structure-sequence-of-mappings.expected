@@ -1,0 +1,6 @@
+seq
+  - map
+    "name": str "x"
+    "v": int 1
+  - map
+    "name": str "y"

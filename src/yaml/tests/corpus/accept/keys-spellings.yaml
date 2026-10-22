@@ -1,0 +1,10 @@
+plain key: 1
+"double": 2
+'single': 3
+"": 4
+"tab\tkey": 5
+k:x: 6
+-k: 7
+"42": 8
+'true': 9
+é: 10

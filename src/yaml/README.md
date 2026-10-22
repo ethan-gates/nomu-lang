@@ -11,6 +11,10 @@ Nomu's YAML library: a strict subset of YAML 1.2 Core, read by the manifests and
   changed in the other, and `tests/ParseTests.swift` checks them.
 - Edits (`sources/Edit.swift`): `YAMLEdits` turns operations into byte replacements and parses the result into
   a new document; bytes outside the edited values are kept exactly.
+- Codable: `YAMLDecoder` (`sources/Decode.swift`) decodes in place with the Core types and rejects unknown keys;
+  `YAMLEncoder` (`sources/Encode.swift`) writes through the edit renderer.
+- `tests/corpus`: accepted documents with their hand-written Core values (`.expected`) and rejected ones with
+  their errors (`.errors`); `CorpusTests.swift` describes the notation. Add a case for every rule change.
 - Positions are byte offsets (`ByteSpan`); `LineIndex` resolves them to 1-based line and byte column.
 - Vector code uses only the SIMD operations listed in `sources/SIMD.swift`; the rest lower to per-lane
   code. Benchmark: `bazel run -c opt //src/yaml/bench:yamlbench -- [megabytes] [iters] [file ...]`; it

@@ -163,7 +163,9 @@ final class StructureTests: XCTestCase {
         assertErrors("key: hello\n  world\n", [.multilinePlainScalar], at: 13)
         assertErrors("hello\nworld\n", [.multilinePlainScalar])
         assertErrors("- a\n  b\n  c\n- d\n", [.multilinePlainScalar])
-        assertErrors("a: b\n  c: d\ne: f\n", [.multilinePlainScalar])
+        // A deeper line with a key or dash cannot continue a plain scalar: it is nesting under a complete value.
+        assertErrors("a: b\n  c: d\ne: f\n", [.indentationJump])
+        assertErrors("a: b\n  - c\n", [.indentationJump])
     }
 
     // MARK: Indentation and collections

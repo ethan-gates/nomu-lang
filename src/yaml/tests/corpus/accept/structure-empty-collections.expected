@@ -1,0 +1,6 @@
+map
+  "a": seq []
+  "b": map {}
+  "c": seq
+    - seq []
+    - map {}

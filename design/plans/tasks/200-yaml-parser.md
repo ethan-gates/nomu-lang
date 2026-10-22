@@ -1,6 +1,6 @@
 # YAML parser — Nomu's own strict YAML subset
 
-**Avenue:** Infra · **Type/Lifecycle:** `tooling · driver` · **Status:** building; 200.1–200.7 and 200.12.1–200.12.3 done (200.12.4 deferred); 200.8 next · **Source:** [163](163-manifest-yaml.md) (manifests move to YAML)
+**Avenue:** Infra · **Type/Lifecycle:** `tooling · driver` · **Status:** done — 200.1–200.9 and 200.12.1–200.12.3; the open items moved to [204](204-yaml-parser-upgrades.md) · **Source:** [163](163-manifest-yaml.md) (manifests move to YAML)
 and [198](198-build-configuration.md) G17 (configuration files are YAML).
 
 ## Deliverable
@@ -278,13 +278,27 @@ complicates splitting the input.
   checks) and word-wise key comparison gave the rest. What remains is Codable's own: a type-erasing box
   allocated per keyed container (`_KeyedDecodingContainerBox`), a generic metadata lookup per container,
   dynamic dispatch and an existential `CodingKey` per field, and coding-path arrays for nested values.
-- **200.9** The hand-written equivalence corpus.
-- **200.10** Follow-up: fuzzing and differential testing.
-- **200.11** Follow-up: move duplicate-key hashing to the shared fast hash once [172](172-incremental-build-cache.md)
-  question 7 settles it. Today's `KeyHash` is a word-at-a-time multiply-xorshift with SplitMix64 constants:
-  untested for distribution, no final mix, and a fixed seed. Hash quality affects only speed, since equal
-  hashes always lead to a full key comparison. It was deferred because hashing is about 18% of stage 3's
-  samples, under a tenth of a whole parse, and a better hash would not be much faster on short keys.
+  Codable stays the decoding API: decoding takes microseconds for the manifests and `cfg.yaml` files that
+  read it, and the shared parse is where speed counts.
+  - **200.8.1** Faster decoding and encoding: moved to [204](204-yaml-parser-upgrades.md) 204.3.
+- **200.9** The hand-written equivalence corpus. *Done:* `tests/corpus`, run by `CorpusTests.swift`. 35
+  accepted documents, one or more per spec area (documents, lines, structure, keys, plain scalars, each
+  Core type, quoted and block scalars), each with the value a YAML 1.2 Core parser gives it, written by
+  hand from the spec as a typed tree (`int 42`, `float 42.0` and `str "42"` differ); 64 rejected documents
+  with every error the parse reports, as line and code. Writing them found four cascades in the diagnostic
+  path, each now one report: a `%YAML` directive counted as content, so the `---` after it was a second
+  document; a deeper line with a key under a plain value was called a multi-line plain scalar (now
+  `indentationJump`); a line holding a stage 1 error (a lone CR) was lexed again; and a tab-indented line
+  left the key above it reported as missing a value.
+  Checked once against the yaml-test-suite data (no other parser, nothing kept in the repo): of 402 cases,
+  all 94 invalid ones are rejected, 268 valid ones fall outside the subset, and the 40 inside it give the
+  suite's values, typing included, except one: a block scalar running to the end of a file without a
+  final line break, which the suite reads as ending with a line break and the 1.2.2 grammar does not. Such
+  a file is now rejected (`blockScalarAtEndOfFile`, spec §20), so an accepted document has one meaning
+  under either reading.
+- **200.10** Fuzzing: moved to [204](204-yaml-parser-upgrades.md) 204.1. Differential testing against
+  another parser was dropped; the corpus (200.9) and the parser-against-diagnostic-path checks cover it.
+- **200.11** Duplicate-key hashing on the shared fast hash: moved to [204](204-yaml-parser-upgrades.md) 204.2.
 - **200.12** The shared core at ≥1 GB/s. Every parse runs stages 1–4, whichever API reads the result
   (document, Codable, generic values), so they get a budget of 1 ns per byte, single-threaded, with every
   check kept; work one API needs (decoded strings, number values, lookup indexes, Codable containers) stays
@@ -349,19 +363,8 @@ complicates splitting the input.
     - A 256-bit filter per open mapping, one bit per key from its hash, skips the duplicate scan for a
       key whose bit is clear: about 10% on `aircraft.yml` and `hp.yml`.
     - Stage 1's per-block step inlined: 4.0 → 4.7 GB/s.
-  - **200.12.4** Deferred follow-ups.
-    - A reusable parser that keeps its output buffers across parses, as simdjson's does: the 64 MB
-      synthetic input parses at 0.58 GB/s, held back mostly by first-touch page faults on the ~4 bytes of
-      output per input byte. Matters for large files and batches of files, not for typical config sizes.
-    - Calibration: simdjson on this machine, on a JSON form of the same data, outside the repo, so the
-      1 GB/s figures have a reference from the same hardware.
-    - *Profile-guided, deferred:* a position list in place of masks, as simdjson's stage 1 hands stage 2
-      a flat array of `UInt32` offsets. Stage 1 would flatten its masks into the offsets of every
-      candidate (line ends, plain stops, quotes) and the parser would walk them, with no mask shifts or
-      loops at block boundaries. Against it: stage 1 writes about 1 byte per input byte more, and YAML's
-      context means candidates inside quoted scalars, comments and block scalars must be stepped over
-      (quote-heavy files like `naruto.yaml` would fill the list with them). Taken up only if a profile
-      shows the mask scans dominating; on the samples the parser's time is mostly structure and keys.
+  - **200.12.4** The reusable parser, the simdjson calibration and the position list: moved to
+    [204](204-yaml-parser-upgrades.md) 204.4–204.6.
 
 ## Consumers
 

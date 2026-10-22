@@ -1,8 +1,8 @@
 # Manifest format — switch from JSON to YAML
 
 **Avenue:** Usability · **Type/Lifecycle:** `tooling · driver` · **Size:** S ·
-**Status:** needs-design — deferred from modules ([100](100-modules.md)); JSON ships first; waits on the
-YAML parser ([200](200-yaml-parser.md))
+**Status:** needs-design — deferred from modules ([100](100-modules.md)); JSON ships first; the
+YAML parser ([200](200-yaml-parser.md)) is done
 
 The package manifest ships as **JSON** initially ([173](173-package-model-driver-cli.md) §173.1) because it parses
 dependency-free in the Swift host (Foundation). Switch it to **YAML** once the module system is in use,

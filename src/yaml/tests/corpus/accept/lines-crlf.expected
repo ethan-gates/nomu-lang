@@ -1,0 +1,5 @@
+map
+  "a": int 1
+  "b": seq
+    - str "x"
+    - str "t\n"

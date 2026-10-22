@@ -195,7 +195,7 @@ command, add a size-bounded LRU once the cache is shared.**
 
    Candidates to measure: FNV-1a at 128 bits (same code, wider state) and an in-tree XXH3 (64 or 128 bits).
 
-   The YAML parser ([200](200-yaml-parser.md) 200.11) shares this hash for duplicate-key detection, which
+   The YAML parser ([204](204-yaml-parser-upgrades.md) 204.2) shares this hash for duplicate-key detection, which
    adds needs of its own: latency on keys of 8–16 bytes matters more than throughput; the hash indexes an
    open-addressing table by its low bits, so it needs a full final mix; and a per-parse seed would stop a
    crafted file from forcing collisions. The YAML stand-in is a word-at-a-time multiply-xorshift

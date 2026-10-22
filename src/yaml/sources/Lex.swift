@@ -149,6 +149,11 @@ struct Lexer {
     private var blockHeaderLine = 0
     private var blockHeader = ByteSpan(at: 0)
 
+    // Where stage 1's errors start, in source order; a line holding one reports nothing more.
+    private let stage1: [UInt32]
+    private var stage1Next = 0
+    private var stage1Error = false
+
     // The line being lexed and its bounds.
     private var line = 0
     private var lineStart = 0
@@ -166,6 +171,7 @@ struct Lexer {
         self.b = bytes
         self.source = source
         self.errors = errors
+        stage1 = errors.errors.map(\.span.start)
         masks = LexMasks(bytes)
         self.out = out
     }
@@ -184,6 +190,9 @@ struct Lexer {
                 if e > lineStart && b[e - 1] == Char.cr { e -= 1 }
             }
             end = e
+            let next = l + 1 < starts.count ? Int(starts[l + 1]) : b.count
+            while stage1Next < stage1.count && Int(stage1[stage1Next]) < Int(starts[l]) { stage1Next += 1 }
+            stage1Error = stage1Next < stage1.count && Int(stage1[stage1Next]) < next
             r = LineRecord()
             r.contentStart = UInt32(lineStart)
             r.contentEnd = UInt32(e)
@@ -191,6 +200,7 @@ struct Lexer {
             (out + l).initialize(to: r)
         }
         if blockIndent != nil && !blockStarted { emptyBlockScalar() }
+        if blockIndent != nil && blockStarted && b.count > 0 && b[b.count - 1] != Char.lf { blockScalarAtEndOfFile() }
     }
 
     // MARK: Lines
@@ -203,6 +213,11 @@ struct Lexer {
             if continuesBlock(at: p, indent: indent, content: content) { return }
             blockIndent = nil
             if !blockStarted { emptyBlockScalar() }
+        }
+        // A line holding a stage 1 error (a forbidden character, a lone carriage return) reported already.
+        if stage1Error {
+            r.kind = .invalid
+            return
         }
 
         if p == end {
@@ -501,6 +516,14 @@ struct Lexer {
             : dash ? dashColumn : Int(r.level) * 2
         blockIndent = owner + 2
         blockStarted = false
+    }
+
+    // Reports a block scalar running to the end of a file that has no final line break (spec §20).
+    @inline(never)
+    private mutating func blockScalarAtEndOfFile() {
+        errors.report(YAMLError(.blockScalarAtEndOfFile, ByteSpan(at: UInt32(b.count)),
+                                "a file ending inside a block scalar ends with a line break",
+                                fix: "add a line break at the end of the file"))
     }
 
     // Reports a block scalar that ended before any non-blank content line, on its header line (spec §20).

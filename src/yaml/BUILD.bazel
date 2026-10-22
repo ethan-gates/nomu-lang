@@ -12,5 +12,6 @@ swift_library(
 swift_test(
     name = "yaml_tests",
     srcs = glob(["tests/*.swift"]),
+    data = glob(["tests/corpus/**"]),
     deps = [":yaml"],
 )

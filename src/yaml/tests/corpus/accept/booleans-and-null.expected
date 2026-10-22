@@ -1,0 +1,7 @@
+map
+  "a": bool true
+  "b": bool false
+  "c": null
+  "d": seq
+    - null
+    - bool true

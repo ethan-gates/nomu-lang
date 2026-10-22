@@ -1,0 +1,3 @@
+seq
+  - map
+    "x": int 1

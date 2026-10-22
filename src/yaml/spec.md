@@ -696,6 +696,8 @@ message: |
 next: 1
 ```
 
+A file that ends inside a block scalar ends with a line break. YAML 1.2 readers disagree on whether the end of the input stands for a final line break: the grammar ends the last line at "a line break or the end of input", while the YAML test suite reads `|` followed by `  x` at the end of a file as `"x\n"`. Requiring the line break gives the scalar one meaning under both readings.
+
 ## 21. Block Scalar Indentation
 
 Block scalar indentation follows YAML 1.2 block-scalar indentation semantics. It is distinct from structural collection indentation.

@@ -1,0 +1,5 @@
+a: "\0\a\b\t\n\v\f\r\e\ \"\/\\\N\_\L\P\x41\u00e9\U0001F600"
+b: "plain"
+c: ""
+d: "it's # here"
+e: "\u0041\x7e"

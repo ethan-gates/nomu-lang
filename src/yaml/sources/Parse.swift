@@ -255,6 +255,7 @@ private struct Parser {
             (records + l).initialize(to: r)
         }
         if blockIndent >= 0 && !blockStarted { return false }    // emptyBlockScalar
+        if blockIndent >= 0 && b[count - 1] != Char.lf { return false }  // blockScalarAtEndOfFile
         if slotLevel >= 0 || !sawContent { return false }         // missingValue, emptyDocument
         while frameCount > 0 { popFrame() }
         return true

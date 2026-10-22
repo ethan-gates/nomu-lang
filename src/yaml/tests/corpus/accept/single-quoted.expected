@@ -1,0 +1,7 @@
+map
+  "a": str "it's"
+  "b": str ""
+  "c": str "a # b"
+  "d": str "  spaced  "
+  "e": str "tab\there"
+  "f": str "back\\slash"

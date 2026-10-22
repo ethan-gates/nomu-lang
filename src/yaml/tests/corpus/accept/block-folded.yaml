@@ -1,0 +1,10 @@
+a: >
+  one
+  two
+
+  three
+    indented
+  four
+b: >-
+  x
+  y

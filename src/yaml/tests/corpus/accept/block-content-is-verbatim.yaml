@@ -1,0 +1,5 @@
+a: | # header comment
+  # not a comment
+  key: not a mapping
+  - not a sequence
+  	tab is content

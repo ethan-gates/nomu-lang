@@ -1,0 +1,5 @@
+map
+  "a": str "line 1\nline 2\n"
+  "b": str "x"
+  "c": str "y\n\n"
+  "d": str "x"

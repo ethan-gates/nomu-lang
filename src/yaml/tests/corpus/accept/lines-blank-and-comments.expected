@@ -1,0 +1,4 @@
+map
+  "a": int 1
+  "b": map
+    "c": int 2

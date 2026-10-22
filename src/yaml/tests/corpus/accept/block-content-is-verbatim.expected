@@ -1,0 +1,2 @@
+map
+  "a": str "# not a comment\nkey: not a mapping\n- not a sequence\n\ttab is content\n"

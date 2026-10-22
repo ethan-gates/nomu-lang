@@ -1,0 +1,8 @@
+# head
+
+a: 1  # trailing
+    # deep comment
+# shallow comment
+b:   # owes a value
+  c: 2
+

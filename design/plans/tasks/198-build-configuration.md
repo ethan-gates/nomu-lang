@@ -1,7 +1,7 @@
 # Build configuration — every build and runtime setting part of one configuration system
 
 **Avenue:** Infra · **Type/Lifecycle:** `driver · runtime · design` · **Size:** L · **Status:** design firm;
-build waits on the YAML parser ([200](200-yaml-parser.md)) · **Source:** the 176.5.7 harness design, which needs GC and memory behavior varied per test run and
+ready to build — the YAML parser ([200](200-yaml-parser.md)) is done · **Source:** the 176.5.7 harness design, which needs GC and memory behavior varied per test run and
 found it reachable only through environment variables; [190](190-explicit-module-builds.md) 190.6 F4
 (build options reach only the entry workspace).
 
