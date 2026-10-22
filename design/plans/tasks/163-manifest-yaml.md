@@ -1,7 +1,8 @@
 # Manifest format — switch from JSON to YAML
 
 **Avenue:** Usability · **Type/Lifecycle:** `tooling · driver` · **Size:** S ·
-**Status:** needs-design — deferred from modules ([100](100-modules.md)); JSON ships first
+**Status:** needs-design — deferred from modules ([100](100-modules.md)); JSON ships first; waits on the
+YAML parser ([200](200-yaml-parser.md))
 
 The package manifest ships as **JSON** initially ([173](173-package-model-driver-cli.md) §173.1) because it parses
 dependency-free in the Swift host (Foundation). Switch it to **YAML** once the module system is in use,
@@ -16,15 +17,14 @@ schema, not a schema change.
 
 ## Scope
 
-- Pick the YAML flavor — likely custom strictyaml parser with flow-style and boolean literals added
+- The YAML flavor and its parser are [200](200-yaml-parser.md); this task moves existing formats onto it.
 - Keep the manifest **declarative data**, never a program (the standing rule from 100).
 - Migration: read both during a transition, or a one-shot converter; the schema is unchanged.
-- Consider self-hosting: whatever is chosen must be reimplementable in Nomu (favors owning a small
-  strict subset over a large dependency).
 
 ## Dependencies
 
 - Modules [100](100-modules.md) — the manifest schema and the JSON bootstrap it replaces.
+- YAML parser [200](200-yaml-parser.md) — the parser these formats move onto.
 
 ## Refs
 

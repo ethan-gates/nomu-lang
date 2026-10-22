@@ -1,0 +1,9 @@
+load("@rules_swift//swift:swift.bzl", "swift_binary")
+
+# YAML throughput benchmark: times each parse stage on large synthetic documents.
+# Run: `bazel run -c opt //src/yaml/bench:yamlbench -- [megabytes] [iters]`.
+swift_binary(
+    name = "yamlbench",
+    srcs = glob(["sources/*.swift"]),
+    deps = ["//src/yaml"],
+)

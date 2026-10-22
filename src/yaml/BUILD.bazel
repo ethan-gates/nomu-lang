@@ -1,0 +1,16 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# Nomu's YAML library (task 200): a strict subset of YAML 1.2 Core, specified in spec.md. Pure stdlib (no
+# Foundation, no external deps); returns errors as values. See design/plans/tasks/200-yaml-parser.md.
+swift_library(
+    name = "yaml",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "yaml",
+    visibility = ["//visibility:public"],
+)
+
+swift_test(
+    name = "yaml_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = [":yaml"],
+)

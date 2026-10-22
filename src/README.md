@@ -29,3 +29,5 @@ interface modules hold each IR's format, implementation modules hold the code;
 **stdlib** — the Nomu-written standard library (compiled alongside user code)
 
 **bench** — frontend throughput benchmark (lexer/parser timing, isolated from codegen).
+
+**yaml** — the strict YAML 1.2 Core subset read by manifests and `cfg.yaml` (spec in `yaml/spec.md`).

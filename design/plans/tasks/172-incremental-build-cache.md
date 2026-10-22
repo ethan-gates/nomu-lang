@@ -194,6 +194,12 @@ command, add a size-bounded LRU once the cache is shared.**
    - collision probability similar to 64-bit FNV-1a or better.
 
    Candidates to measure: FNV-1a at 128 bits (same code, wider state) and an in-tree XXH3 (64 or 128 bits).
+
+   The YAML parser ([200](200-yaml-parser.md) 200.11) shares this hash for duplicate-key detection, which
+   adds needs of its own: latency on keys of 8–16 bytes matters more than throughput; the hash indexes an
+   open-addressing table by its low bits, so it needs a full final mix; and a per-parse seed would stop a
+   crafted file from forcing collisions. The YAML stand-in is a word-at-a-time multiply-xorshift
+   (`KeyHash` in `src/yaml/sources/Structure.swift`).
    Accidental-collision odds for a 64-bit key: about N²/2⁶⁵ for N entries (about 3 × 10⁻⁸ at a million).
 8. **Re-audit how key inputs are hashed** (190.6 F25): the embedded sources, the runtime key and the
    embedded tree are hashed once per process today; check that every input of the new keys is too.
