@@ -73,6 +73,9 @@ public struct PlanOptions {
     public var outputOptions: [String] = []
     // The commands that build the runtime archive, as the driver runs them; they enter the archive's key.
     public var runtimeRecipe: [[String]] = []
+    // The directory under the entry workspace's `build/` that holds this configuration's outputs, so builds
+    // under different configurations keep their own (empty: `build/` itself).
+    public var outputConfig = ""
     public init() {}
 }
 
@@ -110,11 +113,12 @@ extension Plan {
         let languageDir = settings.cacheRoot + "/nomu/"
             + HostCache.languageWorkspaceKey(compilerIdentity: settings.compilerIdentity,
                                              outputOptions: settings.outputOptions)
+        let build = root.root + "/build" + (settings.outputConfig.isEmpty ? "" : "/" + settings.outputConfig)
         func outputDir(_ key: ModuleKey) -> String {
             let base: String
             if key.workspace == LanguageWorkspace.identity { base = languageDir }
-            else if key.workspace == root.identity { base = root.root + "/build" }
-            else { base = root.root + "/build/_external/\(key.workspace)" }
+            else if key.workspace == root.identity { base = build }
+            else { base = build + "/_external/\(key.workspace)" }
             return key.path.isEmpty ? base : base + "/" + key.path.joined(separator: "/")
         }
 

@@ -471,7 +471,7 @@ extension LLVMGen {
             let tlabGet = runtimeFn("rt_self_tlab_get", ret: i8ptr, params: [], varArg: false)
             let tlab = buildCall(tlabGet.0, tlabGet.1, [])!
             // Inline TLAB bump fast path (150.3.10.2): load the carrier's private cursor/limit and bump within
-            // the current hole with no call and no lock. `NOMU_NO_INLINE_ALLOC` turns it off (every allocation
+            // the current hole with no call and no lock. `opt.inline_alloc: false` turns it off (every allocation
             // calls rtTlabAlloc) for A/B measurement; NOMU_GC_STRESS leaves the limit 0 so it always misses.
             // cursor/limit (@0/@8) are heap-relative byte offsets; `need` is the 8-aligned request. A hole never
             // spans more than one 32 KiB block, so a large-object request (need > block) can never satisfy

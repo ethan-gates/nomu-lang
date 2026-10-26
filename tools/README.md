@@ -14,7 +14,7 @@ bazel-bin/src/compiler-test/compiler-test tests/suite.json
 ## Scripts
 
 - `escape-diff.sh` — builds and runs every example module with escape analysis on and off
-  (`NOMU_NO_ESCAPE=1`) and asserts identical output and exit status, on one carrier.
+  (`-c no_escape`) and asserts identical output and exit status, on one carrier.
 - `perf-tier.py` — times benchmark workloads under each optimizer-pass configuration (best of N runs)
   and flags any configuration whose output differs from the all-passes-off baseline.
 - `workspace_status.sh` — feeds the build's commit stamp (`.bazelrc`).

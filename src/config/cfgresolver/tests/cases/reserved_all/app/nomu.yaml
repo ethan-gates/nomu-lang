@@ -1,0 +1,4 @@
+scope: acme
+name: app
+externals:
+  all: ../lib

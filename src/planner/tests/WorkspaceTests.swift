@@ -39,6 +39,10 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertEqual(parse("scope: a\nname: b\nexternals:\n  x: ../x\n  x: ../y\n  Bad: ../z\n").1,
                        ["nomu.yaml:5:3: error: pin alias 'x' is declared more than once",
                         "nomu.yaml:6:3: error: pin alias 'Bad' must match [a-z][a-z0-9_]*"])
+        XCTAssertEqual(parse("scope: a\nname: all\n").1,
+                       ["nomu.yaml:2:7: error: workspace name 'all' is reserved for the cfg.yaml block covering every external"])
+        XCTAssertEqual(parse("scope: a\nname: b\nexternals:\n  all: ../x\n").1,
+                       ["nomu.yaml:4:3: error: pin alias 'all' is reserved for the cfg.yaml block covering every external"])
     }
 
     func testPathComponentRule() {

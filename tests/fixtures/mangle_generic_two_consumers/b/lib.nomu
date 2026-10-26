@@ -1,0 +1,12 @@
+import pkg/gen
+
+package struct Item {
+  let p: Int
+  let q: Int
+  let r: Int
+}
+
+package fun fromB() -> Int {
+  let it = keep(Item(p: 1, q: 2, r: 7), 10)
+  return it.p + it.q * 10 + it.r * 100
+}

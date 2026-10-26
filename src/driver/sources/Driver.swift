@@ -15,6 +15,7 @@ import embedded
 import planner
 import buildinfo
 import LLVMBridge
+import settings
 
 // Build a program from one module's files (task 190): plan the build, run each module's compile job in
 // order, and link. The planner reads the workspaces, resolves every import and places every output (D2, D4);
@@ -29,25 +30,44 @@ public struct BuildResult {
 }
 
 // Returns the entry's output stem (the binary, for a binary build); nil on failure.
-public func buildProgram(paths: [String], options: EmitOptions = EmitOptions()) -> String? {
-    build(paths: paths, options: options).binary
+public func buildProgram(paths: [String], options: EmitOptions = EmitOptions(),
+                         selection: ConfigSelection = ConfigSelection()) -> String? {
+    build(paths: paths, options: options, selection: selection).binary
 }
 
-public func build(paths: [String], options: EmitOptions = EmitOptions()) -> BuildResult {
+public func build(paths: [String], options: EmitOptions = EmitOptions(),
+                  selection: ConfigSelection = ConfigSelection()) -> BuildResult {
     var result = BuildResult()
     guard let primary = paths.first else {
         fputs("error: no source files given\n", stderr)
         return result
     }
     let timings = Timings()
-    timings.optimize = options.optimize
     timings.egress = "ssair"
 
     var planOptions = PlanOptions()
     planOptions.allowCoreImport = options.allowCoreImport
     planOptions.compilerIdentity = BuildInfo.gitCommit
     planOptions.runtimeRecipe = runtimeArchiveRecipe
-    let plan = Plan(entryFiles: paths, options: planOptions)
+    // The configuration resolves once, between reading the module table and planning: the language
+    // workspace's settings enter its host-cache key, which places its outputs.
+    let workspaces = WorkspaceSet(entry: primary, disk: DiskTree(), includeLanguageWorkspace: planOptions.product == .binary)
+    let moduleTable = ModuleTable(workspaces: workspaces, entryFiles: paths, options: planOptions)
+    var configuration: ResolvedBuildConfiguration? = nil
+    if moduleTable.diagnostics.isEmpty {
+        switch timings.measure("plan", "configuration", { resolveConfiguration(moduleTable, workspaces, selection) }) {
+        case .success(let c):
+            configuration = c
+            planOptions.outputOptions = [c.languageCanonical]
+            planOptions.outputConfig = c.outputDirectory
+            timings.optimize = JobSettings(c.jobSettings(moduleTable.entry)).optimize
+        case .failure(let errors):
+            fputs(errors.rendered + "\n", stderr)
+            timings.report()
+            return result
+        }
+    }
+    let plan = Plan(modules: moduleTable, workspaces: workspaces, options: planOptions)
     for step in PlanTimings.Step.allCases {
         timings.record(phase: "plan", name: step.rawValue, seconds: plan.timings.seconds[step] ?? 0)
     }
@@ -141,6 +161,7 @@ public func build(paths: [String], options: EmitOptions = EmitOptions()) -> Buil
                              whiteBox: j.whiteBox, runtimeSubsetByMembership: j.runtimeSubsetByMembership,
                              outputs: outputs)
         if j.inHostCache, let sourceCopy { job.reportedPaths = LanguageSourceCopy.reportedPaths(j.files, copy: sourceCopy) }
+        job.settings = configuration?.jobSettings(j.module) ?? [:]
         // The building workspace's modules take the build's options; another workspace's modules, and the
         // language workspace's, compile with the defaults.
         var jobOptions = EmitOptions()
@@ -172,7 +193,10 @@ public func build(paths: [String], options: EmitOptions = EmitOptions()) -> Buil
         // The entry object links first: it owns the program-wide definitions (GC type and root maps), which
         // must win over any weak copy in a library object.
         let objectsInOrder = [entryJob.object] + link.objects.filter { $0 != entryJob.object }
-        guard linkBinary(objects: objectsInOrder, output: stem, runtimeArchive: archive.archive, timings: timings) else {
+        guard let configuration else { preconditionFailure("a planned build has a configuration") }
+        guard linkBinary(objects: objectsInOrder, output: stem, runtimeArchive: archive.archive,
+                         runtimeGlobals: configuration.runtimeGlobals, record: configuration.summary,
+                         timings: timings) else {
             timings.report(); return result
         }
     }
@@ -242,27 +266,31 @@ public func resolveModule(path rawPath: String) -> ResolvedModule? {
 // `pkg/…` dependencies follow via module discovery). Returns the produced binary's path on success, nil on
 // failure (so `run` can exec it).
 @discardableResult
-public func buildTarget(path rawPath: String, options: EmitOptions = EmitOptions()) -> String? {
-    buildTargetResult(path: rawPath, options: options).binary
+public func buildTarget(path rawPath: String, options: EmitOptions = EmitOptions(),
+                        selection: ConfigSelection = ConfigSelection()) -> String? {
+    buildTargetResult(path: rawPath, options: options, selection: selection).binary
 }
 
 // The same build, reporting what it did (the binary, and the jobs compiled and taken from the host cache).
-public func buildTargetResult(path rawPath: String, options: EmitOptions = EmitOptions()) -> BuildResult {
+public func buildTargetResult(path rawPath: String, options: EmitOptions = EmitOptions(),
+                              selection: ConfigSelection = ConfigSelection()) -> BuildResult {
     guard let m = resolveModule(path: rawPath) else { return BuildResult() }
-    return build(paths: scanModuleFiles(m.dir), options: options)
+    return build(paths: scanModuleFiles(m.dir), options: options, selection: selection)
 }
 
 // Build an already-resolved module and return its binary path. The binary is named after the module and
 // placed in its own unit directory under the workspace `build/` (D2), unless an explicit `-o` names it.
-public func buildResolved(_ m: ResolvedModule, options: EmitOptions = EmitOptions()) -> String? {
-    buildProgram(paths: scanModuleFiles(m.dir), options: options)
+public func buildResolved(_ m: ResolvedModule, options: EmitOptions = EmitOptions(),
+                          selection: ConfigSelection = ConfigSelection()) -> String? {
+    buildProgram(paths: scanModuleFiles(m.dir), options: options, selection: selection)
 }
 
 // `nomu run <path> [-- args]` (task 173.5.3): build the target module, then exec the produced binary,
 // forwarding `args` and propagating its exit status. A module without a `main` is not executable — its
 // build fails, which surfaces here as a non-zero exit. Returns the process exit code.
-public func runTarget(path: String, args: [String], options: EmitOptions = EmitOptions()) -> Int32 {
-    guard let binary = buildTarget(path: path, options: options) else { return 1 }
+public func runTarget(path: String, args: [String], options: EmitOptions = EmitOptions(),
+                      selection: ConfigSelection = ConfigSelection()) -> Int32 {
+    guard let binary = buildTarget(path: path, options: options, selection: selection) else { return 1 }
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: binary)
     proc.arguments = args
@@ -283,7 +311,8 @@ public func runTarget(path: String, args: [String], options: EmitOptions = EmitO
 // executable whose `main` drives its own checks, so this builds it and runs it, reporting an `ok`/`FAIL`
 // line. (Running a whole package's tests from one path is the deferred label surface, shared with `build`.)
 @discardableResult
-public func testPackage(target rawPath: String, options: EmitOptions = EmitOptions()) -> Bool {
+public func testPackage(target rawPath: String, options: EmitOptions = EmitOptions(),
+                        selection: ConfigSelection = ConfigSelection(defaultConfig: "test")) -> Bool {
     guard let m = resolveModule(path: rawPath) else { return false }
 
     // Role predicate: a test module is one declared in the package manifest's `tests` (modules.md §Tests —
@@ -300,7 +329,7 @@ public func testPackage(target rawPath: String, options: EmitOptions = EmitOptio
     }
 
     let label = m.id.components.isEmpty ? "(root)" : m.id.pathString
-    guard let binary = buildResolved(m, options: options) else {
+    guard let binary = buildResolved(m, options: options, selection: selection) else {
         fputs("FAIL  \(label) — build failed\n", stderr)
         return false
     }
@@ -466,7 +495,7 @@ private func parseEmbeddedPrelude(_ source: String, _ name: String) -> Program {
     return parsed
 }
 
-// Prepend the `runtime` prelude for a white-box runtime test (`NOMU_RT_PRELUDE`, task 174.5): the fixture
+// Prepend the `runtime` prelude for a white-box runtime test (`test.runtime_prelude`, task 174.5): the fixture
 // calls runtime internals directly, so they must be local decls. Returns the runtime function names as the
 // runtime-subset designation (its functions compile `noSafepoint`, like the package). The bare weak-ODR
 // definitions fold with the `runtime` package's, so this adds no runtime duplication to the test binary.
@@ -656,9 +685,12 @@ func shippedTemplates(_ module: NOIRModule, ownNames: Set<String>) -> [NOIRDecl]
     return shipped
 }
 
-// Link a binary: the entry object, every dependency object and the runtime archive.
+// Link a binary: the entry object, every dependency object, the settings object and the runtime archive.
+// The settings object holds `runtimeGlobals`, the values the runtime reads (G14 of the build-configuration
+// design); `record`, the configuration's short form, goes in the `__TEXT,__nomu_config` section (G13).
 // Returns false on failure (message on stderr).
-func linkBinary(objects: [String], output binPath: String, runtimeArchive: String, timings: Timings) -> Bool {
+func linkBinary(objects: [String], output binPath: String, runtimeArchive: String,
+                runtimeGlobals: [(symbol: String, value: RuntimeGlobal)], record: String, timings: Timings) -> Bool {
     let archive = timings.measure("runtime", "archive") { cachedRuntimeArchive(at: runtimeArchive) }
     guard let archive = archive else { return false }
     // `-dead_strip` drops code unreachable from the program's entry, and `-x` strips local symbols.
@@ -673,12 +705,22 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Strin
     }
     defer { try? FileManager.default.removeItem(atPath: stagingDir) }
     let staging = stagingDir + "/" + (binPath as NSString).lastPathComponent
-    var linkArgs = ["-o", staging, "-Wl,-dead_strip", "-Wl,-x"] + objects + [archive]
-    // The GC frame index (FrameIndex.swift): the link reserves its section and writes a link map; afterwards
-    // the index is written into the binary and its signature's page hashes are redone (CodeSignature.swift).
     let scratch = NSTemporaryDirectory() + "nomu-link-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
     try? FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(atPath: scratch) }
+    let settingsObject = scratch + "/settings.o", recordFile = scratch + "/config.yaml"
+    if let error = timings.measure("link", "settings", { emitSettingsObject(runtimeGlobals, to: settingsObject) }) {
+        fputs("error: settings object: \(error)\n", stderr)
+        return false
+    }
+    guard FileManager.default.createFile(atPath: recordFile, contents: Data(record.utf8)) else {
+        fputs("error: cannot write '\(recordFile)'\n", stderr)
+        return false
+    }
+    var linkArgs = ["-o", staging, "-Wl,-dead_strip", "-Wl,-x"] + objects + [settingsObject, archive]
+    linkArgs.append("-Wl,-sectcreate,__TEXT,__nomu_config,\(recordFile)")
+    // The GC frame index (FrameIndex.swift): the link reserves its section and writes a link map; afterwards
+    // the index is written into the binary and its signature's page hashes are redone (CodeSignature.swift).
     let reserveFile = scratch + "/frameidx.bin", mapFile = scratch + "/link.map"
     do {
         let size = try FrameIndex.reserveSize(objects: objects)

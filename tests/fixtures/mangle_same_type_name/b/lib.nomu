@@ -1,0 +1,15 @@
+// No managed field: this `Node`'s pointer map is empty, and its words are not pointers.
+package class Node {
+  var x: Int
+  var y: Int
+}
+
+package fun fromB(n: Int) -> Int {
+  let node = Node(x: 1000003, y: 7)
+  var i = 0
+  while i < n {
+    let g = Node(x: i, y: i)
+    i = i + g.x - i + 1
+  }
+  return node.y
+}

@@ -1,0 +1,4 @@
+exit 1
+app/cfg.yaml:2:3: error: `temp debug` is qualified inside a section qualified by `release`; qualify the section or the key, not both
+app/cfg.yaml:3:1: error: `dough.flours`: a name holds no dots; nest it: `dough:` then `flours:`
+app/cfg.yaml:6:3: error: `name  sign` is not a name followed by config names (lowercase words separated by single spaces)

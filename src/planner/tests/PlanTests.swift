@@ -7,12 +7,13 @@ final class PlanTests: XCTestCase {
     private let nomu = LanguageWorkspace.identity
 
     private func plan(_ files: [String: String], entry: [String], product: ModuleJob.Product = .binary,
-                      outputOptions: [String] = []) -> Plan {
+                      outputOptions: [String] = [], outputConfig: String = "") -> Plan {
         var options = PlanOptions()
         options.product = product
         options.cacheRoot = "/cache"
         options.compilerIdentity = "abc123"
         options.outputOptions = outputOptions
+        options.outputConfig = outputConfig
         return Plan(entryFiles: entry, options: options, disk: MemoryTree(files))
     }
 
@@ -66,6 +67,17 @@ final class PlanTests: XCTestCase {
         XCTAssertEqual(p.link?.objects, p.jobs.map(\.object))
         XCTAssertEqual(p.link?.runtimeArchive, p.runtimeArchive?.archive)
         XCTAssertEqual(p.link?.output, "/w/build/app/cli/cli")
+    }
+
+    // A configuration's outputs go under its own directory in `build/`, externals' included; the language
+    // workspace stays in the host cache.
+    func testOutputsUnderTheConfigurationDirectory() {
+        let p = plan(app, entry: ["/w/app/cli/main.nomu"], outputConfig: "debug-tagged")
+        let byKey = Dictionary(uniqueKeysWithValues: p.jobs.map { ($0.module, $0) })
+        XCTAssertEqual(p.link?.output, "/w/build/debug-tagged/app/cli/cli")
+        XCTAssertEqual(byKey[key(WorkspaceIdentity(scope: "them", name: "prov"), "greet")]?.outputDir,
+                       "/w/build/debug-tagged/_external/them.prov/greet")
+        XCTAssertTrue(byKey[key(nomu, "std/prelude")]!.outputDir.hasPrefix("/cache/nomu/"))
     }
 
     func testLibraryBuildHasNoLinkAndNoLanguageWorkspace() {

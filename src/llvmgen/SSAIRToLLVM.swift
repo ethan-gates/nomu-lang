@@ -1,4 +1,5 @@
 import sema
+import mangle
 
 import ssair
 import noir
@@ -16,7 +17,7 @@ import LLVM_C
 //
 // Type-layout + witness + actor metadata come from the original NOIR module (populated into `LLVMGen`),
 // plus the closure/spawn environment aggregates the SSA module synthesized. Function *declaration* is
-// done here (the `m:Type:method` → `nomu_m_*` mangling); the
+// done here (the `m:Type:method` → `Mangle.method` symbol); the
 // shared witness/actor thunks find the resulting callables already declared, so their internal
 // `declareMethod`/`declareActorHandler` calls early-return without needing NOIR method bodies.
 final class SSAIRToLLVM {
@@ -439,20 +440,18 @@ final class SSAIRToLLVM {
         // the on-demand declaration in `LLVMGenCallables`, which derives it the same way (name + file).
         // A cross-module specialization carries an origin-keyed name, so it is producer-qualified, not
         // home-qualified — the weak-ODR fold then collapses identical copies across objects (100.5.5).
+        let home = e.definitionModule(for: f.span.file)
         guard f.name.hasPrefix("m:") else {
-            let qualifier = e.definitionQualifier(for: f.name, file: f.span.file)
-            return ("f:\(f.name)", nil, false, Mangle.free(f.name, qualifier: qualifier))
+            return ("f:\(f.name)", nil, false, Mangle.function(f.name, home: home))
         }
         let rest = f.name.dropFirst(2)
         let colon = rest.firstIndex(of: ":")!
         let type = String(rest[rest.startIndex..<colon])
         let method = String(rest[rest.index(after: colon)...])
-        let qualifier = e.definitionQualifier(for: type, file: f.span.file)
         let isActor = e.actorMap[type] != nil
         let isReference = e.classMap[type] != nil || isActor
         let byPointer = isReference || f.isMutating
-        let symbol = isActor ? Mangle.actorHandler(type, method, qualifier: qualifier)
-                             : Mangle.method(type, method, qualifier: qualifier)
+        let symbol = Mangle.method(type, method, home: home)
         return ("m:\(f.name.dropFirst(2))", type, byPointer, symbol)
     }
 
@@ -1917,12 +1916,8 @@ final class SSAIRToLLVM {
                 // An imported function's callee name is its per-origin identity `origin@name`
                 // (task 100.2.3.2); decode it to the producer's mangled symbol so this external
                 // declaration matches the definition the dependency emitted.
-                let symbol: String
-                if let (origin, bare) = ExternalName.decode(name) {
-                    symbol = Mangle.free(bare, qualifier: Mangle.qualifier(module: origin.split(separator: "/").map(String.init)))
-                } else {
-                    symbol = Mangle.free(name)
-                }
+                // A bare imported name is a runtime function, which keeps its bare symbol.
+                let symbol = Mangle.function(name, home: ExternalName.isEncoded(name) ? e.homeModule : [])
                 let (fn, fnTy) = e.emitFunction(symbol, ret: retTy, params: paramTys)
                 e.callables[key] = Callable(fn: fn, ty: fnTy,
                                             ir: NOIRFunc(name: name, params: [], returnType: resultType,
@@ -1940,7 +1935,7 @@ final class SSAIRToLLVM {
                 let rest = name.dropFirst(2)
                 if let colon = rest.firstIndex(of: ":"),
                    case let typePart = String(rest[rest.startIndex..<colon]),
-                   let (origin, bareType) = ExternalName.decode(typePart) {
+                   ExternalName.isEncoded(typePart) {
                     let method = String(rest[rest.index(after: colon)...])
                     // Erased generic method (task 100.4.3.5.3.3): `typePart` is a mono'd instantiation of
                     // an imported generic type whose method the producer compiled once erased. Route
@@ -1949,9 +1944,7 @@ final class SSAIRToLLVM {
                     if let typeArgs = e.monoTypeArgs[typePart] {
                         let erasedTypeKey = String(typePart.prefix { $0 != "<" })   // util@Box
                         if let sig = e.externalGenericSigs["m:\(erasedTypeKey):\(method)"] {
-                            let bareBase = String(bareType.prefix { $0 != "<" })    // Box
-                            let symbol = Mangle.method(bareBase, method,
-                                qualifier: Mangle.qualifier(module: origin.split(separator: "/").map(String.init)))
+                            let symbol = Mangle.method(erasedTypeKey, method, home: e.homeModule)
                             return emitErasedExternalCall("m:\(erasedTypeKey):\(method)", sig: sig, args: args,
                                 typeArgs: typeArgs, resultType: resultType, span: span, symbolOverride: symbol)
                         }
@@ -1959,8 +1952,7 @@ final class SSAIRToLLVM {
                     guard let retTy = ty(resultType, span) else { return nil }
                     let argVals = args.map { val($0) }
                     let paramTys = argVals.map { LLVMTypeOf($0)! }
-                    let symbol = Mangle.method(bareType, method,
-                                               qualifier: Mangle.qualifier(module: origin.split(separator: "/").map(String.init)))
+                    let symbol = Mangle.method(typePart, method, home: e.homeModule)
                     let (fn, fnTy) = e.emitFunction(symbol, ret: retTy, params: paramTys)
                     e.callables[key] = Callable(fn: fn, ty: fnTy,
                                                 ir: NOIRFunc(name: name, params: [], returnType: resultType,
@@ -2031,10 +2023,8 @@ final class SSAIRToLLVM {
         let symbol: String
         if let symbolOverride {           // an erased generic *method* — `Mangle.method`, computed by the caller
             symbol = symbolOverride
-        } else if let (origin, bare) = ExternalName.decode(name) {
-            symbol = Mangle.free(bare, qualifier: Mangle.qualifier(module: origin.split(separator: "/").map(String.init)))
         } else {
-            symbol = Mangle.free(name)
+            symbol = Mangle.function(name, home: ExternalName.isEncoded(name) ? e.homeModule : [])
         }
         let key = "f:\(name)"
         let fn: LLVMValueRef, fnTy: LLVMTypeRef

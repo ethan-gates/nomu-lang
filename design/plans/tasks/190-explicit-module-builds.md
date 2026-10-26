@@ -254,7 +254,8 @@ separate link-selection step. This replaces today's over-linking of all of `std`
     The harness half is fixed: the suite once found a case's binary by fixture path alone, so cases building
     one fixture under different settings ran whichever binary was built last; each configuration now gets
     its own binary under `build/compiler-test/` (155 Phase 3).
-  - **F4 — `-O` and `--mono` do not reach other workspaces' modules.** Pinned and language-workspace modules
+  - **F4 — `-O` and `--mono` do not reach other workspaces' modules.** *Closed by 198.6:* the optimization
+    level and mono are settings every job receives, and the language workspace's key includes them. Pinned and language-workspace modules
     compile with default options (inherited from the nested builds), so a release build links debug `std`, and
     `PlanOptions.outputOptions` is never filled, so the language workspace's cache key ignores options.
     **Moved to [198](198-build-configuration.md)** (build configuration), which designs per-workspace

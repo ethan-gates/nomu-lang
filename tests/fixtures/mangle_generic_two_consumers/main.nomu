@@ -1,0 +1,10 @@
+// One generic specialized by two consumers for their own `Item` structs of different sizes (task 203). The
+// specializations once shared one weak symbol (`gen@keep<Item>`), so one consumer called the other's copy.
+// 5 + (1 + 2 × 10 + 7 × 100) = 726.
+import pkg/a
+import pkg/b
+
+fun main() {
+  print(fromA() + fromB())
+  print("\n")
+}

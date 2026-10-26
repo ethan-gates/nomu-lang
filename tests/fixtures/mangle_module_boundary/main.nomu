@@ -1,0 +1,9 @@
+// Symbol names keep module boundaries apart (task 203): `util_helper` in `lib` and `helper` in `lib/util`
+// once mangled to the same `_`-joined name and failed the link. 1 + 2 × 10 = 21.
+import pkg/lib
+import pkg/lib/util
+
+fun main() {
+  print(util_helper() + helper() * 10)
+  print("\n")
+}

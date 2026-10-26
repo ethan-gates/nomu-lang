@@ -1,0 +1,18 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# The build configuration library (task 198): setting schemas, layers, configs and the resolver. The schema
+# is an input, so the library declares no settings of its own. Pure stdlib (no Foundation, no external deps);
+# returns errors as values. See design/plans/tasks/198-build-configuration.md.
+swift_library(
+    name = "config",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "config",
+    deps = ["//src/yaml"],
+    visibility = ["//visibility:public"],
+)
+
+swift_test(
+    name = "config_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = [":config", "//src/config/cfgresolver:cfgresolver_lib"],
+)

@@ -1,0 +1,9 @@
+package fun keep<T>(x: T, n: Int) -> T {
+  var i = 0
+  var t = 0
+  while i < n {
+    t = t + i
+    i = i + 1
+  }
+  return x
+}

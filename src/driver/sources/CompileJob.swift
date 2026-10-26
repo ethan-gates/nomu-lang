@@ -13,6 +13,7 @@ import facts
 import LLVMBridge
 import embedded
 import planner
+import settings
 
 // One module's compilation (task 190, 190.4): everything `compile(_:options:timings:)` reads and writes. The
 // compile knows nothing beyond this value: no plan, workspaces, manifests or other modules' sources. Each
@@ -107,6 +108,8 @@ public struct CompileJob: Codable {
     // `<nomu>/…` file's on-disk copy (Driver, `LanguageSourceCopy`). Diagnostics and debug info use it; the job
     // still reads the file by its `files` path. Nil or missing entries report the path itself.
     public var reportedPaths: [String: String]?
+    // The settings this job receives, by name, in canonical form (G12): values only, never config names.
+    public var settings: [String: String] = [:]
 
     public init(origin: [String], files: [String], packageName: String, packageKey: String, isProduct: Bool,
                 imports: [String: [Import]], dependencies: [Dependency], product: Product, whiteBox: Bool,
@@ -372,12 +375,13 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     if dupDiags.hasErrors { fputs(dupDiags.render() + "\n", stderr); return false }
 
     // The `runtime` package designates its own functions runtime-subset by membership. White-box runtime
-    // tests (`NOMU_RT_PRELUDE`) prepend the runtime prelude so a user fixture can call runtime internals by
-    // name; the definitions are bare weak-ODR, so they fold with the `runtime` package's own copies.
+    // tests (`test.runtime_prelude`) prepend the runtime prelude so a user fixture can call runtime internals
+    // by name; the definitions are bare weak-ODR, so they fold with the `runtime` package's own copies.
+    let jobSettings = JobSettings(job.settings)
     let runtimeSubsetNames: Set<String>
     if job.runtimeSubsetByMembership {
         runtimeSubsetNames = Set(program.decls.compactMap { if case .funcDecl(let f) = $0 { return f.name } else { return nil } })
-    } else if !options.compilingPrelude, ProcessInfo.processInfo.environment["NOMU_RT_PRELUDE"] != nil {
+    } else if !options.compilingPrelude, jobSettings.bool("test.runtime_prelude") {
         (program, runtimeSubsetNames) = timings.measure("noir", "prelude") { prependRuntimePrelude(program) }
     } else {
         runtimeSubsetNames = []
@@ -448,12 +452,13 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         else { try? serializeBIR(shipped).write(toFile: job.outputs.bir, atomically: true, encoding: .utf8) }
     }
 
-    // Cross-module specialization: under `--mono != none`, inject the generic templates visible dependencies
-    // ship so the monomorphizer specializes the instances this module uses.
+    // Cross-module specialization: unless `opt.mono` is `none`, inject the generic templates visible
+    // dependencies ship so the monomorphizer specializes the instances this module uses.
+    let mono = MonoMode(rawValue: jobSettings.choice("opt.mono"))!
     var moduleForMono = semaResult.module
     var localizedGenerics: Set<String> = []
-    if options.effectiveMono != .none {
-        let selected = selectForDial(importedTemplates(), mode: options.effectiveMono, consumer: moduleForMono)
+    if mono != .none {
+        let selected = selectForDial(importedTemplates(), mode: mono, consumer: moduleForMono)
         let injection = injectImportedTemplates(into: moduleForMono, templates: selected)
         moduleForMono = injection.module
         localizedGenerics = injection.localizedNames
@@ -485,24 +490,35 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     }
     // The `runtime` package emits its functions bare and weak-ODR (its files are the weak-origin set); an
     // ordinary module marks the embedded prelude file names weak, which matters only for a white-box
-    // `NOMU_RT_PRELUDE` prepend.
+    // `test.runtime_prelude` prepend.
     let weakOrigins: Set<String> = job.runtimeSubsetByMembership ? ownFiles
         : options.compilingPrelude ? [] : [EmbeddedSources.preludeName, EmbeddedSources.runtimePreludeName]
+    var optimizer = OptimizerSettings()
+    optimizer.devirt = jobSettings.bool("opt.devirt")
+    optimizer.inline = jobSettings.bool("opt.inline")
+    optimizer.escape = jobSettings.bool("opt.escape")
+    optimizer.scalar = jobSettings.bool("opt.scalar")
+    optimizer.inlineAlloc = jobSettings.bool("opt.inline_alloc")
+    switch jobSettings.choice("opt.escape_provider") {
+    case "graph": optimizer.escapeProvider = .graph
+    case "graph_precise": optimizer.escapeProvider = .graphPrecise
+    default: optimizer.escapeProvider = .legacy
+    }
     let err: String?
     if job.product == .binary {
         let emitLLVM = debugStem != nil && (options.llvm || options.stopAt == .llvm)
-        err = emitObject(gen.module, from: monoModule, to: job.outputs.object, optimize: options.optimize,
+        err = emitObject(gen.module, from: monoModule, to: job.outputs.object, optimize: jobSettings.optimize,
                          onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
                          emitLLVMTo: emitLLVM ? debugStem! + ".ll" : nil, stopAfterEgress: options.stopAt == .llvm,
                          externalFuncNames: extFuncs, externalGenericSigs: extGenerics,
-                         weakOriginFiles: weakOrigins, facts: store)
+                         weakOriginFiles: weakOrigins, homeModule: job.origin, facts: store, optimizer: optimizer)
         if err == nil, emitLLVM { fputs(debugStem! + ".ll\n", stderr) }
     } else {
-        err = emitObject(gen.module, from: monoModule, to: job.outputs.object, optimize: options.optimize,
+        err = emitObject(gen.module, from: monoModule, to: job.outputs.object, optimize: jobSettings.optimize,
                          onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
                          requireMain: false, externalFuncNames: extFuncs, externalGenericSigs: extGenerics,
                          weakOriginFiles: weakOrigins, emitTypeMaps: false,
-                         homeQualifier: Mangle.qualifier(module: job.origin), facts: store)
+                         homeModule: job.origin, facts: store, optimizer: optimizer)
     }
     if let err { fputs("error: \(err)\n", stderr); return false }
     return true

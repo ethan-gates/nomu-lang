@@ -62,26 +62,23 @@ struct Ctx {
         var h: UInt64 = 0xcbf29ce484222325
         for b in c.compileKey.utf8 { h ^= UInt64(b); h = h &* 0x00000100000001B3 }
         let slug = c.fixture.replacingOccurrences(of: "/", with: "_")
-        let leaf = (binaryPath(c.fixture) as NSString).lastPathComponent
+        let leaf = binaryName(c.fixture)
         return projectRoot + "/build/compiler-test/" + slug + "-" + String(h, radix: 16) + "/" + leaf
     }
 
     func fixturePath(_ fixture: String) -> String {
         (fixture as NSString).isAbsolutePath ? fixture : projectRoot + "/" + fixture
     }
-    // Binary lands in the fixture module's own build directory, named after the module, under the build/
-    // of the workspace holding it (its nearest `nomu.yaml`): <workspace>/build/<module path>/<leaf> (the
-    // compiler's layout, task 190 D2).
-    func binaryPath(_ fixture: String) -> String {
+    // The binary's file name: the compiler names it after the fixture's module directory, or after the
+    // fixture when the fixture is a workspace root (task 190 D2). Where it lands, the build reports.
+    func binaryName(_ fixture: String) -> String {
         let dir = fixturePath(fixture)
         var ws = dir
         while ws != "/" && !FileManager.default.fileExists(atPath: ws + "/nomu.yaml") {
             ws = (ws as NSString).deletingLastPathComponent
         }
         if ws == "/" { ws = projectRoot }
-        let rel = dir == ws ? "" : String(dir.dropFirst(ws.count + 1))
-        let leaf = rel.isEmpty ? fixtureStem(fixture) : (rel as NSString).lastPathComponent
-        return ws + "/build/" + (rel.isEmpty ? "" : rel + "/") + leaf
+        return dir == ws ? fixtureStem(fixture) : (dir as NSString).lastPathComponent
     }
     func fixtureStem(_ fixture: String) -> String {
         ((fixture as NSString).lastPathComponent as NSString).deletingPathExtension

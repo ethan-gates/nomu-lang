@@ -1,0 +1,18 @@
+package class Box {
+  var v: Int
+}
+
+// A managed field: this `Node`'s pointer map has one entry.
+package class Node {
+  var box: Box
+}
+
+package fun fromA(n: Int) -> Int {
+  let node = Node(box: Box(v: 5))
+  var i = 0
+  while i < n {
+    let g = Box(v: i)
+    i = i + g.v - i + 1
+  }
+  return node.box.v
+}

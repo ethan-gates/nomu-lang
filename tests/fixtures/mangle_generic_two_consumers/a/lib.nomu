@@ -1,0 +1,10 @@
+import pkg/gen
+
+package struct Item {
+  let v: Int
+}
+
+package fun fromA() -> Int {
+  let it = keep(Item(v: 5), 10)
+  return it.v
+}

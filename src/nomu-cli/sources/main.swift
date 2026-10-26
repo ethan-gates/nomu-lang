@@ -1,6 +1,7 @@
 import Foundation
 import cli
 import driver
+import settings
 
 // The `nomu` driver (task 173.5.1). Every entry is a subcommand: `build`/`run`/`test`/`query` for people,
 // and `compile`, the per-module job for tools that divide a build into processes (task 190, D9). The command
@@ -11,7 +12,6 @@ let nomuVersion = "nomu 0.1.0-dev"
 // The flags and options every building command (`build`, `run`, `test`) takes. The debug views apply to the
 // entry module; the hidden switches serve the test suite.
 let buildFlags: [Flag] = [
-    Flag("release", short: "O", help: "optimize (LLVM -O2); default is a debug build"),
     Flag("emit-ast", help: "also emit the entry module's parsed AST (<name>.ast)"),
     Flag("emit-noir", help: "also emit the entry module's NOIR, the Nomu typed IR (<name>.noir)"),
     Flag("emit-ssair", help: "also emit the entry module's SSAIR, the optimizer IR (<name>.ssair)"),
@@ -24,7 +24,9 @@ let buildFlags: [Flag] = [
          hidden: true),
 ]
 let buildOptionList: [Opt] = [
-    Opt("mono", valueName: "mode", help: "cross-module specialization depth", choices: ["none", "edge", "all"]),
+    Opt("config", short: "c", valueName: "names",
+        help: "select configs from cfg.yaml (repeat, or separate with commas); default: debug, or test for `test`",
+        isList: true),
     Opt("runtime-subset", valueName: "names", help: "functions compiled under the runtime subset",
         isList: true, commaSplit: true),
     Opt("stop", valueName: "stage", help: "halt after STAGE (`plan` prints the build plan)",
@@ -93,15 +95,14 @@ func runCompile(_ args: Parsed) -> Bool {
     do { file = try JobFile.decode(Data(contentsOf: URL(fileURLWithPath: path))) }
     catch { fputs("error: cannot read job file '\(path)': \(error)\n", stderr); return false }
     let timings = Timings()
-    timings.optimize = file.options.optimize
+    timings.optimize = JobSettings(file.job.settings).optimize
     return compile(file.job, options: file.options, timings: timings)
 }
 
-// The options shared by `build`, `run` and `test`. Choice options (`--mono`, `--stop`) are already validated
-// by the parser, so the rawValue conversions hold.
+// The options shared by `build`, `run` and `test`. The choice option `--stop` is already validated by the
+// parser, so its rawValue conversion holds.
 func buildOptions(_ args: Parsed) -> EmitOptions {
     var options = EmitOptions()
-    options.optimize = args.has("release")
     options.ast = args.has("emit-ast")
     options.noir = args.has("emit-noir")
     options.ssair = args.has("emit-ssair")
@@ -110,7 +111,6 @@ func buildOptions(_ args: Parsed) -> EmitOptions {
     options.allowCoreImport = args.has("allow-core-import")
     options.emitJobs = args.has("emit-jobs")
     options.subsetFuncs.formUnion(args.values("runtime-subset"))
-    if let m = args.value("mono") { options.mono = MonoMode(rawValue: m) }
     if let s = args.value("stop") { options.stopAt = Stage(rawValue: s) ?? .binary }
     return options
 }
@@ -123,7 +123,7 @@ func runBuild(_ args: Parsed) -> Bool {
     if targets.isEmpty { targets = ["."] }
     var ok = true
     for target in targets {
-        let r = buildTargetResult(path: target, options: options)
+        let r = buildTargetResult(path: target, options: options, selection: ConfigSelection(args.values("config")))
         if args.has("report-jobs") {
             for m in r.compiled { print("compiled \(m)") }
             for m in r.cached { print("cached \(m)") }
@@ -138,7 +138,8 @@ func runBuild(_ args: Parsed) -> Bool {
 // forwarding the post-`--` args and the exit status. A non-executable module (no `main`) fails the build.
 func runRun(_ args: Parsed) -> Int32 {
     let target = args.positional("target") ?? "."
-    return runTarget(path: target, args: args.passthrough, options: buildOptions(args))
+    return runTarget(path: target, args: args.passthrough, options: buildOptions(args),
+                     selection: ConfigSelection(args.values("config")))
 }
 
 // `nomu test [target]` — build and run test modules (default target: the current directory). A path
@@ -146,7 +147,8 @@ func runRun(_ args: Parsed) -> Int32 {
 // Each test module is a binary with white-box `test import` access; the case runner is task 161.
 func runTest(_ args: Parsed) -> Bool {
     let target = args.positional("target") ?? "."
-    return testPackage(target: target, options: buildOptions(args))
+    return testPackage(target: target, options: buildOptions(args),
+                       selection: ConfigSelection(args.values("config"), defaultConfig: "test"))
 }
 
 // `nomu query [target]` — print the package metadata (modules, dep edges, externals) as JSON on stdout.

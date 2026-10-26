@@ -1,0 +1,2 @@
+exit 1
+error: -c prod: `prod` is not a declared config

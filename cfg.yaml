@@ -1,0 +1,19 @@
+# Configs the integration suite and the tools select (tests/suite.json, tools/). Each sets one setting, so
+# they combine: `-c release -c no_escape`.
+configs:
+  mono_all: null
+  mono_edge: null
+  no_devirt: null
+  no_inline: null
+  no_escape: null
+  no_scalar: null
+  rt_prelude: null
+opt:
+  mono mono_all: all
+  mono mono_edge: edge
+  devirt no_devirt: false
+  inline no_inline: false
+  escape no_escape: false
+  scalar no_scalar: false
+test rt_prelude:
+  runtime_prelude: true

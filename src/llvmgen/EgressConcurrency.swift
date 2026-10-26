@@ -48,6 +48,7 @@ enum EgressConcurrency {
             g.e.fail("7.2.3: unknown spawn body '\(startFn)'", span); return
         }
         let (thunk, _) = g.e.emitFunction("nomu_spawnthunk_\(binding)", ret: g.e.i8ptr, params: [g.e.i8ptr])
+        LLVMSetLinkage(thunk, LLVMInternalLinkage)   // referenced only from this spawn site
         g.e.withStubBody(thunk) {
             let envArg = LLVMGetParam(thunk, 0)!   // addr0 void* — matches `spawn:N`'s addr0 env param
             let r = g.e.buildCall(start.fn, start.ty, [envArg])!

@@ -16,6 +16,7 @@ swift_library(
     visibility = ["//visibility:public"],  # the driver deps on this for the backend
     deps = [
         "//src/support",  # Span/Type/Diagnostic (interface leaf)
+        "//src/mangle",  # symbol names (Rust v0)
         "//src/frontend/ast",  # BinOp (NOIR reuses the AST binary-op enum)
         "//src/frontend/noir",  # NOIRModule — the type/witness metadata the SSAIRToLLVM egress reads
         "//src/midend/ssair",  # SSAModule / the SSAIR the SSAIRToLLVM egress lowers (7.2.3)

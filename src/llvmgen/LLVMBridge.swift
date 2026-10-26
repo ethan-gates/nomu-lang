@@ -28,6 +28,19 @@ private func cgStage<T>(_ phase: String, _ name: String, _ onStage: StageSink?, 
     return r
 }
 
+/// The optimizer switches a job's settings give (`opt.*` in the compiler's settings): each SSAIR pass, the
+/// escape provider, and the inline allocation fast path. All on, with the legacy provider, by default.
+public struct OptimizerSettings {
+    public enum EscapeProvider { case legacy, graph, graphPrecise }
+    public var devirt = true
+    public var inline = true
+    public var escape = true
+    public var scalar = true
+    public var escapeProvider = EscapeProvider.legacy
+    public var inlineAlloc = true
+    public init() {}
+}
+
 /// Lower an already-gen'd SSAIR module to a native object file for the host triple (the driver gens the
 /// SSA, interposes inference + `.nmi` emit, then calls this and links the result with the runtime `.a`).
 /// `noirModule` is the source NOIR the egress still reads for lowering. Returns nil on success, else a
@@ -39,7 +52,8 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
                        requireMain: Bool = true, externalFuncNames: Set<String> = [],
                        externalGenericSigs: [String: ExternalGenericSig] = [:],
                        weakOriginFiles: Set<String> = [], emitTypeMaps: Bool = true,
-                       homeQualifier: String = "", facts: FactStore = FactStore()) -> String? {
+                       homeModule: [String] = [], facts: FactStore = FactStore(),
+                       optimizer: OptimizerSettings = OptimizerSettings()) -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
@@ -56,31 +70,29 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
     // tree-walk; the driver owns gen now, task 165.1). The optimizer pipeline runs in place, verifying
     // the GC-precision invariants (§7.0.5) after every pass. Pipeline order is devirt → inline →
     // stack/scalar promotion (§7.0.4): devirt un-uses a locally-dispatched box and inline exposes callee
-    // bodies, so promotion then falls out. Each pass has an A/B env gate
-    // (`NOMU_NO_DEVIRT`/`NOMU_NO_INLINE`/`NOMU_NO_ESCAPE`/`NOMU_NO_SCALAR`) so a tier-off baseline stays
+    // bodies, so promotion then falls out. Each pass has a switch in `optimizer` so a tier-off baseline stays
     // available for bisecting a regression.
     var ssaModule = ssa
-    let env = ProcessInfo.processInfo.environment
     var passes: [SSAPass] = []
-    if env["NOMU_NO_DEVIRT"] == nil { passes.append(Devirtualize()) }
-    if env["NOMU_NO_INLINE"] == nil { passes.append(Inline()) }
-    // Escape provider A/B (tasks 166.3/166.4): `NOMU_PTG_ESCAPE` swaps the legacy `escapingValues` for the
+    if optimizer.devirt { passes.append(Devirtualize()) }
+    if optimizer.inline { passes.append(Inline()) }
+    // Escape provider A/B (tasks 166.3/166.4): `graph` swaps the legacy `escapingValues` for the
     // points-to-graph-backed `graphEscaping`. Its faithful query reproduces `escapingValues` exactly (an
-    // unchanged-output differential oracle over the suite); `NOMU_PTG_PRECISE` additionally flips it to the
-    // graph's container/field-sensitive query, which promotes a superset. Both gates stay available to
-    // bisect a precision regression back to faithful, then back to legacy.
-    if env["NOMU_NO_ESCAPE"] == nil {
-        if env["NOMU_PTG_ESCAPE"] != nil {
+    // unchanged-output differential oracle over the suite); `graphPrecise` uses the graph's
+    // container/field-sensitive query, which promotes a superset. Both stay available to bisect a precision
+    // regression back to faithful, then back to legacy.
+    if optimizer.escape {
+        if optimizer.escapeProvider != .legacy {
             let aggregates = ssaModule.aggregates
-            let precise = env["NOMU_PTG_PRECISE"] != nil
+            let precise = optimizer.escapeProvider == .graphPrecise
             passes.append(StackPromotion(escaping: { graphEscaping($0, aggregates: aggregates, precise: precise) }))
         } else {
             passes.append(StackPromotion())
         }
     }
-    // Scalar promotion (§7.3.1) rides the escape A/B flag (off ⇒ no promotion) with its own bisect gate;
+    // Scalar promotion (§7.3.1) rides the escape switch (off ⇒ no promotion) with its own bisect switch;
     // it decomposes a loop-carried non-escaping class the simple-slot path leaves heap.
-    if env["NOMU_NO_ESCAPE"] == nil && env["NOMU_NO_SCALAR"] == nil { passes.append(ScalarPromotion()) }
+    if optimizer.escape && optimizer.scalar { passes.append(ScalarPromotion()) }
     let pipeline = PassPipeline(passes)
     let violations = pipeline.run(&ssaModule, stem: path, onStage: onStage)
     if let first = violations.first { return "SSAIR verify: \(first)" }
@@ -89,7 +101,8 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
     egress.e.externalGenericSigs = externalGenericSigs
     egress.e.weakOriginFiles = weakOriginFiles
     egress.e.emitsTypeMaps = emitTypeMaps
-    egress.e.homeQualifier = homeQualifier
+    egress.e.homeModule = homeModule
+    egress.e.inlineAlloc = optimizer.inlineAlloc
     cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: noirModule) }
     if let err = egress.error { return err }
     // The entry object must have `main`; a library object need not.
@@ -110,6 +123,37 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
     }
     if stopAfterEgress { return nil }
     return emitModuleObject(mod, to: path, optimize: optimize, onStage: onStage)
+}
+
+/// A value the runtime reads from a global in the settings object: an `int64_t`, a `uint8_t` 0 or 1, or a
+/// NUL-terminated `const char[]`.
+public enum RuntimeGlobal {
+    case int(Int64)
+    case bool(Bool)
+    case string(String)
+}
+
+/// Emit the settings object a binary links (G14 of the build-configuration design): one exported constant
+/// per runtime setting, under the symbol the runtime declares. Returns nil on success, else an error.
+public func emitSettingsObject(_ globals: [(symbol: String, value: RuntimeGlobal)], to path: String) -> String? {
+    guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
+    guard LLVMInitializeNativeAsmPrinter() == 0 else { return "LLVM: no native asm printer configured" }
+    guard LLVMInitializeNativeAsmParser() == 0 else { return "LLVM: no native asm parser configured" }
+    let ctx = LLVMContextCreate()!
+    defer { LLVMContextDispose(ctx) }
+    let mod = LLVMModuleCreateWithNameInContext("nomu.settings", ctx)!
+    for (symbol, value) in globals {
+        let initializer: LLVMValueRef
+        switch value {
+        case .int(let v): initializer = LLVMConstInt(LLVMInt64TypeInContext(ctx), UInt64(bitPattern: v), 1)
+        case .bool(let b): initializer = LLVMConstInt(LLVMInt8TypeInContext(ctx), b ? 1 : 0, 0)
+        case .string(let s): initializer = LLVMConstStringInContext2(ctx, s, s.utf8.count, 0)
+        }
+        let g = LLVMAddGlobal(mod, LLVMTypeOf(initializer), symbol)!
+        LLVMSetInitializer(g, initializer)
+        LLVMSetGlobalConstant(g, 1)
+    }
+    return emitModuleObject(mod, to: path, optimize: false)
 }
 
 /// Emit an already-built, verified module to a native object file for the host triple, via

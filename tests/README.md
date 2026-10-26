@@ -27,10 +27,10 @@ Exit codes: 0 all pass · 1 a case failed/timed out · 2 usage · 3 deadline.
 build first (a debug compiler is ~10× slower to run), falling back to `bazel-bin` with a warning.
 Build it once with `bazel build -c opt //src/nomu-cli:nomu`. Override with `--compiler`.
 Each fixture builds with `nomu build <fixture dir>`, and each configuration (a fixture plus its compile
-settings) keeps its own binary at `build/compiler-test/<fixture>-<hash>/<leaf>`. `nomu build` writes one
-output path per module whatever its settings, so configurations of one fixture compile one after another
-and the harness copies each binary out; different fixtures compile in parallel. (Task 198 moves this into
-the driver.)
+settings) keeps its own binary at `build/compiler-test/<fixture>-<hash>/<leaf>`, copied from the path the
+build reports. The suite's settings are still environment variables, which leave the build's output path
+unchanged, so configurations of one fixture compile one after another; different fixtures compile in
+parallel. (Task 205 moves the run settings off environment variables and restores the parallel compiles.)
 
 **Hermetic runs:** compiles and runs see only `PATH`, `HOME`, `TMPDIR` and the case's declared settings.
 Any `NOMU_*` variable in your shell is dropped.
@@ -92,10 +92,11 @@ Unset fields fall back to `defaults`.
 ## Settings
 
 A case changes how its fixture is compiled or run only through named settings. The table, with each
-setting's stage and today's mechanism, is `src/compiler-test/sources/Settings.swift`; an unknown name, or a
-setting at the wrong stage, is an error. Task 198 turns these into compiler flags; the names stay.
-- Compile: `optimize` (`--release`), `inline`, `escape`, `scalar`, `devirt` (each default `true`; `false`
-  turns the pass off), `rt_prelude` (fixtures that call `rt*` directly).
+setting's stage and its mechanism, is `src/compiler-test/sources/Settings.swift`; an unknown name, or a
+setting at the wrong stage, is an error. Compile settings select configs declared in the repository's root
+`cfg.yaml`; run settings are still environment variables (task 205 moves them).
+- Compile: `optimize` (`-c release`), `inline`, `escape`, `scalar`, `devirt` (each default `true`; `false`
+  selects `no_inline` and the like, turning the pass off), `rt_prelude` (fixtures that call `rt*` directly).
 - Run: `gc_log` (log each collection: `nomu-gc-sync: collection N (minor|major)`), `gc_stress_bytes` (a
   collection every N bytes a carrier allocates), `nursery_blocks` (a minor collection when the nursery
   fills N 32 KiB blocks), `mature_floor` (every collection major below this mature size),
@@ -151,7 +152,7 @@ data. Safe to commit (CI/fresh checkouts inherit the order) or to delete (a full
 fixture's correct output legitimately changes, e.g.:
 
 ```
-NOMU_NO_ESCAPE=1 build/examples/gc_string > tests/expected/gc_string.txt
+nomu build -c no_escape examples/gc_string && build/no_escape/examples/gc_string > tests/expected/gc_string.txt
 ```
 
 ## Status

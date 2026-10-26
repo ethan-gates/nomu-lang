@@ -1,4 +1,5 @@
 import sema
+import mangle
 import noir
 import ast
 import support
@@ -11,22 +12,21 @@ import LLVM_C
 // so they live here in the shared emitter. Body definition (the tree-walk) stays on each egress —
 // `NOIRToLLVM.defineBody` today, its SSAIR analog later.
 extension LLVMGen {
-    // The mangling qualifier for a symbol *defined* in this module (tasks 100.4 / 100.5.5). An
-    // **origin-keyed** name (`lib@foo<Int>`) is a cross-module generic specialized locally: the producer
-    // is already in the name, so it takes **no** consumer home-qualifier — every consumer that specializes
-    // the same instance emits the identical producer-qualified symbol, which the weak-ODR fold collapses
-    // (100.5.5). A prelude/runtime function keeps a bare name (its file is in `weakOriginFiles`); any other
-    // definition carries the module's `homeQualifier`. The definition and every on-demand declaration of
-    // the same function route through here, so they agree.
-    func definitionQualifier(for name: String, file: String) -> String {
-        if ExternalName.isEncoded(name) { return "" }
-        return weakOriginFiles.contains(file) ? "" : homeQualifier
+    // The home module for mangling a symbol *defined* in this module (tasks 100.4 / 100.5.5). An
+    // **origin-keyed** name (`lib@foo<Int>`) is a cross-module generic specialized locally: the producer is
+    // in the name, so every consumer that specializes the same instance emits the identical
+    // producer-qualified symbol, which the weak-ODR fold collapses (100.5.5); its type arguments still
+    // resolve against this module. A prelude/runtime function keeps a bare name (its file is in
+    // `weakOriginFiles`, an empty home). The definition and every on-demand declaration of the same function
+    // route through here, so they agree.
+    func definitionModule(for file: String) -> Mangle.Module {
+        weakOriginFiles.contains(file) ? [] : homeModule
     }
 
     func declareFree(_ name: String) {
         let key = "f:\(name)"
         guard callables[key] == nil, let f = funcMap[name] else { return }
-        declareCallable(key: key, llvmName: Mangle.free(name, qualifier: definitionQualifier(for: name, file: f.span.file)),
+        declareCallable(key: key, llvmName: Mangle.function(name, home: definitionModule(for: f.span.file)),
                         ir: f, selfType: nil, selfByPointer: false)
     }
 
@@ -40,7 +40,7 @@ extension LLVMGen {
         // A class is a reference type: `self` is always the object pointer. A struct/enum passes
         // `self` by pointer only when the method mutates it.
         let byPointer = classMap[typeName] != nil || f.isMutating
-        declareCallable(key: key, llvmName: Mangle.method(typeName, method, qualifier: definitionQualifier(for: typeName, file: f.span.file)),
+        declareCallable(key: key, llvmName: Mangle.method(typeName, method, home: definitionModule(for: f.span.file)),
                         ir: f, selfType: typeName, selfByPointer: byPointer)
     }
 
@@ -55,7 +55,7 @@ extension LLVMGen {
         }
         let f = NOIRFunc(name: h.name, params: h.params, returnType: h.returnType,
                        body: h.body, isMutating: true, span: h.span)
-        declareCallable(key: key, llvmName: Mangle.actorHandler(actorName, handler, qualifier: definitionQualifier(for: actorName, file: f.span.file)),
+        declareCallable(key: key, llvmName: Mangle.method(actorName, handler, home: definitionModule(for: f.span.file)),
                         ir: f, selfType: actorName, selfByPointer: true)
     }
 

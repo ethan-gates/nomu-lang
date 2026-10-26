@@ -60,6 +60,12 @@ public struct WorkspaceConfig: Equatable {
                                                 "pin alias '\(key)' must match [a-z][a-z0-9_]*"))
                     continue
                 }
+                // `all` names every external in a `cfg.yaml` `externals:` section (task 198, G20).
+                if key == "all" {
+                    diags.append(PlanDiagnostic(file: file, line: line, column: indent + 1,
+                                                "pin alias 'all' is reserved for the cfg.yaml block covering every external"))
+                    continue
+                }
                 if pins.contains(where: { $0.alias == key }) {
                     diags.append(PlanDiagnostic(file: file, line: line, column: indent + 1,
                                                 "pin alias '\(key)' is declared more than once"))
@@ -89,6 +95,10 @@ public struct WorkspaceConfig: Equatable {
         }
         let scope = identityField("scope", "my_handle")
         let name = identityField("name", "my_project")
+        if name == "all", let f = fields["name"] {
+            diags.append(PlanDiagnostic(file: file, line: f.line, column: f.column,
+                                        "workspace name 'all' is reserved for the cfg.yaml block covering every external"))
+        }
         guard diags.isEmpty, let scope, let name else { return (nil, diags) }
         return (WorkspaceConfig(identity: WorkspaceIdentity(scope: scope, name: name), pins: pins), [])
     }

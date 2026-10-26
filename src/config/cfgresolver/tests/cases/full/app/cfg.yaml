@@ -1,0 +1,17 @@
+configs:
+  production: release
+oven:
+  temp production: 230
+  mode: convect
+dough:
+  flours:
+    - rye
+pantry:
+  capacity production: 256M
+externals:
+  all:
+    oven:
+      mode: bake
+  json:
+    dough:
+      proof: false

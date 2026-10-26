@@ -1,0 +1,33 @@
+# The builtin layer: every setting at its default, and the values the builtin configs set.
+configs:
+  debug: null
+  release: null
+  test: debug
+oven:
+  # How the oven heats.
+  # one of bake, broil, convect; targets: compile; granularity: module
+  mode: bake
+  # Oven temperature in degrees.
+  # int (0...300); targets: compile; granularity: module
+  temp: 180
+  temp release: 220
+dough:
+  # Whether dough rises before baking.
+  # bool; targets: compile; granularity: module
+  proof: true
+  proof test: false
+  # Flours mixed into the dough.
+  # list of string; targets: compile; granularity: module; appends
+  flours:
+    - wheat
+pantry:
+  # Pantry space.
+  # size; targets: compile, run; granularity: program
+  capacity: 64M
+shop:
+  # The shop's sign.
+  # string; targets: run; granularity: program
+  name: corner
+  # Where sales are written.
+  # string; targets: build; granularity: build
+  ledger: ledger

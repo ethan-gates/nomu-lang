@@ -1,0 +1,46 @@
+command: cfgresolver -c production,test ../full/app
+compiler: cfgresolver
+source: fixture
+active:
+  acme.app:
+    - release
+    - production
+    - debug
+    - test
+  externals:
+    - release
+    - debug
+    - test
+builtin:
+  oven.mode: bake
+  oven.temp: 180
+  oven.temp release: 220
+  dough.proof: true
+  dough.proof test: false
+  dough.flours:
+    - wheat
+  pantry.capacity: 64M
+  shop.name: corner
+  shop.ledger: ledger
+workspaces:
+  acme.app:
+    oven.mode: convect
+    oven.temp production: 230
+    dough.flours:
+      - rye
+    pantry.capacity production: 256M
+  acme.json:
+    oven.temp release: 190
+packages:
+  acme.app/net:
+    oven.temp: 200
+    oven.temp release: 210
+modules:
+  acme.app/net/tls:
+    dough.flours:
+      - spelt
+externals:
+  all:
+    oven.mode: bake
+  json:
+    dough.proof: false

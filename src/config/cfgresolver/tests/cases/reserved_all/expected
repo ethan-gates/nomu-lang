@@ -1,0 +1,2 @@
+exit 1
+app/nomu.yaml:4:8: error: `all` is reserved and cannot be a pin alias

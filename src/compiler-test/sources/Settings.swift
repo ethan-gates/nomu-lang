@@ -2,10 +2,9 @@ import Foundation
 
 // Named settings — the manifest's only way to change how a fixture is compiled or how its binary runs.
 // A case, group or dimension value names a setting by meaning (`gc_stress_bytes: 4096`); this table maps
-// each name to its stage and to the mechanism that carries it today: a `nomu build` argument or an
-// environment variable. Task 198 makes these compiler flags; the table's targets change, the manifest does
-// not. A name missing from the table is a manifest error, so a mistyped or retired knob cannot pass
-// silently.
+// each name to its stage and to the mechanism that carries it: a config selected on `nomu build` (declared
+// in the repository's root `cfg.yaml`) for compile settings, an environment variable for run settings. A
+// name missing from the table is a manifest error, so a mistyped or retired knob cannot pass silently.
 
 enum Stage { case compile, run }
 
@@ -31,11 +30,11 @@ enum SettingValue: Decodable, Equatable {
 
 typealias Settings = [String: SettingValue]
 
-// How a setting reaches its stage. `flagWhen`: an argument passed when the value equals the given boolean.
-// `envWhen`: the variable set to `1` when the value equals the given boolean. `envValue`: the variable set
-// to the value.
+// How a setting reaches its stage. `configWhen`: the config selected when the value equals the given
+// boolean. `envWhen`: the variable set to `1` when the value equals the given boolean. `envValue`: the
+// variable set to the value.
 enum Carrier {
-    case flagWhen(Bool, String)
+    case configWhen(Bool, String)
     case envWhen(Bool, String)
     case envValue(String)
 }
@@ -48,17 +47,17 @@ struct SettingDef {
 
 let settingTable: [String: SettingDef] = [
     // Compile settings.
-    "optimize":           SettingDef(stage: .compile, carrier: .flagWhen(true, "--release"),
+    "optimize":           SettingDef(stage: .compile, carrier: .configWhen(true, "release"),
                                      help: "release pipeline (LLVM -O2)"),
-    "inline":             SettingDef(stage: .compile, carrier: .envWhen(false, "NOMU_NO_INLINE"),
+    "inline":             SettingDef(stage: .compile, carrier: .configWhen(false, "no_inline"),
                                      help: "SSAIR inlining (default on)"),
-    "escape":             SettingDef(stage: .compile, carrier: .envWhen(false, "NOMU_NO_ESCAPE"),
+    "escape":             SettingDef(stage: .compile, carrier: .configWhen(false, "no_escape"),
                                      help: "escape analysis and stack promotion (default on)"),
-    "scalar":             SettingDef(stage: .compile, carrier: .envWhen(false, "NOMU_NO_SCALAR"),
+    "scalar":             SettingDef(stage: .compile, carrier: .configWhen(false, "no_scalar"),
                                      help: "scalar promotion (default on)"),
-    "devirt":             SettingDef(stage: .compile, carrier: .envWhen(false, "NOMU_NO_DEVIRT"),
+    "devirt":             SettingDef(stage: .compile, carrier: .configWhen(false, "no_devirt"),
                                      help: "devirtualization (default on)"),
-    "rt_prelude":         SettingDef(stage: .compile, carrier: .envWhen(true, "NOMU_RT_PRELUDE"),
+    "rt_prelude":         SettingDef(stage: .compile, carrier: .configWhen(true, "rt_prelude"),
                                      help: "compile against the runtime prelude (fixtures that call rt* directly)"),
     // Run settings.
     "gc_log":             SettingDef(stage: .run, carrier: .envWhen(true, "NOMU_GC_DEBUG_PRESSURE"),
@@ -99,9 +98,9 @@ func lower(_ settings: Settings, at stage: Stage, in owner: String) -> (args: [S
             die("\(owner): '\(name)' is a \(def.stage == .compile ? "compile" : "run") setting")
         }
         switch def.carrier {
-        case .flagWhen(let when, let flag):
+        case .configWhen(let when, let config):
             guard case .bool(let b) = value else { die("\(owner): '\(name)' takes true or false") }
-            if b == when { args.append(flag) }
+            if b == when { args.append("--config=" + config) }
         case .envWhen(let when, let variable):
             guard case .bool(let b) = value else { die("\(owner): '\(name)' takes true or false") }
             if b == when { env[variable] = "1" }

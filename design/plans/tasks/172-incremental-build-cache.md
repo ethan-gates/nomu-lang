@@ -78,6 +78,28 @@ What determines a module's cache entry. Candidate inputs: the module's own sourc
   perf edit that preserves its ABI leaves the dependent's key fixed and its object reused. **Lean: fixed.**
 - *Compiler version.* Embed a recipe version (the runtime archive's `"recipe-N"` model) so a compiler change
   invalidates everything without the user clearing anything. **Lean: fixed.**
+  Found in 203: the language workspace's key today uses the compiler's git commit, so a compiler built from
+  uncommitted changes reuses entries an older build of the same commit wrote (203's new symbol names met
+  stale `std` objects until the cache was cleared). The identity should cover the compiler binary itself,
+  or a dev build should key on a hash of its sources.
+- *What 198 leaves to the key.* After 198, every setting that changes an object is in the job's `settings`
+  in canonical form, and no environment variable read during a compile changes an object (the remaining
+  ones, `NOMU_DUMP_LLVM`, `NOMU_DUMP_SSAIR_PASSES` and `NOMU_TIME_CODEGEN`, write diagnostics). Inputs
+  outside `settings` that still change an object, and so belong in the key:
+  - `--runtime-subset` (`EmitOptions.subsetFuncs`): changes codegen for the named functions and reaches only
+    the entry workspace's jobs, as F4 did. Making it a setting would put it in `settings` and give it to
+    every workspace.
+  - `compilingPrelude` (`EmitOptions`): set by the planner for language-workspace jobs; changes symbol
+    linkage. Deterministic from the module's place, but a job-file field the key must cover.
+  - The target CPU and its features: object emission tunes for `LLVMGetHostCPUName`, so objects differ
+    across machines. Safe in a per-host cache; a shared or remote cache needs it in the key.
+  - The compiler's identity for user modules (the language workspace's key already has it), and absolute
+    source paths, which debug info embeds.
+
+  The job file also carries options that change no object (the `--emit-*` dumps, `--stop`, `emitJobs`);
+  the key leaves them out, so switching a dump does not rebuild. So: key each job on its `CompileJob`
+  (sources, imports, dependencies, `settings`), the output-affecting options, the compiler identity and the
+  target CPU.
 
 ### Invalidation walk
 
@@ -167,6 +189,28 @@ command, add a size-bounded LRU once the cache is shared.**
   [145](145-monomorphization-cost.md) (cached monomorphizations), [142](142-ir-pipeline-hardening.md)
   (versioned stage-boundary formats, so a cached artifact is never misread across a format change),
   [156](156-differential-stage-diffing.md) (shares the determinism requirement).
+
+- *A starting sketch for the output layout (from 198), unsettled; Bazel is the main reference.* Every
+  artifact is named by its hash and stored in the central, space-managed host cache. The key covers input
+  files and compiler settings; config names likely stay out of it. To show a module's built artifacts, the
+  build symlinks them into `build/`, as Bazel does. One workspace runs one invocation at a time; parallelism
+  is across the modules of one build, under one CLI-level selection (`-c release`). It would replace 198's
+  interim `build/<configs>/` directories. Questions it raises:
+  - `build/` shows the last build only; tools that need two configurations at once use the reported cache
+    paths.
+  - Hash-named files give no path-shaped tree to link as one directory, so `build/` becomes a per-artifact
+    symlink farm that each build rewrites and prunes.
+  - Eviction can remove an artifact `build/` still links to; the last build's artifacts may need to be
+    roots eviction skips.
+  - The linked binary's name is its signature identifier, and its debug map points at the `.o` paths, so
+    evicting an object breaks debugging of binaries linked from it. The binary may stay a real file.
+  - One invocation per workspace needs a lock, and a choice between waiting (Bazel) and failing.
+- *Externals default to `release` (from 198).* 198 builds externals and the language workspace under
+  `debug` when nothing is selected, because without the cache an optimized external recompiles on every
+  build. With the cache, switch `CompilerSettings.externalDefault` to `["release"]`, as 198's design intends.
+- *Why did this rebuild (from 198).* A user should be able to ask why a module compiled instead of coming
+  from the cache: which input or setting changed since the build that produced the cached entry. Jobs carry
+  their settings in canonical form (198), so two keys' inputs can be compared setting by setting.
 
 ## Open design questions (for the session)
 

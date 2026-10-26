@@ -1,0 +1,7 @@
+oven:
+  tmp: 200
+  mode: grill
+externals:
+  libb:
+    oven:
+      temp: 150

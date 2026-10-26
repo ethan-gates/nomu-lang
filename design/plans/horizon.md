@@ -41,20 +41,27 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
         │        complements 179 (value-level GC classification)
         ├── 171  modules cleanup — cross-module generics residuals           (perf-accuracy)
         │        interacts with 170 (method-level generics), 118 (associated types)
-        ├── 203  symbol encoding — one injective mangling for every family   (correctness)
-        └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)
-            └── 198  build configuration — modes, per-workspace settings, the cache-key input  ◀ next
+        ├── 203  symbol encoding — one injective mangling for every family   (correctness)  (done)
+        └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)  ◀ next
+            └── 198  build configuration — modes, per-workspace settings, the cache-key input  (done)
 ```
 
-**Order of the next run:** 198, then 203, then 172, then 159. 190 (explicit module builds) and 200 (the
+**Order of the next run:** 172, then 159 (198 and 203 are done). 190 (explicit module builds) and 200 (the
 YAML parser, which 198's configuration files needed) are done; 200's open items are
 [204](tasks/204-yaml-parser-upgrades.md), off this chain. 198 went ahead of 203 by choice; 203 is 190's
-last correctness finding (a weak-symbol collision silently links the wrong definition) and follows it. 198 precedes 172,
+last correctness finding (a weak-symbol collision silently links the wrong definition) and follows it. 198 carries only what 172 needs; the rest of
+the configuration story is [205](tasks/205-config-upgrades.md), off this chain. 198 precedes 172,
 whose key takes the configuration's canonical form. GC correctness came before the modules work
 (soundness is Nomu's first priority, `vision.md`). Retiring MMTk and the C scheduler (197) was moved ahead of
 the rest of 176.5, so 176.5 was finished and tested against one runtime; 176.5 is done (176.5.1–176.5.8), and
 195 is done (195.1–195.5), and 190 closed on them. 176.4 (the escape-promotion placement route) stays with
 [148](tasks/148-ssair-optimizer-tier.md) / [179](tasks/179-value-level-gc-classification.md), off this chain.
+
+**Off the chain, after 127:** [128.5](tasks/128-self-hosting-runtime.md) retires the C floor (`runtime.c`,
+`core.c`) that remains under the Nomu runtime, the last step to the end goal's "no C". It is a location
+change, so it follows LXR by the Order rule. Its blockers include FFI-like calls, C-ABI thread entries,
+safepoint-free functions and runtime globals, some of which need language surface agreed first. A candidate
+for its own task.
 
 **What the benchmark needs from the language.** The goal is a language complete enough to benchmark against
 Go and Swift, with results that reflect the language, compiler, scheduling and memory as designed, and not

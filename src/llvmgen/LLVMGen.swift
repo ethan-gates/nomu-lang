@@ -1,4 +1,5 @@
 import noir
+import mangle
 import support
 import ssair
 import Foundation
@@ -79,12 +80,11 @@ final class LLVMGen {
     // producer's compiled-once symbol, keyed by the callee's per-origin identity.
     var externalGenericSigs: [String: ExternalGenericSig] = [:]
     var weakOriginFiles: Set<String> = []
-    // Module-path mangling (task 100.4). `homeQualifier` prefixes every symbol this module *defines*
-    // (empty for the entry/root module → bare names). An imported function's callee name is its
-    // per-origin identity (`origin@name`, task 100.2.3.2); the external-call site decodes it to the
-    // producer's mangled symbol. Prelude/runtime functions (source file in `weakOriginFiles`) stay bare —
-    // the C runtime pins those names.
-    var homeQualifier: String = ""
+    // Module-path mangling (`Mangle`). `homeModule` is the identity of the module being compiled, the module
+    // of every symbol it *defines*. An imported function's callee name is its per-origin identity
+    // (`origin@name`, task 100.2.3.2), which names its own module. Prelude/runtime functions (source file in
+    // `weakOriginFiles`) stay bare — the C runtime pins those names.
+    var homeModule: Mangle.Module = []
     // The GC type-map globals are single extern tables the C runtime reads by name, so only one object
     // may define them (the entry). Dependency objects skip the definition and reference it externally.
     // (Interim: cross-module type-ids/type-map unification is a later separate-compilation task.)
@@ -173,7 +173,7 @@ final class LLVMGen {
     // `UInt64` is the shape's registration id; its descriptor symbol (resolved at emit time) is written into
     // the pointer map as a link-time descriptor offset after the flat direct offsets. Empty for most types.
     var typeShaped: [[(offset: Int32, shapeId: UInt64)]] = []
-    // Parallel to `typeMaps`: each registered type's stable descriptor symbol (`nomu_gc_desc_*`) and
+    // Parallel to `typeMaps`: each registered type's stable descriptor symbol (`Mangle.descriptor`) and
     // whether it folds across modules (weak `linkonce_odr`) or is a program-local shape (`internal`).
     // Drives the link-time offset-as-id descriptor section (task 100.4.7); the flat tables above are
     // the interim representation, retired once the runtime reads descriptors.
@@ -225,9 +225,9 @@ final class LLVMGen {
     var intFmt: LLVMValueRef?
     var uintFmt: LLVMValueRef?
     var strFmt: LLVMValueRef?
-    // §6.6 — inline the allocation TLAB bump fast path; `NOMU_NO_INLINE_ALLOC` sends every allocation to the
-    // out-of-line `rtTlabAlloc` for A/B measurement.
-    let inlineAlloc = ProcessInfo.processInfo.environment["NOMU_NO_INLINE_ALLOC"] == nil
+    // §6.6 — inline the allocation TLAB bump fast path; off (`opt.inline_alloc: false`) sends every allocation
+    // to the out-of-line `rtTlabAlloc` for A/B measurement.
+    var inlineAlloc = true
 
     init(ctx: LLVMContextRef, mod: LLVMModuleRef) {
         self.ctx = ctx

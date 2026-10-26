@@ -1,4 +1,5 @@
 import sema
+import mangle
 import noir
 import ast
 import support
@@ -59,7 +60,7 @@ extension LLVMGen {
         let d = descriptorEntries(shapes.fieldsShape(params, base: 32))   // args start past the 4-slot prefix
         let slot = 4 + params.reduce(0) { $0 + slotCount($1) }
         let id = registerMap([8, 24] + d.offsets, sizeBytes: Int32(slot * 8),   // next, self
-                             symbol: descSymbol("msg_\(actorName)_\(h.name)"), foldable: true, shaped: d.shaped)
+                             symbol: Mangle.messageDescriptor(actorName, h.name, home: homeModule), foldable: true, shaped: d.shaped)
         messageTypeIds[key] = id
         return id
     }
@@ -75,6 +76,7 @@ extension LLVMGen {
         let handler = callables["m:\(actorName):\(h.name)"]!
         let mt = messageType(actorName, h)!
         let (fn, _) = emitFunction("nomu_onthunk_\(actorName)_\(h.name)", ret: voidTy, params: [p1])
+        LLVMSetLinkage(fn, LLVMInternalLinkage)   // referenced only from this object's sends
         actorThunks[key] = fn
         withStubBody(fn) {
             let msg = LLVMGetParam(fn, 0)!

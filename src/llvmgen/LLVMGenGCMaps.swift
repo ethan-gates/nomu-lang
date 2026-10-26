@@ -1,4 +1,5 @@
 import noir
+import mangle
 import ast
 import support
 import LLVM_C
@@ -95,22 +96,9 @@ extension LLVMGen {
         return id
     }
 
-    // A descriptor symbol from a type/shape key: `nomu_gc_desc_<key>`, non-identifier chars replaced so
-    // the linker can fold on the name. Foldable descriptors (named types, shared singletons, array
-    // buffers) share this name across modules; per-site shapes (closures) get `foldable: false` and a
-    // uniquified key so they never collide (task 100.4.7).
-    func descSymbol(_ key: String) -> String {
-        var s = "nomu_gc_desc_"
-        for ch in key {
-            switch ch {
-            case "<", ">", ",", " ", ".", "-", "&", "|", ":", "(", ")", "[", "]":
-                s.append("_")
-            default:
-                s.append(ch)
-            }
-        }
-        return s
-    }
+    // Descriptor symbols come from `Mangle.descriptor`: the kind and the type, qualified by the module that
+    // declares the type, so the linker folds copies of one type's descriptor across modules and never two
+    // types' (task 100.4.7, task 203).
 
     // Type-id for a class/actor heap type; assigns one (and computes its pointer map) on first use.
     func typeId(forHeapType name: String) -> UInt64 {
@@ -123,7 +111,7 @@ extension LLVMGen {
         if isActor { d.offsets.append(Int32(slot * 8)) }   // trailing mailbox pointer is scanned
         let totalSlots = slot + (isActor ? 1 : 0)
         let id = registerMap(d.offsets, sizeBytes: Int32(totalSlots * 8),
-                             symbol: descSymbol(name), foldable: true, shaped: d.shaped)
+                             symbol: Mangle.descriptor("desc", named: name, home: homeModule), foldable: true, shaped: d.shaped)
         typeIds[name] = id
         return id
     }
@@ -136,7 +124,7 @@ extension LLVMGen {
         let id = registerShapedMap(tagOff: Int32(leaf.tagOffset), tagShift: Int32(leaf.tagShift),
                                    sizeBytes: Int32(leaf.slots * 8),
                                    cases: leaf.managedCases.map { (tag: Int32($0.tag), offsets: $0.offsets.map(Int32.init)) },
-                                   symbol: descSymbol(leaf.name), foldable: true)
+                                   symbol: Mangle.descriptor(leaf.name, home: homeModule), foldable: true)
         leafShapeIds[leaf] = id
         return id
     }
@@ -150,7 +138,7 @@ extension LLVMGen {
     // Shared type-id for every `any I` box `{ header, witness, payload }`: scan `payload` only.
     func anyBoxTypeId() -> UInt64 {
         if let id = anyBoxMapId { return id }
-        let id = registerMap([16], sizeBytes: 24, symbol: descSymbol("anybox"), foldable: true)
+        let id = registerMap([16], sizeBytes: 24, symbol: Mangle.descriptor("anybox", home: homeModule), foldable: true)
         anyBoxMapId = id
         return id
     }
@@ -164,14 +152,14 @@ extension LLVMGen {
         let d = descriptorEntries(shapes.shape(t).shifted(by: 8))   // result at slot 1 (header is slot 0)
         let slots = 1 + slotCount(t)
         return registerMap(d.offsets, sizeBytes: Int32(slots * 8),
-                           symbol: descSymbol("spawnbox_\(t.description)"), foldable: true, shaped: d.shaped)
+                           symbol: Mangle.descriptor("spawnbox", [t], home: homeModule), foldable: true, shaped: d.shaped)
     }
 
     // The shared type-id for every mailbox object `{ header, mb_head, mb_tail, scheduled, sched_next }`:
     // mb_head (8), mb_tail (16), sched_next (32) are managed pointers (scanned). 40 bytes.
     func mailboxTypeIdValue() -> UInt64 {
         if let id = mailboxTypeId { return id }
-        let id = registerMap([8, 16, 32], sizeBytes: 40, symbol: descSymbol("mailbox"), foldable: true)
+        let id = registerMap([8, 16, 32], sizeBytes: 40, symbol: Mangle.descriptor("mailbox", home: homeModule), foldable: true)
         mailboxTypeId = id
         return id
     }
@@ -179,7 +167,7 @@ extension LLVMGen {
     // The shared type-id for every Array handle `{ header, len, bufptr }` (bufptr at byte 16).
     func arrayHandleTypeId() -> UInt64 {
         if let id = arrayHandleMapId { return id }
-        let id = registerMap([16], sizeBytes: 24, symbol: descSymbol("arrayhandle"), foldable: true)
+        let id = registerMap([16], sizeBytes: 24, symbol: Mangle.descriptor("arrayhandle", home: homeModule), foldable: true)
         arrayHandleMapId = id
         return id
     }
@@ -191,7 +179,7 @@ extension LLVMGen {
         if let id = arrayBufMapIds[key] { return id }
         let d = descriptorEntries(shapes.shape(elem))
         let id = registerArrayMap(d.offsets, stride: Int32(arrayElemStride(elem)),
-                                  symbol: descSymbol("arraybuf_\(key)"), foldable: true, shaped: d.shaped)
+                                  symbol: Mangle.descriptor("arraybuf", [elem], home: homeModule), foldable: true, shaped: d.shaped)
         arrayBufMapIds[key] = id
         return id
     }
@@ -219,7 +207,7 @@ extension LLVMGen {
         let id = registerBufferMap(headerSize: Int32(slotCount(header) * 8),
                                    headerOffsets: headerOffsets, elementOffsets: elemOffsets,
                                    stride: Int32(rawStride(element)),
-                                   symbol: descSymbol("managedbuffer_\(key)"), foldable: true, shaped: elem.shaped)
+                                   symbol: Mangle.descriptor("managedbuffer", [header, element], home: homeModule), foldable: true, shaped: elem.shaped)
         managedBufferMapIds[key] = id
         return id
     }
@@ -250,7 +238,7 @@ extension LLVMGen {
         // shaped typed-root gap — `internals/gc-model-upgrade.md`).
         let d = descriptorEntries(shapes.shape(t))
         let id = registerMap(d.offsets, sizeBytes: Int32(slotCount(t) * 8),
-                             symbol: descSymbol("val_\(key)"), foldable: true, shaped: d.shaped)
+                             symbol: Mangle.descriptor("val", [t], home: homeModule), foldable: true, shaped: d.shaped)
         valueDescIds[key] = id
         return id
     }
@@ -351,7 +339,7 @@ extension LLVMGen {
             cases.append((tag: Int32(c.tag), flat: d.offsets, shaped: d.shaped))
         }
         let id = registerEnumShapedMap(sizeBytes: Int32(slotCount(.named(name, .enum_)) * 8), cases: cases,
-                                       symbol: descSymbol("enum_\(name)"), foldable: true)
+                                       symbol: Mangle.descriptor("enum", named: name, home: homeModule), foldable: true)
         enumShapeIds[name] = id
         return id
     }
@@ -461,10 +449,10 @@ extension LLVMGen {
             if let ek = enumKind2Descs[UInt64(i)] {
                 // An enum kind-2 descriptor: serialize its discriminant-keyed, per-case blob here (deferred,
                 // task 176.3b), converting nested shaped sub-entry ids to link-time section offsets.
-                let pm = emitEnumKind2PtrMap(sym.name + "__ptrmap", ek, foldable: sym.foldable)
+                let pm = emitEnumKind2PtrMap(Mangle.pointerMap(of: sym.name), ek, foldable: sym.foldable)
                 ptrmapOff = sectionOffset(of: pm, seg: "__DATA", sect: "__nomu_ptrmaps")
             } else if !offsets.isEmpty || !shaped.isEmpty || !header.isEmpty {
-                let pm = emitPtrMap(sym.name + "__ptrmap", offsets, header: header, shaped: shaped, foldable: sym.foldable)
+                let pm = emitPtrMap(Mangle.pointerMap(of: sym.name), offsets, header: header, shaped: shaped, foldable: sym.foldable)
                 ptrmapOff = sectionOffset(of: pm, seg: "__DATA", sect: "__nomu_ptrmaps")
             }
             let initv = constStruct(descTy, [

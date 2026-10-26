@@ -1,0 +1,10 @@
+// Two modules each declare a `Node` with a different layout (task 203). Their GC descriptors once shared
+// one weak symbol, so the linker kept one and the collector scanned one module's objects with the other's
+// pointer map. Each `Node` stays live across collections; 5 + 7 = 12.
+import pkg/a
+import pkg/b
+
+fun main() {
+  print(fromA(200000) + fromB(200000))
+  print("\n")
+}

@@ -1,0 +1,10 @@
+oven.mode: convect
+oven.temp: 210
+dough.proof: true
+dough.flours:
+  - wheat
+  - rye
+  - spelt
+pantry.capacity: 256M
+shop.name: corner
+shop.ledger: ledger

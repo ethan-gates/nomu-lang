@@ -240,6 +240,38 @@ The parts this task owns directly (the delegated prerequisites 125/149/150/127 k
     roots (150.3.12). [197](197-retire-mmtk-and-c-scheduler.md) then made it the default and deleted the
     lever, the oracle overrides and the support matrix along with MMTk and the C scheduler.
 
+- **128.5 — Retire the C floor.** *Not started; a candidate for breaking out into its own task.* After 197,
+  `runtime.c` (about 1,000 lines) and `core.c` remain under the Nomu scheduler and collector: the process
+  entry, the GC coordinator and smoke threads, the TLAB and mod-buffer registries, the write-barrier slow
+  path, the GC descriptor accessors, raw memory, line input with its kqueue poller, and the carrier TLS
+  slots. The asm floor (128.2) is separate and stays. Ordered after [127 LXR](127-lxr-collector.md) and its
+  chain, by the Order rule in `horizon.md`: LXR changes the algorithm on a fixed runtime, and this is a
+  location change. What Nomu cannot express today, each a blocker:
+  1. **Calls into the C library:** `pthread_create`, `pthread_mutex_*`, `__ulock_wait`/`__ulock_wake`,
+     `kqueue`/`kevent`, `poll`, `read`, `nanosleep`, `posix_memalign`/`free`, `fprintf`/`abort`/`exit`,
+     `getsectiondata`, some over C struct layouts (`struct kevent`, `pthread_mutex_t`). One-off codegen
+     intrinsics can cover them one at a time; the general answer is [130 FFI](130-ffi-c-abi.md).
+  2. **Entry points called by foreign threads:** `pthread_create` runs a C function pointer on a new OS
+     thread, and dyld calls `main`. Nomu functions use the GC calling convention and expect a carrier (the
+     current fiber in TLS, a TLAB). `main` alone codegen can emit; thread entries need a C-ABI function safe
+     to run with no fiber.
+  3. **Code that never reaches a safepoint:** the GC coordinator threads drive the stop-the-world, and a
+     back-edge poll in their loops could park a coordinator on its own collection. The anchor shims
+     (`spawn_join`, `rt_sleep_ms`, `__nomu_gc_poll_slow`) must be a separate frame directly below user code
+     and read the return and frame addresses. Needs a no-polls, no-statepoints, never-inlined function
+     property, and return-address and frame-address intrinsics. The runtime subset (149) rules out
+     allocation, not polls or frame shape.
+  4. **Process-wide globals and thread-locals:** the stop-the-world flag, the scheduler handle, the
+     write-barrier globals that inlined code reads, the Immix space pointer, the GC tuning globals and the
+     run settings (198), the registries, and the TLS slots. Nomu has no global variables; C defines the
+     storage and codegen loads it.
+  5. **Link-level control (minor):** the weak fallback `nomu_actor_drain`, and section lookup through
+     `_mh_execute_header`, which `section$start$…` symbols can replace.
+
+  Items 2–4 likely need runtime-tier language surface (a function property, globals, FFI declarations),
+  which needs agreement before it is added. Item 5, and item 1 done call by call as intrinsics, are
+  compiler-only.
+
 ## Refs
 
 deferred.md "Self-hosting the runtime"; `runtime.md` (scheduler, safepoints, mutator);

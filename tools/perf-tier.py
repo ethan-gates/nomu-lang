@@ -6,7 +6,8 @@ several times (best wall-clock reported, to cut noise), and prints a table of ti
 speedups. Correctness is guarded: every config's stdout must match the `off` baseline's,
 so a config that changes program output is flagged rather than silently trusted.
 
-Configurations (all on the SSAIR egress — the sole backend path; passes A/B-toggled by NOMU_NO_*):
+Configurations (all on the SSAIR egress — the sole backend path; passes A/B-toggled by the `no_*` configs
+in the repository's root cfg.yaml):
 
   off    every pass disabled  (the inert tier — the correctness + timing baseline)
   esc    off + escape analysis (stack + scalar promotion) only
@@ -32,14 +33,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NOMU = os.path.join(ROOT, "bazel-bin", "src", "nomu-cli", "nomu")
 BENCH_DIR = os.path.join(ROOT, "examples", "benchmarks")
 
-# name -> extra environment (on top of the SSAIR egress, except `noir`). A pass is *enabled*
-# by the absence of its NOMU_NO_* flag; `off` disables all three.
+# name -> the configs selected (root cfg.yaml). A pass is *enabled* by the absence of its `no_*` config;
+# `off` disables all three.
 CONFIGS = [
-    ("off", {"NOMU_NO_DEVIRT": "1", "NOMU_NO_INLINE": "1", "NOMU_NO_ESCAPE": "1"}),  # the inert tier
-    ("esc", {"NOMU_NO_DEVIRT": "1", "NOMU_NO_INLINE": "1"}),
-    ("dev", {"NOMU_NO_INLINE": "1", "NOMU_NO_ESCAPE": "1"}),
-    ("di",  {"NOMU_NO_ESCAPE": "1"}),
-    ("all", {}),                                                                     # every pass on
+    ("off", ["no_devirt", "no_inline", "no_escape"]),  # the inert tier
+    ("esc", ["no_devirt", "no_inline"]),
+    ("dev", ["no_inline", "no_escape"]),
+    ("di",  ["no_escape"]),
+    ("all", []),                                       # every pass on
 ]
 
 # The tier microbenchmarks plus real GC/compute workloads.
@@ -56,22 +57,16 @@ def resolve(name):
     sys.exit(f"perf-tier: workload not found: {name}")
 
 
-def binary_path(src):
-    """Where the compiler drops the linked binary: <root>/build/<module path>/<leaf>."""
-    rel = os.path.relpath(src, ROOT)
-    return os.path.join(ROOT, "build", rel, os.path.basename(src))
-
-
-def compile_config(src, env_extra, release):
-    env = dict(os.environ)
-    env.update(env_extra)
-    cmd = [NOMU, "build", src]
-    if release:
-        cmd.append("-O")
-    r = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+def compile_config(src, configs, release):
+    """Build `src` under `configs` (plus `release`); returns (ok, stderr or the binary's path), the path as the
+    build reports it."""
+    selected = (["release"] if release else []) + configs
+    cmd = [NOMU, "build", "--report-jobs"] + [f"--config={c}" for c in selected] + [src]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         return False, r.stderr.decode(errors="replace")
-    return True, ""
+    lines = [l[len("binary "):] for l in r.stdout.decode().splitlines() if l.startswith("binary ")]
+    return (True, lines[-1]) if lines else (False, "the build reported no binary")
 
 
 def run_timed(binary, iters):
@@ -113,22 +108,22 @@ def main():
 
     names = [c[0] for c in CONFIGS]
     header = f"{'workload':<16}" + "".join(f"{n:>9}" for n in names) + f"{'all/off':>10}"
-    print(f"perf-tier — best of {iters} runs, ms{' (-O)' if release else ''}\n")
+    print(f"perf-tier — best of {iters} runs, ms{' (-c release)' if release else ''}\n")
     print(header)
     print("-" * len(header))
 
     for w in workloads:
         src = resolve(w)
-        binary = binary_path(src)
         times = {}
         baseline_out = None
         note = ""
-        for name, env_extra in CONFIGS:
-            ok, err = compile_config(src, env_extra, release)
+        for name, configs in CONFIGS:
+            ok, result = compile_config(src, configs, release)
             if not ok:
                 times[name] = None
-                note = f"  (compile fail @ {name}: {err.strip().splitlines()[-1] if err.strip() else '?'})"
+                note = f"  (compile fail @ {name}: {result.strip().splitlines()[-1] if result.strip() else '?'})"
                 continue
+            binary = result
             ms, out = run_timed(binary, iters)
             times[name] = ms
             if baseline_out is None:

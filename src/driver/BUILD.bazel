@@ -9,7 +9,7 @@ swift_library(
         "-Xcc",
         "-std=c++17",
     ],
-    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir", "//src/frontend/sema", "//src/modules", "//src/planner", "//src/buildinfo", "//src/interface", "//src/midend", "//src/midend/ssair", "//src/midend/ssairgen", "//src/midend/ssairpasses", "//src/facts", "//src/runtime/embedded:embedded", "//src/llvmgen:llvmswift"],
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir", "//src/frontend/sema", "//src/modules", "//src/planner", "//src/buildinfo", "//src/interface", "//src/midend", "//src/midend/ssair", "//src/midend/ssairgen", "//src/midend/ssairpasses", "//src/facts", "//src/runtime/embedded:embedded", "//src/llvmgen:llvmswift", "//src/config", "//src/settings"],
     visibility = ["//visibility:public"],
 )
 

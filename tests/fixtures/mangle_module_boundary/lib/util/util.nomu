@@ -1,0 +1,3 @@
+package fun helper() -> Int {
+  return 2
+}

@@ -37,21 +37,10 @@ public struct EmitOptions: Codable {
     public var nmi = false        // --emit-nmi: emit the module's public interface (<name>.nmi), task 100.4.1
     public var llvm = false      // --emit-llvm: emit LLVM IR as emitted by the egress, pre-opt (<name>.ll)
     public var stopAt: Stage = .binary
-    // 8.5.3 — LLVM optimization level. Default (debug) runs the minimal `mem2reg`/`sroa` the
-    // statepoint rewrite needs and preserves Tier-0 debug info; `-O`/`--release` runs the full
-    // `default<O2>` pipeline (faster code, debug info degraded). Both precede statepoint rewriting.
-    public var optimize = false  // -O / --release
     // Task 149 — interim runtime-subset designation: the set of function names compiled under the subset
     // rules (no implicit GC alloc / heap construct / non-subset call). A compiler input standing in for
     // module membership until the module system (task 100) lands. Set by `--runtime-subset=a,b`.
     public var subsetFuncs: Set<String> = []
-    // `--mono=none|edge|all` — the consumer specialization dial (task 100.5.2). Nil means "mode default":
-    // resolved by `effectiveMono` to `none` for a debug build and `all` for a release (`-O`) build, so the
-    // dial follows the optimization level unless set explicitly. Part of the build-cache key (task 172).
-    public var mono: MonoMode? = nil
-    // The dial in force, resolving the nil default against the optimization level (debug=none, release=all).
-    public var effectiveMono: MonoMode { mono ?? (optimize ? .all : .none) }
-
     // Compiler-internal (task 174): the job compiles a module of the language workspace (`core`/
     // `runtime`/`std`), not user code. Its symbols link strong (no weak origin, except the `runtime`
     // package's own bare weak-ODR set), and no white-box runtime prelude is prepended.

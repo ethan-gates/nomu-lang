@@ -955,6 +955,10 @@ static void* rt_gc_sync_thread(void* _) {
     }
 }
 
+// Runtime settings, fixed at build time, are globals the driver's settings object defines (G14 of the
+// build-configuration design, `CompilerSettings.runSettings`); each is declared here `extern` and read
+// directly. None has moved off its environment variable yet.
+
 int main(void) {
     // Nursery reserve override: a dev/test override of the default-on generational trigger (rtGenReserve reads
     // it). Positive = override the reserve; negative = disable generational (major-only); 0/unset = descriptor default.

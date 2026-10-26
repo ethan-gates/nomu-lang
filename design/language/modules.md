@@ -315,7 +315,7 @@ machinery, not new representation.
 
 **Specialization control — two axes: a consumer build flag + a producer in-source surface.**
 
-*Consumer axis — the dial, a build flag.* `--mono` controls whether the module under compilation
+*Consumer axis — the dial, a build setting.* `opt.mono` controls whether the module under compilation
 specializes the generics it **consumes**, as a spectrum of values:
 - **`none`** — no cross-module specialization; generics dispatch through witnesses at module edges.
 - **`edge`** — specialize the directly-called generic instances only; nested generic calls inside a
@@ -326,11 +326,11 @@ specializes the generics it **consumes**, as a spectrum of values:
 - **Depth is a configurable knob to start** (`edge` vs `all`), held open while the right default is
   unknown; it may later be subsumed by the per-call-site cost model (task
   [145](../plans/tasks/145-monomorphization-cost.md)), which would make a global depth flag obsolete.
-- Mode defaults: **debug = `none`**, **release = `all`** (opt in per invocation,
-  `nomuc compile MyModule --mono=edge`).
-- The flag is part of the build config and every action's cache key, so switching modes is a full rebuild.
-  The consumer axis is controlled by the flag, never an in-source marker — it is a build decision. The same
-  depth knob governs the whole-program release pass below.
+- Mode defaults: **debug = `none`**, **release = `all`** (the `release` config sets it; any `cfg.yaml`
+  can set it per workspace, package or module, e.g. `opt: {mono: edge}`).
+- The setting is part of the build configuration and every job's cache key, so switching modes rebuilds.
+  The consumer axis is controlled by the setting, never an in-source marker — it is a build decision. The
+  same depth knob governs the whole-program release pass below.
 
 *Producer axis — in-source, per declaration.* A generic's author controls whether and how it is
 specialized. (This reverses the earlier blanket "no in-source markers" — that rule now governs only the
@@ -356,7 +356,7 @@ consumer axis above.) Two forms:
   prespecializes its hot instances is the stdlib pattern** — ship no bodies, prebuild the hot set, and every
   consumer (including debug) picks them up.
 
-*Release mechanism — per-module specialization + COMDAT fold.* Release compiles each module with `--mono`
+*Release mechanism — per-module specialization + COMDAT fold.* Release compiles each module with `opt.mono`
 and the linker folds the duplicate specializations, which already yields whole-program-mono output — no
 separate link-time pass is needed for parity. Duplicate specializations **fold at link** (COMDAT / coalesced
 weak symbols); the specialized symbol is **producer-qualified + type args**, so copies emitted by different
@@ -378,10 +378,12 @@ canonical type encoding.
 
 **Module artifacts.** A module compile produces `.o` (concrete code + the erased generic path), `.nmi`
 (interface), and `.bir` (generic and inlinable-non-generic body IR). Each module has its own directory under
-the building **workspace**'s `build/`, at its workspace-relative path (`build/app/cli/` holds `cli.o`,
-`cli.nmi`, and the binary `cli`); another workspace's modules sit under `build/_external/<scope>.<name>/`.
-The runtime archive and the language workspace's modules live in a per-host cache instead. (Layout:
-[190](../plans/tasks/190-explicit-module-builds.md) D2, D4.)
+the building **workspace**'s `build/<configs>/`, at its workspace-relative path, where `<configs>` is the
+build's active configs joined with `-` (`build/debug/app/cli/` holds `cli.o`, `cli.nmi`, and the binary
+`cli`); another workspace's modules sit under `build/<configs>/_external/<scope>.<name>/`. The runtime
+archive and the language workspace's modules live in a per-host cache instead. (Layout:
+[190](../plans/tasks/190-explicit-module-builds.md) D2, D4; the configuration directory is interim until
+[172](../plans/tasks/172-incremental-build-cache.md), per [198](../plans/tasks/198-build-configuration.md).)
 - `.nmi` is **body-free** and carries the API contract only: signatures, type layouts, generic
   signatures + bounds, conformances, witness / value-witness layouts + per-type GC trace metadata, and
   body-derived contract facts (mutating-ness, shareability). It holds no body and no body hash — that

@@ -1,0 +1,6 @@
+oven release:
+  temp debug: 100
+dough.flours:
+  - rye
+shop:
+  name  sign: x

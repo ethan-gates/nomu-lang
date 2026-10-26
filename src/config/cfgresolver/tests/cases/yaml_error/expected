@@ -1,0 +1,2 @@
+exit 1
+app/cfg.yaml:2:10: error: `True` is not a boolean spelling; booleans are `true` and `false`; write true, or quote it for a string: "True"
