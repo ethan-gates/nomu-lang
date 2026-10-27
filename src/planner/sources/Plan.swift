@@ -20,8 +20,10 @@ public struct ModuleJob: Equatable {
     // A module of the language workspace's `runtime` package: its functions are a runtime subset by
     // membership.
     public let runtimeSubsetByMembership: Bool
-    // Outputs live in the per-host cache (D4); a present entry means the job can be skipped.
-    public let inHostCache: Bool
+    // The job's key in the per-host cache (D4); nil for a job the cache does not hold. A present entry means the
+    // job's outputs are materialized into `outputDir` and its compile skipped.
+    public let hostCacheKey: String?
+    public var inHostCache: Bool { hostCacheKey != nil }
 
     public var object: String { outputDir + "/" + stem + ".o" }
     public var interface: String { outputDir + "/" + stem + ".nmi" }
@@ -30,8 +32,10 @@ public struct ModuleJob: Equatable {
     public var binary: String { outputDir + "/" + stem }
 }
 
-// The runtime archive (D4), built from the embedded runtime sources into the per-host cache.
+// The runtime archive (D4), built from the embedded runtime sources, held in the per-host cache under `key`, and
+// materialized into `outputDir`.
 public struct RuntimeArchiveJob: Equatable {
+    public let key: String
     public let outputDir: String
     public var archive: String { outputDir + "/nomu-runtime.a" }
 }
@@ -73,9 +77,6 @@ public struct PlanOptions {
     public var outputOptions: [String] = []
     // The commands that build the runtime archive, as the driver runs them; they enter the archive's key.
     public var runtimeRecipe: [[String]] = []
-    // The directory under the entry workspace's `build/` that holds this configuration's outputs, so builds
-    // under different configurations keep their own (empty: `build/` itself).
-    public var outputConfig = ""
     public init() {}
 }
 
@@ -110,14 +111,18 @@ extension Plan {
         guard diagnostics.isEmpty else { return ([], nil, nil, diagnostics) }
 
         let root = workspaces.root
-        let languageDir = settings.cacheRoot + "/nomu/"
-            + HostCache.languageWorkspaceKey(compilerIdentity: settings.compilerIdentity,
-                                             outputOptions: settings.outputOptions)
-        let build = root.root + "/build" + (settings.outputConfig.isEmpty ? "" : "/" + settings.outputConfig)
+        let languageKey = HostCache.languageWorkspaceKey(compilerIdentity: settings.compilerIdentity,
+                                                         outputOptions: settings.outputOptions)
+        func hostCacheKey(_ key: ModuleKey) -> String? {
+            key.workspace == LanguageWorkspace.identity
+                ? HostCache.languageModuleKey(workspaceKey: languageKey, path: key.path) : nil
+        }
+        // `build/` shows the last build, whatever its configuration (210); one invocation per workspace at a time.
+        let build = root.root + "/build"
+        // The language workspace's modules go under `_external/` like any other workspace's.
         func outputDir(_ key: ModuleKey) -> String {
             let base: String
-            if key.workspace == LanguageWorkspace.identity { base = languageDir }
-            else if key.workspace == root.identity { base = build }
+            if key.workspace == root.identity { base = build }
             else { base = build + "/_external/\(key.workspace)" }
             return key.path.isEmpty ? base : base + "/" + key.path.joined(separator: "/")
         }
@@ -146,14 +151,14 @@ extension Plan {
                 outputDir: outputDir(key), stem: key.path.last!,
                 whiteBox: table.testImportTargets.contains(key),
                 runtimeSubsetByMembership: isLanguageWorkspace && m.package.name == "runtime",
-                inHostCache: isLanguageWorkspace))
+                hostCacheKey: hostCacheKey(key)))
         }
 
         var archive: RuntimeArchiveJob? = nil
         var link: LinkJob? = nil
         if settings.product == .binary {
-            let a = RuntimeArchiveJob(outputDir: settings.cacheRoot + "/runtime/"
-                                  + HostCache.runtimeArchiveKey(recipe: settings.runtimeRecipe))
+            let archiveKey = HostCache.runtimeArchiveKey(recipe: settings.runtimeRecipe)
+            let a = RuntimeArchiveJob(key: archiveKey, outputDir: build + "/_runtime")
             let entry = jobs.last { $0.module == table.entry }!
             archive = a
             link = LinkJob(objects: jobs.map(\.object), runtimeArchive: a.archive, output: entry.binary)

@@ -44,17 +44,17 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
         ├── 203  symbol encoding — one injective mangling for every family   (correctness)  (done)
         └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)
             ├── 206  compiler identity — commit plus uncommitted changes, baked in          (done)
-            ├── 208  job keys — over everything a compile reads                            ◀ next
-            ├── 209  content-addressed store — one store for every cached artifact         ◀ next
-            ├── 207  build determinism — byte-identical outputs                            (for early cutoff)
-            ├── 210  workspace lock and build/ layout
-            ├── 211  several root modules per build
-            ├── 212  build-cache observability — what was cached and why                  (needs 208, 210)
+            ├── 208  job keys — over everything a compile reads                            (done)
+            ├── 209  content-addressed store — one store for every cached artifact         (done)
+            ├── 207  build determinism — byte-identical outputs                            (done but 207.6, binaries)
+            ├── 210  workspace lock and build/ layout                                       (done)
+            ├── 211  several root modules per build                                       ◀ next
+            ├── 212  build-cache observability — what was cached and why                  ◀ next
             └── 198  build configuration — modes, per-workspace settings, the cache-key input  (done)
 ```
 
-**Order of the next run:** 172's prerequisites (206 done; 209 and 208 next; 207, 210 and 211 in any order,
-207 before 172's cutoff tests), then 172 itself, which wires them together, then 159 (198 and 203 are done). 190 (explicit module builds) and 200 (the
+**Order of the next run:** 172's prerequisites (206, 208, 209 and 210 done; 207 done but
+for 207.6, binaries; 211 and 212 next, in any order), then 172 itself, which wires them together, then 159 (198 and 203 are done). 190 (explicit module builds) and 200 (the
 YAML parser, which 198's configuration files needed) are done; 200's open items are
 [204](tasks/204-yaml-parser-upgrades.md), off this chain. 198 went ahead of 203 by choice; 203 is 190's
 last correctness finding (a weak-symbol collision silently links the wrong definition) and follows it. 198 carries only what 172 needs; the rest of

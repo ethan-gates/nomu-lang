@@ -378,12 +378,13 @@ canonical type encoding.
 
 **Module artifacts.** A module compile produces `.o` (concrete code + the erased generic path), `.nmi`
 (interface), and `.bir` (generic and inlinable-non-generic body IR). Each module has its own directory under
-the building **workspace**'s `build/<configs>/`, at its workspace-relative path, where `<configs>` is the
-build's active configs joined with `-` (`build/debug/app/cli/` holds `cli.o`, `cli.nmi`, and the binary
-`cli`); another workspace's modules sit under `build/<configs>/_external/<scope>.<name>/`. The runtime
-archive and the language workspace's modules live in a per-host cache instead. (Layout:
-[190](../plans/tasks/190-explicit-module-builds.md) D2, D4; the configuration directory is interim until
-[172](../plans/tasks/172-incremental-build-cache.md), per [198](../plans/tasks/198-build-configuration.md).)
+the building **workspace**'s `build/`, at its workspace-relative path (`build/app/cli/` holds `cli.o`,
+`cli.nmi`, and the binary `cli`); another workspace's modules sit under `build/_external/<scope>.<name>/`, the
+language workspace's under `build/_external/nomu.nomu/`, and the runtime archive under `build/_runtime/`.
+`build/` shows the workspace's last build, whatever its configuration, and one `nomu` builds in a workspace at
+a time. The language workspace's modules and the runtime archive are also held in a per-host cache, from which a
+build materializes them. (Layout: [190](../plans/tasks/190-explicit-module-builds.md) D2, D4;
+[209](../plans/tasks/209-content-addressed-store.md), [210](../plans/tasks/210-workspace-lock-and-layout.md).)
 - `.nmi` is **body-free** and carries the API contract only: signatures, type layouts, generic
   signatures + bounds, conformances, witness / value-witness layouts + per-type GC trace metadata, and
   body-derived contract facts (mutating-ness, shareability). It holds no body and no body hash — that

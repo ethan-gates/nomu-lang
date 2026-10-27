@@ -8,27 +8,27 @@ job nomu.nomu:runtime
   package runtime at @nomu.nomu/runtime (product)
   files runtime.nomu
   library, host-cache, runtime-subset
-  out $cache/nomu/<key>/runtime/runtime
+  out @nomu.nomu_lang/build/_external/nomu.nomu/runtime/runtime
 job nomu.nomu:std/prelude
   package std at @nomu.nomu/std (product)
   files prelude.nomu
   library, host-cache
-  out $cache/nomu/<key>/std/prelude/prelude
+  out @nomu.nomu_lang/build/_external/nomu.nomu/std/prelude/prelude
 job nomu.nomu:std/math
   package std at @nomu.nomu/std (product)
   files math.nomu
   library, host-cache
-  out $cache/nomu/<key>/std/math/math
+  out @nomu.nomu_lang/build/_external/nomu.nomu/std/math/math
 job nomu.nomu:std/random
   package std at @nomu.nomu/std (product)
   files random.nomu
   library, host-cache
-  out $cache/nomu/<key>/std/random/random
+  out @nomu.nomu_lang/build/_external/nomu.nomu/std/random/random
 job nomu.nomu:std/time
   package std at @nomu.nomu/std (product)
   files time.nomu
   library, host-cache
-  out $cache/nomu/<key>/std/time/time
+  out @nomu.nomu_lang/build/_external/nomu.nomu/std/time/time
   import time.nomu:3:1 pkg/prelude → nomu.nomu:std/prelude
   sees nomu.nomu:std/prelude
 job nomu.nomu_lang:tests/fixtures/std_module_import
@@ -42,5 +42,5 @@ job nomu.nomu_lang:tests/fixtures/std_module_import
   import main.nomu:5:1 std/time → nomu.nomu:std/time (package std)
   sees nomu.nomu:std/prelude, nomu.nomu:std/math, nomu.nomu:std/random, nomu.nomu:std/time
 
-runtime archive $cache/runtime/<key>/nomu-runtime.a
+runtime archive @nomu.nomu_lang/build/_runtime/nomu-runtime.a
 link @nomu.nomu_lang/build/tests/fixtures/std_module_import/std_module_import from 6 objects

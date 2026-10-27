@@ -1,8 +1,10 @@
 import embedded
+import store
 
 // The per-host cache (task 190, D4): language-level artifacts shared by every build on the host and kept
-// across `git clean -dfx`, namely the runtime archive and the language workspace's modules. Entries are
-// content-keyed, so a present entry is always the right one for its key.
+// across `git clean -dfx`, namely the runtime archive and the language workspace's modules. They live in one
+// store under the root (task 209): an action cache (`ac/<key>`) and a content-addressed store (`cas/<digest>`);
+// a build materializes each one's outputs under its `build/`.
 public enum HostCache {
     // The cache root: `NOMU_CACHE_DIR` when set, else the platform user cache directory
     // (`~/Library/Caches/nomu` on macOS; `$XDG_CACHE_HOME/nomu`, falling back to `~/.cache/nomu`, elsewhere).
@@ -16,6 +18,9 @@ public enum HostCache {
         return home + "/.cache/nomu"
         #endif
     }
+
+    // The store under the cache root.
+    public static func store(cacheRoot: String) -> ArtifactStore { ArtifactStore(root: cacheRoot) }
 
     // The host the build targets, as it enters cache keys.
     public static var hostArch: String {
@@ -59,6 +64,15 @@ public enum HostCache {
         return h.hex
     }
 
+    // One language-workspace module's key: the workspace's key and the module's path within it.
+    public static func languageModuleKey(workspaceKey: String, path: [String]) -> String {
+        var h = Hasher64()
+        h.mix(workspaceKey)
+        h.mix(String(path.count))
+        for p in path { h.mix(p) }
+        return h.hex
+    }
+
     // A digest of the language workspace's files (their paths and text).
     public static var languageSourcesDigest: String { planner.languageSourcesDigest }
 }
@@ -79,16 +93,3 @@ private let languageSourcesDigest: String = {
     for f in LanguageWorkspace.files() { h.mix(f.path); h.mix(f.text) }
     return h.hex
 }()
-
-// FNV-1a, 64-bit: stable across runs and hosts. Each mixed string is length-prefixed, so ("ab", "c") and
-// ("a", "bc") differ.
-struct Hasher64 {
-    private var h: UInt64 = 0xcbf29ce484222325
-    mutating func mix(_ s: String) {
-        mixBytes(String(s.utf8.count).utf8); mixBytes(":".utf8); mixBytes(s.utf8)
-    }
-    private mutating func mixBytes<S: Sequence>(_ bytes: S) where S.Element == UInt8 {
-        for b in bytes { h ^= UInt64(b); h = h &* 0x00000100000001B3 }
-    }
-    var hex: String { String(h, radix: 16) }
-}

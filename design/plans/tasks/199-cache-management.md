@@ -13,13 +13,16 @@ builds, and configure their limits. Most likely a `nomu` subcommand; its shape i
 
 The per-host cache ([190](190-explicit-module-builds.md) D4) at `NOMU_CACHE_DIR`, else
 `~/Library/Caches/nomu/` (macOS) or `$XDG_CACHE_HOME/nomu/` / `~/.cache/nomu/` (Linux):
-- `runtime/` — the runtime archive, keyed by the runtime sources, architecture and recipe.
-- `nomu/<key>/` — the language workspace's compiled modules (`core`, `runtime`, `std/*`), one directory per
-  key (embedded sources, compiler identity, host target, options).
+- `ac/<key>` and `cas/<digest>` — the store of [209](209-content-addressed-store.md): an action result per
+  job (the runtime archive, keyed by the runtime sources, architecture and recipe; each language-workspace
+  module, keyed by embedded sources, compiler identity, host target, options and module path) and the output
+  blobs they name, each stored once. Builds materialize them under their `build/`.
 - `source/` — the one on-disk copy of the embedded sources, for reporting (190.6 F10).
-- Leftovers: `.staging-*` and `.source-*` directories from interrupted builds.
+- Leftovers: `.tmp-*` files in `ac/` and `cas/` (`ArtifactStore.leftovers()` lists them), `.source-*`
+  directories, and the roots of earlier layouts (`nomu/`, `modules/`, `runtime/`). Blobs no result names are
+  garbage once a result is discarded or replaced.
 
-Nothing evicts: every compiler or embedded-source change adds a `nomu/<key>/` entry, and old ones stay.
+Nothing evicts: every compiler or embedded-source change adds an action result and blobs per language module, and old ones stay.
 [172](172-incremental-build-cache.md) adds a module store with many more entries.
 
 ## Goals

@@ -53,6 +53,9 @@ public struct EmitOptions: Codable {
     // Hidden `--emit-jobs`: write each job's file (`<unit>/<stem>.job.json`, the `nomu compile` input) beside
     // its outputs.
     public var emitJobs = false
+    // `--verify-cache`: compile every job, taking nothing from the host cache, and fail when an entry
+    // already at a job's key differs from its compile (`CacheVerification`).
+    public var verifyCache = false
 
     public init() {}
 }

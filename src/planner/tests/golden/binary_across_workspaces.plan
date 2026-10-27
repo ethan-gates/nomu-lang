@@ -9,12 +9,12 @@ job nomu.nomu:runtime
   package runtime at @nomu.nomu/runtime (product)
   files runtime.nomu
   library, host-cache, runtime-subset
-  out $cache/nomu/<key>/runtime/runtime
+  out @me.app/build/_external/nomu.nomu/runtime/runtime
 job nomu.nomu:std/prelude
   package std at @nomu.nomu/std (product)
   files prelude.nomu
   library, host-cache
-  out $cache/nomu/<key>/std/prelude/prelude
+  out @me.app/build/_external/nomu.nomu/std/prelude/prelude
 job me.app:app/util/inner
   package app at @me.app/app
   files i.nomu
@@ -49,7 +49,7 @@ job nomu.nomu:std/time
   package std at @nomu.nomu/std (product)
   files time.nomu
   library, host-cache
-  out $cache/nomu/<key>/std/time/time
+  out @me.app/build/_external/nomu.nomu/std/time/time
   import time.nomu:3:1 pkg/prelude → nomu.nomu:std/prelude
   sees nomu.nomu:std/prelude
 job me.app:app/cli
@@ -63,5 +63,5 @@ job me.app:app/cli
   import main.nomu:3:1 std/time → nomu.nomu:std/time (package std)
   sees nomu.nomu:std/prelude, me.app:app/util/inner, me.app:app/util, them.prov:greet/inner, them.prov:greet, nomu.nomu:std/time
 
-runtime archive $cache/runtime/<key>/nomu-runtime.a
+runtime archive @me.app/build/_runtime/nomu-runtime.a
 link @me.app/build/app/cli/cli from 8 objects

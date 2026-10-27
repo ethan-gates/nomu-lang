@@ -76,8 +76,8 @@ extension Plan {
     func render(_ path: String) -> String {
         if path == cacheRoot || path.hasPrefix(cacheRoot + "/") {
             var parts = String(path.dropFirst(cacheRoot.count)).split(separator: "/").map(String.init)
-            // `<cache>/nomu/<key>/…` and `<cache>/runtime/<key>/…`
-            if parts.count >= 2, parts[0] == "nomu" || parts[0] == "runtime" { parts[1] = "<key>" }
+            // `<cache>/ac/<key>` and `<cache>/cas/<digest>`
+            if parts.count >= 2, parts[0] == "ac" || parts[0] == "cas" { parts[1] = "<key>" }
             return "$cache" + (parts.isEmpty ? "" : "/" + parts.joined(separator: "/"))
         }
         // The deepest workspace root holding the path (a workspace may sit inside another's directory).

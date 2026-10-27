@@ -8,12 +8,12 @@ job nomu.nomu:runtime
   package runtime at @nomu.nomu/runtime (product)
   files runtime.nomu
   library, host-cache, runtime-subset
-  out $cache/nomu/<key>/runtime/runtime
+  out @nomu.mpbasic/build/_external/nomu.nomu/runtime/runtime
 job nomu.nomu:std/prelude
   package std at @nomu.nomu/std (product)
   files prelude.nomu
   library, host-cache
-  out $cache/nomu/<key>/std/prelude/prelude
+  out @nomu.mpbasic/build/_external/nomu.nomu/std/prelude/prelude
 job nomu.mpbasic:greet
   package greetlib at @nomu.mpbasic/greet (product)
   files lib.nomu
@@ -30,5 +30,5 @@ job nomu.mpbasic:app
   import main.nomu:5:1 greetlib → nomu.mpbasic:greet (package greetlib)
   sees nomu.nomu:std/prelude, nomu.mpbasic:greet
 
-runtime archive $cache/runtime/<key>/nomu-runtime.a
+runtime archive @nomu.mpbasic/build/_runtime/nomu-runtime.a
 link @nomu.mpbasic/build/app/app from 4 objects

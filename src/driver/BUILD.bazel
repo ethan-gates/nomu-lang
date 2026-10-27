@@ -9,7 +9,7 @@ swift_library(
         "-Xcc",
         "-std=c++17",
     ],
-    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir", "//src/frontend/sema", "//src/modules", "//src/planner", "//src/buildinfo", "//src/interface", "//src/midend", "//src/midend/ssair", "//src/midend/ssairgen", "//src/midend/ssairpasses", "//src/facts", "//src/runtime/embedded:embedded", "//src/llvmgen:llvmswift", "//src/config", "//src/settings"],
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/parse", "//src/frontend/noir", "//src/frontend/sema", "//src/modules", "//src/planner", "//src/buildinfo", "//src/interface", "//src/midend", "//src/midend/ssair", "//src/midend/ssairgen", "//src/midend/ssairpasses", "//src/facts", "//src/runtime/embedded:embedded", "//src/llvmgen:llvmswift", "//src/config", "//src/settings", "//src/store"],
     visibility = ["//visibility:public"],
 )
 
@@ -17,7 +17,20 @@ swift_library(
 # language workspace, and planning errors stop a build before any compile.
 swift_test(
     name = "build_tests",
-    srcs = glob(["tests/*.swift"]),
+    srcs = ["tests/BuildTests.swift"],
     data = ["//:suite_sources", "//src/nomu-cli:nomu"],
+    deps = ["//src/store"],
     env = {"NOMU_BINARY": "$(rootpath //src/nomu-cli:nomu)"},
+)
+
+# Job keys (task 208): which inputs a key covers, and which it leaves out.
+swift_test(
+    name = "job_key_tests",
+    srcs = ["tests/JobKeyTests.swift"],
+    copts = [
+        "-cxx-interoperability-mode=default",
+        "-Xcc",
+        "-std=c++17",
+    ],
+    deps = [":driver"],
 )

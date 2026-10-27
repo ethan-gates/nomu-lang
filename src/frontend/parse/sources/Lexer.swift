@@ -16,13 +16,13 @@ public struct Lexer {
     // can share one sink across the lexer and parser.
     private let diags: DiagnosticSink
 
-    // `displayName` is the path reported for the file when it differs from its identity `file` (see
-    // `SourceMap.displayName`).
-    public init(_ source: String, file: String = "<input>", displayName: String? = nil,
+    // `displayName` is the path reported for the file when it differs from its identity `file`, and
+    // `debugName` the path debug info records (see `SourceMap`).
+    public init(_ source: String, file: String = "<input>", displayName: String? = nil, debugName: String? = nil,
                 diagnostics: DiagnosticSink = DiagnosticSink()) {
         let bytes = Array(source.utf8)
         src = bytes
-        map = SourceMap(name: file, bytes: bytes, displayName: displayName)
+        map = SourceMap(name: file, bytes: bytes, displayName: displayName, debugName: debugName)
         self.diags = diagnostics
     }
 

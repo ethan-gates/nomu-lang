@@ -10,17 +10,20 @@
 // lexed source; a `Span` holds a reference so any consumer can resolve on demand.
 //
 // `name` is the file's identity inside the compiler (modules and interfaces key on it). `displayName` is the
-// path reported to people and tools — diagnostics and debug info. They differ for the language workspace's
-// sources, whose identity is a virtual `<nomu>/…` path and whose reported path is the on-disk copy the driver
-// keeps for reporting.
+// path reported to people, in diagnostics. They differ for the language workspace's sources, whose identity is
+// a virtual `<nomu>/…` path and whose reported path is the on-disk copy the driver keeps for reporting.
+// `debugName` is the path debug info records: a form independent of where the sources and the host cache live
+// (the driver's `DebugPaths`), which the debugger maps back to disk.
 public final class SourceMap {
     public let name: String
     public let displayName: String
+    public let debugName: String
     private let lineStarts: [Int]   // byte offset of the start of each line
 
-    public init(name: String, bytes: [UInt8], displayName: String? = nil) {
+    public init(name: String, bytes: [UInt8], displayName: String? = nil, debugName: String? = nil) {
         self.name = name
         self.displayName = displayName ?? name
+        self.debugName = debugName ?? displayName ?? name
         var starts = [0]
         for i in 0..<bytes.count where bytes[i] == 0x0A { starts.append(i + 1) }   // '\n'
         lineStarts = starts
@@ -72,8 +75,10 @@ public struct Span: Equatable {
     public var begin: Pos { Pos(offset: startOffset, map: map) }
     public var end: Pos { Pos(offset: endOffset, map: map) }
     public var file: String { map?.name ?? "" }
-    // The path reported for this span's file (diagnostics, debug info); see `SourceMap.displayName`.
+    // The path reported for this span's file in diagnostics; see `SourceMap.displayName`.
     public var displayFile: String { map?.displayName ?? "" }
+    // The path debug info records for this span's file; see `SourceMap.debugName`.
+    public var debugFile: String { map?.debugName ?? "" }
 
     // A span reaching from the start of `a` to the end of `b` (same file). Used to give a parent
     // node the range of its first..last child.

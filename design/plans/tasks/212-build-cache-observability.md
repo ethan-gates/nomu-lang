@@ -32,11 +32,13 @@ A module compiled for the first time reports that it had no previous entry.
 
 ## Work
 
-- **212.1** Section-level hashes in the recorded key inputs (208.2): each dependency's ABI, perf and `.bir`
+- **212.1** Section-level hashes in the key's named inputs (208.2): each dependency's ABI, perf and `.bir`
   hashes beside the whole-file hash the key uses, and the per-definition perf hashes. The key itself is
   unchanged (it covers the bytes, 172's decision).
 - **212.2** The last-build record: module → the key its last build used, kept in the workspace beside
-  210's `build/` view, written when a build finishes.
+  210's `build/` view, written when a build finishes. The key's named inputs go in it only when the reasons
+  are asked for, as Bazel writes its execution log only on request (208.2); a rebuild after a build that did
+  not record them reports that the key changed, without the input.
 - **212.3** The report: the summary on every build (one line), the per-module reasons under a flag, and
   machine-readable lines under `--report-jobs` for tests and the harness.
 - **212.4** Tests: a body edit that changes a function's escape facts reports the chain to each consumer; a

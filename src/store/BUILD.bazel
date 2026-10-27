@@ -1,0 +1,16 @@
+load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
+
+# The build cache store (task 209): an action cache and a content-addressed store, as Bazel splits them. The
+# host cache keeps the runtime archive and the language workspace's modules in it.
+swift_library(
+    name = "store",
+    srcs = glob(["sources/*.swift"]),
+    module_name = "store",
+    visibility = ["//visibility:public"],
+)
+
+swift_test(
+    name = "store_tests",
+    srcs = glob(["tests/*.swift"]),
+    deps = [":store"],
+)

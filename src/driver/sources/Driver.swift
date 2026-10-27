@@ -16,6 +16,7 @@ import planner
 import buildinfo
 import LLVMBridge
 import settings
+import store
 
 // Build a program from one module's files (task 190): plan the build, run each module's compile job in
 // order, and link. The planner reads the workspaces, resolves every import and places every output (D2, D4);
@@ -27,6 +28,9 @@ public struct BuildResult {
     public var binary: String? = nil
     public var compiled: [String] = []
     public var cached: [String] = []
+    // Under `--verify-cache`: each module whose cache entry differs from its fresh compile, with the key's
+    // inputs.
+    public var cacheMismatches: [String] = []
 }
 
 // Returns the entry's output stem (the binary, for a binary build); nil on failure.
@@ -59,7 +63,6 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
         case .success(let c):
             configuration = c
             planOptions.outputOptions = [c.languageCanonical]
-            planOptions.outputConfig = c.outputDirectory
             timings.optimize = JobSettings(c.jobSettings(moduleTable.entry)).optimize
         case .failure(let errors):
             fputs(errors.rendered + "\n", stderr)
@@ -86,11 +89,13 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
     timings.package = table.modules[table.entry]?.package.name ?? ""
     timings.file = plan.jobs.count == 1 ? primary : "\(plan.jobs.count) modules"
 
+    // One building invocation per workspace (210): held from the first write until the build returns.
+    guard let lock = WorkspaceLock.acquire(workspaceRoot: workspaces.root.root) else { return result }
+    defer { withExtendedLifetime(lock) {} }
+
     let stem = entryJob.binary
-    func makeDirectory(_ dir: String) -> Bool {
-        do { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true); return true }
-        catch { fputs("error: failed to create output dir '\(dir)': \(error)\n", stderr); return false }
-    }
+    let buildRoot = workspaces.root.root + "/build"
+    func makeDirectory(_ dir: String) -> Bool { Layout.makeDirectory(dir, buildRoot: buildRoot) }
     guard makeDirectory((stem as NSString).deletingLastPathComponent) else { return result }
 
     // AST debug view of the entry module: --emit-ast writes it; --stop=ast writes it and halts.
@@ -115,32 +120,26 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
     // A module's canonical identity (D6): its workspace's scope and name, then its path. Library symbols
     // mangle under it.
     func origin(_ k: ModuleKey) -> [String] { [k.workspace.scope, k.workspace.name] + k.path }
+    // A package's key: its workspace and its root within the workspace, so it reads the same from any checkout.
     func packageKey(_ k: ModuleKey) -> String {
         let p = table.modules[k]!.package
-        return "\(p.workspace)|\(p.root)"
+        guard let wsRoot = plan.workspaceRoots[p.workspace], p.root == wsRoot || p.root.hasPrefix(wsRoot + "/") else {
+            return "\(p.workspace)|\(p.root)"
+        }
+        return "\(p.workspace)|\(p.root.dropFirst(wsRoot.count))"
     }
     let jobByKey = Dictionary(uniqueKeysWithValues: plan.jobs.map { ($0.module, $0) })
     // The language workspace's sources on disk, for reporting (diagnostics, debug info): kept current
     // whenever a build uses that workspace, compiled or cached.
     let sourceCopy = plan.jobs.contains(where: \.inHostCache)
         ? timings.measure("plan", "source copy") { LanguageSourceCopy.ensure(cacheRoot: plan.cacheRoot) } : nil
+    let store = HostCache.store(cacheRoot: plan.cacheRoot)
+    let verification = options.verifyCache ? CacheVerification() : nil
+    let keyer = plan.jobs.contains(where: \.inHostCache) ? JobKeyer() : nil
     var objects: [String] = []
     for j in plan.jobs {
         let m = table.modules[j.module]!
         let isEntry = j.module == table.entry
-        // A host-cache entry (D4) is complete once its directory exists: it is published whole by one rename.
-        if j.inHostCache && FileManager.default.fileExists(atPath: j.outputDir) {
-            objects.append(j.object)
-            result.cached.append(j.module.description)
-            continue
-        }
-        // A cached job compiles into a private directory first, then publishes it.
-        let staging = j.inHostCache
-            ? (j.outputDir as NSString).deletingLastPathComponent
-              + "/.staging-\(ProcessInfo.processInfo.processIdentifier)-\(UInt32.random(in: 0 ..< .max))"
-            : j.outputDir
-        func staged(_ path: String) -> String { staging + String(path.dropFirst(j.outputDir.count)) }
-        guard makeDirectory(staging) else { return result }
         var imports: [String: [CompileJob.Import]] = [:]
         for imp in m.imports {
             let root: ImportRoot
@@ -153,7 +152,7 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
             let dj = jobByKey[d]!
             return CompileJob.Dependency(origin: origin(d), interface: dj.interface, bir: dj.bir, packageKey: packageKey(d))
         }
-        let outputs = CompileJob.Outputs(object: staged(j.object), interface: staged(j.interface), bir: staged(j.bir),
+        let outputs = CompileJob.Outputs(object: j.object, interface: j.interface, bir: j.bir,
                                          debugStem: isEntry ? stem : nil)
         var job = CompileJob(origin: origin(j.module), files: j.files, packageName: m.package.name,
                              packageKey: packageKey(j.module), isProduct: m.isProduct, imports: imports,
@@ -161,24 +160,69 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
                              whiteBox: j.whiteBox, runtimeSubsetByMembership: j.runtimeSubsetByMembership,
                              outputs: outputs)
         if j.inHostCache, let sourceCopy { job.reportedPaths = LanguageSourceCopy.reportedPaths(j.files, copy: sourceCopy) }
+        if let wsRoot = plan.workspaceRoots[j.module.workspace] {
+            job.debugPaths = DebugPaths.paths(j.files, workspace: j.module.workspace, workspaceRoot: wsRoot)
+        }
         job.settings = configuration?.jobSettings(j.module) ?? [:]
         // The building workspace's modules take the build's options; another workspace's modules, and the
         // language workspace's, compile with the defaults.
         var jobOptions = EmitOptions()
         if j.module.workspace == table.entry.workspace { jobOptions = options }
         jobOptions.compilingPrelude = j.inHostCache
-        if options.emitJobs, let data = JobFile(job: job, options: jobOptions).encoded() {
-            try? data.write(to: URL(fileURLWithPath: staged(j.outputDir + "/" + j.stem + ".job.json")))
+
+        // The files a job writes, by name within its output directory.
+        let outputNames = j.product == .library ? [j.stem + ".o", j.stem + ".nmi", j.stem + ".bir"] : [j.stem + ".o"]
+
+        // A host-cache entry (D4) whose blobs match their digests is materialized into the job's output directory
+        // and the compile skipped; a damaged one is discarded and rebuilt. Under `--verify-cache` nothing is
+        // served: every job compiles.
+        if verification == nil, let key = j.hostCacheKey, let cached = store.lookup(key) {
+            guard makeDirectory(j.outputDir) else { return result }
+            do { try store.materialize(cached, into: j.outputDir) } catch {
+                fputs("error: \(error)\n", stderr)
+                timings.report(); return result
+            }
+            objects.append(j.object)
+            result.cached.append(j.module.description)
+            continue
         }
-        guard compile(job, options: jobOptions, timings: timings) else {
-            if j.inHostCache { try? FileManager.default.removeItem(atPath: staging) }
+        guard makeDirectory(j.outputDir) else { return result }
+        if options.emitJobs, let data = JobFile(job: job, options: jobOptions).encoded() {
+            try? data.write(to: URL(fileURLWithPath: j.outputDir + "/" + j.stem + ".job.json"))
+        }
+        // A cached job compiles into a private scratch directory; its outputs reach `build/` by materializing
+        // the published result, file by file through a rename, so a concurrent build of the same workspace never
+        // reads a half-written output.
+        let scratch = j.hostCacheKey == nil ? nil
+            : NSTemporaryDirectory() + "nomu-job-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
+        defer { if let scratch { try? FileManager.default.removeItem(atPath: scratch) } }
+        var compiled = job
+        if let scratch {
+            guard makeDirectory(scratch) else { return result }
+            compiled.outputs = CompileJob.Outputs(object: scratch + "/" + j.stem + ".o",
+                                                  interface: scratch + "/" + j.stem + ".nmi",
+                                                  bir: scratch + "/" + j.stem + ".bir", debugStem: outputs.debugStem)
+        }
+        guard compile(compiled, options: jobOptions, timings: timings) else {
             timings.report(); return result
         }
-        if j.inHostCache && rename(staging, j.outputDir) != 0 {
-            // Another build published this entry first; it is the same content, so keep it.
-            try? FileManager.default.removeItem(atPath: staging)
-            guard FileManager.default.fileExists(atPath: j.outputDir) else {
-                fputs("error: cannot publish '\(j.outputDir)': \(String(cString: strerror(errno)))\n", stderr)
+        if let key = j.hostCacheKey, let scratch {
+            let published: ActionResult
+            if let verification, let cached = store.lookup(key) {
+                // `--verify-cache`: the entry already at this key must hold what this compile produced.
+                verification.compare(module: j.module.description, fresh: scratch, names: outputNames,
+                                     cached: cached, store: store, inputs: keyer!.key(job, options: jobOptions).inputs)
+                published = cached
+            } else {
+                // The entry records the job's key; its named inputs are computed when asked for (`--verify-cache`).
+                let jobKey = keyer!.key(job, options: jobOptions)
+                do { published = try store.publish(key, outputsIn: scratch, files: outputNames, inputs: ["key": jobKey.key]) } catch {
+                    fputs("error: \(error)\n", stderr)
+                    timings.report(); return result
+                }
+            }
+            do { try store.materialize(published, into: j.outputDir) } catch {
+                fputs("error: \(error)\n", stderr)
                 timings.report(); return result
             }
         }
@@ -186,6 +230,9 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
         result.compiled.append(j.module.description)
     }
     timings.jobs = (compiled: result.compiled.count, cached: result.cached.count)
+    result.cacheMismatches = verification?.failures ?? []
+    // A cache entry that differs from its key's fresh compile fails the build before the link.
+    if !result.cacheMismatches.isEmpty { timings.report(); return result }
 
     // A binary links every object the plan built with the runtime archive. A debug stop or a terminal
     // `--emit-nmi` ends the build before the link.
@@ -194,11 +241,18 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
         // must win over any weak copy in a library object.
         let objectsInOrder = [entryJob.object] + link.objects.filter { $0 != entryJob.object }
         guard let configuration else { preconditionFailure("a planned build has a configuration") }
-        guard linkBinary(objects: objectsInOrder, output: stem, runtimeArchive: archive.archive,
+        guard linkBinary(objects: objectsInOrder, output: stem, runtimeArchive: archive, cacheRoot: plan.cacheRoot,
                          runtimeGlobals: configuration.runtimeGlobals, record: configuration.summary,
                          timings: timings) else {
             timings.report(); return result
         }
+        // The debugger's map from recorded source paths to this machine's (`DebugPaths`). Best-effort.
+        var roots: [(WorkspaceIdentity, String)] = []
+        for (workspace, root) in plan.workspaceRoots {
+            if workspace == LanguageWorkspace.identity { if let sourceCopy { roots.append((workspace, sourceCopy)) } }
+            else { roots.append((workspace, root)) }
+        }
+        try? DebugPaths.lldbInit(roots).write(toFile: stem + ".lldbinit", atomically: true, encoding: .utf8)
     }
     timings.report()
     result.binary = stem
@@ -651,10 +705,12 @@ func topDeclNames(_ program: Program) -> Set<String> {
 // snapshot), so a prelude/builtin callee is never pulled in. Generic **types**/methods ride a later
 // 100.5.4 increment.
 func shippedTemplates(_ module: NOIRModule, ownNames: Set<String>) -> [NOIRDecl] {
-    // This module's own functions, by name (excludes prelude, which `ownNames` already filters out).
+    // This module's own functions, by name, with their positions in `module.decls` (excludes prelude, which
+    // `ownNames` already filters out).
     var ownFuncs: [String: NOIRDecl] = [:]
-    for decl in module.decls {
-        if case .funcDecl(let f) = decl, ownNames.contains(f.name) { ownFuncs[f.name] = decl }
+    var position: [String: Int] = [:]
+    for (i, decl) in module.decls.enumerated() {
+        if case .funcDecl(let f) = decl, ownNames.contains(f.name) { ownFuncs[f.name] = decl; position[f.name] = i }
     }
     // An exported generic — `public` (cross-package) or `package` (same-package, task 187.4.4) — seeds the
     // shipped `.bir` so a consumer that may call it specializes it; a sub-`package` generic ships only as a
@@ -669,29 +725,31 @@ func shippedTemplates(_ module: NOIRModule, ownNames: Set<String>) -> [NOIRDecl]
         return false
     }
     var shippedNames = Set<String>()
-    var shipped: [NOIRDecl] = []
     var worklist: [NOIRDecl] = []
     // Seed: every exported (`public`/`package`) generic function.
     for (name, decl) in ownFuncs where isPublic(decl) && isGeneric(decl) {
-        shippedNames.insert(name); shipped.append(decl); worklist.append(decl)
+        shippedNames.insert(name); worklist.append(decl)
     }
     // Close over the non-public functions the shipped bodies reach, transitively.
     while let decl = worklist.popLast() {
         for ref in collectReferencedNames(decl) {
             guard let callee = ownFuncs[ref], !isPublic(callee), shippedNames.insert(ref).inserted else { continue }
-            shipped.append(callee); worklist.append(callee)
+            worklist.append(callee)
         }
     }
-    return shipped
+    // In declaration order, so the `.bir` is the same bytes on every build.
+    return shippedNames.map { position[$0]! }.sorted().map { module.decls[$0] }
 }
 
 // Link a binary: the entry object, every dependency object, the settings object and the runtime archive.
 // The settings object holds `runtimeGlobals`, the values the runtime reads (G14 of the build-configuration
 // design); `record`, the configuration's short form, goes in the `__TEXT,__nomu_config` section (G13).
 // Returns false on failure (message on stderr).
-func linkBinary(objects: [String], output binPath: String, runtimeArchive: String,
+func linkBinary(objects: [String], output binPath: String, runtimeArchive: RuntimeArchiveJob, cacheRoot: String,
                 runtimeGlobals: [(symbol: String, value: RuntimeGlobal)], record: String, timings: Timings) -> Bool {
-    let archive = timings.measure("runtime", "archive") { cachedRuntimeArchive(at: runtimeArchive) }
+    let archive = timings.measure("runtime", "archive") {
+        cachedRuntimeArchive(runtimeArchive, store: HostCache.store(cacheRoot: cacheRoot))
+    }
     guard let archive = archive else { return false }
     // `-dead_strip` drops code unreachable from the program's entry, and `-x` strips local symbols.
     // The binary is linked, indexed and signed in a temporary directory beside the output, then renamed into
@@ -734,7 +792,11 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Strin
     }
     linkArgs += ["-Wl,-sectcreate,\(FrameIndex.segment),\(FrameIndex.section),\(reserveFile)",
                  "-Wl,-map,\(mapFile)"]
-    let linkStatus = timings.measure("link", "cc") { runProcess("/usr/bin/cc", linkArgs) }
+    // `ZERO_AR_DATE` records zero for each object's time in the debug map (its `N_OSO` entries), which
+    // otherwise reaches the binary's UUID and signature.
+    let linkStatus = timings.measure("link", "cc") {
+        runProcess("/usr/bin/cc", linkArgs, environment: ["ZERO_AR_DATE": "1"])
+    }
     if linkStatus != 0 {
         fputs("error: link failed\n", stderr)
         return false
@@ -762,6 +824,7 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Strin
             return false
         }
     }
+    Layout.clearDirectory(at: binPath)
     guard rename(staging, binPath) == 0 else {
         fputs("error: cannot move the linked binary to '\(binPath)': \(String(cString: strerror(errno)))\n", stderr)
         return false
@@ -774,28 +837,42 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Strin
 // `backend.md` "runtime library" item, real for the LLVM path). Replaces the C backend's
 // per-file `cc` co-compile. Returns the archive path, or nil on failure (message on stderr).
 // The runtime `.a` is identical across programs (the C floor is embedded in nomuc), so it lives in the
-// per-host cache at the path the plan gives (D4), under a key over the embedded runtime sources, the host
-// architecture and `runtimeArchiveRecipe` (`HostCache.runtimeArchiveKey`): editing the runtime rebuilds the
-// compiler, which changes the key, and so does editing a command. A present archive is reused.
-private func cachedRuntimeArchive(at cached: String) -> String? {
-    let fm = FileManager.default
-    let dir = (cached as NSString).deletingLastPathComponent
-    if fm.fileExists(atPath: cached) { return cached }   // hit
+// per-host cache (D4), under a key over the embedded runtime sources, the host architecture and
+// `runtimeArchiveRecipe` (`HostCache.runtimeArchiveKey`): editing the runtime rebuilds the compiler, which
+// changes the key, and so does editing a command. A cached archive is materialized into the build's `_runtime/`.
+private func cachedRuntimeArchive(_ job: RuntimeArchiveJob, store: ArtifactStore) -> String? {
+    let name = (job.archive as NSString).lastPathComponent
+    guard Layout.makeDirectory(job.outputDir, buildRoot: (job.outputDir as NSString).deletingLastPathComponent)
+    else { return nil }
+    if let cached = store.lookup(job.key) {   // hit
+        do { try store.materialize(cached, into: job.outputDir); return job.archive } catch {
+            fputs("error: \(error)\n", stderr)
+            return nil
+        }
+    }
 
-    // Miss: build in a pid-unique scratch dir, then publish atomically under the content key so a
-    // crash or a concurrent compile never leaves a partial archive at the shared path.
-    let scratch = dir + "/build-\(ProcessInfo.processInfo.processIdentifier)"
-    try? fm.createDirectory(atPath: scratch, withIntermediateDirectories: true)
+    // Miss: build in a scratch directory, publish the archive, and materialize it.
+    let fm = FileManager.default
+    let scratch = NSTemporaryDirectory() + "nomu-runtime-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
+    guard (try? fm.createDirectory(atPath: scratch, withIntermediateDirectories: true)) != nil else {
+        fputs("error: cannot create '\(scratch)'\n", stderr)
+        return nil
+    }
     defer { try? fm.removeItem(atPath: scratch) }
     writeRuntimeSources(toDir: scratch)
     guard let built = buildRuntimeArchive(inDir: scratch) else { return nil }
-    // `rename` replaces an archive another compile published meanwhile in one atomic step (same key, same
-    // contents), so a concurrent link never finds the path missing.
-    guard rename(built, cached) == 0 else {
-        fputs("error: failed to publish runtime archive: \(String(cString: strerror(errno)))\n", stderr)
+    guard rename(built, scratch + "/" + name) == 0 else {
+        fputs("error: cannot name the runtime archive: \(String(cString: strerror(errno)))\n", stderr)
         return nil
     }
-    return cached
+    do {
+        let published = try store.publish(job.key, outputsIn: scratch, files: [name])
+        try store.materialize(published, into: job.outputDir)
+    } catch {
+        fputs("error: \(error)\n", stderr)
+        return nil
+    }
+    return job.archive
 }
 
 // The commands that build the runtime archive, run in order in a directory holding the runtime sources
@@ -811,7 +888,8 @@ let runtimeArchiveRecipe: [[String]] = {
         members.append("rtasm.o")
     }
     // `rcs` creates + indexes the archive; the directory is fresh, so no stale members accumulate.
-    commands.append(["/usr/bin/ar", "rcs", "libnomuruntime.a"] + members)
+    // `ZERO_AR_DATE` records zero for each member's time, so the archive is the same bytes on every build.
+    commands.append(["/usr/bin/env", "ZERO_AR_DATE=1", "/usr/bin/ar", "rcs", "libnomuruntime.a"] + members)
     return commands
 }()
 
@@ -825,12 +903,15 @@ private func buildRuntimeArchive(inDir dir: String) -> String? {
     return dir + "/libnomuruntime.a"
 }
 
-// Run `exe args` (in `dir` when given), wait, and return its exit status (or 1 if it could not be launched).
-private func runProcess(_ exe: String, _ args: [String], in dir: String? = nil) -> Int32 {
+// Run `exe args` (in `dir` when given, with `environment` added to this process's), wait, and return its exit
+// status (or 1 if it could not be launched).
+private func runProcess(_ exe: String, _ args: [String], in dir: String? = nil,
+                        environment: [String: String] = [:]) -> Int32 {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
     if let dir { p.currentDirectoryURL = URL(fileURLWithPath: dir) }
+    if !environment.isEmpty { p.environment = ProcessInfo.processInfo.environment.merging(environment) { $1 } }
     do {
         try p.run()
         p.waitUntilExit()

@@ -38,7 +38,7 @@ public func serializeBIR(_ decls: [NOIRDecl]) -> String {
 }
 
 // Parse a `.bir` back to its decls (the consumer side). Returns nil on malformed input or a version
-// mismatch — the consumer then falls back to the erased witness path for that dependency.
+// mismatch, which fails the consumer's compile.
 public func parseBIR(_ text: String) -> [NOIRDecl]? {
     guard let data = text.data(using: .utf8),
           let file = try? JSONDecoder().decode(BIRFile.self, from: data),

@@ -27,7 +27,8 @@ public struct CompileJob: Codable {
         // The module's canonical identity (its mangling origin), e.g. `["nomu", "std", "prelude"]`.
         public let origin: [String]
         public let interface: String
-        // Its shipped generic templates; nil when it ships none, or they are not offered.
+        // Its shipped generic templates. Every library writes one, empty when it ships none; nil when they are
+        // not offered.
         public let bir: String?
         // Its package, compared with the job's for `package` visibility.
         public let packageKey: String
@@ -108,6 +109,10 @@ public struct CompileJob: Codable {
     // `<nomu>/…` file's on-disk copy (Driver, `LanguageSourceCopy`). Diagnostics and debug info use it; the job
     // still reads the file by its `files` path. Nil or missing entries report the path itself.
     public var reportedPaths: [String: String]?
+    // The path debug info records for each file in `files` (`DebugPaths`): independent of where the sources and
+    // the host cache live, so an object is the same bytes from any checkout. Missing entries record the
+    // reported path.
+    public var debugPaths: [String: String]?
     // The settings this job receives, by name, in canonical form (G12): values only, never config names.
     public var settings: [String: String] = [:]
 
@@ -153,7 +158,13 @@ private struct LoadedDependencies {
             interfaces[key] = nmi.abi
             escape[key] = nmi.perf.escape
             packageKey[key] = d.packageKey
-            if let b = d.bir { bir[key] = b }
+            if let b = d.bir {
+                guard FileManager.default.fileExists(atPath: b) else {
+                    fputs("error: missing the templates of '\(key)' at '\(b)'\n", stderr)
+                    return nil
+                }
+                bir[key] = b
+            }
         }
     }
 }
@@ -171,7 +182,8 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
             fputs("error: cannot read '\(path)'\n", stderr); return false
         }
         let tokens = timings.measure("parse", "lex") { () -> [Token] in
-            var lexer = Lexer(text, file: path, displayName: job.reportedPaths?[path], diagnostics: parseDiags)
+            var lexer = Lexer(text, file: path, displayName: job.reportedPaths?[path], debugName: job.debugPaths?[path],
+                              diagnostics: parseDiags)
             return lexer.tokenize()
         }
         timings.bytes += text.utf8.count
@@ -261,11 +273,15 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         out.interfaces = iface.interfaces.filter { admits(k, $0.visibility) }
         return out
     }
-    func importedTemplates() -> [ImportedTemplate] {
+    // The templates the visible dependencies ship; nil (reported) when an offered `.bir` cannot be read.
+    func importedTemplates() -> [ImportedTemplate]? {
         var out: [ImportedTemplate] = []
         for k in visible {
-            guard let path = deps.bir[k], let text = try? String(contentsOfFile: path, encoding: .utf8),
-                  let decls = parseBIR(text) else { continue }
+            guard let path = deps.bir[k] else { continue }
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8), let decls = parseBIR(text) else {
+                fputs("error: cannot read the templates of '\(k)' at '\(path)'\n", stderr)
+                return nil
+            }
             out.append(contentsOf: decls.map { ImportedTemplate(origin: k, decl: $0) })
         }
         return out
@@ -447,9 +463,11 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     let ownNames = topDeclNames(ownSurface)
     let shipped = canonicalizeForExport(shippedTemplates(semaResult.module, ownNames: ownNames),
                                         origin: originKey, ownNames: ownNames)
+    // A library always writes its `.bir`, empty when it ships no templates, so a dependent can rely on it.
     if job.product == .library {
-        if shipped.isEmpty { try? FileManager.default.removeItem(atPath: job.outputs.bir) }
-        else { try? serializeBIR(shipped).write(toFile: job.outputs.bir, atomically: true, encoding: .utf8) }
+        guard (try? serializeBIR(shipped).write(toFile: job.outputs.bir, atomically: true, encoding: .utf8)) != nil else {
+            fputs("error: cannot write '\(job.outputs.bir)'\n", stderr); return false
+        }
     }
 
     // Cross-module specialization: unless `opt.mono` is `none`, inject the generic templates visible
@@ -458,7 +476,8 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     var moduleForMono = semaResult.module
     var localizedGenerics: Set<String> = []
     if mono != .none {
-        let selected = selectForDial(importedTemplates(), mode: mono, consumer: moduleForMono)
+        guard let templates = importedTemplates() else { return false }
+        let selected = selectForDial(templates, mode: mono, consumer: moduleForMono)
         let injection = injectImportedTemplates(into: moduleForMono, templates: selected)
         moduleForMono = injection.module
         localizedGenerics = injection.localizedNames
@@ -526,7 +545,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
 
 // A source file's text. A path under the language workspace's root (`<nomu>/…`) is served from the sources
 // the compiler carries, so a job can name the language workspace's files in any process.
-private func readSource(_ path: String) -> String? {
+func readSource(_ path: String) -> String? {
     if path.hasPrefix(LanguageWorkspace.root + "/") {
         return LanguageWorkspace.tree.read(path).map { String(decoding: $0, as: UTF8.self) }
     }

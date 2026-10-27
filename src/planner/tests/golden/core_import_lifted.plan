@@ -8,17 +8,17 @@ job nomu.nomu:runtime
   package runtime at @nomu.nomu/runtime (product)
   files runtime.nomu
   library, host-cache, runtime-subset
-  out $cache/nomu/<key>/runtime/runtime
+  out @me.app/build/_external/nomu.nomu/runtime/runtime
 job nomu.nomu:std/prelude
   package std at @nomu.nomu/std (product)
   files prelude.nomu
   library, host-cache
-  out $cache/nomu/<key>/std/prelude/prelude
+  out @me.app/build/_external/nomu.nomu/std/prelude/prelude
 job nomu.nomu:core
   package core at @nomu.nomu/core (product)
   files core.nomu
   library, host-cache
-  out $cache/nomu/<key>/core/core
+  out @me.app/build/_external/nomu.nomu/core/core
 job me.app:app
   package app at @me.app/app
   files main.nomu
@@ -28,5 +28,5 @@ job me.app:app
   import main.nomu:1:1 core → nomu.nomu:core (package core)
   sees nomu.nomu:std/prelude, nomu.nomu:core
 
-runtime archive $cache/runtime/<key>/nomu-runtime.a
+runtime archive @me.app/build/_runtime/nomu-runtime.a
 link @me.app/build/app/app from 4 objects

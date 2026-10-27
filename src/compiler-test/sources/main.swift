@@ -8,4 +8,5 @@ import Foundation
 // (one case), Suite (drives the pool + report), Ordering (LPT dispatch), Progress (live output),
 // Spawn (bounded subprocess). This file is just the entry point.
 
-exit(Suite(Ctx.fromArgs()).run())
+let ctx = Ctx.fromArgs()
+exit(ctx.checkReproducible ? ReproducibilitySweep(ctx: ctx).run() : Suite(ctx).run())

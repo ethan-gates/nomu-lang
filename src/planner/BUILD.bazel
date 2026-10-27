@@ -6,7 +6,7 @@ swift_library(
     name = "planner",
     srcs = glob(["sources/*.swift"]),
     module_name = "planner",
-    deps = ["//src/planner/scanner", "//src/modules", "//src/runtime/embedded"],
+    deps = ["//src/planner/scanner", "//src/modules", "//src/runtime/embedded", "//src/store"],
     visibility = ["//visibility:public"],
 )
 

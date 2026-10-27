@@ -38,7 +38,12 @@ let tool = Command("nomu", summary: "The Nomu compiler and build driver.",
         Command("compile", summary: "compile one module from a job file (a tool interface; builds use `build`)",
             positionals: [Positional("job", help: "the job file: one module's inputs, outputs and options")]),
         Command("build", summary: "build a module or package",
-            flags: buildFlags, options: buildOptionList,
+            flags: buildFlags + [
+                Flag("verify-cache",
+                     help: "compile every module, taking nothing from the cache, and fail if a cache entry under "
+                         + "a module's key differs from its compile"),
+            ],
+            options: buildOptionList,
             positionals: [Positional("targets", help: "module or package directories (default: .)",
                                      variadic: true, required: false)]),
         Command("run", summary: "build and run an executable module",
@@ -110,6 +115,7 @@ func buildOptions(_ args: Parsed) -> EmitOptions {
     options.llvm = args.has("emit-llvm")
     options.allowCoreImport = args.has("allow-core-import")
     options.emitJobs = args.has("emit-jobs")
+    options.verifyCache = args.has("verify-cache")
     options.subsetFuncs.formUnion(args.values("runtime-subset"))
     if let s = args.value("stop") { options.stopAt = Stage(rawValue: s) ?? .binary }
     return options
@@ -129,7 +135,7 @@ func runBuild(_ args: Parsed) -> Bool {
             for m in r.cached { print("cached \(m)") }
             if let b = r.binary { print("binary \(b)") }
         }
-        if r.binary == nil { ok = false }
+        if r.binary == nil || !r.cacheMismatches.isEmpty { ok = false }
     }
     return ok
 }

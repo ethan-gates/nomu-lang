@@ -42,10 +42,6 @@ struct ResolvedBuildConfiguration {
         }
     }
 
-    // The directory under `build/` for this configuration's outputs: the entry's active configs, joined with
-    // `-` (config names are words, so the join is unambiguous). An interim naming until the build cache.
-    var outputDirectory: String { build.entryActive.joined(separator: "-") }
-
     // The record's short form a binary carries in its `__nomu_config` section (G13).
     var summary: String { build.summary(compiler: BuildInfo.gitCommit) }
 

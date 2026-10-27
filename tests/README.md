@@ -18,6 +18,11 @@ Flags:
 - `--repeat N` — run the selection N times and report each case's pass rate (for hunting flakes).
 - `--compiler PATH` — the `nomu` to test, e.g. an older build to check that a case catches its bug.
 - `--deadline SEC` — overall wall-clock backstop (default 300, scaled by `--repeat`).
+- `--check-reproducible` — instead of compiling and running, build the selection twice from clean, the second time
+  from a copy of the sources and a host cache at other paths, and compare every cached output byte for byte
+  (objects, `.nmi`, `.bir`, the runtime archive, entry manifests; binaries are left out). About 6 s for the
+  fast tier. Exit 1 on a difference, with each file and its first differing byte; the rounds are kept for
+  inspection. `nomu build --verify-cache` checks one build against the host cache.
 
 The manifest path is a required positional argument. List tokens match a case `name`; `all` is the
 wildcard; a trailing `*` matches by prefix. The pool is 8 lanes; a case occupies `weight` of them.

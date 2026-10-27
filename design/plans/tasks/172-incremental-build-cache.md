@@ -62,6 +62,7 @@ story (sub-module units, cached monomorphizations, LSP responsiveness), downstre
   - concurrent builds of two workspaces sharing one cache produce correct, uncorrupted entries;
   - each case's 212 report matches the edit: the reasons name what the edit changed, and nothing else
     recompiles.
+- **172.4** Organize the Swift sources better.
 
 ## Deferred until after 172
 

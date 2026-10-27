@@ -385,7 +385,7 @@ final class SSAIRToLLVM {
         // A library module has no `main`; debug info still needs a source file, so fall back to the first
         // function's. Only the entry object requires `main` (checked by the driver via `loweredMain`).
         if let anyFn = module.functions.first(where: { $0.name == "main" }) ?? module.functions.first {
-            e.setupDebugInfo(sourceFile: anyFn.span.displayFile)
+            e.setupDebugInfo(sourceFile: anyFn.span.debugFile)
         }
 
         for f in module.functions { declareFunction(f) }

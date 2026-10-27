@@ -10,12 +10,11 @@ struct CompileResult {
 // Compiles each distinct (fixture, compile settings) once into a keyed cache the run phase reads. Two cases
 // sharing a compile config (e.g. a default leg and a stress leg) build a single binary.
 //
-// `nomu build` places outputs by its selected configs, but these settings are still environment variables,
-// which leave that place unchanged. So the configurations of one fixture compile one after another, and each
-// binary (with its object, for the symbol checks) is copied to its configuration's own path
-// (`Ctx.configBinaryPath`) before the next build overwrites it. Different fixtures compile in parallel. Once
-// the settings are configs (build-configuration design, Phases), configurations of one fixture compile in
-// parallel too and the copy goes away.
+// `build/` shows a workspace's last build, whatever its configuration, so the configurations of one fixture
+// compile one after another, and each binary (with its object, for the symbol checks) is copied to its
+// configuration's own path (`Ctx.configBinaryPath`) before the next build overwrites it. Different fixtures
+// compile in parallel, each in a lane's copy of the workspace (`WorkspaceLanes`), since one workspace builds one
+// invocation at a time.
 final class CompileCache {
     private var results: [String: CompileResult] = [:]
     private let lock = NSLock()
@@ -26,6 +25,8 @@ final class CompileCache {
     }
 
     func compileAll(_ selected: [ResolvedCase], ctx: Ctx, gate: WeightedGate, progress: Progress) {
+        let lanes = WorkspaceLanes(projectRoot: ctx.projectRoot, fixtures: selected.map(\.fixture))
+        defer { lanes.removeAll() }
         var seen = Set<String>()
         var byFixture: [String: [ResolvedCase]] = [:]
         var fixtureOrder: [String] = []
@@ -39,13 +40,16 @@ final class CompileCache {
         // fixture is one lane. No deadline here — a single hung compile is bounded by its own `runProcess`
         // timeout, and the bounded dispatch prevents the worker-starvation wedge the old eager loop had.
         gate.dispatch(fixtureOrder) { fixture in
+            let lane = lanes.take()
+            defer { lanes.give(lane) }
+            let target = (fixture as NSString).isAbsolutePath ? fixture : lane + "/" + fixture
             let stem = ctx.fixtureStem(fixture)
             for job in byFixture[fixture]! {
                 progress.start(stem)
                 // `nomu build <fixture dir>`: plans the fixture's build, compiles every module, and links. It
                 // reports the binary's path as a `binary <path>` line.
                 let r = runProcess(path: ctx.nomu,
-                                   args: ["build", "--report-jobs"] + job.compileArgs + ctx.compileInputs(fixture),
+                                   args: ["build", "--report-jobs"] + job.compileArgs + [target],
                                    env: job.compileEnv, timeout: job.compileTimeout)
                 var res = CompileResult(ok: r.succeeded, timedOut: r.timedOut, stderr: r.stderr, duration: r.duration)
                 if res.ok, job.compile?.expectError == nil {

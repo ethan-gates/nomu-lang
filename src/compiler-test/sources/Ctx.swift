@@ -7,7 +7,7 @@ import Foundation
 
 let USAGE = """
     usage: compiler-test <config> [--enable a,b,*] [--disable a,b,*] [--where axis=value,…] [--tier fast|full]
-                         [--repeat N] [--compiler PATH] [--deadline SEC] [--jobs N]
+                         [--repeat N] [--compiler PATH] [--deadline SEC] [--jobs N] [--check-reproducible]
 
     config           manifest path (required)
     --enable LIST    run only these cases (base becomes empty, then these are added)
@@ -18,6 +18,9 @@ let USAGE = """
     --compiler PATH  the nomu to test (default: the newest release build)
     --deadline SEC   overall wall-clock backstop (default 300; scaled by --repeat)
     --jobs N         pool capacity in cores (default: host cores − 2)
+    --check-reproducible
+                     instead of compiling and running, build the selection twice from clean (the second
+                     time at other source and cache paths) and compare the outputs byte for byte
 
     LIST entries match a case name; `all` is the wildcard; a trailing `*` matches by prefix. A group run is
     named group/fixture/value/… (e.g. shape/local_string/debug/stress-minor).
@@ -39,6 +42,7 @@ struct Ctx {
     let projectRoot: String
     let nomu: String
     let cases: [ResolvedCase]
+    let checkReproducible: Bool   // run the reproducibility sweep instead of the suite (`--check-reproducible`)
 
     // The tier's cases; base = all of them, or empty if --enable was given; add --enable; remove --disable;
     // keep only group runs matching every --where.
@@ -99,6 +103,7 @@ struct Ctx {
         var compiler: String? = nil
         var deadline = 300.0   // suite-level wall-clock backstop (seconds)
         var jobs: Int? = nil   // pool capacity override; default derives from host cores below
+        var checkReproducible = false
 
         func parseValued(_ flag: String, _ v: String) {
             switch flag {
@@ -125,6 +130,8 @@ struct Ctx {
             switch a {
             case "--help", "-h":
                 print(USAGE); exit(0)
+            case "--check-reproducible":
+                checkReproducible = true
             case "--enable":
                 i += 1; guard i < argv.count else { die("--enable needs a list") }
                 enableList += splitList(argv[i])
@@ -185,7 +192,7 @@ struct Ctx {
         return Ctx(enableList: enableList, disableList: disableList, whereList: whereList, tier: tier,
                    repeatCount: repeatCount, deadline: deadline * Double(repeatCount),
                    poolCapacity: capacity, configPath: configPath, manifest: manifest, projectRoot: root,
-                   nomu: resolveNomu(projectRoot: root, override: compiler), cases: cases)
+                   nomu: resolveNomu(projectRoot: root, override: compiler), cases: cases, checkReproducible: checkReproducible)
     }
 }
 

@@ -1,6 +1,6 @@
 # Workspace lock and `build/` layout
 
-**Avenue:** Infra · **Type/Lifecycle:** `driver · ready-to-build` · **Size:** M · **Status:** ready-to-build ·
+**Avenue:** Infra · **Type/Lifecycle:** `driver · done` · **Size:** M · **Status:** done ·
 **Source:** [172](172-incremental-build-cache.md) (the `build/` layout), [190](190-explicit-module-builds.md)
 190.6 F3 and F6. A prerequisite of 172.
 
@@ -32,6 +32,37 @@ configurations at once use the paths a build reports.
   reverse, is detected, reported, and removed, instead of an opaque "File exists".
 - **210.4** Tests: a second build waits and names the first's pid; a dead holder's lock is taken over; a
   stale layout is cleared.
+
+## Two shapes of repository
+
+- **A Nomu source repository** follows Bazel: one workspace root, one building invocation at a time. Many
+  targets go to one `nomu build` ([211](211-multi-root-builds.md)) and compile in parallel under the driver's
+  scheduler ([191](191-threaded-job-execution.md)); many test targets go to one `nomu test`, run in parallel with
+  scheduling aware of resource use, so test lanes are not starved (not yet a task).
+- **The compiler repository** holds Nomu sources too: the suite's fixtures, all in the one project workspace.
+  Its long-term test shape (Bazel-run unit tests, `swift_test`) is [213](213-compiler-unit-tests.md)'s. Until
+  `nomu build` and `nomu test` run work in parallel, the suite runner builds in per-lane copies of the workspace
+  (`WorkspaceLanes`), each with its own lock and sharing the host cache, which keeps its compile phase parallel.
+
+## Done
+
+- **210.1** `WorkspaceLock`: an `flock` on `build/.nomu-lock`, taken by `build`, `run` and `test` once planning
+  succeeds (a planning error still writes nothing) and held until the build returns; `run` releases it before
+  the program starts. A second invocation prints `nomu: waiting for another nomu (pid N) building in workspace
+  '…'` and waits. The kernel releases an `flock` when its holder exits, so a dead holder never blocks;
+  the pid in the file is only for the message. `nomu compile` never takes it.
+- **210.2** `build/` shows the last build: `PlanOptions.outputConfig` and the `build/<configs>/` level are
+  gone. Binaries at `build/<module path>/<leaf>`; externals under `build/_external/<scope>.<name>/`, the language
+  workspace under `build/_external/nomu.nomu/` and the runtime archive under `build/_runtime/`, materialized from
+  the host cache (209.4). User modules are not yet in the store and compile every build, as before; 172.1
+  brings them in.
+- **210.3** `Layout`: a file where a directory goes (the directory or an ancestor, within `build/`) and a
+  directory where the binary goes are reported (`nomu: removed '…', a file left by an earlier build …`) and
+  removed. Old `build/<configs>/` directories are not recognized as stale; they stay until `build/` is deleted.
+- **210.4** `build_tests`: a second build waits while the test holds the lock and names its pid; a lock file
+  naming a dead pid does not delay a build; a stale file and a stale directory are cleared. The suite runner's
+  lanes keep both tiers' times within a few seconds of before (fast 42.6 s, full 121.6 s).
+- `tools/escape-diff.sh` reads one binary path per example; its builds take turns and its runs stay parallel.
 
 ## Refs
 

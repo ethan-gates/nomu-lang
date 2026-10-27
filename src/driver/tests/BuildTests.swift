@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import store
 
 // Builds of real suite fixtures with the `nomu` binary (190.5.2): each module compiles once per build, the
 // host cache serves the language workspace on the next build, and a planning error stops the build before
@@ -94,6 +95,109 @@ final class BuildTests: XCTestCase {
         XCTAssertEqual(second.compiled, first.compiled.filter { !$0.hasPrefix("nomu.nomu:") })
     }
 
+    // Every library writes its `.bir`, empty when it ships no templates; a compile that finds a dependency's
+    // `.bir` missing fails.
+    func testMissingDependencyBIRFailsTheCompile() throws {
+        XCTAssertNotNil(try build("tests/fixtures/module_link_diamond", ["--emit-jobs"]).binary)
+        let unit = repo + "/build/tests/fixtures/module_link_diamond"
+        let files = FileManager.default.enumerator(atPath: unit)?.compactMap { $0 as? String } ?? []
+        for library in ["data", "left", "right"] {
+            XCTAssertTrue(files.contains { $0 == "\(library)/\(library).bir" }, library)
+        }
+        let leftJob = unit + "/" + (try XCTUnwrap(files.first { $0 == "left/left.job.json" }))
+        let dataBIR = unit + "/" + (try XCTUnwrap(files.first { $0 == "data/data.bir" }))
+        XCTAssertEqual(try run(nomu, ["compile", leftJob]).status, 0)
+        try FileManager.default.removeItem(atPath: dataBIR)
+        let r = try run(nomu, ["compile", leftJob])
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(r.stderr.contains("missing the templates of"), r.stderr)
+    }
+
+    // `--verify-cache` compiles every module, taking nothing from the cache, and passes when each entry
+    // already under a module's key matches its compile. An entry whose object differs, under a manifest that
+    // still matches (an input outside the key), fails the build, naming the module and the key's inputs.
+    func testVerifyCache() throws {
+        let fixture = "tests/fixtures/std_module_import"
+        let first = try build(fixture)
+        XCTAssertNotNil(first.binary)
+        let checked = try build(fixture, ["--verify-cache"])
+        XCTAssertNotNil(checked.binary)
+        XCTAssertEqual(checked.cached, [])
+        XCTAssertEqual(Set(checked.compiled), Set(first.compiled))
+        // Store a changed object in the CAS and point the result at it, so the entry is served.
+        let resultPath = try result(holding: "prelude.o")
+        var object = try Data(contentsOf: URL(fileURLWithPath: try blob(of: "prelude.o")))
+        object[object.count / 2] ^= 0xff
+        try object.write(to: URL(fileURLWithPath: cache + "/cas/" + ContentHash.of(object)))
+        var result = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: resultPath))) as? [String: Any])
+        var files = try XCTUnwrap(result["files"] as? [[String: Any]])
+        for i in files.indices where files[i]["path"] as? String == "prelude.o" { files[i]["hash"] = ContentHash.of(object) }
+        result["files"] = files
+        try JSONSerialization.data(withJSONObject: result).write(to: URL(fileURLWithPath: resultPath))
+
+        let r = try run(nomu, ["build", "--verify-cache", repo + "/" + fixture], env: ["NOMU_CACHE_DIR": cache])
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(r.stderr.contains("error: --verify-cache: nomu.nomu:std/prelude: differs from its cache entry"
+                                        + " (prelude.o at byte"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("; the key covers:\n    compiler = "), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\n    source:/nomu-src/nomu.nomu/std/prelude/prelude.nomu = "), r.stderr)
+        XCTAssertEqual(r.stderr.components(separatedBy: "differs from its cache entry").count, 2, r.stderr)
+    }
+
+    // A second build in a workspace waits while another holds its lock, naming the holder's pid (210).
+    func testSecondBuildWaitsForTheLock() throws {
+        let lockPath = repo + "/build/.nomu-lock"
+        try FileManager.default.createDirectory(atPath: repo + "/build", withIntermediateDirectories: true)
+        let fd = open(lockPath, O_RDWR | O_CREAT, 0o644)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        XCTAssertEqual(flock(fd, LOCK_EX), 0)
+        _ = "4242\n".withCString { pwrite(fd, $0, 5, 0) }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: nomu)
+        p.arguments = ["build", repo + "/tests/fixtures/module_link_diamond"]
+        p.environment = ProcessInfo.processInfo.environment.merging(["NOMU_CACHE_DIR": cache]) { $1 }
+        let err = Pipe()
+        p.standardError = err
+        p.standardOutput = FileHandle.nullDevice
+        try p.run()
+        Thread.sleep(forTimeInterval: 2)
+        XCTAssertTrue(p.isRunning, "the build went ahead while the lock was held")
+        close(fd)
+        let stderr = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        XCTAssertEqual(p.terminationStatus, 0, stderr)
+        XCTAssertTrue(stderr.contains("nomu: waiting for another nomu (pid 4242) building in workspace '\(repo)'"), stderr)
+    }
+
+    // A lock file naming a holder that is gone (no process holds the `flock`) does not delay a build.
+    func testDeadHolderDoesNotBlock() throws {
+        try FileManager.default.createDirectory(atPath: repo + "/build", withIntermediateDirectories: true)
+        try write(repo + "/build/.nomu-lock", "999999\n")
+        let r = try run(nomu, ["build", repo + "/tests/fixtures/module_link_diamond"], env: ["NOMU_CACHE_DIR": cache])
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertFalse(r.stderr.contains("waiting"), r.stderr)
+    }
+
+    // A file where the layout puts a directory, and a directory where it puts the binary, are reported and
+    // removed (210.3).
+    func testStaleLayoutIsCleared() throws {
+        let fixture = repo + "/tests/fixtures/module_link_diamond"
+        try FileManager.default.createDirectory(atPath: repo + "/build", withIntermediateDirectories: true)
+        try write(repo + "/build/tests", "an old binary")
+        let first = try run(nomu, ["build", fixture], env: ["NOMU_CACHE_DIR": cache])
+        XCTAssertEqual(first.status, 0, first.stderr)
+        XCTAssertTrue(first.stderr.contains("nomu: removed '\(repo)/build/tests', a file left by an earlier build"), first.stderr)
+
+        let binary = repo + "/build/tests/fixtures/module_link_diamond/module_link_diamond"
+        try FileManager.default.removeItem(atPath: binary)
+        try FileManager.default.createDirectory(atPath: binary + "/old", withIntermediateDirectories: true)
+        let second = try run(nomu, ["build", fixture], env: ["NOMU_CACHE_DIR": cache])
+        XCTAssertEqual(second.status, 0, second.stderr)
+        XCTAssertTrue(second.stderr.contains("nomu: removed '\(binary)', a directory left by an earlier build"), second.stderr)
+        XCTAssertEqual(try output(of: binary), "23\n")
+    }
+
     // A planning error stops the build before any job: nothing compiles and nothing is written.
     func testPlanningErrorsPrecedeEveryCompile() throws {
         for fixture in ["tests/fixtures/multipackage_undeclared/app", "tests/fixtures/multipackage_cycle/p"] {
@@ -112,7 +216,7 @@ final class BuildTests: XCTestCase {
         let binary = try XCTUnwrap(r.binary)
         XCTAssertTrue(r.compiled.contains("nomu.prov:greet"))
         let consumer = repo + "/tests/fixtures/xworkspace_basic/consumer"
-        XCTAssertTrue(FileManager.default.fileExists(atPath: consumer + "/build/debug/_external/nomu.prov/greet/greet.o"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: consumer + "/build/_external/nomu.prov/greet/greet.o"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: repo + "/tests/fixtures/xworkspace_basic/provider/build"))
         XCTAssertEqual(try output(of: binary), "42\n")
     }
@@ -120,7 +224,7 @@ final class BuildTests: XCTestCase {
     // Settings resolve once per build and reach each module's compile (task 198), read here from the job
     // files. An external takes its own file's value, and the entry's `externals: all` block over it when its
     // config is selected; the language workspace's settings do not change with the selection, so its
-    // host-cache entry is shared. Each configuration keeps its own outputs under `build/<configs>/`.
+    // host-cache entry is shared. `build/` shows the last build, whatever its configuration (210).
     func testSettingsReachEachModulesCompile() throws {
         let root = repo + "/tests/fixtures/xworkspace_basic"
         try write(root + "/consumer/cfg.yaml", """
@@ -137,16 +241,16 @@ final class BuildTests: XCTestCase {
         try write(root + "/provider/cfg.yaml", "opt:\n  scalar: false\n")
 
         let plain = try build("tests/fixtures/xworkspace_basic/consumer/app", ["--emit-jobs"])
-        XCTAssertEqual(plain.binary, root + "/consumer/build/debug/app/app")
+        XCTAssertEqual(plain.binary, root + "/consumer/build/app/app")
         let language = languageEntries()
-        let before = try jobSettings([root + "/consumer/build/debug"] + language)
+        let before = try jobSettings([root + "/consumer/build"])
         XCTAssertEqual(before["nomu/cons/app"]?["opt.inline"], "true")
         XCTAssertEqual(before["nomu/prov/greet"]?["opt.scalar"], "false")
 
         let tagged = try build("tests/fixtures/xworkspace_basic/consumer/app", ["--emit-jobs", "-c", "tagged"])
-        XCTAssertEqual(tagged.binary, root + "/consumer/build/debug-tagged/app/app")
+        XCTAssertEqual(tagged.binary, root + "/consumer/build/app/app")
         XCTAssertEqual(try output(of: XCTUnwrap(tagged.binary)), "42\n")
-        let after = try jobSettings([root + "/consumer/build/debug-tagged"])
+        let after = try jobSettings([root + "/consumer/build"])
         XCTAssertEqual(after["nomu/cons/app"]?["opt.inline"], "false")
         XCTAssertEqual(after["nomu/prov/greet"]?["opt.inline"], "true")
         XCTAssertEqual(after["nomu/prov/greet"]?["opt.scalar"], "true")
@@ -155,8 +259,6 @@ final class BuildTests: XCTestCase {
         for (origin, settings) in before where origin.hasPrefix("nomu/nomu/") {
             XCTAssertEqual(settings["opt.inline"], "true", origin)
         }
-        // The first configuration's outputs are untouched.
-        XCTAssertEqual(try jobSettings([root + "/consumer/build/debug"])["nomu/cons/app"]?["opt.inline"], "true")
     }
 
     // The binary carries the compiler and the active configs in its `__nomu_config` section (task 198).
@@ -201,12 +303,13 @@ final class BuildTests: XCTestCase {
         let plain = try build("tests/fixtures/xworkspace_basic/consumer/app", ["--emit-jobs"])
         XCTAssertEqual(try output(of: XCTUnwrap(plain.binary)), "42\n")
         let debugEntries = languageEntries()
-        XCTAssertEqual(debugEntries.count, 1)
-        let debug = try jobSettings([root + "/consumer/build/debug"] + debugEntries)
+        XCTAssertEqual(debugEntries.count, plain.compiled.filter { $0.hasPrefix("nomu.nomu:") }.count)
+        let debug = try jobSettings([root + "/consumer/build"])
         let release = try build("tests/fixtures/xworkspace_basic/consumer/app", ["--emit-jobs", "-c", "release"])
         XCTAssertEqual(try output(of: XCTUnwrap(release.binary)), "42\n")
         XCTAssertEqual(release.cached, [])
-        let optimized = try jobSettings([root + "/consumer/build/release"] + languageEntries().subtracting(debugEntries))
+        XCTAssertEqual(languageEntries().subtracting(debugEntries).count, debugEntries.count)
+        let optimized = try jobSettings([root + "/consumer/build"])
         for origin in ["nomu/cons/app", "nomu/prov/greet", "nomu/nomu/std/prelude", "nomu/nomu/runtime"] {
             XCTAssertEqual(debug[origin]?["opt.level"], "none", origin)
             XCTAssertEqual(debug[origin]?["opt.mono"], "none", origin)
@@ -230,9 +333,72 @@ final class BuildTests: XCTestCase {
         return found
     }
 
-    // The language workspace's host-cache entries: one per distinct set of its settings.
+    // The host cache's action results (`ac/<key>`), each parsed.
+    private func cacheResults() throws -> [String: [String: Any]] {
+        var out: [String: [String: Any]] = [:]
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: cache + "/ac")) ?? [] where !name.hasPrefix(".") {
+            let data = try Data(contentsOf: URL(fileURLWithPath: cache + "/ac/" + name))
+            out[name] = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+        return out
+    }
+
+    private func fileNames(_ result: [String: Any]) -> [String] {
+        ((result["files"] as? [[String: Any]]) ?? []).compactMap { $0["path"] as? String }
+    }
+
+    // The keys of the language-workspace modules' results: one per module per distinct set of its settings.
     private func languageEntries() -> Set<String> {
-        Set(((try? FileManager.default.contentsOfDirectory(atPath: cache + "/nomu")) ?? []).map { cache + "/nomu/" + $0 })
+        Set(((try? cacheResults()) ?? [:]).filter { !fileNames($0.value).contains("nomu-runtime.a") }.keys)
+    }
+
+    // The path of the action result that holds the output `file`.
+    private func result(holding file: String) throws -> String {
+        let key = try XCTUnwrap(try cacheResults().first { fileNames($0.value).contains(file) }?.key, file)
+        return cache + "/ac/" + key
+    }
+
+    // The CAS blob of the output `file`.
+    private func blob(of file: String) throws -> String {
+        let data = try Data(contentsOf: URL(fileURLWithPath: try result(holding: file)))
+        let result = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let entry = try XCTUnwrap((result["files"] as? [[String: Any]])?.first { $0["path"] as? String == file })
+        return cache + "/cas/" + (try XCTUnwrap(entry["hash"] as? String))
+    }
+
+    // A host-cache action result records the job's key and its outputs; the key's named inputs are computed only
+    // when asked for (`--verify-cache`).
+    func testHostCacheEntryRecordsItsKey() throws {
+        XCTAssertNotNil(try build("tests/fixtures/std_module_import").binary)
+        for key in languageEntries() {
+            let result = try XCTUnwrap(try cacheResults()[key])
+            XCTAssertEqual(Array((try XCTUnwrap(result["inputs"] as? [String: String])).keys), ["key"], key)
+            XCTAssertFalse(fileNames(result).isEmpty, key)
+        }
+    }
+
+    // A host-cache entry naming a blob that no longer matches its digest is discarded and recompiled; the other
+    // entries are served. A leftover temporary file changes nothing.
+    func testDamagedHostCacheEntryIsRebuilt() throws {
+        let first = try build("tests/fixtures/std_module_import")
+        XCTAssertNotNil(first.binary)
+        let language = first.compiled.filter { $0.hasPrefix("nomu.nomu:") }
+        let preludeBlob = try blob(of: "prelude.o")
+        var object = try Data(contentsOf: URL(fileURLWithPath: preludeBlob))
+        object[object.count / 2] ^= 0xff
+        try object.write(to: URL(fileURLWithPath: preludeBlob))
+        try write(cache + "/cas/.tmp-leftover", "partial")
+
+        let second = try build("tests/fixtures/std_module_import")
+        XCTAssertEqual(try output(of: XCTUnwrap(second.binary)), try output(of: XCTUnwrap(first.binary)))
+        XCTAssertEqual(second.compiled.filter { $0.hasPrefix("nomu.nomu:") }, ["nomu.nomu:std/prelude"])
+        XCTAssertEqual(second.cached, language.filter { $0 != "nomu.nomu:std/prelude" })
+
+        // A damaged runtime archive is rebuilt the same way.
+        try write(try blob(of: "nomu-runtime.a"), "ruined")
+        let third = try build("tests/fixtures/std_module_import")
+        XCTAssertEqual(try output(of: XCTUnwrap(third.binary)), try output(of: XCTUnwrap(first.binary)))
+        XCTAssertEqual(third.cached, language)
     }
 
     // A wrong `cfg.yaml` or selection stops the build before any compile, with the file's position.
@@ -294,20 +460,23 @@ final class BuildTests: XCTestCase {
         XCTAssertTrue(details.contains("adhoc,linker-signed"), details)
     }
 
-    // The language workspace's sources are copied under the host cache for reporting, and its modules' debug
-    // info names the copy; a copy holding other sources (a `.digest` mismatch) is replaced.
+    // The language workspace's sources are copied under the host cache for reporting. Its modules' debug info
+    // records `/nomu-src/nomu.nomu/…` (`DebugPaths`), and the binary's `.lldbinit` maps that prefix to the copy;
+    // a copy holding other sources (a `.digest` mismatch) is replaced.
     func testLanguageSourcesCopiedForReporting() throws {
         let r = try build("tests/fixtures/gc_roots_across_modules")
-        XCTAssertNotNil(r.binary)
+        let binary = try XCTUnwrap(r.binary)
         let copy = cache + "/source"
         let prelude = copy + "/std/prelude/prelude.nomu"
         XCTAssertTrue(FileManager.default.fileExists(atPath: prelude))
         let digest = try String(contentsOfFile: copy + "/.digest", encoding: .utf8)
-        let objects = FileManager.default.enumerator(atPath: cache + "/nomu")?.compactMap { $0 as? String }
-            .filter { $0.hasSuffix("prelude.o") } ?? []
-        let object = try Data(contentsOf: URL(fileURLWithPath: cache + "/nomu/" + XCTUnwrap(objects.first)))
-        XCTAssertNotNil(object.range(of: Data((copy + "/std/prelude").utf8)), "debug info names the copy")
+        let object = try Data(contentsOf: URL(fileURLWithPath: repo + "/build/_external/nomu.nomu/std/prelude/prelude.o"))
+        XCTAssertNotNil(object.range(of: Data("/nomu-src/nomu.nomu/std/prelude".utf8)), "debug info records the fixed form")
+        XCTAssertNil(object.range(of: Data(cache.utf8)), "no host-cache path in debug info")
         XCTAssertNil(object.range(of: Data("<nomu>/".utf8)), "no virtual path in debug info")
+        let lldbInit = try String(contentsOfFile: binary + ".lldbinit", encoding: .utf8)
+        XCTAssertTrue(lldbInit.contains("settings append target.source-map /nomu-src/nomu.nomu \"\(copy)\"\n"), lldbInit)
+        XCTAssertTrue(lldbInit.contains("settings append target.source-map /nomu-src/nomu.nomu_lang \"\(repo)\"\n"), lldbInit)
 
         try "stale".write(toFile: copy + "/.digest", atomically: true, encoding: .utf8)
         try FileManager.default.removeItem(atPath: prelude)

@@ -156,6 +156,14 @@ public func emitSettingsObject(_ globals: [(symbol: String, value: RuntimeGlobal
     return emitModuleObject(mod, to: path, optimize: false)
 }
 
+// The target objects are emitted for: the host triple, CPU and CPU features, as `emitModuleObject` passes them
+// to the target machine. Build-cache keys cover them, since an object is tuned to the host it was built on.
+public func objectTarget() -> (triple: String, cpu: String, features: String) {
+    let triple = LLVMGetDefaultTargetTriple()!, cpu = LLVMGetHostCPUName()!, features = LLVMGetHostCPUFeatures()!
+    defer { LLVMDisposeMessage(triple); LLVMDisposeMessage(cpu); LLVMDisposeMessage(features) }
+    return (String(cString: triple), String(cString: cpu), String(cString: features))
+}
+
 /// Emit an already-built, verified module to a native object file for the host triple, via
 /// `llvm-c/TargetMachine.h`. Returns nil on success, else an error message.
 // Run the 8-byte-slot layout check (`LLVMGen.checkSlotLayout`) under the host target's data layout, the one

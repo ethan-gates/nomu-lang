@@ -10,12 +10,12 @@ job nomu.nomu:runtime
   package runtime at @nomu.nomu/runtime (product)
   files runtime.nomu
   library, host-cache, runtime-subset
-  out $cache/nomu/<key>/runtime/runtime
+  out @nomu.cons/build/_external/nomu.nomu/runtime/runtime
 job nomu.nomu:std/prelude
   package std at @nomu.nomu/std (product)
   files prelude.nomu
   library, host-cache
-  out $cache/nomu/<key>/std/prelude/prelude
+  out @nomu.cons/build/_external/nomu.nomu/std/prelude/prelude
 job nomu.pa:util
   package util at @nomu.pa/util (product)
   files u.nomu
@@ -40,5 +40,5 @@ job nomu.cons:app
   import main.nomu:2:1 wsb/util as util2 → nomu.pb:util (package util)
   sees nomu.nomu:std/prelude, nomu.pa:util, nomu.pb:util
 
-runtime archive $cache/runtime/<key>/nomu-runtime.a
+runtime archive @nomu.cons/build/_runtime/nomu-runtime.a
 link @nomu.cons/build/app/app from 5 objects
