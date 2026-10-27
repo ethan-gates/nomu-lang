@@ -1,17 +1,24 @@
 load("@rules_swift//swift:swift.bzl", "swift_library")
 
-# Build facts embedded in the compiler: the git commit it was built from (task 190, D4), read from Bazel's
-# stable workspace status (`tools/workspace_status.sh`). Always stamped, so every build carries its commit.
+# Build facts embedded in the compiler, read from Bazel's stable workspace status
+# (`tools/workspace_status.sh`): the git commit it was built from (task 190, D4), and its identity in cache
+# keys, the commit plus a hash of uncommitted changes (task 206). Always stamped, so every build carries them.
+# Both are computed properties, so a new stamp changes this module's code and not its interface, and modules
+# that import it do not recompile.
 genrule(
     name = "build_info_swift",
     outs = ["BuildInfo.swift"],
     cmd = """
 commit=$$(sed -n 's/^STABLE_NOMU_GIT_COMMIT //p' bazel-out/stable-status.txt)
+identity=$$(sed -n 's/^STABLE_NOMU_COMPILER_IDENTITY //p' bazel-out/stable-status.txt)
 {
   echo '// GENERATED from the Bazel workspace status — do not edit.'
   echo 'public enum BuildInfo {'
   echo "    // The git commit the compiler was built from; \\"unstamped\\" outside a git checkout."
-  echo "    public static let gitCommit = \\"$${commit:-unstamped}\\""
+  echo "    public static var gitCommit: String { \\"$${commit:-unstamped}\\" }"
+  echo "    // The compiler's identity in cache keys: the commit, plus a hash of uncommitted changes to the paths"
+  echo "    // that build it when there are any."
+  echo "    public static var compilerIdentity: String { \\"$${identity:-unstamped}\\" }"
   echo '}'
 } > $@
 """,

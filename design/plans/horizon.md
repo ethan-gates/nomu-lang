@@ -43,8 +43,8 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
         │        interacts with 170 (method-level generics), 118 (associated types)
         ├── 203  symbol encoding — one injective mangling for every family   (correctness)  (done)
         └── 172  incremental build cache — content-addressed, module-granular (dev-productivity)
-            ├── 206  compiler identity — a hash of the nomu binary in every key           ◀ next
-            ├── 208  job keys — over everything a compile reads                            (needs 206)
+            ├── 206  compiler identity — commit plus uncommitted changes, baked in          (done)
+            ├── 208  job keys — over everything a compile reads                            ◀ next
             ├── 209  content-addressed store — one store for every cached artifact         ◀ next
             ├── 207  build determinism — byte-identical outputs                            (for early cutoff)
             ├── 210  workspace lock and build/ layout
@@ -53,7 +53,7 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
             └── 198  build configuration — modes, per-workspace settings, the cache-key input  (done)
 ```
 
-**Order of the next run:** 172's prerequisites (206 and 209 first, then 208; 207, 210 and 211 in any order,
+**Order of the next run:** 172's prerequisites (206 done; 209 and 208 next; 207, 210 and 211 in any order,
 207 before 172's cutoff tests), then 172 itself, which wires them together, then 159 (198 and 203 are done). 190 (explicit module builds) and 200 (the
 YAML parser, which 198's configuration files needed) are done; 200's open items are
 [204](tasks/204-yaml-parser-upgrades.md), off this chain. 198 went ahead of 203 by choice; 203 is 190's

@@ -47,9 +47,9 @@ public enum HostCache {
         return h.hex
     }
 
-    // The language workspace's key: its sources, the compiler's identity (the git commit it was built from;
-    // `.nmi` / `.bir` formats change with the compiler), the host target, and every option that changes the
-    // compiled output.
+    // The language workspace's key: its sources, the compiler's identity (`BuildInfo.compilerIdentity`: its
+    // commit plus any uncommitted changes; output and the `.nmi` / `.bir` formats change with the compiler), the host target,
+    // and every option that changes the compiled output.
     public static func languageWorkspaceKey(compilerIdentity: String, outputOptions: [String]) -> String {
         var h = Hasher64()
         h.mix(languageSourcesDigest)

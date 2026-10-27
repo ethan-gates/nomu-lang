@@ -15,7 +15,7 @@ The parts are prerequisite tasks, each verified on its own; 172 itself connects 
 
 | task | what it provides |
 |---|---|
-| [206](206-compiler-identity.md) compiler identity | a hash of the `nomu` binary in every key, so a rebuilt compiler never reuses stale entries |
+| [206](206-compiler-identity.md) compiler identity | the commit plus uncommitted changes, baked into `nomu`, in every key, so a changed compiler never reuses stale entries |
 | [207](207-build-determinism.md) build determinism | byte-identical outputs for identical inputs, so a recompiled dependency with unchanged outputs leaves its dependents' keys unchanged (early cutoff) |
 | [208](208-job-keys.md) job keys | a key per job over everything the compile reads, with its inputs recorded for "why did this rebuild" |
 | [209](209-content-addressed-store.md) content-addressed store | one store, staged and atomically published, for the runtime archive, the language workspace and now every module |
@@ -36,7 +36,8 @@ story (sub-module units, cached monomorphizations, LSP responsiveness), downstre
   determinism (207): a body edit that leaves a dependency's outputs byte-identical rebuilds nothing above
   it. This settles how the `opt.mono` dial and `.bir` bodies reach dependents, and which dependency
   interfaces enter a key (190.6 F15): each mode's key covers what that mode's compile reads.
-- **The compiler's identity is a hash of its binary** ([206](206-compiler-identity.md)); 190.6 F5.
+- **The compiler's identity is its commit plus a hash of uncommitted changes, baked in at build time**
+  ([206](206-compiler-identity.md)); 190.6 F5.
 - **Entries live in the host cache, `build/` shows the last build** (tentative; [209](209-content-addressed-store.md),
   [210](210-workspace-lock-and-layout.md)).
 - **One invocation per workspace**, a second waiting with the holder's pid ([210](210-workspace-lock-and-layout.md));

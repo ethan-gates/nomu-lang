@@ -47,7 +47,7 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
 
     var planOptions = PlanOptions()
     planOptions.allowCoreImport = options.allowCoreImport
-    planOptions.compilerIdentity = BuildInfo.gitCommit
+    planOptions.compilerIdentity = BuildInfo.compilerIdentity
     planOptions.runtimeRecipe = runtimeArchiveRecipe
     // The configuration resolves once, between reading the module table and planning: the language
     // workspace's settings enter its host-cache key, which places its outputs.

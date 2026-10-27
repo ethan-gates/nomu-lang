@@ -67,7 +67,7 @@ public struct PlanOptions {
     public var product: ModuleJob.Product = .binary
     // The per-host cache root (D4).
     public var cacheRoot: String = HostCache.root(environment: ProcessInfo.processInfo.environment)
-    // The compiler's identity for the language workspace's cache key: the git commit it was built from.
+    // The compiler's identity for the language workspace's cache key (`BuildInfo.compilerIdentity`).
     public var compilerIdentity = "unstamped"
     // Every option that changes compiled output (e.g. `-O`), as it enters the language workspace's key.
     public var outputOptions: [String] = []

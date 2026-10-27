@@ -263,7 +263,8 @@ separate link-selection step. This replaces today's over-linking of all of `std`
     performance only, the language workspace's entry is always built one way, and nothing under `build/` is
     reused across invocations. Costs: release performance figures include a debug `std`, and a release `std`
     is untested.
-  - **F5 — a dirty tree can reuse stale cache entries.** The compiler's identity is its git commit (D4);
+  - **F5 — a dirty tree can reuse stale cache entries.** *Closed by 206:* the identity is the commit plus a
+    hash of uncommitted changes, baked in at build time. The compiler's identity is its git commit (D4);
     uncommitted compiler changes keep the identity, so a compiler edit that changes codegen, the `.nmi` /
     `.bir` formats, layouts, GC metadata or symbol names reuses `std`/`core`/`runtime` objects from the
     previous compiler (a link error or a silent mismatch). Edits to the embedded `.nomu` sources do change
