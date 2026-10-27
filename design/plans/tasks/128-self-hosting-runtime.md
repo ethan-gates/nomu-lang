@@ -268,8 +268,14 @@ The parts this task owns directly (the delegated prerequisites 125/149/150/127 k
   5. **Link-level control (minor):** the weak fallback `nomu_actor_drain`, and section lookup through
      `_mh_execute_header`, which `section$start$…` symbols can replace.
 
+  6. **The asm floor into the runtime's object** (for [192](192-bazel-friendliness.md)): retiring the C files
+     leaves `rtasm_arm64.s` (the context switch, fiber setup) assembled into the runtime archive. For the
+     archive to go, so that every runtime byte comes from `nomu compile`, the asm moves into the runtime
+     module's object, for example as module-level inline asm through LLVM (the backend already emits the
+     stackmap keep directive that way). Needed only by 192, which waits for it.
+
   Items 2–4 likely need runtime-tier language surface (a function property, globals, FFI declarations),
-  which needs agreement before it is added. Item 5, and item 1 done call by call as intrinsics, are
+  which needs agreement before it is added. Items 5 and 6, and item 1 done call by call as intrinsics, are
   compiler-only.
 
 ## Refs

@@ -2,7 +2,7 @@
 
 **Avenue:** Infra · **Type/Lifecycle:** `infra · needs-design` (driver + build orchestration) · **Size:** L ·
 **Status:** done — D1–D9 decided (§Decisions); 190.1–190.6 done. 190.6's open items moved to their own
-homes: F1 → 195 (done), F2 → 203, F3/F5/F6/F16 → 172, F4 → 198, F12/F17 → 192, F20 → 202. ·
+homes: F1 → 195 (done), F2 → 203 (done), F3/F6 → 210, F5 → 206, F16 → 172, F4 → 198 (done), F12/F17 → 192, F20 → 202. ·
 **Source:** found closing [174](174-prelude-as-packages.md): the language workspace's `std` package compiled
 `std/prelude` twice per build.
 

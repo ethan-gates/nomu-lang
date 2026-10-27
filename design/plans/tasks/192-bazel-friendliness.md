@@ -8,6 +8,25 @@
 Nomu builds that Bazel can drive hermetically. Review where the driver reads and writes outside declared
 inputs and outputs, and settle how Bazel supplies them.
 
+## Direction
+
+Bazel drives `nomu compile` (one module per action, from its job file) and a `nomu link` command still to
+be built (the link, the settings object, the `__nomu_config` record, the GC frame index and the re-sign that
+`linkBinary` does inside `build`); it never runs `nomu build`. `nomu compile` does no caching: Bazel's action
+cache does that job, and 172's cache belongs to `build`, `run` and `test`. Bazel fixes its action graph at
+analysis time, so the module graph comes from the rules (BUILD targets per module), and `nomu` actions can
+only produce data other actions read.
+
+**This task waits until the runtime archive is gone.** Without it, Bazel would also need an action that
+builds the archive from C and assembly outside its own toolchain. The archive goes when the C floor is
+retired ([128](128-self-hosting-runtime.md) 128.5) and the asm floor (`rtasm_arm64.s`) comes out of the
+runtime module's own object, so every runtime byte is produced by a `nomu compile`. 192 therefore sits after
+LXR, with 128.5.
+
+**Configuration is open, and its design waits until this task starts.** Job files carry resolved settings,
+and resolving `cfg.yaml` happens in `build` ([198](198-build-configuration.md)). Under Bazel something else
+must produce each job's settings. The answer may reshape the configuration system, which is accepted.
+
 ## Work
 
 - **Per-host cache.** 190 D4 places the runtime archive and the language workspace in a user cache
@@ -57,5 +76,6 @@ inputs and outputs, and settle how Bazel supplies them.
 
 ## Dependencies & triggers
 
-- Follows 190 (jobs, D4 cache). Interacts with [172](172-incremental-build-cache.md), whose content keys
-  overlap Bazel's action cache.
+- Follows 190 (jobs, D4 cache). Waits on [128](128-self-hosting-runtime.md) 128.5 and the asm floor moving
+  into the runtime module's object (Direction). Interacts with [172](172-incremental-build-cache.md), whose
+  content keys overlap Bazel's action cache.
