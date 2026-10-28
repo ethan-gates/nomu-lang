@@ -40,7 +40,8 @@ public struct RuntimeArchiveJob: Equatable {
     public var archive: String { outputDir + "/nomu-runtime.a" }
 }
 
-// The final link: every object the plan builds, plus the runtime archive.
+// One root's link: the root's object first, then every object it depends on and the implicit roots' (the
+// `runtime` package and what it imports), plus the runtime archive.
 public struct LinkJob: Equatable {
     public let objects: [String]
     public let runtimeArchive: String
@@ -54,7 +55,8 @@ public struct Plan {
     public let modules: ModuleTable
     public let jobs: [ModuleJob]
     public let runtimeArchive: RuntimeArchiveJob?
-    public let link: LinkJob?
+    // One link per root, in the roots' order (a binary build); none for a library build.
+    public let links: [LinkJob]
     public let diagnostics: [PlanDiagnostic]
     public let timings: PlanTimings
     // The workspaces the plan spans: each one's root directory and pins (alias → identity). For rendering
@@ -85,18 +87,23 @@ extension Plan {
     // Plan a build entered at `entryFiles` (one module's files), reading from `disk`. A binary build includes
     // the language workspace.
     public init(entryFiles: [String], options: PlanOptions = PlanOptions(), disk: SourceTree = DiskTree()) {
-        let workspaces = WorkspaceSet(entry: entryFiles.first ?? ".", disk: disk,
+        self.init(roots: [entryFiles], options: options, disk: disk)
+    }
+
+    // Plan a build of several targets, each given as one module's files (task 211).
+    public init(roots: [[String]], options: PlanOptions = PlanOptions(), disk: SourceTree = DiskTree()) {
+        let workspaces = WorkspaceSet(entry: roots.first?.first ?? ".", disk: disk,
                                       includeLanguageWorkspace: options.product == .binary)
-        self.init(modules: ModuleTable(workspaces: workspaces, entryFiles: entryFiles, options: options),
+        self.init(modules: ModuleTable(workspaces: workspaces, roots: roots, options: options),
                   workspaces: workspaces, options: options)
     }
 
     public init(modules table: ModuleTable, workspaces: WorkspaceSet, options settings: PlanOptions = PlanOptions()) {
         let clock = workspaces.clock
-        let (jobs, archive, link, diagnostics) = clock.measure(.plan) {
+        let (jobs, archive, links, diagnostics) = clock.measure(.plan) {
             Self.build(table, workspaces, settings)
         }
-        self.init(modules: table, jobs: jobs, runtimeArchive: archive, link: link, diagnostics: diagnostics,
+        self.init(modules: table, jobs: jobs, runtimeArchive: archive, links: links, diagnostics: diagnostics,
                   timings: clock.timings,
                   workspaceRoots: workspaces.byIdentity.mapValues(\.root),
                   workspacePins: workspaces.byIdentity.mapValues(\.pins),
@@ -104,11 +111,21 @@ extension Plan {
     }
 
     static func build(_ table: ModuleTable, _ workspaces: WorkspaceSet, _ settings: PlanOptions)
-        -> ([ModuleJob], RuntimeArchiveJob?, LinkJob?, [PlanDiagnostic]) {
+        -> ([ModuleJob], RuntimeArchiveJob?, [LinkJob], [PlanDiagnostic]) {
         var diagnostics = table.diagnostics
         let order = Self.moduleOrder(table, &diagnostics)
         Self.checkPackageCycles(table, &diagnostics)
-        guard diagnostics.isEmpty else { return ([], nil, nil, diagnostics) }
+        // A binary root's object owns program-wide definitions, so no other module of the build may import it.
+        if settings.product == .binary {
+            for root in table.roots {
+                for (_, m) in table.modules.sorted(by: { $0.key.description < $1.key.description }) {
+                    guard let imp = m.imports.first(where: { $0.target == root }) else { continue }
+                    diagnostics.append(PlanDiagnostic(file: imp.file, line: imp.line, column: imp.column,
+                        "target '\(display(root, table))' is imported by '\(display(m.key, table))'; build them separately"))
+                }
+            }
+        }
+        guard diagnostics.isEmpty else { return ([], nil, [], diagnostics) }
 
         let root = workspaces.root
         let languageKey = HostCache.languageWorkspaceKey(compilerIdentity: settings.compilerIdentity,
@@ -145,7 +162,7 @@ extension Plan {
             jobs.append(ModuleJob(
                 module: key, files: m.files, dependencies: deps,
                 visibleDependencies: closure[key]!.sorted { position[$0]! < position[$1]! },
-                product: key == table.entry ? settings.product : .library,
+                product: table.roots.contains(key) ? settings.product : .library,
                 // A module is named by its last path component. Every module has one: packages, and so modules,
                 // live below their workspace's root (resolution rejects a module at the root).
                 outputDir: outputDir(key), stem: key.path.last!,
@@ -155,15 +172,21 @@ extension Plan {
         }
 
         var archive: RuntimeArchiveJob? = nil
-        var link: LinkJob? = nil
+        var links: [LinkJob] = []
         if settings.product == .binary {
             let archiveKey = HostCache.runtimeArchiveKey(recipe: settings.runtimeRecipe)
             let a = RuntimeArchiveJob(key: archiveKey, outputDir: build + "/_runtime")
-            let entry = jobs.last { $0.module == table.entry }!
             archive = a
-            link = LinkJob(objects: jobs.map(\.object), runtimeArchive: a.archive, output: entry.binary)
+            let jobByKey = Dictionary(uniqueKeysWithValues: jobs.map { ($0.module, $0) })
+            for root in table.roots {
+                var linked = closure[root]!.union([root])
+                for implicit in table.implicitRoots { linked.formUnion(closure[implicit]!.union([implicit])) }
+                let objects = [jobByKey[root]!.object]
+                    + jobs.filter { $0.module != root && linked.contains($0.module) }.map(\.object)
+                links.append(LinkJob(objects: objects, runtimeArchive: a.archive, output: jobByKey[root]!.binary))
+            }
         }
-        return (jobs, archive, link, [])
+        return (jobs, archive, links, [])
     }
 
     // Modules in dependency order (each after everything it imports), by a depth-first walk from the entry in
@@ -190,7 +213,7 @@ extension Plan {
             path.removeLast(); state[k] = true
             order.append(k)
         }
-        for root in t.implicitRoots + [t.entry] where state[root] == nil { visit(root) }
+        for root in t.implicitRoots + t.roots where state[root] == nil { visit(root) }
         return order
     }
 

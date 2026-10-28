@@ -67,9 +67,54 @@ final class PlanTests: XCTestCase {
         XCTAssertEqual(p.runtimeArchive?.outputDir, "/w/build/_runtime")
 
         // The link takes every object the plan builds, plus the runtime archive.
-        XCTAssertEqual(p.link?.objects, p.jobs.map(\.object))
-        XCTAssertEqual(p.link?.runtimeArchive, p.runtimeArchive?.archive)
-        XCTAssertEqual(p.link?.output, "/w/build/app/cli/cli")
+        XCTAssertEqual(p.links.count, 1)
+        XCTAssertEqual(p.links.first?.objects, [cli.object] + p.jobs.map(\.object).filter { $0 != cli.object })
+        XCTAssertEqual(p.links.first?.runtimeArchive, p.runtimeArchive?.archive)
+        XCTAssertEqual(p.links.first?.output, "/w/build/app/cli/cli")
+    }
+
+    private func plan(_ files: [String: String], roots: [[String]]) -> Plan {
+        var options = PlanOptions()
+        options.cacheRoot = "/cache"
+        options.compilerIdentity = "abc123"
+        return Plan(roots: roots, options: options, disk: MemoryTree(files))
+    }
+
+    // Two targets plan as one graph: a module they share is one job, and each target links its own binary from
+    // the modules it reaches (task 211).
+    func testSeveralRootsShareModules() {
+        var files = app
+        files["/w/app/tool/main.nomu"] = "import pkg/util\n"
+        let p = plan(files, roots: [["/w/app/cli/main.nomu"], ["/w/app/tool/main.nomu"]])
+        XCTAssertEqual(p.diagnostics, [])
+        XCTAssertEqual(p.modules.roots, [key(me, "app/cli"), key(me, "app/tool")])
+        XCTAssertEqual(p.jobs.filter { $0.module == key(me, "app/util") }.count, 1)
+        XCTAssertEqual(p.jobs.filter { $0.product == .binary }.map(\.module), [key(me, "app/cli"), key(me, "app/tool")])
+        XCTAssertEqual(p.links.map(\.output), ["/w/build/app/cli/cli", "/w/build/app/tool/tool"])
+        let byKey = Dictionary(uniqueKeysWithValues: p.jobs.map { ($0.module, $0) })
+        let tool = p.links[1].objects
+        XCTAssertEqual(tool.first, byKey[key(me, "app/tool")]!.object)
+        XCTAssertTrue(tool.contains(byKey[key(me, "app/util")]!.object))
+        XCTAssertTrue(tool.contains(byKey[key(nomu, "runtime")]!.object))
+        XCTAssertTrue(tool.contains(byKey[key(nomu, "std/prelude")]!.object))
+        XCTAssertFalse(tool.contains(byKey[key(WorkspaceIdentity(scope: "them", name: "prov"), "greet")]!.object))
+        XCTAssertFalse(tool.contains(byKey[key(me, "app/cli")]!.object))
+        // The same target twice is one root.
+        XCTAssertEqual(plan(files, roots: [["/w/app/tool/main.nomu"], ["/w/app/tool/main.nomu"]]).modules.roots,
+                       [key(me, "app/tool")])
+    }
+
+    // A binary target that another module of the build imports, and a target outside the build's workspace,
+    // are planning errors.
+    func testRootErrors() {
+        let imported = plan(app, roots: [["/w/app/cli/main.nomu"], ["/w/app/util/u.nomu"]])
+        XCTAssertEqual(imported.jobs, [])
+        XCTAssertTrue(imported.diagnostics.contains { $0.message == "target 'app/util' is imported by 'app/cli'; build them separately" },
+                      "\(imported.diagnostics)")
+        let outside = plan(app, roots: [["/w/app/cli/main.nomu"], ["/p/greet/g.nomu"]])
+        XCTAssertEqual(outside.jobs, [])
+        XCTAssertTrue(outside.diagnostics.contains { $0.message.hasPrefix("target '/p/greet' is outside workspace 'me.app'") },
+                      "\(outside.diagnostics)")
     }
 
     func testLibraryBuildHasNoLinkAndNoLanguageWorkspace() {
@@ -78,7 +123,7 @@ final class PlanTests: XCTestCase {
         XCTAssertEqual(p.diagnostics, [])
         XCTAssertEqual(p.jobs.map(\.module), [key(me, "lib")])
         XCTAssertEqual(p.jobs.first?.product, .library)
-        XCTAssertNil(p.link)
+        XCTAssertEqual(p.links, [])
         XCTAssertNil(p.runtimeArchive)
     }
 
@@ -169,7 +214,7 @@ final class PlanTests: XCTestCase {
                      entry: ["/w/app/main.nomu"])
         XCTAssertEqual(p.diagnostics.map(\.description), ["/w/app/b/b.nomu:2:1: error: module import cycle: app/a → app/b → app/a"])
         XCTAssertEqual(p.jobs, [])
-        XCTAssertNil(p.link)
+        XCTAssertEqual(p.links, [])
     }
 
     func testPackageCycle() {
@@ -197,6 +242,6 @@ final class PlanTests: XCTestCase {
         XCTAssertEqual(p.diagnostics, [])
         XCTAssertTrue(p.jobs.contains { $0.outputDir.contains("/build/_external/nomu.prov/") })
         XCTAssertEqual(p.jobs.last?.product, .binary)
-        XCTAssertEqual(p.link?.output.hasSuffix("/consumer/build/app/app"), true)
+        XCTAssertEqual(p.links.first?.output.hasSuffix("/consumer/build/app/app"), true)
     }
 }

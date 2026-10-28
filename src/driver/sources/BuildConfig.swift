@@ -26,6 +26,12 @@ struct ResolvedBuildConfiguration {
         build.configuration(for: places[key]!).canonicalValues(for: [.compile])
     }
 
+    // Where the binary's debug info lives (`link.debug_info_storage`), one value per build's binaries.
+    var debugInfoStorage: String {
+        guard case .choice(let c)? = build.buildWideSettings["link.debug_info_storage"] else { return "objects" }
+        return c
+    }
+
     // The values the runtime reads, as the settings object's globals (G14). Run settings are program settings,
     // so the build has one value for each.
     var runtimeGlobals: [(symbol: String, value: RuntimeGlobal)] {

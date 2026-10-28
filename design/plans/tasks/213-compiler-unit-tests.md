@@ -17,7 +17,8 @@ the kinds, what each kind is for, where a new test goes, and where two kinds cov
 - **Bazel golden tests:** the planner's plan goldens and cfgresolver's goldens, each rewritten through
   `NOMU_UPDATE_GOLDENS`.
 - **Bazel end-to-end tests:** `driver:build_tests` runs the fastbuild `nomu` on suite fixtures, each test
-  with an empty host cache. A cold build there takes 6.7 s, against 0.9 s for an opt `nomu`.
+  with an empty host cache. A cold build there takes 6.7 s, against 0.9 s for an opt `nomu`. The target
+  takes about 200 s with the 210–212 tests.
 - **The integration suite:** `compiler-test` over `tests/suite.json` (181 entries, fast and full tiers), built
   and run outside `bazel test`, compiling `tests/fixtures/` and `examples/` and running the binaries.
 - **Scripts:** `tools/escape-diff.sh`, `tools/perf-tier.py`, `src/bench`.

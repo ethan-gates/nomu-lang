@@ -1,14 +1,16 @@
-# Incremental build cache (content-addressed, module-granular)
+# Incremental build cache (content-addressed, module-granular compiles and cached links)
 
 **Avenue:** Infra · **Type/Lifecycle:** `perf · driver` · **Size:** M (the wiring; the parts are their own
-tasks) · **Status:** design settled; waits on [206](206-compiler-identity.md)–[212](212-build-cache-observability.md) ·
+tasks) · **Status:** design settled; waits on [207](207-build-determinism.md).6 and [214](214-link-caching.md)
+(206 and 208–212 done) ·
 **Source:** pulled out of [100](100-modules.md) §100.4.5 (driver incremental cache) + §100.4.6 (incremental /
 stability tests).
 
 ## What
 
-A persistent cache at **module granularity**: a build recompiles only the modules whose inputs changed and
-reuses the stored outputs (`.o`, `.nmi`, `.bir`) of every other. The output of an incremental build is
+A persistent cache over the whole build: compiles at **module granularity**, recompiling only the modules whose
+inputs changed and reusing the stored outputs (`.o`, `.nmi`, `.bir`) of every other, and links, reusing a stored
+binary whose link inputs are unchanged ([214](214-link-caching.md)). The output of an incremental build is
 bit-for-bit the output of a clean build.
 
 The parts are prerequisite tasks, each verified on its own; 172 itself connects them:
@@ -22,6 +24,7 @@ The parts are prerequisite tasks, each verified on its own; 172 itself connects 
 | [210](210-workspace-lock-and-layout.md) workspace lock and `build/` layout | one invocation per workspace (a second waits, naming the holder's pid), the binary as a real file in `build/` |
 | [211](211-multi-root-builds.md) several root modules per build | one plan over several targets, so shared modules compile once |
 | [212](212-build-cache-observability.md) build-cache observability | how many modules compiled and came from the cache, and why each recompiled, down to the dependency section (ABI, perf facts, `.bir`) and definition; the way soundness is checked |
+| [214](214-link-caching.md) link caching | a key per link over the objects, runtime archive, settings and recipe; a hit reuses the stored binary. Needs 207.6 (path-independent binaries) |
 
 **Boundary with [136](136-incremental-compilation.md) (Incremental compilation).** 172 is the **coarse,
 persistent, module-granular build cache**. 136 is the **fine-grained, in-process, query-based** incremental

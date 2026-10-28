@@ -19,6 +19,8 @@ let buildFlags: [Flag] = [
     Flag("emit-llvm", help: "also emit the entry module's LLVM IR from the egress, pre-opt (<name>.ll)"),
     Flag("allow-core-import", help: "let user code import the language workspace's `core` package (test suite only)",
          hidden: true),
+    Flag("explain", help: "say why each module compiled, compared with the last build, and record this build's "
+         + "inputs for the next"),
     Flag("emit-jobs", help: "write each module's job file beside its outputs", hidden: true),
     Flag("report-jobs", help: "print each job as `compiled <module>` or `cached <module>`, then `binary <path>`",
          hidden: true),
@@ -53,8 +55,8 @@ let tool = Command("nomu", summary: "The Nomu compiler and build driver.",
             passthrough: true),
         Command("test", summary: "build and run test modules",
             flags: buildFlags, options: buildOptionList,
-            positionals: [Positional("target", help: "module, or package dir for its declared tests (default: .)",
-                                     required: false)]),
+            positionals: [Positional("targets", help: "declared test modules, built as one plan (default: .)",
+                                     variadic: true, required: false)]),
         Command("query", summary: "print package metadata as JSON",
             positionals: [Positional("target", help: "module or package directory (default: .)",
                                      required: false)]),
@@ -115,29 +117,27 @@ func buildOptions(_ args: Parsed) -> EmitOptions {
     options.llvm = args.has("emit-llvm")
     options.allowCoreImport = args.has("allow-core-import")
     options.emitJobs = args.has("emit-jobs")
+    options.explain = args.has("explain")
     options.verifyCache = args.has("verify-cache")
     options.subsetFuncs.formUnion(args.values("runtime-subset"))
     if let s = args.value("stop") { options.stopAt = Stage(rawValue: s) ?? .binary }
     return options
 }
 
-// `nomu build [targets…]` — resolve each target directory to a module and build it (default: the current
-// directory). One module per target; `//path/...` expansion is the deferred label surface (173.5.2).
+// `nomu build [targets…]` — resolve each target directory to a module and build them all as one plan (task 211;
+// default: the current directory), so a module they share compiles once. One module per target; `//path/...`
+// expansion is the deferred label surface (173.5.2).
 func runBuild(_ args: Parsed) -> Bool {
-    let options = buildOptions(args)
     var targets = args.positionals("targets")
     if targets.isEmpty { targets = ["."] }
-    var ok = true
-    for target in targets {
-        let r = buildTargetResult(path: target, options: options, selection: ConfigSelection(args.values("config")))
-        if args.has("report-jobs") {
-            for m in r.compiled { print("compiled \(m)") }
-            for m in r.cached { print("cached \(m)") }
-            if let b = r.binary { print("binary \(b)") }
-        }
-        if r.binary == nil || !r.cacheMismatches.isEmpty { ok = false }
+    let r = buildTargetsResult(paths: targets, options: buildOptions(args), selection: ConfigSelection(args.values("config")))
+    if args.has("report-jobs") {
+        for m in r.compiled { print("compiled \(m)") }
+        for m in r.cached { print("cached \(m)") }
+        for (m, why) in r.reasons { print("reason \(m) \(why)") }
+        for b in r.binaries { print("binary \(b)") }
     }
-    return ok
+    return r.binary != nil && r.cacheMismatches.isEmpty
 }
 
 // `nomu run [target] [-- args]` — build the target module (default: the current directory) and exec it,
@@ -152,9 +152,10 @@ func runRun(_ args: Parsed) -> Int32 {
 // resolves the same way `build`/`run` resolve it (a container package root runs its declared `tests` set).
 // Each test module is a binary with white-box `test import` access; the case runner is task 161.
 func runTest(_ args: Parsed) -> Bool {
-    let target = args.positional("target") ?? "."
-    return testPackage(target: target, options: buildOptions(args),
-                       selection: ConfigSelection(args.values("config"), defaultConfig: "test"))
+    var targets = args.positionals("targets")
+    if targets.isEmpty { targets = ["."] }
+    return testPackages(targets: targets, options: buildOptions(args),
+                        selection: ConfigSelection(args.values("config"), defaultConfig: "test"))
 }
 
 // `nomu query [target]` — print the package metadata (modules, dep edges, externals) as JSON on stdout.

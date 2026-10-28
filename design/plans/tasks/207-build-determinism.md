@@ -1,7 +1,7 @@
 # Build determinism — identical inputs give byte-identical outputs
 
-**Avenue:** Infra · **Type/Lifecycle:** `driver · codegen · needs-audit` · **Size:** M–L · **Status:**
-needs-audit · **Source:** [172](172-incremental-build-cache.md) (Determinism). A prerequisite of 172's
+**Avenue:** Infra · **Type/Lifecycle:** `driver · codegen · done` · **Size:** M–L · **Status:**
+done · **Source:** [172](172-incremental-build-cache.md) (Determinism). A prerequisite of 172's
 early cutoff; shared with [156](156-differential-stage-diffing.md) and [192](192-bazel-friendliness.md).
 
 ## Why
@@ -33,13 +33,10 @@ correctness. Differential stage-diffing (156) and Bazel's caching (192) need the
     input outside the key.
   - Covers the language workspace's entries now and every module once 172.1 stores them.
 
-- **207.6** Binaries. A binary's debug map (`N_OSO`) names each object by absolute path, so binaries are
-  path-dependent, and a cached link must not be. The likely shape, as Bazel and Xcode split it: development
-  builds keep a debug map with relative object paths (every object a link reads under one root, `-oso_prefix`;
-  host-cache objects linked in under `build/`), and `release` writes a dSYM and drops the debug map. A
-  `dsymutil` per link costs O(all debug info), which is why development builds avoid it. Needs a setting
-  (along the lines of `link.debug_info: map | dsym`) and a hand check of how lldb resolves relative debug-map
-  paths. The determinism check then compares binaries too.
+- **207.6** Binaries; a prerequisite of [214](214-link-caching.md) (link caching), and so of 172. A binary's
+  debug map (`N_OSO`) named each object by absolute path, so binaries were path-dependent, and a cached link
+  must not be. The split follows Xcode and Bazel: development links keep a debug map, with relative paths;
+  `release` writes a dSYM, since `dsymutil` costs O(all debug info) per link.
 
 ## Progress
 
@@ -79,6 +76,16 @@ correctness. Differential stage-diffing (156) and Bazel's caching (192) need the
     lldb follows to the DWARF. Binaries are not cached; making them path-independent (`-oso_prefix`, or a
     dSYM) is Bazel's concern ([192](192-bazel-friendliness.md)).
   - Checked by hand: lldb, given the `.lldbinit`, lists source for a user module and a `std` module.
+
+- **207.6 done.** The setting `link.debug_info_storage: objects | dsym` (build target,
+  program granularity; `release` sets `dsym`). `objects`: the link passes `-oso_prefix <workspace root>/`, so the
+  debug map names `build/…` paths; every object a link reads is under `build/` since 209.4. `dsym`: after the
+  frame index, `dsymutil` writes `<binary>.dSYM` and `strip -S` removes the debug map, then the binary is signed;
+  the dSYM shares the binary's UUID and moves into place beside it, and a later `objects` build removes it.
+  Neither form holds an absolute path. The sweep now compares binaries and dSYMs (563 outputs identical across
+  two checkout and cache paths); `build_tests` (`testDebugInfoStorage`) checks both forms. Checked by hand: lldb
+  lists source through the relative debug map, from the workspace and from another directory, and through the
+  dSYM.
 
 ## Refs
 

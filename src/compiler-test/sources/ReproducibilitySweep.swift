@@ -5,8 +5,8 @@ import Foundation
 // sources with its own host cache, the second at other, longer paths, so one comparison covers both
 // non-determinism (unordered iteration, timestamps) and paths leaking into outputs. Compared: every file under
 // each workspace's `build/` and the host cache's action results and blobs (`ac/`, `cas/`): objects, `.nmi`,
-// `.bir`, the runtime archive. Left out: binaries and their `.lldbinit`, which hold this machine's paths
-// by design (207.6). Runs only when asked; it replaces the compile and run phases. `nomu build
+// `.bir`, the runtime archive, binaries and their dSYMs, the last-build record. Left out: the workspace lock (its
+// holder's pid) and each binary's `.lldbinit`, which maps to this machine's paths by design. Runs only when asked; it replaces the compile and run phases. `nomu build
 // --verify-cache` checks a build against the cache; this sweep covers every fixture and varies the paths.
 struct ReproducibilitySweep {
     let ctx: Ctx
@@ -80,21 +80,20 @@ struct ReproducibilitySweep {
     }
 
     // The files a round produced, by path relative to the round's root: `ws/…` under each `build/`, `cache/…`
-    // in the host cache's stores. Binaries and their `.lldbinit` are left out.
+    // in the host cache's stores. The workspace lock and `.lldbinit` files are left out.
     private func outputs(src: String, cache: String) -> [String: String] {
         let fm = FileManager.default
         var out: [String: String] = [:]
-        var lldbInits: [String] = []
         for case let rel as String in fm.enumerator(atPath: src)! {
             let parts = rel.split(separator: "/")
             guard let b = parts.firstIndex(of: "build"), b < parts.count - 1 else { continue }
             let path = src + "/" + rel
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else { continue }
-            if rel.hasSuffix(".lldbinit") { lldbInits.append(rel); continue }
+            if rel.hasSuffix(".lldbinit") { continue }   // maps recorded paths to this machine's
+            if rel.hasSuffix("/.nomu-lock") { continue }   // the workspace lock holds its holder's pid
             out["ws/" + rel] = path
         }
-        for rel in lldbInits { out["ws/" + String(rel.dropLast(".lldbinit".count))] = nil }
         for store in ["ac", "cas"] {
             guard let entries = fm.enumerator(atPath: cache + "/" + store) else { continue }
             for case let rel as String in entries {

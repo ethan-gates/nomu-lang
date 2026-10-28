@@ -21,6 +21,7 @@ public final class Timings {
     public var tokens = 0
     public var egress = "ssair"   // the backend egress (SSAIR tier — the sole path since M7.7)
     public var jobs: (compiled: Int, cached: Int)? = nil   // module jobs run, and taken from the host cache
+    public var compileSeconds = 0.0   // wall time spent in module compiles
 
     public init() { started = clock.now }
 
@@ -53,7 +54,10 @@ public final class Timings {
         out += "  package:   \(package)\n"
         out += "  egress:    \(egress)\n"
         out += "  optimize:  \(optimize ? "yes" : "no")\n"
-        if let j = jobs { out += "  jobs:      \(j.compiled) compiled, \(j.cached) from cache\n" }
+        if let j = jobs {
+            out += "  jobs:      \(j.compiled) compiled, \(j.cached) from cache"
+                + String(format: " (%.2f s compiling)\n", compileSeconds)
+        }
 
         // Group by phase in first-appearance order.
         var order: [String] = []

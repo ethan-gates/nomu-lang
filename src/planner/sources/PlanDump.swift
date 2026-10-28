@@ -27,7 +27,7 @@
 // A plan with errors lists them in place of jobs.
 extension Plan {
     public func dump() -> String {
-        var out = "plan for \(modules.entry)\n\nworkspaces\n"
+        var out = "plan for \(modules.roots.map(\.description).joined(separator: ", "))\n\nworkspaces\n"
         for id in workspaceRoots.keys.sorted() {
             let pins = (workspacePins[id] ?? [:]).sorted { $0.key < $1.key }.map { "\($0.key) → \($0.value)" }
             out += "  \(id)" + (pins.isEmpty ? "" : "  pins " + pins.joined(separator: ", ")) + "\n"
@@ -68,7 +68,7 @@ extension Plan {
             }
         }
         if let a = runtimeArchive { out += "\nruntime archive \(render(a.archive))\n" }
-        if let l = link { out += "link \(render(l.output)) from \(l.objects.count) objects\n" }
+        for l in links { out += "link \(render(l.output)) from \(l.objects.count) objects\n" }
         return out
     }
 

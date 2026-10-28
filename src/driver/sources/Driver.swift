@@ -25,9 +25,14 @@ import store
 // What a build did: the binary it produced (nil on failure), and which module jobs it compiled and which it
 // took from the host cache, in plan order (modules named `<scope>.<name>:<path>`).
 public struct BuildResult {
+    // The first target's binary (or output stem, for a stop before the link); nil on failure.
     public var binary: String? = nil
+    // Every target's binary, in the targets' order (task 211).
+    public var binaries: [String] = []
     public var compiled: [String] = []
     public var cached: [String] = []
+    // Each module this build compiled, with why, compared with the last build (212).
+    public var reasons: [(module: String, reason: String)] = []
     // Under `--verify-cache`: each module whose cache entry differs from its fresh compile, with the key's
     // inputs.
     public var cacheMismatches: [String] = []
@@ -41,8 +46,15 @@ public func buildProgram(paths: [String], options: EmitOptions = EmitOptions(),
 
 public func build(paths: [String], options: EmitOptions = EmitOptions(),
                   selection: ConfigSelection = ConfigSelection()) -> BuildResult {
+    build(targets: [paths], options: options, selection: selection)
+}
+
+// Build several targets, each given as one module's files, as one plan (task 211): a module they share compiles
+// once, and each target links its own binary.
+public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
+                  selection: ConfigSelection = ConfigSelection()) -> BuildResult {
     var result = BuildResult()
-    guard let primary = paths.first else {
+    guard let primary = targets.first(where: { !$0.isEmpty })?.first else {
         fputs("error: no source files given\n", stderr)
         return result
     }
@@ -56,7 +68,7 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
     // The configuration resolves once, between reading the module table and planning: the language
     // workspace's settings enter its host-cache key, which places its outputs.
     let workspaces = WorkspaceSet(entry: primary, disk: DiskTree(), includeLanguageWorkspace: planOptions.product == .binary)
-    let moduleTable = ModuleTable(workspaces: workspaces, entryFiles: paths, options: planOptions)
+    let moduleTable = ModuleTable(workspaces: workspaces, roots: targets, options: planOptions)
     var configuration: ResolvedBuildConfiguration? = nil
     if moduleTable.diagnostics.isEmpty {
         switch timings.measure("plan", "configuration", { resolveConfiguration(moduleTable, workspaces, selection) }) {
@@ -85,7 +97,8 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
         return result
     }
     let table = plan.modules
-    guard let entryJob = plan.jobs.first(where: { $0.module == table.entry }) else { return result }
+    let rootJobs = table.roots.compactMap { root in plan.jobs.first { $0.module == root } }
+    guard rootJobs.count == table.roots.count else { return result }
     timings.package = table.modules[table.entry]?.package.name ?? ""
     timings.file = plan.jobs.count == 1 ? primary : "\(plan.jobs.count) modules"
 
@@ -93,26 +106,29 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
     guard let lock = WorkspaceLock.acquire(workspaceRoot: workspaces.root.root) else { return result }
     defer { withExtendedLifetime(lock) {} }
 
-    let stem = entryJob.binary
     let buildRoot = workspaces.root.root + "/build"
     func makeDirectory(_ dir: String) -> Bool { Layout.makeDirectory(dir, buildRoot: buildRoot) }
-    guard makeDirectory((stem as NSString).deletingLastPathComponent) else { return result }
+    for r in rootJobs { guard makeDirectory(r.outputDir) else { return result } }
 
-    // AST debug view of the entry module: --emit-ast writes it; --stop=ast writes it and halts.
+    // AST debug view of each target: --emit-ast writes it; --stop=ast writes it and halts.
     if options.ast || options.stopAt == .ast {
-        let diags = DiagnosticSink()
-        var decls: [TopDecl] = [], imports: [ImportDecl] = []
-        for f in entryJob.files {
-            guard let text = try? String(contentsOfFile: f, encoding: .utf8) else { continue }
-            var lexer = Lexer(text, file: f, diagnostics: diags)
-            var parser = Parser(lexer.tokenize(), diagnostics: diags)
-            let prog = parser.parse()
-            decls += prog.decls; imports += prog.imports
+        var failed = false
+        for r in rootJobs {
+            let diags = DiagnosticSink()
+            var decls: [TopDecl] = [], imports: [ImportDecl] = []
+            for f in r.files {
+                guard let text = try? String(contentsOfFile: f, encoding: .utf8) else { continue }
+                var lexer = Lexer(text, file: f, diagnostics: diags)
+                var parser = Parser(lexer.tokenize(), diagnostics: diags)
+                let prog = parser.parse()
+                decls += prog.decls; imports += prog.imports
+            }
+            writeArtifact(dumpAST(Program(decls: decls, imports: imports)), toFile: r.binary + ".ast")
+            if options.stopAt == .ast, !diags.isEmpty { fputs(diags.render() + "\n", stderr) }
+            failed = failed || diags.hasErrors
         }
-        writeArtifact(dumpAST(Program(decls: decls, imports: imports)), toFile: stem + ".ast")
         if options.stopAt == .ast {
-            if !diags.isEmpty { fputs(diags.render() + "\n", stderr) }
-            if !diags.hasErrors { result.binary = stem }
+            if !failed { result.binary = rootJobs[0].binary }
             return result
         }
     }
@@ -135,11 +151,14 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
         ? timings.measure("plan", "source copy") { LanguageSourceCopy.ensure(cacheRoot: plan.cacheRoot) } : nil
     let store = HostCache.store(cacheRoot: plan.cacheRoot)
     let verification = options.verifyCache ? CacheVerification() : nil
-    let keyer = plan.jobs.contains(where: \.inHostCache) ? JobKeyer() : nil
+    let keyer = JobKeyer()
+    // The last-build record (212): every job's key, and under `--explain` its inputs, for the next build's reasons.
+    var record = BuildRecord.load(buildRoot: buildRoot)
+    defer { record.save(buildRoot: buildRoot) }
     var objects: [String] = []
     for j in plan.jobs {
         let m = table.modules[j.module]!
-        let isEntry = j.module == table.entry
+        let isRoot = table.roots.contains(j.module)
         var imports: [String: [CompileJob.Import]] = [:]
         for imp in m.imports {
             let root: ImportRoot
@@ -153,7 +172,7 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
             return CompileJob.Dependency(origin: origin(d), interface: dj.interface, bir: dj.bir, packageKey: packageKey(d))
         }
         let outputs = CompileJob.Outputs(object: j.object, interface: j.interface, bir: j.bir,
-                                         debugStem: isEntry ? stem : nil)
+                                         debugStem: isRoot ? j.binary : nil)
         var job = CompileJob(origin: origin(j.module), files: j.files, packageName: m.package.name,
                              packageKey: packageKey(j.module), isProduct: m.isProduct, imports: imports,
                              dependencies: dependencies, product: j.product == .binary ? .binary : .library,
@@ -169,6 +188,12 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
         var jobOptions = EmitOptions()
         if j.module.workspace == table.entry.workspace { jobOptions = options }
         jobOptions.compilingPrelude = j.inHostCache
+
+        // The job's key, over everything it reads (208), and under `--explain` what its dependency inputs hold.
+        let jobKey = keyer.key(job, options: jobOptions)
+        let details = options.explain ? keyer.details(job) : nil
+        let previous = record.modules[j.module.description]
+        record.update(j.module.description, key: jobKey, details: details, explain: options.explain)
 
         // The files a job writes, by name within its output directory.
         let outputNames = j.product == .library ? [j.stem + ".o", j.stem + ".nmi", j.stem + ".bir"] : [j.stem + ".o"]
@@ -203,19 +228,22 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
                                                   interface: scratch + "/" + j.stem + ".nmi",
                                                   bir: scratch + "/" + j.stem + ".bir", debugStem: outputs.debugStem)
         }
+        let compileStart = Date()
         guard compile(compiled, options: jobOptions, timings: timings) else {
             timings.report(); return result
         }
+        timings.compileSeconds += Date().timeIntervalSince(compileStart)
+        result.reasons.append((j.module.description, CompileReason.of(previous: previous, key: jobKey, details: details,
+                                                                      cachable: j.hostCacheKey != nil)))
         if let key = j.hostCacheKey, let scratch {
             let published: ActionResult
             if let verification, let cached = store.lookup(key) {
                 // `--verify-cache`: the entry already at this key must hold what this compile produced.
                 verification.compare(module: j.module.description, fresh: scratch, names: outputNames,
-                                     cached: cached, store: store, inputs: keyer!.key(job, options: jobOptions).inputs)
+                                     cached: cached, store: store, inputs: jobKey.inputs)
                 published = cached
             } else {
                 // The entry records the job's key; its named inputs are computed when asked for (`--verify-cache`).
-                let jobKey = keyer!.key(job, options: jobOptions)
                 do { published = try store.publish(key, outputsIn: scratch, files: outputNames, inputs: ["key": jobKey.key]) } catch {
                     fputs("error: \(error)\n", stderr)
                     timings.report(); return result
@@ -230,32 +258,43 @@ public func build(paths: [String], options: EmitOptions = EmitOptions(),
         result.compiled.append(j.module.description)
     }
     timings.jobs = (compiled: result.compiled.count, cached: result.cached.count)
+    if options.explain && !result.reasons.isEmpty {
+        let width = result.reasons.map(\.module.count).max()!
+        var out = "nomu: why each module compiled\n"
+        for (module, reason) in result.reasons {
+            out += "  " + module.padding(toLength: width, withPad: " ", startingAt: 0) + "  " + reason + "\n"
+        }
+        fputs(out, stderr)
+    }
     result.cacheMismatches = verification?.failures ?? []
     // A cache entry that differs from its key's fresh compile fails the build before the link.
     if !result.cacheMismatches.isEmpty { timings.report(); return result }
 
-    // A binary links every object the plan built with the runtime archive. A debug stop or a terminal
+    // Each target links its binary from its objects and the runtime archive. A debug stop or a terminal
     // `--emit-nmi` ends the build before the link.
-    if let link = plan.link, let archive = plan.runtimeArchive, !options.nmi, options.stopAt == .binary {
-        // The entry object links first: it owns the program-wide definitions (GC type and root maps), which
-        // must win over any weak copy in a library object.
-        let objectsInOrder = [entryJob.object] + link.objects.filter { $0 != entryJob.object }
+    if let archive = plan.runtimeArchive, !options.nmi, options.stopAt == .binary {
         guard let configuration else { preconditionFailure("a planned build has a configuration") }
-        guard linkBinary(objects: objectsInOrder, output: stem, runtimeArchive: archive, cacheRoot: plan.cacheRoot,
-                         runtimeGlobals: configuration.runtimeGlobals, record: configuration.summary,
-                         timings: timings) else {
-            timings.report(); return result
-        }
-        // The debugger's map from recorded source paths to this machine's (`DebugPaths`). Best-effort.
-        var roots: [(WorkspaceIdentity, String)] = []
+        // The debugger's map from recorded source paths to this machine's (`DebugPaths`), beside each binary.
+        var sourceRoots: [(WorkspaceIdentity, String)] = []
         for (workspace, root) in plan.workspaceRoots {
-            if workspace == LanguageWorkspace.identity { if let sourceCopy { roots.append((workspace, sourceCopy)) } }
-            else { roots.append((workspace, root)) }
+            if workspace == LanguageWorkspace.identity { if let sourceCopy { sourceRoots.append((workspace, sourceCopy)) } }
+            else { sourceRoots.append((workspace, root)) }
         }
-        try? DebugPaths.lldbInit(roots).write(toFile: stem + ".lldbinit", atomically: true, encoding: .utf8)
+        for link in plan.links {
+            // The target's object links first (`LinkJob`): it owns the program-wide definitions (GC type and root
+            // maps), which must win over any weak copy in a library object.
+            guard linkBinary(objects: link.objects, output: link.output, runtimeArchive: archive,
+                             cacheRoot: plan.cacheRoot, runtimeGlobals: configuration.runtimeGlobals,
+                             record: configuration.summary, workspaceRoot: workspaces.root.root,
+                             debugInfoStorage: configuration.debugInfoStorage, timings: timings) else {
+                timings.report(); return result
+            }
+            try? DebugPaths.lldbInit(sourceRoots).write(toFile: link.output + ".lldbinit", atomically: true, encoding: .utf8)
+        }
     }
     timings.report()
-    result.binary = stem
+    result.binaries = rootJobs.map(\.binary)
+    result.binary = result.binaries.first
     return result
 }
 
@@ -332,6 +371,18 @@ public func buildTargetResult(path rawPath: String, options: EmitOptions = EmitO
     return build(paths: scanModuleFiles(m.dir), options: options, selection: selection)
 }
 
+// Build several target paths as one plan (task 211): each resolves to a module as `buildTarget`'s does. An
+// unresolvable path fails the build before anything is planned.
+public func buildTargetsResult(paths: [String], options: EmitOptions = EmitOptions(),
+                               selection: ConfigSelection = ConfigSelection()) -> BuildResult {
+    var targets: [[String]] = []
+    for path in paths {
+        guard let m = resolveModule(path: path) else { return BuildResult() }
+        targets.append(scanModuleFiles(m.dir))
+    }
+    return build(targets: targets, options: options, selection: selection)
+}
+
 // Build an already-resolved module and return its binary path. The binary is named after the module and
 // placed in its own unit directory under the workspace `build/` (D2), unless an explicit `-o` names it.
 public func buildResolved(_ m: ResolvedModule, options: EmitOptions = EmitOptions(),
@@ -367,39 +418,52 @@ public func runTarget(path: String, args: [String], options: EmitOptions = EmitO
 @discardableResult
 public func testPackage(target rawPath: String, options: EmitOptions = EmitOptions(),
                         selection: ConfigSelection = ConfigSelection(defaultConfig: "test")) -> Bool {
-    guard let m = resolveModule(path: rawPath) else { return false }
+    testPackages(targets: [rawPath], options: options, selection: selection)
+}
 
-    // Role predicate: a test module is one declared in the package manifest's `tests` (modules.md §Tests —
-    // test identity is module-level and manifest-declared).
-    let manifest: Manifest?
-    do { manifest = try loadManifest(packageRoot: m.packageRoot) }
-    catch { fputs("error: \(error)\n", stderr); return false }
-    let declared = (manifest?.tests ?? []).map { testModuleID($0.module) }
-    guard declared.contains(m.id) else {
-        let name = m.id.components.isEmpty ? "(root)" : m.id.pathString
-        fputs("error: '\(name)' is not a declared test module — list it under 'tests' in "
-            + "'\(m.packageRoot)/pkg.json'\n", stderr)
-        return false
+// Several test targets: each is checked to be a declared test module, all build as one plan (task 211), and
+// each binary runs in turn. True when every one builds and passes.
+@discardableResult
+public func testPackages(targets rawPaths: [String], options: EmitOptions = EmitOptions(),
+                         selection: ConfigSelection = ConfigSelection(defaultConfig: "test")) -> Bool {
+    var modules: [ResolvedModule] = []
+    for rawPath in rawPaths {
+        guard let m = resolveModule(path: rawPath) else { return false }
+        // Role predicate: a test module is one declared in the package manifest's `tests` (modules.md §Tests —
+        // test identity is module-level and manifest-declared).
+        let manifest: Manifest?
+        do { manifest = try loadManifest(packageRoot: m.packageRoot) }
+        catch { fputs("error: \(error)\n", stderr); return false }
+        let declared = (manifest?.tests ?? []).map { testModuleID($0.module) }
+        guard declared.contains(m.id) else {
+            let name = m.id.components.isEmpty ? "(root)" : m.id.pathString
+            fputs("error: '\(name)' is not a declared test module — list it under 'tests' in "
+                + "'\(m.packageRoot)/pkg.json'\n", stderr)
+            return false
+        }
+        modules.append(m)
     }
+    func label(_ m: ResolvedModule) -> String { m.id.components.isEmpty ? "(root)" : m.id.pathString }
 
-    let label = m.id.components.isEmpty ? "(root)" : m.id.pathString
-    guard let binary = buildResolved(m, options: options, selection: selection) else {
-        fputs("FAIL  \(label) — build failed\n", stderr)
+    let built = build(targets: modules.map { scanModuleFiles($0.dir) }, options: options, selection: selection)
+    guard built.binary != nil, built.binaries.count == modules.count else {
+        for m in modules { fputs("FAIL  \(label(m)) — build failed\n", stderr) }
         return false
     }
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: binary)
-    do { try proc.run() } catch {
-        fputs("FAIL  \(label) — cannot run '\(binary)': \(error)\n", stderr)
-        return false
+    var passed = true
+    for (m, binary) in zip(modules, built.binaries) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: binary)
+        do { try proc.run() } catch {
+            fputs("FAIL  \(label(m)) — cannot run '\(binary)': \(error)\n", stderr)
+            passed = false
+            continue
+        }
+        proc.waitUntilExit()
+        if proc.terminationStatus == 0 { fputs("ok    \(label(m))\n", stderr) }
+        else { fputs("FAIL  \(label(m)) — exit \(proc.terminationStatus)\n", stderr); passed = false }
     }
-    proc.waitUntilExit()
-    if proc.terminationStatus == 0 {
-        fputs("ok    \(label)\n", stderr)
-        return true
-    }
-    fputs("FAIL  \(label) — exit \(proc.terminationStatus)\n", stderr)
-    return false
+    return passed
 }
 
 // The module identity named by a manifest `tests`/`bin` entry: a package-root-relative, `/`-separated path,
@@ -745,8 +809,12 @@ func shippedTemplates(_ module: NOIRModule, ownNames: Set<String>) -> [NOIRDecl]
 // The settings object holds `runtimeGlobals`, the values the runtime reads (G14 of the build-configuration
 // design); `record`, the configuration's short form, goes in the `__TEXT,__nomu_config` section (G13).
 // Returns false on failure (message on stderr).
+// Debug info stays path-independent either way (207.6): under `objects` the debug map names each object relative
+// to `workspaceRoot` (`-oso_prefix`), and under `dsym` it is gathered into `<binary>.dSYM` and the debug map
+// stripped, so the binary names no object.
 func linkBinary(objects: [String], output binPath: String, runtimeArchive: RuntimeArchiveJob, cacheRoot: String,
-                runtimeGlobals: [(symbol: String, value: RuntimeGlobal)], record: String, timings: Timings) -> Bool {
+                runtimeGlobals: [(symbol: String, value: RuntimeGlobal)], record: String, workspaceRoot: String,
+                debugInfoStorage: String, timings: Timings) -> Bool {
     let archive = timings.measure("runtime", "archive") {
         cachedRuntimeArchive(runtimeArchive, store: HostCache.store(cacheRoot: cacheRoot))
     }
@@ -775,7 +843,8 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Runti
         fputs("error: cannot write '\(recordFile)'\n", stderr)
         return false
     }
-    var linkArgs = ["-o", staging, "-Wl,-dead_strip", "-Wl,-x"] + objects + [settingsObject, archive]
+    var linkArgs = ["-o", staging, "-Wl,-dead_strip", "-Wl,-x", "-Wl,-oso_prefix," + workspaceRoot + "/"]
+        + objects + [settingsObject, archive]
     linkArgs.append("-Wl,-sectcreate,__TEXT,__nomu_config,\(recordFile)")
     // The GC frame index (FrameIndex.swift): the link reserves its section and writes a link map; afterwards
     // the index is written into the binary and its signature's page hashes are redone (CodeSignature.swift).
@@ -806,6 +875,19 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Runti
         fputs("error: frame index: \(error)\n", stderr)
         return false
     }
+    // `dsym`: gather the debug info into a dSYM beside the binary, then strip the debug map, before signing.
+    let dsym = binPath + ".dSYM", stagedDsym = staging + ".dSYM"
+    if debugInfoStorage == "dsym" {
+        let gathered = timings.measure("link", "dsymutil") { runProcess("/usr/bin/dsymutil", [staging, "-o", stagedDsym]) }
+        guard gathered == 0 else {
+            fputs("error: dsymutil failed for '\(binPath)'\n", stderr)
+            return false
+        }
+        guard timings.measure("link", "strip", { runProcess("/usr/bin/strip", ["-S", staging]) }) == 0 else {
+            fputs("error: strip failed for '\(binPath)'\n", stderr)
+            return false
+        }
+    }
     let resigned = timings.measure("link", "sign") { Result { try CodeSignature.resign(binary: staging) } }
     switch resigned {
     case .failure(let error):
@@ -825,6 +907,12 @@ func linkBinary(objects: [String], output binPath: String, runtimeArchive: Runti
         }
     }
     Layout.clearDirectory(at: binPath)
+    // A dSYM from an earlier build would describe another binary; the new one, if any, replaces it.
+    try? FileManager.default.removeItem(atPath: dsym)
+    if debugInfoStorage == "dsym", rename(stagedDsym, dsym) != 0 {
+        fputs("error: cannot move the dSYM to '\(dsym)': \(String(cString: strerror(errno)))\n", stderr)
+        return false
+    }
     guard rename(staging, binPath) == 0 else {
         fputs("error: cannot move the linked binary to '\(binPath)': \(String(cString: strerror(errno)))\n", stderr)
         return false

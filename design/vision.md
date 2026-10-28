@@ -78,6 +78,16 @@ Colorless stackful concurrency and GC reference types both require the runtime, 
 
 You write the program you mean and the types catch mistakes; you never think about memory and it's still fast; you reach for concurrency without dread; you read others' code and understand it; you ship a binary and it runs. **Legibility is the north star** — when two designs are equally correct, the clearer one wins.
 
+## Audience: human developers and AIs
+
+Nomu is designed for human developers and for AIs. Both write and read Nomu code, and the language surface serves both: legibility stays the north star. Many uses around the code will be AI-only: debugging, diagnosing builds, checking caches and reproducibility, investigating performance. A tool or report built for one of those uses is designed for the AI first:
+
+- **Machine-readable first.** The primary form is structured: stable line formats and JSON, complete enough to act on. Human layout (aligned columns, prose summaries) is an optional presentation of the same facts.
+- **Batch and scriptable.** Every tool runs non-interactively, takes its inputs on the command line or from files, ends with a meaningful exit status, and works inside an agent's sandbox. A debugger session is a batch of commands with captured output.
+- **Complete over terse.** A report names every relevant fact (each input a cache key covers, each definition that changed), since an AI reads a long report as readily as a short one.
+
+When a capability serves people and AIs alike, it serves both forms; when only AIs will use it, the AI's form is enough.
+
 ## Design principles
 
 Two principles generate downstream decisions; when a future feature is unclear, resolve it against these.
@@ -107,5 +117,6 @@ Three rules:
 1. **Keep the surface legible.**
 2. **Never tax the common case with annotations — pay only where it's hard.**
 3. **Bias toward ease; add static enforcement only when it doesn't reintroduce Rust-grade friction.**
+4. **Design AI-only tools for the AI** (Audience, above).
 
 And the working discipline: **build the part you doubt first; prototype the belief, not the surface.** The belief to prototype now is the concurrency-safety model and the front-end feel — memory is a solved, borrowed component.

@@ -56,6 +56,9 @@ public struct EmitOptions: Codable {
     // `--verify-cache`: compile every job, taking nothing from the host cache, and fail when an entry
     // already at a job's key differs from its compile (`CacheVerification`).
     public var verifyCache = false
+    // `--explain`: say why each module compiled, compared with the workspace's last build, and record this
+    // build's key inputs for the next one (`BuildRecord`).
+    public var explain = false
 
     public init() {}
 }

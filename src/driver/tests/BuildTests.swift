@@ -16,6 +16,7 @@ final class BuildTests: XCTestCase {
         var binary: String? = nil
         var compiled: [String] = []
         var cached: [String] = []
+        var reasons: [String: String] = [:]   // module → why it compiled (`--report-jobs` `reason` lines)
     }
 
     override func setUpWithError() throws {
@@ -47,6 +48,9 @@ final class BuildTests: XCTestCase {
             case "compiled": r.compiled.append(parts[1])
             case "cached": r.cached.append(parts[1])
             case "binary": r.binary = parts[1]
+            case "reason":
+                let rest = parts[1].split(separator: " ", maxSplits: 1).map(String.init)
+                if rest.count == 2 { r.reasons[rest[0]] = rest[1] }
             default: break
             }
         }
@@ -196,6 +200,112 @@ final class BuildTests: XCTestCase {
         XCTAssertEqual(second.status, 0, second.stderr)
         XCTAssertTrue(second.stderr.contains("nomu: removed '\(binary)', a directory left by an earlier build"), second.stderr)
         XCTAssertEqual(try output(of: binary), "23\n")
+    }
+
+    // Several targets build as one plan (task 211): a module they share compiles once, each target gets its binary,
+    // and each binary is byte-identical to its single-target build.
+    func testSeveralTargetsBuildAsOnePlan() throws {
+        let a = "tests/fixtures/module_link_diamond", b = "tests/fixtures/std_module_import"
+        let singleA = try XCTUnwrap(try build(a).binary)
+        let bytesA = try Data(contentsOf: URL(fileURLWithPath: singleA))
+        let singleB = try XCTUnwrap(try build(b).binary)
+        let bytesB = try Data(contentsOf: URL(fileURLWithPath: singleB))
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: nomu)
+        p.arguments = ["build", "--report-jobs", repo + "/" + a, repo + "/" + b]
+        p.environment = ProcessInfo.processInfo.environment.merging(["NOMU_CACHE_DIR": cache]) { $1 }
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        try p.run()
+        let lines = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).split(separator: "\n")
+        p.waitUntilExit()
+        XCTAssertEqual(p.terminationStatus, 0)
+        let jobs = lines.filter { $0.hasPrefix("compiled ") || $0.hasPrefix("cached ") }.map { $0.split(separator: " ")[1] }
+        XCTAssertEqual(jobs.count, Set(jobs).count, "a module built twice: \(jobs)")
+        XCTAssertEqual(lines.filter { $0.hasPrefix("binary ") }, ["binary " + singleA, "binary " + singleB])
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: singleA)), bytesA)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: singleB)), bytesB)
+        XCTAssertEqual(try output(of: singleA), "23\n")
+    }
+
+    // A planning error in one target stops the whole build before any module compiles.
+    func testPlanningErrorInOneTargetStopsTheBuild() throws {
+        let ws = "tests/fixtures/multipackage_undeclared"
+        let r = try build(ws + "/app", [repo + "/" + ws + "/greet"])
+        XCTAssertNil(r.binary)
+        XCTAssertEqual(r.compiled, [])
+        XCTAssertEqual(r.cached, [])
+    }
+
+    // `--explain` says why each module compiled, compared with the last build (task 212): a first build has no
+    // record; a body edit that leaves the interface byte-identical names the source and nothing above it; one
+    // that changes a function's escape facts names them in every consumer; a setting change names the setting;
+    // a build without `--explain` records no inputs, so the next explains only that the key changed.
+    func testExplainSaysWhyEachModuleCompiled() throws {
+        let fixture = "tests/fixtures/module_link_diamond"
+        let source = repo + "/" + fixture + "/data/lib.nomu"
+        let data = "nomu.nomu_lang:" + fixture + "/data", left = "nomu.nomu_lang:" + fixture + "/left"
+        func lib(passBody: String, base: String) -> String {
+            "package class Box {\n    var v: Int\n}\n\npackage fun pass(b: Box) -> Box {\n    return \(passBody)\n}\n\n"
+                + "package fun dataBase() -> Int {\n    return pass(Box(v: \(base))).v\n}\n"
+        }
+        try write(source, lib(passBody: "b", base: "10"))
+        let first = try build(fixture, ["--explain"])
+        XCTAssertNotNil(first.binary)
+        XCTAssertEqual(first.reasons[data], "no previous build recorded")
+
+        try write(source, lib(passBody: "b", base: "11"))
+        let body = try build(fixture, ["--explain"])
+        XCTAssertEqual(body.reasons[data], "source changed: \(fixture)/data/lib.nomu")
+        XCTAssertEqual(body.reasons[left], "unchanged; not cached yet")
+        XCTAssertEqual(try output(of: XCTUnwrap(body.binary)), "25\n")
+
+        try write(source, lib(passBody: "Box(v: b.v)", base: "11"))
+        let perf = try build(fixture, ["--explain"])
+        XCTAssertEqual(perf.reasons[left], "dependency \(data): perf facts changed (escape summary of pass)")
+
+        let release = try build(fixture, ["--explain", "-c", "release"])
+        XCTAssertEqual(release.reasons[left], "setting opt.level: none → o2; setting opt.mono: none → all")
+
+        try write(source, lib(passBody: "Box(v: b.v)", base: "12"))
+        XCTAssertNotNil(try build(fixture, ["-c", "release"]).binary)
+        try write(source, lib(passBody: "Box(v: b.v)", base: "13"))
+        let unrecorded = try build(fixture, ["--explain", "-c", "release"])
+        XCTAssertEqual(unrecorded.reasons[data],
+                       "key changed (the last build did not record its inputs; build with --explain to record them)")
+    }
+
+    // `link.debug_info_storage` (207.6): under `objects` (debug) the debug map names each object relative to the
+    // workspace; under `dsym` (release) the debug info is in `<binary>.dSYM`, sharing the binary's UUID, and the
+    // binary names no object. Neither holds an absolute path.
+    func testDebugInfoStorage() throws {
+        func uuid(_ path: String) throws -> String {
+            let out = try run("/usr/bin/dwarfdump", ["--uuid", path]).stdout
+            return String(try XCTUnwrap(out.split(separator: " ").dropFirst().first))
+        }
+        let fixture = "tests/fixtures/module_link_diamond"
+        let debug = try XCTUnwrap(try build(fixture).binary)
+        let map = try run("/usr/bin/nm", ["-pa", debug]).stdout.split(separator: "\n").filter { $0.contains(" OSO ") }
+        XCTAssertFalse(map.isEmpty)
+        for line in map { XCTAssertTrue(line.contains(" OSO build/"), String(line)) }
+        XCTAssertNil(try Data(contentsOf: URL(fileURLWithPath: debug)).range(of: Data(repo.utf8)))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: debug + ".dSYM"))
+
+        let release = try XCTUnwrap(try build(fixture, ["-c", "release"]).binary)
+        XCTAssertEqual(release, debug)
+        let dsym = release + ".dSYM"
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dsym))
+        XCTAssertEqual(try uuid(release), try uuid(dsym))
+        XCTAssertFalse(try run("/usr/bin/nm", ["-pa", release]).stdout.contains(" OSO "))
+        XCTAssertNil(try Data(contentsOf: URL(fileURLWithPath: release)).range(of: Data(repo.utf8)))
+        XCTAssertEqual(try run("/usr/bin/codesign", ["-v", "--strict", release]).status, 0)
+        XCTAssertEqual(try output(of: release), "23\n")
+
+        // Back to `objects`: the dSYM, which no longer describes the binary, is removed.
+        XCTAssertNotNil(try build(fixture).binary)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dsym))
     }
 
     // A planning error stops the build before any job: nothing compiles and nothing is written.

@@ -50,11 +50,15 @@ public struct PlannedModule {
     public internal(set) var imports: [ResolvedImport] = []
 }
 
-// Every module the build reaches from its entry, with each import resolved and checked. Resolution follows
-// imports breadth-first from the entry module across every workspace in `workspaces`; each module's files are
-// scanned once. All errors are collected in `diagnostics` (the workspace set's own come first).
+// Every module the build reaches from its roots, with each import resolved and checked. Resolution follows
+// imports breadth-first from the root modules (the build's targets, task 211) across every workspace in
+// `workspaces`; each module's files are scanned once. All errors are collected in `diagnostics` (the workspace
+// set's own come first).
 public struct ModuleTable {
-    public let entry: ModuleKey
+    // The build's targets, in the order given. They share the build's workspace.
+    public let roots: [ModuleKey]
+    // The first root; its workspace is the build's entry workspace.
+    public var entry: ModuleKey { roots[0] }
     // Modules the build needs without any import naming them: the language workspace's `runtime` package,
     // whose functions `std` and generated code call by their bare names. Planned before the entry.
     public private(set) var implicitRoots: [ModuleKey] = []
@@ -66,13 +70,18 @@ public struct ModuleTable {
     public private(set) var diagnostics: [PlanDiagnostic] = []
 
     public init(workspaces: WorkspaceSet, entryFiles: [String], options: PlanOptions = PlanOptions()) {
+        self.init(workspaces: workspaces, roots: [entryFiles], options: options)
+    }
+
+    // A table over several roots, each given as one module's files.
+    public init(workspaces: WorkspaceSet, roots rootFiles: [[String]], options: PlanOptions = PlanOptions()) {
         guard !workspaces.missingWorkspace else {
-            entry = ModuleKey(workspaces.root.identity, [])
+            roots = [ModuleKey(workspaces.root.identity, [])]
             diagnostics = workspaces.diagnostics
             return
         }
         var r = Resolver(workspaces: workspaces, options: options)
-        entry = workspaces.clock.measure(.resolve) { r.run(entryFiles: entryFiles) }
+        roots = workspaces.clock.measure(.resolve) { r.run(roots: rootFiles) }
         implicitRoots = r.implicitRoots
         workspaces.clock.setModules(r.modules.count)
         modules = r.modules
@@ -117,19 +126,50 @@ private struct Resolver {
 
     // MARK: - Driving
 
-    mutating func run(entryFiles: [String]) -> ModuleKey {
+    // Resolve from every root; returns the roots' keys, each once, in the order given.
+    mutating func run(roots rootFiles: [[String]]) -> [ModuleKey] {
         let ws = workspaces.root
-        guard let given = entryFiles.first else {
+        guard rootFiles.contains(where: { !$0.isEmpty }) else {
             diagnostics.append(PlanDiagnostic("no source files given"))
-            return ModuleKey(ws.identity, [])
+            return [ModuleKey(ws.identity, [])]
         }
-        let rawDir = given.pathParent
+        // A package at the workspace root (reported by the workspace set) stops planning before any module.
+        if workspaces.hasRootPackage(ws) {
+            return rootFiles.compactMap { $0.first }.map { ModuleKey(ws.identity, relativePath(($0.pathParent), in: ws) ?? []) }
+        }
+        var keys: [ModuleKey] = []
+        let reported = diagnostics.count
+        for files in rootFiles where !files.isEmpty {
+            guard let key = addRoot(files), !keys.contains(key) else { continue }
+            keys.append(key)
+        }
+        // A target that cannot be a root stops resolution there.
+        if keys.isEmpty || diagnostics.count > reported { return keys.isEmpty ? [ModuleKey(ws.identity, [])] : keys }
+        if let language = workspaces.byIdentity[LanguageWorkspace.identity],
+           case .success(let rt) = inPackage("runtime", path: [], of: language, external: true) {
+            if modules[rt.key] == nil { add(rt.key, dir: rt.dir, files: language.moduleFiles(rt.dir), package: (rt.package, rt.deps)) }
+            implicitRoots = [rt.key]
+        }
+        while !queue.isEmpty { resolveImports(of: queue.removeFirst()) }
+        return keys
+    }
+
+    // Add one root module, given as its files; its key, or nil (reported) when it cannot be a root.
+    mutating func addRoot(_ rootFiles: [String]) -> ModuleKey? {
+        let ws = workspaces.root
+        let rawDir = rootFiles[0].pathParent
         let dir = ws.tree.canonical(rawDir) ?? rawDir
-        let files = entryFiles.map { dir + "/" + $0.pathLastComponent }
-        let key = ModuleKey(ws.identity, relativePath(dir, in: ws) ?? [])
+        let files = rootFiles.map { dir + "/" + $0.pathLastComponent }
+        // One build's targets share its workspace (one invocation per workspace, task 210).
+        guard let path = relativePath(dir, in: ws) else {
+            diagnostics.append(PlanDiagnostic("target '\(dir)' is outside workspace '\(ws.identity)' — one build's "
+                                              + "targets share a workspace"))
+            return nil
+        }
+        let key = ModuleKey(ws.identity, path)
+        if modules[key] != nil { return key }
         // Every module is in a package (modules.md §Manifest): a `pkg.json` at or above it, within its workspace,
         // and never at the workspace root.
-        if workspaces.hasRootPackage(ws) { return key }
         if dir == ws.root {
             diagnostics.append(PlanDiagnostic("module '\(dir)' sits at the root of workspace '\(ws.identity)' — "
                                               + "modules live in packages, in subdirectories of the workspace"))
@@ -142,12 +182,6 @@ private struct Resolver {
             return key
         }
         add(key, dir: dir, files: files, package: package(at: pkgRoot, in: ws))
-        if let language = workspaces.byIdentity[LanguageWorkspace.identity],
-           case .success(let rt) = inPackage("runtime", path: [], of: language, external: true) {
-            if modules[rt.key] == nil { add(rt.key, dir: rt.dir, files: language.moduleFiles(rt.dir), package: (rt.package, rt.deps)) }
-            implicitRoots = [rt.key]
-        }
-        while !queue.isEmpty { resolveImports(of: queue.removeFirst()) }
         return key
     }
 

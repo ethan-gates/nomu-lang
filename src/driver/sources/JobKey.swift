@@ -3,6 +3,7 @@ import store
 import buildinfo
 import LLVMBridge
 import planner
+import interface
 
 // A compile job's cache key (task 208): a hash over everything the compile reads, so equal keys mean equal
 // outputs. Each input is kept by name beside the key, so two keys can be compared input by input to say why a
@@ -81,6 +82,33 @@ public final class JobKeyer {
         }
         for (name, value) in job.settings { inputs["setting:" + name] = value }
         return JobKey(inputs: inputs)
+    }
+
+    // What a job's dependency inputs hold, below the whole-file hashes the key uses (task 212.1): for each
+    // dependency, its `.nmi`'s ABI and perf section hashes, a hash per ABI declaration (`dep:<o>.nmi.abi:<kind>
+    // <name>`) and per perf definition (`dep:<o>.nmi.perf:<name>`). Explanation only: the key covers the bytes.
+    public func details(_ job: CompileJob) -> [String: String] {
+        var out: [String: String] = [:]
+        for d in job.dependencies {
+            let origin = "dep:" + d.origin.joined(separator: "/") + ".nmi"
+            guard let text = try? String(contentsOfFile: d.interface, encoding: .utf8), let nmi = parseNMI(text) else {
+                continue
+            }
+            out[origin + ".abi"] = String(nmi.abiHash, radix: 16)
+            out[origin + ".perf"] = String(nmi.perfHash, radix: 16)
+            for f in nmi.abi.functions { out[origin + ".abi:func \(f.name)"] = hash(canonicalJSON(f)) }
+            for t in nmi.abi.types { out[origin + ".abi:type \(t.name)"] = hash(canonicalJSON(t)) }
+            for e in nmi.abi.enums { out[origin + ".abi:enum \(e.name)"] = hash(canonicalJSON(e)) }
+            for i in nmi.abi.interfaces { out[origin + ".abi:interface \(i.name)"] = hash(canonicalJSON(i)) }
+            for (name, summary) in nmi.perf.escape { out[origin + ".perf:\(name)"] = hash(canonicalJSON(summary)) }
+        }
+        return out
+    }
+
+    private func canonicalJSON<T: Encodable>(_ v: T) -> String {
+        let e = JSONEncoder()
+        e.outputFormatting = [.sortedKeys]
+        return (try? e.encode(v)).map { String(decoding: $0, as: UTF8.self) } ?? ""
     }
 
     // A file's content hash, or `absent` when it cannot be read.
