@@ -39,7 +39,7 @@ the kinds, what each kind is for, where a new test goes, and where two kinds cov
   dependency), and tests that do not exercise a cold cache start from a shared warm one. A time budget for
   `bazel test //...`. The opt transition is done: `opt_binary` (`bazel/opt_binary.bzl`) gives
   `//src/nomu-cli:nomu_opt`, which lands in the same output directory as `bazel build -c opt` and so shares its
-  actions; `build_tests` went from 325 s to 69 s. Left: the shared warm cache, which belongs with the test layout
+  actions; `build_tests` went from 325 s to about 70–80 s. Left: the shared warm cache, which belongs with the test layout
   (tests that run as one workspace over one cache warm it once; tests of an empty or damaged cache keep their
   own).
 - **213.5** Act on 213.1's overlap: move, merge or drop tests that check the same thing twice.

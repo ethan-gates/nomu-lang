@@ -12,20 +12,17 @@ import embedded
 import midend
 import sema
 
-// The `.nmi` perf section (task 164.4.3): the per-definition escape summary of each exported definition.
-// Computed over the module's **erased/template** bodies — the pre-mono SSA — so each definition is
-// summarized once (the cross-module form a dependent reads, 164.6), distinct from the per-instance
-// post-mono summary the promotion path consumes (164.2/164.5). The summary is re-keyed to the per-
-// definition convention and projected onto the public surface, so only an exported definition carries
-// one (no private symbol leaks, and the key matches the ABI facts). Best-effort: a body that fails to
-// lower pre-mono simply carries no summary (read as "unknown", the conservative floor); lowering
-// diagnostics are intentionally dropped — a valid interface's facts are advisory, never fatal here.
-func escapePerfSection(_ iface: ModuleInterface, _ module: NOIRModule,
-                               subsetFuncs: Set<String>,
-                               external: [String: EscapeSummary] = [:]) -> InterfacePerf {
-    let gen = lowerToSSAIR(module, subsetFuncs: subsetFuncs)
-    let perDef = perDefinitionEscapeSummaries(
-        computeEscapeSummaries(gen.module.functions, aggregates: gen.module.aggregates, external: external))
+// The `.nmi` perf section (task 164.4.3): the module's published results, read from the fact store after
+// module inference. Module inference runs over the monomorphized lowering, which holds each exported generic
+// in erased form under its bare symbol (generic functions, and the methods of generic type templates), so a
+// generic's result is computed over its erased body, the form a dependent's call reaches. The results are
+// re-keyed to the per-definition convention and projected onto the public surface, so only an exported
+// definition carries one (no private symbol leaks, and the key matches the ABI facts). A definition with no
+// result is read by a dependent as "unknown", the conservative floor.
+func publishedResults(_ iface: ModuleInterface, from store: FactStore) -> InterfacePerf {
+    var computed: [String: EscapeSummary] = [:]
+    for id in store.symbolIDs { if let s = store.facts(for: id)?.perf.escape { computed[id.mangled] = s } }
+    let perDef = perDefinitionEscapeResults(computed)
 
     var surface = Set(iface.functions.map(\.name))
     for t in iface.types { for m in t.methods { surface.insert("\(t.name).\(m.name)") } }
@@ -33,14 +30,14 @@ func escapePerfSection(_ iface: ModuleInterface, _ module: NOIRModule,
     return InterfacePerf(escape: perDef.filter { surface.contains($0.key) })
 }
 
-// Re-key a dependency's published per-definition escape summaries to the call names an importer uses for
-// them (task 164.6), so a consumer's escape computation finds the summary at the `.direct(name)` its SSA
-// emits for an imported call: a free function `foo` → `origin@foo`, a method `Type.method` →
-// `m:origin@Type:method` (mirrors `ExternalName.encode` + ssairgen's method symbol). The importer seeds
-// `computeEscapeSummaries(external:)` with the union of these over its visible dependencies.
-func externalEscapeKeys(_ perDef: [String: EscapeSummary], origin: String) -> [String: EscapeSummary] {
+// Re-key a dependency's published results to the call names an importer uses for them (task 164.6), so the
+// importer's module inference finds a result at the `.direct(name)` its SSA emits for an imported call: a
+// free function `foo` → `origin@foo`, a method `Type.method` → `m:origin@Type:method` (mirrors
+// `ExternalName.encode` + ssairgen's method symbol). The union of these over the visible dependencies is
+// the importer's dependency results.
+func publishedResultsByCallName(_ published: [String: EscapeSummary], origin: String) -> [String: EscapeSummary] {
     var out: [String: EscapeSummary] = [:]
-    for (key, s) in perDef {
+    for (key, s) in published {
         if let dot = key.firstIndex(of: ".") {   // `Type.method` — a method on an imported type
             let type = String(key[..<dot]), method = String(key[key.index(after: dot)...])
             out[ssaMethodSymbol(ExternalName.encode(origin: origin, name: type), method)] = s

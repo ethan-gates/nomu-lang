@@ -140,11 +140,11 @@ public struct JobFile: Codable {
     public static func decode(_ data: Data) throws -> JobFile { try JSONDecoder().decode(JobFile.self, from: data) }
 }
 
-// The job's dependencies, loaded: interfaces, escape summaries and template paths by origin key
+// The job's dependencies, loaded: interfaces, published results and template paths by origin key
 // (`a/b/c`), and the views a module's checks need.
 private struct LoadedDependencies {
     var interfaces: [String: ModuleInterface] = [:]
-    var escape: [String: [String: EscapeSummary]] = [:]
+    var publishedResults: [String: [String: EscapeSummary]] = [:]
     var bir: [String: String] = [:]
     var packageKey: [String: String] = [:]
 
@@ -156,7 +156,7 @@ private struct LoadedDependencies {
                 return nil
             }
             interfaces[key] = nmi.abi
-            escape[key] = nmi.perf.escape
+            publishedResults[key] = nmi.perf.escape
             packageKey[key] = d.packageKey
             if let b = d.bir {
                 guard FileManager.default.fileExists(atPath: b) else {
@@ -286,11 +286,13 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         }
         return out
     }
-    func externalEscape() -> [String: EscapeSummary] {
+    // The dependency results module inference reads: each visible dependency's published results, keyed by
+    // the call names this module uses for them.
+    func dependencyResults() -> [String: EscapeSummary] {
         var out: [String: EscapeSummary] = [:]
         for k in visible {
-            guard let summ = deps.escape[k] else { continue }
-            out.merge(externalEscapeKeys(summ, origin: k)) { a, _ in a }
+            guard let published = deps.publishedResults[k] else { continue }
+            out.merge(publishedResultsByCallName(published, origin: k)) { a, _ in a }
         }
         return out
     }
@@ -441,29 +443,11 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
                                reexportModulePath: { imp in target(of: imp).map { $0.split(separator: "/").map(String.init) } })
     iface.foreignTypes = foreignTypeOrigins(iface)
 
-    // `--emit-nmi` on the entry is terminal: it publishes the interface and stops.
-    if let stem = debugStem, options.nmi {
-        let perf = escapePerfSection(iface, semaResult.module, subsetFuncs: subset, external: externalEscape())
-        writeArtifact(serialize(iface, perf: perf), toFile: stem + ".nmi")
-        return true
-    }
-    // A library publishes its interface (with escape summaries, so a consumer seeds across the boundary) and
-    // its shipped generic templates.
-    if job.product == .library {
-        let perf = timings.measure("interface", "escape") {
-            escapePerfSection(iface, semaResult.module, subsetFuncs: subset, external: externalEscape())
-        }
-        let text = timings.measure("interface", "serialize") { serialize(iface, perf: perf) }
-        guard timings.measure("interface", "write", {
-            (try? text.write(toFile: job.outputs.interface, atomically: true, encoding: .utf8)) != nil
-        }) else {
-            fputs("error: cannot write '\(job.outputs.interface)'\n", stderr); return false
-        }
-    }
     let ownNames = topDeclNames(ownSurface)
     let shipped = canonicalizeForExport(shippedTemplates(semaResult.module, ownNames: ownNames),
                                         origin: originKey, ownNames: ownNames)
     // A library always writes its `.bir`, empty when it ships no templates, so a dependent can rely on it.
+    // It needs only sema's templates, so it is written before mono; the `.nmi` waits for module inference.
     if job.product == .library {
         guard (try? serializeBIR(shipped).write(toFile: job.outputs.bir, atomically: true, encoding: .utf8)) != nil else {
             fputs("error: cannot write '\(job.outputs.bir)'\n", stderr); return false
@@ -498,14 +482,35 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     let extFuncs = semaResult.externalFuncNames.subtracting(localizedGenerics)
     let extGenerics = semaResult.externalGenericSigs.filter { !localizedGenerics.contains($0.key) }
 
-    // Codegen: gen SSAIR → inference (escape summaries) → emit. A binary owns the program-wide type maps and
-    // bare names; a library emits a home-qualified object.
+    // Codegen: gen SSAIR → module inference → publish → emit. The one lowering of the module: module
+    // inference runs over it once, seeded with the dependency results, into the fact store, and the `.nmi`'s
+    // published results are read from the store. A binary owns the program-wide type maps and bare names; a
+    // library emits a home-qualified object.
     let gen = timings.measure("ssair", "gen") { lowerToSSAIR(monoModule, subsetFuncs: subset) }
     if gen.diagnostics.hasErrors { fputs("error: SSAIR: " + gen.diagnostics.render() + "\n", stderr); return false }
     var store = factStore
-    timings.measure("ssair", "inference") {
-        let summaries = computeEscapeSummaries(gen.module.functions, aggregates: gen.module.aggregates)
+    timings.measure("inference", "module") {
+        let summaries = computeEscapeSummaries(gen.module.functions, aggregates: gen.module.aggregates,
+                                               dependencyResults: dependencyResults())
         writeEscapeSummaries(summaries, into: &store)
+    }
+
+    // `--emit-nmi` on the entry is terminal: it publishes the interface and stops.
+    if let stem = debugStem, options.nmi {
+        writeArtifact(serialize(iface, perf: publishedResults(iface, from: store)), toFile: stem + ".nmi")
+        return true
+    }
+    // A library publishes its interface with its published results, so a consumer seeds its module inference
+    // across the boundary.
+    if job.product == .library {
+        let text = timings.measure("interface", "serialize") {
+            serialize(iface, perf: publishedResults(iface, from: store))
+        }
+        guard timings.measure("interface", "write", {
+            (try? text.write(toFile: job.outputs.interface, atomically: true, encoding: .utf8)) != nil
+        }) else {
+            fputs("error: cannot write '\(job.outputs.interface)'\n", stderr); return false
+        }
     }
     // The `runtime` package emits its functions bare and weak-ODR (its files are the weak-origin set); an
     // ordinary module marks the embedded prelude file names weak, which matters only for a white-box

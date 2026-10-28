@@ -34,13 +34,14 @@ struct EscapeFact: FactSummary, Equatable {
 
 // Compute the escape summary of every function, composing bottom-up over the call graph via the engine.
 // `aggregates` feeds the graph's field-name resolution. The result maps each function's name to its
-// summary; a direct call to a function outside `functions` reads `external` — a dependency's published
-// per-definition summaries, keyed by the call name this module uses (`util@foo` / `m:util@Type:method`),
-// seeded from imported `.nmi`s (task 164.6). A callee in neither the in-module graph nor `external` (a
-// builtin, an un-summarized import) stays conservative — the "all arguments escape" floor.
+// summary; a direct call to a function outside `functions` reads `dependencyResults` — the published
+// results of the modules this one imports, keyed by the call name this module uses (`util@foo` /
+// `m:util@Type:method`), read from their `.nmi`s (task 164.6). A callee in neither the in-module graph nor
+// `dependencyResults` (a builtin, an import with no published result) stays conservative — the "all
+// arguments escape" floor.
 public func computeEscapeSummaries(_ functions: [SSAFunction],
                                    aggregates: [SSAAggregate] = [],
-                                   external: [String: EscapeSummary] = [:]) -> [String: EscapeSummary] {
+                                   dependencyResults: [String: EscapeSummary] = [:]) -> [String: EscapeSummary] {
     let graphs = Dictionary(functions.map { ($0.name, buildPointsToGraph($0, aggregates: aggregates)) },
                             uniquingKeysWith: { a, _ in a })
     let fnByName = Dictionary(functions.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
@@ -58,7 +59,7 @@ public func computeEscapeSummaries(_ functions: [SSAFunction],
 
     let solution = FixpointSolver(graph: callGraph) { (name: String, lookup: (String) -> EscapeFact) in
         guard let f = fnByName[name], let g = graphs[name] else { return EscapeFact.bottom }
-        return EscapeFact(summarize(f, g, callGraph: callGraph, external: external, lookup: lookup))
+        return EscapeFact(summarize(f, g, callGraph: callGraph, dependencyResults: dependencyResults, lookup: lookup))
     }.solve()
 
     return solution.mapValues { $0.summary }
@@ -70,12 +71,12 @@ public func writeEscapeSummaries(_ summaries: [String: EscapeSummary], into stor
     for (name, s) in summaries { store.update(SymbolID(name)) { $0.perf.escape = s } }
 }
 
-// Re-key SSA-named escape summaries to the per-definition `.nmi` convention (task 164.4.3). A method's
+// Re-key SSA-named escape results to the per-definition `.nmi` convention (task 164.4.3). A method's
 // `m:Type:method` SSA name (ssairgen's `ModuleContext.methodSymbol`) becomes `Type.method`; a free
-// function keeps its bare name. This is the per-definition (erased-body) form the `.nmi` perf section
-// publishes and a dependent seeds its fixpoint from (164.6) — distinct from the per-instance post-mono
-// SSA keys the promotion path consumes (164.2/164.5), which this computation over pre-mono SSA produces.
-public func perDefinitionEscapeSummaries(_ ssaKeyed: [String: EscapeSummary]) -> [String: EscapeSummary] {
+// function keeps its bare name. A public generic's erased body sits under its bare symbol, so its result
+// re-keys to its definition like any other; a specialized instance's name matches no surface declaration
+// and is dropped when the published results are projected onto the surface.
+public func perDefinitionEscapeResults(_ ssaKeyed: [String: EscapeSummary]) -> [String: EscapeSummary] {
     var out: [String: EscapeSummary] = [:]
     for (name, s) in ssaKeyed {
         let parts = name.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
@@ -91,7 +92,7 @@ public func perDefinitionEscapeSummaries(_ ssaKeyed: [String: EscapeSummary]) ->
 // summary (`lookup`). This is the engine transfer: it reads callees' summaries, never its own node's prior
 // value, so recomputing from the graph each iteration is correct.
 func summarize(_ f: SSAFunction, _ g: PointsToGraph,
-               callGraph: CallGraph<String>, external: [String: EscapeSummary] = [:],
+               callGraph: CallGraph<String>, dependencyResults: [String: EscapeSummary] = [:],
                lookup: (String) -> EscapeFact) -> EscapeSummary {
     // Does a value escape f's frame? Faithful rules, except a direct-call argument escapes only when the
     // callee's summary says it escapes that parameter. `includeReturn` folds the returned value into the
@@ -107,7 +108,7 @@ func summarize(_ f: SSAFunction, _ g: PointsToGraph,
                 case .ret:
                     if includeReturn { esc.insert(v) }
                 case .callArg(let callee, let j):
-                    if argEscapes(callee, j, callGraph: callGraph, external: external, lookup: lookup) { esc.insert(v) }
+                    if argEscapes(callee, j, callGraph: callGraph, dependencyResults: dependencyResults, lookup: lookup) { esc.insert(v) }
                 }
             }
         }
@@ -141,15 +142,16 @@ func summarize(_ f: SSAFunction, _ g: PointsToGraph,
 
 // Does an argument at parameter position `j` of `callee` escape? A direct call to an in-graph callee reads
 // its current summary (a not-yet-computed callee reads as optimistic `noEscape`, widening as the fixpoint
-// proceeds); an external direct callee and every witness / indirect call are conservative.
+// proceeds); a dependency's callee reads its published result; any other direct callee outside the graph
+// and every witness / indirect call are conservative.
 private func argEscapes(_ callee: PTGCallee, _ j: Int,
-                        callGraph: CallGraph<String>, external: [String: EscapeSummary],
+                        callGraph: CallGraph<String>, dependencyResults: [String: EscapeSummary],
                         lookup: (String) -> EscapeFact) -> Bool {
     func disposition(_ s: EscapeSummary) -> Bool { j < s.params.count ? s.params[j] == .escapes : false }
     switch callee {
     case .direct(let name):
-        if let s = external[name] { return disposition(s) }   // a dependency's published summary (164.6)
-        guard callGraph.contains(name) else { return true }   // builtin / un-summarized import — conservative
+        if let s = dependencyResults[name] { return disposition(s) }   // a dependency's published result
+        guard callGraph.contains(name) else { return true }   // builtin / unpublished import — conservative
         return disposition(lookup(name).summary)
     case .witness, .indirect:
         return true                                           // unknown dynamic target — conservative

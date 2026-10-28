@@ -14,9 +14,9 @@ module whose outputs it reads are unchanged.
 
 ## Today
 
-- **One action per module:** parse, sema, the pre-mono lowering and escape inference for the `.nmi`, the
-  `.bir`, mono, the post-mono lowering, the optimizer passes, LLVM and the object. A consumer reads only the
-  `.nmi` and `.bir`, which are written before mono, yet waits for the whole job.
+- **One action per module:** parse, sema, the `.bir`, mono, the lowering, module inference, the `.nmi`, the
+  optimizer passes, LLVM and the object. A consumer reads only the `.bir` (written after sema) and the `.nmi`
+  (written after module inference), yet waits for the whole job.
 - **Two interface files per module** (`.nmi`, `.bir`), every library writing both.
 - **Transitive whole-file keys:** a job receives every transitive dependency's `.nmi` and `.bir` and its key
   covers their bytes. The compile reads less: of a dependency that is neither direct nor re-exported, only the
@@ -45,9 +45,12 @@ module whose outputs it reads are unchanged.
 
 ## Open questions
 
-1. **Where the interface boundary sits** follows from [202](202-one-inference-phase.md): with one lowering, the
-   published escape results come from that lowering (and an erased-form lowering of public generics), which
-   decides how much of the work the interface action does.
+1. **Where the interface boundary sits.** [202](202-one-inference-phase.md) settled where the published
+   results come from: module inference over the one monomorphized lowering, so the `.nmi`'s perf section is
+   ready only after mono, the lowering and module inference. The `.bir` and the ABI section are ready after
+   sema. Open: whether the interface artifact's sections become available separately (a consumer's sema and
+   mono start once the ABI section and templates exist, its module inference once the perf section does),
+   or the interface action ends after module inference.
 2. **What the object action reuses** from the interface action instead of redoing (parse and sema, the
    lowering): stored state, or recomputation, by measurement.
 3. **The slice's closure:** whether every declaration a transitive slice needs is reachable from the direct
@@ -78,5 +81,5 @@ module whose outputs it reads are unchanged.
 ## Refs
 
 `compile` (`src/driver/sources/CompileJob.swift`: `LoadedDependencies`, `externals()`, `importedTemplates`,
-`externalEscape`); `JobKeyer.key`/`details` (`JobKey.swift`); `ModuleJob.visibleDependencies` (`Plan.swift`);
-`escapePerfSection` (`Driver.swift`).
+`dependencyResults`); `JobKeyer.key`/`details` (`JobKey.swift`); `ModuleJob.visibleDependencies` (`Plan.swift`);
+`publishedResults` (`CompileSupport.swift`).

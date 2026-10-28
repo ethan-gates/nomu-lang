@@ -15,9 +15,9 @@ program structure rather than annotated.
 
 ## Terms
 
-Each term is defined within the one that encloses it. Code and the rest of this doc are moving to these
-names ([202](../plans/tasks/202-one-inference-phase.md)); older text says "summary" for a declaration's
-escape result and "external" for dependency results.
+Each term is defined within the one that encloses it. "Summary" names the technique (summary-based
+interprocedural analysis, §Summary and composition); what one declaration's summary records is its escape
+result. In code, a result's type is still `EscapeSummary`.
 
 - **Module inference** — the phase of one module's compile that analyzes the module's lowered code and
   determines properties of its declarations. It runs once per module, after lowering and before the
@@ -71,7 +71,7 @@ encoding, which running after ssairgen supplies for free.
 | Function/closure-type shareability | Sema/inference | soundness | structural over captures | yes | deferred (132) |
 | Conditional conformance (`Box<T>` shareable iff `T`) | Sema | soundness | structural | yes | built |
 | Escape (→ stack/scalar promotion) | inference | perf | value-flow (intra) | interproc summary only | intra-fn built (166 graph + faithful/precise queries); precise-promotion consumption deferred (148) |
-| Interprocedural escape summary | inference | perf | value-flow + fixpoint | yes (perf section) | Level-1 summary built (169, on 166 + 168); per-definition summary serialized into the `.nmi` perf section + cross-module seeded (164.4.3/164.6); promotion consumption deferred (164.5 → 148) |
+| Interprocedural escape summary | inference | perf | value-flow + fixpoint | yes (perf section) | Level-1 summary built (169, on 166 + 168); one module inference per module over the monomorphized lowering (202); public results published in the `.nmi` perf section and read by dependents as dependency results (164.4.3/164.6); promotion consumption deferred (164.5 → 148) |
 | Fiber locality | inference | perf | value-flow + fixpoint | yes if interproc | future |
 | Cross-fiber reachability | inference / runtime | perf (poss. soundness) | reachability + fixpoint | yes if a cross-module contract | future; GC scans all fibers today |
 | Lives across suspension | inference | perf | liveness over the fiber CFG across `await`/yield points | yes if interproc (callee-may-suspend) | future; decides frame-held vs promoted placement across a yield |
@@ -153,11 +153,12 @@ Summary(f):
 
 At `y = f(a, b)`: instantiate the param nodes to the actuals, apply `escape`, wire `return` into y,
 propagate `fieldEdges`. Compose bottom-up over the call graph; SCCs iterate to a fixpoint. This is the
-object the `.nmi` perf section serializes (one per definition; the erased body for generics). The
-analysis runs over the whole body and reads two projections off the one graph: **local facts** keyed to
-the function's own SSA values (consumed by this function's transforms — stack/scalar promotion, in-place
-mutation) and the **summary** (consumed by callers and serialized). Local facts are ephemeral; the
-summary persists. The dataflow is the hub drawn in 164's "What".
+object the `.nmi` perf section serializes as published results (one per definition; the erased body for
+generics). The analysis runs over the whole body and reads two projections off the one graph: **local
+facts** keyed to the function's own SSA values (consumed by this function's transforms — stack/scalar
+promotion, in-place mutation) and the **escape result** (consumed by callers and, for the public surface,
+published). Local facts are ephemeral; the escape result persists. The dataflow is the hub drawn in 164's
+"What".
 
 ### Soundness direction
 
@@ -170,9 +171,9 @@ uncertainty.
 ### Dynamic dispatch
 
 At a witness call — `any I`, a cross-module erased generic in release, an indirect closure call — the
-callee is unknown, so there is no single summary. These are perf facts over an open world (separate
-compilation lets a later module add a conformer), so the assumed summary must be a sound upper bound over
-all conformers, present and future. The summary slot therefore lives on the **interface method (and
+callee is unknown, so there is no single escape result. These are perf facts over an open world (separate
+compilation lets a later module add a conformer), so the assumed result must be a sound upper bound over
+all conformers, present and future. The result slot therefore lives on the **interface method (and
 function type)**, read at the call site, with a pluggable fill:
 
 - **Conservative** — worst case; always sound; the default for an open public interface.
@@ -186,7 +187,7 @@ function type)**, read at the call site, with a pluggable fill:
   alternative to `sealed` for the public case, also deferred.
 
 The concrete path keeps full precision: the interface bound applies only on the dynamic path, and a
-conformer called directly uses its own exact summary. The "verify conformer ≤ bound" step is vacuous for
+conformer called directly uses its own exact escape result. The "verify conformer ≤ bound" step is vacuous for
 an inferred join (the join is an upper bound of its members by construction) and real only for a declared
 contract.
 
@@ -194,7 +195,7 @@ contract.
 
 At a final link the conformer world is closed, so the open-public precision problem dissolves — the same
 closed-world join applies to everything. The engine is therefore built **scope-agnostic**: it takes a
-call graph + a conformer set + a summary source and is indifferent to whether the scope is one module
+call graph + a conformer set + a source of results and is indifferent to whether the scope is one module
 (boundary open, conservative fills) or the whole build (boundary closed, precise joins). A per-module run
 and a whole-program link-time run are the same engine under two drivers — the ThinLTO /
 whole-program-devirtualization architecture.
@@ -202,7 +203,7 @@ whole-program-devirtualization architecture.
 Libraries are **distributed as source**, so the whole program's source is present at every build and the
 world is always closable. There is no third-party-IR-distribution blocker, and the choice between open
 (incremental) and closed (whole-program precise) is a build-mode decision. The `.nmi` is a
-**build-internal** incremental-cache + interface artifact (summaries now; bodies-as-IR can ride later for
+**build-internal** incremental-cache + interface artifact (published results now; bodies-as-IR can ride later for
 a link tier to re-optimize), never a distribution format, so it evolves freely build to build while
 staying byte-stable within a build for the incremental cache.
 
@@ -306,17 +307,17 @@ The inference is designable now; its value is realized when those consumers exis
 
 The fact store is the **hub**: the one in-memory structure every analysis writes its results into and
 every consumer (this module's transforms, this module's interface emit) reads from. It decouples
-producing a fact from consuming it — the escape *analysis* writes a summary into the store; the promotion
+producing a fact from consuming it — the escape *analysis* writes an escape result into the store; the promotion
 *transform* and the `.nmi` emit each read it, independently.
 
 - **Per-symbol, keyed by a stable symbol id.** The mangled name is the key — already stable across
-  producer and consumer. **Per-definition, not per-instantiation**: a public generic is summarized once
-  over its erased/template body, so the store (and the `.nmi`) carries one record per definition.
+  producer and consumer. **Per-definition, not per-instantiation**: a public generic has one result,
+  computed over its erased/template body, so the store (and the `.nmi`) carries one record per definition.
 - **Structured, not scalar flags.** A record holds typed facts — mutating-ness is a per-method bit,
   shareability a per-type bit, escape is per-parameter/return, stack-depth is per-function.
 - **Sectioned with independent hashes.** Each record splits into an **ABI/soundness** section (facts a
   consumer must see to compile correctly — mutating-ness, shareability, conditional conformance) and a
-  **perf** section (optimization facts — escape summary, stack-depth, later uniqueness/fiber). Each
+  **perf** section (optimization facts — escape result, stack-depth, later uniqueness/fiber). Each
   section hashes independently and deterministically, so a body edit that changes perf facts but not the
   ABI leaves the ABI digest byte-identical — the property the incremental cache rests on (a debug
   dependent that consumed only the ABI stays cached). The hash is over a canonical encoding (sorted keys),
@@ -328,7 +329,9 @@ producing a fact from consuming it — the escape *analysis* writes a summary in
   carries a schema version so the `.nmi` cache can reason across builds.
 - **In-memory hub vs the `.nmi` file.** The store is the mutable in-flight state; the `.nmi` is assembled
   once from it (one file, sectioned, immutable, build-internal — see 164). Transforms and lowering read
-  the store, never the file; a dependency's published summaries seed this module's store as input.
+  the store, never the file. A dependency's published results enter module inference as its dependency
+  results; module inference runs once, over the module's one lowering (the monomorphized one, which holds
+  each public generic's erased body), and the `.nmi` reads the published results from the store after it.
 
 The store is plain infrastructure — a schema plus deterministic section hashing plus a two-writer API —
 independent of the SCC engine that fills it and the analyses that produce the facts. It is built and
@@ -339,7 +342,7 @@ unit-tested on its own ([`plans/tasks/167-fact-store.md`](../plans/tasks/167-fac
 
 Keep the three roles distinct across the whole mid-end and backend:
 
-- **Analysis** — produces summaries into the store. The escape *fact* lives here, separate from the
+- **Analysis** — produces results into the store. The escape *fact* lives here, separate from the
   promotion *transform* that consumes it.
 - **Transform** — consumes facts, rewrites IR (stage 3). Promotion becomes a consumer of the escape fact
   rather than its producer.
@@ -367,8 +370,8 @@ drive.
   shareable-requirement. These consume the materialized def-use the raw-SSA substrate supplies. (The
   legacy inline `EscapeAnalysis.swift` is the faithful oracle the graph reproduces.)
 - **The SCC fixpoint is a stage-agnostic engine, not a stage** (`src/inference`, task 168). Driven at the
-  Sema altitude for mutating-ness (over NOIR bodies + imported summaries) and at the inference-stage
-  altitude for the escape summary (over the raw-SSA points-to graph). Each analysis plugs in at one
+  Sema altitude for mutating-ness (over NOIR bodies + imported mutating-ness) and at module inference
+  for the escape result (over the raw-SSA points-to graph). Each analysis plugs in at one
   altitude; the engine and the fact store (`src/facts`, task 167) are shared.
 
 Current homes: mutating-ness `passes/Mutation.swift` (run from `Sema.check` over the shared SCC engine,
@@ -378,6 +381,6 @@ conformance `gen/Shareability.swift`; exhaustiveness `passes/Exhaustiveness.swif
 `ssairpasses/EscapeQuery.swift` (faithful + precise) and the interprocedural summary
 `ssairpasses/InterprocEscape.swift`; the shared engine `src/inference` and the fact store `src/facts`. The
 analysis/transform separation landed in [165](../plans/tasks/165-midend-pipeline-prefactor.md); wiring the
-summaries into the store + emit + promotion is [164](../plans/tasks/164-formal-inference-stage.md). The
+results into the store + emit + promotion is [164](../plans/tasks/164-formal-inference-stage.md). The
 legacy `ssairpasses/EscapeAnalysis.swift` remains as `StackPromotion`'s default provider and the faithful
 differential oracle.

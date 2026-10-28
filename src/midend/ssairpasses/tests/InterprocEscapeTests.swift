@@ -159,10 +159,10 @@ final class InterprocEscapeTests: XCTestCase {
         XCTAssertEqual(computeEscapeSummaries([f])["f"]!.params, [.escapes],
                        "no summary ⇒ the imported call is conservative")
         let noEsc = ["util@ext": EscapeSummary(params: [.noEscape], ret: .fresh)]
-        XCTAssertEqual(computeEscapeSummaries([f], external: noEsc)["f"]!.params, [.noEscape],
+        XCTAssertEqual(computeEscapeSummaries([f], dependencyResults: noEsc)["f"]!.params, [.noEscape],
                        "a published no-escape summary keeps the arg local")
         let esc = ["util@ext": EscapeSummary(params: [.escapes], ret: .fresh)]
-        XCTAssertEqual(computeEscapeSummaries([f], external: esc)["f"]!.params, [.escapes],
+        XCTAssertEqual(computeEscapeSummaries([f], dependencyResults: esc)["f"]!.params, [.escapes],
                        "a published escaping summary propagates")
     }
 
@@ -170,7 +170,7 @@ final class InterprocEscapeTests: XCTestCase {
     // name becomes `Type.method` (matching the ABI facts); a free function keeps its bare name.
     func testPerDefinitionReKeying() {
         let s = EscapeSummary(params: [.noEscape], ret: .fresh)
-        let out = perDefinitionEscapeSummaries([
+        let out = perDefinitionEscapeResults([
             "m:Point:bump": s,
             "makePoint": s,
         ])

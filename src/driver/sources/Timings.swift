@@ -4,10 +4,10 @@ import support
 import Foundation
 
 // Per-invocation compiler timing, categorized by pipeline phase. Every stage records under a phase
-// (parse / noir / ssair / llvm / runtime / link); the report groups stages by phase with a per-phase
-// subtotal + percentage, then a grand total, to stderr (stdout stays the artifact path). Stages
-// measured deep in a module (SSAIR passes, LLVM sub-stages) report up through a `StageSink` (see
-// `record`), so the `llvm`/`ssair` phases break down rather than showing one opaque `codegen` bucket.
+// (parse / noir / ssair / inference / interface / llvm / runtime / link); the report groups stages by
+// phase with a per-phase subtotal + percentage, then a grand total, to stderr (stdout stays the artifact
+// path). Stages measured deep in a module (SSAIR passes, LLVM sub-stages) report up through a `StageSink`
+// (see `record`), so the `llvm`/`ssair` phases break down rather than showing one opaque `codegen` bucket.
 public final class Timings {
     private let clock = ContinuousClock()
     private let started: ContinuousClock.Instant

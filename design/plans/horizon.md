@@ -10,9 +10,10 @@ parallel/cheap work tracked in `tasks.md`.
 Two epics are live. **Epic A (self-hosted GC + runtime) is the active priority.** MMTk and the C scheduler
 are retired ([197](tasks/197-retire-mmtk-and-c-scheduler.md)): one runtime, the Nomu scheduler and collector.
 The GC-correctness run ([176](tasks/176-shaped-gc-roots.md) 176.5) and the link-time GC frame index
-([195](tasks/195-link-time-gc-frame-index.md)) are done; next is the **modules build-out** beneath the benchmark, which needs programs large enough to be meaningful and the
-perf-affecting module capabilities real: dev-productivity first (explicit module builds, then the build
-cache), then the perf-relevant capabilities (cross-module generics residuals, cross-module inlining). The
+([195](tasks/195-link-time-gc-frame-index.md)) are done. The **modules build-out** sits beneath the benchmark, which needs programs large enough to be meaningful and the
+perf-affecting module capabilities real: dev-productivity first (explicit module builds and the build cache,
+both done; build graph granularity next), then the perf-relevant capabilities (cross-module generics residuals,
+cross-module inlining). The
 benchmark against Go and Swift (with 158/159) sits above that, when the language is complete.
 Epic B (strings) has only independent follow-ons left.
 
@@ -36,12 +37,14 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
 └── benchmark against Go and Swift (when the language is complete)
     └── 150  self-hosted GC ladder — GenImmix correctness-complete on the one runtime (197)
         ├── 158  GC packaging — self-contained plans behind one trigger protocol
-        ├── 159  GC observability — collection tracing, stats, pause timing  ◀ next
+        ├── 159  GC observability — collection tracing, stats, pause timing
         ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
         │        complements 179 (value-level GC classification)
         ├── 171  modules cleanup — cross-module generics residuals           (perf-accuracy)
         │        interacts with 170 (method-level generics), 118 (associated types)
         ├── 203  symbol encoding — one injective mangling for every family   (correctness)  (done)
+        ├── 217  build graph granularity — interface/object actions, sliced keys, scheduler  ◀ next
+        │   └── 202  one inference phase per module — one SSAIR lowering                    (done)
         └── 172  incremental build cache — content-addressed compiles and links (dev-productivity)  (done)
             ├── 206  compiler identity — commit plus uncommitted changes, baked in          (done)
             ├── 208  job keys — over everything a compile reads                            (done)
@@ -54,7 +57,7 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
             └── 198  build configuration — modes, per-workspace settings, the cache-key input  (done)
 ```
 
-**Order of the next run:** 172 and its prerequisites (206–212, 214) are done; next is 159 (198 and 203 are done). 172's keys are transitive and whole-file; narrowing them to what a compile reads, with interface and object actions and a scheduler, is [217](tasks/217-build-graph-granularity.md), after [202](tasks/202-one-inference-phase.md) (one lowering per module), off this chain. 190 (explicit module builds) and 200 (the
+**Order of the next run:** 172 and its prerequisites (206–212, 214) are done. Next is [217](tasks/217-build-graph-granularity.md) (build graph granularity: keys over what a compile reads, interface and object actions, a scheduler), its prerequisite [202](tasks/202-one-inference-phase.md) (one lowering per module) done, starting with 217.1 (measurement), while the build-cache code is fresh; then 159 (198 and 203 are done). 190 (explicit module builds) and 200 (the
 YAML parser, which 198's configuration files needed) are done; 200's open items are
 [204](tasks/204-yaml-parser-upgrades.md), off this chain. 198 went ahead of 203 by choice; 203 is 190's
 last correctness finding (a weak-symbol collision silently links the wrong definition) and follows it. 198 carries only what 172 needs; the rest of
@@ -84,7 +87,9 @@ ways:
 
 - **Dev-productivity** — [190](tasks/190-explicit-module-builds.md) (explicit module builds: one planned
   graph, each module compiled once; done), then [172](tasks/172-incremental-build-cache.md) (the content-addressed
-  module-granular cache, keyed on 190's jobs). These make building and iterating large programs bearable.
+  module-granular cache, keyed on 190's jobs; done), then [217](tasks/217-build-graph-granularity.md) (keys over
+  what a compile reads, interface and object actions, a scheduler). These make building and iterating large
+  programs bearable.
 - **Perf-accuracy** — [171](tasks/171-modules-cleanup.md) (cross-module generics residuals) and
   [182](tasks/182-cross-module-inlining.md) (cross-module inlining + inlinable stdlib). They change
   performance enough that a benchmark taken before them would mislead.
