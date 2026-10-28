@@ -6,13 +6,10 @@ final class PlanTests: XCTestCase {
     private let me = WorkspaceIdentity(scope: "me", name: "app")
     private let nomu = LanguageWorkspace.identity
 
-    private func plan(_ files: [String: String], entry: [String], product: ModuleJob.Product = .binary,
-                      outputOptions: [String] = []) -> Plan {
+    private func plan(_ files: [String: String], entry: [String], product: ModuleJob.Product = .binary) -> Plan {
         var options = PlanOptions()
         options.product = product
         options.cacheRoot = "/cache"
-        options.compilerIdentity = "abc123"
-        options.outputOptions = outputOptions
         return Plan(entryFiles: entry, options: options, disk: MemoryTree(files))
     }
 
@@ -54,15 +51,13 @@ final class PlanTests: XCTestCase {
         XCTAssertEqual(byKey[key(them, "greet")]?.outputDir, "/w/build/_external/them.prov/greet")
         XCTAssertEqual(byKey[key(them, "greet")]?.product, .library)
 
-        // D4: the language workspace's modules and the runtime archive are held in the per-host cache under their
-        // keys, and materialized under `build/`.
+        // D4: the language workspace's modules go under `_external/` like any other workspace's; the runtime
+        // archive is held in the per-host cache under its key, and materialized under `build/`.
         let prelude = byKey[key(nomu, "std/prelude")]!
-        let workspaceKey = HostCache.languageWorkspaceKey(compilerIdentity: "abc123", outputOptions: [])
-        let preludeKey = HostCache.languageModuleKey(workspaceKey: workspaceKey, path: ["std", "prelude"])
-        XCTAssertEqual(prelude.hostCacheKey, preludeKey)
+        XCTAssertTrue(prelude.inLanguageWorkspace)
         XCTAssertEqual(prelude.outputDir, "/w/build/_external/nomu.nomu/std/prelude")
         XCTAssertEqual(prelude.object, "/w/build/_external/nomu.nomu/std/prelude/prelude.o")
-        XCTAssertNil(cli.hostCacheKey)
+        XCTAssertFalse(cli.inLanguageWorkspace)
         XCTAssertEqual(p.runtimeArchive?.key, HostCache.runtimeArchiveKey(recipe: []))
         XCTAssertEqual(p.runtimeArchive?.outputDir, "/w/build/_runtime")
 
@@ -76,7 +71,6 @@ final class PlanTests: XCTestCase {
     private func plan(_ files: [String: String], roots: [[String]]) -> Plan {
         var options = PlanOptions()
         options.cacheRoot = "/cache"
-        options.compilerIdentity = "abc123"
         return Plan(roots: roots, options: options, disk: MemoryTree(files))
     }
 
@@ -141,13 +135,16 @@ final class PlanTests: XCTestCase {
         XCTAssertEqual(root.whiteBox, false)
     }
 
-    // Each language-workspace module has its own key, which follows the workspace's key.
-    func testLanguageModuleKeys() {
-        let a = HostCache.languageModuleKey(workspaceKey: "w1", path: ["std", "prelude"])
-        XCTAssertEqual(a, HostCache.languageModuleKey(workspaceKey: "w1", path: ["std", "prelude"]))
-        XCTAssertNotEqual(a, HostCache.languageModuleKey(workspaceKey: "w2", path: ["std", "prelude"]))
-        XCTAssertNotEqual(a, HostCache.languageModuleKey(workspaceKey: "w1", path: ["std", "time"]))
-        XCTAssertNotEqual(a, HostCache.languageModuleKey(workspaceKey: "w1", path: ["std/prelude"]))
+    // The cache root: `NOMU_CACHE_DIR` first, then the entry workspace's `cache.root` (absolute, `~/`-relative or
+    // workspace-relative), then the platform's cache directory.
+    func testCacheRoot() {
+        let env = ["HOME": "/Users/me"]
+        XCTAssertEqual(HostCache.root(environment: env.merging(["NOMU_CACHE_DIR": "/c"]) { $1 }, configured: "/d", workspaceRoot: "/w"), "/c")
+        XCTAssertEqual(HostCache.root(environment: env, configured: "/d", workspaceRoot: "/w"), "/d")
+        XCTAssertEqual(HostCache.root(environment: env, configured: "~/nomu-cache", workspaceRoot: "/w"), "/Users/me/nomu-cache")
+        XCTAssertEqual(HostCache.root(environment: env, configured: ".cache", workspaceRoot: "/w"), "/w/.cache")
+        XCTAssertEqual(HostCache.root(environment: env, configured: nil, workspaceRoot: "/w"),
+                       HostCache.root(environment: env))
     }
 
     func testRuntimeArchiveKeyFollowsRecipe() {
@@ -155,16 +152,10 @@ final class PlanTests: XCTestCase {
         XCTAssertEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "runtime.c"]]))
         XCTAssertNotEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-O2", "-c", "runtime.c"]]))
         XCTAssertNotEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-c"], ["runtime.c"]]))
-    }
-
-    func testLanguageWorkspaceKeyFollowsCompilerAndOptions() {
-        let a = HostCache.languageWorkspaceKey(compilerIdentity: "abc", outputOptions: [])
-        XCTAssertEqual(a, HostCache.languageWorkspaceKey(compilerIdentity: "abc", outputOptions: []))
-        XCTAssertNotEqual(a, HostCache.languageWorkspaceKey(compilerIdentity: "abd", outputOptions: []))
-        XCTAssertNotEqual(a, HostCache.languageWorkspaceKey(compilerIdentity: "abc", outputOptions: ["-O"]))
-        let plain = plan(app, entry: ["/w/app/cli/main.nomu"])
-        let optimized = plan(app, entry: ["/w/app/cli/main.nomu"], outputOptions: ["-O"])
-        XCTAssertNotEqual(plain.jobs.first?.hostCacheKey, optimized.jobs.first?.hostCacheKey)
+        // A toolchain update changes the key.
+        let tools = HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "runtime.c"]], toolchain: ["cc": "clang-2100"])
+        XCTAssertNotEqual(a, tools)
+        XCTAssertNotEqual(tools, HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "runtime.c"]], toolchain: ["cc": "clang-2200"]))
     }
 
     func testRuntimePackageJob() {

@@ -228,9 +228,10 @@ selects configs. Ambient environment variables stop changing results.
   optimizer switches, diagnostics), `program` (one value per linked binary, which every module must agree
   on: `gc.plan`, which changes barriers in every module, and the runtime settings baked into the binary),
   or `build` (one value per build: the cache location). Program and build settings may
-  be set only in the builtin layer and the entry workspace's `cfg.yaml`; a package or module file, an
-  external workspace's file, or an `externals:` block (G20) that sets one is an error, so every module
-  of a program agrees by construction. This restricts which layers may set a setting; it is still one stack and one walk.
+  be set only in the builtin layer and workspace files, and only the entry workspace's values apply, so every
+  module of a program agrees by construction; another workspace's values are for its own builds and are
+  ignored when it is consumed. A package or module file, or an `externals:` block (G20), that sets one is an
+  error. This restricts which layers may set a setting; it is still one stack and one walk.
 - **G19. The builtin layer is viewable.** A user can print the builtin layer as a YAML file: every setting
   at its default, each commented with its meaning, type, allowed values, targets and granularity, plus the
   builtin config declarations. It is generated from the schema (G8), so it always matches the compiler.

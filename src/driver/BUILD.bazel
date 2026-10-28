@@ -18,15 +18,15 @@ swift_library(
 swift_test(
     name = "build_tests",
     srcs = ["tests/BuildTests.swift"],
-    data = ["//:suite_sources", "//src/nomu-cli:nomu"],
+    data = ["//:suite_sources", "//src/nomu-cli:nomu_opt"],
     deps = ["//src/store"],
-    env = {"NOMU_BINARY": "$(rootpath //src/nomu-cli:nomu)"},
+    env = {"NOMU_BINARY": "$(rootpath //src/nomu-cli:nomu_opt)"},
 )
 
-# Job keys (task 208): which inputs a key covers, and which it leaves out.
+# Job and link keys (tasks 208, 214): which inputs a key covers, and which it leaves out; the toolchain record.
 swift_test(
     name = "job_key_tests",
-    srcs = ["tests/JobKeyTests.swift"],
+    srcs = ["tests/JobKeyTests.swift", "tests/LinkKeyTests.swift", "tests/ToolchainTests.swift"],
     copts = [
         "-cxx-interoperability-mode=default",
         "-Xcc",

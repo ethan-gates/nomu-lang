@@ -32,6 +32,12 @@ struct ResolvedBuildConfiguration {
         return c
     }
 
+    // The cache root the entry workspace sets (`cache.root`), as written; nil when it sets none.
+    var cacheRoot: String? {
+        guard case .string(let s)? = build.buildWideSettings["cache.root"], !s.isEmpty else { return nil }
+        return s
+    }
+
     // The values the runtime reads, as the settings object's globals (G14). Run settings are program settings,
     // so the build has one value for each.
     var runtimeGlobals: [(symbol: String, value: RuntimeGlobal)] {
@@ -50,14 +56,6 @@ struct ResolvedBuildConfiguration {
 
     // The record's short form a binary carries in its `__nomu_config` section (G13).
     var summary: String { build.summary(compiler: BuildInfo.gitCommit) }
-
-    // The canonical settings every language-workspace module compiles under. The language workspace reads no
-    // files, so its modules share one configuration, and it enters the workspace's host-cache key (G2).
-    var languageCanonical: String {
-        let place = ModulePlace(LanguageWorkspace.identity.description, package: nil, module: "")
-        let c = build.configuration(for: place)
-        return c.canonical(c.settings.filter { $0.setting.targets.contains(.compile) }.map(\.setting.name))
-    }
 }
 
 // Reads the `cfg.yaml` at each workspace, package and module root the build reaches, and resolves them under

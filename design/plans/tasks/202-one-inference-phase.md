@@ -57,6 +57,8 @@ module's takes 0.04–0.35 ms; serializing and writing a `.nmi` takes under 1 ms
 
 - **148 §148.1** (promotion reads the escape result) depends on this: its wiring becomes passing a
   store-backed provider to `StackPromotion`.
+- **[217](217-build-graph-granularity.md)** (interface and object actions) depends on this: the one lowering
+  fixes where the interface boundary sits.
 - Parametric results (`inference.md` §Terms) stay out of scope; they change the escape result's shape,
   not the phase structure.
 

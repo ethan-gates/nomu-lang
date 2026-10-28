@@ -6,7 +6,7 @@ public struct ConfigError: Error, Equatable {
         // Settings.
         case unknownSetting
         case invalidValue               // a value that does not read as the setting's type
-        case settingInWrongLayer        // a program or build setting in a package or module file (G18)
+        case settingInWrongLayer        // a program or build setting in a package or module file or an `externals:` block (G18)
         case duplicateDeclaration       // two spellings of one declaration in one layer (G9)
         case conflict                   // two declarations in one layer win under one config with different values
 

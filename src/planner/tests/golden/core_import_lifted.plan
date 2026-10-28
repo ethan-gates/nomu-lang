@@ -7,17 +7,17 @@ workspaces
 job nomu.nomu:runtime
   package runtime at @nomu.nomu/runtime (product)
   files runtime.nomu
-  library, host-cache, runtime-subset
+  library, language, runtime-subset
   out @me.app/build/_external/nomu.nomu/runtime/runtime
 job nomu.nomu:std/prelude
   package std at @nomu.nomu/std (product)
   files prelude.nomu
-  library, host-cache
+  library, language
   out @me.app/build/_external/nomu.nomu/std/prelude/prelude
 job nomu.nomu:core
   package core at @nomu.nomu/core (product)
   files core.nomu
-  library, host-cache
+  library, language
   out @me.app/build/_external/nomu.nomu/core/core
 job me.app:app
   package app at @me.app/app

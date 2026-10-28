@@ -12,10 +12,10 @@ public enum LayerKind: String, Equatable {
     // Configs are declared only in the builtin layer and workspace files (G4).
     public var declaresConfigs: Bool { self == .builtin || self == .entryWorkspace || self == .workspace }
 
-    // Program and build settings are set only in the builtin layer and the entry workspace's `cfg.yaml`
-    // (G18), so every module of a program agrees.
+    // Program and build settings are set only in the builtin layer and workspace files (G18). Only the entry
+    // workspace's values apply, so every module of a program agrees; another workspace's are its own builds'.
     public func admits(_ granularity: Granularity) -> Bool {
-        granularity == .module || self == .builtin || self == .entryWorkspace
+        granularity == .module || self == .builtin || self == .entryWorkspace || self == .workspace
     }
 }
 

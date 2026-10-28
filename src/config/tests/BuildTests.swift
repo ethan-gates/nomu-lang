@@ -143,8 +143,13 @@ final class BuildTests: XCTestCase {
         XCTAssertEqual(b.configuration(for: collections)["pantry.capacity"], .size(256 << 20))
     }
 
-    func testProgramSettingInAnExternalOrBlockIsAnError() {
-        XCTAssertEqual(codes(json: "pantry:\n  capacity: 1G\n"), [.settingInWrongLayer])
+    // An external workspace's own program settings are for its own builds: accepted and ignored here. An
+    // `externals:` block may not set one.
+    func testProgramSettingInAnExternalIsIgnored() throws {
+        let b = try build(["production"], json: "pantry:\n  capacity: 1G\n")
+        XCTAssertEqual(b.configuration(for: parse)["pantry.capacity"], .size(256 << 20))
+        XCTAssertEqual(b.buildWideSettings["pantry.capacity"], .size(256 << 20))
+        XCTAssertEqual(codes(json: "pantry:\n  capacity: lots\n"), [.invalidValue], "its values are still checked")
         XCTAssertEqual(codes(entry: "externals:\n  all:\n    shop:\n      name: x\n"), [.settingInWrongLayer])
     }
 

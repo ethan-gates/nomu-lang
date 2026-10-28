@@ -1,7 +1,7 @@
 import Foundation
 
 // The last-build record (task 212.2): each module's job key from the workspace's last build that compiled or
-// served it, in `build/.nomu-last-build.json`. Under `--explain` it also holds the key's named inputs and the
+// served it, and each binary's link key (214), in `build/.nomu-last-build.json`. Under `--explain` it also holds the key's named inputs and the
 // details below them (`JobKeyer.details`), as Bazel writes its execution log only on request; a build that does
 // not ask keeps a module's recorded inputs while its key is unchanged and drops them when it changes.
 struct BuildRecord: Codable {
@@ -12,6 +12,17 @@ struct BuildRecord: Codable {
     }
 
     var modules: [String: Entry] = [:]
+    // By binary, workspace-relative.
+    var links: [String: Entry] = [:]
+
+    init() {}
+
+    // A record written before links were recorded reads with none.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        modules = try c.decode([String: Entry].self, forKey: .modules)
+        links = try c.decodeIfPresent([String: Entry].self, forKey: .links) ?? [:]
+    }
 
     static let fileName = ".nomu-last-build.json"
 
@@ -35,28 +46,34 @@ struct BuildRecord: Codable {
 
     // Record a module's key; its inputs and details when `explain`, else the previous ones while the key holds.
     mutating func update(_ module: String, key: JobKey, details: [String: String]?, explain: Bool) {
-        let previous = modules[module]
+        modules[module] = Self.entry(modules[module], key, details, explain)
+    }
+
+    // Record a binary's link key, as `update` records a module's.
+    mutating func updateLink(_ binary: String, key: JobKey, explain: Bool) {
+        links[binary] = Self.entry(links[binary], key, nil, explain)
+    }
+
+    private static func entry(_ previous: Entry?, _ key: JobKey, _ details: [String: String]?, _ explain: Bool) -> Entry {
         let kept = previous?.key == key.key
-        modules[module] = Entry(key: key.key,
-                                inputs: explain ? key.inputs : (kept ? previous?.inputs : nil),
-                                details: explain ? details : (kept ? previous?.details : nil))
+        return Entry(key: key.key, inputs: explain ? key.inputs : (kept ? previous?.inputs : nil),
+                     details: explain ? details : (kept ? previous?.details : nil))
     }
 }
 
-// Why a module compiled, compared with its entry in the last-build record (task 212.3).
+// Why a module compiled, or a binary linked, compared with its entry in the last-build record (task 212.3).
 enum CompileReason {
-    // `cachable`: the module's outputs go into the host cache, so an unchanged key means its entry was missing.
-    static func of(previous: BuildRecord.Entry?, key: JobKey, details: [String: String]?, cachable: Bool) -> String {
+    static func of(previous: BuildRecord.Entry?, key: JobKey, details: [String: String]?) -> String {
         guard let previous else { return "no previous build recorded" }
-        if previous.key == key.key {
-            return cachable ? "unchanged; its cache entry was missing or damaged" : "unchanged; not cached yet"
-        }
+        if previous.key == key.key { return "unchanged; its cache entry was missing or damaged" }
         guard let before = previous.inputs else {
             return "key changed (the last build did not record its inputs; build with --explain to record them)"
         }
         let old = JobKey(inputs: before)
-        return key.changes(from: old).map { describe($0, old: before, new: key.inputs, oldDetails: previous.details,
-                                                     newDetails: details) }
+        // A tool present on one side only entered or left the link with a setting (`dsymutil` with
+        // `link.debug_info_storage`), which names the change.
+        let changed = key.changes(from: old).filter { !$0.hasPrefix("tool:") || (before[$0] != nil && key.inputs[$0] != nil) }
+        return changed.map { describe($0, old: before, new: key.inputs, oldDetails: previous.details, newDetails: details) }
             .joined(separator: "; ")
     }
 
@@ -71,6 +88,13 @@ enum CompileReason {
         if name.hasPrefix("imports:") { return "imports changed: \(shown(String(name.dropFirst(8))))" }
         if name.hasPrefix("setting:") {
             return "setting \(name.dropFirst(8)): \(old[name] ?? "unset") → \(new[name] ?? "unset")"
+        }
+        if name.hasPrefix("object:") { return "object changed: \(name.dropFirst(7))" }
+        if name.hasPrefix("tool:") {
+            return "toolchain changed: \(name.dropFirst(5)) (\(old[name] ?? "unset") → \(new[name] ?? "unset"))"
+        }
+        if name.hasPrefix("runtime-global:") {
+            return "runtime setting \(name.dropFirst(15)): \(old[name] ?? "unset") → \(new[name] ?? "unset")"
         }
         // A dependency's origin (`scope/name/path…`) as a module reads elsewhere (`scope.name:path`).
         func module(_ origin: Substring) -> String {
@@ -91,6 +115,12 @@ enum CompileReason {
         case "target", "target.cpu", "target.features": return "target changed (\(name))"
         case "files": return "file list changed"
         case "dependencies": return "dependency list changed"
+        case "objects": return "object list changed"
+        case "runtime-archive": return "runtime archive changed"
+        case "config-record": return "configuration record changed"
+        case "link.recipe": return "link recipe changed"
+        case "link.debug-info-storage":
+            return "setting link.debug_info_storage: \(old[name] ?? "unset") → \(new[name] ?? "unset")"
         default: return "\(name) changed"
         }
     }

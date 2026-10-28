@@ -40,7 +40,7 @@ public struct JobKey: Equatable {
 public final class JobKeyer {
     let compilerIdentity: String
     let target: (triple: String, cpu: String, features: String)
-    private let featuresHash: String
+    let featuresHash: String
     private var fileHashes: [String: (stamp: FileStamp, hash: String)] = [:]
 
     public init(compilerIdentity: String = BuildInfo.compilerIdentity,

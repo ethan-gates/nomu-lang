@@ -46,7 +46,7 @@ extension Plan {
             out += "  package \(m.package.name) at \(render(m.package.root))" + (m.isProduct ? " (product)" : "") + "\n"
             out += "  files " + j.files.map(basename).joined(separator: " ") + "\n"
             var kind = [j.product == .binary ? "binary" : "library"]
-            if j.inHostCache { kind.append("host-cache") }
+            if j.inLanguageWorkspace { kind.append("language") }
             if j.runtimeSubsetByMembership { kind.append("runtime-subset") }
             if j.whiteBox { kind.append("white-box") }
             out += "  " + kind.joined(separator: ", ") + "\n"

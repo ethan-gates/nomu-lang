@@ -7,27 +7,27 @@ workspaces
 job nomu.nomu:runtime
   package runtime at @nomu.nomu/runtime (product)
   files runtime.nomu
-  library, host-cache, runtime-subset
+  library, language, runtime-subset
   out @nomu.nomu_lang/build/_external/nomu.nomu/runtime/runtime
 job nomu.nomu:std/prelude
   package std at @nomu.nomu/std (product)
   files prelude.nomu
-  library, host-cache
+  library, language
   out @nomu.nomu_lang/build/_external/nomu.nomu/std/prelude/prelude
 job nomu.nomu:std/math
   package std at @nomu.nomu/std (product)
   files math.nomu
-  library, host-cache
+  library, language
   out @nomu.nomu_lang/build/_external/nomu.nomu/std/math/math
 job nomu.nomu:std/random
   package std at @nomu.nomu/std (product)
   files random.nomu
-  library, host-cache
+  library, language
   out @nomu.nomu_lang/build/_external/nomu.nomu/std/random/random
 job nomu.nomu:std/time
   package std at @nomu.nomu/std (product)
   files time.nomu
-  library, host-cache
+  library, language
   out @nomu.nomu_lang/build/_external/nomu.nomu/std/time/time
   import time.nomu:3:1 pkg/prelude → nomu.nomu:std/prelude
   sees nomu.nomu:std/prelude

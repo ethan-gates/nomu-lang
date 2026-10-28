@@ -86,6 +86,9 @@ correctness. Differential stage-diffing (156) and Bazel's caching (192) need the
   two checkout and cache paths); `build_tests` (`testDebugInfoStorage`) checks both forms. Checked by hand: lldb
   lists source through the relative debug map, from the workspace and from another directory, and through the
   dSYM.
+  Corrected in [214](214-link-caching.md): `dsymutil` resolved the relative debug map against the current
+  directory, so a `dsym` build run from outside the workspace root wrote an empty dSYM; it now reads objects from
+  the workspace root.
 
 ## Refs
 

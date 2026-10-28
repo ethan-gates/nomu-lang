@@ -1,7 +1,7 @@
 import config
 
 // The compiler's settings (G8) and its builtin configs (G4). `build` and `run` select `debug` by default,
-// `test` selects `test`; externals and the language workspace build under `debug` when nothing is selected.
+// `test` selects `test`; externals and the language workspace build under `release` when nothing is selected.
 public enum CompilerSettings {
     public static let schema = Schema(
         settings: [
@@ -34,14 +34,18 @@ public enum CompilerSettings {
                     doc: "Where a binary's debug info lives: `objects` leaves it in the object files, which the binary names by workspace-relative path; `dsym` gathers it into `<binary>.dSYM` and leaves no paths in the binary.",
                     targets: [.build], granularity: .program,
                     configValues: [.init(["release"], .choice("dsym"))]),
+            Setting("cache.root", .string, default: .string(""),
+                    doc: "The per-host build cache's directory: absolute, `~/`-relative, or relative to the entry workspace; empty is the platform's cache directory. `NOMU_CACHE_DIR` takes precedence.",
+                    targets: [.build], granularity: .build),
             Setting("test.runtime_prelude", .bool, default: .bool(false),
                     doc: "Prepend the runtime prelude, so a white-box test calls runtime internals by name.",
                     targets: [.compile], granularity: .module),
         ],
         configs: [("debug", nil), ("release", nil), ("test", "debug")])
 
-    // Interim: `release` once the build cache (172) makes optimized externals cheap to keep.
-    public static let externalDefault = ["debug"]
+    // The configs externals and the language workspace build under when nothing is selected: `release`, since the
+    // build cache (172) compiles each once per key, so optimized dependencies cost one compile.
+    public static let externalDefault = ["release"]
 
     // The settings the runtime reads, each with the symbol of the global it reads (G14): the name with each
     // `.` as `_`, under `nomu_setting_` (`gc.stress` would be `nomu_setting_gc_stress`).

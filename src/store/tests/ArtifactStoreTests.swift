@@ -54,6 +54,31 @@ final class ArtifactStoreTests: XCTestCase {
         XCTAssertNil(store.lookup("k2"))
     }
 
+    // A link's outputs: an executable, kept executable, and a bundle's files under directories made as needed.
+    func testExecutableAndBundleOutputs() throws {
+        let dir = work + "/out-link"
+        try write("binary", dir + "/app")
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir + "/app")
+        try write("dwarf", dir + "/app.dSYM/Contents/Resources/DWARF/app")
+        let published = try store.publish("link", outputsIn: dir, files: ["app", "app.dSYM/Contents/Resources/DWARF/app"])
+        let target = work + "/build/app"
+        try store.materialize(try XCTUnwrap(store.lookup("link")), into: target)
+        XCTAssertEqual(published.files.map(\.path), ["app", "app.dSYM/Contents/Resources/DWARF/app"])
+        XCTAssertEqual(read(target + "/app.dSYM/Contents/Resources/DWARF/app"), "dwarf")
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: target + "/app"))
+    }
+
+    // An action result holds only what the outputs' contents determine, so two hosts publishing one key write the
+    // same bytes; when a blob was last hashed is this host's, under `checked/`.
+    func testResultHoldsNoHostState() throws {
+        try publish("k")
+        XCTAssertNotNil(store.lookup("k"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: store.root + "/ac/k"))) as? [String: Any])
+        for file in try XCTUnwrap(json["files"] as? [[String: Any]]) { XCTAssertEqual(Set(file.keys), ["path", "size", "hash"]) }
+        let marks = try FileManager.default.contentsOfDirectory(atPath: store.root + "/checked")
+        XCTAssertEqual(marks.count, 2)
+    }
+
     // A materialized output changed in place leaves its blob as it was.
     func testMaterializedOutputIsIndependentOfItsBlob() throws {
         let result = try publish("k")

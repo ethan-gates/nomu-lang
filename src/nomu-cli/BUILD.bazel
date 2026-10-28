@@ -1,4 +1,5 @@
 load("@rules_swift//swift:swift.bzl", "swift_binary")
+load("//bazel:opt_binary.bzl", "opt_binary")
 
 swift_binary(
     name = "nomu",
@@ -14,4 +15,11 @@ swift_binary(
         "//src/settings",                   # the compiler's settings, read from a job file
     ],
     visibility = ["//visibility:public"]
+)
+
+# `nomu` built optimized whatever the build's mode, for tests that run it.
+opt_binary(
+    name = "nomu_opt",
+    binary = ":nomu",
+    visibility = ["//visibility:public"],
 )

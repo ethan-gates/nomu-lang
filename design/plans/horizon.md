@@ -36,13 +36,13 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
 └── benchmark against Go and Swift (when the language is complete)
     └── 150  self-hosted GC ladder — GenImmix correctness-complete on the one runtime (197)
         ├── 158  GC packaging — self-contained plans behind one trigger protocol
-        ├── 159  GC observability — collection tracing, stats, pause timing
+        ├── 159  GC observability — collection tracing, stats, pause timing  ◀ next
         ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
         │        complements 179 (value-level GC classification)
         ├── 171  modules cleanup — cross-module generics residuals           (perf-accuracy)
         │        interacts with 170 (method-level generics), 118 (associated types)
         ├── 203  symbol encoding — one injective mangling for every family   (correctness)  (done)
-        └── 172  incremental build cache — content-addressed compiles and links (dev-productivity)
+        └── 172  incremental build cache — content-addressed compiles and links (dev-productivity)  (done)
             ├── 206  compiler identity — commit plus uncommitted changes, baked in          (done)
             ├── 208  job keys — over everything a compile reads                            (done)
             ├── 209  content-addressed store — one store for every cached artifact         (done)
@@ -50,11 +50,11 @@ floor (`runtime.c`). LXR is the algorithm change that remains.
             ├── 210  workspace lock and build/ layout                                       (done)
             ├── 211  several root modules per build                                       (done)
             ├── 212  build-cache observability — what was cached and why                  (done)
-            ├── 214  link caching — a cached link for an unchanged binary                  ◀ next
+            ├── 214  link caching — a cached link for an unchanged binary                  (done)
             └── 198  build configuration — modes, per-workspace settings, the cache-key input  (done)
 ```
 
-**Order of the next run:** 172's prerequisites (206–212 done; 214, link caching, next), then 172 itself, which wires them together, then 159 (198 and 203 are done). 190 (explicit module builds) and 200 (the
+**Order of the next run:** 172 and its prerequisites (206–212, 214) are done; next is 159 (198 and 203 are done). 172's keys are transitive and whole-file; narrowing them to what a compile reads, with interface and object actions and a scheduler, is [217](tasks/217-build-graph-granularity.md), after [202](tasks/202-one-inference-phase.md) (one lowering per module), off this chain. 190 (explicit module builds) and 200 (the
 YAML parser, which 198's configuration files needed) are done; 200's open items are
 [204](tasks/204-yaml-parser-upgrades.md), off this chain. 198 went ahead of 203 by choice; 203 is 190's
 last correctness finding (a weak-symbol collision silently links the wrong definition) and follows it. 198 carries only what 172 needs; the rest of

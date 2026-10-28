@@ -1,8 +1,8 @@
 # Incremental build cache (content-addressed, module-granular compiles and cached links)
 
 **Avenue:** Infra · **Type/Lifecycle:** `perf · driver` · **Size:** M (the wiring; the parts are their own
-tasks) · **Status:** design settled; waits on [207](207-build-determinism.md).6 and [214](214-link-caching.md)
-(206 and 208–212 done) ·
+tasks) · **Status:** done; keys over only what a compile reads, and interface and object actions, are
+[217](217-build-graph-granularity.md)'s ·
 **Source:** pulled out of [100](100-modules.md) §100.4.5 (driver incremental cache) + §100.4.6 (incremental /
 stability tests).
 
@@ -67,12 +67,52 @@ story (sub-module units, cached monomorphizations, LSP responsiveness), downstre
     recompiles.
 - **172.4** Organize the Swift sources better.
 
+## Done
+
+- **172.1** One scheme for every job: each module, the language workspace's included, is looked up in the store
+  under its job key (208); a hit materializes the entry and skips the compile, a miss compiles into scratch,
+  publishes and materializes. The language workspace's workspace-wide key (`languageWorkspaceKey`,
+  `languageModuleKey`, `PlanOptions.outputOptions`, `languageCanonical`) is gone; `ModuleJob.inLanguageWorkspace`
+  marks what still differs (the prelude's privileges, sources embedded in `nomu`), and the plan dump says
+  `language`. A target asked for its debug views (`--emit-noir`/`-ssair`/`-llvm`/`-nmi`, a `--stop`) compiles in
+  place and stays out of the store. `--emit-jobs` writes the job file on a hit too. Each action result records
+  its module (`inputs.module`) or binary (`inputs.binary`) beside its key. A lookup hashes a blob once per write:
+  the store marks a hashed blob with its modification time under `checked/`, kept out of the action results so
+  they stay byte-identical across hosts. Reasons lose `unchanged; not cached yet`. Tests:
+  `testUnchangedBuildCompilesNothing`; `testExplainSaysWhyEachModuleCompiled` (a body edit that keeps `data`'s
+  interface compiles `data` alone); `testCachedBinaryServesAnotherCheckout` (another checkout compiles nothing);
+  `testResultHoldsNoHostState`. The sweep: 1422 outputs identical (action results now for every module).
+- **172.2** `CompilerSettings.externalDefault` is `release`: with nothing selected, externals and the language
+  workspace compile under `release` (`opt.level: o2`, `opt.mono: all`) and the building workspace under `debug`;
+  the binary's record says so (`externals: release`, `language: release`). A later `-c release` build compiles only
+  the building workspace's modules, the rest coming from the cache under unchanged keys. A selected config still
+  reaches externals (`-c debug` gives every module `debug`). Tests: `testReleaseReachesEveryJob`,
+  `testBinaryCarriesItsConfiguration`, `testSettingsReachEachModulesCompile`. A cold build of `xworkspace_basic`
+  stays about 2 s; the sweep (1427 outputs) holds with optimized dependencies.
+- **172.3** The sweep's second round is incremental (`compiler-test --check-reproducible`): it builds every
+  configuration from the unedited sources, then appends an unused private function to one file of each of a
+  fixture's library modules (their objects change, their `.nmi` and `.bir` do not) and builds again, serving the
+  modules above from the cache; the outputs equal round 1's clean build of the edited sources, byte for byte
+  (1427 outputs, 52 modules edited). `build_tests`: `testInterfaceEditRecompilesEveryModuleAbove` (an ABI edit in
+  `data` recompiles `left`, `right` and the root, whose key covers `data`'s `.nmi` though `left`'s and `right`'s
+  come out identical: the transitive rule 217 narrows), `testConcurrentWorkspacesShareOneCache` (two workspaces
+  at once against one cache; the entries verify and a second build of each compiles and links nothing). The
+  other cases came with 172.1 and 214: an interface-preserving edit compiles one module, another checkout
+  compiles nothing, the reasons name each edit.
+- **172.4** `Driver.swift` split by concern, code moved without change: `Driver.swift` (the build loop),
+  `Commands.swift` (resolution, `build`/`run`/`test`/`query`), `CompileSupport.swift` (what `compile` uses: the
+  escape perf section, external declarations, templates, the runtime prelude), `Link.swift`,
+  `RuntimeArchive.swift`, `Support.swift` (`runProcess`, `writeArtifact`).
+
 ## Deferred until after 172
 
 Explicitly out of 172's scope; each is picked up after it lands. Added to as the work goes.
 
 - **A shared cache layer, remote caching and remote execution** — Bazel's ([192](192-bazel-friendliness.md)).
 - **Granularity below the module** — [136](136-incremental-compilation.md).
+- **Keys over what a compile reads, interface and object actions, a scheduler** —
+  [217](217-build-graph-granularity.md). 172's keys are transitive and whole-file: a job's key covers every
+  transitive dependency's `.nmi` and `.bir` bytes, sound and over-conservative.
 - **Eviction, size limits, clearing and totals across builds** — [199](199-cache-management.md).
 - **Replacing the key hash** — open question 1; 64-bit FNV-1a stays behind one function.
 - **More of `build/`:** objects and interfaces linked or listed there, and tools reading two configurations

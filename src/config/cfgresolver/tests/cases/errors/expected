@@ -2,4 +2,4 @@ exit 1
 app/cfg.yaml:5:3: error: `libb` is not `all` or a pin alias; did you mean `lib`?
 app/cfg.yaml:2:3: error: unknown setting `oven.tmp`; did you mean `oven.temp`?
 app/cfg.yaml:3:3: error: `oven.mode`: `grill` is not one of bake, broil, convect
-app/net/cfg.yaml:2:3: error: `shop.name` is a program setting, set only in the entry workspace's `cfg.yaml`
+app/net/cfg.yaml:2:3: error: `shop.name` is a program setting, set only in a workspace's `cfg.yaml`

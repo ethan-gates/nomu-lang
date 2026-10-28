@@ -1,16 +1,24 @@
 import embedded
 import store
 
-// The per-host cache (task 190, D4): language-level artifacts shared by every build on the host and kept
-// across `git clean -dfx`, namely the runtime archive and the language workspace's modules. They live in one
-// store under the root (task 209): an action cache (`ac/<key>`) and a content-addressed store (`cas/<digest>`);
-// a build materializes each one's outputs under its `build/`.
+// The per-host cache (task 190, D4): every build's compiled modules and links, keyed by what each reads (job and
+// link keys), and the runtime archive, shared by every build on the host and kept across `git clean -dfx`. They
+// live in one store under the root (task 209): an action cache (`ac/<key>`) and a content-addressed store
+// (`cas/<digest>`); a build materializes each one's outputs under its `build/`.
 public enum HostCache {
-    // The cache root: `NOMU_CACHE_DIR` when set, else the platform user cache directory
+    // The cache root: `NOMU_CACHE_DIR` when set; else `configured`, the entry workspace's `cache.root` (absolute,
+    // `~/`-relative, or relative to `workspaceRoot`); else the platform user cache directory
     // (`~/Library/Caches/nomu` on macOS; `$XDG_CACHE_HOME/nomu`, falling back to `~/.cache/nomu`, elsewhere).
-    public static func root(environment env: [String: String]) -> String {
+    public static func root(environment env: [String: String], configured: String? = nil,
+                            workspaceRoot: String = "") -> String {
         if let dir = env["NOMU_CACHE_DIR"], !dir.isEmpty { return dir }
         let home = env["HOME"] ?? "/tmp"
+        if let c = configured, !c.isEmpty {
+            if c.hasPrefix("/") { return c }
+            if c == "~" { return home }
+            if c.hasPrefix("~/") { return home + c.dropFirst(1) }
+            return workspaceRoot + "/" + c
+        }
         #if os(macOS)
         return home + "/Library/Caches/nomu"
         #else
@@ -40,36 +48,16 @@ public enum HostCache {
         #endif
     }
 
-    // The runtime archive's key: the embedded runtime sources, the host architecture and the recipe (the
-    // driver's commands that build the archive, `PlanOptions.runtimeRecipe`). Editing the runtime rebuilds the
-    // compiler, which changes the embedded content and so the key; editing a command changes the recipe. (The
-    // local `cc` version is deliberately left out: an archive built by an older `cc` still links and runs.)
-    public static func runtimeArchiveKey(recipe: [[String]]) -> String {
+    // The runtime archive's key: the embedded runtime sources, the host architecture, the recipe (the driver's
+    // commands that build the archive, `PlanOptions.runtimeRecipe`) and the identities of the tools and SDK it
+    // runs (`PlanOptions.runtimeToolchain`). Editing the runtime rebuilds the compiler, which changes the embedded
+    // content and so the key; editing a command changes the recipe; a toolchain update changes the identities.
+    public static func runtimeArchiveKey(recipe: [[String]], toolchain: [String: String] = [:]) -> String {
         var h = Hasher64()
         h.mix(runtimeSourcesDigest)
         h.mix(hostArch)
         for command in recipe { h.mix(String(command.count)); for arg in command { h.mix(arg) } }
-        return h.hex
-    }
-
-    // The language workspace's key: its sources, the compiler's identity (`BuildInfo.compilerIdentity`: its
-    // commit plus any uncommitted changes; output and the `.nmi` / `.bir` formats change with the compiler), the host target,
-    // and every option that changes the compiled output.
-    public static func languageWorkspaceKey(compilerIdentity: String, outputOptions: [String]) -> String {
-        var h = Hasher64()
-        h.mix(languageSourcesDigest)
-        h.mix(compilerIdentity)
-        h.mix(hostTarget)
-        for o in outputOptions { h.mix(o) }
-        return h.hex
-    }
-
-    // One language-workspace module's key: the workspace's key and the module's path within it.
-    public static func languageModuleKey(workspaceKey: String, path: [String]) -> String {
-        var h = Hasher64()
-        h.mix(workspaceKey)
-        h.mix(String(path.count))
-        for p in path { h.mix(p) }
+        for name in toolchain.keys.sorted() { h.mix(name); h.mix(toolchain[name]!) }
         return h.hex
     }
 

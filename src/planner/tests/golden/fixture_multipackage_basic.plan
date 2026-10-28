@@ -7,12 +7,12 @@ workspaces
 job nomu.nomu:runtime
   package runtime at @nomu.nomu/runtime (product)
   files runtime.nomu
-  library, host-cache, runtime-subset
+  library, language, runtime-subset
   out @nomu.mpbasic/build/_external/nomu.nomu/runtime/runtime
 job nomu.nomu:std/prelude
   package std at @nomu.nomu/std (product)
   files prelude.nomu
-  library, host-cache
+  library, language
   out @nomu.mpbasic/build/_external/nomu.nomu/std/prelude/prelude
 job nomu.mpbasic:greet
   package greetlib at @nomu.mpbasic/greet (product)

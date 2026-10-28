@@ -1,9 +1,16 @@
 import Foundation
 
-// The reproducibility sweep (`--check-reproducible`, task 207.4): builds every selected compile configuration twice from
-// clean, and compares what the build cache stores, byte for byte. Each round builds from its own copy of the
-// sources with its own host cache, the second at other, longer paths, so one comparison covers both
-// non-determinism (unordered iteration, timestamps) and paths leaking into outputs. Compared: every file under
+// The reproducibility sweep (`--check-reproducible`, tasks 207.4 and 172.3): builds every selected compile
+// configuration in two rounds and compares what the build cache stores, byte for byte. Each round builds from its
+// own copy of the sources with its own host cache, the second at other, longer paths, so one comparison covers
+// non-determinism (unordered iteration, timestamps), paths leaking into outputs, and incremental builds:
+//   - round 1 builds the edited sources from clean;
+//   - round 2 builds the sources as they are, then the edited ones, so its second build serves what the edit left
+//     unchanged from the cache and compiles the rest, and must produce round 1's outputs.
+// The edit appends an unused private function to one file of each of a fixture's library modules (each directory
+// below the target holding sources): their objects change and their `.nmi` and `.bir` do not, so the modules
+// above them come from the cache. Round 2's cache also holds the unedited build's entries; every entry of round 1
+// must be in it, the same. Compared: every file under
 // each workspace's `build/` and the host cache's action results and blobs (`ac/`, `cas/`): objects, `.nmi`,
 // `.bir`, the runtime archive, binaries and their dSYMs, the last-build record. Left out: the workspace lock (its
 // holder's pid) and each binary's `.lldbinit`, which maps to this machine's paths by design. Runs only when asked; it replaces the compile and run phases. `nomu build
@@ -18,7 +25,7 @@ struct ReproducibilitySweep {
         let base = NSTemporaryDirectory() + "nomu-reproducible-sweep-\(ProcessInfo.processInfo.processIdentifier)"
         let places = [(src: base + "/a/src", cache: base + "/a/cache"),
                       (src: base + "/elsewhere/round-b/src", cache: base + "/elsewhere/round-b/host-cache")]
-        print("reproducible: \(configs.count) compile configurations, two clean rounds under \(base)")
+        print("reproducible: \(configs.count) compile configurations, a clean and an incremental round under \(base)")
 
         var rounds: [[String: String]] = []
         for (i, place) in places.enumerated() {
@@ -26,20 +33,28 @@ struct ReproducibilitySweep {
             if let error = copyWorkspace(projectRoot: ctx.projectRoot, fixtures: configs.map(\.fixture), to: place.src) {
                 die("reproducible: \(error)")
             }
-            let failures = build(configs, src: place.src, cache: place.cache)
-            if !failures.isEmpty {
-                for f in failures { print("FAIL build \(f.name): \(f.detail)") }
-                print("== reproducible: \(failures.count) builds failed in round \(i + 1); outputs kept under \(base) ==")
-                return 1
+            // Round 2 first builds the sources as they are, warming its cache.
+            var steps = ["edited"]
+            if i == 1 { steps.insert("unedited", at: 0) }
+            var edited = 0
+            for step in steps {
+                if step == "edited" { edited = edit(fixtures: Set(configs.map(\.fixture)), src: place.src) }
+                let failures = build(configs, src: place.src, cache: place.cache)
+                if !failures.isEmpty {
+                    for f in failures { print("FAIL build \(f.name): \(f.detail)") }
+                    print("== reproducible: \(failures.count) builds of the \(step) sources failed in round \(i + 1); outputs kept under \(base) ==")
+                    return 1
+                }
             }
             rounds.append(outputs(src: place.src, cache: place.cache))
-            print("round \(i + 1): \(rounds[i].count) outputs in \(String(format: "%.1f", Date().timeIntervalSince(start)))s")
+            print("round \(i + 1) (\(steps.joined(separator: ", then "))): \(rounds[i].count) outputs, \(edited) modules edited, in \(String(format: "%.1f", Date().timeIntervalSince(start)))s")
         }
 
         let (a, b) = (rounds[0], rounds[1])
         var differences: [String] = []
         for rel in Set(a.keys).union(b.keys).sorted() {
-            guard let pa = a[rel] else { differences.append("\(rel): only in round 2"); continue }
+            // Round 2's cache also holds the unedited build's entries.
+            guard let pa = a[rel] else { if !rel.hasPrefix("cache/") { differences.append("\(rel): only in round 2") }; continue }
             guard let pb = b[rel] else { differences.append("\(rel): only in round 1"); continue }
             if let d = firstDifference(pa, pb) { differences.append("\(rel): \(d)") }
         }
@@ -47,11 +62,36 @@ struct ReproducibilitySweep {
         if differences.count > 50 { print("… and \(differences.count - 50) more") }
         if differences.isEmpty {
             try? fm.removeItem(atPath: base)
-            print("== reproducible: \(a.count) outputs identical across both rounds ==")
+            print("== reproducible: \(a.count) outputs identical across both rounds, the second incremental ==")
             return 0
         }
         print("== reproducible: \(differences.count) of \(Set(a.keys).union(b.keys).count) outputs differ; rounds kept under \(base) ==")
         return 1
+    }
+
+    // Append an unused private function to the first source file of each directory below each fixture's target
+    // (its library modules). Returns how many were edited.
+    private func edit(fixtures: Set<String>, src: String) -> Int {
+        let fm = FileManager.default
+        var edited = 0
+        // A directory is edited once, though it may lie below more than one fixture's target.
+        var done = Set<String>()
+        for fixture in fixtures.sorted() where !(fixture as NSString).isAbsolutePath {
+            let target = src + "/" + fixture
+            var byDir: [String: [String]] = [:]
+            for rel in (fm.enumerator(atPath: target)?.allObjects as? [String]) ?? []
+                where rel.hasSuffix(".nomu") && rel.contains("/") && !rel.split(separator: "/").contains("build") {
+                byDir[target + "/" + (rel as NSString).deletingLastPathComponent, default: []].append(target + "/" + rel)
+            }
+            for (dir, files) in byDir.sorted(by: { $0.key < $1.key }) where done.insert(dir).inserted {
+                guard let first = files.sorted().first, let handle = FileHandle(forWritingAtPath: first) else { continue }
+                handle.seekToEndOfFile()
+                handle.write(Data("\nprivate fun incrementalProbe() -> Int {\n    return 1\n}\n".utf8))
+                try? handle.close()
+                edited += 1
+            }
+        }
+        return edited
     }
 
     // Build each configuration under `src` with the host cache at `cache`: one fixture's configurations one

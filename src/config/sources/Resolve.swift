@@ -166,8 +166,9 @@ private func check(_ schema: Schema, _ scoped: [ScopedLayer]) throws(ConfigError
                 ok = false
             }
             if !layer.kind.admits(setting.granularity) {
+                let place = layer.kind == .externals ? "outside `externals:`" : "in a workspace's `cfg.yaml`"
                 errors.report(ConfigError(.settingInWrongLayer, d.origin,
-                                          "`\(d.setting)` is a \(setting.granularity.rawValue) setting, set only in the entry workspace's `cfg.yaml`"))
+                                          "`\(d.setting)` is a \(setting.granularity.rawValue) setting, set only \(place)"))
                 ok = false
             }
             let qualifier = Set(d.configs)

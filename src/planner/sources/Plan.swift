@@ -20,10 +20,9 @@ public struct ModuleJob: Equatable {
     // A module of the language workspace's `runtime` package: its functions are a runtime subset by
     // membership.
     public let runtimeSubsetByMembership: Bool
-    // The job's key in the per-host cache (D4); nil for a job the cache does not hold. A present entry means the
-    // job's outputs are materialized into `outputDir` and its compile skipped.
-    public let hostCacheKey: String?
-    public var inHostCache: Bool { hostCacheKey != nil }
+    // A module of the language workspace: its sources are embedded in the compiler, and it compiles with the
+    // prelude's privileges.
+    public let inLanguageWorkspace: Bool
 
     public var object: String { outputDir + "/" + stem + ".o" }
     public var interface: String { outputDir + "/" + stem + ".nmi" }
@@ -73,12 +72,10 @@ public struct PlanOptions {
     public var product: ModuleJob.Product = .binary
     // The per-host cache root (D4).
     public var cacheRoot: String = HostCache.root(environment: ProcessInfo.processInfo.environment)
-    // The compiler's identity for the language workspace's cache key (`BuildInfo.compilerIdentity`).
-    public var compilerIdentity = "unstamped"
-    // Every option that changes compiled output (e.g. `-O`), as it enters the language workspace's key.
-    public var outputOptions: [String] = []
     // The commands that build the runtime archive, as the driver runs them; they enter the archive's key.
     public var runtimeRecipe: [[String]] = []
+    // The identities of the tools and SDK the recipe runs, by name; they enter the archive's key.
+    public var runtimeToolchain: [String: String] = [:]
     public init() {}
 }
 
@@ -128,12 +125,6 @@ extension Plan {
         guard diagnostics.isEmpty else { return ([], nil, [], diagnostics) }
 
         let root = workspaces.root
-        let languageKey = HostCache.languageWorkspaceKey(compilerIdentity: settings.compilerIdentity,
-                                                         outputOptions: settings.outputOptions)
-        func hostCacheKey(_ key: ModuleKey) -> String? {
-            key.workspace == LanguageWorkspace.identity
-                ? HostCache.languageModuleKey(workspaceKey: languageKey, path: key.path) : nil
-        }
         // `build/` shows the last build, whatever its configuration (210); one invocation per workspace at a time.
         let build = root.root + "/build"
         // The language workspace's modules go under `_external/` like any other workspace's.
@@ -168,13 +159,14 @@ extension Plan {
                 outputDir: outputDir(key), stem: key.path.last!,
                 whiteBox: table.testImportTargets.contains(key),
                 runtimeSubsetByMembership: isLanguageWorkspace && m.package.name == "runtime",
-                hostCacheKey: hostCacheKey(key)))
+                inLanguageWorkspace: isLanguageWorkspace))
         }
 
         var archive: RuntimeArchiveJob? = nil
         var links: [LinkJob] = []
         if settings.product == .binary {
-            let archiveKey = HostCache.runtimeArchiveKey(recipe: settings.runtimeRecipe)
+            let archiveKey = HostCache.runtimeArchiveKey(recipe: settings.runtimeRecipe,
+                                                         toolchain: settings.runtimeToolchain)
             let a = RuntimeArchiveJob(key: archiveKey, outputDir: build + "/_runtime")
             archive = a
             let jobByKey = Dictionary(uniqueKeysWithValues: jobs.map { ($0.module, $0) })
