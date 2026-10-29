@@ -4,19 +4,20 @@ import store
 
 // Builds of real suite fixtures with the `nomu` binary (190.5.2): each module compiles once per build, the
 // host cache serves the language workspace on the next build, and a planning error stops the build before
-// any module compiles. Each test runs `nomu build --report-jobs` on a copy of the fixtures (a build writes
-// under their `build/`) with its own host cache.
+// any module compiles. Each test runs `nomu build` on a copy of the fixtures (a build writes under their
+// `build/`) with its own host cache, and reads what the build did from its report (`build/_perf/report.json`).
 final class BuildTests: XCTestCase {
     private var repo = ""
     private var cache = ""
     private var nomu = ""
 
-    // What one `nomu build` did, read from its `--report-jobs` lines.
+    // What one `nomu build` did, read from its report.
     struct BuildResult {
         var binary: String? = nil
+        var binaries: [String] = []
         var compiled: [String] = []
         var cached: [String] = []
-        var reasons: [String: String] = [:]   // module → why it compiled (`--report-jobs` `reason` lines)
+        var reasons: [String: String] = [:]   // module (or `link:<binary>`) → why it compiled
         var linked: [String] = []             // binaries linked, workspace-relative
         var linkCached: [String] = []         // binaries taken from the host cache
     }
@@ -32,33 +33,49 @@ final class BuildTests: XCTestCase {
     }
 
     private func build(_ fixture: String, _ args: [String] = [], in root: String? = nil) throws -> BuildResult {
+        let target = (root ?? repo) + "/" + fixture
         let p = Process()
         p.executableURL = URL(fileURLWithPath: nomu)
-        p.arguments = ["build", "--report-jobs"] + args + [(root ?? repo) + "/" + fixture]
+        p.arguments = ["build"] + args + [target]
         p.environment = ProcessInfo.processInfo.environment.merging(["NOMU_CACHE_DIR": cache]) { $1 }
-        let out = Pipe()
-        p.standardOutput = out
+        p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         try p.run()
-        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         p.waitUntilExit()
+        var result = try report(for: target)
+        if p.terminationStatus != 0 { result.binary = nil }
+        return result
+    }
+
+    // The report a build of `target` wrote: in the `build/_perf/` of its workspace, the nearest directory at or above
+    // it with a `nomu.yaml`. Empty when the build wrote none.
+    private struct Report: Decodable {
+        struct Unit: Decodable { var kind: String; var name: String; var outcome: String; var reason: String? }
+        var status: String
+        var binaries: [String]
+        var units: [Unit]
+    }
+    private func report(for target: String) throws -> BuildResult {
+        var dir = target
+        while !FileManager.default.fileExists(atPath: dir + "/nomu.yaml") && dir != "/" {
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        let path = dir + "/build/_perf/report.json"
+        guard let data = FileManager.default.contents(atPath: path) else { return BuildResult() }
+        let report = try JSONDecoder().decode(Report.self, from: data)
         var r = BuildResult()
-        for line in text.split(separator: "\n") {
-            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
-            guard parts.count == 2 else { continue }
-            switch parts[0] {
-            case "compiled": r.compiled.append(parts[1])
-            case "cached": r.cached.append(parts[1])
-            case "binary": r.binary = parts[1]
-            case "linked": r.linked.append(parts[1])
-            case "link-cached": r.linkCached.append(parts[1])
-            case "reason":
-                let rest = parts[1].split(separator: " ", maxSplits: 1).map(String.init)
-                if rest.count == 2 { r.reasons[rest[0]] = rest[1] }
+        for u in report.units {
+            switch (u.kind, u.outcome) {
+            case ("module", "compiled"): r.compiled.append(u.name)
+            case ("module", "cached"): r.cached.append(u.name)
+            case ("link", "compiled"): r.linked.append(u.name)
+            case ("link", "cached"): r.linkCached.append(u.name)
             default: break
             }
+            if let why = u.reason { r.reasons[u.kind == "link" ? "link:" + u.name : u.name] = why }
         }
-        if p.terminationStatus != 0 { r.binary = nil }
+        r.binaries = report.binaries
+        if report.status == "built" { r.binary = report.binaries.first }
         return r
     }
 
@@ -100,6 +117,114 @@ final class BuildTests: XCTestCase {
         XCTAssertEqual(try output(of: XCTUnwrap(second.binary)), try output(of: XCTUnwrap(first.binary)))
         XCTAssertEqual(second.compiled, [])
         XCTAssertEqual(second.cached, first.compiled)
+    }
+
+    // Every build writes its report (task 193): `report.json`, `trace.json` and `index.html` under `build/_perf/`.
+    // The report lists every planned module once with its outcome, its counts agree with its units, and the summary
+    // line on stderr gives the same counts and the page's link.
+    func testReportListsEveryModule() throws {
+        let fixture = "tests/fixtures/module_link_diamond"
+        let r = try run(nomu, ["build", repo + "/" + fixture], env: ["NOMU_CACHE_DIR": cache])
+        XCTAssertEqual(r.status, 0, r.stderr)
+        let dir = repo + "/build/_perf/"
+        for name in ["report.json", "trace.json", "index.html"] {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: dir + name), name)
+        }
+        struct Report: Decodable {
+            struct Counts: Decodable { var total: Int; var compiled: Int; var cached: Int; var failed: Int }
+            struct Unit: Decodable { var kind: String; var name: String; var outcome: String }
+            var status: String
+            var modules: Counts
+            var units: [Unit]
+        }
+        let report = try JSONDecoder().decode(Report.self, from: try XCTUnwrap(FileManager.default.contents(atPath: dir + "report.json")))
+        XCTAssertEqual(report.status, "built")
+        let modules = report.units.filter { $0.kind == "module" }
+        XCTAssertEqual(Set(modules.map(\.name)).count, modules.count, "a module listed twice")
+        XCTAssertTrue(modules.map(\.name).contains("nomu.nomu_lang:" + fixture + "/data"))
+        XCTAssertEqual(report.modules.total, modules.count)
+        XCTAssertEqual(report.modules.compiled, modules.filter { $0.outcome == "compiled" }.count)
+        XCTAssertEqual(report.modules.cached, modules.filter { $0.outcome == "cached" }.count)
+        XCTAssertEqual(report.modules.compiled + report.modules.cached + report.modules.failed, report.modules.total)
+        XCTAssertTrue(r.stderr.contains("\(report.modules.total) modules: \(report.modules.compiled) compiled, \(report.modules.cached) cached"),
+                      r.stderr)
+        XCTAssertTrue(r.stderr.contains("report: " + URL(fileURLWithPath: dir + "index.html").absoluteString), r.stderr)
+    }
+
+    // A build that stops before it takes the workspace's lock (a configuration error) writes no report and removes
+    // the last build's, so no tool reads that one as this build's (task 193).
+    func testEarlyFailureRemovesTheLastReport() throws {
+        let fixture = "tests/fixtures/module_link_diamond"
+        XCTAssertNotNil(try build(fixture).binary)
+        let dir = repo + "/build/_perf/"
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir + "report.json"))
+        try write(repo + "/cfg.yaml", "opt:\n  inlin: false\n")
+        let r = try run(nomu, ["build", repo + "/" + fixture], env: ["NOMU_CACHE_DIR": cache])
+        XCTAssertNotEqual(r.status, 0)
+        for name in ["report.json", "trace.json", "index.html"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: dir + name), name)
+        }
+        XCTAssertNil(try build(fixture).binary)
+    }
+
+    // The report's critical path (task 193) follows the dependency graph: every unit on it depends on the one before,
+    // and it ends at the link. It weighs each unit by what building it costs, cached or not, so a rebuild the cache
+    // serves whole reports the same path, every unit's cost recorded.
+    func testReportCriticalPath() throws {
+        let fixture = "tests/fixtures/module_link_diamond"
+        struct Report: Decodable {
+            struct Path: Decodable { var dur: Int; var units: [String]; var summed: Int; var unrecorded: [String] }
+            struct Unit: Decodable { var name: String; var outcome: String; var cost: Int?; var dependencies: [String] }
+            var criticalPath: Path
+            var units: [Unit]
+        }
+        func report() throws -> Report {
+            let data = try XCTUnwrap(FileManager.default.contents(atPath: repo + "/build/_perf/report.json"))
+            return try JSONDecoder().decode(Report.self, from: data)
+        }
+        XCTAssertNotNil(try build(fixture).binary)
+        let cold = try report()
+        let deps = Dictionary(uniqueKeysWithValues: cold.units.map { ($0.name, Set($0.dependencies)) })
+        for (a, b) in zip(cold.criticalPath.units, cold.criticalPath.units.dropFirst()) {
+            XCTAssertTrue(deps[b]?.contains(a) == true, "\(b) does not depend on \(a)")
+        }
+        XCTAssertEqual(cold.criticalPath.units.last, "build/" + fixture + "/module_link_diamond")
+        XCTAssertGreaterThan(cold.criticalPath.dur, 0)
+        XCTAssertLessThanOrEqual(cold.criticalPath.dur, cold.criticalPath.summed)
+
+        XCTAssertNotNil(try build(fixture).binary)
+        let warm = try report()
+        XCTAssertTrue(warm.units.filter { $0.name != "build" }.allSatisfy { $0.outcome == "cached" && $0.cost != nil })
+        XCTAssertEqual(warm.criticalPath.unrecorded, [])
+        XCTAssertEqual(warm.criticalPath.units, cold.criticalPath.units)
+    }
+
+    // Every build writes its timeline (`build/_perf/trace.json`, task 193): one named track per unit, and on each
+    // track every event nests inside the one that encloses it, as a trace viewer requires. Beside it, the report page
+    // embeds the report.
+    func testReportTraceNests() throws {
+        XCTAssertNotNil(try build("tests/fixtures/module_link_diamond").binary)
+        let page = try String(contentsOfFile: repo + "/build/_perf/index.html", encoding: .utf8)
+        let json = try String(contentsOfFile: repo + "/build/_perf/report.json", encoding: .utf8)
+        XCTAssertTrue(page.contains(json.replacingOccurrences(of: "</", with: "<\\/")), "the page embeds the report")
+        let data = try XCTUnwrap(FileManager.default.contents(atPath: repo + "/build/_perf/trace.json"))
+        let trace = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let events = try XCTUnwrap(trace["traceEvents"] as? [[String: Any]])
+        let tracks = events.filter { $0["name"] as? String == "thread_name" }
+        XCTAssertEqual(tracks.count, try report(for: repo + "/tests/fixtures/module_link_diamond").compiled.count + 3,
+                       "a track per module, the archive, the link and the build")
+        let complete = events.filter { $0["ph"] as? String == "X" }
+        for tid in Set(complete.compactMap { $0["tid"] as? Int }) {
+            var open: [(start: Int, end: Int)] = []
+            let onTrack = complete.filter { $0["tid"] as? Int == tid }
+                .map { (start: $0["ts"] as! Int, end: ($0["ts"] as! Int) + ($0["dur"] as! Int), name: $0["name"] as! String) }
+                .sorted { ($0.start, -$0.end) < ($1.start, -$1.end) }
+            for e in onTrack {
+                while let top = open.last, top.end <= e.start, !(top.end == e.start && e.end == e.start) { open.removeLast() }
+                if let top = open.last { XCTAssertLessThanOrEqual(e.end, top.end, "\(e.name) on track \(tid) leaves its parent") }
+                open.append((e.start, e.end))
+            }
+        }
     }
 
     // Every library writes its `.bir`, empty when it ships no templates; a compile that finds a dependency's
@@ -374,20 +499,12 @@ final class BuildTests: XCTestCase {
         let singleB = try XCTUnwrap(try build(b).binary)
         let bytesB = try Data(contentsOf: URL(fileURLWithPath: singleB))
 
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: nomu)
-        p.arguments = ["build", "--report-jobs", repo + "/" + a, repo + "/" + b]
-        p.environment = ProcessInfo.processInfo.environment.merging(["NOMU_CACHE_DIR": cache]) { $1 }
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        try p.run()
-        let lines = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).split(separator: "\n")
-        p.waitUntilExit()
-        XCTAssertEqual(p.terminationStatus, 0)
-        let jobs = lines.filter { $0.hasPrefix("compiled ") || $0.hasPrefix("cached ") }.map { $0.split(separator: " ")[1] }
+        let both = try run(nomu, ["build", repo + "/" + a, repo + "/" + b], env: ["NOMU_CACHE_DIR": cache])
+        XCTAssertEqual(both.status, 0, both.stderr)
+        let r = try report(for: repo + "/" + a)
+        let jobs = r.compiled + r.cached
         XCTAssertEqual(jobs.count, Set(jobs).count, "a module built twice: \(jobs)")
-        XCTAssertEqual(lines.filter { $0.hasPrefix("binary ") }, ["binary " + singleA, "binary " + singleB])
+        XCTAssertEqual(r.binaries, [singleA, singleB])
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: singleA)), bytesA)
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: singleB)), bytesB)
         XCTAssertEqual(try output(of: singleA), "23\n")
@@ -707,7 +824,8 @@ final class BuildTests: XCTestCase {
         XCTAssertEqual(first.status, 0, first.stderr)
         XCTAssertTrue(FileManager.default.fileExists(atPath: repo + "/.nomu-cache/ac"))
         let second = try buildWithoutCacheDir(repo + "/" + fixture)
-        XCTAssertFalse(second.stdout.contains("compiled "), second.stdout)
+        XCTAssertEqual(second.status, 0, second.stderr)
+        XCTAssertEqual(try report(for: repo + "/" + fixture).compiled, [])
 
         XCTAssertNotNil(try build(fixture).binary)
         XCTAssertFalse(try cacheResults().isEmpty, "NOMU_CACHE_DIR takes precedence")
@@ -731,13 +849,13 @@ final class BuildTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: root + "/consumer/provider-cache"))
     }
 
-    // `nomu build --report-jobs <target>` with `NOMU_CACHE_DIR` unset, so the configuration places the cache.
+    // `nomu build <target>` with `NOMU_CACHE_DIR` unset, so the configuration places the cache.
     private func buildWithoutCacheDir(_ target: String) throws -> (status: Int32, stdout: String, stderr: String) {
         var env = ProcessInfo.processInfo.environment
         env["NOMU_CACHE_DIR"] = nil
         let p = Process()
         p.executableURL = URL(fileURLWithPath: nomu)
-        p.arguments = ["build", "--report-jobs", target]
+        p.arguments = ["build", target]
         p.environment = env
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
@@ -752,7 +870,7 @@ final class BuildTests: XCTestCase {
     func testConfigurationErrorsPrecedeEveryCompile() throws {
         let root = repo + "/tests/fixtures/xworkspace_basic"
         try write(root + "/consumer/cfg.yaml", "opt:\n  inlin: false\n")
-        let r = try run(nomu, ["build", "--report-jobs", root + "/consumer/app"], env: ["NOMU_CACHE_DIR": cache])
+        let r = try run(nomu, ["build", root + "/consumer/app"], env: ["NOMU_CACHE_DIR": cache])
         XCTAssertNotEqual(r.status, 0)
         XCTAssertTrue(r.stderr.contains("consumer/cfg.yaml:2:3: error: unknown setting `opt.inlin`; did you mean `opt.inline`?"), r.stderr)
         XCTAssertEqual(r.stdout, "")

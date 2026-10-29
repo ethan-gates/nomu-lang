@@ -46,14 +46,14 @@ final class CompileCache {
             let stem = ctx.fixtureStem(fixture)
             for job in byFixture[fixture]! {
                 progress.start(stem)
-                // `nomu build <fixture dir>`: plans the fixture's build, compiles every module, and links. It
-                // reports the binary's path as a `binary <path>` line.
+                // `nomu build <fixture dir>`: plans the fixture's build, compiles every module, and links. Its
+                // report (`build/_perf/report.json` in the fixture's workspace) names the binary.
                 let r = runProcess(path: ctx.nomu,
-                                   args: ["build", "--report-jobs"] + job.compileArgs + [target],
+                                   args: ["build"] + job.compileArgs + [target],
                                    env: job.compileEnv, timeout: job.compileTimeout)
                 var res = CompileResult(ok: r.succeeded, timedOut: r.timedOut, stderr: r.stderr, duration: r.duration)
                 if res.ok, job.compile?.expectError == nil {
-                    let built = r.stdout.split(separator: "\n").last { $0.hasPrefix("binary ") }.map { String($0.dropFirst(7)) }
+                    let built = builtBinary(target)
                     if let err = built.map({ keepBinary($0, at: ctx.configBinaryPath(job)) }) ?? "the build reported no binary" {
                         res.ok = false
                         res.stderr += "compiler-test: " + err + "\n"
@@ -65,6 +65,19 @@ final class CompileCache {
         }
         progress.endPhase()
     }
+}
+
+// The binary a build of `target` reports: the first of `binaries` in the report its workspace's `build/_perf/`
+// holds (the workspace is the nearest directory at or above `target` with a `nomu.yaml`); nil when there is none.
+func builtBinary(_ target: String) -> String? {
+    struct Report: Decodable { var status: String; var binaries: [String] }
+    var dir = target
+    while !FileManager.default.fileExists(atPath: dir + "/nomu.yaml") && dir != "/" {
+        dir = (dir as NSString).deletingLastPathComponent
+    }
+    guard let data = FileManager.default.contents(atPath: dir + "/build/_perf/report.json"),
+          let report = try? JSONDecoder().decode(Report.self, from: data), report.status == "built" else { return nil }
+    return report.binaries.first
 }
 
 // Copy a built binary and its object to a configuration's path. Returns an error message on failure.

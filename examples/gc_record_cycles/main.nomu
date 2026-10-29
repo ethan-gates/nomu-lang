@@ -1,0 +1,143 @@
+// The collector's recorder over real collections (gc-observability): a sliding window of live Boxes forces
+// collections, then the space's recorder is read back. For each cycle kind and trigger seen, it checks that
+// every cycle of that kind recorded the phases and counters its collector records, and that every interval
+// lies inside its cycle. Prints one line per (kind, trigger) seen, `kind trigger ok`, sorted; 1 for ok.
+//
+// With a one-block nursery every collection is a minor raised by a full nursery: `1 1 1`. With a mature floor
+// above the heap every collection escalates to a major: `2 2 1`.
+class Box {
+  var v: Int
+}
+fun fill(xs: Array<Box>, n: Int) {
+  var i = 0
+  while i < n {
+    xs[i % 100] = Box(v: i)
+    i = i + 1
+  }
+}
+// Whether cycle `c` holds a record of `kind` with id `id`.
+fun has(rec: RawPtr, c: Int, kind: Int, id: Int) -> Bool {
+  var i = 0
+  while i < rtRecCount(rec) {
+    let r = rtRecAt(rec, i)
+    let k: Int = r.load(fromByteOffset: 0)
+    let rid: Int = r.load(fromByteOffset: 8)
+    let rc: Int = r.load(fromByteOffset: 32)
+    if k == kind && rid == id && rc == c {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+// Whether every interval of cycle `c` lies within [start, start + dur] and has a duration of zero or more.
+fun inside(rec: RawPtr, c: Int, start: Int, dur: Int) -> Bool {
+  var i = 0
+  while i < rtRecCount(rec) {
+    let r = rtRecAt(rec, i)
+    let k: Int = r.load(fromByteOffset: 0)
+    let rc: Int = r.load(fromByteOffset: 32)
+    if k == 1 && rc == c {
+      let s: Int = r.load(fromByteOffset: 16)
+      let d: Int = r.load(fromByteOffset: 24)
+      if d < 0 || s < start || s + d > start + dur {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  return true
+}
+fun checkCycle(rec: RawPtr, c: Int, kind: Int, start: Int, dur: Int) -> Bool {
+  var ok = inside(rec, c, start, dur)
+  var phases: Array<Int> = [1, 2, 17, 18]
+  var counters: Array<Int> = [1, 20, 21, 22, 23, 24, 25, 30, 31, 32]
+  if kind == 1 {
+    phases = [1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 18]
+    counters = [1, 2, 3, 20, 21, 22, 23, 24, 25, 30, 31, 32]
+  } else {
+    phases = [1, 2, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    counters = [1, 4, 20, 21, 22, 23, 24, 25, 30, 31, 32]
+  }
+  var i = 0
+  while i < phases.count {
+    if !has(rec, c, 1, phases[i]) {
+      ok = false
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < counters.count {
+    if !has(rec, c, 3, counters[i]) {
+      ok = false
+    }
+    i = i + 1
+  }
+  return ok
+}
+fun main() {
+  var xs: Array<Box> = []
+  var w = 0
+  while w < 100 {
+    xs.append(Box(v: 0))
+    w = w + 1
+  }
+  fill(xs, 300000)
+  let rec = rtRecSpace()
+  // (kind, trigger) pairs seen, as kind * 10 + trigger, each with whether all its cycles checked out.
+  var seen: Array<Int> = []
+  var good: Array<Bool> = []
+  var i = 0
+  while i < rtRecCount(rec) {
+    let r = rtRecAt(rec, i)
+    let k: Int = r.load(fromByteOffset: 0)
+    if k == 2 {
+      let kind: Int = r.load(fromByteOffset: 8)
+      let start: Int = r.load(fromByteOffset: 16)
+      let dur: Int = r.load(fromByteOffset: 24)
+      let c: Int = r.load(fromByteOffset: 32)
+      let trigger: Int = r.load(fromByteOffset: 40)
+      let ok = checkCycle(rec, c, kind, start, dur)
+      let key = kind * 10 + trigger
+      var j = 0
+      var found = false
+      while j < seen.count {
+        if seen[j] == key {
+          found = true
+          if !ok {
+            good[j] = false
+          }
+        }
+        j = j + 1
+      }
+      if !found {
+        seen.append(key)
+        good.append(ok)
+      }
+    }
+    i = i + 1
+  }
+  // Print sorted by key.
+  var printed = 0
+  var last = -1
+  while printed < seen.count {
+    var best = 1000000
+    var bi = 0
+    var j = 0
+    while j < seen.count {
+      if seen[j] > last && seen[j] < best {
+        best = seen[j]
+        bi = j
+      }
+      j = j + 1
+    }
+    print(best / 10)
+    print(" ")
+    print(best % 10)
+    print(" ")
+    print(good[bi])
+    print("\n")
+    last = best
+    printed = printed + 1
+  }
+}

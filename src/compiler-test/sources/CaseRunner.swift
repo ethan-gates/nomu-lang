@@ -104,6 +104,15 @@ struct CaseRunner {
             for iter in 1...c.iterations {
                 var env = c.runEnv
                 if let carrier = carrier { env["NOMU_CARRIERS"] = String(carrier) }
+                // A case asserting collections reads them from the run's collector report, written into a
+                // directory of its own (cases share binaries and run concurrently).
+                let reportDir = c.collections.isEmpty ? nil
+                    : NSTemporaryDirectory() + "nomu-gc-report-" + UUID().uuidString
+                if let dir = reportDir {
+                    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                    env["NOMU_GC_REPORT_DIR"] = dir
+                }
+                defer { if let dir = reportDir { try? FileManager.default.removeItem(atPath: dir) } }
                 let r = runProcess(path: bin, args: [], env: env, timeout: c.runTimeout, stdin: stdinFeed)
                 totalRun += r.duration
                 let runRepro = "\(envPrefix(env)) \(bin)".trimmingCharacters(in: .whitespaces)
@@ -139,6 +148,27 @@ struct CaseRunner {
                         if !r.stderr.isEmpty { d += ["  stderr:"] + indented(r.stderr) }
                         d += ["  repro: \(runRepro)"]
                         return result(.fail, d, runTime: totalRun)
+                    }
+                }
+                if let dir = reportDir {
+                    switch collectionCounts(in: dir) {
+                    case .failure(let why):
+                        return result(.fail, ["  collector report (\(at)): \(why)", "  repro: \(runRepro)"],
+                                      runTime: totalRun)
+                    case .success(let counts):
+                        for m in c.collections {
+                            let n = m.kind.map { counts[$0] ?? 0 } ?? counts.values.reduce(0, +)
+                            let what = m.kind.map { "\($0) cycles" } ?? "cycles"
+                            let bad = (m.min.map { n < $0 } ?? false) ? "min \(m.min!)"
+                                    : (m.max.map { n > $0 } ?? false) ? "max \(m.max!)" : nil
+                            if let bound = bad {
+                                let seen = counts.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }
+                                    .joined(separator: ", ")
+                                return result(.fail, ["  collection assertion failed (\(at)): \(n) \(what) (\(bound));"
+                                                      + " report: \(seen.isEmpty ? "no cycles" : seen)",
+                                                      "  repro: \(runRepro)"], runTime: totalRun)
+                            }
+                        }
                     }
                 }
             }
@@ -185,4 +215,32 @@ private func countOccurrences(_ haystack: String, _ needle: String) -> Int {
     guard !needle.isEmpty else { return 0 }
     return haystack.split(separator: "\n", omittingEmptySubsequences: false)
         .reduce(0) { $0 + ($1.contains(needle) ? 1 : 0) }
+}
+
+// Cycles by kind name in the one collector report (`*-gc-*.json`, beside its `.trace.json`) a run wrote into `dir`.
+func collectionCounts(in dir: String) -> Result<[String: Int], CollectionReportError> {
+    struct Report: Decodable {
+        struct Names: Decodable { var kinds: [String: String] }
+        struct Cycle: Decodable { var kind: Int }
+        var names: Names
+        var cycles: [Cycle]
+    }
+    let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
+        .filter { $0.hasSuffix(".json") && !$0.hasSuffix(".trace.json") }
+    guard files.count == 1 else {
+        return .failure(CollectionReportError(files.isEmpty ? "no report written (built with gc_record?)"
+                                                            : "\(files.count) reports written"))
+    }
+    guard let data = FileManager.default.contents(atPath: dir + "/" + files[0]),
+          let report = try? JSONDecoder().decode(Report.self, from: data) else {
+        return .failure(CollectionReportError("cannot read \(files[0])"))
+    }
+    var counts: [String: Int] = [:]
+    for c in report.cycles { counts[report.names.kinds[String(c.kind)] ?? "kind \(c.kind)", default: 0] += 1 }
+    return .success(counts)
+}
+
+struct CollectionReportError: Error, CustomStringConvertible {
+    let description: String
+    init(_ d: String) { description = d }
 }

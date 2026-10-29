@@ -20,6 +20,8 @@ public struct Sema {
     let externalDecls: [TopDecl]
     let diags = DiagnosticSink()
     private let subsetFuncs: Set<String>   // task 149 — functions compiled under the runtime-subset rules
+    // The `gc.record` setting as the level `RawPtr.gcRecordLevel()` folds to: 0 off, 1 limited, 2 full.
+    let gcRecordLevel: Int
 
     // Global declarations, by name.
     var structs: [String: StructDecl] = [:]
@@ -129,8 +131,10 @@ public struct Sema {
                 fileQualifiers: [String: [String: Set<String>]] = [:],
                 moduleFuncs: [String: Set<String>] = [:],
                 moduleTypes: [String: Set<String>] = [:],
-                externalMutatingMethods: Set<String> = []) {
+                externalMutatingMethods: Set<String> = [],
+                gcRecordLevel: Int = 0) {
         self.program = program
+        self.gcRecordLevel = gcRecordLevel
         self.externalDecls = externalDecls
         self.subsetFuncs = subsetFuncs
         self.fileVisibleModules = fileVisibleModules

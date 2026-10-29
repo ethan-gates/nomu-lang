@@ -63,14 +63,16 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
         fputs("error: no source files given\n", stderr)
         return result
     }
-    let timings = Timings()
-    timings.egress = "ssair"
+    let profile = BuildProfile()
+    // The build's own work (configuration, planning, the source copy) records on the build's track.
+    let timings = profile.build.timings
 
     var planOptions = PlanOptions()
     planOptions.allowCoreImport = options.allowCoreImport
     planOptions.runtimeRecipe = runtimeArchiveRecipe
     // The configuration resolves once, between reading the module table and planning.
     let workspaces = WorkspaceSet(entry: primary, disk: DiskTree(), includeLanguageWorkspace: planOptions.product == .binary)
+    if workspaces.diagnostics.isEmpty { profile.buildRoot = workspaces.root.root + "/build" }
     let moduleTable = ModuleTable(workspaces: workspaces, roots: targets, options: planOptions)
     var configuration: ResolvedBuildConfiguration? = nil
     if moduleTable.diagnostics.isEmpty {
@@ -79,10 +81,10 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
             configuration = c
             planOptions.cacheRoot = HostCache.root(environment: ProcessInfo.processInfo.environment,
                                                    configured: c.cacheRoot, workspaceRoot: workspaces.root.root)
-            timings.optimize = JobSettings(c.jobSettings(moduleTable.entry)).optimize
+            profile.optimize = JobSettings(c.jobSettings(moduleTable.entry)).optimize
         case .failure(let errors):
             fputs(errors.rendered + "\n", stderr)
-            timings.report()
+            profile.report()
             return result
         }
     }
@@ -90,10 +92,9 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
     // the cache root the configuration chose.
     let toolchain = timings.measure("plan", "toolchain") { Toolchain.identities(cacheRoot: planOptions.cacheRoot) }
     planOptions.runtimeToolchain = toolchain.filter { ["cc", "ar", "sdk"].contains($0.key) }
+    profile.plannerStart = profile.now
     let plan = Plan(modules: moduleTable, workspaces: workspaces, options: planOptions)
-    for step in PlanTimings.Step.allCases {
-        timings.record(phase: "plan", name: step.rawValue, seconds: plan.timings.seconds[step] ?? 0)
-    }
+    profile.planner = plan.timings
     if options.stopAt == .plan {
         print(plan.dump(), terminator: "")
         if plan.diagnostics.isEmpty { result.binary = plan.jobs.last?.binary ?? "" }
@@ -101,18 +102,18 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
     }
     if !plan.diagnostics.isEmpty {
         fputs(plan.diagnostics.map(\.description).joined(separator: "\n") + "\n", stderr)
-        timings.report()
+        profile.report()
         return result
     }
     let table = plan.modules
     let rootJobs = table.roots.compactMap { root in plan.jobs.first { $0.module == root } }
     guard rootJobs.count == table.roots.count else { return result }
-    timings.package = table.modules[table.entry]?.package.name ?? ""
-    timings.file = plan.jobs.count == 1 ? primary : "\(plan.jobs.count) modules"
+    profile.package = table.modules[table.entry]?.package.name ?? ""
 
     // One building invocation per workspace (210): held from the first write until the build returns.
     guard let lock = WorkspaceLock.acquire(workspaceRoot: workspaces.root.root) else { return result }
     defer { withExtendedLifetime(lock) {} }
+    profile.holdsLock = true
 
     let buildRoot = workspaces.root.root + "/build"
     func makeDirectory(_ dir: String) -> Bool { Layout.makeDirectory(dir, buildRoot: buildRoot) }
@@ -166,6 +167,10 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
     var objects: [String] = []
     for j in plan.jobs {
         let m = table.modules[j.module]!
+        // The job's track: it waits for the dependencies whose interfaces it reads.
+        let track = profile.begin(.module, j.module.description,
+                                  dependencies: j.visibleDependencies.map(\.description))
+        let jobTimings = track.timings
         let isRoot = table.roots.contains(j.module)
         var imports: [String: [CompileJob.Import]] = [:]
         for imp in m.imports {
@@ -198,7 +203,7 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
         jobOptions.compilingPrelude = j.inLanguageWorkspace
 
         // The job's key, over everything it reads (208), and under `--explain` what its dependency inputs hold.
-        let jobKey = keyer.key(job, options: jobOptions)
+        let jobKey = jobTimings.measure("cache", "key") { keyer.key(job, options: jobOptions) }
         let details = options.explain ? keyer.details(job) : nil
         let previous = record.modules[j.module.description]
         record.update(j.module.description, key: jobKey, details: details, explain: options.explain)
@@ -217,11 +222,14 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
         // An entry at the job's key whose blobs match their digests is materialized into the job's output
         // directory and the compile skipped; a damaged one is discarded and rebuilt. Under `--verify-cache`
         // nothing is served: every job compiles.
-        if !viewing, verification == nil, let cached = store.lookup(jobKey.key) {
-            do { try store.materialize(cached, into: j.outputDir) } catch {
+        if !viewing, verification == nil,
+           let cached = jobTimings.measure("cache", "lookup", { store.lookup(jobKey.key) }) {
+            do { try jobTimings.measure("cache", "materialize") { try store.materialize(cached, into: j.outputDir) } } catch {
                 fputs("error: \(error)\n", stderr)
-                timings.report(); return result
+                profile.finish(track, .failed); profile.report(); return result
             }
+            profile.finish(track, .cached)
+            track.cost = store.cost(jobKey.key)
             objects.append(j.object)
             result.cached.append(j.module.description)
             continue
@@ -239,16 +247,15 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
                                                   interface: scratch + "/" + j.stem + ".nmi",
                                                   bir: scratch + "/" + j.stem + ".bir", debugStem: outputs.debugStem)
         }
-        let compileStart = Date()
-        guard compile(compiled, options: jobOptions, timings: timings) else {
-            timings.report(); return result
+        guard compile(compiled, options: jobOptions, timings: jobTimings) else {
+            profile.finish(track, .failed); profile.report(); return result
         }
-        timings.compileSeconds += Date().timeIntervalSince(compileStart)
-        result.reasons.append((j.module.description,
-                               viewing ? "debug views asked for" : CompileReason.of(previous: previous, key: jobKey, details: details)))
+        let reason = viewing ? "debug views asked for" : CompileReason.of(previous: previous, key: jobKey, details: details)
+        result.reasons.append((j.module.description, reason))
+        track.reason = reason
         if let scratch {
             let published: ActionResult
-            if let verification, let cached = store.lookup(jobKey.key) {
+            if let verification, let cached = jobTimings.measure("cache", "lookup", { store.lookup(jobKey.key) }) {
                 // `--verify-cache`: the entry already at this key must hold what this compile produced.
                 verification.compare(module: j.module.description, fresh: scratch, names: outputNames,
                                      cached: cached, store: store, inputs: jobKey.inputs)
@@ -257,22 +264,26 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
                 // The entry records the job's key and module; its named inputs are computed when asked for
                 // (`--verify-cache`).
                 do {
-                    published = try store.publish(jobKey.key, outputsIn: scratch, files: outputNames,
-                                                  inputs: ["key": jobKey.key, "module": j.module.description])
+                    let cost = profile.elapsed(track)
+                    published = try jobTimings.measure("cache", "publish") {
+                        try store.publish(jobKey.key, outputsIn: scratch, files: outputNames,
+                                          inputs: ["key": jobKey.key, "module": j.module.description])
+                    }
+                    store.recordCost(jobKey.key, seconds: cost)
                 } catch {
                     fputs("error: \(error)\n", stderr)
-                    timings.report(); return result
+                    profile.finish(track, .failed); profile.report(); return result
                 }
             }
-            do { try store.materialize(published, into: j.outputDir) } catch {
+            do { try jobTimings.measure("cache", "materialize") { try store.materialize(published, into: j.outputDir) } } catch {
                 fputs("error: \(error)\n", stderr)
-                timings.report(); return result
+                profile.finish(track, .failed); profile.report(); return result
             }
         }
+        profile.finish(track, .compiled)
         objects.append(j.object)
         result.compiled.append(j.module.description)
     }
-    timings.jobs = (compiled: result.compiled.count, cached: result.cached.count)
     if options.explain && !result.reasons.isEmpty {
         let width = result.reasons.map(\.module.count).max()!
         var out = "nomu: why each module compiled\n"
@@ -284,15 +295,21 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
     // A cache entry that differs from its key's fresh compile fails the build before the link.
     if let verification, !verification.failures.isEmpty {
         result.cacheMismatches = verification.failures
-        timings.report(); return result
+        profile.report(); return result
     }
 
     // Each target links its binary from its objects and the runtime archive. A debug stop or a terminal
     // `--emit-nmi` ends the build before the link.
     if let archiveJob = plan.runtimeArchive, !options.nmi, options.stopAt == .binary {
         guard let configuration else { preconditionFailure("a planned build has a configuration") }
-        let archive = timings.measure("runtime", "archive") { cachedRuntimeArchive(archiveJob, store: store) }
-        guard let archive else { timings.report(); return result }
+        let archiveTrack = profile.begin(.archive, "runtime archive")
+        let archive = cachedRuntimeArchive(archiveJob, store: store, track: archiveTrack)
+        let archiveOutcome = archiveTrack.outcome
+        profile.finish(archiveTrack, archive == nil ? .failed : archiveOutcome)
+        if archiveOutcome == .cached { archiveTrack.cost = store.cost(archiveJob.key) }
+        guard let archive else { profile.report(); return result }
+        // Each object's module, for a link's dependencies.
+        let moduleByObject = Dictionary(plan.jobs.map { ($0.object, $0.module.description) }, uniquingKeysWith: { a, _ in a })
         // The debugger's map from recorded source paths to this machine's (`DebugPaths`), beside each binary.
         var sourceRoots: [(WorkspaceIdentity, String)] = []
         for (workspace, root) in plan.workspaceRoots {
@@ -307,36 +324,52 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
                                     debugInfoStorage: configuration.debugInfoStorage, output: link.output,
                                     workspaceRoot: workspaces.root.root, toolchain: toolchain)
             let binary = inputs.recorded(link.output)
-            let linkKey = keyer.key(inputs)
+            let linkTrack = profile.begin(.link, binary,
+                                          dependencies: link.objects.compactMap { moduleByObject[$0] } + [archiveTrack.name])
+            let linkTimings = linkTrack.timings
+            let linkKey = linkTimings.measure("cache", "key") { keyer.key(inputs) }
             let previous = record.links[binary]
             record.updateLink(binary, key: linkKey, explain: options.explain)
             // A cached link, like a cached compile, is materialized at the binary's path; under `--verify-cache`
             // every binary links.
-            if verification == nil, let cached = store.lookup(linkKey.key) {
-                guard materializeLink(cached, store: store, output: link.output) else { timings.report(); return result }
+            if verification == nil, let cached = linkTimings.measure("cache", "lookup", { store.lookup(linkKey.key) }) {
+                guard linkTimings.measure("cache", "materialize", { materializeLink(cached, store: store, output: link.output) }) else {
+                    profile.finish(linkTrack, .failed); profile.report(); return result
+                }
+                profile.finish(linkTrack, .cached)
+                linkTrack.cost = store.cost(linkKey.key)
                 result.linkCached.append(binary)
             } else {
                 let scratch = NSTemporaryDirectory() + "nomu-link-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
                 defer { try? FileManager.default.removeItem(atPath: scratch) }
-                guard let names = linkBinary(inputs, into: scratch, timings: timings) else {
-                    timings.report(); return result
+                guard let names = linkBinary(inputs, into: scratch, timings: linkTimings) else {
+                    profile.finish(linkTrack, .failed); profile.report(); return result
                 }
-                result.linkReasons.append((binary, CompileReason.of(previous: previous, key: linkKey, details: nil)))
+                let reason = CompileReason.of(previous: previous, key: linkKey, details: nil)
+                result.linkReasons.append((binary, reason))
+                linkTrack.reason = reason
                 let published: ActionResult
-                if let verification, let cached = store.lookup(linkKey.key) {
+                if let verification, let cached = linkTimings.measure("cache", "lookup", { store.lookup(linkKey.key) }) {
                     verification.compare(module: "link of " + binary, fresh: scratch, names: names, cached: cached,
                                          store: store, inputs: linkKey.inputs)
                     published = cached
                 } else {
                     do {
-                        published = try store.publish(linkKey.key, outputsIn: scratch, files: names,
-                                                      inputs: ["key": linkKey.key, "binary": binary])
+                        let cost = profile.elapsed(linkTrack)
+                        published = try linkTimings.measure("cache", "publish") {
+                            try store.publish(linkKey.key, outputsIn: scratch, files: names,
+                                              inputs: ["key": linkKey.key, "binary": binary])
+                        }
+                        store.recordCost(linkKey.key, seconds: cost)
                     } catch {
                         fputs("error: \(error)\n", stderr)
-                        timings.report(); return result
+                        profile.finish(linkTrack, .failed); profile.report(); return result
                     }
                 }
-                guard materializeLink(published, store: store, output: link.output) else { timings.report(); return result }
+                guard linkTimings.measure("cache", "materialize", { materializeLink(published, store: store, output: link.output) }) else {
+                    profile.finish(linkTrack, .failed); profile.report(); return result
+                }
+                profile.finish(linkTrack, .compiled)
                 result.linked.append(binary)
             }
             fputs(link.output + "\n", stderr)
@@ -350,11 +383,11 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
         // A cached binary that differs from its fresh link fails the build.
         if let verification, !verification.failures.isEmpty {
             result.cacheMismatches = verification.failures
-            timings.report(); return result
+            profile.report(); return result
         }
     }
-    timings.report()
     result.binaries = rootJobs.map(\.binary)
+    profile.report(options.stopAt == .binary && !options.nmi ? .built : .stopped, binaries: result.binaries)
     result.binary = result.binaries.first
     return result
 }

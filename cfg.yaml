@@ -8,6 +8,7 @@ configs:
   no_escape: null
   no_scalar: null
   rt_prelude: null
+  gc_record: null
 opt:
   mono mono_all: all
   mono mono_edge: edge
@@ -17,3 +18,5 @@ opt:
   scalar no_scalar: false
 test rt_prelude:
   runtime_prelude: true
+gc gc_record:
+  record: limited

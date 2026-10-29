@@ -42,6 +42,15 @@ struct StderrMatch: Decodable {
     var max: Int?
 }
 
+// A collection-count assertion, read from the run's collector report (`gc.record`, written into a directory
+// the runner names through `NOMU_GC_REPORT_DIR`): cycles of `kind` (a name from the report's `names.kinds`,
+// e.g. `minor`), or of any kind when absent. A case that asserts collections compiles with `gc_record`.
+struct CollectionMatch: Decodable {
+    var kind: String?
+    var min: Int?
+    var max: Int?
+}
+
 // A symbol-count assertion over the fixture's own object (`<binary>.o`): lines naming a symbol that contains
 // `pattern`. `object_symbols` counts defined symbols (`nm -U`) — what the object defines, e.g. that no
 // runtime / `std` definition is duplicated into it; `object_references` counts undefined ones (`nm -u`) —
@@ -60,12 +69,12 @@ enum Tier: String, Decodable, Comparable {
     var budgetSec: Double { self == .fast ? 60 : 300 }
 }
 
-// One value of a dimension: the settings it adds, the collections a run under it must log, and its tier.
+// One value of a dimension: the settings it adds, the collections a run under it must report, and its tier.
 struct DimensionValue: Decodable {
     var name: String
     var compileSettings: Settings?
     var runSettings: Settings?
-    var requireCollections: Int?
+    var collections: [CollectionMatch]?
     var tier: Tier?
 }
 
@@ -103,6 +112,7 @@ struct Case: Decodable {
     var weight: Int?
     var compile: CompileSpec?
     var stderrMatch: [StderrMatch]?
+    var collections: [CollectionMatch]?
     var objectSymbols: [SymbolMatch]?
     var objectReferences: [SymbolMatch]?
     var stdinFile: String?
@@ -128,6 +138,7 @@ struct ResolvedCase {
     var weight: Int   // cores this case saturates (its pool lanes); derived from the run shape, below
     var compile: CompileSpec?
     var stderrMatch: [StderrMatch]
+    var collections: [CollectionMatch]
     var objectSymbols: [SymbolMatch]
     var objectReferences: [SymbolMatch]
     var stdinFile: String?   // repo-relative file fed to the program's stdin (default: /dev/null)
@@ -143,8 +154,13 @@ struct ResolvedCase {
     }
 }
 
-// The line the runtime logs per collection (`gc_log`), counted by a dimension's `require_collections`.
-let collectionLogPattern = "nomu-gc-sync: collection"
+// A case that asserts collections records them: its compile settings gain `gc_record`.
+func recording(_ settings: Settings, _ collections: [CollectionMatch]) -> Settings {
+    if collections.isEmpty { return settings }
+    var s = settings
+    s["gc_record"] = .bool(true)
+    return s
+}
 
 extension Manifest {
     // The number of cores a case saturates — its pool weight (task: CPU-aware scheduling). A case advertises
@@ -172,7 +188,7 @@ extension Manifest {
         var out: [ResolvedCase] = cases.map { c in
             let carriers = c.carriers ?? d?.carriers ?? [1]
             let owner = "case '\(c.name)'"
-            let compile = lower(c.compileSettings ?? [:], at: .compile, in: owner)
+            let compile = lower(recording(c.compileSettings ?? [:], c.collections ?? []), at: .compile, in: owner)
             let run = lower(c.runSettings ?? [:], at: .run, in: owner)
             return ResolvedCase(
                 name: c.name,
@@ -189,6 +205,7 @@ extension Manifest {
                                         carriers: carriers, capacity: capacity),
                 compile: c.compile,
                 stderrMatch: c.stderrMatch ?? [],
+                collections: c.collections ?? [],
                 objectSymbols: c.objectSymbols ?? [],
                 objectReferences: c.objectReferences ?? [],
                 stdinFile: c.stdinFile,
@@ -228,19 +245,17 @@ extension Manifest {
                 let name = ([g.name, leaf] + combo.map { $0.1.name }).joined(separator: "/")
                 var compileSettings = g.compileSettings ?? [:]
                 var runSettings = g.runSettings ?? [:]
-                var match = g.stderrMatch ?? []
+                let match = g.stderrMatch ?? []
+                var collections: [CollectionMatch] = []
                 var tier = g.tier ?? .fast
                 for (_, v) in combo {
                     compileSettings.merge(v.compileSettings ?? [:]) { _, new in new }
                     runSettings.merge(v.runSettings ?? [:]) { _, new in new }
-                    if let n = v.requireCollections {
-                        runSettings["gc_log"] = .bool(true)
-                        match.append(StderrMatch(pattern: collectionLogPattern, min: n, max: nil))
-                    }
+                    collections += v.collections ?? []
                     tier = max(tier, v.tier ?? .fast)
                 }
                 let owner = "group '\(g.name)'"
-                let compile = lower(compileSettings, at: .compile, in: owner)
+                let compile = lower(recording(compileSettings, collections), at: .compile, in: owner)
                 let run = lower(runSettings, at: .run, in: owner)
                 out.append(ResolvedCase(
                     name: name, fixture: fixture,
@@ -251,7 +266,7 @@ extension Manifest {
                     runTimeout: g.timeoutSec ?? d?.timeoutSec ?? 60,
                     compileTimeout: d?.compileTimeoutSec ?? 120,
                     weight: Manifest.weight(explicit: g.weight, heavy: false, carriers: carriers, capacity: capacity),
-                    compile: nil, stderrMatch: match, objectSymbols: [], objectReferences: [],
+                    compile: nil, stderrMatch: match, collections: collections, objectSymbols: [], objectReferences: [],
                     stdinFile: nil, stdinDelayMs: 0,
                     tier: tier, timingSensitive: false,
                     dims: Dictionary(uniqueKeysWithValues: combo.map { ($0.0, $0.1.name) })))
@@ -290,7 +305,8 @@ private let defaultsKeys: Set<String> = ["timeout_sec", "compile_timeout_sec", "
 private let caseKeys: Set<String> = [
     "name", "fixture", "compile_args", "compile_settings", "run_settings", "expect", "iterations",
     "full_iterations", "carriers",
-    "timeout_sec", "compile_timeout_sec", "heavy", "weight", "compile", "stderr_match", "object_symbols",
+    "timeout_sec", "compile_timeout_sec", "heavy", "weight", "compile", "stderr_match", "collections",
+    "object_symbols",
     "object_references", "stdin_file", "stdin_delay_ms", "tier", "timing_sensitive",
 ]
 private let groupKeys: Set<String> = [
@@ -298,7 +314,7 @@ private let groupKeys: Set<String> = [
     "carriers",
     "timeout_sec", "weight", "tier", "stderr_match",
 ]
-private let dimensionValueKeys: Set<String> = ["name", "compile_settings", "run_settings", "require_collections", "tier"]
+private let dimensionValueKeys: Set<String> = ["name", "compile_settings", "run_settings", "collections", "tier"]
 
 private func checkKeys(_ json: Any, path: String) {
     func check(_ obj: Any?, _ allowed: Set<String>, _ owner: String) {

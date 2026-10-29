@@ -59,9 +59,9 @@ let settingTable: [String: SettingDef] = [
                                      help: "devirtualization (default on)"),
     "rt_prelude":         SettingDef(stage: .compile, carrier: .configWhen(true, "rt_prelude"),
                                      help: "compile against the runtime prelude (fixtures that call rt* directly)"),
+    "gc_record":          SettingDef(stage: .compile, carrier: .configWhen(true, "gc_record"),
+                                     help: "the collector's recorder at `limited` (`gc.record`)"),
     // Run settings.
-    "gc_log":             SettingDef(stage: .run, carrier: .envWhen(true, "NOMU_GC_DEBUG_PRESSURE"),
-                                     help: "log each collection to stderr (`nomu-gc-sync: collection N`)"),
     "gc_stress_bytes":    SettingDef(stage: .run, carrier: .envValue("NOMU_GC_STRESS"),
                                      help: "a collection every N bytes a carrier allocates"),
     "nursery_blocks":     SettingDef(stage: .run, carrier: .envValue("NOMU_NURSERY_RESERVE"),
@@ -78,7 +78,7 @@ let settingTable: [String: SettingDef] = [
                                       help: "external timed root-walk STW driver thread"),
 ]
 
-// The manifest decoder's snake_case conversion also rewrites dictionary keys (`gc_log` arrives as `gcLog`),
+// The manifest decoder's snake_case conversion also rewrites dictionary keys (`gc_record` arrives as `gcRecord`),
 // so a setting is looked up with underscores and case ignored.
 private func normalized(_ s: String) -> String { s.replacingOccurrences(of: "_", with: "").lowercased() }
 private let settingName: [String: String] =

@@ -1,8 +1,14 @@
 # Fiber stack strategy: growth, overflow, high-fiber-count throughput
 
 **Avenue:** Risk (the "better than Go" concurrency thesis) · **Type/Lifecycle:** `perf · needs-design`
-(runtime + compiler architecture) · **Size:** L · **Status:** build deferred; direction provisionally
-decided (2026-08-25) · **Source:** deferred.md (2026-08-18)
+(runtime + compiler architecture) · **Size:** L · **Status:** needs-design; built before any
+collector is measured; direction provisionally decided (2026-08-25) · **Source:** deferred.md (2026-08-18)
+
+**Scheduled before any collector is measured** (the benchmark against Go and Swift on GenImmix, then the
+GenImmix–LXR comparison). All three of today's stack problems are fixed together first, so the benchmarks run on large, fiber-heavy programs: overflow is
+silent (no guard page), every fiber commits its whole 128 KiB up front (`rtSchedFiberNew` takes its stack
+from `rt_raw_alloc`, which zeroes it), and the size is fixed. Only the first is strictly required to compare
+collectors; the other two cost the same under both, and are done now rather than with 103.
 
 **Provisional decision (2026-08-25): defer the build, lean guard-page.** The build rides the late
 massive-fan-out workload ([103](103-dynamic-spawn-group.md)); fixed 128 KiB holds until then, and the
@@ -11,7 +17,8 @@ GC substrate a moving scheme would need (statepoints + parked-fiber scan) is alr
 ripple, which is what makes deferring safe. The one thing this forecloses against is **copy-on-grow**
 (Go-style prologue stack-limit checks + calling-convention changes); avoid baking ABI decisions that
 assume it. Optional cheap win now, decoupled from any growth scheme: a guard page on the current fixed
-stacks for clean overflow *detection* (crash instead of silent corruption). The decide-early flag is
+stacks for clean overflow *detection* (crash instead of silent corruption). The overflow is reported through
+[219](219-runtime-fault-handling.md)'s fault handler. The decide-early flag is
 thereby answered — full evaluation below stands for when the build is picked up.
 
 ## What
@@ -46,8 +53,10 @@ The answer is likely a hybrid.
 
 ## Dependencies & triggers
 
-- **Trigger:** the dynamic spawn group ([103](103-dynamic-spawn-group.md)) — growable stacks + syscall-free switch ride it.
-  Bring the *decision* ahead of the build.
+- **Trigger:** the first collector measurement (above), ahead of the dynamic spawn group
+  ([103](103-dynamic-spawn-group.md)), which the earlier plan tied the build to.
+- **Reports through:** [219](219-runtime-fault-handling.md)'s fault handler (overflow, and the guard-page
+  fault a lazy-commit scheme services).
 - **Couples with:** [TCO](129-tail-call-optimization.md) (lowers stack depth, eases the memory floor),
   GC statepoints, the dynamic spawn group.
 

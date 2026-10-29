@@ -1,0 +1,76 @@
+// The collector's recorder (gc-observability): built under `gc.record`, compiled out without it. With the
+// setting on, the space carries a recorder, and a recorder written by hand reads back what was written:
+// nested phases inside a cycle, a counter, the open-phase breadcrumb, and records past the first chunk. With
+// it off, the space's recorder slot is null.
+//
+// Expected output with `gc.record: limited`: 1 / 1 / 1 / 3 / 1 / 0 / 1 3 1 / 1 1 1 / 2 7 1 / 3 9 0 / 1 / 2504 / 2499.
+// Expected output with it off: 1 / 0 / 1.
+class Box {
+  var v: Int
+}
+fun main() {
+  let b = Box(v: 1)               // the first allocation creates the space
+  print(b.v)
+  print("\n")
+  let level = RawPtr.gcRecordLevel()
+  print(level)
+  print("\n")
+  let spaceRec = rtRecSpace()
+  if level == 0 {
+    print(spaceRec.eq(RawPtr.null))   // 1: nothing recorded
+    print("\n")
+    return
+  }
+  print(!spaceRec.eq(RawPtr.null))   // 1: the space has a recorder
+  print("\n")
+
+  let rec = rtRecNew(0)
+  rtRecCycleBegin(rec, 7, 0, RawPtr.ticks())
+  let t1 = rtRecOpen(rec, 1)
+  let t2 = rtRecOpen(rec, 3)
+  print(rtRecOpenPhase(rec))      // 3: the innermost open phase
+  print("\n")
+  rtRecClose(rec, 3, t2, 1)
+  print(rtRecOpenPhase(rec))      // 1
+  print("\n")
+  rtRecClose(rec, 1, t1, 0)
+  print(rtRecOpenPhase(rec))      // 0: none open
+  print("\n")
+  rtRecCycleEnd(rec)
+  rtRecCounter(rec, 9, 42)
+
+  // kind, id and cycle of each record: the inner interval closes first, then the outer, then the cycle; the
+  // counter after the cycle carries no cycle number.
+  var i = 0
+  while i < rtRecCount(rec) {
+    let r = rtRecAt(rec, i)
+    let kind: Int = r.load(fromByteOffset: 0)
+    let id: Int = r.load(fromByteOffset: 8)
+    let cycle: Int = r.load(fromByteOffset: 32)
+    print(kind)
+    print(" ")
+    print(id)
+    print(" ")
+    print(cycle)
+    print("\n")
+    i = i + 1
+  }
+  // An interval's duration is its end less its start, never negative.
+  let outer = rtRecAt(rec, 1)
+  let dur: Int = outer.load(fromByteOffset: 24)
+  print(dur >= 0)                 // 1
+  print("\n")
+
+  // Records past the first chunk (1024 each) read back in order.
+  var n = 0
+  while n < 2500 {
+    rtRecCounter(rec, 10, n)
+    n = n + 1
+  }
+  print(rtRecCount(rec))          // 2504: four records, then 2500 counters
+  print("\n")
+  let last = rtRecAt(rec, 2503)
+  let v: Int = last.load(fromByteOffset: 24)
+  print(v)                        // 2499
+  print("\n")
+}

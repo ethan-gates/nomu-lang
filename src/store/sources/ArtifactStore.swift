@@ -16,7 +16,9 @@ import Darwin
 // and the lookup misses, so a damaged entry is rebuilt and never served. A blob is hashed only once per write: the
 // store writes a blob whole, by rename, and never again, so a blob whose size and modification time are those it
 // had when last hashed is the one hashed. That time is this host's bookkeeping (`checked/<digest>@<time>`, an empty
-// file), kept out of the action results, which hold only what the outputs' contents determine.
+// file), kept out of the action results, which hold only what the outputs' contents determine. So is what producing
+// an entry cost (`costs/<key>`, its seconds as text), which a build that takes the entry reports as the time it would
+// have spent (the performance report's critical path weighs every unit by it).
 //
 // Clearing, eviction and size limits belong to cache management (199); `leftovers()` lists what an interrupted
 // write left behind.
@@ -28,6 +30,20 @@ public struct ArtifactStore {
     var ac: String { root + "/ac" }
     var cas: String { root + "/cas" }
     var checked: String { root + "/checked" }
+    var costs: String { root + "/costs" }
+
+    // Record what producing the entry at `key` took, in seconds. Best-effort: without it, a hit reports no cost.
+    public func recordCost(_ key: String, seconds: Double) {
+        try? FileManager.default.createDirectory(atPath: costs, withIntermediateDirectories: true)
+        let path = costs + "/" + key, temp = costs + "/" + Self.tmpPrefix + Self.tag()
+        guard FileManager.default.createFile(atPath: temp, contents: Data(String(seconds).utf8)) else { return }
+        if rename(temp, path) != 0 { try? FileManager.default.removeItem(atPath: temp) }
+    }
+
+    // What producing the entry at `key` took, when it was recorded.
+    public func cost(_ key: String) -> Double? {
+        FileManager.default.contents(atPath: costs + "/" + key).flatMap { Double(String(decoding: $0, as: UTF8.self)) }
+    }
 
     // The action result at `key` when every blob it names is present and matches its digest. A result that names a
     // missing or altered blob, or cannot be read, is discarded and the lookup misses.

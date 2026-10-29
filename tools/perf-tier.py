@@ -24,6 +24,7 @@ the built `nomu` (run `bazel build -c opt //src/nomu-cli:nomu` first). Runs use 
 (NOMU_CARRIERS=1) so timings and output are free of scheduling noise.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -61,12 +62,26 @@ def compile_config(src, configs, release):
     """Build `src` under `configs` (plus `release`); returns (ok, stderr or the binary's path), the path as the
     build reports it."""
     selected = (["release"] if release else []) + configs
-    cmd = [NOMU, "build", "--report-jobs"] + [f"--config={c}" for c in selected] + [src]
+    cmd = [NOMU, "build"] + [f"--config={c}" for c in selected] + [src]
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         return False, r.stderr.decode(errors="replace")
-    lines = [l[len("binary "):] for l in r.stdout.decode().splitlines() if l.startswith("binary ")]
-    return (True, lines[-1]) if lines else (False, "the build reported no binary")
+    binaries = built_binaries(src)
+    return (True, binaries[-1]) if binaries else (False, "the build reported no binary")
+
+
+def built_binaries(src):
+    """The binaries the last build of `src` produced, from its report (`build/_perf/report.json` in the workspace
+    holding `src`, the nearest directory at or above it with a `nomu.yaml`)."""
+    d = src
+    while not os.path.exists(os.path.join(d, "nomu.yaml")) and d != os.path.dirname(d):
+        d = os.path.dirname(d)
+    try:
+        with open(os.path.join(d, "build", "_perf", "report.json")) as f:
+            report = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return report["binaries"] if report.get("status") == "built" else []
 
 
 def run_timed(binary, iters):

@@ -35,7 +35,8 @@ in `tools/`), and for each classify + decide:
 
 - **Product selection.** None remains (197). Confirm nothing else selects an implementation.
 - **GC test drivers.** `NOMU_GC_STRESS` (a collection every N allocated bytes), `NOMU_GC_PRESSURE`,
-  `NOMU_STW_COLLECT`, `NOMU_STW_SELFHOST`, `NOMU_GC_DEBUG_PRESSURE` — dev/test-only, set by suite cases.
+  `NOMU_STW_COLLECT`, `NOMU_STW_SELFHOST` — dev/test-only, set by suite cases. (`NOMU_GC_DEBUG_PRESSURE`
+  retired with the collection log in 159.5; `NOMU_GC_REPORT_DIR`, 159's report directory, is new.)
 - **GC/scheduler tuning.** `NOMU_NURSERY_RESERVE`, `NOMU_MATURE_FLOOR`, `NOMU_CARRIERS`,
   `NOMU_GC_TRIGGER_RESERVE`, and the like. Each should carry an internal default (the descriptor
   already holds `nurseryReserve = numBlocks/4`, for instance) and drop the env, or demote it to a

@@ -65,8 +65,12 @@ since no package may sit at a workspace root. Fields:
 - `iterations` (repeat; all must pass), `carriers` (one run per count, sets `NOMU_CARRIERS`). Set
   `"carriers": []` to run once without setting `NOMU_CARRIERS` — for fixtures that manage their own
   threads (the self-hosted scheduler/actor cases).
-- `stderr_match` — `[ { "pattern": "(minor)", "min": 10 } ]`, a per-line substring count for
-  "collection actually fired" checks. `min` / `max` both optional.
+- `stderr_match` — `[ { "pattern": "STW-ROOT 111", "min": 1 } ]`, a per-line substring count over the
+  run's stderr. `min` / `max` both optional.
+- `collections` — `[ { "kind": "minor", "min": 10 } ]`, a count of the run's collection cycles of `kind`
+  (`minor`, `major`, `forced`; any kind when absent), read from the collector report. A case with it
+  compiles with `gc_record` and runs with `NOMU_GC_REPORT_DIR` set to a directory of its own, which the
+  runner reads after each run. `min` / `max` both optional.
 - `object_symbols` — `[ { "pattern": "_nomu_fn_rt", "max": 0 } ]`, a count of defined symbols (`nm -U`)
   containing the substring in the fixture's own object (`<binary>.o`), checked once after compile. `min` /
   `max` both optional. Pins what the program's object defines, e.g. no duplicated runtime / `std` copies.
@@ -101,8 +105,9 @@ setting's stage and its mechanism, is `src/compiler-test/sources/Settings.swift`
 setting at the wrong stage, is an error. Compile settings select configs declared in the repository's root
 `cfg.yaml`; run settings are still environment variables (task 205 moves them).
 - Compile: `optimize` (`-c release`), `inline`, `escape`, `scalar`, `devirt` (each default `true`; `false`
-  selects `no_inline` and the like, turning the pass off), `rt_prelude` (fixtures that call `rt*` directly).
-- Run: `gc_log` (log each collection: `nomu-gc-sync: collection N (minor|major)`), `gc_stress_bytes` (a
+  selects `no_inline` and the like, turning the pass off), `rt_prelude` (fixtures that call `rt*` directly),
+  `gc_record` (the collector's recorder at `limited`; `collections` turns it on).
+- Run: `gc_stress_bytes` (a
   collection every N bytes a carrier allocates), `nursery_blocks` (a minor collection when the nursery
   fills N 32 KiB blocks), `mature_floor` (every collection major below this mature size),
   `gc_trigger_reserve`, and the external driver threads `gc_pressure_driver` (heap-pressure defrag),
@@ -111,14 +116,14 @@ setting at the wrong stage, is an error. Compile settings select configs declare
 ## GC legs
 
 Every program runs on the Nomu runtime (the Nomu scheduler and collector). A fixture's plain case runs it
-with no setting; its collecting legs force collections and check with `stderr_match` (or a dimension's
-`require_collections`) that they fired: `-evac` cases use `gc_stress_bytes`, `-nursery` cases
+with no setting; its collecting legs force collections and check with `collections` (on the case or a
+dimension value) that they ran: `-evac` cases use `gc_stress_bytes`, `-nursery` cases
 `nursery_blocks`.
 
 ## Dimensions and groups
 
 A matrix is declared once. `dimensions` names axes; each value carries `compile_settings`, `run_settings`,
-`require_collections` (at least N collections logged; turns on `gc_log`) and a `tier`:
+`collections` (as on a case) and a `tier`:
 - `pipeline` — `debug`; `release` (`optimize`) and `noinline` (`inline: false`), both `full`.
 - `gc` — `default`; `nursery` (64 blocks); `nursery-tight` (1 block: collections land at points the larger
   nursery never reaches); `stress-minor` (a collection every 4 KiB); `stress-major` (the same, every

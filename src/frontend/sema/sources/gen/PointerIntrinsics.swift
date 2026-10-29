@@ -274,6 +274,75 @@ enum PointerIntrinsics {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return s.ptrIntrinsic("__sysMonotonicNanos", .int, [], span)
+        // The collector's clock: raw ticks of the CPU's monotonic counter (`mach_absolute_time`, ~5 ns), converted
+        // to time only when a report is written. gc-leaf, subset-legal.
+        case "ticks":
+            guard checkArgLabels(&s, args, [], "RawPtr.ticks", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__sysTicks", .int, [], span)
+        // The process-level calls the collector's report needs (gc-observability), each a libSystem entry.
+        // Wall-clock time in nanoseconds since the epoch (`clock_gettime_nsec_np(CLOCK_REALTIME)`).
+        case "wallNanos":
+            guard checkArgLabels(&s, args, [], "RawPtr.wallNanos", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__sysWallNanos", .int, [], span)
+        // `mach_timebase_info` into `info` (two UInt32: numer @0, denom @4): ticks × numer / denom = ns.
+        case "timebase":
+            guard checkArgLabels(&s, args, ["info"], "RawPtr.timebase", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__sysTimebase", .int, [ptrArg(&s, args[0].value, "RawPtr.timebase", "info")], span)
+        // `getenv`: the variable's NUL-terminated value, or null.
+        case "getenv":
+            guard checkArgLabels(&s, args, ["name"], "RawPtr.getenv", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__sysGetenv", .rawPtr, [ptrArg(&s, args[0].value, "RawPtr.getenv", "name")], span)
+        // `_NSGetExecutablePath(buf, size)`: the executable's path, NUL-terminated; `size` is a UInt32 cell
+        // holding the buffer's size. Returns 0 on success.
+        case "executablePath":
+            guard checkArgLabels(&s, args, ["buf", "size"], "RawPtr.executablePath", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__sysExecutablePath", .int,
+                                  [ptrArg(&s, args[0].value, "RawPtr.executablePath", "buf"),
+                                   ptrArg(&s, args[1].value, "RawPtr.executablePath", "size")], span)
+        // `creat(path, mode)`: create or truncate the file at the NUL-terminated `path` for writing; the fd or -1.
+        case "createFile":
+            guard checkArgLabels(&s, args, ["path", "mode"], "RawPtr.createFile", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__sysCreat", .int,
+                                  [ptrArg(&s, args[0].value, "RawPtr.createFile", "path"),
+                                   intArg(&s, args[1].value, "RawPtr.createFile", "mode")], span)
+        case "closeFd":
+            guard checkArgLabels(&s, args, ["fd"], "RawPtr.closeFd", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__sysClose", .int, [intArg(&s, args[0].value, "RawPtr.closeFd", "fd")], span)
+        // Copy a string literal's UTF-8 bytes to `to`; returns their count. The runtime's way to write text,
+        // since the runtime subset calls no `String` method. The argument must be a literal.
+        case "copyLiteral":
+            guard checkArgLabels(&s, args, ["to", nil], "RawPtr.copyLiteral", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let dst = ptrArg(&s, args[0].value, "RawPtr.copyLiteral", "to")
+            guard case .stringLit(let v, let lspan) = args[1].value else {
+                s.diags.error("RawPtr.copyLiteral expects a string literal", at: span)
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            // The literal's `StringBase`, unwrapped: the subset calls no `String` method.
+            let text = NOIRExpr(type: .stringBase, span: lspan, kind: .stringLit(v))
+            return s.ptrIntrinsic("__sysCopyLiteral", .int, [dst, text], span)
+        // The `gc.record` setting as a constant (0 off, 1 limited, 2 full), so recording code under a level the
+        // setting leaves off folds away.
+        case "gcRecordLevel":
+            guard checkArgLabels(&s, args, [], "RawPtr.gcRecordLevel", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return NOIRExpr(type: .int, span: span, kind: .intLit(s.gcRecordLevel))
         // Asm-floor isolation self-test (task 128.2). Drives the per-arch context switch (rtSwitch /
         // rtFiberInit) through a seed → switch-in → switch-back round-trip and returns 1 if the fiber ran
         // with its argument intact, else 0 (0 also on an arch with no asm floor yet). The isolation check

@@ -1544,6 +1544,36 @@ final class SSAIRToLLVM {
         // on macOS the libSystem entry `uint64_t clock_gettime_nsec_np(clockid_t)` (the stable Darwin
         // floor, selfhosted-scheduler.md §3.3), no C-runtime shim. `CLOCK_MONOTONIC` is 6 on Darwin. The
         // Linux lowering (raw `clock_gettime`/vDSO) lands with the Linux build target (§5).
+        case "__sysWallNanos":
+            let (fn, fty) = e.runtimeFn("clock_gettime_nsec_np", ret: e.i64, params: [e.i32], varArg: false)
+            return e.buildCall(fn, fty, [LLVMConstInt(e.i32, 0, 0)])   // CLOCK_REALTIME
+        case "__sysTimebase":
+            let (fn, fty) = e.runtimeFn("mach_timebase_info", ret: e.i32, params: [e.i8ptr], varArg: false)
+            return LLVMBuildSExt(b, e.buildCall(fn, fty, [val(args[0])])!, e.i64, "timebase.r")
+        case "__sysGetenv":
+            let (fn, fty) = e.runtimeFn("getenv", ret: e.i8ptr, params: [e.i8ptr], varArg: false)
+            return e.buildCall(fn, fty, [val(args[0])])
+        case "__sysExecutablePath":
+            let (fn, fty) = e.runtimeFn("_NSGetExecutablePath", ret: e.i32, params: [e.i8ptr, e.i8ptr], varArg: false)
+            return LLVMBuildSExt(b, e.buildCall(fn, fty, [val(args[0]), val(args[1])])!, e.i64, "exepath.r")
+        case "__sysCreat":
+            // int creat(const char* path, mode_t mode); mode_t is 16 bits on Darwin.
+            let i16 = LLVMInt16TypeInContext(e.ctx)!
+            let (fn, fty) = e.runtimeFn("creat", ret: e.i32, params: [e.i8ptr, i16], varArg: false)
+            let mode = LLVMBuildTrunc(b, val(args[1]), i16, "creat.mode")
+            return LLVMBuildSExt(b, e.buildCall(fn, fty, [val(args[0]), mode])!, e.i64, "creat.r")
+        case "__sysClose":
+            let (fn, fty) = e.runtimeFn("close", ret: e.i32, params: [e.i32], varArg: false)
+            let cfd = LLVMBuildTrunc(b, val(args[0]), e.i32, "close.fd")
+            return LLVMBuildSExt(b, e.buildCall(fn, fty, [cfd])!, e.i64, "close.r")
+        case "__sysCopyLiteral":
+            let text = val(args[1])
+            let n = strLen(text)
+            LLVMBuildMemCpy(b, val(args[0]), 1, strPtr(text), 1, n)
+            return n
+        case "__sysTicks":
+            let (fn, fty) = e.runtimeFn("mach_absolute_time", ret: e.i64, params: [], varArg: false)
+            return e.buildCall(fn, fty, [])
         case "__sysMonotonicNanos":
             let (fn, fty) = e.runtimeFn("clock_gettime_nsec_np", ret: e.i64, params: [e.i32], varArg: false)
             return e.buildCall(fn, fty, [LLVMConstInt(e.i32, 6, 0)])

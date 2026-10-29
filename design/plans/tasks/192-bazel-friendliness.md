@@ -79,3 +79,8 @@ must produce each job's settings. The answer may reshape the configuration syste
 - Follows 190 (jobs, D4 cache). Waits on [128](128-self-hosting-runtime.md) 128.5 and the asm floor moving
   into the runtime module's object (Direction). Interacts with [172](172-incremental-build-cache.md), whose
   content keys overlap Bazel's action cache.
+
+**From [217](217-build-graph-granularity.md):** the driver compiles a module as one staged job whose interface
+(`.nmi`, `.bir`) is ready partway through and releases dependents early (Cargo's pipelined compilation). A Bazel
+action's outputs appear only when it ends, so under Bazel a module is one action without pipelining, or two
+actions where the interface action repeats the front end, lowering and module inference.

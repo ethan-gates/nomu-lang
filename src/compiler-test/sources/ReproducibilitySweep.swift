@@ -120,7 +120,7 @@ struct ReproducibilitySweep {
     }
 
     // The files a round produced, by path relative to the round's root: `ws/…` under each `build/`, `cache/…`
-    // in the host cache's stores. The workspace lock and `.lldbinit` files are left out.
+    // in the host cache's stores. The workspace lock, `.lldbinit` files and the build's report are left out.
     private func outputs(src: String, cache: String) -> [String: String] {
         let fm = FileManager.default
         var out: [String: String] = [:]
@@ -132,6 +132,7 @@ struct ReproducibilitySweep {
             guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else { continue }
             if rel.hasSuffix(".lldbinit") { continue }   // maps recorded paths to this machine's
             if rel.hasSuffix("/.nomu-lock") { continue }   // the workspace lock holds its holder's pid
+            if parts.count > b + 1 && parts[b + 1] == "_perf" { continue }   // the build's report holds its timings
             out["ws/" + rel] = path
         }
         for store in ["ac", "cas"] {

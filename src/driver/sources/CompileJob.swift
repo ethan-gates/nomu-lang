@@ -417,7 +417,8 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         var sema = Sema(program, externalDecls: externals(), subsetFuncs: subset,
                         fileVisibleModules: fileVisible, fileQualifiers: fileQualifiers,
                         moduleFuncs: moduleFuncs, moduleTypes: moduleTypes,
-                        externalMutatingMethods: externalMutating())
+                        externalMutatingMethods: externalMutating(),
+                        gcRecordLevel: ["off": 0, "limited": 1, "full": 2][jobSettings.choice("gc.record")]!)
         let result = sema.check()
         checkExhaustiveness(result.module, into: result.diagnostics)
         return result

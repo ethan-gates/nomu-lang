@@ -22,8 +22,6 @@ let buildFlags: [Flag] = [
     Flag("explain", help: "say why each module compiled, compared with the last build, and record this build's "
          + "inputs for the next"),
     Flag("emit-jobs", help: "write each module's job file beside its outputs", hidden: true),
-    Flag("report-jobs", help: "print each job as `compiled <module>` or `cached <module>`, each link as `linked <binary>` or `link-cached <binary>`, then `binary <path>`",
-         hidden: true),
 ]
 let buildOptionList: [Opt] = [
     Opt("config", short: "c", valueName: "names",
@@ -102,7 +100,6 @@ func runCompile(_ args: Parsed) -> Bool {
     do { file = try JobFile.decode(Data(contentsOf: URL(fileURLWithPath: path))) }
     catch { fputs("error: cannot read job file '\(path)': \(error)\n", stderr); return false }
     let timings = Timings()
-    timings.optimize = JobSettings(file.job.settings).optimize
     return compile(file.job, options: file.options, timings: timings)
 }
 
@@ -131,15 +128,6 @@ func runBuild(_ args: Parsed) -> Bool {
     var targets = args.positionals("targets")
     if targets.isEmpty { targets = ["."] }
     let r = buildTargetsResult(paths: targets, options: buildOptions(args), selection: ConfigSelection(args.values("config")))
-    if args.has("report-jobs") {
-        for m in r.compiled { print("compiled \(m)") }
-        for m in r.cached { print("cached \(m)") }
-        for (m, why) in r.reasons { print("reason \(m) \(why)") }
-        for b in r.linked { print("linked \(b)") }
-        for b in r.linkCached { print("link-cached \(b)") }
-        for (b, why) in r.linkReasons { print("reason link:\(b) \(why)") }
-        for b in r.binaries { print("binary \(b)") }
-    }
     return r.binary != nil && r.cacheMismatches.isEmpty
 }
 

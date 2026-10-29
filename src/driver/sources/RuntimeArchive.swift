@@ -10,12 +10,15 @@ import embedded
 // per-host cache (D4), under a key over the embedded runtime sources, the host architecture and
 // `runtimeArchiveRecipe` and the identities of the tools and SDK it runs (`HostCache.runtimeArchiveKey`): editing
 // the runtime rebuilds the compiler, which changes the key, and so do editing a command and a toolchain update. A cached archive is materialized into the build's `_runtime/`.
-func cachedRuntimeArchive(_ job: RuntimeArchiveJob, store: ArtifactStore) -> String? {
+// `track` records the archive's stages and whether the cache served it.
+func cachedRuntimeArchive(_ job: RuntimeArchiveJob, store: ArtifactStore, track: Track) -> String? {
+    let timings = track.timings
     let name = (job.archive as NSString).lastPathComponent
     guard Layout.makeDirectory(job.outputDir, buildRoot: (job.outputDir as NSString).deletingLastPathComponent)
     else { return nil }
-    if let cached = store.lookup(job.key) {   // hit
-        do { try store.materialize(cached, into: job.outputDir); return job.archive } catch {
+    if let cached = timings.measure("cache", "lookup", { store.lookup(job.key) }) {   // hit
+        track.outcome = .cached
+        do { try timings.measure("cache", "materialize") { try store.materialize(cached, into: job.outputDir) }; return job.archive } catch {
             fputs("error: \(error)\n", stderr)
             return nil
         }
@@ -29,15 +32,17 @@ func cachedRuntimeArchive(_ job: RuntimeArchiveJob, store: ArtifactStore) -> Str
         return nil
     }
     defer { try? fm.removeItem(atPath: scratch) }
-    writeRuntimeSources(toDir: scratch)
-    guard let built = buildRuntimeArchive(inDir: scratch) else { return nil }
+    timings.measure("runtime", "sources") { writeRuntimeSources(toDir: scratch) }
+    guard let built = timings.measure("runtime", "archive", { buildRuntimeArchive(inDir: scratch) }) else { return nil }
     guard rename(built, scratch + "/" + name) == 0 else {
         fputs("error: cannot name the runtime archive: \(String(cString: strerror(errno)))\n", stderr)
         return nil
     }
     do {
-        let published = try store.publish(job.key, outputsIn: scratch, files: [name])
-        try store.materialize(published, into: job.outputDir)
+        let cost = max(0, timings.now - track.begin)
+        let published = try timings.measure("cache", "publish") { try store.publish(job.key, outputsIn: scratch, files: [name]) }
+        store.recordCost(job.key, seconds: cost)
+        try timings.measure("cache", "materialize") { try store.materialize(published, into: job.outputDir) }
     } catch {
         fputs("error: \(error)\n", stderr)
         return nil

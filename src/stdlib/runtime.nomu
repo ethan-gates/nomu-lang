@@ -674,12 +674,13 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitS
 // (§10.2, Decided), one byte per entry, over the reserved heap range. Entry value 0 is the initial state
 // (block FREE / line unmarked), and rt_raw_alloc zero-fills, so the fresh tables start correct.
 //
-// Space descriptor (152 bytes):
+// Space descriptor (160 bytes):
 //   { heapBase: RawPtr @0, numBlocks: Int @8, lineTable: RawPtr @16, blockTable: RawPtr @24,
 //     freeCursor: Int @32, heapBaseInt: Int @40, allocCursor: Int @48, allocLimit: Int @56,
 //     losHead: RawPtr @64, allocBlock: Int @72, allocLine: Int @80, freeList: RawPtr @88,
 //     freeListTop: Int @96, scanBlock: Int @104, defragTable: RawPtr @112, poolLock: Int @120,
-//     nurseryReserve: Int @128, nurseryUsed: Int @136, logbitTable: RawPtr @144 }.
+//     nurseryReserve: Int @128, nurseryUsed: Int @136, logbitTable: RawPtr @144, recorder: RawPtr @152 }.
+// recorder is the collector's recorder (rtRecNew), null unless `gc.record` is on.
 // allocCursor/allocLimit are heap-relative byte offsets bounding the current hole (0/0 → refill). freeCursor
 // bumps never-used blocks. allocBlock/allocLine track the block being filled + its next line to scan for
 // holes (allocBlock −1 = none). freeList is a stack of reclaimed empty block indices (freeListTop entries).
@@ -728,7 +729,7 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   // Log-bit side table (150.4.2): one bit per 8-byte region = one byte per 64 heap bytes = 512 bytes per
   // 32 KiB block, plus a word of slack for the top-of-heap boundary index. Zero-filled → all objects logged.
   let logbitTable = RawPtr.alloc(bytes: numBlocks * 512 + 64, align: 8)
-  let ctl = RawPtr.alloc(bytes: 152, align: 8)
+  let ctl = RawPtr.alloc(bytes: 160, align: 8)
   ctl.store(heap, toByteOffset: 0)
   ctl.store(numBlocks, toByteOffset: 8)
   ctl.store(lineTable, toByteOffset: 16)
@@ -749,6 +750,10 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   ctl.store(numBlocks / 4, toByteOffset: 128) // nurseryReserve (150.4): bounded copying nursery, 1/4 of the pool
   ctl.store(0, toByteOffset: 136)            // nurseryUsed: NURSERY blocks acquired since the last collection
   ctl.store(logbitTable, toByteOffset: 144)  // logbitTable (150.4.2): write-barrier log-bit side table
+  ctl.store(RawPtr.null, toByteOffset: 152)  // recorder: null unless `gc.record` is on
+  if RawPtr.gcRecordLevel() > 0 {
+    ctl.store(rtRecNew(0), toByteOffset: 152)
+  }
   return ctl
 }
 
@@ -846,6 +851,7 @@ fun rtAcquireBlock(space: RawPtr) -> RawPtr {
 // zero-fills, so the object is zero-initialized like a block object. The object pointer (chunk + 8) is what
 // the seam turns into the managed `p1` — codegen never sees the link word.
 fun rtLosAlloc(space: RawPtr, need: Int) -> RawPtr {
+  rtGcRecordLargeObject(need)
   let raw = RawPtr.alloc(bytes: need + 8, align: 8)
   let head: RawPtr = space.load(fromByteOffset: 64)
   raw.store(head, toByteOffset: 0)              // link → previous LOS head
@@ -1019,7 +1025,7 @@ fun rtImmixAlloc(space: RawPtr, n: Int) -> RawPtr {
 // addition is initiating the STW: the first carrier into OOM sets the stw-request (sched+136) under the lock
 // and wakes the coordinator; because 136 is set before this fiber parks, the carrier's `while 136 != 0` wait
 // cannot race ahead of the request. Concurrent OOMs coalesce (only the first initiates; the rest just park).
-fun rtSelfhostOom(anchorSp: RawPtr, anchorPc: Int) -> Bool {
+fun rtSelfhostOom(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
   let sched = RawPtr.schedHandle()
   if sched.isNull {
     return false
@@ -1028,6 +1034,7 @@ fun rtSelfhostOom(anchorSp: RawPtr, anchorPc: Int) -> Bool {
   rtSchedSetAnchor(self, anchorSp, anchorPc)      // user-frame anchor for the STW walk (128.3.2 machinery)
   rtSchedLock(sched)
   if sched.atomicLoad(fromByteOffset: 136) == 0 {
+    rtGcRecordRequest(trigger)
     sched.atomicStore(1, toByteOffset: 136)       // initiate the stop-the-world (this carrier is the initiator)
     sched.atomicStore(1, toByteOffset: 168)       // signal the GC coordinator to run the collection
     sched.advanced(by: 168).futexWake(all: false)
@@ -1050,7 +1057,7 @@ fun rtSelfhostOom(anchorSp: RawPtr, anchorPc: Int) -> Bool {
 // (nomuSchedStwCollectMinor) rather than a major/defrag. Returns false when there is no self-hosted scheduler
 // (no collector — the reserve stays unenforced, as in 150.4.1); else true (a minor GC always empties the
 // nursery). The coordinator resets this carrier's TLAB before resuming it, so the caller re-reads the TLAB.
-fun rtSelfhostMinorGc(anchorSp: RawPtr, anchorPc: Int) -> Bool {
+fun rtSelfhostMinorGc(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
   let sched = RawPtr.schedHandle()
   if sched.isNull {
     return false
@@ -1059,6 +1066,7 @@ fun rtSelfhostMinorGc(anchorSp: RawPtr, anchorPc: Int) -> Bool {
   rtSchedSetAnchor(self, anchorSp, anchorPc)
   rtSchedLock(sched)
   if sched.atomicLoad(fromByteOffset: 136) == 0 {
+    rtGcRecordRequest(trigger)
     sched.atomicStore(1, toByteOffset: 176)       // collection kind = minor (the coordinator reads this)
     sched.atomicStore(1, toByteOffset: 136)       // initiate the stop-the-world
     sched.atomicStore(1, toByteOffset: 168)       // signal the GC coordinator
@@ -1080,8 +1088,9 @@ fun rtSelfhostMinorGc(anchorSp: RawPtr, anchorPc: Int) -> Bool {
 // The floor is the worst-case promotion (the whole nursery, minorTrigger blocks) plus a fragmentation margin,
 // raised by NOMU_MATURE_FLOOR (the mature-pressure knob) when set higher. The defrag major is
 // heap-pressure-safe (it selects sources within the copy reserve), so it runs even when the minor could not
-// place its promotions. Called without the pool lock held. Returns whether a collection ran.
-fun rtGenCollect(minorTrigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+// place its promotions. Called without the pool lock held. `trigger` is why the collection was raised (the
+// recorder's trigger id: nursery full or allocation stress). Returns whether a collection ran.
+fun rtGenCollect(minorTrigger: Int, trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
   let avail = nomuGcSpaceAvail()
   var floor = minorTrigger + minorTrigger        // 2× the reserve: promotion headroom + fragmentation margin
   let matureFloor = RawPtr.gcMatureFloor()
@@ -1089,9 +1098,13 @@ fun rtGenCollect(minorTrigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
     floor = matureFloor
   }
   if avail < floor {
-    return rtSelfhostOom(anchorSp, anchorPc)     // escalate → major (collection kind 0)
+    var why = trigger
+    if trigger == 1 {
+      why = 2                                    // a nursery-full minor escalated by the mature floor
+    }
+    return rtSelfhostOom(why, anchorSp, anchorPc)     // escalate → major (collection kind 0)
   }
-  return rtSelfhostMinorGc(anchorSp, anchorPc)   // minor (collection kind 1)
+  return rtSelfhostMinorGc(trigger, anchorSp, anchorPc)   // minor (collection kind 1)
 }
 
 // Allocation stress (env NOMU_GC_STRESS): count `need` bytes against this carrier's stress interval and, once
@@ -1111,9 +1124,9 @@ fun rtStressTick(space: RawPtr, tlab: RawPtr, need: Int, stress: Int, anchorSp: 
   tlab.store(0, toByteOffset: 40)
   let minorTrigger = rtGenReserve(space)
   if minorTrigger > 0 {
-    let ran = rtGenCollect(minorTrigger, anchorSp, anchorPc)
+    let ran = rtGenCollect(minorTrigger, 4, anchorSp, anchorPc)
   } else {
-    let ran = rtSelfhostOom(anchorSp, anchorPc)
+    let ran = rtSelfhostOom(4, anchorSp, anchorPc)
   }
 }
 
@@ -1142,7 +1155,7 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
       var didGc = false
       if minorTrigger > 0 && nurseryNow >= minorTrigger {
         rtSchedMutexUnlockAt(space.advanced(by: 120))
-        didGc = rtGenCollect(minorTrigger, anchorSp, anchorPc)
+        didGc = rtGenCollect(minorTrigger, 1, anchorSp, anchorPc)
         rtSchedMutexLockAt(space.advanced(by: 120))
       }
       if didGc {
@@ -1155,12 +1168,13 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
         // the loop (which re-reads the TLAB the collection reset). A collection that freed nothing is genuine
         // OOM: stop with result = false.
         rtSchedMutexUnlockAt(space.advanced(by: 120))
-        let progressed = rtSelfhostOom(anchorSp, anchorPc)
+        let progressed = rtSelfhostOom(3, anchorSp, anchorPc)
         rtSchedMutexLockAt(space.advanced(by: 120))
         if !progressed {
           done = true
         }
       } else {
+        rtGcRecordRefill()
         // 150.4: a clean block (FREE/never-used, state 0) handed to a mutator holds only young objects, so
         // tag it NURSERY (the minor GC's from-space) and count it against the nursery. A reused RECYCLABLE
         // block (state 1) holds mature survivors from a prior sweep, so it stays mature (untagged).
@@ -2439,9 +2453,15 @@ fun rtImmixCollectRoots(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
 // to-space and is non-moving when the heap is near-full — the collection to run under heap pressure, where
 // force-all cannot (no free blocks for to-space). Only source-block roots move; their slots are fixed up.
 fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
+  var tp = rtGcPhaseOpen(10)
   let nSources = rtSelectDefragSources(space)
+  rtGcPhaseClose(10, tp)
+  rtGcCounter(4, nSources)
+  tp = rtGcPhaseOpen(11)
   rtClearAllLines(space)
   rtSetupCopyAllocator(space)
+  rtGcPhaseClose(11, tp)
+  tp = rtGcPhaseOpen(12)
   var i = 0
   while i < nslots {
     let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
@@ -2453,8 +2473,14 @@ fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> In
     }
     i = i + 1
   }
+  rtGcPhaseClose(12, tp)
+  tp = rtGcPhaseOpen(13)
   rtImmixSweepBlocks(space)
+  rtGcPhaseClose(13, tp)
+  tp = rtGcPhaseOpen(14)
   rtImmixSweepLos(space)
+  rtGcPhaseClose(14, tp)
+  tp = rtGcPhaseOpen(16)
   var j = 0
   while j < nslots {
     let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
@@ -2465,6 +2491,7 @@ fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> In
     }
     j = j + 1
   }
+  rtGcPhaseClose(16, tp)
   rtResetAllocator(space)
   return nSources
 }
@@ -2482,9 +2509,15 @@ fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> In
 // next minor; a stale unlog on a freed region would falsely remember a young object. Only the driver differs
 // from the non-generational defrag — this path runs solely under NOMU_NURSERY_RESERVE (the minor is enabled).
 fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
+  var tp = rtGcPhaseOpen(10)
   let nSources = rtSelectDefragSources(space)
+  rtGcPhaseClose(10, tp)
+  rtGcCounter(4, nSources)
+  tp = rtGcPhaseOpen(11)
   rtClearAllLines(space)
   rtSetupCopyAllocator(space)
+  rtGcPhaseClose(11, tp)
+  tp = rtGcPhaseOpen(12)
   var i = 0
   while i < nslots {
     let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
@@ -2496,9 +2529,17 @@ fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) ->
     }
     i = i + 1
   }
+  rtGcPhaseClose(12, tp)
+  tp = rtGcPhaseOpen(13)
   rtImmixSweepBlocks(space)
+  rtGcPhaseClose(13, tp)
+  tp = rtGcPhaseOpen(14)
   rtImmixSweepLos(space)
+  rtGcPhaseClose(14, tp)
+  tp = rtGcPhaseOpen(15)
   rtClearLogTable(space)                       // wipe stale unlogged bits; freed regions read logged
+  rtGcPhaseClose(15, tp)
+  tp = rtGcPhaseOpen(16)
   var j = 0
   while j < nslots {
     let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
@@ -2509,6 +2550,7 @@ fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) ->
     }
     j = j + 1
   }
+  rtGcPhaseClose(16, tp)
   rtResetAllocator(space)
   return nSources
 }
@@ -2638,14 +2680,17 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
   q.store(cap0, toByteOffset: 8)
   var count = 0
   // Root source 1 — stack slots. A young root is promoted + its slot fixed up; a mature root is left alone.
+  var tp = rtGcPhaseOpen(4)
   var s = 0
   while s < nslots {
     let slot: RawPtr = slotBuf.load(fromByteOffset: s * 8)
     count = rtMinorForward(space, slot, q, count)
     s = s + 1
   }
+  rtGcPhaseClose(4, tp)
   // Root source 2 — the remembered set: scan each logged mature object's slots for young referents, then
   // re-unlog it so a store into it next cycle is remembered again.
+  tp = rtGcPhaseOpen(5)
   var r = 0
   while r < nrem {
     let robj: RawPtr = remBuf.load(fromByteOffset: r * 8)
@@ -2664,6 +2709,8 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
   // space is scanned wholesale. Immortal buffers (String bytes) hold no managed pointers, so they need no
   // scanning and are not on this list. A dead-but-unswept LOS object keeps its young referents alive until the
   // next major sweeps it — conservative, not incorrect.
+  rtGcPhaseClose(5, tp)
+  tp = rtGcPhaseOpen(6)
   var los: RawPtr = space.load(fromByteOffset: 64)
   var losNull = los.eq(RawPtr.null)
   while !losNull {
@@ -2672,7 +2719,9 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
     los = los.load(fromByteOffset: 0)                // next LOS node
     losNull = los.eq(RawPtr.null)
   }
+  rtGcPhaseClose(6, tp)
   // Cheney: scan each promoted object for further nursery referents (its young children promote too).
+  tp = rtGcPhaseOpen(7)
   var scan = 0
   while scan < count {
     let qbase: RawPtr = q.load(fromByteOffset: 0)
@@ -2680,8 +2729,10 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
     scan = scan + 1
     count = rtMinorScanObj(space, obj, q, count)
   }
+  rtGcPhaseClose(7, tp)
   // Clear each promoted object's transient mark bit and set its unlog bit — it is mature now, so a future
   // store of a young object into it must be remembered.
+  tp = rtGcPhaseOpen(8)
   var p = 0
   let qbaseFix: RawPtr = q.load(fromByteOffset: 0)   // growth is done; the buffer no longer moves
   while p < count {
@@ -2690,8 +2741,10 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
     rtSetUnlogged(space, obj)
     p = p + 1
   }
+  rtGcPhaseClose(8, tp)
   // Reclaim the emptied nursery blocks (every live object promoted out) onto the free list; mature blocks are
   // left untouched (not swept).
+  tp = rtGcPhaseOpen(9)
   let fl: RawPtr = space.load(fromByteOffset: 88)
   var bj = 0
   while bj < fc {
@@ -2705,6 +2758,7 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
   }
   space.store(0, toByteOffset: 136)              // the nursery is empty again
   rtResetAllocator(space)
+  rtGcPhaseClose(9, tp)
   let qbaseFree: RawPtr = q.load(fromByteOffset: 0)   // free the (possibly grown) buffer, then the handle
   qbaseFree.free()
   q.free()
@@ -2722,9 +2776,17 @@ fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
   if spaceNull {
     return 0
   }
+  var kind = 2
+  if forceAll != 0 {
+    kind = 3
+  }
+  let collectStart = rtGcRecordEntry(kind)
   let cap = 8192
   let slots = RawPtr.alloc(bytes: cap * 8, align: 8)
+  let tw = rtGcPhaseOpen(2)
   let ns = nomuSchedWalkSlots(sched, slots, cap)
+  rtGcPhaseClose(2, tw)
+  rtGcCounter(1, ns)
   if forceAll != 0 {
     rtImmixCollectRoots(space, slots, ns)
   } else {
@@ -2738,6 +2800,7 @@ fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
     }
   }
   slots.free()
+  rtGcRecordExit(collectStart)
   return ns
 }
 
@@ -2762,15 +2825,24 @@ fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
   if spaceNull {
     return 0
   }
+  let collectStart = rtGcRecordEntry(1)
   let cap = 8192
   let slots = RawPtr.alloc(bytes: cap * 8, align: 8)
+  let tw = rtGcPhaseOpen(2)
   let ns = nomuSchedWalkSlots(sched, slots, cap)
+  rtGcPhaseClose(2, tw)
   let remCap = 1048576
   let rem = RawPtr.alloc(bytes: remCap * 8, align: 8)
+  let td = rtGcPhaseOpen(3)
   let nrem = RawPtr.gcDrainModBufs(rem, remCap)
+  rtGcPhaseClose(3, td)
+  rtGcCounter(1, ns)
+  rtGcCounter(3, nrem)
   let n = rtImmixCollectMinor(space, slots, ns, rem, nrem)
+  rtGcCounter(2, n)
   rem.free()
   slots.free()
+  rtGcRecordExit(collectStart)
   return n
 }
 
@@ -2796,6 +2868,1160 @@ fun nomuGcSpaceBlocks() -> Int {
     return 0
   }
   return space.load(fromByteOffset: 8)
+}
+
+// ---- The collector's recorder (gc-observability) ----
+// What the collector did, for tuning it: one model for every collector (GenImmix now, LXR later). An
+// interval is a piece of collector work (a phase, its start and duration, in a pause or concurrent); a cycle
+// is one logical collection (its kind, trigger and span), and the intervals inside it carry its number; a
+// counter is a value at a moment (heap snapshots are runs of counters). Present only under `gc.record`:
+// every call site sits under `RawPtr.gcRecordLevel() > 0`, a constant, so with the setting off it folds away
+// and the space's recorder slot stays null. Times are raw ticks (`RawPtr.ticks()`), converted when the
+// report is written.
+//
+// One recorder per recording thread; GenImmix records only on its STW coordinator. A recorder is written by
+// its own thread alone, without locks. Its records live in chunks off the GC heap that never move. A record
+// is written whole before its chunk's count and the recorder's count advance, so a reader that interrupts
+// the writer (a fault handler) sees only whole records; the open-phase stack names the work in progress.
+//
+// Recorder (168 bytes): { head: RawPtr @0, tail: RawPtr @8, count: Int @16, thread: Int @24, cycle: Int @32,
+//   cycleKind: Int @40, cycleTrigger: Int @48, cycleStart: Int @56, cycles: Int @64, depth: Int @72,
+//   open phases: Int ×6 @80, requestedAt: Int @128, requestTrigger: Int @136, blocksRefilled: Int @144,
+//   largeObjects: Int @152, largeBytes: Int @160, origin: Int @168, originWall: Int @176 }. origin is the
+//   recorder's creation in ticks, the zero of the report's times, and originWall the same moment in wall-clock
+//   nanoseconds. cycle is the current cycle's number (0 between cycles);
+//   cycles counts them. Two groups of fields are written by other threads: the request (@128, @136), by the
+//   mutator that raises a collection, under the scheduler lock before it signals the coordinator; and the
+//   allocation counts (@144–@160), by mutators under the pool lock. The coordinator reads both only inside a
+//   pause.
+// Chunk: { next: RawPtr @0, used: Int @8, records @16 }, rtRecChunkRecords() records each.
+// Record (48 bytes): { kind: Int @0, id: Int @8, start: Int @16, value: Int @24, cycle: Int @32, flags: Int @40 }.
+//   kind 1 interval: id the phase, value its duration, flags 1 when concurrent (0 in a pause).
+//   kind 2 cycle:    id the cycle kind, value its duration, flags its trigger.
+//   kind 3 counter:  id the counter, start the moment, value the value.
+// Phase, cycle-kind, trigger and counter ids are numbered where they are recorded; the report names them.
+
+fun rtRecChunkRecords() -> Int {
+  return 1024
+}
+
+fun rtRecChunkNew() -> RawPtr {
+  let chunk = RawPtr.alloc(bytes: 16 + rtRecChunkRecords() * 48, align: 8)
+  chunk.store(RawPtr.null, toByteOffset: 0)
+  chunk.store(0, toByteOffset: 8)
+  return chunk
+}
+
+// A recorder for the thread numbered `thread` (0 is the STW coordinator).
+fun rtRecNew(thread: Int) -> RawPtr {
+  let rec = RawPtr.alloc(bytes: 184, align: 8)
+  let chunk = rtRecChunkNew()
+  rec.store(chunk, toByteOffset: 0)
+  rec.store(chunk, toByteOffset: 8)
+  rec.store(0, toByteOffset: 16)
+  rec.store(thread, toByteOffset: 24)
+  rec.store(0, toByteOffset: 32)
+  rec.store(0, toByteOffset: 64)
+  rec.store(0, toByteOffset: 72)
+  rec.store(0, toByteOffset: 128)
+  rec.store(0, toByteOffset: 136)
+  rec.store(0, toByteOffset: 144)
+  rec.store(0, toByteOffset: 152)
+  rec.store(0, toByteOffset: 160)
+  rec.store(RawPtr.ticks(), toByteOffset: 168)
+  rec.store(RawPtr.wallNanos(), toByteOffset: 176)
+  return rec
+}
+
+// The space's recorder: null before the space exists and when `gc.record` is off.
+fun rtRecSpace() -> RawPtr {
+  let space = RawPtr.gcSelfhostSpace()
+  let spaceNull = space.eq(RawPtr.null)
+  if spaceNull {
+    return RawPtr.null
+  }
+  return space.load(fromByteOffset: 152)
+}
+
+// Append one record, then publish it.
+fun rtRecAppend(rec: RawPtr, kind: Int, id: Int, start: Int, value: Int, flags: Int) {
+  var chunk: RawPtr = rec.load(fromByteOffset: 8)
+  let used: Int = chunk.load(fromByteOffset: 8)
+  var at = used
+  if used == rtRecChunkRecords() {
+    let fresh = rtRecChunkNew()
+    chunk.store(fresh, toByteOffset: 0)
+    rec.store(fresh, toByteOffset: 8)
+    chunk = fresh
+    at = 0
+  }
+  let r = chunk.advanced(by: 16 + at * 48)
+  r.store(kind, toByteOffset: 0)
+  r.store(id, toByteOffset: 8)
+  r.store(start, toByteOffset: 16)
+  r.store(value, toByteOffset: 24)
+  let cycle: Int = rec.load(fromByteOffset: 32)
+  r.store(cycle, toByteOffset: 32)
+  r.store(flags, toByteOffset: 40)
+  chunk.store(at + 1, toByteOffset: 8)
+  let count: Int = rec.load(fromByteOffset: 16)
+  rec.store(count + 1, toByteOffset: 16)
+}
+
+// Open the phase `phase`; returns its start, which rtRecClose takes back. Phases nest up to six deep; a
+// deeper one is recorded but left off the open-phase stack.
+fun rtRecOpen(rec: RawPtr, phase: Int) -> Int {
+  let depth: Int = rec.load(fromByteOffset: 72)
+  if depth < 6 {
+    rec.store(phase, toByteOffset: 80 + depth * 8)
+  }
+  rec.store(depth + 1, toByteOffset: 72)
+  return RawPtr.ticks()
+}
+
+// Close the phase `phase` opened at `start`, recording its interval. `concurrent` is 1 for work that ran
+// beside the mutator, 0 for work in a pause.
+fun rtRecClose(rec: RawPtr, phase: Int, start: Int, concurrent: Int) {
+  let end = RawPtr.ticks()
+  rtRecAppend(rec, 1, phase, start, end - start, concurrent)
+  let depth: Int = rec.load(fromByteOffset: 72)
+  rec.store(depth - 1, toByteOffset: 72)
+}
+
+// Begin a cycle of kind `kind` raised by `trigger`, starting at `start` (its request); the intervals and
+// counters recorded until rtRecCycleEnd carry its number.
+fun rtRecCycleBegin(rec: RawPtr, kind: Int, trigger: Int, start: Int) {
+  let n: Int = rec.load(fromByteOffset: 64)
+  rec.store(n + 1, toByteOffset: 64)
+  rec.store(kind, toByteOffset: 40)
+  rec.store(trigger, toByteOffset: 48)
+  rec.store(start, toByteOffset: 56)
+  rec.store(n + 1, toByteOffset: 32)
+}
+
+fun rtRecCycleEnd(rec: RawPtr) {
+  let start: Int = rec.load(fromByteOffset: 56)
+  let kind: Int = rec.load(fromByteOffset: 40)
+  let trigger: Int = rec.load(fromByteOffset: 48)
+  rtRecAppend(rec, 2, kind, start, RawPtr.ticks() - start, trigger)
+  rec.store(0, toByteOffset: 32)
+}
+
+// Record counter `id` as `value` at this moment.
+fun rtRecCounter(rec: RawPtr, id: Int, value: Int) {
+  rtRecAppend(rec, 3, id, RawPtr.ticks(), value, 0)
+}
+
+// Record an interval of phase `phase` from `start` to now, without opening it first.
+fun rtRecSpan(rec: RawPtr, phase: Int, start: Int) {
+  rtRecAppend(rec, 1, phase, start, RawPtr.ticks() - start, 0)
+}
+
+// Reading: the number of published records, and the i-th (0-based) of them.
+fun rtRecCount(rec: RawPtr) -> Int {
+  return rec.load(fromByteOffset: 16)
+}
+
+fun rtRecAt(rec: RawPtr, i: Int) -> RawPtr {
+  var chunk: RawPtr = rec.load(fromByteOffset: 0)
+  var skip = i
+  while skip >= rtRecChunkRecords() {
+    chunk = chunk.load(fromByteOffset: 0)
+    skip = skip - rtRecChunkRecords()
+  }
+  return chunk.advanced(by: 16 + skip * 48)
+}
+
+// Every chunk's address in order, so a reader reaches record i without walking the chunk list: rtRecIn.
+fun rtRecChunks(rec: RawPtr) -> RawPtr {
+  let count = rtRecCount(rec)
+  let n = count / rtRecChunkRecords() + 1
+  let chunks = RawPtr.alloc(bytes: n * 8, align: 8)
+  var chunk: RawPtr = rec.load(fromByteOffset: 0)
+  var k = 0
+  while k < n && !chunk.isNull {
+    chunks.store(chunk, toByteOffset: k * 8)
+    chunk = chunk.load(fromByteOffset: 0)
+    k = k + 1
+  }
+  return chunks
+}
+
+fun rtRecIn(chunks: RawPtr, i: Int) -> RawPtr {
+  let chunk: RawPtr = chunks.load(fromByteOffset: (i / rtRecChunkRecords()) * 8)
+  return chunk.advanced(by: 16 + (i % rtRecChunkRecords()) * 48)
+}
+
+// The innermost open phase, or 0 when none is open: the breadcrumb a fault handler prints.
+fun rtRecOpenPhase(rec: RawPtr) -> Int {
+  let depth: Int = rec.load(fromByteOffset: 72)
+  if depth == 0 {
+    return 0
+  }
+  var top = depth - 1
+  if top > 5 {
+    top = 5
+  }
+  return rec.load(fromByteOffset: 80 + top * 8)
+}
+
+// ---- What the collector records (GenImmix) ----
+// The collector calls these hooks; each is empty unless `gc.record` is on, so with it off they fold away in
+// the release-built runtime. Ids, which the report names:
+//   cycle kinds: 1 minor, 2 major, 3 forced (every object moved; the smoke driver).
+//   triggers:    0 an external driver (no request), 1 nursery full, 2 mature floor (a minor escalated to a
+//                major), 3 heap exhausted, 4 allocation stress.
+//   phases:      1 time to safepoint (the request to the collector's entry, with every carrier stopped),
+//                2 root walk, 3 remembered-set drain, 4 stack roots, 5 remembered set, 6 large objects,
+//                7 scan, 8 unmark and unlog, 9 nursery reclaim, 10 source selection, 11 prepare, 12 trace,
+//                13 sweep, 14 large-object sweep, 15 log-table clear, 16 unmark, 17 snapshot, 18 collect
+//                (the collector's entry to its return; the rest nest in it).
+//   counters:    1 roots, 2 objects promoted, 3 remembered entries, 4 defrag sources; a snapshot: 20 free
+//                blocks, 21 recyclable, 22 full, 23 nursery, 24 large objects, 25 blocks in the heap; since
+//                the last cycle: 30 blocks refilled, 31 large objects allocated, 32 their bytes.
+// The pause ends when the coordinator resumes the world, after the collector returns; that tail (TLAB and
+// mod-buffer resets, the wake) is the coordinator's, in C, and is not recorded.
+
+// A mutator raising a collection, as the first carrier into the request, under the scheduler lock.
+fun rtGcRecordRequest(trigger: Int) {
+  if RawPtr.gcRecordLevel() > 0 {
+    let rec = rtRecSpace()
+    if !rec.isNull {
+      rec.store(RawPtr.ticks(), toByteOffset: 128)
+      rec.store(trigger, toByteOffset: 136)
+    }
+  }
+}
+
+// The collector's entry, with the world stopped: begin a cycle of `kind` at its request, record the time to
+// safepoint and the allocation since the last cycle, and open the collect phase. Returns its start.
+fun rtGcRecordEntry(kind: Int) -> Int {
+  if RawPtr.gcRecordLevel() > 0 {
+    let rec = rtRecSpace()
+    if !rec.isNull {
+      let entry = RawPtr.ticks()
+      let requestedAt: Int = rec.load(fromByteOffset: 128)
+      var start = entry
+      if requestedAt != 0 {
+        start = requestedAt
+      }
+      let trigger: Int = rec.load(fromByteOffset: 136)
+      rtRecCycleBegin(rec, kind, trigger, start)
+      if requestedAt != 0 {
+        rtRecAppend(rec, 1, 1, requestedAt, entry - requestedAt, 0)
+      }
+      rec.store(0, toByteOffset: 128)
+      rec.store(0, toByteOffset: 136)
+      let refilled: Int = rec.load(fromByteOffset: 144)
+      let losN: Int = rec.load(fromByteOffset: 152)
+      let losB: Int = rec.load(fromByteOffset: 160)
+      rtRecCounter(rec, 30, refilled)
+      rtRecCounter(rec, 31, losN)
+      rtRecCounter(rec, 32, losB)
+      rec.store(0, toByteOffset: 144)
+      rec.store(0, toByteOffset: 152)
+      rec.store(0, toByteOffset: 160)
+      rtGcRecordSnapshot(rec)
+      return rtRecOpen(rec, 18)
+    }
+  }
+  return 0
+}
+
+// The collector's return: close the collect phase, take a snapshot, end the cycle.
+fun rtGcRecordExit(start: Int) {
+  if RawPtr.gcRecordLevel() > 0 {
+    let rec = rtRecSpace()
+    if !rec.isNull {
+      rtRecClose(rec, 18, start, 0)
+      rtGcRecordSnapshot(rec)
+      rtRecCycleEnd(rec)
+    }
+  }
+}
+
+fun rtGcPhaseOpen(phase: Int) -> Int {
+  if RawPtr.gcRecordLevel() > 0 {
+    let rec = rtRecSpace()
+    if !rec.isNull {
+      return rtRecOpen(rec, phase)
+    }
+  }
+  return 0
+}
+
+fun rtGcPhaseClose(phase: Int, start: Int) {
+  if RawPtr.gcRecordLevel() > 0 {
+    let rec = rtRecSpace()
+    if !rec.isNull {
+      rtRecClose(rec, phase, start, 0)
+    }
+  }
+}
+
+fun rtGcCounter(id: Int, value: Int) {
+  if RawPtr.gcRecordLevel() > 0 {
+    let rec = rtRecSpace()
+    if !rec.isNull {
+      rtRecCounter(rec, id, value)
+    }
+  }
+}
+
+// A block handed to a mutator's TLAB, under the pool lock.
+fun rtGcRecordRefill() {
+  if RawPtr.gcRecordLevel() > 0 {
+    let rec = rtRecSpace()
+    if !rec.isNull {
+      let n: Int = rec.load(fromByteOffset: 144)
+      rec.store(n + 1, toByteOffset: 144)
+    }
+  }
+}
+
+// A large object of `bytes` allocated, under the pool lock.
+fun rtGcRecordLargeObject(bytes: Int) {
+  if RawPtr.gcRecordLevel() > 0 {
+    let rec = rtRecSpace()
+    if !rec.isNull {
+      let n: Int = rec.load(fromByteOffset: 152)
+      rec.store(n + 1, toByteOffset: 152)
+      let b: Int = rec.load(fromByteOffset: 160)
+      rec.store(b + bytes, toByteOffset: 160)
+    }
+  }
+}
+
+// The heap's blocks by state and its large objects, as counters 20–25, inside a snapshot phase. Only blocks
+// below the never-used cursor are read; the rest are free.
+fun rtGcRecordSnapshot(rec: RawPtr) {
+  let start = rtRecOpen(rec, 17)
+  let space = RawPtr.gcSelfhostSpace()
+  let nb: Int = space.load(fromByteOffset: 8)
+  let used: Int = space.load(fromByteOffset: 32)
+  let tbl: RawPtr = space.load(fromByteOffset: 24)
+  var free = nb - used
+  var recyclable = 0
+  var full = 0
+  var nursery = 0
+  var bi = 0
+  while bi < used {
+    let b: UInt8 = tbl.load(fromByteOffset: bi)
+    let st = b.int
+    if st == 0 {
+      free = free + 1
+    } else if st == 1 {
+      recyclable = recyclable + 1
+    } else if st == 2 {
+      full = full + 1
+    } else if st == 4 {
+      nursery = nursery + 1
+    }
+    bi = bi + 1
+  }
+  var los = 0
+  var node: RawPtr = space.load(fromByteOffset: 64)
+  while !node.isNull {
+    los = los + 1
+    node = node.load(fromByteOffset: 0)
+  }
+  rtRecCounter(rec, 20, free)
+  rtRecCounter(rec, 21, recyclable)
+  rtRecCounter(rec, 22, full)
+  rtRecCounter(rec, 23, nursery)
+  rtRecCounter(rec, 24, los)
+  rtRecCounter(rec, 25, nb)
+  rtRecClose(rec, 17, start, 0)
+}
+
+// ---- The collector's report (gc-observability) ----
+// At exit, with every carrier stopped, the recorder is written out as `<binary>-gc-<time>.json` (everything
+// recorded, its names, and the metrics derived from it) and `<binary>-gc-<time>.trace.json` (the Chrome
+// trace-event view of the same cycles, for Perfetto). They go in the executable's directory, or the one
+// `NOMU_GC_REPORT_DIR` names; `<time>` is the recorder's creation in UTC (`20261029T120405.123Z`), so runs
+// never overwrite each other. Times are integer microseconds from the recorder's creation; `dur` is a
+// duration. Its path is printed to stderr. Written in Nomu over raw buffers: the runtime subset calls no
+// `String` method, so text comes from literals (`RawPtr.copyLiteral`) and numbers are formatted here.
+
+fun rtGcRecordFinish() {
+  if RawPtr.gcRecordLevel() > 0 {
+    let rec = rtRecSpace()
+    if !rec.isNull {
+      rtGcReportWrite(rec)
+    }
+  }
+}
+
+// A growable byte buffer off the GC heap: { data: RawPtr @0, len: Int @8, cap: Int @16 }.
+fun rtBufNew(cap: Int) -> RawPtr {
+  let buf = RawPtr.alloc(bytes: 24, align: 8)
+  buf.store(RawPtr.alloc(bytes: cap, align: 8), toByteOffset: 0)
+  buf.store(0, toByteOffset: 8)
+  buf.store(cap, toByteOffset: 16)
+  return buf
+}
+
+fun rtBufFree(buf: RawPtr) {
+  let data: RawPtr = buf.load(fromByteOffset: 0)
+  data.free()
+  buf.free()
+}
+
+// Room for `need` more bytes; returns where they go. rtBufGrew then counts the bytes written there.
+fun rtBufAt(buf: RawPtr, need: Int) -> RawPtr {
+  var data: RawPtr = buf.load(fromByteOffset: 0)
+  let len: Int = buf.load(fromByteOffset: 8)
+  var cap: Int = buf.load(fromByteOffset: 16)
+  if len + need > cap {
+    while len + need > cap {
+      cap = cap * 2
+    }
+    let grown = RawPtr.alloc(bytes: cap, align: 8)
+    grown.copyBytes(from: data, byteCount: len)
+    data.free()
+    data = grown
+    buf.store(grown, toByteOffset: 0)
+    buf.store(cap, toByteOffset: 16)
+  }
+  return data.advanced(by: len)
+}
+
+fun rtBufGrew(buf: RawPtr, n: Int) {
+  let len: Int = buf.load(fromByteOffset: 8)
+  buf.store(len + n, toByteOffset: 8)
+}
+
+fun rtBufByte(buf: RawPtr, b: Int) {
+  let at = rtBufAt(buf, 1)
+  at.store(b.uint8, toByteOffset: 0)
+  rtBufGrew(buf, 1)
+}
+
+fun rtBufInt(buf: RawPtr, v: Int) {
+  var n = v
+  if n < 0 {
+    rtBufByte(buf, 45)
+    n = 0 - n
+  }
+  let digits = RawPtr.alloc(bytes: 24, align: 8)
+  var k = 0
+  if n == 0 {
+    digits.store(48.uint8, toByteOffset: 0)
+    k = 1
+  }
+  while n > 0 {
+    let d = n % 10
+    digits.store((48 + d).uint8, toByteOffset: k)
+    n = n / 10
+    k = k + 1
+  }
+  while k > 0 {
+    k = k - 1
+    let b: UInt8 = digits.load(fromByteOffset: k)
+    rtBufByte(buf, b.int)
+  }
+  digits.free()
+}
+
+// `v` as at least `width` digits, zero-padded.
+fun rtBufPadded(buf: RawPtr, v: Int, width: Int) {
+  var limit = 1
+  var w = 1
+  while w < width {
+    limit = limit * 10
+    if v < limit {
+      rtBufByte(buf, 48)
+    }
+    w = w + 1
+  }
+  rtBufInt(buf, v)
+}
+
+// A fraction `num / den` in [0, 1] with four decimals.
+fun rtBufFraction(buf: RawPtr, num: Int, den: Int) {
+  var tenThousandths = 0
+  if den > 0 {
+    tenThousandths = num * 10000 / den
+  }
+  rtBufInt(buf, tenThousandths / 10000)
+  rtBufByte(buf, 46)
+  rtBufPadded(buf, tenThousandths % 10000, 4)
+}
+
+// `n` bytes at `p` as a JSON string body (quotes and backslashes escaped).
+fun rtBufJsonBytes(buf: RawPtr, p: RawPtr, n: Int) {
+  var i = 0
+  while i < n {
+    let b: UInt8 = p.load(fromByteOffset: i)
+    let c = b.int
+    if c == 34 || c == 92 {
+      rtBufByte(buf, 92)
+    }
+    rtBufByte(buf, c)
+    i = i + 1
+  }
+}
+
+// Ticks since the recorder's creation as microseconds.
+fun rtGcMicros(rec: RawPtr, ticks: Int, numer: Int, denom: Int) -> Int {
+  let origin: Int = rec.load(fromByteOffset: 168)
+  return (ticks - origin) * numer / denom / 1000
+}
+
+fun rtGcDuration(ticks: Int, numer: Int, denom: Int) -> Int {
+  return ticks * numer / denom / 1000
+}
+
+// The name of id `id` in table `table` (1 cycle kinds, 2 triggers, 3 phases, 4 counters), as a JSON string.
+fun rtGcPutName(buf: RawPtr, table: Int, id: Int) {
+  rtBufByte(buf, 34)
+  var n = 0
+  let at = rtBufAt(buf, 64)
+  if table == 1 {
+    if id == 1 { n = RawPtr.copyLiteral(to: at, "minor") }
+    else if id == 2 { n = RawPtr.copyLiteral(to: at, "major") }
+    else if id == 3 { n = RawPtr.copyLiteral(to: at, "forced") }
+  } else if table == 2 {
+    if id == 0 { n = RawPtr.copyLiteral(to: at, "external driver") }
+    else if id == 1 { n = RawPtr.copyLiteral(to: at, "nursery full") }
+    else if id == 2 { n = RawPtr.copyLiteral(to: at, "mature floor") }
+    else if id == 3 { n = RawPtr.copyLiteral(to: at, "heap exhausted") }
+    else if id == 4 { n = RawPtr.copyLiteral(to: at, "allocation stress") }
+  } else if table == 3 {
+    if id == 1 { n = RawPtr.copyLiteral(to: at, "time to safepoint") }
+    else if id == 2 { n = RawPtr.copyLiteral(to: at, "root walk") }
+    else if id == 3 { n = RawPtr.copyLiteral(to: at, "remembered-set drain") }
+    else if id == 4 { n = RawPtr.copyLiteral(to: at, "stack roots") }
+    else if id == 5 { n = RawPtr.copyLiteral(to: at, "remembered set") }
+    else if id == 6 { n = RawPtr.copyLiteral(to: at, "large objects") }
+    else if id == 7 { n = RawPtr.copyLiteral(to: at, "scan") }
+    else if id == 8 { n = RawPtr.copyLiteral(to: at, "unmark and unlog") }
+    else if id == 9 { n = RawPtr.copyLiteral(to: at, "nursery reclaim") }
+    else if id == 10 { n = RawPtr.copyLiteral(to: at, "source selection") }
+    else if id == 11 { n = RawPtr.copyLiteral(to: at, "prepare") }
+    else if id == 12 { n = RawPtr.copyLiteral(to: at, "trace") }
+    else if id == 13 { n = RawPtr.copyLiteral(to: at, "sweep") }
+    else if id == 14 { n = RawPtr.copyLiteral(to: at, "large-object sweep") }
+    else if id == 15 { n = RawPtr.copyLiteral(to: at, "log-table clear") }
+    else if id == 16 { n = RawPtr.copyLiteral(to: at, "unmark") }
+    else if id == 17 { n = RawPtr.copyLiteral(to: at, "snapshot") }
+    else if id == 18 { n = RawPtr.copyLiteral(to: at, "collect") }
+  } else {
+    if id == 1 { n = RawPtr.copyLiteral(to: at, "roots") }
+    else if id == 2 { n = RawPtr.copyLiteral(to: at, "objects promoted") }
+    else if id == 3 { n = RawPtr.copyLiteral(to: at, "remembered entries") }
+    else if id == 4 { n = RawPtr.copyLiteral(to: at, "defrag sources") }
+    else if id == 20 { n = RawPtr.copyLiteral(to: at, "free blocks") }
+    else if id == 21 { n = RawPtr.copyLiteral(to: at, "recyclable blocks") }
+    else if id == 22 { n = RawPtr.copyLiteral(to: at, "full blocks") }
+    else if id == 23 { n = RawPtr.copyLiteral(to: at, "nursery blocks") }
+    else if id == 24 { n = RawPtr.copyLiteral(to: at, "large objects") }
+    else if id == 25 { n = RawPtr.copyLiteral(to: at, "heap blocks") }
+    else if id == 30 { n = RawPtr.copyLiteral(to: at, "blocks refilled") }
+    else if id == 31 { n = RawPtr.copyLiteral(to: at, "large objects allocated") }
+    else if id == 32 { n = RawPtr.copyLiteral(to: at, "large-object bytes allocated") }
+  }
+  rtBufGrew(buf, n)
+  rtBufByte(buf, 34)
+}
+
+// `"names":{...}`: every id the report uses, by table.
+fun rtGcPutNames(buf: RawPtr) {
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "\"names\":{\"kinds\":{"))
+  rtGcPutNameList(buf, 1, 1, 3)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "},\"triggers\":{"))
+  rtGcPutNameList(buf, 2, 0, 4)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "},\"phases\":{"))
+  rtGcPutNameList(buf, 3, 1, 18)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "},\"counters\":{"))
+  rtGcPutNameList(buf, 4, 1, 4)
+  rtBufByte(buf, 44)
+  rtGcPutNameList(buf, 4, 20, 25)
+  rtBufByte(buf, 44)
+  rtGcPutNameList(buf, 4, 30, 32)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "}}"))
+}
+
+fun rtGcPutNameList(buf: RawPtr, table: Int, from: Int, to: Int) {
+  var id = from
+  while id <= to {
+    if id > from {
+      rtBufByte(buf, 44)
+    }
+    rtBufByte(buf, 34)
+    rtBufInt(buf, id)
+    rtBufByte(buf, 34)
+    rtBufByte(buf, 58)
+    rtGcPutName(buf, table, id)
+    id = id + 1
+  }
+}
+
+// Sort `n` Ints at `a` ascending (bottom-up merge sort through a scratch buffer).
+fun rtSortInts(a: RawPtr, n: Int) {
+  let tmp = RawPtr.alloc(bytes: n * 8 + 8, align: 8)
+  var width = 1
+  while width < n {
+    var lo = 0
+    while lo < n {
+      var mid = lo + width
+      if mid > n {
+        mid = n
+      }
+      var hi = lo + width + width
+      if hi > n {
+        hi = n
+      }
+      var i = lo
+      var j = mid
+      var k = lo
+      while k < hi {
+        var takeLeft = false
+        if i < mid {
+          if j >= hi {
+            takeLeft = true
+          } else {
+            let x: Int = a.load(fromByteOffset: i * 8)
+            let y: Int = a.load(fromByteOffset: j * 8)
+            takeLeft = x <= y
+          }
+        }
+        if takeLeft {
+          let x: Int = a.load(fromByteOffset: i * 8)
+          tmp.store(x, toByteOffset: k * 8)
+          i = i + 1
+        } else {
+          let y: Int = a.load(fromByteOffset: j * 8)
+          tmp.store(y, toByteOffset: k * 8)
+          j = j + 1
+        }
+        k = k + 1
+      }
+      lo = hi
+    }
+    a.copyBytes(from: tmp, byteCount: n * 8)
+    width = width + width
+  }
+  tmp.free()
+}
+
+// The `p`-th percentile (0–100) of `n` sorted Ints, nearest rank.
+fun rtPercentile(a: RawPtr, n: Int, p: Int) -> Int {
+  if n == 0 {
+    return 0
+  }
+  var rank = (p * n + 99) / 100
+  if rank < 1 {
+    rank = 1
+  }
+  return a.load(fromByteOffset: (rank - 1) * 8)
+}
+
+// Minimum mutator utilization over windows of `w` µs, in ten-thousandths: the least share of any window in
+// [0, total] left to the mutator. Pauses are `n` sorted, disjoint [start, end) pairs at `ps` (start @16i,
+// end @16i+8). The worst window starts at a pause's start or ends at a pause's end, so only those are tried;
+// two cursors keep it linear. -1 when the run is shorter than the window.
+fun rtGcMmu(ps: RawPtr, n: Int, total: Int, w: Int) -> Int {
+  if w > total {
+    return -1
+  }
+  var worst = 0
+  // Windows starting at a pause's start: pauses i..j-1 lie wholly or partly inside.
+  var j = 0
+  var inside = 0                                   // the full lengths of pauses i..j-1
+  var i = 0
+  while i < n {
+    var t: Int = ps.load(fromByteOffset: i * 16)
+    if t + w > total {
+      t = total - w
+    }
+    if j < i {
+      j = i
+      inside = 0
+    }
+    while j < n {
+      let sj: Int = ps.load(fromByteOffset: j * 16)
+      if sj >= t + w {
+        break
+      }
+      let ej: Int = ps.load(fromByteOffset: j * 16 + 8)
+      inside = inside + (ej - sj)
+      j = j + 1
+    }
+    // The last pause inside may run past the window's end; the first may start before it.
+    var gc = inside
+    if j > i {
+      let el: Int = ps.load(fromByteOffset: (j - 1) * 16 + 8)
+      if el > t + w {
+        gc = gc - (el - (t + w))
+      }
+      let sf: Int = ps.load(fromByteOffset: i * 16)
+      if sf < t {
+        gc = gc - (t - sf)
+      }
+    }
+    if gc > worst {
+      worst = gc
+    }
+    let si: Int = ps.load(fromByteOffset: i * 16)
+    let ei: Int = ps.load(fromByteOffset: i * 16 + 8)
+    inside = inside - (ei - si)
+    i = i + 1
+  }
+  // Windows ending at a pause's end, mirrored: pauses k..i lie wholly or partly inside.
+  var k = 0
+  var behind = 0                                   // the full lengths of pauses k..i
+  i = 0
+  while i < n {
+    let ei: Int = ps.load(fromByteOffset: i * 16 + 8)
+    let si: Int = ps.load(fromByteOffset: i * 16)
+    behind = behind + (ei - si)
+    var t = ei - w
+    if t < 0 {
+      t = 0
+    }
+    while k <= i {
+      let ek: Int = ps.load(fromByteOffset: k * 16 + 8)
+      if ek > t {
+        break
+      }
+      let sk: Int = ps.load(fromByteOffset: k * 16)
+      behind = behind - (ek - sk)
+      k = k + 1
+    }
+    var gc = behind
+    if k <= i {
+      let sk: Int = ps.load(fromByteOffset: k * 16)
+      if sk < t {
+        gc = gc - (t - sk)
+      }
+    }
+    if gc > worst {
+      worst = gc
+    }
+    i = i + 1
+  }
+  return (w - worst) * 10000 / w
+}
+
+// The UTC time `wallNs` (ns since the epoch) as `YYYYMMDDTHHMMSS.mmmZ` (`basic`) or `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+fun rtBufUtc(buf: RawPtr, wallNs: Int, basic: Bool) {
+  let ms = wallNs / 1000000
+  let secs = ms / 1000
+  let days = secs / 86400
+  let daySecs = secs % 86400
+  // Civil date from days since 1970-01-01 (Hinnant's algorithm, days ≥ 0).
+  let z = days + 719468
+  let era = z / 146097
+  let doe = z - era * 146097
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  let mp = (5 * doy + 2) / 153
+  let d = doy - (153 * mp + 2) / 5 + 1
+  var m = mp + 3
+  if mp >= 10 {
+    m = mp - 9
+  }
+  var y = yoe + era * 400
+  if m <= 2 {
+    y = y + 1
+  }
+  rtBufPadded(buf, y, 4)
+  if !basic { rtBufByte(buf, 45) }
+  rtBufPadded(buf, m, 2)
+  if !basic { rtBufByte(buf, 45) }
+  rtBufPadded(buf, d, 2)
+  rtBufByte(buf, 84)
+  rtBufPadded(buf, daySecs / 3600, 2)
+  if !basic { rtBufByte(buf, 58) }
+  rtBufPadded(buf, daySecs % 3600 / 60, 2)
+  if !basic { rtBufByte(buf, 58) }
+  rtBufPadded(buf, daySecs % 60, 2)
+  rtBufByte(buf, 46)
+  rtBufPadded(buf, ms % 1000, 3)
+  rtBufByte(buf, 90)
+}
+
+// Write `buf` to `path` (NUL-terminated). Returns whether it was written whole.
+fun rtGcWriteFile(path: RawPtr, buf: RawPtr) -> Bool {
+  let fd = RawPtr.createFile(path: path, mode: 420)   // 0644
+  if fd < 0 {
+    return false
+  }
+  let data: RawPtr = buf.load(fromByteOffset: 0)
+  let len: Int = buf.load(fromByteOffset: 8)
+  var off = 0
+  var ok = true
+  while off < len && ok {
+    let n = RawPtr.writeFd(fd: fd, buf: data.advanced(by: off), count: len - off)
+    if n <= 0 {
+      ok = false
+    } else {
+      off = off + n
+    }
+  }
+  let closed = RawPtr.closeFd(fd: fd)
+  return ok && closed == 0
+}
+
+fun rtGcReportWrite(rec: RawPtr) {
+  let end = RawPtr.ticks()
+  let tb = RawPtr.alloc(bytes: 8, align: 8)
+  tb.store(0, toByteOffset: 0)
+  let tbOk = RawPtr.timebase(info: tb)
+  let packed: Int = tb.load(fromByteOffset: 0)
+  tb.free()
+  let numer = packed % 4294967296
+  let denom = packed / 4294967296
+  if denom == 0 {
+    return
+  }
+  let total = rtGcMicros(rec, end, numer, denom)
+
+  // The executable's path: its directory and its name.
+  let exe = RawPtr.alloc(bytes: 4096, align: 8)
+  let size = RawPtr.alloc(bytes: 8, align: 8)
+  size.store(4096, toByteOffset: 0)
+  let got = RawPtr.executablePath(buf: exe, size: size)
+  size.free()
+  if got != 0 {
+    exe.free()
+    return
+  }
+  var exeLen = 0
+  var slash = -1
+  var scanning = true
+  while scanning {
+    let b: UInt8 = exe.load(fromByteOffset: exeLen)
+    if b.int == 0 {
+      scanning = false
+    } else {
+      if b.int == 47 {
+        slash = exeLen
+      }
+      exeLen = exeLen + 1
+    }
+  }
+  let nameStart = slash + 1
+  let nameLen = exeLen - nameStart
+
+  // The directory: NOMU_GC_REPORT_DIR, or the executable's.
+  let envName = RawPtr.alloc(bytes: 32, align: 8)
+  let envLen = RawPtr.copyLiteral(to: envName, "NOMU_GC_REPORT_DIR")
+  envName.store(0.uint8, toByteOffset: envLen)
+  let envDir = RawPtr.getenv(name: envName)
+  envName.free()
+  let path = rtBufNew(256)
+  if !envDir.isNull {
+    var i = 0
+    var more = true
+    while more {
+      let b: UInt8 = envDir.load(fromByteOffset: i)
+      if b.int == 0 {
+        more = false
+      } else {
+        rtBufByte(path, b.int)
+        i = i + 1
+      }
+    }
+    rtBufByte(path, 47)
+  } else if slash >= 0 {
+    let at = rtBufAt(path, slash + 1)
+    at.copyBytes(from: exe, byteCount: slash + 1)
+    rtBufGrew(path, slash + 1)
+  }
+  let at = rtBufAt(path, nameLen)
+  at.copyBytes(from: exe.advanced(by: nameStart), byteCount: nameLen)
+  rtBufGrew(path, nameLen)
+  rtBufGrew(path, RawPtr.copyLiteral(to: rtBufAt(path, 16), "-gc-"))
+  let originWall: Int = rec.load(fromByteOffset: 176)
+  rtBufUtc(path, originWall, true)
+  let stemLen: Int = path.load(fromByteOffset: 8)
+
+  let report = rtGcReportJson(rec, exe.advanced(by: nameStart), nameLen, total, numer, denom)
+  rtBufGrew(path, RawPtr.copyLiteral(to: rtBufAt(path, 16), ".json"))
+  rtBufByte(path, 0)
+  let pathData: RawPtr = path.load(fromByteOffset: 0)
+  let wroteReport = rtGcWriteFile(pathData, report)
+  rtBufFree(report)
+
+  let trace = rtGcTraceJson(rec, total, numer, denom)
+  path.store(stemLen, toByteOffset: 8)
+  rtBufGrew(path, RawPtr.copyLiteral(to: rtBufAt(path, 16), ".trace.json"))
+  rtBufByte(path, 0)
+  let tracePath: RawPtr = path.load(fromByteOffset: 0)
+  let wroteTrace = rtGcWriteFile(tracePath, trace)
+  rtBufFree(trace)
+
+  // Report the path (or the failure) on stderr.
+  let msg = rtBufNew(256)
+  if wroteReport && wroteTrace {
+    rtBufGrew(msg, RawPtr.copyLiteral(to: rtBufAt(msg, 32), "nomu-gc: report "))
+  } else {
+    rtBufGrew(msg, RawPtr.copyLiteral(to: rtBufAt(msg, 48), "nomu-gc: cannot write the report "))
+  }
+  path.store(stemLen, toByteOffset: 8)
+  rtBufGrew(path, RawPtr.copyLiteral(to: rtBufAt(path, 16), ".json"))
+  let pd: RawPtr = path.load(fromByteOffset: 0)
+  let pl: Int = path.load(fromByteOffset: 8)
+  let mat = rtBufAt(msg, pl)
+  mat.copyBytes(from: pd, byteCount: pl)
+  rtBufGrew(msg, pl)
+  rtBufByte(msg, 10)
+  let md: RawPtr = msg.load(fromByteOffset: 0)
+  let ml: Int = msg.load(fromByteOffset: 8)
+  let w = RawPtr.writeFd(fd: 2, buf: md, count: ml)
+  rtBufFree(msg)
+  rtBufFree(path)
+  exe.free()
+}
+
+// The report's JSON. Cycles are runs of records ending in their cycle record, since one thread records them
+// in order; their phases are `[phase, start, dur, concurrent]` and their counters `[counter, at, value]`.
+fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: Int, denom: Int) -> RawPtr {
+  let buf = rtBufNew(65536)
+  let count = rtRecCount(rec)
+  let chunks = rtRecChunks(rec)
+  let cycles: Int = rec.load(fromByteOffset: 64)
+  // Pauses as [start, end) pairs, and their durations, for the metrics.
+  let pauses = RawPtr.alloc(bytes: cycles * 16 + 16, align: 8)
+  let durs = RawPtr.alloc(bytes: cycles * 8 + 8, align: 8)
+  let tts = RawPtr.alloc(bytes: cycles * 8 + 8, align: 8)
+  var np = 0
+  var nt = 0
+  var gcTime = 0
+  var peakInUse = 0
+  var peakLarge = 0
+  var heapBlocks = 0
+
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "{\"version\":1,\"binary\":\""))
+  rtBufJsonBytes(buf, name, nameLen)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "\",\"started\":\""))
+  let originWall: Int = rec.load(fromByteOffset: 176)
+  rtBufUtc(buf, originWall, false)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "\",\"record\":\""))
+  if RawPtr.gcRecordLevel() > 1 {
+    rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "full"))
+  } else {
+    rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "limited"))
+  }
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "\",\"dur\":"))
+  rtBufInt(buf, total)
+  rtBufByte(buf, 44)
+  rtGcPutNames(buf)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"cycles\":["))
+  var runStart = 0
+  var firstCycle = true
+  var i = 0
+  while i < count {
+    let r = rtRecIn(chunks, i)
+    let kind: Int = r.load(fromByteOffset: 0)
+    if kind == 2 {
+      let id: Int = r.load(fromByteOffset: 8)
+      let start: Int = r.load(fromByteOffset: 16)
+      let dur: Int = r.load(fromByteOffset: 24)
+      let c: Int = r.load(fromByteOffset: 32)
+      let trigger: Int = r.load(fromByteOffset: 40)
+      let s = rtGcMicros(rec, start, numer, denom)
+      let d = rtGcDuration(dur, numer, denom)
+      if !firstCycle {
+        rtBufByte(buf, 44)
+      }
+      firstCycle = false
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "{\"n\":"))
+      rtBufInt(buf, c)
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"kind\":"))
+      rtBufInt(buf, id)
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"trigger\":"))
+      rtBufInt(buf, trigger)
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"start\":"))
+      rtBufInt(buf, s)
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"dur\":"))
+      rtBufInt(buf, d)
+      pauses.store(s, toByteOffset: np * 16)
+      pauses.store(s + d, toByteOffset: np * 16 + 8)
+      durs.store(d, toByteOffset: np * 8)
+      np = np + 1
+      gcTime = gcTime + d
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"phases\":["))
+      var first = true
+      var k = runStart
+      while k < i {
+        let q = rtRecIn(chunks, k)
+        let qk: Int = q.load(fromByteOffset: 0)
+        if qk == 1 {
+          let qid: Int = q.load(fromByteOffset: 8)
+          let qs: Int = q.load(fromByteOffset: 16)
+          let qd: Int = q.load(fromByteOffset: 24)
+          let qf: Int = q.load(fromByteOffset: 40)
+          if !first {
+            rtBufByte(buf, 44)
+          }
+          first = false
+          rtBufByte(buf, 91)
+          rtBufInt(buf, qid)
+          rtBufByte(buf, 44)
+          rtBufInt(buf, rtGcMicros(rec, qs, numer, denom))
+          rtBufByte(buf, 44)
+          rtBufInt(buf, rtGcDuration(qd, numer, denom))
+          rtBufByte(buf, 44)
+          rtBufInt(buf, qf)
+          rtBufByte(buf, 93)
+          if qid == 1 {
+            tts.store(rtGcDuration(qd, numer, denom), toByteOffset: nt * 8)
+            nt = nt + 1
+          }
+        }
+        k = k + 1
+      }
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "],\"counters\":["))
+      first = true
+      var free = -1
+      k = runStart
+      while k < i {
+        let q = rtRecIn(chunks, k)
+        let qk: Int = q.load(fromByteOffset: 0)
+        if qk == 3 {
+          let qid: Int = q.load(fromByteOffset: 8)
+          let qs: Int = q.load(fromByteOffset: 16)
+          let qv: Int = q.load(fromByteOffset: 24)
+          if !first {
+            rtBufByte(buf, 44)
+          }
+          first = false
+          rtBufByte(buf, 91)
+          rtBufInt(buf, qid)
+          rtBufByte(buf, 44)
+          rtBufInt(buf, rtGcMicros(rec, qs, numer, denom))
+          rtBufByte(buf, 44)
+          rtBufInt(buf, qv)
+          rtBufByte(buf, 93)
+          if qid == 20 {
+            free = qv
+          } else if qid == 25 {
+            heapBlocks = qv
+            if free >= 0 && qv - free > peakInUse {
+              peakInUse = qv - free
+            }
+          } else if qid == 24 && qv > peakLarge {
+            peakLarge = qv
+          }
+        }
+        k = k + 1
+      }
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "]}"))
+      runStart = i + 1
+    }
+    i = i + 1
+  }
+  rtBufByte(buf, 93)
+
+  // The metrics.
+  rtSortInts(durs, np)
+  rtSortInts(tts, nt)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"metrics\":{\"cycles\":"))
+  rtBufInt(buf, np)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"gcTime\":"))
+  rtBufInt(buf, gcTime)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"mutatorTime\":"))
+  rtBufInt(buf, total - gcTime)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"pauses\":{\"p50\":"))
+  rtBufInt(buf, rtPercentile(durs, np, 50))
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"p90\":"))
+  rtBufInt(buf, rtPercentile(durs, np, 90))
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"p99\":"))
+  rtBufInt(buf, rtPercentile(durs, np, 99))
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"max\":"))
+  rtBufInt(buf, rtPercentile(durs, np, 100))
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "},\"timeToSafepoint\":{\"p50\":"))
+  rtBufInt(buf, rtPercentile(tts, nt, 50))
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"p99\":"))
+  rtBufInt(buf, rtPercentile(tts, nt, 99))
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"max\":"))
+  rtBufInt(buf, rtPercentile(tts, nt, 100))
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), "},\"mmu\":["))
+  var w = 1000
+  var firstW = true
+  while w <= 1000000 {
+    let mmu = rtGcMmu(pauses, np, total, w)
+    if mmu >= 0 {
+      if !firstW {
+        rtBufByte(buf, 44)
+      }
+      firstW = false
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), "{\"window\":"))
+      rtBufInt(buf, w)
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), ",\"mmu\":"))
+      rtBufFraction(buf, mmu, 10000)
+      rtBufByte(buf, 125)
+    }
+    w = w * 10
+  }
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "],\"heap\":{\"blocks\":"))
+  rtBufInt(buf, heapBlocks)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"peakBlocksInUse\":"))
+  rtBufInt(buf, peakInUse)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"peakBytesInUse\":"))
+  rtBufInt(buf, peakInUse * 32768)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"peakLargeObjects\":"))
+  rtBufInt(buf, peakLarge)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "}}}\n"))
+  pauses.free()
+  durs.free()
+  tts.free()
+  chunks.free()
+  return buf
+}
+
+// The trace view: the collector's thread as one track, each cycle a complete event named for its kind with
+// its phases nested inside, and the snapshot counters as counter tracks.
+fun rtGcTraceJson(rec: RawPtr, total: Int, numer: Int, denom: Int) -> RawPtr {
+  let buf = rtBufNew(65536)
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 128), "{\"displayTimeUnit\":\"ms\",\"traceEvents\":[{\"ph\":\"M\",\"pid\":1,\"tid\":1,\"name\":\"thread_name\",\"args\":{\"name\":\"collector\"}}"))
+  let count = rtRecCount(rec)
+  let chunks = rtRecChunks(rec)
+  var i = 0
+  while i < count {
+    let r = rtRecIn(chunks, i)
+    let kind: Int = r.load(fromByteOffset: 0)
+    let id: Int = r.load(fromByteOffset: 8)
+    let start: Int = r.load(fromByteOffset: 16)
+    let value: Int = r.load(fromByteOffset: 24)
+    let flags: Int = r.load(fromByteOffset: 40)
+    rtBufByte(buf, 44)
+    if kind == 3 {
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "{\"ph\":\"C\",\"pid\":1,\"name\":"))
+      rtGcPutName(buf, 4, id)
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"ts\":"))
+      rtBufInt(buf, rtGcMicros(rec, start, numer, denom))
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), ",\"args\":{\"value\":"))
+      rtBufInt(buf, value)
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "}}"))
+    } else {
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "{\"ph\":\"X\",\"pid\":1,\"tid\":1,\"name\":"))
+      if kind == 2 {
+        rtGcPutName(buf, 1, id)
+        rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), ",\"cat\":\"cycle\""))
+      } else {
+        rtGcPutName(buf, 3, id)
+        rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), ",\"cat\":\"phase\""))
+      }
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"ts\":"))
+      rtBufInt(buf, rtGcMicros(rec, start, numer, denom))
+      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"dur\":"))
+      rtBufInt(buf, rtGcDuration(value, numer, denom))
+      if kind == 2 {
+        rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), ",\"args\":{\"trigger\":"))
+        rtGcPutName(buf, 2, flags)
+        rtBufByte(buf, 125)
+      }
+      rtBufByte(buf, 125)
+    }
+    i = i + 1
+  }
+  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "]}\n"))
+  chunks.free()
+  return buf
 }
 
 // ---- Copy reserve + defrag trigger — the general collector (task 150 · rung 3, 150.3.8) ----
@@ -3773,4 +4999,5 @@ fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int, drainFn: RawPt
     k = k + 1
   }
   th.threadJoin()
+  rtGcRecordFinish()
 }
