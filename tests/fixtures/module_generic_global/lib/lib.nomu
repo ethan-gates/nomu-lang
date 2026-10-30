@@ -1,0 +1,7 @@
+// A public generic whose body reads a **private** global (task 224). A consumer that specializes it reads
+// this module's one global by its origin-keyed symbol; the global's storage is never copied.
+private let factor = 10
+
+package fun scaleIt<T>(tag: T, n: Int) -> Int {
+    return n * factor
+}

@@ -29,7 +29,7 @@ fun main() {
   print(dead.n)                         // keep `dead` allocated; unreachable from the seed
   print("\n")
 
-  let tcount = RawPtr.gcTypeCount()
+  let tcount = Runtime.gcTypeCount()
   let counts = RawPtr.alloc(bytes: tcount * 8, align: 8)
   let fp = RawPtr.alloc(bytes: 8, align: 8)
   let total = rtMarkVerify(addrOf(root), counts, fp)

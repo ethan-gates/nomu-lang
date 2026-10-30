@@ -1,0 +1,15 @@
+// Two startup globals whose initializers read each other through calls: an initialization cycle.
+let a = fromB()
+let b = fromA()
+
+fun fromB() -> Int {
+  return b + 1
+}
+
+fun fromA() -> Int {
+  return a + 1
+}
+
+fun main() {
+  print(a)
+}

@@ -1,5 +1,5 @@
 // Task 128.1.3 · single-carrier run queue + spawn / park / unpark / join, written in Nomu over the
-// scheduler substrate (raw memory + the asm context switch + RawPtr.ofFunc/callEntry). One carrier (the
+// scheduler substrate (raw memory + the asm context switch + Runtime.ofFunc/callEntry). One carrier (the
 // main thread), cooperative and single-threaded, so the run queue needs no atomics yet (128.1.4 adds the
 // MT lock). The scheduler functions are runtime-subset (allocate only off-heap, call only substrate
 // primitives + each other), so they carry no safepoint poll; the fiber bodies run through an indirect
@@ -55,7 +55,7 @@ fun schedRun(sched: RawPtr) {
       sched.store(fib, toByteOffset: 24)
       fib.store(1, toByteOffset: 168)
       let carrierCtx: RawPtr = sched.load(fromByteOffset: 0)
-      carrierCtx.ctxSwitchTo(fib)
+      Runtime.ctxSwitch(from: carrierCtx, to: fib)
     }
   }
 }
@@ -65,7 +65,7 @@ fun schedRun(sched: RawPtr) {
 fun fiberMain(fib: RawPtr) -> RawPtr {
   let entry: RawPtr = fib.load(fromByteOffset: 184)
   let arg: RawPtr = fib.load(fromByteOffset: 192)
-  let res = entry.callEntry(arg)
+  let res = Runtime.callEntry(entry, arg: arg)
   fib.store(res, toByteOffset: 216)
   fib.store(3, toByteOffset: 168)
   let joiner: RawPtr = fib.load(fromByteOffset: 224)
@@ -76,7 +76,7 @@ fun fiberMain(fib: RawPtr) -> RawPtr {
   }
   let sched: RawPtr = fib.load(fromByteOffset: 200)
   let carrierCtx: RawPtr = sched.load(fromByteOffset: 0)
-  fib.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: fib, to: carrierCtx)
   return fib
 }
 
@@ -92,7 +92,7 @@ fun fiberSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   fib.store(stack, toByteOffset: 208)
   fib.store(RawPtr.null, toByteOffset: 216)
   fib.store(RawPtr.null, toByteOffset: 224)
-  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberMain), arg: fib)
+  Runtime.fiberInit(context: fib, stackTop: stackTop, entry: Runtime.ofFunc(fiberMain), arg: fib)
   enqueue(sched, fib)
   return fib
 }
@@ -103,7 +103,7 @@ fun park(sched: RawPtr) {
   let fib: RawPtr = sched.load(fromByteOffset: 24)
   fib.store(2, toByteOffset: 168)
   let carrierCtx: RawPtr = sched.load(fromByteOffset: 0)
-  fib.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: fib, to: carrierCtx)
 }
 
 fun unpark(sched: RawPtr, fib: RawPtr) {
@@ -193,7 +193,7 @@ fun main() {
   let s1 = newSched()
   let acc1 = RawPtr.alloc(bytes: 8, align: 8)
   acc1.store(0, toByteOffset: 0)
-  let body = RawPtr.ofFunc(addBody)
+  let body = Runtime.ofFunc(addBody)
   let a1 = RawPtr.alloc(bytes: 16, align: 8)
   a1.store(acc1, toByteOffset: 0)
   a1.store(1, toByteOffset: 8)
@@ -218,12 +218,12 @@ fun main() {
   let pArg = RawPtr.alloc(bytes: 16, align: 8)
   pArg.store(acc2, toByteOffset: 0)
   pArg.store(s2, toByteOffset: 8)
-  let pFib = fiberSpawn(s2, RawPtr.ofFunc(parkBody), pArg)
+  let pFib = fiberSpawn(s2, Runtime.ofFunc(parkBody), pArg)
   let qArg = RawPtr.alloc(bytes: 24, align: 8)
   qArg.store(acc2, toByteOffset: 0)
   qArg.store(s2, toByteOffset: 8)
   qArg.store(pFib, toByteOffset: 16)
-  fiberSpawn(s2, RawPtr.ofFunc(unparkBody), qArg)
+  fiberSpawn(s2, Runtime.ofFunc(unparkBody), qArg)
   schedRun(s2)
   let total2: Int = acc2.load(fromByteOffset: 0)
   print(total2)
@@ -233,12 +233,12 @@ fun main() {
   let s3 = newSched()
   let acc3 = RawPtr.alloc(bytes: 8, align: 8)
   acc3.store(0, toByteOffset: 0)
-  let cFib = fiberSpawn(s3, RawPtr.ofFunc(computeBody), RawPtr.null)
+  let cFib = fiberSpawn(s3, Runtime.ofFunc(computeBody), RawPtr.null)
   let dArg = RawPtr.alloc(bytes: 24, align: 8)
   dArg.store(acc3, toByteOffset: 0)
   dArg.store(s3, toByteOffset: 8)
   dArg.store(cFib, toByteOffset: 16)
-  fiberSpawn(s3, RawPtr.ofFunc(joinBody), dArg)
+  fiberSpawn(s3, Runtime.ofFunc(joinBody), dArg)
   schedRun(s3)
   let total3: Int = acc3.load(fromByteOffset: 0)
   print(total3)

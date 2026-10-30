@@ -1,0 +1,16 @@
+// Startup globals across modules: a module's init function runs its imports' first, and a module imported
+// twice (`base`, through `left` and `right`) initializes once.
+import pkg/left
+import pkg/right
+
+private let total = sum()
+
+fun sum() -> Int {
+  print("main\n")
+  return leftValue() + rightValue()
+}
+
+fun main() {
+  print(total)
+  print("\n")
+}

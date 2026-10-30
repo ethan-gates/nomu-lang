@@ -446,6 +446,9 @@ final class FunctionLowerer {
         case .varRef(let name):
             return readVar(name, e.span, fieldType: e.type)
 
+        case .globalRef(let name):
+            return emit(.globalRead(name), e.type, e.span)
+
         case .binary(let op, let l, let r):
             if op == .and || op == .or { return lowerShortCircuit(op, l, r, e.span) }
             guard let lv = lowerExpr(l), let rv = lowerExpr(r) else { return nil }

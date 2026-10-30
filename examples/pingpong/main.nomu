@@ -1,6 +1,6 @@
 // Task 128.1.2 · two-thread futex ping-pong. Closes the part of the futex story the single-threaded
 // 128.1.1 test could not cover: a real cross-thread sleep → wake. `main` creates a second OS thread
-// (pthread_create) running the Nomu function `worker` (reached via RawPtr.ofFunc), then blocks in
+// (pthread_create) running the Nomu function `worker` (reached via Runtime.ofFunc), then blocks in
 // futexWait on a word that is still 0. `worker` waits ~30 ms so main is genuinely asleep, sets the word
 // to 1, and wakes it. main then observes the word, joins, and checks three invariants encoded as digits:
 //   hundreds — the word holds 1 (the child's store is visible)
@@ -9,13 +9,13 @@
 // `worker` is runtime-subset (raw memory + atomics + clock + futex only), so it carries no safepoint poll
 // on the raw thread. All memory is off-heap. Expected output: 111. Checked by tools/pingpong.sh.
 fun worker(cb: RawPtr) -> RawPtr {
-  let start = RawPtr.monotonicNanos()
+  let start = Runtime.monotonicNanos()
   var now = start
   while now - start < 30000000 {           // ~30 ms, so main is parked in futexWait before we wake it
-    now = RawPtr.monotonicNanos()
+    now = Runtime.monotonicNanos()
   }
   cb.atomicStore(1, toByteOffset: 0)        // set the futex word
-  cb.futexWake(all: false)                  // wake the sleeper
+  Runtime.futexWake(at: cb, all: false)                  // wake the sleeper
   cb.store(7, toByteOffset: 8)              // witness: the worker ran to completion
   return cb
 }
@@ -26,11 +26,11 @@ fun main() {
   cb.atomicStore(0, toByteOffset: 0)
   cb.store(0, toByteOffset: 8)
 
-  let t0 = RawPtr.monotonicNanos()
-  handle.threadCreate(entry: RawPtr.ofFunc(worker), arg: cb)
-  cb.futexWait(expected: 0, timeoutMicros: 2000000)   // sleep until the worker wakes us (2 s backstop)
-  let t1 = RawPtr.monotonicNanos()
-  handle.threadJoin()
+  let t0 = Runtime.monotonicNanos()
+  Runtime.threadCreate(handle: handle, entry: Runtime.ofFunc(worker), arg: cb)
+  Runtime.futexWait(at: cb, expected: 0, timeoutMicros: 2000000)   // sleep until the worker wakes us (2 s backstop)
+  let t1 = Runtime.monotonicNanos()
+  Runtime.threadJoin(handle: handle)
 
   let word: Int = cb.atomicLoad(fromByteOffset: 0)
   let witness: Int = cb.load(fromByteOffset: 8)

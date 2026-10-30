@@ -70,7 +70,6 @@ private let runtimeSourcesDigest: String = {
     var h = Hasher64()
     h.mix(EmbeddedSources.runtimeHeader)
     h.mix(EmbeddedSources.runtimeC)
-    h.mix(EmbeddedSources.coreC)
     h.mix(EmbeddedSources.rtAsmArm64)   // the asm floor is archived in
     return h.hex
 }()

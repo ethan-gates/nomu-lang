@@ -36,6 +36,7 @@ private struct ExhaustivenessPass {
         case .actorDecl(let a):
             for field in a.fields { if let initv = field.initializer { walkExpr(initv) } }
             for h in a.handlers { walk(h.body) }
+        case .globalDecl(let g): walkExpr(g.value)
         }
     }
 
@@ -70,7 +71,7 @@ private struct ExhaustivenessPass {
 
     private func walkExpr(_ e: NOIRExpr) {
         switch e.kind {
-        case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .funcRef:
+        case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .globalRef, .funcRef:
             break
         case .fieldAccess(let base, _):
             walkExpr(base)

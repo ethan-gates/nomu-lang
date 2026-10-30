@@ -233,7 +233,18 @@ system is in use. StrictYAML and KDL were the earlier leans; JSON is the pragmat
 - **Ordered-eager global initialization.** Globals may have runtime initializer expressions, run in
   module-topological order (supplied by the acyclic module graph), completed before `main`. No implicit
   `init()` blocks — initialization is traceable to the variable it initializes. Const-evaluable globals
-  fold to compile time. Per-access cost is zero.
+  fold to compile time. Within a module, startup initializers run in the order their reads require: the
+  compiler follows each initializer into the functions it calls (Go's rule), assuming an interface or
+  closure call may reach every candidate in the module, and a cycle is a compile error naming the globals
+  in it. With the order proven, every read sees the final value, so a read costs one load and no check.
+- **Globals are module-private constants.** A global is a top-level `let`; top-level `var` is an error.
+  Its type is an immutable value that holds no GC-managed reference (numbers, `Bool`, string literals,
+  structs and enums built only from those); classes and arrays are rejected while they are shared mutable
+  references. State that changes after startup lives in an actor; a global holding an actor reference
+  waits for a collector design ([224](../plans/tasks/224-globals.md), open question 1). A global is `private` or `internal`; `package` and
+  `public` are errors (public compile-time constants are an open question,
+  [222](../plans/tasks/222-public-compile-time-constants.md)). Why: every access stays in one module, where the module summary sees it, and no form allows a
+  data race or an initialization-order hazard. Built in [224](../plans/tasks/224-globals.md).
 - **Entry point.** A `main` function makes its module an executable. `build`/`run` target a module **by
   path** (`nomu run pkg/server`) and build/exec it; a module without a `main` is not executable and running
   it is an error. Targeting by path is the selection — it is not whole-tree scanning, so the "no

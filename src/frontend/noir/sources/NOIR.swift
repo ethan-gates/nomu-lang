@@ -101,6 +101,22 @@ public enum NOIRDecl {
     case classDecl(NOIRClass)
     case actorDecl(NOIRActor)
     case funcDecl(NOIRFunc)
+    case globalDecl(NOIRGlobal)
+}
+
+// A global: a module-private top-level `let` (`modules.md` §Initialization & entry point). Its value is
+// folded at compile time (`isConstant`: built only from literals, arithmetic, struct and payload-free enum
+// values, `RawPtr.null`, and other constant globals, which sema substitutes in) or computed once at startup.
+public struct NOIRGlobal {
+    public let name: String
+    public let type: Type
+    public let value: NOIRExpr
+    public let isConstant: Bool
+    public let span: Span
+
+    public init(name: String, type: Type, value: NOIRExpr, isConstant: Bool, span: Span) {
+        self.name = name; self.type = type; self.value = value; self.isConstant = isConstant; self.span = span
+    }
 }
 
 // MARK: - Declarations
@@ -309,7 +325,8 @@ public indirect enum ExprKind {
     case doubleLit(Double)
     case boolLit(Bool)
     case stringLit(String)
-    case varRef(String)                                 // resolved local / param / global name
+    case varRef(String)                                 // resolved local / param / function name
+    case globalRef(String)                              // a read of a global (NOIRGlobal) of this module
     case fieldAccess(base: NOIRExpr, field: String)
     case construct(typeName: String, args: [NOIRArg])     // struct / class / actor construction
     case enumInit(typeName: String, caseName: String, args: [NOIRArg])    // enum value construction (M4.10)
@@ -321,7 +338,7 @@ public indirect enum ExprKind {
     case box(value: NOIRExpr, interfaces: [String])       // M5 A1.4/A1.5b: wrap a conformer as `any I` / `any A & B`
     case arrayLit(elements: [NOIRExpr])                   // [a, b, c] — build an Array<T>; `type` is `.array(T)` (M6)
     case index(base: NOIRExpr, idx: NOIRExpr)               // a[i] — array subscript read; `type` is the element T (M6)
-    case funcRef(name: String)                              // the C-ABI code address of a top-level non-capturing `fun` as a `RawPtr` (task 128.2, RawPtr.ofFunc). A runtime-tier primitive for handing an entry point to the asm floor / pthread_create; not first-class functions (task 128 note).
+    case funcRef(name: String)                              // the C-ABI code address of a top-level non-capturing `fun` as a `RawPtr` (task 128.2, Runtime.ofFunc). A runtime-tier primitive for handing an entry point to the asm floor / pthread_create; not first-class functions (task 128 note).
 }
 
 public struct NOIRArg {
@@ -359,6 +376,7 @@ extension NOIRActor: Codable {}
 extension NOIRParam: Codable {}
 extension NOIRGenericParam: Codable {}
 extension NOIRFunc: Codable {}
+extension NOIRGlobal: Codable {}
 extension NOIRStmt: Codable {}
 extension StmtKind: Codable {}
 extension NOIRSwitch: Codable {}

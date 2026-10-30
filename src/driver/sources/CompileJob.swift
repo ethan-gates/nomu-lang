@@ -418,7 +418,9 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
                         fileVisibleModules: fileVisible, fileQualifiers: fileQualifiers,
                         moduleFuncs: moduleFuncs, moduleTypes: moduleTypes,
                         externalMutatingMethods: externalMutating(),
-                        gcRecordLevel: ["off": 0, "limited": 1, "full": 2][jobSettings.choice("gc.record")]!)
+                        gcRecordLevel: ["off": 0, "limited": 1, "full": 2][jobSettings.choice("gc.record")]!,
+                        runtimeTier: job.runtimeSubsetByMembership || jobSettings.bool("test.runtime_prelude")
+                            || jobSettings.bool("test.runtime_tier"))
         let result = sema.check()
         checkExhaustiveness(result.module, into: result.diagnostics)
         return result
@@ -536,14 +538,17 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
                          onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
                          emitLLVMTo: emitLLVM ? debugStem! + ".ll" : nil, stopAfterEgress: options.stopAt == .llvm,
                          externalFuncNames: extFuncs, externalGenericSigs: extGenerics,
-                         weakOriginFiles: weakOrigins, homeModule: job.origin, facts: store, optimizer: optimizer)
+                         weakOriginFiles: weakOrigins, homeModule: job.origin,
+                         dependencyModules: job.dependencies.map(\.origin),
+                         isRuntimePackage: job.runtimeSubsetByMembership, facts: store, optimizer: optimizer)
         if err == nil, emitLLVM { fputs(debugStem! + ".ll\n", stderr) }
     } else {
         err = emitObject(gen.module, from: monoModule, to: job.outputs.object, optimize: jobSettings.optimize,
                          onStage: { timings.record(phase: $0, name: $1, seconds: $2) },
                          requireMain: false, externalFuncNames: extFuncs, externalGenericSigs: extGenerics,
                          weakOriginFiles: weakOrigins, emitTypeMaps: false,
-                         homeModule: job.origin, facts: store, optimizer: optimizer)
+                         homeModule: job.origin, dependencyModules: job.dependencies.map(\.origin),
+                         isRuntimePackage: job.runtimeSubsetByMembership, facts: store, optimizer: optimizer)
     }
     if let err { fputs("error: \(err)\n", stderr); return false }
     return true

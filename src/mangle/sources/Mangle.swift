@@ -8,17 +8,22 @@ import support
 // The subset Nomu uses:
 //   module    `C<scope>` then `Nm<component>` per further identity component (workspace name, module path)
 //   function  `Nv<module><name>`; a generic instance wraps it, `I<path><type args>E`
+//   global    `Nv<module><name>`, as a function: globals and functions share one value namespace; its
+//             initializer `Nv<global>4init`, a static-storage global's block `Nv<global>7storage`
 //   type      `Nt<module><name>`, nested types `Nt<outer><inner>`
 //   method    `Nv<type><method>`; an accessor `count.get` nests, `Nv(Nv<type>5count)3get`
 //   closure   `NC<module>[s<index>]0`, a spawn routine `NC<module>[s<index>]5spawn`
+//   init      `Ni<module>4init`, the module's startup-global initializer
 //   GC data   `I Nd C4nomu <kind> <types> E` (or `Nd C4nomu <kind>` with no type), its pointer map
 //             `Nd <descriptor> 6ptrmap`
-// Modules (`m`), types (`t`), values (`v`) and GC data (`d`) are distinct namespaces, so a module and a type
+// Modules (`m`), types (`t`), values (`v`), module initializers (`i`) and GC data (`d`) are distinct namespaces, so a module and a type
 // of the same name never meet. Paths directly under `C4nomu` with no workspace-name component below them
 // (`Nt C4nomu <name>`) are reserved for what has no module: type parameters, `Self`, builtin named types.
 //
 // Two exemptions keep fixed names: the program entry `nomu_main`, and the `runtime` package's functions,
-// `nomu_fn_<name>` (an empty home), since the C runtime calls them by name and they are weak-ODR.
+// `nomu_fn_<name>` (an empty home), since the C runtime calls them by name and they are weak-ODR; its
+// globals are `nomu_g_<name>`, its static-storage blocks `nomu_static_<name>` and its initializer
+// `nomu_runtime_init` likewise.
 public enum Mangle {
     // A module's identity components: workspace scope, workspace name, then the workspace-relative path.
     public typealias Module = [String]
@@ -29,6 +34,10 @@ public enum Mangle {
         if name == "main" { return "nomu_main" }
         let (module, rest) = split(name, home: home)
         guard !module.isEmpty else { return "nomu_fn_" + bare(rest) }
+        // A global's initializer nests under the global: `Nv<global>4init`.
+        if rest.hasPrefix("global:") {
+            return "_RNv" + "Nv" + modulePath(module) + ident(String(rest.dropFirst(7))) + ident("init")
+        }
         for (prefix, label) in [("clo:", ""), ("spawn:", "spawn")] where rest.hasPrefix(prefix) {
             if let index = Int(rest.dropFirst(prefix.count)) {
                 return "_RNC" + modulePath(module) + disambiguator(index) + ident(label)
@@ -39,6 +48,29 @@ public enum Mangle {
         var path = "Nv" + modulePath(module) + ident(key.head)
         if !key.args.isEmpty { path = "I" + path + key.args.map { type($0, home: home) }.joined() + "E" }
         return "_R" + path
+    }
+
+    // A global (a top-level `let`) defined in `home`, or, for an origin-keyed name `origin@name`, in `origin`.
+    // Globals and functions share a module's value namespace (a name is one or the other), so the same path
+    // form never collides. An empty home is a bare runtime name.
+    public static func global(_ name: String, home: Module) -> String {
+        let (module, rest) = split(name, home: home)
+        guard !module.isEmpty else { return "nomu_g_" + bare(rest) }
+        return "_RNv" + modulePath(module) + ident(rest)
+    }
+
+    // The data block a static-storage global (`Runtime.staticStorage`) holds the address of. The runtime's are
+    // read by symbol from codegen's inline poll and from C.
+    public static func staticStorage(_ name: String, home: Module) -> String {
+        let (module, rest) = split(name, home: home)
+        guard !module.isEmpty else { return "nomu_static_" + bare(rest) }
+        return "_RNv" + "Nv" + modulePath(module) + ident(rest) + ident("storage")
+    }
+
+    // The function that initializes `home`'s startup globals, once, after its imports'. An empty home is the
+    // runtime's, which the process entry `main` calls.
+    public static func moduleInit(home: Module) -> String {
+        home.isEmpty ? "nomu_runtime_init" : "_RNi" + modulePath(home) + ident("init")
     }
 
     // A method or `on` handler of `type`, defined in `home` (or in the type's origin when it is origin-keyed).

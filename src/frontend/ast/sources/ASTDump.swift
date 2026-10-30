@@ -56,6 +56,9 @@ private func appendTopDecl(_ decl: TopDecl, ind: String, into lines: inout [Stri
             lines.append("\(ind)  OnHandler '\(h.name)'(\(params))\(ret)")
             appendBlock(h.body, ind: ind + "    ", into: &lines)
         }
+    case .globalDecl(let g):
+        let type = g.type.map { ": \($0.name)" } ?? ""
+        lines.append("\(ind)GlobalDecl \(g.isMutable ? "var" : "let") '\(g.name)'\(type) = \(describeExpr(g.value))")
     case .interfaceDecl(let i):
         lines.append("\(ind)InterfaceDecl '\(i.name)'\(conformanceSuffix(i.refines))")
         for m in i.methods {

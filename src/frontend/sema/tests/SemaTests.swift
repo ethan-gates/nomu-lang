@@ -17,12 +17,12 @@ final class SemaTests: XCTestCase {
         return parser.parse().decls.filter { if case .structDecl(let d) = $0 { return d.name == "String" } else { return false } }
     }()
 
-    private func sema(_ source: String) -> SemaResult {
+    private func sema(_ source: String, runtimeTier: Bool = false) -> SemaResult {
         var lexer = Lexer(source, file: "t.nomu")
         var parser = Parser(lexer.tokenize())
         // Match the real pipeline: extensions are merged into their target before Sema (M4.12).
         let merged = mergeExtensions(parser.parse(), into: DiagnosticSink())
-        var s = Sema(merged, externalDecls: Self.preludeString)
+        var s = Sema(merged, externalDecls: Self.preludeString, runtimeTier: runtimeTier)
         return s.check()
     }
 
@@ -1997,5 +1997,145 @@ final class SemaTests: XCTestCase {
         """)
         XCTAssertTrue(r.diagnostics.hasErrors)
         XCTAssertTrue(r.diagnostics.render().contains("is not shareable"), r.diagnostics.render())
+    }
+
+    // Runtime intrinsics are spelled on `Runtime`, which only the runtime tier may name
+    // (`internals/runtime-subset.md` §5).
+    func testRuntimeIntrinsicRejectedOutsideRuntimeTier() {
+        let r = sema("fun f() -> Int { return Runtime.ticks() }")
+        XCTAssertTrue(r.diagnostics.render().contains("undefined name 'Runtime'"), r.diagnostics.render())
+    }
+
+    func testRuntimeIntrinsicAcceptedInRuntimeTier() {
+        let r = sema("fun f() -> Int { return Runtime.ticks() }", runtimeTier: true)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+    }
+
+    func testUserTypeNamedRuntimeIsOrdinary() {
+        let r = sema("struct Runtime {\nvar x: Int\nstatic fun make() -> Int { return 7 }\n}\nfun f() -> Int { return Runtime.make() }")
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+    }
+
+    func testRuntimeIntrinsicsAreOffRawPtr() {
+        let r = sema("fun f() -> Int { return RawPtr.ticks() }", runtimeTier: true)
+        XCTAssertTrue(r.diagnostics.render().contains("type 'RawPtr' has no static method 'ticks'"), r.diagnostics.render())
+    }
+
+    // Globals: module-private top-level `let`s (task 224).
+    private func errors(_ r: SemaResult) -> String { r.diagnostics.render() }
+
+    func testGlobalReadInFunction() {
+        let r = sema("let limit = 64\nfun f() -> Int { return limit }")
+        XCTAssertTrue(r.diagnostics.isEmpty, errors(r))
+        let globals = r.module.decls.compactMap { d -> NOIRGlobal? in if case .globalDecl(let g) = d { return g } else { return nil } }
+        XCTAssertEqual(globals.map(\.name), ["limit"])
+        XCTAssertEqual(globals.first?.type, .int)
+    }
+
+    func testGlobalsReferenceInAnyOrder() {
+        let r = sema("let a = b + 1\nlet b = 2\nfun f() -> Int { return a }")
+        XCTAssertTrue(r.diagnostics.isEmpty, errors(r))
+    }
+
+    func testGlobalSelfReferenceRejected() {
+        let r = sema("let a = b + 1\nlet b = a")
+        XCTAssertTrue(errors(r).contains("depends on its own value"), errors(r))
+    }
+
+    func testTopLevelVarRejected() {
+        let r = sema("var count = 0")
+        XCTAssertTrue(errors(r).contains("top-level 'var' is not allowed"), errors(r))
+    }
+
+    func testPublicGlobalRejected() {
+        let r = sema("public let limit = 64")
+        XCTAssertTrue(errors(r).contains("a global is 'private' or 'internal'"), errors(r))
+    }
+
+    func testAssignToGlobalRejected() {
+        let r = sema("struct P {\nvar x: Int\n}\nlet n = 1\nlet p = P(x: 1)\nfun f() {\n  n = 2\n  p.x = 3\n}")
+        XCTAssertTrue(errors(r).contains("cannot assign to global 'n'"), errors(r))
+        XCTAssertTrue(errors(r).contains("cannot assign to global 'p'"), errors(r))
+    }
+
+    func testGlobalStructOfValuesAccepted() {
+        let r = sema("struct P {\nlet x: Int\nlet ok: Bool\n}\nlet origin = P(x: 0, ok: true)")
+        XCTAssertTrue(r.diagnostics.isEmpty, errors(r))
+    }
+
+    func testGlobalHoldingReferenceRejected() {
+        let r = sema("class C {\nvar x: Int\n}\nlet c = C(x: 1)\nlet a = [1, 2]")
+        XCTAssertTrue(errors(r).contains("'C' is not one"), errors(r))
+        XCTAssertTrue(errors(r).contains("is not one"), errors(r))
+        XCTAssertEqual(errors(r).components(separatedBy: "a global holds an immutable value").count - 1, 2, errors(r))
+    }
+
+    func testRawPtrGlobalOnlyInRuntimeTier() {
+        let src = "let p = RawPtr.null"
+        XCTAssertTrue(errors(sema(src)).contains("'RawPtr' is not one"), errors(sema(src)))
+        XCTAssertTrue(sema(src, runtimeTier: true).diagnostics.isEmpty, errors(sema(src, runtimeTier: true)))
+    }
+
+    func testLocalShadowsGlobal() {
+        let r = sema("let n = 1\nfun f() -> Bool {\n  let n = true\n  return n\n}")
+        XCTAssertTrue(r.diagnostics.isEmpty, errors(r))
+    }
+
+    // A global folds at compile time when its initializer is built from literals, arithmetic, struct and
+    // payload-free enum values, and constant globals (substituted in); a call makes it a startup global.
+    func testGlobalConstantClassification() {
+        let r = sema("struct P {\nlet x: Int\n}\nlet a = 2 * 3\nlet b = a + 1\nlet p = P(x: b)\nfun seven() -> Int { return 7 }\nlet c = seven()")
+        XCTAssertTrue(r.diagnostics.isEmpty, errors(r))
+        var byName: [String: NOIRGlobal] = [:]
+        for d in r.module.decls { if case .globalDecl(let g) = d { byName[g.name] = g } }
+        XCTAssertEqual(byName["a"]?.isConstant, true)
+        XCTAssertEqual(byName["b"]?.isConstant, true)
+        XCTAssertEqual(byName["p"]?.isConstant, true)
+        XCTAssertEqual(byName["c"]?.isConstant, false)
+        // `b` reads `a`: the folded value carries `a`'s expression, not a read of `a`.
+        if case .binary(_, let l, _) = byName["b"]?.value.kind { XCTAssertFalse({ if case .globalRef = l.kind { return true }; return false }()) }
+        else { XCTFail("expected b = a + 1 as a binary") }
+    }
+
+    func testComputedStringGlobalRejected() {
+        let r = sema("fun name() -> String { return \"x\" }\nlet s = name()")
+        XCTAssertTrue(errors(r).contains("a global holding a 'String' must be a literal"), errors(r))
+    }
+
+    // `Runtime.staticStorage` is a constant global's whole initializer; a global reading it stays a read, so the
+    // block is reserved once.
+    func testStaticStorageGlobal() {
+        let r = sema("let block = Runtime.staticStorage(bytes: 16, align: 8)\nlet alias = block", runtimeTier: true)
+        XCTAssertTrue(r.diagnostics.isEmpty, errors(r))
+        var byName: [String: NOIRGlobal] = [:]
+        for d in r.module.decls { if case .globalDecl(let g) = d { byName[g.name] = g } }
+        XCTAssertEqual(byName["block"]?.isConstant, true)
+        XCTAssertEqual(byName["block"]?.type, .rawPtr)
+        XCTAssertEqual(byName["alias"]?.isConstant, true)
+        if case .globalRef("block") = byName["alias"]?.value.kind {} else { XCTFail("alias should read block") }
+    }
+
+    func testStaticStorageRejectedOutsideAGlobalInitializer() {
+        let site = "'Runtime.staticStorage' is legal only as a global's whole initializer"
+        let inBody = sema("fun f() -> RawPtr { return Runtime.staticStorage(bytes: 8, align: 8) }", runtimeTier: true)
+        XCTAssertTrue(errors(inBody).contains(site), errors(inBody))
+        let nested = sema("let p = Runtime.staticStorage(bytes: 8, align: 8).advanced(by: 4)", runtimeTier: true)
+        XCTAssertTrue(errors(nested).contains(site), errors(nested))
+    }
+
+    func testReserveZeroed() {
+        let ok = sema("fun f(n: Int) -> RawPtr { return Runtime.reserveZeroed(bytes: n * 8, align: 4096) }", runtimeTier: true)
+        XCTAssertTrue(ok.diagnostics.isEmpty, errors(ok))
+        let outside = sema("fun f() -> RawPtr { return Runtime.reserveZeroed(bytes: 8, align: 8) }")
+        XCTAssertTrue(errors(outside).contains("undefined name 'Runtime'"), errors(outside))
+    }
+
+    func testStaticStorageArguments() {
+        let literal = sema("let n = 8\nlet p = Runtime.staticStorage(bytes: n, align: 8)", runtimeTier: true)
+        XCTAssertTrue(errors(literal).contains("takes integer literals for 'bytes' and 'align'"), errors(literal))
+        let align = sema("let p = Runtime.staticStorage(bytes: 8, align: 12)", runtimeTier: true)
+        XCTAssertTrue(errors(align).contains("'align' a power of two up to 4096"), errors(align))
+        let empty = sema("let p = Runtime.staticStorage(bytes: 0, align: 8)", runtimeTier: true)
+        XCTAssertTrue(errors(empty).contains("'bytes' above 0"), errors(empty))
     }
 }

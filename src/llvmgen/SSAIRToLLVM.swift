@@ -23,6 +23,13 @@ import LLVM_C
 final class SSAIRToLLVM {
     let e: LLVMGen
 
+    // Globals (task 224) by NOIR name: the LLVM global, and for a constant one its folded value, which a
+    // read in this module uses directly. A global read from another module (a shipped generic body naming
+    // it origin-keyed) is declared on first use.
+    var globalVars: [String: (global: LLVMValueRef, constant: LLVMValueRef?)] = [:]
+    // The constant global being folded, which names a `Runtime.staticStorage` block.
+    private var foldingGlobal: SSAGlobal?
+
     // Per-function state, reset in `defineFunction`.
     var values: [Int: LLVMValueRef] = [:]          // SSAValue.id → LLVM value
     var blockMap: [Int: LLVMBasicBlockRef] = [:]   // SSABlock.id → LLVM basic block
@@ -363,6 +370,7 @@ final class SSAIRToLLVM {
             case .enumDecl(let en):  e.enumMap[en.name] = en
             case .classDecl(let c):  e.classMap[c.name] = c
             case .actorDecl(let a):  e.actorMap[a.name] = a
+            case .globalDecl:        break   // globals are emitted from the SSA module (task 224.2–224.3)
             }
         }
         // `EmptyHeader` is compiler GC substrate (task 174.5.1): the zero-field `ManagedBuffer` header codegen
@@ -388,10 +396,20 @@ final class SSAIRToLLVM {
             e.setupDebugInfo(sourceFile: anyFn.span.debugFile)
         }
 
-        for f in module.functions { declareFunction(f) }
-        for f in module.functions {
+        // Constant globals fold before any body is lowered, so a read uses the value directly. Their init
+        // functions are only folded, never declared or emitted. A startup global gets zero-filled storage its
+        // init function's result is stored into once, from the module's init function.
+        let constantInits = Set(module.globals.filter(\.isConstant).map(\.initFunction))
+        for f in module.functions where !constantInits.contains(f.name) { declareFunction(f) }
+        foldConstantGlobals(module)
+        declareStartupGlobals(module)
+        for f in module.functions where !constantInits.contains(f.name) {
             if error != nil { break }
             defineFunction(f)
+        }
+        if error == nil { defineModuleInits(module) }
+        if error == nil, e.emitsProcessEntry, let entry = e.callables["f:main"] {
+            e.emitProcessEntry(main: entry.fn, entry.ty)
         }
 
         // Value-witness tables for monomorphized generic value-type instantiations (task 100.4.3.2;
@@ -428,6 +446,155 @@ final class SSAIRToLLVM {
             e.di = nil
         }
         if error == nil { loweredMain = e.callables["f:main"] != nil }
+    }
+
+    // MARK: - Globals (task 224)
+
+    // Emit each constant global as read-only static data. Its init function is a single block of constant
+    // instructions (sema admits only literals, arithmetic, struct and payload-free enum values, and
+    // `RawPtr.null`); lowering them in a scratch block yields LLVM constants and inserts nothing.
+    private func foldConstantGlobals(_ module: SSAModule) {
+        guard !module.globals.isEmpty else { return }
+        let scratchFn = LLVMAddFunction(e.mod, "__nomu_fold_scratch", LLVMFunctionType(e.voidTy, nil, 0, 0))!
+        defer { LLVMDeleteFunction(scratchFn) }
+        // A static-storage global folds first: it reads nothing, and another constant global may read it.
+        let constants = module.globals.filter(\.isConstant)
+        let storageFirst = constants.filter { isStaticStorageInit($0, module) } + constants.filter { !isStaticStorageInit($0, module) }
+        for g in storageFirst {
+            foldingGlobal = g
+            defer { foldingGlobal = nil }
+            guard let f = module.functions.first(where: { $0.name == g.initFunction }) else { continue }
+            guard let gty = ty(g.type, g.span) else { continue }
+            let symbol = Mangle.global(g.name, home: e.definitionModule(for: g.span.file))
+            guard f.blocks.count == 1, let blk = f.blocks.first, case .ret(let rv?) = blk.terminator.kind else {
+                e.fail("global '\(g.name)': a constant initializer must be straight-line", g.span); continue
+            }
+            values = [:]; shapedHome = [:]; shapedLive = nil
+            let scratch = LLVMAppendBasicBlockInContext(ctx, scratchFn, "fold")!
+            LLVMPositionBuilderAtEnd(b, scratch)
+            for inst in blk.insts { lowerInst(inst) }
+            let value = values[rv.id]
+            let inserted = LLVMGetFirstInstruction(scratch) != nil
+            LLVMDeleteBasicBlock(scratch)
+            guard let c = value, !inserted, LLVMIsConstant(c) != 0, LLVMIsPoison(c) == 0, LLVMIsUndef(c) == 0 else {
+                e.fail("global '\(g.name)': its initializer does not fold to a constant (a division by zero or an out-of-range shift?)", g.span)
+                continue
+            }
+            let gv = LLVMAddGlobal(e.mod, gty, symbol)!
+            LLVMSetInitializer(gv, c)
+            LLVMSetGlobalConstant(gv, 1)
+            if e.weakOriginFiles.contains(g.span.file) { LLVMSetLinkage(gv, LLVMWeakODRLinkage) }
+            globalVars[g.name] = (gv, c)
+        }
+        values = [:]
+    }
+
+    private func isStaticStorageInit(_ g: SSAGlobal, _ module: SSAModule) -> Bool {
+        guard let f = module.functions.first(where: { $0.name == g.initFunction }) else { return false }
+        return f.blocks.contains { $0.insts.contains { inst in
+            if case .call(let c) = inst.kind, case .direct("__staticStorage") = c.kind { return true }
+            return false
+        } }
+    }
+
+    // A `Runtime.staticStorage(bytes:align:)` block: zeroed, writable data under its own symbol, whose address
+    // is the folding global's value. Sema admits it only as a global's whole initializer.
+    private func staticStorageBlock(_ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
+        guard let g = foldingGlobal, args.count == 2 else {
+            e.fail("internal: 'Runtime.staticStorage' outside a global's initializer", span); return nil
+        }
+        let bytes = LLVMConstIntGetZExtValue(val(args[0]))
+        let align = LLVMConstIntGetZExtValue(val(args[1]))
+        let symbol = Mangle.staticStorage(g.name, home: e.definitionModule(for: g.span.file))
+        guard LLVMGetNamedGlobal(e.mod, symbol) == nil else {
+            e.fail("internal: static storage '\(symbol)' declared before its global folds", span); return nil
+        }
+        let blockTy = LLVMArrayType2(e.i8, bytes)!
+        let block = LLVMAddGlobal(e.mod, blockTy, symbol)!
+        LLVMSetInitializer(block, LLVMConstNull(blockTy))
+        LLVMSetAlignment(block, UInt32(align))
+        if e.weakOriginFiles.contains(g.span.file) { LLVMSetLinkage(block, LLVMWeakODRLinkage) }
+        return block
+    }
+
+    // A startup global's storage: zero-filled and writable, holding its value once the module's init function
+    // has run. Its init function is never inlined, so no function that stores the value also reads it.
+    private func declareStartupGlobals(_ module: SSAModule) {
+        for g in module.globals where !g.isConstant {
+            guard let gty = ty(g.type, g.span) else { continue }
+            let gv = LLVMAddGlobal(e.mod, gty, Mangle.global(g.name, home: e.definitionModule(for: g.span.file)))!
+            LLVMSetInitializer(gv, LLVMConstNull(gty))
+            if e.weakOriginFiles.contains(g.span.file) { LLVMSetLinkage(gv, LLVMWeakODRLinkage) }
+            globalVars[g.name] = (gv, nil)
+            if let c = e.callables["f:\(g.initFunction)"] { e.addNoInline(c.fn) }
+        }
+    }
+
+    // The module's init function: run once, guarded by a done-flag, it calls its imports' init functions,
+    // then stores its startup globals in their proven order. The `runtime` package defines the runtime's
+    // instead, which the process entry `main` calls before the scheduler boots and which calls nothing else.
+    // A runtime-tier global in any other module (a `test.runtime_prelude` prepend) is the runtime's own,
+    // shared through its weak-ODR symbol, so the runtime's init stores it. Neither is inlined, so the stores never share a
+    // function with the globals' invariant loads.
+    private func defineModuleInits(_ module: SSAModule) {
+        let startup = module.globals.filter { !$0.isConstant }
+        if e.isRuntimePackage {
+            let (fn, _) = e.preludeFn(Mangle.moduleInit(home: []), ret: e.voidTy, params: [])
+            defineInit(fn, calling: [], storing: startup)
+            return
+        }
+        let own = startup.filter { !e.weakOriginFiles.contains($0.span.file) }
+        let dependencies = e.dependencyModules.map { e.preludeFn(Mangle.moduleInit(home: $0), ret: e.voidTy, params: []) }
+        defineInit(moduleInit, calling: dependencies, storing: own)
+    }
+
+    private func defineInit(_ fn: LLVMValueRef, calling inits: [(LLVMValueRef, LLVMTypeRef)], storing globals: [SSAGlobal]) {
+        LLVMSetGC(fn, "statepoint-example")
+        e.addNoInline(fn)
+        let done = LLVMAddGlobal(e.mod, e.i1, "__nomu_init_done")!
+        LLVMSetInitializer(done, LLVMConstInt(e.i1, 0, 0))
+        LLVMSetLinkage(done, LLVMInternalLinkage)
+        e.withStubBody(fn) {
+            let run = LLVMAppendBasicBlockInContext(ctx, fn, "run")!
+            let finished = LLVMAppendBasicBlockInContext(ctx, fn, "done")!
+            LLVMBuildCondBr(b, LLVMBuildLoad2(b, e.i1, done, "done"), finished, run)
+            LLVMPositionBuilderAtEnd(b, run)
+            LLVMBuildStore(b, LLVMConstInt(e.i1, 1, 0), done)
+            if e.isRuntimePackage { e.emitCarrierKeySetup() }
+            for (f, t) in inits { _ = e.buildCall(f, t, []) }
+            for g in globals {
+                guard let c = e.callables["f:\(g.initFunction)"], let gv = globalVars[g.name]?.global else { continue }
+                LLVMBuildStore(b, e.buildCall(c.fn, c.ty, []), gv)
+            }
+            LLVMBuildBr(b, finished)
+            LLVMPositionBuilderAtEnd(b, finished)
+            LLVMBuildRetVoid(b)
+        }
+    }
+
+    // This module's init function, declared on first use: `main` calls it on entry, and the module defines it
+    // after every body.
+    private var moduleInit: LLVMValueRef {
+        e.preludeFn(Mangle.moduleInit(home: e.homeModule), ret: e.voidTy, params: []).0
+    }
+
+    // A global read: a constant global of this module is its folded value; any other global is a load from
+    // its symbol (declared here when another module defines it). The load is invariant: a startup global is
+    // read only after the init functions have run, and never changes after.
+    private func readGlobal(_ name: String, _ type: Type, _ span: Span) -> LLVMValueRef? {
+        guard let gty = ty(type, span) else { return nil }
+        let gv: LLVMValueRef
+        if let g = globalVars[name] {
+            if let c = g.constant { return c }
+            gv = g.global
+        } else {
+            let symbol = Mangle.global(name, home: e.homeModule)
+            gv = LLVMGetNamedGlobal(e.mod, symbol) ?? LLVMAddGlobal(e.mod, gty, symbol)!
+            globalVars[name] = (gv, nil)
+        }
+        let load = LLVMBuildLoad2(b, gty, gv, "global")!
+        e.markInvariantLoad(load)
+        return load
     }
 
     // MARK: - Declaration (the callable-key / symbol mangling)
@@ -649,6 +816,11 @@ final class SSAIRToLLVM {
             // entry so the slot holds the current value before the header poll records it (task 176).
             for p in blk.params {
                 if let home = shapedHome[p.id], let phi = values[p.id] { LLVMBuildStore(b, phi, home.slot) }
+            }
+            // The entry runs every module's init function first, on the main fiber (globals design).
+            if f.name == "main", blk.id == f.blocks.first?.id {
+                e.setDebugLoc(f.span)
+                _ = e.buildCall(moduleInit, e.fnType(e.voidTy, []), [])
             }
             if headers.contains(blk.id) {
                 e.setDebugLoc(blk.insts.first?.span ?? blk.terminator.span)
@@ -908,6 +1080,8 @@ final class SSAIRToLLVM {
             define(inst, LLVMConstInt(e.i1, v ? 1 : 0, 0))
         case .constString(let s):
             define(inst, e.lowerStringLit(s))
+        case .globalRead(let name):
+            define(inst, inst.result.flatMap { readGlobal(name, $0.type, span) })
 
         case .binary(let op, let l, let r):
             define(inst, lowerBinary(op, l, r, span))
@@ -997,11 +1171,11 @@ final class SSAIRToLLVM {
         case .makeClosure(let funcName, let env, let onStack):
             define(inst, EgressConcurrency.makeClosure(self, funcName, env, onStack, span))
         case .funcAddr(let name):
-            // The bare C-ABI code pointer of a top-level function (task 128.2, RawPtr.ofFunc). The
+            // The bare C-ABI code pointer of a top-level function (task 128.2, Runtime.ofFunc). The
             // callable's `fn` is a `ptr` already usable as an addrspace(0) RawPtr (the closure/spawn
             // paths store it into an i8ptr slot directly), so no cast is needed.
             guard let c = e.callables["f:\(name)"] else {
-                e.fail("128.2: unknown function '\(name)' for RawPtr.ofFunc", span); return
+                e.fail("128.2: unknown function '\(name)' for Runtime.ofFunc", span); return
             }
             define(inst, c.fn)
         }
@@ -1272,6 +1446,11 @@ final class SSAIRToLLVM {
         }
         guard case .named(let name, _) = t, let et = e.enumType(name),
               let en = e.enumMap[name] else { e.fail("7.2.3: makeEnum of non-enum", span); return nil }
+        // A payload-free case is a constant: its tag and a zero payload region.
+        if fields.isEmpty {
+            var elems: [LLVMValueRef?] = [LLVMConstInt(e.i64, UInt64(caseIndex), 0), LLVMConstNull(LLVMStructGetTypeAtIndex(et, 1))]
+            return elems.withUnsafeMutableBufferPointer { LLVMConstNamedStruct(et, $0.baseAddress, 2) }
+        }
         let slot = e.entryAlloca(et, "enum")
         LLVMBuildStore(b, LLVMConstInt(e.i64, UInt64(caseIndex), 0), e.structGEP(et, slot, 0))
         if !fields.isEmpty {
@@ -1487,12 +1666,13 @@ final class SSAIRToLLVM {
         case "__arraySet":    return EgressArrays.emitArraySet(self, args, span)
         case "__arrayAppend": return EgressArrays.emitArrayAppend(self, args, span)
         // Unsafe raw memory (task 125). RawPtr / Ptr<T> are addrspace(0) i8ptr words; load/store/advance
-        // are plain addrspace(0) memory ops (no barrier, never a GC root), alloc/free hit the raw floor.
+        // are plain addrspace(0) memory ops (no barrier, never a GC root); alloc is `__nomu_raw_alloc` and free
+        // is libc's `free`.
         case "__rawAlloc":
-            let (fn, fty) = e.runtimeFn("rt_raw_alloc", ret: e.i8ptr, params: [e.i64, e.i64], varArg: false)
+            let (fn, fty) = e.nomuRawAlloc()
             return e.buildCall(fn, fty, [val(args[0]), val(args[1])])
         case "__rawFree":
-            let (fn, fty) = e.runtimeFn("rt_raw_free", ret: e.voidTy, params: [e.i8ptr], varArg: false)
+            let (fn, fty) = e.runtimeFn("free", ret: e.voidTy, params: [e.i8ptr], varArg: false)
             return e.buildCall(fn, fty, [val(args[0])])
         case "__rawAdvanced":
             return e.gepByte(val(args[0]), val(args[1]))
@@ -1577,19 +1757,15 @@ final class SSAIRToLLVM {
         case "__sysMonotonicNanos":
             let (fn, fty) = e.runtimeFn("clock_gettime_nsec_np", ret: e.i64, params: [e.i32], varArg: false)
             return e.buildCall(fn, fty, [LLVMConstInt(e.i32, 6, 0)])
-        // Asm-floor isolation self-test (task 128.2): the runtime harness rt_asm_selftest drives a
-        // context-switch round-trip and returns 1/0. Just a call to the runtime symbol.
-        case "__sysAsmSelfTest":
-            let (fn, fty) = e.runtimeFn("rt_asm_selftest", ret: e.i64, params: [], varArg: false)
-            return e.buildCall(fn, fty, [])
-        // Carrier-local slot (task 128.1.6): the running fiber handle (`rt_current`). Backed by a
-        // `_Thread_local` word in the embedded floor (core.c). tlsGet reads it, tlsSet writes it.
-        case "__sysTlsGet":
-            let (fn, fty) = e.runtimeFn("rt_tls_get", ret: e.i8ptr, params: [], varArg: false)
-            return e.buildCall(fn, fty, [])
-        case "__sysTlsSet":
-            let (fn, fty) = e.runtimeFn("rt_tls_set", ret: e.voidTy, params: [e.i8ptr], varArg: false)
-            _ = e.buildCall(fn, fty, [val(args[0])])
+        // The carrier-local slot: one thread-specific word read and written in place, no call.
+        // A zeroed reservation, pages committed on first touch (the collector's heap and side tables).
+        case "__sysReserveZeroed":
+            let (fn, fty) = e.nomuReserveZeroed()
+            return e.buildCall(fn, fty, [val(args[0]), val(args[1])])
+        case "__sysCarrierLocal":
+            return e.emitCarrierLocalGet()
+        case "__sysSetCarrierLocal":
+            e.emitCarrierLocalSet(val(args[0]))
             return LLVMConstInt(e.i64, 0, 0)
         // I/O poller substrate (task 128.1.7): the macOS kqueue floor + pipe/read/write, bound as libSystem
         // externs (selfhosted-scheduler.md §3.3). fd numbers and counts are i32 at the C boundary; buffers
@@ -1620,6 +1796,19 @@ final class SSAIRToLLVM {
             let (fn, fty) = e.runtimeFn("read", ret: e.i64, params: [e.i32, e.i8ptr, e.i64], varArg: false)
             let rfd = LLVMBuildTrunc(b, val(args[0]), e.i32, "rfd")
             return e.buildCall(fn, fty, [rfd, val(args[1]), val(args[2])])
+        case "__sysPoll":
+            // int poll(struct pollfd* fds, nfds_t n, int timeout) over one `{ int fd; short events; short
+            // revents; }` asking POLLIN (1), timeout 0 so it never blocks. 1 when ready, else 0.
+            let i16 = LLVMInt16TypeInContext(ctx)!
+            let pollfdTy = e.structTy([e.i32, i16, i16])
+            let slot = e.entryAlloca(pollfdTy, "pollfd")
+            LLVMBuildStore(b, LLVMBuildTrunc(b, val(args[0]), e.i32, "pfd"), e.structGEP(pollfdTy, slot, 0))
+            LLVMBuildStore(b, LLVMConstInt(i16, 1, 0), e.structGEP(pollfdTy, slot, 1))
+            LLVMBuildStore(b, LLVMConstInt(i16, 0, 0), e.structGEP(pollfdTy, slot, 2))
+            let (fn, fty) = e.runtimeFn("poll", ret: e.i32, params: [e.i8ptr, e.i32, e.i32], varArg: false)
+            let r = e.buildCall(fn, fty, [slot, LLVMConstInt(e.i32, 1, 0), LLVMConstInt(e.i32, 0, 0)])!
+            let ready = LLVMBuildICmp(b, LLVMIntSGT, r, LLVMConstInt(e.i32, 0, 0), "poll.ready")
+            return LLVMBuildZExt(b, ready, e.i64, "poll.r")
         // Asm-floor context switch (task 128.2): rtSwitch(from, to). Void — returns a dummy word.
         case "__sysCtxSwitch":
             let (fn, fty) = e.runtimeFn("rtSwitch", ret: e.voidTy, params: [e.i8ptr, e.i8ptr], varArg: false)
@@ -1673,7 +1862,7 @@ final class SSAIRToLLVM {
             guard case .ptr(let elem) = resultType else { e.fail("125: __ptrAlloc result not Ptr<T>", span); return nil }
             let strideV = LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0)
             let bytes = LLVMBuildMul(b, val(args[0]), strideV, "ptr.bytes")!
-            let (fn, fty) = e.runtimeFn("rt_raw_alloc", ret: e.i8ptr, params: [e.i64, e.i64], varArg: false)
+            let (fn, fty) = e.nomuRawAlloc()
             return e.buildCall(fn, fty, [bytes, strideV])
         case "__ptrStore":
             let off = LLVMBuildMul(b, val(args[2]), LLVMConstInt(e.i64, UInt64(e.rawStride(args[1].type)), 0), "ptr.off")!
@@ -1691,6 +1880,8 @@ final class SSAIRToLLVM {
             return val(args[0])   // no-op reinterpret — both are one addrspace(0) word
         case "__ptrNull":
             return LLVMConstPointerNull(e.i8ptr)
+        case "__staticStorage":
+            return staticStorageBlock(args, span)
         case "__ptrIsNull":
             return LLVMBuildICmp(b, LLVMIntEQ, val(args[0]), LLVMConstPointerNull(e.i8ptr), "ptr.isnull")
         case "__ptrEq":
@@ -1731,59 +1922,33 @@ final class SSAIRToLLVM {
             let (fn, fty) = e.runtimeFn("llvm.returnaddress.p0", ret: e.i8ptr, params: [e.i32], varArg: false)
             let ra = e.buildCall(fn, fty, [LLVMConstInt(e.i32, 0, 0)])!
             return LLVMBuildPtrToInt(b, ra, e.i64, "retaddr")
-        case "__schedHandle":
-            // Task 128.3.2: load the C global `rt_nomu_sched` — the self-hosted scheduler's Sched handle,
-            // bound at boot. Lets a driver reach the scheduler to run the self-hosted STW walk
-            // (nomuSchedWalkParked).
-            let g = LLVMGetNamedGlobal(e.mod, "rt_nomu_sched") ?? LLVMAddGlobal(e.mod, e.i8ptr, "rt_nomu_sched")
-            return LLVMBuildLoad2(b, e.i8ptr, g, "sched.handle")
-        case "__gcSelfhostSpace":
-            // Task 150 rung 3: load the global `__nomu_selfhost_space` (the Immix space descriptor the alloc
-            // function lazily creates on the first managed allocation). The space is defined in the C floor
-            // (`runtime.c`, task 174.3.1) and referenced here as an external global, so the tracer and the
-            // allocator — in any object — read one process-shared descriptor.
-            let g = e.getOrAddGlobal(e.i8ptr, "__nomu_selfhost_space")
-            return LLVMBuildLoad2(b, e.i8ptr, g, "gc.selfhostspace")
-        case "__gcSelfModBuf":
-            // Task 150.4.2: this carrier's write-barrier mod-buffer (rt_self_modbuf_get, binding + registering
-            // it on first use). A plain runtime call — the buffer is a raw addrspace(0) control block.
-            let (fn, fty) = e.runtimeFn("rt_self_modbuf_get", ret: e.i8ptr, params: [], varArg: false)
-            return e.buildCall(fn, fty, [])
-        case "__gcDrainModBufs":
-            // Task 150.4.3: drain every carrier's mod-buffer into outBuf (the minor GC's remembered set),
-            // resetting the buffers; returns the count. A runtime call over the C-side buffer registry.
-            let (fn, fty) = e.runtimeFn("rt_modbuf_drain", ret: e.i64, params: [e.i8ptr, e.i64], varArg: false)
-            return e.buildCall(fn, fty, [val(args[0]), val(args[1])])
-        case "__gcNurseryReserve":
-            // Task 150.4.3: load the C global `__nomu_nursery_reserve` (the env-set nursery reserve in blocks,
-            // 0 = default). rtImmixNew reads it at space creation. A direct extern-global load.
-            let g = LLVMGetNamedGlobal(e.mod, "__nomu_nursery_reserve") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_nursery_reserve")
-            return LLVMBuildLoad2(b, e.i64, g, "gc.nurseryreserve")
-        case "__gcMatureFloor":
-            // Task 150.4.4: load the C global `__nomu_mature_floor` (the env-set mature-pressure floor in
-            // blocks, 0 = default). rtImmixRefill reads it to pick minor vs. major. Same direct-extern-load
-            // shape as __gcNurseryReserve.
-            let g = LLVMGetNamedGlobal(e.mod, "__nomu_mature_floor") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_mature_floor")
-            return LLVMBuildLoad2(b, e.i64, g, "gc.maturefloor")
-        case "__gcStress":
-            // Load the C global `__nomu_gc_stress` (the env-set allocation-stress interval in bytes, 0 = off).
-            // rtTlabAlloc reads it. Same direct-extern-load shape as __gcNurseryReserve.
-            let g = LLVMGetNamedGlobal(e.mod, "__nomu_gc_stress") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_gc_stress")
-            return LLVMBuildLoad2(b, e.i64, g, "gc.stress")
-        case "__gcExternalDriver":
-            // Load the C global `__nomu_gc_ext_driver` (nonzero when an external STW driver owns collection so
-            // the default minor coordinator is not running). rtGenReserve gates generational off on it.
-            let g = LLVMGetNamedGlobal(e.mod, "__nomu_gc_ext_driver") ?? LLVMAddGlobal(e.mod, e.i64, "__nomu_gc_ext_driver")
-            return LLVMBuildLoad2(b, e.i64, g, "gc.extdriver")
-        case "__gcTypeCount":
-            // The number of descriptors = `__nomu_descs` section size / record size, resolved at run
-            // time from the linked section (task 100.4.7); no compile-time dense count exists.
-            let (fn, fty) = e.runtimeFn("nomu_gc_typecount", ret: e.i64, params: [], varArg: false)
-            return e.buildCall(fn, fty, [])
-        case "__gcDescSize":
-            // The descriptor record byte size (task 180): one runtime source for the record stride.
-            let (fn, fty) = e.runtimeFn("nomu_gc_descsize", ret: e.i64, params: [], varArg: false)
-            return e.buildCall(fn, fty, [])
+        case "__gcTypeCount", "__gcDescBase":
+            // The descriptor section (`__DATA,__nomu_descs`), through its linker section-bracket symbols as for
+            // `__gcStackmapBase`: its start, or its record count (byte size / the 32-byte record). A type-id is
+            // a record's byte offset from the start.
+            let startName = "\u{01}section$start$__DATA$__nomu_descs"
+            let start = LLVMGetNamedGlobal(e.mod, startName) ?? LLVMAddGlobal(e.mod, e.i8ptr, startName)
+            if name == "__gcDescBase" { return start }
+            let endName = "\u{01}section$end$__DATA$__nomu_descs"
+            let end = LLVMGetNamedGlobal(e.mod, endName) ?? LLVMAddGlobal(e.mod, e.i8ptr, endName)
+            let bytes = LLVMBuildSub(b, LLVMBuildPtrToInt(b, end, e.i64, "desc.e")!,
+                                     LLVMBuildPtrToInt(b, start, e.i64, "desc.b")!, "desc.bytes")!
+            return LLVMBuildUDiv(b, bytes, LLVMConstInt(e.i64, 32, 0), "desc.count")
+        case "__gcPtrmapBase":
+            // The pointer-map section (`__DATA,__nomu_ptrmaps`): each descriptor's `ptrmapOff` indexes it.
+            let name = "\u{01}section$start$__DATA$__nomu_ptrmaps"
+            return LLVMGetNamedGlobal(e.mod, name) ?? LLVMAddGlobal(e.mod, e.i8ptr, name)
+        case "__rawLoadInt32":
+            let v = LLVMBuildLoad2(b, e.i32, e.gepByte(val(args[0]), val(args[1])), "ld32")!
+            LLVMSetAlignment(v, 4)
+            return LLVMBuildSExt(b, v, e.i64, "ld32.x")
+        case "__sysFatal":
+            // write(2, text, len); abort(). Both gc-leaf libc calls.
+            let text = val(args[0])
+            let (wfn, wty) = e.runtimeFn("write", ret: e.i64, params: [e.i32, e.i8ptr, e.i64], varArg: false)
+            _ = e.buildCall(wfn, wty, [LLVMConstInt(e.i32, 2, 0), strPtr(text), strLen(text)])
+            let (afn, aty) = e.runtimeFn("abort", ret: e.voidTy, params: [], varArg: false)
+            return e.buildCall(afn, aty, [])
         case "__managedBufferCreate":
             // task 180: tail-alloc `{ type-id, cap, Header, Element[cap] }`. `Header`/`Element` come from the
             // result's ManagedBuffer type. The returned `p1` is the ManagedBuffer reference (same
@@ -1846,67 +2011,6 @@ final class SSAIRToLLVM {
             // Load the managed reference stored in the header region as a `p1`.
             let recvV = val(args[0])
             return LLVMBuildLoad2(b, e.p1, e.gepByte(recvV, LLVMConstInt(e.i64, 16, 0)), "mb.href")
-        case "__gcTypeSize":
-            let (fn, fty) = e.runtimeFn("nomu_gc_typesize", ret: e.i64, params: [e.i64], varArg: false)
-            return e.buildCall(fn, fty, [val(args[0])])
-        case "__gcTypeStride":
-            let (fn, fty) = e.runtimeFn("nomu_gc_typestride", ret: e.i64, params: [e.i64], varArg: false)
-            return e.buildCall(fn, fty, [val(args[0])])
-        case "__gcTypeHeaderSize":
-            // Buffer user-header byte size (task 180): element 0 sits at `16 + headerSize`.
-            let (fn, fty) = e.runtimeFn("nomu_gc_typeheadersize", ret: e.i32, params: [e.i64], varArg: false)
-            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0])])!, e.i64, "gc.hdrsz")
-        case "__gcHeaderPtrCount":
-            // Count of managed-pointer offsets in a buffer's header (task 180).
-            let (fn, fty) = e.runtimeFn("nomu_gc_typeheaderptrs", ret: e.i32, params: [e.i64], varArg: false)
-            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0])])!, e.i64, "gc.hdrn")
-        case "__gcHeaderOffsetAt":
-            // The k-th header managed byte offset (task 180), relative to the header base.
-            let (fn, fty) = e.runtimeFn("nomu_gc_headeroffset", ret: e.i32, params: [e.i64, e.i32], varArg: false)
-            let k = LLVMBuildTrunc(b, val(args[1]), e.i32, "gc.hdrk")!
-            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0]), k])!, e.i64, "gc.hdroff")
-        case "__gcTypeKind":
-            let (fn, fty) = e.runtimeFn("nomu_gc_typekind", ret: e.i32, params: [e.i64], varArg: false)
-            let k = e.buildCall(fn, fty, [val(args[0])])!
-            return LLVMBuildZExt(b, k, e.i64, "gc.kind")
-        case "__gcTypeNumPtrs":
-            let (fn, fty) = e.runtimeFn("nomu_gc_typemap", ret: e.i8ptr, params: [e.i64, e.i8ptr], varArg: false)
-            let cslot = e.entryAlloca(e.i32, "gc.nptr")
-            _ = e.buildCall(fn, fty, [val(args[0]), cslot])
-            let c = LLVMBuildLoad2(b, e.i32, cslot, "gc.nptr.v")!
-            return LLVMBuildZExt(b, c, e.i64, "gc.nptr.z")
-        case "__gcTypePtrOffset":
-            let (fn, fty) = e.runtimeFn("nomu_gc_typemap", ret: e.i8ptr, params: [e.i64, e.i8ptr], varArg: false)
-            let cslot = e.entryAlloca(e.i32, "gc.off.c")
-            let base = e.buildCall(fn, fty, [val(args[0]), cslot])!
-            let off = LLVMBuildMul(b, val(args[1]), LLVMConstInt(e.i64, 4, 0), "gc.off.byte")!
-            let elt = LLVMBuildLoad2(b, e.i32, e.gepByte(base, off), "gc.off.v")!
-            return LLVMBuildZExt(b, elt, e.i64, "gc.off.z")
-        case "__gcLiveCount":
-            // nomu_gc_live_offsets(type_id, base, &count): the shared kind-0/1/2 enumerator (task 176).
-            let (fn, fty) = e.runtimeFn("nomu_gc_live_offsets", ret: e.i8ptr, params: [e.i64, e.i8ptr, e.i8ptr], varArg: false)
-            let cslot = e.entryAlloca(e.i32, "gc.live.c")
-            _ = e.buildCall(fn, fty, [val(args[0]), val(args[1]), cslot])
-            let c = LLVMBuildLoad2(b, e.i32, cslot, "gc.live.c.v")!
-            return LLVMBuildZExt(b, c, e.i64, "gc.live.c.z")
-        case "__gcLiveOffsetAt":
-            let (fn, fty) = e.runtimeFn("nomu_gc_live_offsets", ret: e.i8ptr, params: [e.i64, e.i8ptr, e.i8ptr], varArg: false)
-            let cslot = e.entryAlloca(e.i32, "gc.live.off.c")
-            let mapBase = e.buildCall(fn, fty, [val(args[0]), val(args[1]), cslot])!
-            let off = LLVMBuildMul(b, val(args[2]), LLVMConstInt(e.i64, 4, 0), "gc.live.off.byte")!
-            let elt = LLVMBuildLoad2(b, e.i32, e.gepByte(mapBase, off), "gc.live.off.v")!
-            return LLVMBuildZExt(b, elt, e.i64, "gc.live.off.z")
-        case "__gcShapedCount":
-            let (fn, fty) = e.runtimeFn("nomu_gc_shaped_count", ret: e.i32, params: [e.i64], varArg: false)
-            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0])])!, e.i64, "gc.sh.c")
-        case "__gcShapedOffset":
-            let (fn, fty) = e.runtimeFn("nomu_gc_shaped_offset", ret: e.i32, params: [e.i64, e.i32], varArg: false)
-            let k = LLVMBuildTrunc(b, val(args[1]), e.i32, "gc.sh.k")!
-            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0]), k])!, e.i64, "gc.sh.off")
-        case "__gcShapedShapeId":
-            let (fn, fty) = e.runtimeFn("nomu_gc_shaped_shapeid", ret: e.i32, params: [e.i64, e.i32], varArg: false)
-            let k = LLVMBuildTrunc(b, val(args[1]), e.i32, "gc.sh.k2")!
-            return LLVMBuildZExt(b, e.buildCall(fn, fty, [val(args[0]), k])!, e.i64, "gc.sh.sid")
         case "__int_double_double": return LLVMBuildSIToFP(b, val(args[0]), e.f64, "i2d")
         case "__double_int_int":
             let (fn, fty) = e.runtimeFn("llvm.round.f64", ret: e.f64, params: [e.f64], varArg: false)

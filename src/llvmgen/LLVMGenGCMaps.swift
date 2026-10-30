@@ -272,7 +272,7 @@ extension LLVMGen {
     // in its stackmap records (task 176.3): word 0 is the ordinal count, then one entry per ordinal: the
     // shaped leaves' kind-2 descriptors first (`String` is ordinal 0), then each recorded aggregate's.
     // The entries are link-time offsets from the `__nomu_descs` section start (the `type_id`
-    // `nomu_gc_live_offsets` consumes). Local to the object and kept from dead stripping (`llvm.used`): the
+    // the runtime's `rtLiveCount` / `rtLiveOffsetAt` consume). Local to the object and kept from dead stripping (`llvm.used`): the
     // driver's frame index (task 195) points each object's stackmap records at its own table, found by this
     // name and the object in the link map. Its references also keep the leaf descriptors, which no object
     // header stamps, from being stripped.
@@ -510,7 +510,7 @@ extension LLVMGen {
     // `[tagOff, tagShift, ncases, (tag, nFlat, flat…, nShaped, (off, subSectionOff)…)…]`. A per-case entry
     // carries both flat conditional managed offsets (an `Option<SomeClass>`) and nested shaped sub-entries
     // (an `Option<String>`), each sub-id resolved to a `&shapeDesc − &__nomu_descs` link-time offset — the
-    // type-id the enumerator hands back to `nomu_gc_live_offsets` to recurse the payload's sub-shape.
+    // type-id the enumerator hands back to `rtLiveOffsetAt` to recurse the payload's sub-shape.
     func emitEnumKind2PtrMap(_ name: String,
                              _ ek: (tagOff: Int32, tagShift: Int32,
                                     cases: [(tag: Int32, flat: [Int32], shaped: [(offset: Int32, shapeId: UInt64)])]),

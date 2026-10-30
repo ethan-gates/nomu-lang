@@ -32,6 +32,7 @@ public func collectReferencedNames(_ decl: NOIRDecl) -> Set<String> {
         switch e.kind {
         case .intLit, .doubleLit, .boolLit, .stringLit:
             break
+        case .globalRef:                           break   // a global is referenced by symbol, never shipped (task 224)
         case .varRef(let n):                       names.insert(n)
         case .funcRef(let n):                      names.insert(n)
         case .construct(let tn, let args):         names.insert(tn); args.forEach { visitExpr($0.value) }
@@ -160,6 +161,8 @@ private final class Canonicalizer {
             return here(e.kind)
         case .varRef(let n):
             return here(.varRef(bound.contains(n) ? n : keyed(n)))
+        case .globalRef(let n):
+            return here(.globalRef(keyed(n)))   // the producer's one global, by its origin-keyed name
         case .fieldAccess(let base, let field):
             return here(.fieldAccess(base: expr(base, bound), field: field))
         case .construct(let typeName, let args):

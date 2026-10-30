@@ -8,7 +8,6 @@ genrule(
     srcs = [
         "runtime.h",
         "runtime.c",
-        "core.c",
         "//src/stdlib:core.nomu",
         "//src/stdlib:runtime.nomu",
         "//src/stdlib:std_modules",
@@ -18,7 +17,7 @@ genrule(
     tools = ["embed.sh"],
     cmd = "bash $(location embed.sh) $@ " +
           "$(location runtime.h) $(location runtime.c) " +
-          "$(location core.c) $(location //src/stdlib:core.nomu) " +
+          "$(location //src/stdlib:core.nomu) " +
           "$(location //src/stdlib:runtime.nomu) $(location rtasm_arm64.s) " +
           "$(locations //src/stdlib:std_modules)",
 )

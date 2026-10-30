@@ -172,6 +172,8 @@ private final class Monomorphizer {
         case .classDecl(let t):  return .classDecl(NOIRClass(name: t.name, generics: [],
             fields: t.fields.map { rewriteField($0, s) }, methods: t.methods.map { rewriteFunc($0, s, name: $0.name) }, span: t.span))
         case .actorDecl(let a):  return .actorDecl(rewriteActor(a, s))
+        case .globalDecl(let g): return .globalDecl(NOIRGlobal(name: g.name, type: resolveType(g.type, s),
+                                                                value: rewriteExpr(g.value, s), isConstant: g.isConstant, span: g.span))
         }
     }
 
@@ -224,7 +226,7 @@ private final class Monomorphizer {
         let newType = resolveType(e.type, s)
         let kind: ExprKind
         switch e.kind {
-        case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .funcRef:
+        case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .globalRef, .funcRef:
             kind = e.kind
         case .fieldAccess(let base, let field):
             kind = .fieldAccess(base: rewriteExpr(base, s), field: field)

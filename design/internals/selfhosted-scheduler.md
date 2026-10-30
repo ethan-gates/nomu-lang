@@ -100,12 +100,13 @@ Nomu the way the `__raw*`/`__ptr*` intrinsics are:
     macOS `__ulock_wait` / `__ulock_wake`.
   - **Time** — Linux `clock_gettime` (vDSO or syscall); macOS `clock_gettime_nsec_np` / `mach_absolute_time`.
   - **Poller** — Linux `epoll_create/ctl/wait`; macOS `kqueue`/`kevent`. **Built (128.1.7):** macOS
-    `RawPtr.kqueue`/`kevent` + `pipe`/`readFd`/`writeFd` as libSystem externs; the epoll path lands with
+    `Runtime.kqueue`/`kevent` + `pipe`/`readFd`/`writeFd` as libSystem externs; the epoll path lands with
     the Linux target.
-  - **Thread-pointer / TLS** — carrier-local state (`rt_current`). **Built (128.1.6):** on macOS a
-    `_Thread_local` word in the embedded floor (`RawPtr.tlsGet`/`tlsSet` → `__sysTlsGet`/`__sysTlsSet`),
-    the stable platform TLS; the raw arch-register read (arm64 `TPIDRRO_EL0`, x86-64 `fs`) is the
-    Linux/optimization path, deferred with the Linux target (same split as the `svc` `rtSyscall`).
+  - **Thread-pointer / TLS** — carrier-local state (`rt_current`). **Built (128.1.6, moved in 223.1.4):**
+    `Runtime.carrierLocal()` / `setCarrierLocal(p)` read and write the carrier thread's TSD slot for a key
+    the runtime creates at startup, in place: `TPIDRRO_EL0` masked, indexed by the key, as libpthread's
+    `pthread_getspecific` reads it; the runtime's init checks the direct read against
+    `pthread_getspecific` once. Linux's form (`TPIDR_EL0`, x86-64 `fs`) goes with the Linux target (218).
 
 **Whether the primitive surface is its own task number** — the way 125 is separate from 128 for the GC —
 is an open bookkeeping choice (§7). For now it is carried as 128.1's early rungs (128.1.1–128.1.2).
@@ -113,7 +114,7 @@ is an open bookkeeping choice (§7). For now it is carried as 128.1's early rung
 **Function-address primitive (Decided with Ethan; built).** The asm floor and `pthread_create` both need a
 *bare C-ABI code address of a top-level, non-capturing function* — distinct from a closure value, which is
 a heap-boxed `(code, env)` pair with a non-C ABI (and forbidden in subset code). This is exposed as a
-runtime-tier primitive: `RawPtr.ofFunc(f)` yields the address of a top-level `fun (_: RawPtr) -> RawPtr`
+runtime-tier primitive: `Runtime.ofFunc(f)` yields the address of a top-level `fun (_: RawPtr) -> RawPtr`
 as a `RawPtr` (a non-capturing function is ABI-identical to a C pointer). Internally it is a NOIR
 `funcRef` / SSAIR `funcAddr` node lowering to the callable's symbol. **Deliberately not first-class
 functions** — full first-class functions/closures for *user* code are wanted eventually but are a separate
@@ -166,8 +167,9 @@ d8–d15 — a 168-byte context buffer, the layout the GC parked-fiber walk will
 in `nomuc` (`EmbeddedSources.rtAsmArm64`), assembled by `cc` and archived into `libnomuruntime.a` beside
 the C floor, so its symbols resolve in every emitted binary. Isolation-tested first, as §6 requires: the
 C harness `rt_asm_selftest` seeds a fiber, switches in, the fiber records its argument and switches back,
-and the round-trip is verified — reached from Nomu as `RawPtr.asmSelfTest()` (`tools/asmswitch.sh`). x86-64
-is deferred (its `.s` is absent; the self-test degrades to a stub off-arm64). `rtTLSGet` and the `svc`
+and the round-trip is verified — reached from Nomu as `Runtime.asmSelfTest()` (`tools/asmswitch.sh`). The C
+harness was deleted with the C floor (task 223.6); the `fiberswitch` case drives the same round-trip from
+Nomu. x86-64 is deferred (its `.s` is absent). `rtTLSGet` and the `svc`
 `rtSyscall` (Linux) are not built — unneeded on the macOS path so far.
 
 ---
@@ -185,8 +187,8 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
    codegen-only substrate — complete):** the i64 seq-cst atomics (load/store/cas/fetchAdd, with
    `atomicExchange` added at 128.1.4 for the mutex — `tools/atomics.sh`), the 149
    safepoint-poll suppression the scheduler loop needs (`tools/subset-poll.sh`), the monotonic clock —
-   `RawPtr.monotonicNanos()` → libSystem `clock_gettime_nsec_np` (`tools/sysclock.sh`), and the futex —
-   `RawPtr.futexWait`/`futexWake` → libSystem `__ulock_wait`/`__ulock_wake` (`tools/futex.sh`, the
+   `Runtime.monotonicNanos()` → libSystem `clock_gettime_nsec_np` (`tools/sysclock.sh`), and the futex —
+   `Runtime.futexWait`/`futexWake` → libSystem `__ulock_wait`/`__ulock_wake` (`tools/futex.sh`, the
    value-check contract validated single-threaded: mismatch returns prompt, a matched wait sleeps in the
    kernel to the timeout). All are pure LLVM instructions or `libSystem` externs (`__sys` allowlist), no
    assembly. **Moved to 128.1.2:** raw thread-create and the two-thread futex sleep→wake ping-pong. A
@@ -200,11 +202,11 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
      policy rides on them. *(The NoGC-equivalent checkpoint of this ladder.)* **Built:** the arm64 floor
      and both round-trips — the C-harness isolation test (§2.1, `tools/asmswitch.sh`) and the Nomu-driven
      round-trip (`tools/fiberswitch.sh`), where the fiber entry is a Nomu function reached via
-     `RawPtr.ofFunc` and main drives the switch through `fiberInit`/`ctxSwitchTo`. *Remaining:* a run queue
+     `Runtime.ofFunc` and main drives the switch through `fiberInit`/`ctxSwitch`. *Remaining:* a run queue
      (128.1.3) is what a formal diff against the C `swapcontext` oracle attaches to.
    - **Carrier thread-create + the two-thread futex ping-pong (moved from 128.1.1). Built.**
-     `pthread_create` (the stable macOS floor, §2/§3.3) via `RawPtr.threadCreate`/`threadJoin` starts a
-     second OS thread running a Nomu `worker` (reached via `RawPtr.ofFunc`); the futex sleep→wake ping-pong
+     `pthread_create` (the stable macOS floor, §2/§3.3) via `Runtime.threadCreate`/`threadJoin` starts a
+     second OS thread running a Nomu `worker` (reached via `Runtime.ofFunc`); the futex sleep→wake ping-pong
      between two threads closes — a real cross-thread wake, main blocked in `futexWait` until the worker
      wakes it (`tools/pingpong.sh`). The function-pointer callback is the `ofFunc` primitive (§2).
 3. **128.1.3 — single-carrier run queue + spawn/park/unpark/join. Built.** A Nomu scheduler loop on one
@@ -263,12 +265,10 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
 6. **128.1.6 — carrier-local state + live-fiber registry. Built.** Two mechanisms:
    - **`rt_current` in a carrier-local slot.** The running fiber handle moves to a thread-local word so a
      fiber that suspends with no arguments can identify itself — the one thing multi-carrier self-park
-     needs that 128.1.5 could not provide. The carrier sets it at switch-in (`RawPtr.tlsSet(fib)`) and the
-     lock-coupled hand-off (the park) reads it (`RawPtr.tlsGet()`). On macOS the slot is a
-     `_Thread_local` word in the embedded floor (`core.c`, reached via `__sysTlsGet`/`__sysTlsSet`), the
-     stable platform TLS (dyld thread-local support), matching §3.3; the one-instruction `rtTLSGet` over
-     the arch thread-pointer register (arm64 `TPIDRRO_EL0`) is the Linux/optimization path, deferred with
-     the Linux target. The per-carrier scheduler *context* did not need TLS — a fiber records the carrier
+     needs that 128.1.5 could not provide. The carrier sets it at switch-in (`Runtime.setCarrierLocal(fib)`)
+     and the lock-coupled hand-off (the park) reads it (`Runtime.carrierLocal()`). Built first as a
+     `_Thread_local` word in the embedded floor; 223.1.4 replaced it with the direct TSD read above. The
+     per-carrier scheduler *context* did not need TLS — a fiber records the carrier
      that switched into it (fiber offset 232) and switches back to that one (built at 128.1.5). Isolated
      TLS check: each thread's slot is independent across a `threadCreate`.
    - **The cross-thread park/unpark stress (the M6 6.4 race), deferred from 128.1.5, now closed.** With
@@ -307,7 +307,7 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
      unpark (the poller-edition 6.4 handoff). Shutdown is a self-pipe: `signalStop` writes to a stop pipe
      whose read-end is registered with the kqueue, so the blocked `kevent()` returns and the poller exits.
      Eight fibers parked on their own pipes, main writes each fiber's id, every fiber is woken once and
-     reads its byte → sum 36. **New substrate (128.1.7):** `RawPtr.kqueue` / `kevent` / `pipe` / `readFd` /
+     reads its byte → sum 36. **New substrate (128.1.7):** `Runtime.kqueue` / `kevent` / `pipe` / `readFd` /
      `writeFd` — libSystem externs (§3.3), subset-legal (`__sys`). Blocking-syscall offload stays deferred
      (as on the C side). Both fixtures are NoGC-only (raw carriers + feeder threads) and watchdogged.
 8. **128.1.8 — actor mailbox + mailbox-fiber pool. Built.** The fire-and-forget message-send model
@@ -424,7 +424,7 @@ taken with that understood:
 
 So the intrinsic surface (§2) is one Nomu-facing API with two per-platform lowerings: a `libSystem` extern
 call on macOS, the `svc` `rtSyscall` stub on Linux — the same shape as the codegen already carries for
-other platform splits. **Built:** the first entry, the monotonic clock — `RawPtr.monotonicNanos()` lowers
+other platform splits. **Built:** the first entry, the monotonic clock — `Runtime.monotonicNanos()` lowers
 directly to `clock_gettime_nsec_np(CLOCK_MONOTONIC)`, subset-legal (the `__sys` allowlist prefix), no
 C-runtime shim (`tools/sysclock.sh`).
 

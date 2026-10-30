@@ -106,6 +106,7 @@ setting at the wrong stage, is an error. Compile settings select configs declare
 `cfg.yaml`; run settings are still environment variables (task 205 moves them).
 - Compile: `optimize` (`-c release`), `inline`, `escape`, `scalar`, `devirt` (each default `true`; `false`
   selects `no_inline` and the like, turning the pass off), `rt_prelude` (fixtures that call `rt*` directly),
+  `runtime_tier` (fixtures that call the `Runtime` intrinsics without the runtime prelude),
   `gc_record` (the collector's recorder at `limited`; `collections` turns it on).
 - Run: `gc_stress_bytes` (a
   collection every N bytes a carrier allocates), `nursery_blocks` (a minor collection when the nursery

@@ -25,6 +25,7 @@ public func checkDuplicates(_ program: Program, into diags: DiagnosticSink) {
         case .actorDecl(let d):     record(d.name, d.span, &typeNames[moduleOf(d.span), default: [:]], "type", diags)
         case .interfaceDecl(let d): record(d.name, d.span, &typeNames[moduleOf(d.span), default: [:]], "type", diags)
         case .funcDecl(let d):      record(d.name, d.span, &funcNames[moduleOf(d.span), default: [:]], "function", diags)
+        case .globalDecl(let d):    record(d.name, d.span, &funcNames[moduleOf(d.span), default: [:]], "global", diags)   // globals and functions share the value namespace
         case .extensionDecl:        break   // adds members to an existing type; declares no new symbol
         }
     }

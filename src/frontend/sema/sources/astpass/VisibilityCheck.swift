@@ -31,7 +31,7 @@ public func checkVisibilityConsistency(_ program: Program, into diags: Diagnosti
             case .enumDecl(let d):      flag("enum", d.name, d.visibility, d.span)
             case .actorDecl(let d):     flag("actor", d.name, d.visibility, d.span)
             case .interfaceDecl(let d): flag("interface", d.name, d.visibility, d.span)
-            case .extensionDecl:        break
+            case .extensionDecl, .globalDecl: break   // a global is never public: sema reports it
             }
         }
     }
@@ -45,7 +45,7 @@ public func checkVisibilityConsistency(_ program: Program, into diags: Diagnosti
         case .classDecl(let d):     vis[d.name] = d.visibility
         case .actorDecl(let d):     vis[d.name] = d.visibility
         case .interfaceDecl(let d): vis[d.name] = d.visibility
-        case .funcDecl, .extensionDecl: break
+        case .funcDecl, .extensionDecl, .globalDecl: break
         }
     }
 

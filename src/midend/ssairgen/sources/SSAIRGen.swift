@@ -60,6 +60,7 @@ public func lowerToSSAIR(_ module: NOIRModule, subsetFuncs: Set<String> = []) ->
 
     let sink = ClosureSink()
     var functions: [SSAFunction] = []
+    var globals: [SSAGlobal] = []
     for decl in module.decls {
         switch decl {
         case .funcDecl(let f):
@@ -73,6 +74,16 @@ public func lowerToSSAIR(_ module: NOIRModule, subsetFuncs: Set<String> = []) ->
             let handlers = a.handlers.map { NOIRFunc(name: $0.name, params: $0.params, returnType: $0.returnType,
                                                      body: $0.body, isMutating: true, span: $0.span) }
             lowerMethods(a.name, .actor_, handlers, [], ctx, diags, sink, subsetFuncs, &functions)
+        case .globalDecl(let g):
+            // The initializer becomes a parameterless function returning the value. The egress folds a
+            // constant global's into static data and emits no code for it; a startup global's runs once from
+            // the module's init function.
+            let initName = "global:\(g.name)"
+            let initFn = NOIRFunc(name: initName, params: [], returnType: g.type,
+                                  body: [NOIRStmt(kind: .ret(g.value), span: g.span)], isMutating: false, span: g.span)
+            let lowerer = FunctionLowerer(diags: diags, ctx: ctx, sink: sink, subsetFuncs: subsetFuncs)
+            if let fn = lowerer.lower(initFn) { functions.append(fn) }
+            globals.append(SSAGlobal(name: g.name, type: g.type, initFunction: initName, isConstant: g.isConstant, span: g.span))
         }
     }
     functions += sink.lifted   // the lifted closure bodies
@@ -92,9 +103,10 @@ public func lowerToSSAIR(_ module: NOIRModule, subsetFuncs: Set<String> = []) ->
                        cases: e.cases.map { SSAEnumCase(name: $0.name, fields: $0.fields.map(field), span: $0.span) },
                        span: e.span)
     }
-    let ssa = SSAModule(functions: functions, aggregates: aggregates, enums: enums,
+    var ssa = SSAModule(functions: functions, aggregates: aggregates, enums: enums,
                         interfaces: module.interfaces, conformances: module.conformances,
                         composites: module.composites, opaqueUnderlyings: module.opaqueUnderlyings)
+    ssa.globals = orderStartupGlobals(globals, functions: ssa.functions, diags: diags) ?? globals
     return SSAGenResult(module: ssa, diagnostics: diags)
 }
 

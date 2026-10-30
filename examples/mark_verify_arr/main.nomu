@@ -13,7 +13,7 @@ fun main() {
   xs.append(Box(v: 20))
   xs.append(Box(v: 30))
 
-  let tcount = RawPtr.gcTypeCount()
+  let tcount = Runtime.gcTypeCount()
   let counts = RawPtr.alloc(bytes: tcount * 8, align: 8)
   let fp = RawPtr.alloc(bytes: 8, align: 8)
   let total = rtMarkVerify(addrOf(xs), counts, fp)

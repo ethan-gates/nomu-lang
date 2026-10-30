@@ -1,7 +1,7 @@
 # GC observability — one model for every collector: intervals, cycles, counters, heap snapshots
 
 **Avenue:** Risk · **Type/Lifecycle:** `runtime · observability · needs-design` · **Size:** M ·
-**Status:** in progress (159.1–159.5 done; 159.6, the `full` level, open, after [128](128-self-hosting-runtime.md).5.2) ·
+**Status:** in progress (159.1–159.5 done; 159.6, the `full` level, open, after [223](223-retire-the-c-floor.md).2) ·
 **Source:** grounded during 150.4.5.3 — debugging a minor-collector segfault and an STW deadlock, the only
 signal was a single per-collection line and a native backtrace that could not unwind the collector's carrier
 stack (frame #0 only). Ad-hoc `RawPtr.gcDbg` breadcrumbs localized both bugs, then were stripped.
@@ -208,7 +208,7 @@ The model below is LXR's shape. GenImmix is its special case: every interval in 
   it cannot give GenImmix's survival rate (promoted over allocated, in objects or bytes), the allocation
   rate between cycles at object grain, or the mean object size. Those decide nursery sizing and the
   promotion policy now, and they are the mutator-side numbers the GenImmix–LXR comparison needs as well.
-  Do it soon after 128.5.2.
+  Do it soon after 223.2.
 
   **What it touches.**
   - The allocation bump is generated into user code (`opt.inline_alloc`, `LLVMGenRuntime.swift`), so the
@@ -216,13 +216,13 @@ The model below is LXR's shape. GenImmix is its special case: every interval in 
     carries `inlineAlloc` today. The runtime's own path (`rtTlabAlloc`, `rtLosAlloc`) counts under the
     same constant.
   - The counts live per carrier in the TLAB (`allocObjects` and `allocBytes`, laid out by
-    [128](128-self-hosting-runtime.md).5.2), so the bump stays lock-free; the coordinator sums the registered TLABs at each cycle's entry,
-    walking 128.5.2's registry in Nomu.
+    [223](223-retire-the-c-floor.md).2), so the bump stays lock-free; the coordinator sums the registered TLABs at each cycle's entry,
+    walking 223.2's registry in Nomu.
   - Promoted bytes beside promoted objects, so survival can be read in bytes as well.
   - Cost measured at `full` against `limited` and `off`, on an allocation-bound program: this is the level
     that slows allocation, so the report should state by how much.
 
-  **Depends on** [128](128-self-hosting-runtime.md).5.2: the TLABs move into Nomu first, with the counting fields in their
+  **Depends on** [223](223-retire-the-c-floor.md).2: the TLABs move into Nomu first, with the counting fields in their
   layout and a registry the sum can walk. 158 reshapes the coordinator where the per-cycle sum is
   taken; doing 159.6 before 158 means moving that sum when 158 lands.
 

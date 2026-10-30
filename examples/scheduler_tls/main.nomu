@@ -3,9 +3,9 @@
 //
 // The one thing multi-carrier park needs that 128.1.5 could not provide: a fiber that calls `park()` with
 // no arguments must identify *itself* (which fiber, on which carrier). That is `rt_current`, a thread-local
-// slot the carrier sets at switch-in (`RawPtr.tlsSet(fib)`) and `park()` reads (`RawPtr.tlsGet()`), backed
-// by a `_Thread_local` word in the embedded floor. With it, `park()` is the Go-`gopark` shape: read
-// current, take the scheduler lock, save context while holding it, switch to the carrier. `unpark(fib)`
+// slot the carrier sets at switch-in (`Runtime.setCarrierLocal(fib)`) and `park()` reads
+// (`Runtime.carrierLocal()`), the carrier thread's thread-specific word for the runtime's key. With it,
+// `park()` is the Go-`gopark` shape: read current, take the scheduler lock, save context while holding it, switch to the carrier. `unpark(fib)`
 // (an explicit handle — the waker knows whom) enqueues under the same lock and wakes an idle carrier.
 //
 // The race: a fiber parking on carrier A saves its context while a *different* carrier B runs the
@@ -37,7 +37,7 @@ fun mutexLock(m: RawPtr) {
       c = m.atomicExchange(2, atByteOffset: 0)
     }
     while c != 0 {
-      m.futexWait(expected: 2, timeoutMicros: 0)
+      Runtime.futexWait(at: m, expected: 2, timeoutMicros: 0)
       c = m.atomicExchange(2, atByteOffset: 0)
     }
   }
@@ -46,7 +46,7 @@ fun mutexLock(m: RawPtr) {
 fun mutexUnlock(m: RawPtr) {
   let prev: Int = m.atomicExchange(0, atByteOffset: 0)
   if prev == 2 {
-    m.futexWake(all: false)
+    Runtime.futexWake(at: m, all: false)
   }
 }
 
@@ -80,7 +80,7 @@ fun dequeue(sched: RawPtr) -> RawPtr {
 fun wakeCarrier(sched: RawPtr, all: Bool) {
   let gw = sched.advanced(by: 24)
   gw.atomicFetchAdd(1, atByteOffset: 0)
-  gw.futexWake(all: all)
+  Runtime.futexWake(at: gw, all: all)
 }
 
 fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
@@ -96,7 +96,7 @@ fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   fib.store(RawPtr.null, toByteOffset: 216)
   fib.store(RawPtr.null, toByteOffset: 224)
   fib.store(RawPtr.null, toByteOffset: 232)
-  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberMain), arg: fib)
+  Runtime.fiberInit(context: fib, stackTop: stackTop, entry: Runtime.ofFunc(fiberMain), arg: fib)
   return fib
 }
 
@@ -107,7 +107,7 @@ fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
 // while we are still running toward our park. The lock stays held across the save and is released only
 // when we are switched back in (possibly on a different carrier).
 fun handOff(next: RawPtr) {
-  let self = RawPtr.tlsGet()
+  let self = Runtime.carrierLocal()
   let sched: RawPtr = self.load(fromByteOffset: 200)
   mutexLock(sched.advanced(by: 16))
   next.store(0, toByteOffset: 168)                // make the partner runnable
@@ -115,7 +115,7 @@ fun handOff(next: RawPtr) {
   wakeCarrier(sched, false)                       // engage an idle carrier for it
   self.store(2, toByteOffset: 168)                // park self, still under the same lock
   let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  self.ctxSwitchTo(carrierCtx)                    // save self holding the lock; switch to the carrier
+  Runtime.ctxSwitch(from: self, to: carrierCtx)                    // save self holding the lock; switch to the carrier
   mutexUnlock(sched.advanced(by: 16))             // resumed → release after switch-in
 }
 
@@ -138,12 +138,12 @@ fun fiberMain(fib: RawPtr) -> RawPtr {
   mutexUnlock(sched.advanced(by: 16))
   let entry: RawPtr = fib.load(fromByteOffset: 184)
   let arg: RawPtr = fib.load(fromByteOffset: 192)
-  let res = entry.callEntry(arg)
+  let res = Runtime.callEntry(entry, arg: arg)
   mutexLock(sched.advanced(by: 16))
   fib.store(res, toByteOffset: 216)
   fib.store(3, toByteOffset: 168)
   let carrierCtx: RawPtr = fib.load(fromByteOffset: 232)
-  fib.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: fib, to: carrierCtx)
   return fib
 }
 
@@ -162,13 +162,13 @@ fun schedLoop(sched: RawPtr, myCtx: RawPtr) {
         let gw = sched.advanced(by: 24)
         let gen: Int = gw.atomicLoad(fromByteOffset: 0)
         mutexUnlock(sched.advanced(by: 16))
-        gw.futexWait(expected: gen, timeoutMicros: 1000000)
+        Runtime.futexWait(at: gw, expected: gen, timeoutMicros: 1000000)
         mutexLock(sched.advanced(by: 16))
       } else {
         fib.store(myCtx, toByteOffset: 232)
         fib.store(1, toByteOffset: 168)
-        RawPtr.tlsSet(fib)                       // rt_current = fib
-        myCtx.ctxSwitchTo(fib)
+        Runtime.setCarrierLocal(fib)                       // rt_current = fib
+        Runtime.ctxSwitch(from: myCtx, to: fib)
       }
     }
   }
@@ -229,7 +229,7 @@ fun main() {
   sched.atomicStore(budget, toByteOffset: 32)
   let acc = RawPtr.alloc(bytes: 8, align: 8)
   acc.atomicStore(0, toByteOffset: 0)
-  let body = RawPtr.ofFunc(ringBody)
+  let body = Runtime.ofFunc(ringBody)
 
   // Build the token pairs: A and B point at each other; A is readied (holds the token), B stays parked.
   var p = 0
@@ -257,14 +257,14 @@ fun main() {
     carg.store(sched, toByteOffset: 0)
     carg.store(ctx, toByteOffset: 8)
     let h = handles.advanced(by: 8 * c)
-    h.threadCreate(entry: RawPtr.ofFunc(carrierMain), arg: carg)
+    Runtime.threadCreate(handle: h, entry: Runtime.ofFunc(carrierMain), arg: carg)
     c = c + 1
   }
 
   var k = 0
   while k < carriers {
     let h = handles.advanced(by: 8 * k)
-    h.threadJoin()
+    Runtime.threadJoin(handle: h)
     k = k + 1
   }
 

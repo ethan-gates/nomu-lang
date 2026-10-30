@@ -186,6 +186,7 @@ private func noirDeclName(_ d: NOIRDecl) -> String {
     case .enumDecl(let e):   return e.name
     case .classDecl(let c):  return c.name
     case .actorDecl(let a):  return a.name
+    case .globalDecl(let g): return g.name
     }
 }
 
@@ -202,6 +203,7 @@ func topDeclNames(_ program: Program) -> Set<String> {
         case .classDecl(let c):     names.insert(c.name)
         case .enumDecl(let e):      names.insert(e.name)
         case .interfaceDecl(let i): names.insert(i.name)
+        case .globalDecl(let g):    names.insert(g.name)
         default:                    break
         }
     }

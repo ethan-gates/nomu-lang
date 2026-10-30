@@ -404,6 +404,10 @@ enum NOIRGen {
             if let selfTy = s.lookup("self"), s.bareMemberOfSelf(selfTy, name) {
                 return checkExpr(&s, .member(.ident("self", span: span), name, span: span))
             }
+            if let g = s.globalDecls[name] {
+                s.checkVisible(name, g.visibility, declaredIn: g.span.file, at: span)
+                return NOIRExpr(type: lowerGlobal(&s, name).type, span: span, kind: .globalRef(name))
+            }
             if let sig = s.funcs[name] {
                 s.checkVisible(name, sig.visibility, declaredIn: sig.declFile, at: span)
                 return NOIRExpr(type: .function(params: sig.params, ret: sig.ret), span: span, kind: .varRef(name))
@@ -433,6 +437,11 @@ enum NOIRGen {
                let enumName = s.enumNameForConstruction(typeName, at: span) {
                 if let (vis, file) = s.typeVisibility(enumName) { s.checkVisible(enumName, vis, declaredIn: file, at: span) }
                 return EnumConstruction.buildEnumInit(&s, enumName, field, [], explicit: explicit, expected: expected, at: span)
+            }
+            // `Runtime` has only calls: `Runtime.x` without one is an error (runtime tier only).
+            if let (tn, _) = s.typeNameAndArgs(base), s.lookup(tn) == nil, s.isRuntimeNamespace(tn, at: span) {
+                s.diags.error("type 'Runtime' has no property '\(field)'", at: span)
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             // Pointer static properties (task 125): `RawPtr.null`, `Ptr<T>.null`.
             if let (tn, explicit) = s.typeNameAndArgs(base), s.lookup(tn) == nil, tn == "RawPtr" || tn == "Ptr" {
@@ -702,6 +711,10 @@ enum NOIRGen {
         if case .member(let base, let method, _) = callee,
            let (tn, explicit) = s.typeNameAndArgs(base), s.lookup(tn) == nil {
             if tn == "RawPtr" { return PointerIntrinsics.checkRawPtrStatic(&s, method, args, span) }
+            // Runtime intrinsics (`internals/runtime-subset.md` §5): `Runtime` exists only in the runtime tier.
+            if s.isRuntimeNamespace(tn, at: span) {
+                return RuntimeIntrinsics.checkStatic(&s, method, args, span)
+            }
             if tn == "Ptr" {
                 guard let elems = explicit, elems.count == 1 else {
                     s.diags.error("'Ptr' needs one type argument, e.g. 'Ptr<Int>.\(method)(...)'", at: span)
@@ -1047,6 +1060,13 @@ enum NOIRGen {
     // field writes inside methods are already caught by the AST Typechecker (self is
     // read-only); this covers `value.field = …` targets on struct/class values.
     static func rejectLetFieldTarget(_ s: borrowing Sema, _ target: NOIRExpr) {
+        // A global is a `let`: neither it nor a field of it can be assigned.
+        var root = target
+        while case .fieldAccess(let base, _) = root.kind { root = base }
+        if case .globalRef(let name) = root.kind {
+            s.diags.error("cannot assign to global '\(name)' (a global is a 'let')", at: target.span)
+            return
+        }
         guard case .fieldAccess(let base, let field) = target.kind else { return }
         let typeName: String
         switch base.type {
@@ -1147,10 +1167,152 @@ enum NOIRGen {
             return .actorDecl(lowerActor(&s, a))
         case .funcDecl(let f):
             return .funcDecl(lowerFunc(&s, f))
+        case .globalDecl(let g):
+            return .globalDecl(lowerGlobal(&s, g.name))
         case .interfaceDecl:
             preconditionFailure("interfaces are validated in check(), not lowered (M5 A1)")
         case .extensionDecl:
             preconditionFailure("extensions must be merged before Sema (M4.12)")
+        }
+    }
+
+    // MARK: - Globals
+
+    // Check a global's declaration and initializer, once (`modules.md` §Initialization & entry point). An
+    // initializer is an expression with no enclosing function, checked in a scope of its own. A read of a
+    // global not yet checked checks it first, so initializers may name globals in any order; reading itself
+    // (directly or through another global) is an error.
+    @discardableResult
+    static func lowerGlobal(_ s: inout Sema, _ name: String) -> NOIRGlobal {
+        if let done = s.loweredGlobals[name] { return done }
+        let g = s.globalDecls[name]!
+        guard !s.globalsInProgress.contains(name) else {
+            s.diags.error("global '\(name)' depends on its own value", at: g.span)
+            return NOIRGlobal(name: name, type: .error, value: NOIRExpr(type: .error, span: g.span, kind: .intLit(0)),
+                              isConstant: false, span: g.span)
+        }
+        s.globalsInProgress.insert(name)
+        if g.isMutable {
+            s.diags.error("top-level 'var' is not allowed: a global is a 'let'", at: g.span)
+        }
+        if g.visibility >= .package {
+            s.diags.error("a global is 'private' or 'internal'; '\(g.visibility)' is not allowed", at: g.span)
+        }
+        s.pushScope()
+        let annotated = g.type.map { s.resolve($0) }
+        let savedSite = s.staticStorageSite
+        if case .call(_, _, let span) = g.value { s.staticStorageSite = span } else { s.staticStorageSite = nil }
+        let ce = checkExpr(&s, g.value, expected: annotated)
+        s.staticStorageSite = savedSite
+        let value = coerce(&s, ce, to: annotated)
+        checkAssignable(&s, value.type, to: annotated, role: "bind", at: g.span)
+        s.popScope()
+        let type = annotated ?? value.type
+        if type != .error, !globalTypeAllowed(&s, type, seen: []) {
+            s.diags.error("a global holds an immutable value with no reference; '\(type)' is not one", at: g.type?.span ?? g.span)
+        }
+        // Fold: a constant initializer has every constant global it reads substituted in, so its value is a
+        // closed expression codegen turns into static data.
+        let constant = isConstantInit(s, value)
+        let folded = constant ? substitutingConstants(s, value) : value
+        if type != .error, !constant, mentionsString(s, type) {
+            s.diags.error("a global holding a 'String' must be a literal; a 'String' computed at startup is not supported yet", at: g.span)
+        }
+        s.globalsInProgress.remove(name)
+        let out = NOIRGlobal(name: name, type: type, value: folded, isConstant: constant, span: g.span)
+        s.loweredGlobals[name] = out
+        return out
+    }
+
+    // Whether a global's initializer folds at compile time: literals, arithmetic and comparisons on them, a
+    // struct value or a payload-free enum case built from them, `RawPtr.null`, `Runtime.staticStorage`, and
+    // reads of constant globals.
+    // `&&` / `||` lower to branches, so they make an initializer a startup one.
+    static func isConstantInit(_ s: borrowing Sema, _ e: NOIRExpr) -> Bool {
+        switch e.kind {
+        case .intLit, .doubleLit, .boolLit, .stringLit:
+            return true
+        case .binary(let op, let l, let r):
+            return op != .and && op != .or && isConstantInit(s, l) && isConstantInit(s, r)
+        case .construct(_, let args):
+            guard case .named(_, .struct_) = e.type else { return false }
+            return args.allSatisfy { isConstantInit(s, $0.value) }
+        case .enumInit(_, _, let args):
+            return args.isEmpty
+        case .globalRef(let n):
+            return s.loweredGlobals[n]?.isConstant ?? false
+        case .call(let callee, let args, _):
+            if isStaticStorage(callee) { return true }
+            if case .varRef("__ptrNull") = callee.kind, args.isEmpty { return true }
+            return false
+        default:
+            return false
+        }
+    }
+
+    private static func isStaticStorage(_ callee: NOIRExpr) -> Bool {
+        if case .varRef("__staticStorage") = callee.kind { return true }
+        return false
+    }
+
+    // A constant initializer with each constant global it reads replaced by that global's (already folded)
+    // value. Only the kinds `isConstantInit` admits occur.
+    static func substitutingConstants(_ s: borrowing Sema, _ e: NOIRExpr) -> NOIRExpr {
+        func sub(_ x: NOIRExpr) -> NOIRExpr { substitutingConstants(s, x) }
+        switch e.kind {
+        case .globalRef(let n):
+            // A static-storage global stays a read: substituting its initializer would reserve a second block.
+            guard let g = s.loweredGlobals[n] else { return e }
+            if case .call(let callee, _, _) = g.value.kind, isStaticStorage(callee) { return e }
+            return NOIRExpr(type: e.type, span: e.span, kind: g.value.kind)
+        case .binary(let op, let l, let r):
+            return NOIRExpr(type: e.type, span: e.span, kind: .binary(op, sub(l), sub(r)))
+        case .construct(let t, let args):
+            return NOIRExpr(type: e.type, span: e.span,
+                            kind: .construct(typeName: t, args: args.map { NOIRArg(label: $0.label, value: sub($0.value)) }))
+        default:
+            return e
+        }
+    }
+
+    // Whether a global's type holds a `String` anywhere (directly or in a struct or enum field).
+    static func mentionsString(_ s: borrowing Sema, _ t: Type, seen: Set<String> = []) -> Bool {
+        switch t {
+        case .stringBase:
+            return true
+        case .named(let n, .struct_):
+            guard !seen.contains(n), let d = s.structs[n] else { return false }
+            return d.fields.contains { mentionsString(s, s.resolve($0.type), seen: seen.union([n])) }
+        case .named(let n, .enum_):
+            guard !seen.contains(n), let d = s.enums[n] else { return false }
+            return d.cases.flatMap(\.fields).contains { mentionsString(s, s.resolve($0.type), seen: seen.union([n])) }
+        default:
+            return false
+        }
+    }
+
+    // A global's type: an immutable value holding no GC-managed reference — numbers, `Bool`, `String`, and
+    // non-generic structs and enums built only from those — or, in the runtime tier, `RawPtr`. Classes,
+    // actors, arrays, closures and existentials are rejected (`internals/c-types.md` §3; task 224 open
+    // question 1 for actor references).
+    static func globalTypeAllowed(_ s: inout Sema, _ t: Type, seen: Set<String>) -> Bool {
+        switch t {
+        case .int, .uint8, .uint64, .double, .bool, .stringBase:
+            return true
+        case .rawPtr:
+            return s.runtimeTier
+        case .named(let n, .struct_):
+            if seen.contains(n) { return true }
+            guard let d = s.structs[n], d.generics.isEmpty else { return false }
+            let fieldTypes = d.fields.map { s.resolve($0.type) }
+            return fieldTypes.allSatisfy { globalTypeAllowed(&s, $0, seen: seen.union([n])) }
+        case .named(let n, .enum_):
+            if seen.contains(n) { return true }
+            guard let d = s.enums[n], d.generics.isEmpty else { return false }
+            let fieldTypes = d.cases.flatMap(\.fields).map { s.resolve($0.type) }
+            return fieldTypes.allSatisfy { globalTypeAllowed(&s, $0, seen: seen.union([n])) }
+        default:
+            return false
         }
     }
 

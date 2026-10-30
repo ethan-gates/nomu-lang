@@ -304,4 +304,25 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(i.name, "Drawable")
         XCTAssertEqual(i.refines.map(\.name), ["Named"])
     }
+
+    // A global: a top-level `let` with optional visibility and type annotation (task 224).
+    func testGlobalDecl() {
+        let p = parse("private let limit: Int = 64\nlet name = \"nomu\"\nfun f() -> Int { return limit }")
+        XCTAssertEqual(p.decls.count, 3)
+        guard case .globalDecl(let g) = p.decls[0] else { XCTFail("expected a global"); return }
+        XCTAssertEqual(g.name, "limit")
+        XCTAssertEqual(g.visibility, .private)
+        XCTAssertEqual(g.type?.name, "Int")
+        XCTAssertFalse(g.isMutable)
+        guard case .globalDecl(let h) = p.decls[1] else { XCTFail("expected a global"); return }
+        XCTAssertNil(h.type)
+        XCTAssertEqual(h.visibility, .internal)
+    }
+
+    // A top-level `var` parses so sema can report it.
+    func testTopLevelVarParses() {
+        let p = parse("var count = 0")
+        guard case .globalDecl(let g) = p.decls.first else { XCTFail("expected a global"); return }
+        XCTAssertTrue(g.isMutable)
+    }
 }

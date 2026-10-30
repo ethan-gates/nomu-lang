@@ -39,7 +39,7 @@ fun mutexLock(m: RawPtr) {
       c = m.atomicExchange(2, atByteOffset: 0)
     }
     while c != 0 {
-      m.futexWait(expected: 2, timeoutMicros: 0)     // 0 = wait indefinitely; unlock wakes us
+      Runtime.futexWait(at: m, expected: 2, timeoutMicros: 0)     // 0 = wait indefinitely; unlock wakes us
       c = m.atomicExchange(2, atByteOffset: 0)
     }
   }
@@ -48,7 +48,7 @@ fun mutexLock(m: RawPtr) {
 fun mutexUnlock(m: RawPtr) {
   let prev: Int = m.atomicExchange(0, atByteOffset: 0)
   if prev == 2 {
-    m.futexWake(all: false)
+    Runtime.futexWake(at: m, all: false)
   }
 }
 
@@ -86,7 +86,7 @@ fun dequeue(sched: RawPtr) -> RawPtr {
 fun wakeCarrier(sched: RawPtr, all: Bool) {
   let gw = sched.advanced(by: 24)
   gw.atomicFetchAdd(1, atByteOffset: 0)
-  gw.futexWake(all: all)
+  Runtime.futexWake(at: gw, all: all)
 }
 
 // ---- fiber machinery ----
@@ -104,7 +104,7 @@ fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   fib.store(RawPtr.null, toByteOffset: 216)
   fib.store(RawPtr.null, toByteOffset: 224)
   fib.store(RawPtr.null, toByteOffset: 232)
-  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberMain), arg: fib)
+  Runtime.fiberInit(context: fib, stackTop: stackTop, entry: Runtime.ofFunc(fiberMain), arg: fib)
   return fib
 }
 
@@ -129,7 +129,7 @@ fun fiberMain(fib: RawPtr) -> RawPtr {
   mutexUnlock(sched.advanced(by: 16))
   let entry: RawPtr = fib.load(fromByteOffset: 184)
   let arg: RawPtr = fib.load(fromByteOffset: 192)
-  let res = entry.callEntry(arg)
+  let res = Runtime.callEntry(entry, arg: arg)
   mutexLock(sched.advanced(by: 16))
   fib.store(res, toByteOffset: 216)
   fib.store(3, toByteOffset: 168)
@@ -139,7 +139,7 @@ fun fiberMain(fib: RawPtr) -> RawPtr {
     wakeCarrier(sched, true)
   }
   let carrierCtx: RawPtr = fib.load(fromByteOffset: 232)
-  fib.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: fib, to: carrierCtx)
   return fib
 }
 
@@ -160,13 +160,13 @@ fun schedLoop(sched: RawPtr, myCtx: RawPtr) {
         let gw = sched.advanced(by: 24)
         let gen: Int = gw.atomicLoad(fromByteOffset: 0)
         mutexUnlock(sched.advanced(by: 16))
-        gw.futexWait(expected: gen, timeoutMicros: 1000000)   // sleep until push; 1 s backstop
+        Runtime.futexWait(at: gw, expected: gen, timeoutMicros: 1000000)   // sleep until push; 1 s backstop
         mutexLock(sched.advanced(by: 16))
       }
     } else {
       fib.store(myCtx, toByteOffset: 232)    // record the carrier so the fiber can switch back
       fib.store(1, toByteOffset: 168)
-      myCtx.ctxSwitchTo(fib)
+      Runtime.ctxSwitch(from: myCtx, to: fib)
     }
   }
   mutexUnlock(sched.advanced(by: 16))
@@ -216,7 +216,7 @@ fun main() {
   let arg = RawPtr.alloc(bytes: 16, align: 8)
   arg.store(acc, toByteOffset: 0)
   arg.store(amt, toByteOffset: 8)
-  let body = RawPtr.ofFunc(bumpBody)
+  let body = Runtime.ofFunc(bumpBody)
 
   // Phase 1 — enqueue before the carriers exist; they will drain these first.
   var i = 0
@@ -234,16 +234,16 @@ fun main() {
     carg.store(sched, toByteOffset: 0)
     carg.store(ctx, toByteOffset: 8)
     let h = handles.advanced(by: 8 * c)
-    h.threadCreate(entry: RawPtr.ofFunc(carrierMain), arg: carg)
+    Runtime.threadCreate(handle: h, entry: Runtime.ofFunc(carrierMain), arg: carg)
     c = c + 1
   }
 
   // Let the carriers drain phase 1 and go idle (sleep on the wake-gen futex), so phase 2 exercises a real
   // cross-thread wake of a sleeping carrier.
-  let t0 = RawPtr.monotonicNanos()
+  let t0 = Runtime.monotonicNanos()
   var now = t0
   while now - t0 < 50000000 {                 // ~50 ms
-    now = RawPtr.monotonicNanos()
+    now = Runtime.monotonicNanos()
   }
 
   // Phase 2 — push more work from the main thread; each spawn wakes a sleeping carrier.
@@ -257,7 +257,7 @@ fun main() {
   var k = 0
   while k < carriers {
     let h = handles.advanced(by: 8 * k)
-    h.threadJoin()
+    Runtime.threadJoin(handle: h)
     k = k + 1
   }
 

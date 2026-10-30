@@ -1,8 +1,8 @@
 # Self-hosting the runtime: GC + scheduler in Nomu, bootstrapped in assembly
 
 **Avenue:** Risk (author north-star, the core bet) · **Type/Lifecycle:** `perf · refactor · needs-design`
-(runtime + language subset + compiler + GC) · **Size:** XL · **Status:** build now — core bet;
-decomposes into 125 → 149 → 150 → 127. The Nomu scheduler and collector are the only runtime: MMTk, the
+(runtime + language subset + compiler + GC) · **Size:** XL · **Status:** done (128.1–128.4); decomposed
+into 125 → 149 → 150 → 127, and retiring the C floor continues in [223](223-retire-the-c-floor.md). The Nomu scheduler and collector are the only runtime: MMTk, the
 Rust binding and the C scheduler are retired ([197](197-retire-mmtk-and-c-scheduler.md)), and the selector
 knobs the phase logs below name (`NOMU_RUNTIME`, `NOMU_SCHED`, `NOMU_GC_PLAN`) no longer exist · **Source:** deferred.md (2026-08-18)
 
@@ -240,100 +240,7 @@ The parts this task owns directly (the delegated prerequisites 125/149/150/127 k
     roots (150.3.12). [197](197-retire-mmtk-and-c-scheduler.md) then made it the default and deleted the
     lever, the oracle overrides and the support matrix along with MMTk and the C scheduler.
 
-- **128.5 — Retire the C floor.** *Not started.* After 197, `runtime.c` (965 lines) and `core.c` (95) remain
-  under the Nomu scheduler and collector. By area, approximately: the GC type-descriptor accessors (290),
-  the GC coordinator and smoke threads (170), line input with its kqueue poller (140), carrier state (115:
-  the TLAB and mod-buffer slots and registries, the space-creation lock, the write-barrier slow path), the
-  forwarders into Nomu (50: `fiber_spawn`, `spawn_join`, `rt_sleep_ms`, `__nomu_gc_poll_slow`, the mailbox
-  calls), process globals (40), `main` (35), and the rest (60: the frame-index check, raw memory, the bounds
-  trap, `rt_print_double`, the current-fiber TLS slot). The asm floor (128.2) is separate and stays.
-  Ordered after [127 LXR](127-lxr-collector.md) and its chain, by the Order rule in `horizon.md`: LXR
-  changes the algorithm on a fixed runtime, and this is a location change.
-
-  **Rule: from the floor up.** Moving a piece of C into Nomu while what it stands on stays in C adds edges
-  between the two: Nomu calling back into C for memory, a thread-local, or a lock. So each stage below
-  moves code only once everything it needs is expressible in Nomu, and the C it replaces is deleted in the
-  same stage. Until a stage lands, its C stays where it is and new runtime work does not add C beside it.
-
-  What Nomu cannot express today, each a blocker:
-  1. **Calls into the C library:** `pthread_create`, `pthread_mutex_*`, `__ulock_wait`/`__ulock_wake`,
-     `kqueue`/`kevent`, `poll`, `read`, `nanosleep`, `posix_memalign`/`free`, `fprintf`/`abort`/`exit`,
-     `getsectiondata`, some over C struct layouts (`struct kevent`, `pthread_mutex_t`). One-off codegen
-     intrinsics can cover them one at a time; the general answer is [130 FFI](130-ffi-c-abi.md). Several
-     already lower straight to libSystem (`getenv`, `kqueue`/`kevent`, the futex calls, thread create and
-     join, the clocks); `RawPtr.alloc` still goes through C (`rt_raw_alloc`).
-  2. **Entry points called by foreign threads:** `pthread_create` runs a C function pointer on a new OS
-     thread, and dyld calls `main`. Nomu functions use the GC calling convention and expect a carrier (the
-     current fiber in TLS, a TLAB). `main` alone codegen can emit; thread entries need a C-ABI function safe
-     to run with no fiber.
-  3. **Code that never reaches a safepoint:** the GC coordinator threads drive the stop-the-world, and a
-     back-edge poll in their loops could park a coordinator on its own collection. The anchor shims
-     (`spawn_join`, `rt_sleep_ms`, `__nomu_gc_poll_slow`) must be a separate frame directly below user code
-     and read the return and frame addresses. Needs a no-polls, no-statepoints, never-inlined function
-     property, and return-address and frame-address intrinsics. The runtime subset (149) rules out
-     allocation, not polls or frame shape.
-  4. **Process-wide globals and thread-locals:** the stop-the-world flag, the scheduler handle, the
-     write-barrier globals that inlined code reads, the Immix space pointer, the GC tuning globals and the
-     run settings (198), the registries, and the TLS slots. Nomu has no global variables; C defines the
-     storage and codegen loads it.
-  5. **Link-level control (minor):** the weak fallback `nomu_actor_drain`, and section lookup through
-     `_mh_execute_header`, which `section$start$…` symbols can replace (the stack-map lookup already uses
-     them).
-  6. **The asm floor into the runtime's object** (for [192](192-bazel-friendliness.md)): retiring the C files
-     leaves `rtasm_arm64.s` (the context switch, fiber setup) assembled into the runtime archive. For the
-     archive to go, so that every runtime byte comes from `nomu compile`, the asm moves into the runtime
-     module's object, for example as module-level inline asm through LLVM (the backend already emits the
-     stackmap keep directive that way). Needed only by 192, which waits for it.
-
-  Items 2–4 likely need runtime-tier language surface (a function property, globals, FFI declarations),
-  which needs agreement before it is added. Items 5 and 6, and item 1 done call by call as intrinsics, are
-  compiler-only.
-
-  Stages, each deleting the C it replaces:
-  - **128.5.1 The floor.** Blockers 1, 3 and 4 as compiler-provided pieces: process globals and
-    carrier-local slots whose storage codegen defines; `RawPtr.alloc` and `free` lowered straight to
-    libSystem; the no-polls, frame-shaped function property with return- and frame-address intrinsics. The
-    surface for globals and the function property needs agreement first. Deletes the C globals and
-    `rt_raw_alloc`.
-  - **128.5.2 Carrier state and the allocation fast path.** One carrier record behind one carrier-local
-    slot, holding the current fiber, the TLAB and the mod-buffer; bind, registry, reset and drain in Nomu,
-    the registry growable (the C tables stop at 256 carriers). Deletes `rt_self_tlab_get`,
-    `rt_tlab_reset_all`, the mod-buffer functions and `rt_tls_get`/`rt_tls_set`. The inline allocation is
-    rebuilt on it:
-    - *Today*, every allocation does an acquire load of the space pointer and a null branch, calls
-      `rt_self_tlab_get`, bumps, then adds the heap base to a heap-relative cursor. That call is a GC
-      statepoint (it is missing from `gcLeafRuntimeFns`; the stack map has a record at its return address),
-      so references live across an allocation are spilled and reloaded. The C it calls is built at `-O0`
-      (`runtimeArchiveRecipe` passes no optimization flag), so it sets up a frame and calls the
-      thread-local thunk through `blr`.
-    - *After*: the TLAB pointer is read first, and a null one takes a cold bind that also creates the
-      space, so the per-allocation space load and branch go away. Cursor and limit are addresses, so the
-      heap-base add goes away. Nothing on the hit path is a statepoint.
-    - *The carrier-local read.* A fiber can resume on another carrier after a park, so the read must happen
-      again after any park and never be cached across a call. Options: a gc-leaf call to a getter;
-      `pthread_getspecific` on a key the runtime creates; or the thread's TSD slot read directly (`mrs
-      tpidrro_el0`, then `ldr [tp, key*8]`) as inline asm with side effects, which is how libpthread's own
-      `pthread_getspecific` reads it and how Go reaches its TLS on darwin/arm64. A scratch check returned
-      the `pthread_setspecific` value for a dynamic key. Recommended: the direct read, checked against
-      `pthread_getspecific` once at bind; Linux's form goes on [218](218-linux-support.md)'s list.
-    - *Measured in isolation*, a C bump loop costs about 2.25 ns per bump whichever way the TLAB pointer is
-      reached (`-O0` getter, `-O2` getter, `pthread_getspecific`, direct read, register): the cursor's load
-      and store chain bounds it. The gain is in the statepoint, the call and the space load around the read.
-    - *Layout*: 64 bytes, `{ cursor, limit, block, line, stressLimit, stressBytes, allocObjects,
-      allocBytes }`; the last two are [159](159-gc-observability.md).6's counts.
-    - *Measure* against a baseline taken first: an allocation-bound Nomu benchmark with references live
-      across allocations, the instructions at one inlined allocation site, and stack-map records per binary.
-  - **128.5.3 The forwarders and the barrier slow path.** `fiber_spawn`, `spawn_join`, `rt_sleep_ms`,
-    `__nomu_gc_poll_slow`, the mailbox calls and `rt_gc_write_barrier` become frame-shaped Nomu functions
-    reading the scheduler handle from a global.
-  - **128.5.4 GC metadata.** The type-descriptor accessors and the frame-index check, over `section$start$…`
-    symbols.
-  - **128.5.5 Entry points.** `main` emitted by codegen; thread entries as C-ABI functions safe without a
-    fiber; the coordinator threads (shaped by [158](158-gc-packaging.md)), the run-setting parsing, and line
-    input with its poller.
-  - **128.5.6 The remainder.** `rt_print_double` (shortest round-trip formatting, today `snprintf`), the
-    bounds trap, the timing helper; then the C members leave the runtime archive. Blocker 6 follows for
-    192.
+- **128.5 — Retire the C floor.** Moved to its own task, [223](223-retire-the-c-floor.md).
 
 ## Refs
 

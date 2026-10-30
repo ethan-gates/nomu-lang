@@ -1,0 +1,10 @@
+// A startup global whose initializer reads its own value through a call.
+let a = next()
+
+fun next() -> Int {
+  return a + 1
+}
+
+fun main() {
+  print(a)
+}

@@ -1,0 +1,48 @@
+// Lines on both sides of the `small` limit (15 bytes) and one past the first 8 KiB input buffer, read under
+// collection stress (suite case `read-line-long`): a line over 15 bytes is a fresh `heap` string, and `churn`
+// forces collections that may move it while `main` holds it. The last line has no newline.
+class Box {
+  var v: Int
+}
+
+fun churn() -> Int {
+  var sum = 0
+  var i = 0
+  while i < 60000 {
+    let b = Box(v: i)
+    sum = sum + b.v % 7
+    i = i + 1
+  }
+  return sum
+}
+
+fun show(s: String) {
+  print(s.count)
+  print(" ")
+  if s.count > 40 {
+    print(s.byte(at: 0).int)
+    print(" ")
+    print(s.byte(at: s.count - 1).int)
+  } else {
+    print(s)
+  }
+  print("\n")
+}
+
+fun main() {
+  let a = readLine()
+  let b = readLine()
+  let c = readLine()
+  let d = readLine()
+  spawn let n = churn()
+  let e = readLine()
+  let f = readLine()
+  show(a)
+  show(b)
+  show(c)
+  show(d)
+  show(e)
+  show(f)
+  print(n)
+  print("\n")
+}

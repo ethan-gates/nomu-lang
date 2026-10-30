@@ -446,12 +446,16 @@ extension LLVMGen {
         let fn: LLVMValueRef?
         let scope: LLVMMetadataRef?
         let debugLoc: LLVMMetadataRef?
+        let deopt: [LLVMValueRef?]?
     }
 
+    // The caller's pending shaped-root bundle is set aside too: its slots live in the caller, so a call in the
+    // thunk must not carry it.
     func beginThunk(_ fn: LLVMValueRef, line: Int = 0) -> EmitScope {
         let saved = EmitScope(block: LLVMGetInsertBlock(b), fn: currentFn, scope: currentScope,
-                              debugLoc: di != nil ? LLVMGetCurrentDebugLocation2(b) : nil)
+                              debugLoc: di != nil ? LLVMGetCurrentDebugLocation2(b) : nil, deopt: pendingDeopt)
         currentFn = fn
+        pendingDeopt = nil
         LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, fn, "entry"))
         enterDebugScope(fn, line: line)
         return saved
@@ -459,6 +463,7 @@ extension LLVMGen {
 
     func endThunk(_ saved: EmitScope) {
         currentFn = saved.fn
+        pendingDeopt = saved.deopt
         if let block = saved.block { LLVMPositionBuilderAtEnd(b, block) }
         currentScope = saved.scope
         if di != nil { LLVMSetCurrentDebugLocation2(b, saved.debugLoc) }

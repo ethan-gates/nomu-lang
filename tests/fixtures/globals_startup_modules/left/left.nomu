@@ -1,0 +1,12 @@
+import pkg/base
+
+private let value = compute()
+
+fun compute() -> Int {
+  print("left\n")
+  return baseValue() + 1
+}
+
+package fun leftValue() -> Int {
+  return value
+}

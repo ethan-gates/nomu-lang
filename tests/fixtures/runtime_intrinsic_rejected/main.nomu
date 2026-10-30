@@ -1,0 +1,6 @@
+// The runtime intrinsics are spelled on `Runtime`, which exists only in the runtime tier
+// (internals/runtime-subset.md §5): to user code it is an undefined name, like any other.
+fun main() {
+  let t = Runtime.ticks()
+  print(t)
+}

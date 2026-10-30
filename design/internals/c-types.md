@@ -23,11 +23,12 @@ the runtime in `src/runtime/` (`runtime.c`, `core.c`, `runtime.h`); the GC bindi
 
 Every heap object these types allocate goes through one of two homes, both zero-initialized:
 
-- **The moving GC heap (Immix)** — codegen's `__nomu_gc_alloc` seam, which forwards to
-  `__nomu_selfhost_alloc` (a per-carrier TLAB bump, refilled by the Nomu allocator's `rtTlabAlloc`). The
+- **The moving GC heap (Immix)** — codegen's `__nomu_gc_alloc` seam, a per-carrier TLAB bump inlined at
+  each allocation site that calls `__nomu_alloc_slow` on a miss (refilled by the Nomu allocator's
+  `rtTlabAlloc`). The
   object participates in collection: it is traced, relocated, and its managed fields updated.
 - **Immortal memory** — non-moving, never-collected off-heap buffers a moving collector must not relocate
-  (string literals in rodata; `rt_read_line`'s buffer). Until task 197 this was MMTk's immortal space
+  (string literals in rodata). Until task 197 this was MMTk's immortal space
   (`rt_alloc_immortal`).
 
 An object placed in the moving heap must be describable to the collector by its **header type-id** (low
@@ -45,10 +46,10 @@ A `String` value is `{ ptr data (addrspace 0), i64 len }` — two words, passed 
 **unmanaged** raw pointer, so a String value carries no GC reference and never becomes a root.
 
 - **Literals** (`rt_str_lit`, gc-leaf) wrap static rodata — no allocation.
-- **`concat` / `readLine`** (`rt_str_concat` in `core.c`, `rt_read_line` in `runtime.c`) allocate their
-  buffer through **`rt_alloc_immortal`**: `{ ObjectHeader, bytes… }`, non-moving. Because `data` is an
-  untracked `addr0` pointer, a moving collector could not update it — the immortal space keeps the
-  buffer fixed so the raw pointer stays valid. These buffers **leak** (never reclaimed).
+- **`concat` / `readLine`** now build a `small` value (15 bytes or fewer) or a collected `heap` buffer
+  (task [121](../plans/tasks/121-string-utf8-model.md); `readLine` since
+  [223](../plans/tasks/223-retire-the-c-floor.md).5.2). Before that they allocated immortal buffers that
+  leaked.
 
 **Deferred — the collectable form (Q6).** Making `String` a managed `{ header, len, bytes }` box was
 implemented and reverted: it turns every struct/enum with a String field into a category-3 value

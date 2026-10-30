@@ -45,7 +45,7 @@ final class ParserRecoveryTests: XCTestCase {
         // Two independent broken constructs → two diagnostics (parsing continues past each),
         // and the valid declaration between them survives.
         let (p, diags) = parse("""
-        let a = 1
+        a = 1
         struct Good { var x: Int }
         return 5
         """)

@@ -1,4 +1,4 @@
-// Task 128.1.1 · scheduler substrate — raw OS clock. `RawPtr.monotonicNanos()` reads monotonic time in
+// Task 128.1.1 · scheduler substrate — raw OS clock. `Runtime.monotonicNanos()` reads monotonic time in
 // nanoseconds straight from the OS (macOS: the libSystem entry clock_gettime_nsec_np; no C-runtime shim),
 // the primitive under the scheduler's timer heap. The values are wall-clock nondeterministic, so this
 // fixture asserts the two invariants that must hold: the clock is positive, and it is non-decreasing
@@ -7,14 +7,14 @@
 // primitive passes the subset check and its loop carries no safepoint poll.
 // Expected output: 1 / 1. Checked by tools/sysclock.sh.
 fun elapsed() -> Int {
-  let t1 = RawPtr.monotonicNanos()
+  let t1 = Runtime.monotonicNanos()
   var acc = 0
   var i = 0
   while i < 100000 {
     acc = acc + i
     i = i + 1
   }
-  let t2 = RawPtr.monotonicNanos()
+  let t2 = Runtime.monotonicNanos()
   if t2 >= t1 {
     return 1
   }
@@ -22,7 +22,7 @@ fun elapsed() -> Int {
 }
 
 fun main() {
-  let now = RawPtr.monotonicNanos()
+  let now = Runtime.monotonicNanos()
   if now > 0 {
     print(1)
   } else {

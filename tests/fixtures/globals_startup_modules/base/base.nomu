@@ -1,0 +1,11 @@
+// The shared dependency of `left` and `right`: its init function runs once, before either's.
+private let start = announce()
+
+fun announce() -> Int {
+  print("base\n")
+  return 40
+}
+
+package fun baseValue() -> Int {
+  return start
+}

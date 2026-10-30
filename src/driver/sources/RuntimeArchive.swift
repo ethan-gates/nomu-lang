@@ -53,9 +53,8 @@ func cachedRuntimeArchive(_ job: RuntimeArchiveJob, store: ArtifactStore, track:
 // The commands that build the runtime archive, run in order in a directory holding the runtime sources
 // (`writeRuntimeSources`). The plan hashes them into the archive's key, so changing one rebuilds the archive.
 let runtimeArchiveRecipe: [[String]] = {
-    var commands = [["/usr/bin/cc", "-w", "-I", ".", "-c", "runtime.c", "-o", "runtime.o"],
-                    ["/usr/bin/cc", "-w", "-I", ".", "-c", "core.c", "-o", "core.o"]]
-    var members = ["runtime.o", "core.o"]
+    var commands = [["/usr/bin/cc", "-w", "-I", ".", "-c", "runtime.c", "-o", "runtime.o"]]
+    var members = ["runtime.o"]
     // The asm floor (task 128.2): assemble the per-arch `.s` (clang assembles `.s` directly) and archive
     // it beside the C objects, so its symbols (rtSwitch, rtFiberInit) resolve in every emitted binary.
     if HostCache.hostArch == "arm64" {
@@ -78,15 +77,13 @@ func buildRuntimeArchive(inDir dir: String) -> String? {
     return dir + "/libnomuruntime.a"
 }
 
-// Write the embedded runtime/core C sources + ABI header into `dir` (M4.13).
+// Write the embedded runtime C source + ABI header into `dir` (M4.13).
 func writeRuntimeSources(toDir dir: String) {
     var files = [
         ("runtime.h", EmbeddedSources.runtimeHeader),
         ("runtime.c", EmbeddedSources.runtimeC),
-        ("core.c",    EmbeddedSources.coreC),
     ]
-    // The asm floor (task 128.2), per-arch. arm64 only for now; x86-64 is deferred, and core.c's
-    // self-test degrades to a stub there, so no `.s` is needed to link.
+    // The asm floor (task 128.2), per-arch. arm64 only for now; x86-64 is deferred.
     if HostCache.hostArch == "arm64" { files.append(("rtasm.s", EmbeddedSources.rtAsmArm64)) }
     for (name, contents) in files {
         guard (try? contents.write(toFile: dir + "/" + name, atomically: true, encoding: .utf8)) != nil else {

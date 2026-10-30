@@ -5,8 +5,8 @@
 # (##"""…"""##) mean the file contents pass through verbatim — no escaping.
 set -euo pipefail
 
-out="$1"; rt_h="$2"; rt_c="$3"; core_c="$4"; prelude="$5"; rt_prelude="$6"; rtasm_arm64="$7"
-shift 7   # the rest: the `std` package's module files, `.../std/<module>/<file>.nomu`
+out="$1"; rt_h="$2"; rt_c="$3"; prelude="$4"; rt_prelude="$5"; rtasm_arm64="$6"
+shift 6   # the rest: the `std` package's module files, `.../std/<module>/<file>.nomu`
 
 emit() {  # $1 = Swift constant name, $2 = source file
     printf '    public static let %s = ##"""\n' "$1"
@@ -20,7 +20,6 @@ emit() {  # $1 = Swift constant name, $2 = source file
     echo 'public enum EmbeddedSources {'
     emit runtimeHeader "$rt_h"
     emit runtimeC "$rt_c"
-    emit coreC "$core_c"
     echo '    public static let preludeName = "core.nomu"'
     emit preludeSource "$prelude"
     echo '    public static let runtimePreludeName = "runtime.nomu"'

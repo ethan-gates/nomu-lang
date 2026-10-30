@@ -208,7 +208,7 @@ currently-accepted code.
 is the duplicated per-reference action and deopt-range parsing.**
 
 Finding — the strongest of the five. The shape *decode* is one C implementation both collectors call. The
-self-hosted tracer's `RawPtr.gcLiveCount` / `gcLiveOffsetAt` / `gcShapeDescForOrdinal` lower to calls to the
+self-hosted tracer's `Runtime.gcLiveCount` / `gcLiveOffsetAt` / `gcShapeDescForOrdinal` lower to calls to the
 very functions the C walker uses — `nomu_gc_live_offsets` and `nomu_shape_desc_for_ordinal`
 (`SSAIRToLLVM.swift` intrinsic lowering). The kind-2 tag read, the case selection, and the object-field fold
 exist once; a new shape kind added to `nomu_gc_live_offsets` reaches both collectors. Two things stay
@@ -231,7 +231,7 @@ fingerprints across the C and self-hosted collectors.
   can the walker read a dynamic shape-id — does not arise, because erased generics never use the
   deopt/stackmap channel. A non-POD erased `T` buffer is rooted on a **per-fiber shadow stack** (`{prev,
   buffer, vwt}` nodes, task 100.4.3.6, built and green), and `rtWalkShadow` reads a **runtime** descriptor-id
-  from the VWT (`type_id`, byte 8) and runs it through the shared enumerator (`RawPtr.gcLiveCount` /
+  from the VWT (`type_id`, byte 8) and runs it through the shared enumerator (`Runtime.gcLiveCount` /
   `gcLiveOffsetAt` → `nomu_gc_live_offsets`). A runtime descriptor-id resolved through the one enumerator is
   already the shipping mechanism; the walk reads a dynamic shape, so the capability P1.1 feared is built.
 

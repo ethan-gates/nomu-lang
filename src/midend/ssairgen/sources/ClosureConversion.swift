@@ -55,8 +55,8 @@ func collectUsesStmt(_ stmt: NOIRStmt, _ bound: inout Set<String>, _ used: inout
 
 func collectUsesExpr(_ e: NOIRExpr, _ bound: Set<String>, _ used: inout [String]) {
     switch e.kind {
-    case .intLit, .doubleLit, .boolLit, .stringLit, .funcRef:
-        break                              // funcRef names a top-level function, not a captured local
+    case .intLit, .doubleLit, .boolLit, .stringLit, .funcRef, .globalRef:
+        break                              // funcRef / globalRef name a top-level symbol, not a captured local
     case .varRef(let n):
         if !bound.contains(n) { used.append(n) }
     case .fieldAccess(let base, _):

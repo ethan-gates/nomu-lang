@@ -1,0 +1,47 @@
+// Many fibers and many carriers under collection. A binary fan-out spawns 511 fibers, most queued at once,
+// each spawn's captures in a managed closure environment that only the queued fiber holds; collections run
+// while fibers wait to start, so the walk must root a queued fiber's argument (unrooted, the environment was
+// freed and the fiber read a garbage depth and spawned without end). Run with NOMU_CARRIERS=320, more
+// carriers than the old C registry held (256): every carrier binds a carrier record, and the collector must
+// reset every record's TLAB and mod-buffer. Each worker keeps a window of 16 live Boxes in an array while
+// allocating 40,000 more (the rest garbage); a minor collection promotes the array, so later stores into it
+// go through the write barrier into that carrier's mod-buffer. The checksum is independent of collection
+// and carrier count. Run with escape analysis off so the Boxes are heap objects.
+class Box {
+  var v: Int
+}
+
+fun worker(id: Int) -> Int {
+  var xs: Array<Box> = []
+  var w = 0
+  while w < 16 {
+    xs.append(Box(v: id))
+    w = w + 1
+  }
+  var i = 0
+  while i < 40000 {
+    xs[i % 16] = Box(v: i + id)
+    i = i + 1
+  }
+  var s = 0
+  var j = 0
+  while j < 16 {
+    s = s + xs[j].v
+    j = j + 1
+  }
+  return s % 100000
+}
+
+fun fan(depth: Int, id: Int) -> Int {
+  if depth == 0 {
+    return worker(id)
+  }
+  spawn let a = fan(depth - 1, id * 2)
+  spawn let b = fan(depth - 1, id * 2 + 1)
+  return (a + b) % 1000000
+}
+
+fun main() {
+  print(fan(9, 1))
+  print("\n")
+}

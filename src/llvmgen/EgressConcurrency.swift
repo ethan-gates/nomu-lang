@@ -19,6 +19,7 @@ enum EgressConcurrency {
         let mailbox = g.e.rtAllocManaged(LLVMConstInt(g.e.i64, 40, 0))
         g.e.writeTypeIdHeaderRaw(mailbox, g.e.mailboxTypeIdValue())
         g.e.storeField(g.val(obj), g.e.structGEP(at, g.val(obj), g.e.actorMailboxIndex(name)), mailbox)
+        g.e.registerActorDrain()
     }
 
     // A closure value is a managed `{ i64 header, i8ptr fn, p1 env }` object (the env carries the
@@ -79,9 +80,11 @@ enum EgressConcurrency {
             g.e.storeField(box, g.e.gepByte(box, LLVMConstInt(g.e.i64, 8, 0)), result, type: resultType)
             LLVMBuildRet(g.b, g.e.toUnmanaged(box))
         }
-        let (spawn, sty) = g.e.runtimeFn("fiber_spawn", ret: g.e.i8ptr, params: [g.e.i8ptr, g.e.i8ptr], varArg: false)
+        // The scheduler's spawn, called directly with the scheduler handle; returns the fiber handle.
+        let spawn = g.e.runtimePreludeFn("nomuSchedSpawn", ret: g.e.i8ptr, params: [g.e.i8ptr, g.e.i8ptr, g.e.i8ptr])
         let envArg = env != nil ? g.e.toUnmanaged(g.val(env!)) : LLVMConstNull(g.e.i8ptr)
-        let fiber = g.e.buildCall(spawn, sty, [thunk, envArg])!
+        let sched = g.e.loadRuntimeGlobal("rtSched", g.e.i8ptr)
+        let fiber = g.e.buildCall(spawn.fn, spawn.ty, [sched, thunk, envArg])!
         _ = resTy
         let handleSlot = g.e.entryAlloca(g.e.spawnHandleTy, "spawn.h")
         LLVMBuildStore(g.b, fiber, g.e.structGEP(g.e.spawnHandleTy, handleSlot, 0))
@@ -92,7 +95,7 @@ enum EgressConcurrency {
         guard let handleSlot = g.spawnHandles[binding] else { return }
         // `final` (the structured scope-exit join) tells the runtime to drop the fiber from the live-fiber
         // registry after reading the result — the point its result box stops being rooted (150.3.13).
-        let (sj, sty) = g.e.runtimeFn("spawn_join", ret: g.e.i8ptr, params: [g.e.i8ptr, g.e.i64], varArg: false)
+        let (sj, sty) = g.e.nomuSpawnJoin()
         let box = g.e.buildCall(sj, sty, [handleSlot, LLVMConstInt(g.e.i64, final ? 1 : 0, 0)])!
         if let result = inst.result, let rt = g.ty(resultType, span) {
             let payload = g.e.gepByte(box, LLVMConstInt(g.e.i64, 8, 0))   // result after the 8-byte header (150.3.13)

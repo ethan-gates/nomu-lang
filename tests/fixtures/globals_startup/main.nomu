@@ -1,0 +1,79 @@
+// Startup globals: initializers that call functions run once before `main`, each after the globals its calls
+// read, whatever the declaration order. The reads reach through a direct call, an interface method and a
+// closure; `trace` prints each initializer as it runs, so the output shows the order.
+interface Source {
+  fun value() -> Int
+}
+
+struct Offset: Source {
+  let by: Int
+  fun value() -> Int {
+    return base + by
+  }
+}
+
+struct Point {
+  let x: Int
+  let y: Int
+}
+
+fun trace(name: String, v: Int) -> Int {
+  print(name)
+  print("\n")
+  return v
+}
+
+fun sumTo(n: Int) -> Int {
+  var total = 0
+  var i = 1
+  while i <= n {
+    total = total + i
+    i = i + 1
+  }
+  return total
+}
+
+fun twice() -> Int {
+  return trace("doubled", base * 2)
+}
+
+fun read(s: any Source) -> Int {
+  return s.value()
+}
+
+fun applyTo(f: (Int) -> Int, x: Int) -> Int {
+  return f(x)
+}
+
+fun makePoint() -> Point {
+  return Point(x: base, y: scale)
+}
+
+let doubled = twice()
+let viaInterface = trace("viaInterface", read(Offset(by: 1)))
+let viaClosure = trace("viaClosure", applyTo({ (x: Int) -> Int in return x * scale }, 3))
+let point = makePoint()
+let base = trace("base", sumTo(10))
+let scale = trace("scale", 7)
+let independent = trace("independent", 1)
+
+fun main() {
+  var acc = 0
+  var i = 0
+  while i < 1000 {
+    acc = acc + base + scale
+    i = i + 1
+  }
+  print(acc)
+  print("\n")
+  print(doubled)
+  print("\n")
+  print(viaInterface)
+  print("\n")
+  print(viaClosure)
+  print("\n")
+  print(point.x + point.y)
+  print("\n")
+  print(independent)
+  print("\n")
+}

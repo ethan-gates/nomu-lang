@@ -12,7 +12,7 @@ class Box {
 }
 fun main() {
   let b = Box(v: 12345)
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
   let src = addrOf(b)
 
   let copy = rtCopyObject(space, src)

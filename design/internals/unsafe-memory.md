@@ -4,7 +4,8 @@
 untyped off-heap memory, raw load/store, and pointer arithmetic, below the safe type system. Status
 tags: **Decided**, **Leaning**, **Deferred**, **Open**. The surface built in three slices (RawPtr /
 Ptr<T> / composition + identity); the method spellings in §4 are now **pinned** (built), the codegen
-lives in `SSAIRToLLVM.swift` (`__raw*` / `__ptr*` intrinsics) + `runtime.c` (`rt_raw_alloc`/`rt_raw_free`),
+lives in `SSAIRToLLVM.swift` (`__raw*` / `__ptr*` intrinsics; alloc is the emitted `__nomu_raw_alloc` over
+`posix_memalign`, free is libc's `free`),
 and the surface is validated by `tools/raw-mem.sh`, `tools/typed-ptr.sh`, `tools/raw-struct.sh`.
 
 **API scope.** Two type names are agreed: **`RawPtr`** and **`Ptr<T>`**. The surface is **library types
@@ -87,6 +88,10 @@ constraint are all checked). The supported element set is the single-word scalar
 load/store moves: `RawScalar` = `Int`, `UInt8`, `Double`, `Bool`, `RawPtr`, `Ptr<T>` (aggregates are out
 of the minimal floor).
 
+The runtime's privileged operations (GC metadata reads, the scheduler handle, clocks and OS calls, the
+context switch, thread and futex primitives) are not part of this surface: they are runtime intrinsics on
+`Runtime`, which only the runtime tier may name (`runtime-subset.md` §5).
+
 **`RawPtr`**
 - `RawPtr.alloc(bytes: Int, align: Int) -> RawPtr` — raw off-heap block (case 1). Static.
 - `RawPtr.null -> RawPtr` — a null address. Static property.
@@ -101,7 +106,7 @@ of the minimal floor).
 **`Ptr<T>`**
 - `Ptr<T>.alloc(count: Int) -> Ptr<T>` — `count` elements of `T`. Static.
 - `Ptr<T>.null -> Ptr<T>` — a typed null. Static property.
-- `p.free() -> Void` — release it (added for symmetry with `alloc`; routes to `rt_raw_free`).
+- `p.free() -> Void` — release it (added for symmetry with `alloc`; routes to libc's `free`).
 - `p.load(at: Int) -> T` / `p.store(_ value: T, at: Int) -> Void` — element access; `T` is fixed by the
   receiver, so no annotation is needed (unlike `RawPtr`).
 - `p.advanced(by: Int) -> Ptr<T>` — element arithmetic (`by * stride` bytes).
@@ -122,8 +127,9 @@ LLVM directly rather than to same-named C calls:
   reinterpreted type (`RawPtr.load` as `T`). Typed loads carry `T`'s TBAA; raw loads are conservatively
   may-alias-anything.
 - **advanced** → a `getelementptr` (over `i8` for `RawPtr`, over `T` for `Ptr<T>`).
-- **alloc / free** → a runtime entry: initially `rt_raw_alloc` / `rt_raw_free` (aligned malloc-class in
-  `runtime.c`), later re-pointable at the self-hosted allocator itself. Both touch no managed heap.
+- **alloc / free** → libSystem directly: alloc is `__nomu_raw_alloc`, a gc-leaf helper each module emits
+  (`posix_memalign` with the alignment raised to a pointer's, zero-filled, null for no bytes, "out of
+  memory" and exit 1 on failure); free is `free`. Both touch no managed heap.
 - **asPtr / asRaw** → a no-op bitcast (both are one `addrspace(0)` word).
 
 `Ptr<T>` reuses the existing generic monomorphization path (M5): each instantiation is a bare

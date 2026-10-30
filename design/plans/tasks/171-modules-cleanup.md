@@ -198,6 +198,17 @@ therefore has no declaration for the callee.
   across the `--mono` values. The suite has none today: `module_generic_nested` keeps both generics in one
   module, and in `module_generic_fold` the consumer imports both.
 
+### 171.9 — Actor types across modules
+
+**A `package actor` cannot be used from another module** (found building 223.5.1). A library declares
+`package actor Pinger { var n: Int = 0; on ping() { … } }` and `package fun makePinger() -> Pinger`; a module
+importing it fails to compile at `<iface-type>:1:1: error: unknown type 'Pinger'`, so the interface does not
+carry the actor type. Handlers also take no visibility modifier (`package on ping()` is a parse error), so
+what an exported actor exposes is unspecified.
+- Fix: export actor types (fields' layout for the GC maps, the handler set and message layouts) through the
+  interface, and settle handler visibility (language surface: needs agreement).
+- Test: the `actor_two_modules` fixture with the actor sent to from the importing module.
+
 ## Dependencies & triggers
 
 - **Rides:** the erased witness/VWT machinery and the typed-root GC path (§100.4.3, present).

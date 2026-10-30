@@ -1,0 +1,29 @@
+// Static storage: `Runtime.staticStorage` reserves zeroed, aligned bytes in the data section, and its global
+// is a constant `RawPtr` holding their address. Writes through it persist across calls, and a global reading
+// it names the same block.
+let counter = Runtime.staticStorage(bytes: 16, align: 16)
+let alias = counter
+let other = Runtime.staticStorage(bytes: 8, align: 8)
+
+fun bump() {
+  let n: Int = counter.load(fromByteOffset: 0)
+  counter.store(n + 1, toByteOffset: 0)
+}
+
+fun main() {
+  let untouched: Int = counter.load(fromByteOffset: 8)
+  print(untouched)
+  print("\n")
+  bump()
+  bump()
+  bump()
+  let seen: Int = alias.load(fromByteOffset: 0)
+  print(seen)
+  print("\n")
+  print(counter.toInt() == alias.toInt())
+  print("\n")
+  print(counter.toInt() % 16 == 0)
+  print("\n")
+  print(counter.toInt() != other.toInt())
+  print("\n")
+}

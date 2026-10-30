@@ -1,0 +1,7 @@
+import pkg/lib
+
+fun main() {
+    let r = scaleIt(false, 4)
+    print(r)        // 40
+    print("\n")
+}

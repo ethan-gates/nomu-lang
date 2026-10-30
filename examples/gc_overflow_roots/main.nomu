@@ -1,0 +1,86 @@
+// More roots in one collection than the collector's old fixed root buffer held (8,192). Three fibers each
+// recurse 60 frames deep holding 48 Boxes per frame across the recursive call; at its bottom each fiber spawns
+// the next and parks at the join with every frame live, and the last allocates enough garbage to force
+// several collections. One walk then covers 8,640 live Boxes across three stacks (each about a third of a
+// 128 KB fiber stack). Every root must be found and fixed up, so each frame reads back exactly the values it
+// stored. Run with escape analysis off so the Boxes are heap objects.
+class Box {
+  var v: Int
+}
+
+fun churn(n: Int) -> Int {
+  var g = 0
+  var j = 0
+  while j < n {
+    let t = Box(v: j)
+    g = g + t.v % 3
+    j = j + 1
+  }
+  return g
+}
+
+fun deep(level: Int, d: Int) -> Int {
+  let a0 = Box(v: level * 100000 + d * 100 + 0)
+  let a1 = Box(v: level * 100000 + d * 100 + 1)
+  let a2 = Box(v: level * 100000 + d * 100 + 2)
+  let a3 = Box(v: level * 100000 + d * 100 + 3)
+  let a4 = Box(v: level * 100000 + d * 100 + 4)
+  let a5 = Box(v: level * 100000 + d * 100 + 5)
+  let a6 = Box(v: level * 100000 + d * 100 + 6)
+  let a7 = Box(v: level * 100000 + d * 100 + 7)
+  let a8 = Box(v: level * 100000 + d * 100 + 8)
+  let a9 = Box(v: level * 100000 + d * 100 + 9)
+  let a10 = Box(v: level * 100000 + d * 100 + 10)
+  let a11 = Box(v: level * 100000 + d * 100 + 11)
+  let a12 = Box(v: level * 100000 + d * 100 + 12)
+  let a13 = Box(v: level * 100000 + d * 100 + 13)
+  let a14 = Box(v: level * 100000 + d * 100 + 14)
+  let a15 = Box(v: level * 100000 + d * 100 + 15)
+  let a16 = Box(v: level * 100000 + d * 100 + 16)
+  let a17 = Box(v: level * 100000 + d * 100 + 17)
+  let a18 = Box(v: level * 100000 + d * 100 + 18)
+  let a19 = Box(v: level * 100000 + d * 100 + 19)
+  let a20 = Box(v: level * 100000 + d * 100 + 20)
+  let a21 = Box(v: level * 100000 + d * 100 + 21)
+  let a22 = Box(v: level * 100000 + d * 100 + 22)
+  let a23 = Box(v: level * 100000 + d * 100 + 23)
+  let a24 = Box(v: level * 100000 + d * 100 + 24)
+  let a25 = Box(v: level * 100000 + d * 100 + 25)
+  let a26 = Box(v: level * 100000 + d * 100 + 26)
+  let a27 = Box(v: level * 100000 + d * 100 + 27)
+  let a28 = Box(v: level * 100000 + d * 100 + 28)
+  let a29 = Box(v: level * 100000 + d * 100 + 29)
+  let a30 = Box(v: level * 100000 + d * 100 + 30)
+  let a31 = Box(v: level * 100000 + d * 100 + 31)
+  let a32 = Box(v: level * 100000 + d * 100 + 32)
+  let a33 = Box(v: level * 100000 + d * 100 + 33)
+  let a34 = Box(v: level * 100000 + d * 100 + 34)
+  let a35 = Box(v: level * 100000 + d * 100 + 35)
+  let a36 = Box(v: level * 100000 + d * 100 + 36)
+  let a37 = Box(v: level * 100000 + d * 100 + 37)
+  let a38 = Box(v: level * 100000 + d * 100 + 38)
+  let a39 = Box(v: level * 100000 + d * 100 + 39)
+  let a40 = Box(v: level * 100000 + d * 100 + 40)
+  let a41 = Box(v: level * 100000 + d * 100 + 41)
+  let a42 = Box(v: level * 100000 + d * 100 + 42)
+  let a43 = Box(v: level * 100000 + d * 100 + 43)
+  let a44 = Box(v: level * 100000 + d * 100 + 44)
+  let a45 = Box(v: level * 100000 + d * 100 + 45)
+  let a46 = Box(v: level * 100000 + d * 100 + 46)
+  let a47 = Box(v: level * 100000 + d * 100 + 47)
+  var r = 0
+  if d > 0 {
+    r = deep(level, d - 1)
+  } else if level > 0 {
+    spawn let x = deep(level - 1, 59)    // park at the join with this fiber's 60 frames live
+    r = x
+  } else {
+    r = churn(30000000)                  // 480 MB of garbage: several collections with all three stacks live
+  }
+  return (a0.v + a1.v + a2.v + a3.v + a4.v + a5.v + a6.v + a7.v + a8.v + a9.v + a10.v + a11.v + a12.v + a13.v + a14.v + a15.v + a16.v + a17.v + a18.v + a19.v + a20.v + a21.v + a22.v + a23.v + a24.v + a25.v + a26.v + a27.v + a28.v + a29.v + a30.v + a31.v + a32.v + a33.v + a34.v + a35.v + a36.v + a37.v + a38.v + a39.v + a40.v + a41.v + a42.v + a43.v + a44.v + a45.v + a46.v + a47.v + r) % 1000000
+}
+
+fun main() {
+  print(deep(2, 59))
+  print("\n")
+}

@@ -1,0 +1,51 @@
+// More remembered objects in one minor collection than the old fixed drain buffer held (1,048,576). 1.2M
+// Holders are built and promoted by a minor collection; then one young Box is stored into every Holder, so
+// the write barrier remembers all 1.2M. That loop allocates nothing, so no collection splits them: the next
+// minor drains all 1.2M at once. The young Box moves, and every Holder's slot must be updated to it, so the
+// final sum reads each Holder's item back. Run with escape analysis off so the objects are heap objects.
+class Box {
+  var v: Int
+}
+
+class Holder {
+  var item: Box
+}
+
+fun churn(n: Int) -> Int {
+  var g = 0
+  var j = 0
+  while j < n {
+    let t = Box(v: j)
+    g = g + t.v % 3
+    j = j + 1
+  }
+  return g
+}
+
+fun main() {
+  let n = 1200000
+  var hs: Array<Holder> = []
+  var i = 0
+  while i < n {
+    hs.append(Holder(item: Box(v: 0)))
+    i = i + 1
+  }
+  let g1 = churn(5000000)              // 80 MB of garbage over a 64 MB nursery: a minor promotes the Holders
+  let y = Box(v: 7)
+  i = 0
+  while i < n {
+    hs[i].item = y                     // a young Box into a mature Holder: remembered
+    i = i + 1
+  }
+  let g2 = churn(5000000)              // the next minor collection drains all 1.2M remembered Holders
+  var s = 0
+  i = 0
+  while i < n {
+    s = s + hs[i].item.v
+    i = i + 1
+  }
+  print(s)
+  print("\n")
+  print(g1 + g2)
+  print("\n")
+}

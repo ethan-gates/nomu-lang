@@ -92,16 +92,21 @@ extension LLVMGen {
         return fn
     }
 
-    // The one shared drain loop `void @nomu_actor_drain(ptr addrspace(1) mb)` the pool worker calls
-    // (runtime.c `rt_pool_worker_main`): pop a message, run its thunk, repeat until the mailbox is
+    // The one shared drain loop `void @nomu_actor_drain(ptr addrspace(1) mb)` the mailbox fibers call
+    // (`rtSchedMailboxFiberMain`): pop a message, run its thunk, repeat until the mailbox is
     // empty. `mb` and each `msg` are tracked GC roots across the thunk call — the whole reason this
-    // loop is codegen (not C): a moving GC may relocate them at a handler safepoint.
+    // loop is codegen (not C): a moving GC may relocate them at a handler safepoint. Every module that uses
+    // actors emits the same body, weak-ODR so the copies fold to one at link.
     func actorDrain() -> (LLVMValueRef, LLVMTypeRef) {
         if let f = actorDrainFn { return f }
-        let pop = runtimeFn("rt_mailbox_pop", ret: p1, params: [p1], varArg: false)
+        // The scheduler's mailbox pop (`nomuSchedMailboxPop(sched, mailbox)`), called with the managed mailbox
+        // and returning the managed message, so both stay tracked GC values across the call.
+        let popFn = runtimePreludeFn("nomuSchedMailboxPop", ret: i8ptr, params: [i8ptr, i8ptr])
+        let pop = (popFn.fn, fnType(p1, [i8ptr, p1]))
         let thunkTy = fnType(voidTy, [p1])
         let pre = msgPrefixType()
         let (fn, fnTy) = emitFunction("nomu_actor_drain", ret: voidTy, params: [p1])
+        LLVMSetLinkage(fn, LLVMWeakODRLinkage)
         actorDrainFn = (fn, fnTy)
         withStubBody(fn) {
             let mb = LLVMGetParam(fn, 0)!
@@ -110,7 +115,7 @@ extension LLVMGen {
             let exitBB = LLVMAppendBasicBlockInContext(ctx, fn, "drain.exit")!
             LLVMBuildBr(b, loopBB)
             LLVMPositionBuilderAtEnd(b, loopBB)
-            let msg = buildCall(pop.0, pop.1, [mb])!
+            let msg = buildCall(pop.0, pop.1, [loadRuntimeGlobal("rtSched", i8ptr), mb])!
             let isNull = LLVMBuildICmp(b, LLVMIntEQ, msg, LLVMConstNull(p1), "empty?")
             LLVMBuildCondBr(b, isNull, exitBB, bodyBB)
             LLVMPositionBuilderAtEnd(b, bodyBB)
@@ -126,9 +131,20 @@ extension LLVMGen {
         return actorDrainFn!
     }
 
+    // Give the scheduler the drain loop: store its address in the scheduler's drain slot (`rtSched`+120,
+    // which the mailbox fibers call). Emitted at each actor's creation, so only a program that creates an
+    // actor references the drain and the scheduler's actor code; every creation stores the same address.
+    // The first send of any message follows a creation and goes through the scheduler lock, which orders
+    // this store before a mailbox fiber reads the slot.
+    func registerActorDrain() {
+        let drain = actorDrain()
+        let slot = gepByte(loadRuntimeGlobal("rtSched", i8ptr), LLVMConstInt(i64, 120, 0))
+        LLVMBuildStore(b, drain.0, slot)
+    }
+
     // Build + enqueue a handler message from the lowered receiver and argument values (M6 · 6.4): allocate
-    // the message, stamp header/thunk/self/args, and hand it to `rt_actor_send`, which enqueues it and
-    // returns. Fire-and-forget — the only actor operation (§9) — so it yields no value. `argVals` is called
+    // the message, stamp header/thunk/self/args, and hand it to the scheduler's `nomuSchedActorSend`, which
+    // enqueues it and returns. Fire-and-forget — the only actor operation (§9) — so it yields no value. `argVals` is called
     // after the allocation: a shaped argument is read from its home then, so a collection at the allocation
     // that moves its buffer is observed.
     func emitActorSend(_ actorName: String, _ handler: String, _ recvValue: LLVMValueRef,
@@ -152,8 +168,10 @@ extension LLVMGen {
             storeField(msg, structGEP(mt, msg, msgArgIndex(i)), v)
         }
         let mailbox = LLVMBuildLoad2(b, p1, structGEP(at, recvValue, actorMailboxIndex(actorName)), "mailbox")!
-        let send = runtimeFn("rt_actor_send", ret: voidTy, params: [p1, p1], varArg: false)
-        _ = buildCall(send.0, send.1, [mailbox, msg])
+        // The scheduler's send (`nomuSchedActorSend(sched, mailbox, msg)`), with the managed mailbox and message.
+        let sendFn = runtimePreludeFn("nomuSchedActorSend", ret: voidTy, params: [i8ptr, i8ptr, i8ptr])
+        let sched = loadRuntimeGlobal("rtSched", i8ptr)
+        _ = buildCall(sendFn.fn, fnType(voidTy, [i8ptr, p1, p1]), [sched, mailbox, msg])
         return LLVMConstNull(p1)   // fire-and-forget: no value
     }
 }

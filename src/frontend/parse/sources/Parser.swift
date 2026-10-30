@@ -102,6 +102,7 @@ public struct Parser {
             if vis != nil { error("visibility modifier is not allowed on an extension") }
             return .extensionDecl(parseExtensionDecl())
         case .kwFunc:   return .funcDecl(parseFuncDecl(vis ?? .internal))
+        case .kwLet, .kwVar: return .globalDecl(parseGlobalDecl(vis ?? .internal))
         default:
             if isContextual("import") || (isContextual("public") && peekIsContextual("import"))
                 || (isContextual("test") && peekIsContextual("import")) {
@@ -130,7 +131,7 @@ public struct Parser {
 
     // Tokens that begin a top-level declaration — the resync set for declaration recovery.
     private static let declStart: Set<TokenKind> =
-        [.kwStruct, .kwEnum, .kwClass, .kwActor, .kwInterface, .kwExtension, .kwFunc]
+        [.kwStruct, .kwEnum, .kwClass, .kwActor, .kwInterface, .kwExtension, .kwFunc, .kwLet, .kwVar]
 
     // Tokens that introduce a member inside any type body (plus the closing brace) — the
     // resync set when a type-body loop meets a token that starts no member.
@@ -695,6 +696,22 @@ public struct Parser {
         expect(.eq)
         let value = parseExpr()
         return .spawnLet(name: name, type: type, value: value, span: spanFrom(start))
+    }
+
+    // A global: `[private|internal] let name [: Type] = expr` at the top level. A top-level `var` parses
+    // the same way so sema can report it.
+    private mutating func parseGlobalDecl(_ vis: Visibility) -> GlobalDecl {
+        let start = currentSpan
+        let isMutable = check(.kwVar)
+        advance()  // consume let/var
+        let name = expectIdent()
+        var type: TypeRef? = nil
+        if eat(.colon) {
+            type = parseTypeRef()
+        }
+        expect(.eq)
+        let value = parseExpr()
+        return GlobalDecl(name: name, type: type, value: value, isMutable: isMutable, visibility: vis, span: spanFrom(start))
     }
 
     private mutating func parseBinding(isMutable: Bool) -> Stmt {

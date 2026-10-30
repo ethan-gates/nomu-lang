@@ -28,7 +28,7 @@ enum EgressArrays {
         return handle
     }
 
-    // The bounds-check trap sequence (`index UGE length` → `rt_bounds_trap` → unreachable); on return
+    // The bounds-check trap sequence (`index UGE length` → the runtime's `rtBoundsTrap` → unreachable); on return
     // the builder sits in the in-bounds continuation.
     static func emitBoundscheck(_ g: SSAIRToLLVM, _ idx: LLVMValueRef, _ len: LLVMValueRef) {
         guard let fn = g.e.currentFn else { return }
@@ -37,8 +37,8 @@ enum EgressArrays {
         let okBB = LLVMAppendBasicBlockInContext(g.ctx, fn, "arr.ok")!
         LLVMBuildCondBr(g.b, oob, trapBB, okBB)
         LLVMPositionBuilderAtEnd(g.b, trapBB)
-        let (trap, tty) = g.e.runtimeFn("rt_bounds_trap", ret: g.e.voidTy, params: [g.e.i64, g.e.i64], varArg: false)
-        _ = g.e.buildCall(trap, tty, [idx, len])
+        let trap = g.e.runtimePreludeFn("rtBoundsTrap", ret: g.e.voidTy, params: [g.e.i64, g.e.i64])
+        g.e.markCallGCLeaf(g.e.buildCall(trap.fn, trap.ty, [idx, len])!)
         LLVMBuildUnreachable(g.b)
         LLVMPositionBuilderAtEnd(g.b, okBB)
     }

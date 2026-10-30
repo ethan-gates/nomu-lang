@@ -20,7 +20,7 @@ fun main() {
     i = i + 1
   }
   // The self-hosted space is created lazily on the first managed allocation, so read it after the loop.
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
   let nu = rtNurseryBlocksUsed(space)
   let used = rtImmixBlocksUsed(space)
   let reserve = rtNurseryReserve(space)

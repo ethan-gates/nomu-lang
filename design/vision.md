@@ -55,7 +55,9 @@ Feels like Go: cheap to reach for, no ceremony.
 
 ## Deployment
 
-Go-class: a single small static binary (under 9MB), no install requirement (no JVM/Python/Erlang VM), copy-and-run on Linux. MMTk links statically and fits.
+Go-class: a single small static binary (under 9MB), no install requirement (no JVM/Python/Erlang VM), copy-and-run on Linux.
+
+**Runtime size ceiling: under 999 KB.** The runtime (collector and scheduler, both always linked) fits under 999 KB in the binary, without relying on dead-stripping them out: they are essential, so the ceiling holds with them present. Monomorphization and dead-code elimination keep only the runtime paths a program uses. A design restriction on every runtime change, carried from [128](plans/tasks/128-self-hosting-runtime.md)'s goals.
 
 ## Library tiers: language > runtime > stdlib
 

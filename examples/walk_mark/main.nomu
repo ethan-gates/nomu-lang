@@ -12,7 +12,7 @@ fun run() -> Int {
   xs.append(Box(v: 20))
   let rootBuf = RawPtr.alloc(bytes: 512, align: 8)
   let nroots = rtCollectRoots(rootBuf, 64)
-  let tcount = RawPtr.gcTypeCount()
+  let tcount = Runtime.gcTypeCount()
   let counts = RawPtr.alloc(bytes: tcount * 8, align: 8)
   let fp = RawPtr.alloc(bytes: 8, align: 8)
   var i = 0

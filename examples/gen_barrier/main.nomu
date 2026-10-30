@@ -25,8 +25,8 @@ class Holder {
 fun main() {
   let h = Holder(item: Box(v: 1), tag: 7)   // first managed allocation: creates the space + arms the barrier
   // The space + mod-buffer exist only after the first managed allocation, so read them here.
-  let space = RawPtr.gcSelfhostSpace()
-  let mb = RawPtr.gcSelfModBuf()
+  let space = rtSpace
+  let mb = rtSelfModBuf()
   let c0 = rtModBufCount(mb)                 // 0 — nothing remembered yet (h is young; construction did not log)
 
   rtSetUnlogged(space, addrOf(h))            // simulate promotion: h is now mature (unlogged)

@@ -27,7 +27,7 @@ fun main() {
     i = i + 1
   }
 
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
 
   // first collection: no defrag history, so it runs non-moving and only seeds the fragmentation histogram
   let r1 = rtImmixCollectDefrag(space, addrOf(keep))
@@ -35,7 +35,7 @@ fun main() {
   print("\n")
 
   // fingerprint of the (still-sparse) live set before the compacting collection
-  let tc = RawPtr.gcTypeCount()
+  let tc = Runtime.gcTypeCount()
   let counts = RawPtr.alloc(bytes: tc * 8, align: 8)
   let fp = RawPtr.alloc(bytes: 8, align: 8)
   let before = rtMarkVerify(r1, counts, fp)

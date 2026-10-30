@@ -39,7 +39,7 @@ public struct Typechecker {
             case .classDecl(let c):  typeKinds[c.name] = .class_
             case .actorDecl(let a):  typeKinds[a.name] = .actor_
             case .interfaceDecl(let i): typeKinds[i.name] = .interface_
-            case .funcDecl:          break
+            case .funcDecl, .globalDecl: break
             case .extensionDecl:     break   // merged into its target before this pass (M4.12)
             }
         }
@@ -107,6 +107,8 @@ public struct Typechecker {
                 for m in i.methods { if let body = m.defaultBody { checkBlock(body, lets: []) } }
             case .extensionDecl:
                 break   // merged into its target before this pass (M4.12)
+            case .globalDecl:
+                break   // a global is a `let`; sema reports a top-level `var` and any assignment to a global
             }
         }
     }

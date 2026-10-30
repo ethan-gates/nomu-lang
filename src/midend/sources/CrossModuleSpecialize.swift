@@ -74,6 +74,7 @@ private func declName(_ d: NOIRDecl) -> String {
     case .enumDecl(let e):   return e.name
     case .classDecl(let c):  return c.name
     case .actorDecl(let a):  return a.name
+    case .globalDecl(let g): return g.name
     }
 }
 

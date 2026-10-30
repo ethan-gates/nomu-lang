@@ -55,7 +55,6 @@ private struct RuntimeSubsetPass {
         if Builtins.cLeaf.contains(name) { return true }                        // pure C leaves
         switch name {
         case "__int_double_double", "__double_int_int", "__int_uint8_uint8", "__uint8_int_int": return true
-        case "__schedHandle": return true                                       // gc-leaf read of rt_nomu_sched (scheduler substrate)
         default: return designated.contains(name)                               // another designated function
         }
     }

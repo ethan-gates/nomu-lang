@@ -44,7 +44,7 @@ fun mutexLock(m: RawPtr) {
       c = m.atomicExchange(2, atByteOffset: 0)
     }
     while c != 0 {
-      m.futexWait(expected: 2, timeoutMicros: 0)
+      Runtime.futexWait(at: m, expected: 2, timeoutMicros: 0)
       c = m.atomicExchange(2, atByteOffset: 0)
     }
   }
@@ -53,7 +53,7 @@ fun mutexLock(m: RawPtr) {
 fun mutexUnlock(m: RawPtr) {
   let prev: Int = m.atomicExchange(0, atByteOffset: 0)
   if prev == 2 {
-    m.futexWake(all: false)
+    Runtime.futexWake(at: m, all: false)
   }
 }
 
@@ -86,7 +86,7 @@ fun dequeue(sched: RawPtr) -> RawPtr {
 fun wakeCarrier(sched: RawPtr, all: Bool) {
   let gw = sched.advanced(by: 24)
   gw.atomicFetchAdd(1, atByteOffset: 0)
-  gw.futexWake(all: all)
+  Runtime.futexWake(at: gw, all: all)
 }
 
 // Caller holds the scheduler lock. Raise stop + wake idle carriers so they exit for the join.
@@ -134,7 +134,7 @@ fun mailboxFiberNew(sched: RawPtr) -> RawPtr {
   f.store(stack, toByteOffset: 208)
   f.store(RawPtr.null, toByteOffset: 232)
   f.store(RawPtr.null, toByteOffset: 240)
-  f.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(mailboxFiberMain), arg: sched)
+  Runtime.fiberInit(context: f, stackTop: stackTop, entry: Runtime.ofFunc(mailboxFiberMain), arg: sched)
   return f
 }
 
@@ -222,7 +222,7 @@ fun mailboxDrain(sched: RawPtr, mb: RawPtr) {
       go = false
     } else {
       let thunk: RawPtr = msg.load(fromByteOffset: 8)
-      thunk.callEntry(msg)
+      Runtime.callEntry(thunk, arg: msg)
     }
   }
 }
@@ -239,13 +239,13 @@ fun mailboxFiberMain(sched: RawPtr) -> RawPtr {
     } else {
       let mb = schedMbPop(sched)
       if mb.isNull {
-        let self = RawPtr.tlsGet()
+        let self = Runtime.carrierLocal()
         let oldFree: RawPtr = sched.load(fromByteOffset: 80)
         self.store(oldFree, toByteOffset: 240)          // push self onto the free-list
         sched.store(self, toByteOffset: 80)
         self.store(2, toByteOffset: 168)
         let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-        self.ctxSwitchTo(carrierCtx)                    // hand lock to carrier; resume holding it
+        Runtime.ctxSwitch(from: self, to: carrierCtx)                    // hand lock to carrier; resume holding it
       } else {
         mutexUnlock(sched.advanced(by: 16))
         mailboxDrain(sched, mb)                         // drains mb; clears scheduled when empty
@@ -253,9 +253,9 @@ fun mailboxFiberMain(sched: RawPtr) -> RawPtr {
       }
     }
   }
-  let self = RawPtr.tlsGet()
+  let self = Runtime.carrierLocal()
   let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  self.ctxSwitchTo(carrierCtx)                          // stop: yield to the carrier (holding the lock)
+  Runtime.ctxSwitch(from: self, to: carrierCtx)                          // stop: yield to the carrier (holding the lock)
   return sched
 }
 
@@ -272,13 +272,13 @@ fun schedLoop(sched: RawPtr, myCtx: RawPtr) {
         let gw = sched.advanced(by: 24)
         let gen: Int = gw.atomicLoad(fromByteOffset: 0)
         mutexUnlock(sched.advanced(by: 16))
-        gw.futexWait(expected: gen, timeoutMicros: 1000000)
+        Runtime.futexWait(at: gw, expected: gen, timeoutMicros: 1000000)
         mutexLock(sched.advanced(by: 16))
       } else {
         fib.store(myCtx, toByteOffset: 232)
         fib.store(1, toByteOffset: 168)
-        RawPtr.tlsSet(fib)
-        myCtx.ctxSwitchTo(fib)
+        Runtime.setCarrierLocal(fib)
+        Runtime.ctxSwitch(from: myCtx, to: fib)
       }
     }
   }
@@ -351,7 +351,7 @@ fun main() {
     mboxes.store(mb, toByteOffset: 8 * i)
     i = i + 1
   }
-  let thunk = RawPtr.ofFunc(bumpHandler)
+  let thunk = Runtime.ofFunc(bumpHandler)
 
   // Start the carriers.
   let handles = RawPtr.alloc(bytes: 8 * carriers, align: 8)
@@ -362,7 +362,7 @@ fun main() {
     carg.store(sched, toByteOffset: 0)
     carg.store(ctx, toByteOffset: 8)
     let h = handles.advanced(by: 8 * c)
-    h.threadCreate(entry: RawPtr.ofFunc(carrierMain), arg: carg)
+    Runtime.threadCreate(handle: h, entry: Runtime.ofFunc(carrierMain), arg: carg)
     c = c + 1
   }
 
@@ -396,7 +396,7 @@ fun main() {
   var k = 0
   while k < carriers {
     let h = handles.advanced(by: 8 * k)
-    h.threadJoin()
+    Runtime.threadJoin(handle: h)
     k = k + 1
   }
 

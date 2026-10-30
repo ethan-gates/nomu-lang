@@ -52,7 +52,8 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
                        requireMain: Bool = true, externalFuncNames: Set<String> = [],
                        externalGenericSigs: [String: ExternalGenericSig] = [:],
                        weakOriginFiles: Set<String> = [], emitTypeMaps: Bool = true,
-                       homeModule: [String] = [], facts: FactStore = FactStore(),
+                       homeModule: [String] = [], dependencyModules: [[String]] = [], isRuntimePackage: Bool = false,
+                       facts: FactStore = FactStore(),
                        optimizer: OptimizerSettings = OptimizerSettings()) -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
@@ -102,6 +103,9 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
     egress.e.weakOriginFiles = weakOriginFiles
     egress.e.emitsTypeMaps = emitTypeMaps
     egress.e.homeModule = homeModule
+    egress.e.dependencyModules = dependencyModules
+    egress.e.isRuntimePackage = isRuntimePackage
+    egress.e.emitsProcessEntry = requireMain
     egress.e.inlineAlloc = optimizer.inlineAlloc
     cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: noirModule) }
     if let err = egress.error { return err }

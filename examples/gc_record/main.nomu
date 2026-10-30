@@ -12,7 +12,7 @@ fun main() {
   let b = Box(v: 1)               // the first allocation creates the space
   print(b.v)
   print("\n")
-  let level = RawPtr.gcRecordLevel()
+  let level = Runtime.gcRecordLevel()
   print(level)
   print("\n")
   let spaceRec = rtRecSpace()
@@ -25,7 +25,7 @@ fun main() {
   print("\n")
 
   let rec = rtRecNew(0)
-  rtRecCycleBegin(rec, 7, 0, RawPtr.ticks())
+  rtRecCycleBegin(rec, 7, 0, Runtime.ticks())
   let t1 = rtRecOpen(rec, 1)
   let t2 = rtRecOpen(rec, 3)
   print(rtRecOpenPhase(rec))      // 3: the innermost open phase

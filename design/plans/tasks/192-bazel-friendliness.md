@@ -19,9 +19,9 @@ only produce data other actions read.
 
 **This task waits until the runtime archive is gone.** Without it, Bazel would also need an action that
 builds the archive from C and assembly outside its own toolchain. The archive goes when the C floor is
-retired ([128](128-self-hosting-runtime.md) 128.5) and the asm floor (`rtasm_arm64.s`) comes out of the
+retired ([223](223-retire-the-c-floor.md)) and the asm floor (`rtasm_arm64.s`) comes out of the
 runtime module's own object, so every runtime byte is produced by a `nomu compile`. 192 therefore sits after
-LXR, with 128.5.
+LXR, with 223.
 
 **Configuration is open, and its design waits until this task starts.** Job files carry resolved settings,
 and resolving `cfg.yaml` happens in `build` ([198](198-build-configuration.md)). Under Bazel something else
@@ -76,7 +76,7 @@ must produce each job's settings. The answer may reshape the configuration syste
 
 ## Dependencies & triggers
 
-- Follows 190 (jobs, D4 cache). Waits on [128](128-self-hosting-runtime.md) 128.5 and the asm floor moving
+- Follows 190 (jobs, D4 cache). Waits on [223](223-retire-the-c-floor.md) and the asm floor moving
   into the runtime module's object (Direction). Interacts with [172](172-incremental-build-cache.md), whose
   content keys overlap Bazel's action cache.
 

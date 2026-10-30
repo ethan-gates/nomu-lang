@@ -56,7 +56,7 @@ fun rtObjTypeId(obj: RawPtr) -> Int {
 // start is derived, so a header shift lands here, not in each scan phase; the buffer's byte size is then
 // `rtBufElemStart(tid) + cap * stride`.
 fun rtBufElemStart(tid: Int) -> Int {
-  return 16 + RawPtr.gcTypeHeaderSize(tid)
+  return 16 + rtTypeHeaderSize(tid)
 }
 
 // The address-independent content hash of one object: fold its type-id and its scalar (non-pointer) field
@@ -68,16 +68,16 @@ fun rtObjHash(obj: RawPtr, tid: Int) -> Int {
   let prime = 1099511628211
   var h = tid + 1
   h = h * prime
-  let kind = RawPtr.gcTypeKind(tid)
-  let nptr = RawPtr.gcLiveCount(tid, obj)
+  let kind = rtTypeKind(tid)
+  let nptr = rtLiveCount(tid, obj)
   if kind == 0 {
-    let size = RawPtr.gcTypeSize(tid)
+    let size = rtTypeSize(tid)
     var w = 8
     while w < size {
       var managed = false
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        let off = rtLiveOffsetAt(tid, obj, i)
         if off == w {
           managed = true
         }
@@ -94,23 +94,23 @@ fun rtObjHash(obj: RawPtr, tid: Int) -> Int {
     let ecap: Int = obj.load(fromByteOffset: 8)      // array buffer: { header, cap, elems… }
     h = h * prime
     h = h + ecap
-    let stride = RawPtr.gcTypeStride(tid)
+    let stride = rtTypeStride(tid)
     let elemStart = rtBufElemStart(tid)
-    let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
+    let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
     var e = 0
     while e < ecap {
       let elemBase = elemStart + e * stride
       let elemPtr = obj.advanced(by: elemBase)
       var en = nptr
       if elemShaped {
-        en = RawPtr.gcLiveCount(tid, elemPtr)
+        en = rtLiveCount(tid, elemPtr)
       }
       var w = 0
       while w < stride {
         var managed = false
         var i = 0
         while i < en {
-          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
+          let off = rtLiveOffsetAt(tid, elemPtr, i)
           if off == w {
             managed = true
           }
@@ -144,7 +144,7 @@ fun rtTryMark(obj: RawPtr, counts: RawPtr, fp: RawPtr) -> Bool {
   // `counts` is a dense per-type histogram sized by gcTypeCount(); a type-id is a descriptor byte
   // offset (task 100.4.7), so its ordinal is the offset divided by the record size (task 180: read from
   // the runtime, one source of truth, so growing the record never desyncs this math).
-  let slot = tid / RawPtr.gcDescSize() * 8
+  let slot = tid / rtDescSize * 8
   let c: Int = counts.load(fromByteOffset: slot)
   counts.store(c + 1, toByteOffset: slot)
   let oh = rtObjHash(obj, tid)
@@ -156,9 +156,9 @@ fun rtTryMark(obj: RawPtr, counts: RawPtr, fp: RawPtr) -> Bool {
 // Trace from `root`, marking the transitive live set and tallying per-type-id live counts into `counts`
 // (a caller-sized, zeroed Int array indexed by type-id). Returns the total number of live objects.
 fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
-  let cap = 1048576
-  let bytes = cap * 8
-  let work = RawPtr.alloc(bytes: bytes, align: 8)
+  var wcap = 4096                   // grows on demand (rtStackGrow)
+  let bytes = wcap * 8
+  var work = RawPtr.alloc(bytes: bytes, align: 8)
   var top = 0
   let rootNull = root.eq(RawPtr.null)
   if !rootNull {
@@ -172,17 +172,21 @@ fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
     let slot = top * 8
     let obj: RawPtr = work.load(fromByteOffset: slot)
     let tid = rtObjTypeId(obj)
-    let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcLiveCount(tid, obj)
+    let kind = rtTypeKind(tid)
+    let nptr = rtLiveCount(tid, obj)
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        let off = rtLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         let childNull = child.eq(RawPtr.null)
         if !childNull {
           if rtTryMark(child, counts, fp) {
             let dst = top * 8
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(child, toByteOffset: dst)
             top = top + 1
           }
@@ -191,15 +195,19 @@ fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
       }
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)       // array buffer: { header, cap, elems… }
-      let stride = RawPtr.gcTypeStride(tid)
+      let stride = rtTypeStride(tid)
       let elemStart = rtBufElemStart(tid)
       var hk = 0
-      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180), scanned once
+      let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180), scanned once
       while hk < nhdr {
-        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hat = 16 + rtHeaderOffsetAt(tid, hk)
         let hchild: RawPtr = obj.load(fromByteOffset: hat)
         if !hchild.eq(RawPtr.null) {
           if rtTryMark(hchild, counts, fp) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(hchild, toByteOffset: top * 8)
             top = top + 1
           }
@@ -207,23 +215,27 @@ fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
         hk = hk + 1
       }
       var e = 0
-      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
+      let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap {
         let elemBase = elemStart + e * stride
         let elemPtr = obj.advanced(by: elemBase)
         var en = nptr
         if elemShaped {
-          en = RawPtr.gcLiveCount(tid, elemPtr)
+          en = rtLiveCount(tid, elemPtr)
         }
         var i = 0
         while i < en {
-          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
+          let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
           if !childNull {
             if rtTryMark(child, counts, fp) {
               let dst = top * 8
+              if top == wcap {
+                work = rtStackGrow(work, top)
+                wcap = wcap + wcap
+              }
               work.store(child, toByteOffset: dst)
               top = top + 1
             }
@@ -235,7 +247,7 @@ fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
     }
   }
   work.free()
-  let tcount = RawPtr.gcTypeCount()
+  let tcount = Runtime.gcTypeCount()
   var total = 0
   var t = 0
   while t < tcount {
@@ -248,7 +260,7 @@ fun rtMarkVerify(root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
 
 // ---- Stack-map parsing (task 150 · rung 2, the pcsp root walk) ----
 // Read the `__llvm_stackmaps` (v3) records — reached libc-free via the linker section-bracket symbols
-// (RawPtr.gcStackmapBase / gcStackmapSize) — for a statepoint's SP/FP-relative root slots; the GC frame index
+// (Runtime.gcStackmapBase / gcStackmapSize) — for a statepoint's SP/FP-relative root slots; the GC frame index
 // below maps a return address to its record and gives the function's frame size. Format:
 // llvm/Object/StackMapParser.h; the C walker reads the same records. Little-endian scalar reads: load 8 bytes
 // and take the low 16/32 bits by modulo (2^16 = 65536, 2^32 = 4294967296 — no grouping parens yet, task 114).
@@ -285,8 +297,8 @@ fun rtAlign8(x: Int) -> Int {
 //   +0 u64 id, +8 u32 instr-offset, +14 u16 NumLocations, +16 locations (12 each), align8,
 //   then u16 NumLiveOuts, live-outs (4 each), align8.
 fun rtStackmapEnd() -> Int {
-  let base = RawPtr.gcStackmapBase()
-  let size = RawPtr.gcStackmapSize()
+  let base = Runtime.gcStackmapBase()
+  let size = Runtime.gcStackmapSize()
   var cur = 0
   while cur < size {
     let nfuncs = rtU32(base, cur + 4)
@@ -330,7 +342,7 @@ fun rtI32(base: RawPtr, off: Int) -> Int {
 
 // The index's start, or null when the binary has none (the C runtime aborts on a missing index).
 fun rtFrameIndex() -> RawPtr {
-  let raw = RawPtr.gcFrameIndexBase()
+  let raw = Runtime.gcFrameIndexBase()
   let mis = raw.toInt() - raw.toInt() / 8 * 8
   var pad = 0
   if mis != 0 {
@@ -354,7 +366,7 @@ fun rtFrameLookup(pc: Int) -> Int {
   if idx.isNull {
     return -1
   }
-  let sm = RawPtr.gcStackmapBase()
+  let sm = Runtime.gcStackmapBase()
   let count: Int = idx.load(fromByteOffset: 8)
   let key = pc - sm.toInt()
   var lo = 0
@@ -401,7 +413,7 @@ fun rtFrameShapes(entry: Int) -> RawPtr {
   let count: Int = idx.load(fromByteOffset: 8)
   let blob = rtU32(idx, 16 + entry * 24 + 20)
   let delta: Int = idx.load(fromByteOffset: 16 + count * 24 + 8 + blob * 8)
-  return RawPtr.gcStackmapBase().advanced(by: delta)
+  return Runtime.gcStackmapBase().advanced(by: delta)
 }
 
 // ---- The pcsp stack walk (task 150 · rung 2) — recover the live roots from a stack ----
@@ -410,7 +422,8 @@ fun rtFrameShapes(entry: Int) -> RawPtr {
 // per-function StackSize (the pcsp route, §9). arm64/Mach-O layout — a frame's { saved FP, saved LR } pair
 // sits at CFA-16, so with CFA = SP + StackSize the caller's return address is at CFA-8 and the frame pointer
 // (for FP-relative slots) is CFA-16.
-// Recover the live roots from the current stack, from index `n0`, into `outBuf` (up to `cap`). Anchor on
+// Recover the live roots from the current stack into `outBuf`, storing up to `cap` and returning the total,
+// which exceeds `cap` when the buffer was too small (the walk fixtures check it). Anchor on
 // rtCollectRoots's caller frame: its SP is this frame's CFA (FP + 16), its PC is our return address — then
 // walk outward one frame at a time via the pcsp route (§9), terminating at the first return address with no
 // stackmap record (the Nomu→C boundary). Subset code (no managed heap).
@@ -421,11 +434,11 @@ fun rtFrameShapes(entry: Int) -> RawPtr {
 // at the call statepoint (where the walk reads them). Moving the loop behind an ordinary call drops that
 // effect and the caller stops spilling its roots — they vanish from the statepoint (task 150 rung 2).
 fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
-  let base = RawPtr.gcStackmapBase()
+  let base = Runtime.gcStackmapBase()
   var n = 0
-  let fp0 = RawPtr.gcFrameAddr()
+  let fp0 = Runtime.gcFrameAddr()
   var sp = fp0.advanced(by: 16)
-  var pc = RawPtr.gcReturnAddr()
+  var pc = Runtime.gcReturnAddr()
   var walking = true
   while walking {
     var found = false
@@ -477,17 +490,17 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
           }
           let valbase = vbBase.advanced(by: dOff)
           let descId: Int = shapes.load(fromByteOffset: 8 + ordinal * 8)
-          let cnt = RawPtr.gcLiveCount(descId, valbase)
+          let cnt = rtLiveCount(descId, valbase)
           var sk = 0
           while sk < cnt {
-            let soff = RawPtr.gcLiveOffsetAt(descId, valbase, sk)
+            let soff = rtLiveOffsetAt(descId, valbase, sk)
             let wordPtr = valbase.advanced(by: soff)
             let sroot: RawPtr = wordPtr.load(fromByteOffset: 0)
             if sroot.isNull == false {
               if n < cap {
                 outBuf.store(sroot, toByteOffset: n * 8)
-                n = n + 1
               }
+              n = n + 1
             }
             sk = sk + 1
           }
@@ -512,8 +525,8 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
           if !rootNull {
             if n < cap {
               outBuf.store(root, toByteOffset: n * 8)
-              n = n + 1
             }
+            n = n + 1
           }
         }
         li = li + 1
@@ -534,10 +547,10 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
 // ---- Stopped-fiber root walk (task 128.3) ----
 // Scan a stopped fiber's stack for GC roots from the user-frame (sp, pc) anchor the scheduler recorded when it
 // parked or stopped at a safepoint: the pcsp walk (`rtWalkFrom`) reads root slots and steps between Nomu
-// frames self-hosted.
+// frames in Nomu.
 
 // The pcsp walk from an explicit (sp, pc) anchor over a *saved* context — a parked fiber now, an STW-stopped
-// carrier later — appending live root object addresses into `outBuf` (up to `cap`, from index `n0`), one
+// carrier later — appending live roots into the growable buffer `roots` (rtRootsNew) from index `n0`, one
 // Nomu frame at a time, terminating at the first return address with no record (the Nomu→C boundary).
 //
 // This is a deliberate copy of rtCollectRoots's loop, not a call from it: rtCollectRoots reads root slots
@@ -545,8 +558,8 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
 // function's own body to make its live caller spill its roots at the call statepoint (selfhosted-gc.md §9).
 // A saved-context anchor carries no such dependency — its frame's roots were already spilled at the fiber's
 // park/safepoint — so factoring the loop here is sound; only rtCollectRoots must keep it inline.
-fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitSlots: Int) -> Int {
-  let base = RawPtr.gcStackmapBase()
+fun rtWalkFrom(spIn: RawPtr, pcIn: Int, roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
+  let base = Runtime.gcStackmapBase()
   var n = n0
   var sp = spIn
   var pc = pcIn
@@ -602,21 +615,19 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitS
           }
           let valbase = vbBase.advanced(by: dOff)
           let descId: Int = shapes.load(fromByteOffset: 8 + ordinal * 8)
-          let cnt = RawPtr.gcLiveCount(descId, valbase)
+          let cnt = rtLiveCount(descId, valbase)
           var sk = 0
           while sk < cnt {
-            let soff = RawPtr.gcLiveOffsetAt(descId, valbase, sk)
+            let soff = rtLiveOffsetAt(descId, valbase, sk)
             let wordPtr = valbase.advanced(by: soff)
             let sroot: RawPtr = wordPtr.load(fromByteOffset: 0)
             if sroot.isNull == false {
-              if n < cap {
-                if emitSlots != 0 {
-                  outBuf.store(wordPtr, toByteOffset: n * 8)
-                } else {
-                  outBuf.store(sroot, toByteOffset: n * 8)
-                }
-                n = n + 1
+              if emitSlots != 0 {
+                rtQueuePush(roots, n, wordPtr)
+              } else {
+                rtQueuePush(roots, n, sroot)
               }
+              n = n + 1
             }
             sk = sk + 1
           }
@@ -639,16 +650,14 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitS
           let root: RawPtr = slotPtr.load(fromByteOffset: 0)
           let rootNull = root.eq(RawPtr.null)
           if !rootNull {
-            if n < cap {
-              // emitSlots != 0: store the slot ADDRESS (a moving collection rewrites it in place with
-              // the forwarded pointer); else store the root VALUE (for counting / non-moving scans).
-              if emitSlots != 0 {
-                outBuf.store(slotPtr, toByteOffset: n * 8)
-              } else {
-                outBuf.store(root, toByteOffset: n * 8)
-              }
-              n = n + 1
+            // emitSlots != 0: store the slot ADDRESS (a moving collection rewrites it in place with
+            // the forwarded pointer); else store the root VALUE (for counting / non-moving scans).
+            if emitSlots != 0 {
+              rtQueuePush(roots, n, slotPtr)
+            } else {
+              rtQueuePush(roots, n, root)
             }
+            n = n + 1
           }
         }
         li = li + 1
@@ -672,7 +681,7 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitS
 // collection yet (those are 150.3.2+). Geometry matches MMTk Immix (selfhosted-gc.md §10.1): a 32768-byte
 // block, a 256-byte line, 128 lines per block. Metadata lives in side tables keyed by block/line index
 // (§10.2, Decided), one byte per entry, over the reserved heap range. Entry value 0 is the initial state
-// (block FREE / line unmarked), and rt_raw_alloc zero-fills, so the fresh tables start correct.
+// (block FREE / line unmarked), and `RawPtr.alloc` zero-fills, so the fresh tables start correct.
 //
 // Space descriptor (160 bytes):
 //   { heapBase: RawPtr @0, numBlocks: Int @8, lineTable: RawPtr @16, blockTable: RawPtr @24,
@@ -704,10 +713,10 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitS
 // granularity so the inline fast path — `__nomu_write_barrier`, LLVMGenRuntime.swift — reads it verbatim).
 // A bit is 1 when the object is *unlogged* (mature, needs remembering on its first mutation) and 0 when
 // logged (young objects, and mature objects already remembered this cycle). The table starts all-0
-// (rt_raw_alloc zero-fills): young objects never trip the barrier. Promotion sets the unlogged bit (150.4.3);
-// 150.4.2 sets it only via the rtSetUnlogged test hook. The alloc seam arms the barrier globals
-// (__nomu_barrier_active / __nomu_logbit_base / __nomu_logbit_log_region) at space creation so absolute-
-// address indexing lands in this table (LLVMGenRuntime.swift `nomuSelfhostAlloc`). The barrier slow path
+// (a zeroed reservation): young objects never trip the barrier. Promotion sets the unlogged bit (150.4.3);
+// 150.4.2 sets it only via the rtSetUnlogged test hook. The inline barrier indexes this table by absolute
+// address through `rtLogbitBase` (and skips objects outside [rtHeapLo, rtHeapHi)), startup globals set
+// from the runtime's one space (`rtSpace`). The barrier slow path
 // (rtGcRemember) clears the bit and appends the object to the carrier's mod-buffer (the remembered set).
 //
 // Multi-carrier split (150.3.10.1): mutators allocate through per-carrier TLABs, not this descriptor. The
@@ -716,19 +725,145 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, outBuf: RawPtr, n0: Int, cap: Int, emitS
 // scanBlock) and the large-object list (losHead) are pulled under poolLock @120 — a 3-state futex mutex
 // (rtSchedMutexLockAt). The per-carrier bump fast path takes no lock.
 
-// Reserve a heap of `numBlocks` 32 KiB blocks + its side tables; return the space descriptor.
+// ---- Process-wide runtime state, set once at startup ----
+// Startup globals (`tasks/224-globals.md`): `nomu_runtime_init` computes them on the main thread before the
+// scheduler boots, in the order their reads require, and they never change after. Generated code reads the
+// heap and barrier values by symbol (`nomu_g_<name>`) with invariant loads; C reads `rtSched` and
+// `rtGcExternalDriver` as externs until its users move into Nomu.
+
+// Dev/test overrides from the environment; 0 means unset.
+// NOMU_NURSERY_RESERVE, in blocks: positive overrides the generational reserve, negative disables
+// generational collection (major-only); rtGenReserve resolves it against the descriptor's default.
+let rtNurseryReserveOverride = rtEnvNurseryReserve()
+// NOMU_MATURE_FLOOR, in blocks: below this many free mature blocks a nursery-full trigger escalates to a
+// full defrag major (rtImmixRefill).
+let rtMatureFloor = rtPositive(rtEnvMatureFloor())
+// NOMU_GC_STRESS, in bytes: every allocation takes the slow path and each carrier requests a collection
+// after this many allocated bytes.
+let rtGcStress = rtPositive(rtEnvGcStress())
+// 1 when an external stop-the-world driver (NOMU_STW_SELFHOST / NOMU_STW_COLLECT / NOMU_GC_PRESSURE) owns
+// collection, so the default coordinator is not started and rtGenReserve keeps generational collection off.
+let rtGcExternalDriver = rtEnvExternalDriver()
+// NOMU_CARRIERS: the number of carrier threads the scheduler boots with; 4 unless set to 1 or more.
+let rtCarrierCount = rtEnvCarrierCount()
+
+// The scheduler.
+let rtSched = nomuSchedNew()
+
+// The heap: one Immix space of `rtHeapBlocks` 32 KiB blocks, created here so its descriptor and the write
+// barrier's values are constants. Its memory is reserved, not committed (rtImmixNew).
+let rtHeapBlocks = 8192
+let rtSpace = rtImmixNew(rtHeapBlocks)
+// The heap's address range [rtHeapLo, rtHeapHi): the write barrier skips stores into objects outside it
+// (large and immortal objects), which the log-bit table does not cover.
+let rtHeapLo: Int = rtSpace.load(fromByteOffset: 40)
+let rtHeapHi = rtHeapLo + rtHeapBlocks * 32768
+// The log-bit table's base, biased so the barrier indexes it by absolute address: the byte for address `a`
+// is at `rtLogbitBase + (a >> 3 >> 3)` (one bit per 8-byte region).
+let rtLogbitBase = rtLogbitBaseOf(rtSpace)
+
+fun rtLogbitBaseOf(space: RawPtr) -> Int {
+  let table: RawPtr = space.load(fromByteOffset: 144)
+  let heapBase: Int = space.load(fromByteOffset: 40)
+  return table.toInt() - heapBase / 64
+}
+
+fun rtPositive(v: Int) -> Int {
+  if v > 0 {
+    return v
+  }
+  return 0
+}
+
+// The value of the environment variable whose name is the `len` bytes at `name`, NUL-terminated here; frees
+// `name`. Null when unset.
+fun rtEnvValue(name: RawPtr, len: Int) -> RawPtr {
+  name.store(0.uint8, toByteOffset: len)
+  let v = Runtime.getenv(name: name)
+  name.free()
+  return v
+}
+
+// A NUL-terminated string's leading signed decimal number, as `atol` reads it (no leading spaces); 0 for
+// null or no digits.
+fun rtEnvParseInt(s: RawPtr) -> Int {
+  if s.isNull {
+    return 0
+  }
+  var i = 0
+  var sign = 1
+  let first: UInt8 = s.load(fromByteOffset: 0)
+  if first.int == 45 {
+    sign = -1
+    i = 1
+  }
+  var n = 0
+  var more = true
+  while more {
+    let c: UInt8 = s.load(fromByteOffset: i)
+    let d = c.int - 48
+    if d < 0 || d > 9 {
+      more = false
+    } else {
+      n = n * 10 + d
+      i = i + 1
+    }
+  }
+  return sign * n
+}
+
+fun rtEnvNurseryReserve() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_NURSERY_RESERVE")))
+}
+
+fun rtEnvMatureFloor() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_MATURE_FLOOR")))
+}
+
+fun rtEnvGcStress() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_GC_STRESS")))
+}
+
+fun rtEnvCarrierCount() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  let n = rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_CARRIERS")))
+  if n >= 1 {
+    return n
+  }
+  return 4
+}
+
+fun rtEnvExternalDriver() -> Int {
+  let a = RawPtr.alloc(bytes: 32, align: 8)
+  let selfhost = rtEnvValue(a, Runtime.copyLiteral(to: a, "NOMU_STW_SELFHOST"))
+  let b = RawPtr.alloc(bytes: 32, align: 8)
+  let collect = rtEnvValue(b, Runtime.copyLiteral(to: b, "NOMU_STW_COLLECT"))
+  let c = RawPtr.alloc(bytes: 32, align: 8)
+  let pressure = rtEnvValue(c, Runtime.copyLiteral(to: c, "NOMU_GC_PRESSURE"))
+  if !selfhost.isNull || !collect.isNull || !pressure.isNull {
+    return 1
+  }
+  return 0
+}
+
+// Reserve a heap of `numBlocks` 32 KiB blocks + its side tables; return the space descriptor. The heap and
+// tables are zeroed reservations: they read as zero, and their pages become resident only as the allocator
+// and collector first touch them, so an unused heap costs no memory.
 fun rtImmixNew(numBlocks: Int) -> RawPtr {
   let block = 32768
   let heapBytes = numBlocks * block
-  let heap = RawPtr.alloc(bytes: heapBytes, align: block)
+  let heap = Runtime.reserveZeroed(bytes: heapBytes, align: block)
   let lineBytes = numBlocks * 128
-  let lineTable = RawPtr.alloc(bytes: lineBytes, align: 8)
-  let blockTable = RawPtr.alloc(bytes: numBlocks, align: 8)
-  let freeList = RawPtr.alloc(bytes: numBlocks * 8, align: 8)
-  let defragTable = RawPtr.alloc(bytes: numBlocks, align: 8)
+  let lineTable = Runtime.reserveZeroed(bytes: lineBytes, align: 8)
+  let blockTable = Runtime.reserveZeroed(bytes: numBlocks, align: 8)
+  let freeList = Runtime.reserveZeroed(bytes: numBlocks * 8, align: 8)
+  let defragTable = Runtime.reserveZeroed(bytes: numBlocks, align: 8)
   // Log-bit side table (150.4.2): one bit per 8-byte region = one byte per 64 heap bytes = 512 bytes per
-  // 32 KiB block, plus a word of slack for the top-of-heap boundary index. Zero-filled → all objects logged.
-  let logbitTable = RawPtr.alloc(bytes: numBlocks * 512 + 64, align: 8)
+  // 32 KiB block, plus a word of slack for the top-of-heap boundary index. Zero → all objects logged.
+  let logbitTable = Runtime.reserveZeroed(bytes: numBlocks * 512 + 64, align: 8)
   let ctl = RawPtr.alloc(bytes: 160, align: 8)
   ctl.store(heap, toByteOffset: 0)
   ctl.store(numBlocks, toByteOffset: 8)
@@ -751,7 +886,7 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   ctl.store(0, toByteOffset: 136)            // nurseryUsed: NURSERY blocks acquired since the last collection
   ctl.store(logbitTable, toByteOffset: 144)  // logbitTable (150.4.2): write-barrier log-bit side table
   ctl.store(RawPtr.null, toByteOffset: 152)  // recorder: null unless `gc.record` is on
-  if RawPtr.gcRecordLevel() > 0 {
+  if Runtime.gcRecordLevel() > 0 {
     ctl.store(rtRecNew(0), toByteOffset: 152)
   }
   return ctl
@@ -768,10 +903,10 @@ fun rtGenReserve(space: RawPtr) -> Int {
   // minor/OOM coordinator with its own collection thread, so the generational minor trigger has no coordinator
   // to service its request — firing it would park a carrier forever. Defer: generational off under any external
   // driver (that driver is the whole collection mechanism).
-  if RawPtr.gcExternalDriver() != 0 {
+  if rtGcExternalDriver != 0 {
     return 0
   }
-  let env: Int = RawPtr.gcNurseryReserve()
+  let env: Int = rtNurseryReserveOverride
   if env > 0 {
     return env
   }
@@ -847,7 +982,7 @@ fun rtAcquireBlock(space: RawPtr) -> RawPtr {
 // Large-object space (task 150 · rung 3, increment 150.3.3). An object larger than a 32 KiB block cannot
 // fit the block allocator, so it is allocated whole off-heap and never moved. Each LOS chunk carries an
 // 8-byte link word ahead of the object: { next: RawPtr @0, object: header + payload @8… }. The chunks form
-// a singly-linked list off the space's losHead so reclamation (150.3.5) can walk them; rt_raw_alloc
+// a singly-linked list off the space's losHead so reclamation (150.3.5) can walk them; `RawPtr.alloc`
 // zero-fills, so the object is zero-initialized like a block object. The object pointer (chunk + 8) is what
 // the seam turns into the managed `p1` — codegen never sees the link word.
 fun rtLosAlloc(space: RawPtr, need: Int) -> RawPtr {
@@ -1003,11 +1138,121 @@ fun rtImmixAlloc(space: RawPtr, n: Int) -> RawPtr {
 }
 
 // ---- Multi-carrier allocation (task 150 · 150.3.10.1) ----
-// Each carrier owns a 32-byte TLAB { allocCursor@0, allocLimit@8, allocBlock@16, allocLine@24 } and bumps
-// within it privately (no lock). The shared block pool and large-object list are pulled under the space's
-// poolLock (@120). Mirrors Go's mcache/mcentral and MMTk's per-mutator TLABs. The TLAB is bound _Thread_local
-// per carrier in the C runtime (rt_self_tlab_get) and registered in a table the collector resets at
-// end-of-collection (evacuation may relocate a carrier's current block).
+// Each carrier owns a TLAB and bumps within it privately (no lock). The shared block pool and large-object
+// list are pulled under the space's poolLock (@120). Mirrors Go's mcache/mcentral and MMTk's per-mutator
+// TLABs. The TLAB is the first part of the carrier record below; the collector resets every carrier's TLAB at
+// the end of a collection (evacuation may relocate a carrier's current block).
+
+// ---- The carrier record ----
+// One 128-byte record per carrier, behind the carrier-local slot (`Runtime.carrierLocal()`):
+//   0  TLAB (64 bytes): cursor @0, limit @8, block @16, line @24, stressLimit @32, stressBytes @40,
+//      allocObjects @48, allocBytes @56. Cursor and limit are addresses (0 when there is no hole); under
+//      NOMU_GC_STRESS the hole end lives in stressLimit and limit stays 0, so the inline bump always misses.
+//      allocObjects and allocBytes are reserved for the `full` recording level's allocation counts.
+//   64 the fiber running on this carrier
+//   72 the mod-buffer (24 bytes): count @72, cap @80, storage @88
+//   96 the next record in the registry
+// The TLAB sits at offset 0, so a record is its own TLAB pointer, and it fills the first cache line alone.
+// A record lives for the whole process. The registry is a list of every record, pushed with one CAS at bind
+// and walked only under stop-the-world.
+let rtCarriers = Runtime.staticStorage(bytes: 8, align: 8)
+
+// Create this thread's carrier record, register it, and store it in the carrier-local slot. Every carrier
+// binds on entry to its loop; the allocation and barrier slow paths bind a thread that has no record.
+fun rtCarrierBind() -> RawPtr {
+  let rec = RawPtr.alloc(bytes: 128, align: 64)
+  rec.store(-1, toByteOffset: 16)            // no current block: the first allocation refills
+  let cap = 4096
+  rec.store(cap, toByteOffset: 80)
+  rec.store(RawPtr.alloc(bytes: cap * 8, align: 8), toByteOffset: 88)
+  var done = false
+  while !done {
+    let old: Int = rtCarriers.atomicLoad(fromByteOffset: 0)
+    rec.store(old, toByteOffset: 96)
+    done = rtCarriers.atomicCas(old, rec.toInt(), atByteOffset: 0) == old
+  }
+  Runtime.setCarrierLocal(rec)
+  return rec
+}
+
+// This thread's carrier record, binding one if it has none.
+fun rtCarrier() -> RawPtr {
+  let rec = Runtime.carrierLocal()
+  if rec.isNull {
+    return rtCarrierBind()
+  }
+  return rec
+}
+
+// The fiber running on this carrier, or null on a thread with no record or between fibers.
+fun rtCurrentFiber() -> RawPtr {
+  let rec = Runtime.carrierLocal()
+  if rec.isNull {
+    return rec
+  }
+  return rec.load(fromByteOffset: 64)
+}
+
+// This carrier's mod-buffer.
+fun rtSelfModBuf() -> RawPtr {
+  return rtCarrier().advanced(by: 72)
+}
+
+// Drop every carrier's hole and current block, so the next allocation refills from the post-collection pool.
+// Under stop-the-world.
+fun rtCarriersResetTlabs() {
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while !rec.isNull {
+    rec.store(0, toByteOffset: 0)
+    rec.store(0, toByteOffset: 8)
+    rec.store(-1, toByteOffset: 16)
+    rec.store(0, toByteOffset: 24)
+    rec.store(0, toByteOffset: 32)
+    rec = rec.load(fromByteOffset: 96)
+  }
+}
+
+// Empty every carrier's mod-buffer, keeping its storage. Under stop-the-world.
+fun rtCarriersResetModBufs() {
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while !rec.isNull {
+    rec.store(0, toByteOffset: 72)
+    rec = rec.load(fromByteOffset: 96)
+  }
+}
+
+// The number of remembered objects across every carrier's mod-buffer, to size the drain. Under stop-the-world.
+fun rtCarriersModBufTotal() -> Int {
+  var total = 0
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while !rec.isNull {
+    let count: Int = rec.load(fromByteOffset: 72)
+    total = total + count
+    rec = rec.load(fromByteOffset: 96)
+  }
+  return total
+}
+
+// Copy every carrier's remembered objects into `out`, which holds rtCarriersModBufTotal() entries, empty the
+// buffers, and return the count: the minor collection's remembered set. Under stop-the-world.
+fun rtCarriersDrainModBufs(out: RawPtr) -> Int {
+  var total = 0
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while !rec.isNull {
+    let count: Int = rec.load(fromByteOffset: 72)
+    let storage: RawPtr = rec.load(fromByteOffset: 88)
+    var j = 0
+    while j < count {
+      let obj: RawPtr = storage.load(fromByteOffset: j * 8)
+      out.store(obj, toByteOffset: total * 8)
+      total = total + 1
+      j = j + 1
+    }
+    rec.store(0, toByteOffset: 72)
+    rec = rec.load(fromByteOffset: 96)
+  }
+  return total
+}
 
 // Synchronous collection at true OOM (task 150.3.11). rtImmixRefill calls this when the shared pool has no
 // block left. It parks this carrier at its alloc-site anchor so the stop-the-world walk finds the in-flight
@@ -1015,8 +1260,8 @@ fun rtImmixAlloc(space: RawPtr, n: Int) -> RawPtr {
 // a statepoint rtWalkFrom matches), initiates a stop-the-world, signals the GC coordinator (a plain pthread)
 // to run a defrag collection, and waits for it to finish; then reports whether the collection reclaimed space
 // so the refill can retry. Returns false when there is no self-hosted scheduler (no collector) or the
-// collection freed nothing (a genuine out-of-memory — the heap is full of live data). The coordinator resets
-// this carrier's TLAB before resuming it (rt_tlab_reset_all under STW), so the caller re-reads the TLAB.
+// collection freed nothing (a genuine out-of-memory — the heap is full of live data). The collection resets
+// this carrier's TLAB before resuming it, so the caller re-reads the TLAB.
 //
 // The park mirrors nomuSchedSafepoint exactly: under the scheduler lock, set the user-frame anchor and the
 // fiber state (safepoint-stopped, 4), then switch to the carrier context. The carrier loop then acks the STW
@@ -1026,22 +1271,22 @@ fun rtImmixAlloc(space: RawPtr, n: Int) -> RawPtr {
 // and wakes the coordinator; because 136 is set before this fiber parks, the carrier's `while 136 != 0` wait
 // cannot race ahead of the request. Concurrent OOMs coalesce (only the first initiates; the rest just park).
 fun rtSelfhostOom(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
-  let sched = RawPtr.schedHandle()
+  let sched = rtSched
   if sched.isNull {
     return false
   }
-  let self = RawPtr.tlsGet()
+  let self = rtCurrentFiber()
   rtSchedSetAnchor(self, anchorSp, anchorPc)      // user-frame anchor for the STW walk (128.3.2 machinery)
   rtSchedLock(sched)
   if sched.atomicLoad(fromByteOffset: 136) == 0 {
     rtGcRecordRequest(trigger)
     sched.atomicStore(1, toByteOffset: 136)       // initiate the stop-the-world (this carrier is the initiator)
     sched.atomicStore(1, toByteOffset: 168)       // signal the GC coordinator to run the collection
-    sched.advanced(by: 168).futexWake(all: false)
+    Runtime.futexWake(at: sched.advanced(by: 168), all: false)
   }
   self.store(4, toByteOffset: 168)                // safepoint-stopped; the carrier acks + waits, then resumes us
   let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  self.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: self, to: carrierCtx)
   rtSchedUnlock(sched)
   // Retry-worthy iff the heap is not completely full after the collection: any free block suffices for a
   // non-LOS allocation (a hole is at most one block). Checking `> 0` rather than a before/after delta avoids
@@ -1056,13 +1301,13 @@ fun rtSelfhostOom(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
 // collection — but sets the collection-kind flag (sched+176 = 1) so the coordinator runs a minor GC
 // (nomuSchedStwCollectMinor) rather than a major/defrag. Returns false when there is no self-hosted scheduler
 // (no collector — the reserve stays unenforced, as in 150.4.1); else true (a minor GC always empties the
-// nursery). The coordinator resets this carrier's TLAB before resuming it, so the caller re-reads the TLAB.
+// nursery). The collection resets this carrier's TLAB before resuming it, so the caller re-reads the TLAB.
 fun rtSelfhostMinorGc(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
-  let sched = RawPtr.schedHandle()
+  let sched = rtSched
   if sched.isNull {
     return false
   }
-  let self = RawPtr.tlsGet()
+  let self = rtCurrentFiber()
   rtSchedSetAnchor(self, anchorSp, anchorPc)
   rtSchedLock(sched)
   if sched.atomicLoad(fromByteOffset: 136) == 0 {
@@ -1070,11 +1315,11 @@ fun rtSelfhostMinorGc(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
     sched.atomicStore(1, toByteOffset: 176)       // collection kind = minor (the coordinator reads this)
     sched.atomicStore(1, toByteOffset: 136)       // initiate the stop-the-world
     sched.atomicStore(1, toByteOffset: 168)       // signal the GC coordinator
-    sched.advanced(by: 168).futexWake(all: false)
+    Runtime.futexWake(at: sched.advanced(by: 168), all: false)
   }
   self.store(4, toByteOffset: 168)                // safepoint-stopped; the carrier acks + waits, then resumes us
   let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  self.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: self, to: carrierCtx)
   rtSchedUnlock(sched)
   return true
 }
@@ -1093,7 +1338,7 @@ fun rtSelfhostMinorGc(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
 fun rtGenCollect(minorTrigger: Int, trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
   let avail = nomuGcSpaceAvail()
   var floor = minorTrigger + minorTrigger        // 2× the reserve: promotion headroom + fragmentation margin
-  let matureFloor = RawPtr.gcMatureFloor()
+  let matureFloor = rtMatureFloor
   if matureFloor > floor {
     floor = matureFloor
   }
@@ -1112,7 +1357,7 @@ fun rtGenCollect(minorTrigger: Int, trigger: Int, anchorSp: RawPtr, anchorPc: In
 // when generational is on, else a major. Off under an external STW driver, which runs no coordinator to service
 // the request. The collection resets every TLAB, so the caller re-reads it.
 fun rtStressTick(space: RawPtr, tlab: RawPtr, need: Int, stress: Int, anchorSp: RawPtr, anchorPc: Int) {
-  if RawPtr.gcExternalDriver() != 0 {
+  if rtGcExternalDriver != 0 {
     return
   }
   let counted: Int = tlab.load(fromByteOffset: 40)
@@ -1223,8 +1468,9 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
             // reads as pointers. Zeroing on acquire restores the zero-init contract, matching Immix/MMTk.
             let heap: RawPtr = space.load(fromByteOffset: 0)
             heap.advanced(by: startOff).zeroBytes(endOff - startOff)
-            tlab.store(startOff, toByteOffset: 0)
-            tlab.store(endOff, toByteOffset: 8)
+            let heapLo: Int = space.load(fromByteOffset: 40)
+            tlab.store(heapLo + startOff, toByteOffset: 0)   // cursor and limit are addresses
+            tlab.store(heapLo + endOff, toByteOffset: 8)
             done = true
             result = true
           }
@@ -1247,7 +1493,7 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
   let need = bumped / 8 * 8
   // Under NOMU_GC_STRESS the hole end lives at stressLimit (@32) and the inline limit (@8) stays 0, so every
   // allocation reaches here and counts toward the carrier's stress interval.
-  let stress = RawPtr.gcStress()
+  let stress = rtGcStress
   if stress > 0 {
     rtStressTick(space, tlab, need, stress, anchorSp, anchorPc)
   }
@@ -1268,7 +1514,8 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
     let lim: Int = tlab.load(fromByteOffset: limOff)
     if cur + need <= lim {
       let heap: RawPtr = space.load(fromByteOffset: 0)
-      result = heap.advanced(by: cur)
+      let heapLo: Int = space.load(fromByteOffset: 40)
+      result = heap.advanced(by: cur - heapLo)          // the cursor is an address; heap is the same address as heapLo
       tlab.store(cur + need, toByteOffset: 0)
       done = true
     } else {
@@ -1293,7 +1540,7 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
 // it region-shifts the object address, tests its log bit, and on the first mutation of an *unlogged* (mature)
 // object calls the slow path here. These accessors index the log-bit side table (descriptor @144) with the
 // exact region math the fast path uses so the two agree on which bit: byte = objInt/64 − heapBaseInt/64
-// (relative to the table start; the fast path folds the heapBaseInt term into __nomu_logbit_base), bit =
+// (relative to the table start; the fast path folds the heapBaseInt term into `rtLogbitBase`), bit =
 // (objInt/8) mod 8. Bit 1 = unlogged (mature, remember on mutation), 0 = logged. Nomu has no bitwise ops, so
 // powers of two are built by doubling and a single bit is read/set/cleared arithmetically.
 
@@ -1370,9 +1617,9 @@ fun rtClearLogTable(space: RawPtr) {
 }
 
 // The per-carrier mod-buffer (the remembered set, §11.3) is a growable append buffer { count: Int @0,
-// cap: Int @8, storage: RawPtr @16 } bound _Thread_local per carrier in the C runtime (rt_self_modbuf_get),
-// registered in a table the collector resets at end-of-collection (rt_modbuf_reset_all). storage holds `cap`
-// eight-byte object slots. Append is lock-free — each carrier owns its buffer and only its own thread appends.
+// cap: Int @8, storage: RawPtr @16 } inside the carrier record (at record + 72); the collector empties every
+// carrier's buffer at the end of a collection. storage holds `cap` eight-byte object slots. Append is
+// lock-free — each carrier owns its buffer and only its own thread appends.
 
 fun rtModBufCount(mb: RawPtr) -> Int {
   return mb.load(fromByteOffset: 0)
@@ -1401,14 +1648,13 @@ fun rtModBufAppend(mb: RawPtr, obj: RawPtr) {
   mb.store(count + 1, toByteOffset: 0)
 }
 
-// The barrier slow path (§11.2). Called from the C write-barrier seam (rt_gc_write_barrier) with the
-// carrier's mod-buffer and the mutated object. The inline fast path already tested
-// the log bit, but the actor/mailbox path (runtime.c) calls the seam directly, bypassing that test, so
-// re-check here: a logged (young, bit 0) object contributes nothing to the remembered set. On an unlogged
+// The barrier slow path (§11.2), with the carrier's mod-buffer and the mutated object. The inline fast path
+// already tested the log bit, but the scheduler's mailbox stores reach this through rtRememberStore without
+// that test, so re-check here: a logged (young, bit 0) object contributes nothing to the remembered set. On an unlogged
 // (mature) object, mark it logged so subsequent stores elide the slow path, then remember it — the minor GC
 // (150.4.3) rescans each remembered object's managed slots, forwarding any nursery referent.
 fun rtGcRemember(mb: RawPtr, obj: RawPtr) {
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
   if space.isNull {
     return          // no managed allocation yet → no space, nothing to remember
   }
@@ -1438,13 +1684,11 @@ fun rtGcRemember(mb: RawPtr, obj: RawPtr) {
 // root; it finds mature→young pointers only via the remembered set). This is the barrier slow path for those
 // stores: it fetches this carrier's mod-buffer and routes to rtGcRemember, which re-tests the log bit and
 // remembers only a mature (unlogged) in-heap object. A cheap no-op off the self-hosted generational plan (the
-// log table is all-logged, so rtGcRemember returns early) and for young targets.
+// log table is all-logged, so rtGcRemember returns early) and for young targets. Generated code
+// (`__nomu_remember`) calls it too, on the first mutation of an unlogged object; that call is gc-leaf, since
+// this never polls or parks and its only allocation is raw memory.
 fun rtRememberStore(obj: RawPtr) {
-  let mb = RawPtr.gcSelfModBuf()
-  if mb.isNull {
-    return
-  }
-  rtGcRemember(mb, obj)
+  rtGcRemember(rtSelfModBuf(), obj)
 }
 
 // ---- Line marking (task 150 · rung 3, increment 150.3.4) ----
@@ -1482,9 +1726,9 @@ fun rtMarkObjLines(space: RawPtr, obj: RawPtr, size: Int) {
 // the only addition, applied when each object is popped (size from the type tables: fixed size, or
 // 16 + cap*stride for a variable-size buffer). Returns the total live count.
 fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -> Int {
-  let cap = 1048576
-  let bytes = cap * 8
-  let work = RawPtr.alloc(bytes: bytes, align: 8)
+  var wcap = 4096                   // grows on demand (rtStackGrow)
+  let bytes = wcap * 8
+  var work = RawPtr.alloc(bytes: bytes, align: 8)
   var top = 0
   let rootNull = root.eq(RawPtr.null)
   if !rootNull {
@@ -1498,19 +1742,23 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
     let slot = top * 8
     let obj: RawPtr = work.load(fromByteOffset: slot)
     let tid = rtObjTypeId(obj)
-    let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcLiveCount(tid, obj)
+    let kind = rtTypeKind(tid)
+    let nptr = rtLiveCount(tid, obj)
     if kind == 0 {
-      let size = RawPtr.gcTypeSize(tid)
+      let size = rtTypeSize(tid)
       rtMarkObjLines(space, obj, size)
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        let off = rtLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         let childNull = child.eq(RawPtr.null)
         if !childNull {
           if rtTryMark(child, counts, fp) {
             let dst = top * 8
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(child, toByteOffset: dst)
             top = top + 1
           }
@@ -1519,17 +1767,21 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
       }
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
-      let stride = RawPtr.gcTypeStride(tid)
+      let stride = rtTypeStride(tid)
       let elemStart = rtBufElemStart(tid)
       let size = elemStart + ecap * stride
       rtMarkObjLines(space, obj, size)
       var hk = 0
-      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180)
+      let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
       while hk < nhdr {
-        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hat = 16 + rtHeaderOffsetAt(tid, hk)
         let hchild: RawPtr = obj.load(fromByteOffset: hat)
         if !hchild.eq(RawPtr.null) {
           if rtTryMark(hchild, counts, fp) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(hchild, toByteOffset: top * 8)
             top = top + 1
           }
@@ -1537,23 +1789,27 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
         hk = hk + 1
       }
       var e = 0
-      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
+      let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap {
         let elemBase = elemStart + e * stride
         let elemPtr = obj.advanced(by: elemBase)
         var en = nptr
         if elemShaped {
-          en = RawPtr.gcLiveCount(tid, elemPtr)
+          en = rtLiveCount(tid, elemPtr)
         }
         var i = 0
         while i < en {
-          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
+          let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
           if !childNull {
             if rtTryMark(child, counts, fp) {
               let dst = top * 8
+              if top == wcap {
+                work = rtStackGrow(work, top)
+                wcap = wcap + wcap
+              }
               work.store(child, toByteOffset: dst)
               top = top + 1
             }
@@ -1565,7 +1821,7 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
     }
   }
   work.free()
-  let tcount = RawPtr.gcTypeCount()
+  let tcount = Runtime.gcTypeCount()
   var total = 0
   var t = 0
   while t < tcount {
@@ -1622,8 +1878,8 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
   let heapEnd = base + nb * 32768
   let ntot = nb * 128
   let scratch = RawPtr.alloc(bytes: ntot, align: 8)
-  let cap = 1048576
-  let work = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var wcap = 4096                   // grows on demand (rtStackGrow)
+  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
   var violations = 0
   var top = 0
   if rtUnmarkIfMarked(root) {
@@ -1634,14 +1890,14 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
     top = top - 1
     let obj: RawPtr = work.load(fromByteOffset: top * 8)
     let tid = rtObjTypeId(obj)
-    let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcLiveCount(tid, obj)
+    let kind = rtTypeKind(tid)
+    let nptr = rtLiveCount(tid, obj)
     var size = 0
     if kind == 0 {
-      size = RawPtr.gcTypeSize(tid)
+      size = rtTypeSize(tid)
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
-      let stride = RawPtr.gcTypeStride(tid)
+      let stride = rtTypeStride(tid)
       let elemStart = rtBufElemStart(tid)
       size = elemStart + ecap * stride
     }
@@ -1669,9 +1925,13 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        let off = rtLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         if rtUnmarkIfMarked(child) {
+          if top == wcap {
+            work = rtStackGrow(work, top)
+            wcap = wcap + wcap
+          }
           work.store(child, toByteOffset: top * 8)
           top = top + 1
         }
@@ -1679,34 +1939,42 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
       }
     } else {
       let ecap2: Int = obj.load(fromByteOffset: 8)
-      let stride2 = RawPtr.gcTypeStride(tid)
+      let stride2 = rtTypeStride(tid)
       let elemStart = rtBufElemStart(tid)
       var hk = 0
-      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180)
+      let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
       while hk < nhdr {
-        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hat = 16 + rtHeaderOffsetAt(tid, hk)
         let hchild: RawPtr = obj.load(fromByteOffset: hat)
         if rtUnmarkIfMarked(hchild) {
+          if top == wcap {
+            work = rtStackGrow(work, top)
+            wcap = wcap + wcap
+          }
           work.store(hchild, toByteOffset: top * 8)
           top = top + 1
         }
         hk = hk + 1
       }
       var ee = 0
-      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
+      let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
       while ee < ecap2 {
         let elemBase = elemStart + ee * stride2
         let elemPtr = obj.advanced(by: elemBase)
         var en = nptr
         if elemShaped {
-          en = RawPtr.gcLiveCount(tid, elemPtr)
+          en = rtLiveCount(tid, elemPtr)
         }
         var i2 = 0
         while i2 < en {
-          let off2 = RawPtr.gcLiveOffsetAt(tid, elemPtr, i2)
+          let off2 = rtLiveOffsetAt(tid, elemPtr, i2)
           let at = elemBase + off2
           let child2: RawPtr = obj.load(fromByteOffset: at)
           if rtUnmarkIfMarked(child2) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(child2, toByteOffset: top * 8)
             top = top + 1
           }
@@ -1762,8 +2030,8 @@ fun rtTryMarkBare(obj: RawPtr) -> Bool {
 // Mark the transitive live set from `root`: header bit 32 on each object, plus line marks for in-heap
 // objects (rtMarkObjLines; LOS objects get the header bit only, reclaimed by whole chunk).
 fun rtImmixMark(space: RawPtr, root: RawPtr) {
-  let cap = 1048576
-  let work = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var wcap = 4096                   // grows on demand (rtStackGrow)
+  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
   var top = 0
   let rootNull = root.eq(RawPtr.null)
   if !rootNull {
@@ -1776,14 +2044,14 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
     top = top - 1
     let obj: RawPtr = work.load(fromByteOffset: top * 8)
     let tid = rtObjTypeId(obj)
-    let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcLiveCount(tid, obj)
+    let kind = rtTypeKind(tid)
+    let nptr = rtLiveCount(tid, obj)
     var size = 0
     if kind == 0 {
-      size = RawPtr.gcTypeSize(tid)
+      size = rtTypeSize(tid)
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
-      let stride = RawPtr.gcTypeStride(tid)
+      let stride = rtTypeStride(tid)
       let elemStart = rtBufElemStart(tid)
       size = elemStart + ecap * stride
     }
@@ -1791,11 +2059,15 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        let off = rtLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         let childNull = child.eq(RawPtr.null)
         if !childNull {
           if rtTryMarkBare(child) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(child, toByteOffset: top * 8)
             top = top + 1
           }
@@ -1804,15 +2076,19 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
       }
     } else {
       let ecap2: Int = obj.load(fromByteOffset: 8)
-      let stride2 = RawPtr.gcTypeStride(tid)
+      let stride2 = rtTypeStride(tid)
       let elemStart = rtBufElemStart(tid)
       var hk = 0
-      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180)
+      let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
       while hk < nhdr {
-        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hat = 16 + rtHeaderOffsetAt(tid, hk)
         let hchild: RawPtr = obj.load(fromByteOffset: hat)
         if !hchild.eq(RawPtr.null) {
           if rtTryMarkBare(hchild) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(hchild, toByteOffset: top * 8)
             top = top + 1
           }
@@ -1820,22 +2096,26 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
         hk = hk + 1
       }
       var e = 0
-      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
+      let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap2 {
         let elemBase = elemStart + e * stride2
         let elemPtr = obj.advanced(by: elemBase)
         var en = nptr
         if elemShaped {
-          en = RawPtr.gcLiveCount(tid, elemPtr)
+          en = rtLiveCount(tid, elemPtr)
         }
         var i = 0
         while i < en {
-          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
+          let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
           if !childNull {
             if rtTryMarkBare(child) {
+              if top == wcap {
+                work = rtStackGrow(work, top)
+                wcap = wcap + wcap
+              }
               work.store(child, toByteOffset: top * 8)
               top = top + 1
             }
@@ -1926,8 +2206,8 @@ fun rtImmixSweepLos(space: RawPtr) {
 // Clear the header mark bit across the live set (re-walk from root). Runs after the sweeps have read the
 // marks, so the next collection starts clean. Reaches LOS survivors through the graph too.
 fun rtImmixUnmark(root: RawPtr) {
-  let cap = 1048576
-  let work = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var wcap = 4096                   // grows on demand (rtStackGrow)
+  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
   var top = 0
   if rtUnmarkIfMarked(root) {
     work.store(root, toByteOffset: 0)
@@ -1937,14 +2217,18 @@ fun rtImmixUnmark(root: RawPtr) {
     top = top - 1
     let obj: RawPtr = work.load(fromByteOffset: top * 8)
     let tid = rtObjTypeId(obj)
-    let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcLiveCount(tid, obj)
+    let kind = rtTypeKind(tid)
+    let nptr = rtLiveCount(tid, obj)
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        let off = rtLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         if rtUnmarkIfMarked(child) {
+          if top == wcap {
+            work = rtStackGrow(work, top)
+            wcap = wcap + wcap
+          }
           work.store(child, toByteOffset: top * 8)
           top = top + 1
         }
@@ -1952,34 +2236,42 @@ fun rtImmixUnmark(root: RawPtr) {
       }
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
-      let stride = RawPtr.gcTypeStride(tid)
+      let stride = rtTypeStride(tid)
       let elemStart = rtBufElemStart(tid)
       var hk = 0
-      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180)
+      let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
       while hk < nhdr {
-        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hat = 16 + rtHeaderOffsetAt(tid, hk)
         let hchild: RawPtr = obj.load(fromByteOffset: hat)
         if rtUnmarkIfMarked(hchild) {
+          if top == wcap {
+            work = rtStackGrow(work, top)
+            wcap = wcap + wcap
+          }
           work.store(hchild, toByteOffset: top * 8)
           top = top + 1
         }
         hk = hk + 1
       }
       var e = 0
-      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
+      let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap {
         let elemBase = elemStart + e * stride
         let elemPtr = obj.advanced(by: elemBase)
         var en = nptr
         if elemShaped {
-          en = RawPtr.gcLiveCount(tid, elemPtr)
+          en = rtLiveCount(tid, elemPtr)
         }
         var i = 0
         while i < en {
-          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
+          let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           if rtUnmarkIfMarked(child) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(child, toByteOffset: top * 8)
             top = top + 1
           }
@@ -2003,8 +2295,8 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
   let base: Int = space.load(fromByteOffset: 40)
   let nb: Int = space.load(fromByteOffset: 8)
   let heapEnd = base + nb * 32768
-  let cap = 1048576
-  let work = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var wcap = 4096                   // grows on demand (rtStackGrow)
+  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
   var top = 0
   if rtUnmarkIfMarked(root) {
     work.store(root, toByteOffset: 0)
@@ -2020,14 +2312,18 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
       }
     }
     let tid = rtObjTypeId(obj)
-    let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcLiveCount(tid, obj)
+    let kind = rtTypeKind(tid)
+    let nptr = rtLiveCount(tid, obj)
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        let off = rtLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         if rtUnmarkIfMarked(child) {
+          if top == wcap {
+            work = rtStackGrow(work, top)
+            wcap = wcap + wcap
+          }
           work.store(child, toByteOffset: top * 8)
           top = top + 1
         }
@@ -2035,34 +2331,42 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
       }
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
-      let stride = RawPtr.gcTypeStride(tid)
+      let stride = rtTypeStride(tid)
       let elemStart = rtBufElemStart(tid)
       var hk = 0
-      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180)
+      let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
       while hk < nhdr {
-        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hat = 16 + rtHeaderOffsetAt(tid, hk)
         let hchild: RawPtr = obj.load(fromByteOffset: hat)
         if rtUnmarkIfMarked(hchild) {
+          if top == wcap {
+            work = rtStackGrow(work, top)
+            wcap = wcap + wcap
+          }
           work.store(hchild, toByteOffset: top * 8)
           top = top + 1
         }
         hk = hk + 1
       }
       var e = 0
-      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
+      let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap {
         let elemBase = elemStart + e * stride
         let elemPtr = obj.advanced(by: elemBase)
         var en = nptr
         if elemShaped {
-          en = RawPtr.gcLiveCount(tid, elemPtr)
+          en = rtLiveCount(tid, elemPtr)
         }
         var i = 0
         while i < en {
-          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
+          let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           if rtUnmarkIfMarked(child) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(child, toByteOffset: top * 8)
             top = top + 1
           }
@@ -2121,16 +2425,235 @@ fun rtNurseryReserve(space: RawPtr) -> Int {
 // its forwarding pointer afterward. The payload-word-0 slot exists for every managed type — `rtCheckPayloadWord`
 // guards that (§10.8): a fixed object is header + ≥1 field (≥16 bytes), an array buffer is header + cap + ….
 
+// ---- GC type descriptors ----
+// Every module emits a 32-byte descriptor per heap type into `__DATA,__nomu_descs` (weak, so duplicates across
+// modules fold at link), with each type's variable pointer map out of line in `__DATA,__nomu_ptrmaps`. A
+// type-id is a descriptor's byte offset from the section start (`Runtime.gcDescBase()`), stamped into object
+// headers and value-witness tables. A descriptor is eight `int32` fields (codegen's `gcDescType`, backend.md
+// §4): size @0 (0 for an array buffer), stride @4 (0 for a fixed object), kind @8 (0 fixed, 1 array buffer,
+// 2 shaped), nptr @12, ptrmapOff @16, nshaped @20, headerSize @24 (a buffer's user-header bytes), nheader @28.
+// A type's map, at the pointer-map base + ptrmapOff, holds the nheader header offsets, then the nptr field or
+// element offsets, then nshaped (field offset, sub-shape type-id) pairs; kind 2 has the discriminant-keyed
+// form rtLiveCount describes. Type-ids come from codegen and are always valid, so nothing range-checks them.
+let rtDescSize = 32
+
+fun rtDescField(tid: Int, at: Int) -> Int {
+  return Runtime.loadInt32(Runtime.gcDescBase(), at: tid + at)
+}
+
+fun rtTypeSize(tid: Int) -> Int {
+  return rtDescField(tid, 0)
+}
+
+fun rtTypeStride(tid: Int) -> Int {
+  return rtDescField(tid, 4)
+}
+
+fun rtTypeKind(tid: Int) -> Int {
+  return rtDescField(tid, 8)
+}
+
+fun rtShapedCount(tid: Int) -> Int {
+  return rtDescField(tid, 20)
+}
+
+fun rtTypeHeaderSize(tid: Int) -> Int {
+  return rtDescField(tid, 24)
+}
+
+fun rtHeaderPtrCount(tid: Int) -> Int {
+  return rtDescField(tid, 28)
+}
+
+fun rtTypeMap(tid: Int) -> RawPtr {
+  return Runtime.gcPtrmapBase().advanced(by: rtDescField(tid, 16))
+}
+
+// The k-th managed-pointer byte offset within a buffer's user header, relative to the header (`base + 16`).
+fun rtHeaderOffsetAt(tid: Int, k: Int) -> Int {
+  return Runtime.loadInt32(rtTypeMap(tid), at: k * 4)
+}
+
+// The live managed-pointer byte offsets of a value of type `tid` at `base`, as a count and an indexed read:
+// the one enumerator behind object fields, array elements and shaped roots.
+// - A fixed object or array element with no shaped fields: the static map after the header offsets; `base`
+//   is unused. For an array the offsets are an element's, and `base` is that element.
+// - With shaped fields (a `String` in a class): the direct offsets, then each shaped field's live
+//   sub-offsets, each offset by its field.
+// - Kind 2, a shaped value (`String`, an enum): the map is `[tagOff, tagShift, ncases, case…]`, each case
+//   `(tag, nflat, flat…, nshaped, (off, subId)…)`. The tag is the word at `base + tagOff` shifted right by
+//   `tagShift`; only the matching case's offsets are live, and none when no case matches (a small or
+//   immortal `String`, an enum's `.none`).
+// Both walk the map directly, keeping no scratch state, so any thread may call them; shaped maps hold a
+// handful of entries.
+fun rtLiveCount(tid: Int, base: RawPtr) -> Int {
+  let map = rtTypeMap(tid)
+  if rtTypeKind(tid) == 2 {
+    let c = rtShapedCase(map, base)
+    if c < 0 {
+      return 0
+    }
+    return rtCaseCount(map, c, base)
+  }
+  let nptr = rtDescField(tid, 12)
+  let nshaped = rtShapedCount(tid)
+  if nshaped == 0 {
+    return nptr
+  }
+  let flat = map.advanced(by: rtHeaderPtrCount(tid) * 4)
+  return nptr + rtPairsCount(flat.advanced(by: nptr * 4), nshaped, base)
+}
+
+fun rtLiveOffsetAt(tid: Int, base: RawPtr, i: Int) -> Int {
+  let map = rtTypeMap(tid)
+  if rtTypeKind(tid) == 2 {
+    let c = rtShapedCase(map, base)
+    if c < 0 {
+      return 0
+    }
+    return rtCaseOffsetAt(map, c, base, i)
+  }
+  let flat = map.advanced(by: rtHeaderPtrCount(tid) * 4)
+  let nptr = rtDescField(tid, 12)
+  if i < nptr {
+    return Runtime.loadInt32(flat, at: i * 4)
+  }
+  return rtPairsOffsetAt(flat.advanced(by: nptr * 4), rtShapedCount(tid), base, i - nptr)
+}
+
+// `n` (field offset, sub-shape type-id) pairs at `pairs`: the live sub-offsets they hold in all.
+fun rtPairsCount(pairs: RawPtr, n: Int, base: RawPtr) -> Int {
+  var total = 0
+  var k = 0
+  while k < n {
+    let off = Runtime.loadInt32(pairs, at: k * 8)
+    let sub = Runtime.loadInt32(pairs, at: k * 8 + 4)
+    total = total + rtLiveCount(sub, base.advanced(by: off))
+    k = k + 1
+  }
+  return total
+}
+
+// The j-th live sub-offset across `n` pairs, relative to `base`.
+fun rtPairsOffsetAt(pairs: RawPtr, n: Int, base: RawPtr, j0: Int) -> Int {
+  var j = j0
+  var k = 0
+  while k < n {
+    let off = Runtime.loadInt32(pairs, at: k * 8)
+    let sub = Runtime.loadInt32(pairs, at: k * 8 + 4)
+    let fieldBase = base.advanced(by: off)
+    let c = rtLiveCount(sub, fieldBase)
+    if j < c {
+      return off + rtLiveOffsetAt(sub, fieldBase, j)
+    }
+    j = j - c
+    k = k + 1
+  }
+  return 0
+}
+
+// The byte position within a kind-2 map of the case matching the value at `base`, or -1 when none does.
+fun rtShapedCase(map: RawPtr, base: RawPtr) -> Int {
+  let tagOff = Runtime.loadInt32(map, at: 0)
+  let shift = Runtime.loadInt32(map, at: 4)
+  let ncases = Runtime.loadInt32(map, at: 8)
+  let word: Int = base.load(fromByteOffset: tagOff)
+  let tag = rtShrLogical(word, shift)
+  var p = 12
+  var c = 0
+  while c < ncases {
+    let nflat = Runtime.loadInt32(map, at: p + 4)
+    if Runtime.loadInt32(map, at: p) == tag {
+      return p
+    }
+    let nshaped = Runtime.loadInt32(map, at: p + 8 + nflat * 4)
+    p = p + 12 + nflat * 4 + nshaped * 8
+    c = c + 1
+  }
+  return -1
+}
+
+fun rtCaseCount(map: RawPtr, p: Int, base: RawPtr) -> Int {
+  let nflat = Runtime.loadInt32(map, at: p + 4)
+  let nshaped = Runtime.loadInt32(map, at: p + 8 + nflat * 4)
+  if nshaped == 0 {
+    return nflat
+  }
+  return nflat + rtPairsCount(map.advanced(by: p + 12 + nflat * 4), nshaped, base)
+}
+
+fun rtCaseOffsetAt(map: RawPtr, p: Int, base: RawPtr, i: Int) -> Int {
+  let nflat = Runtime.loadInt32(map, at: p + 4)
+  if i < nflat {
+    return Runtime.loadInt32(map, at: p + 8 + i * 4)
+  }
+  let nshaped = Runtime.loadInt32(map, at: p + 8 + nflat * 4)
+  return rtPairsOffsetAt(map.advanced(by: p + 12 + nflat * 4), nshaped, base, i - nflat)
+}
+
+// The logical right shift of a 64-bit word by `s` (0 to 63), for the shaped-tag decode: Nomu has no shift
+// operator, so it is a division by a power of two, offset when the word's top bit is set (negative as an Int).
+fun rtShrLogical(w: Int, s: Int) -> Int {
+  if s == 0 {
+    return w
+  }
+  if s == 63 {
+    if w < 0 {
+      return 1
+    }
+    return 0
+  }
+  let p: Int = rtPow2Table.load(fromByteOffset: s * 8)
+  if w >= 0 {
+    return w / p
+  }
+  // w + 2^64 shifted right: (w + 2^63) / 2^s + 2^(63 - s), with w + 2^63 in range for a negative w.
+  let q: Int = rtPow2Table.load(fromByteOffset: (63 - s) * 8)
+  return (w + 9223372036854775807 + 1) / p + q
+}
+
+// 2^0 through 2^62, for rtShrLogical.
+let rtPow2Table = rtPow2TableNew()
+
+fun rtPow2TableNew() -> RawPtr {
+  let t = RawPtr.alloc(bytes: 63 * 8, align: 8)
+  var v = 1
+  var i = 0
+  while i < 63 {
+    t.store(v, toByteOffset: i * 8)
+    v = v + v
+    i = i + 1
+  }
+  return t
+}
+
+// The GC frame index (`__DATA_CONST,__nomu_frameidx`, layout in the driver's FrameIndex.swift) maps a return
+// address to its stack-map record; `nomu build` writes it after the link. A binary with stack maps but no
+// index was linked another way, and its roots could not be found, so startup stops. The index starts at the
+// section's first 8-aligned address with the magic "NFIX" and version 2.
+let rtFrameIndexChecked = rtCheckFrameIndex()
+
+fun rtCheckFrameIndex() -> Int {
+  if Runtime.gcStackmapSize() > 0 {
+    let fx = Runtime.gcFrameIndexBase()
+    let at = fx.advanced(by: (8 - fx.toInt() % 8) % 8)
+    if Runtime.loadInt32(at, at: 0) != 1481197134 || Runtime.loadInt32(at, at: 4) != 2 {
+      Runtime.fatal("nomu: this binary has no GC frame index (it was linked without `nomu build`)")
+    }
+  }
+  return 1
+}
+
 // The object's total size in bytes from the type tables: fixed size, or 16 + cap*stride for a buffer. Must
 // be read before forwarding clobbers payload word 0 (a buffer's cap lives there).
 fun rtObjSize(obj: RawPtr) -> Int {
   let tid = rtObjTypeId(obj)
-  let kind = RawPtr.gcTypeKind(tid)
+  let kind = rtTypeKind(tid)
   if kind == 0 {
-    return RawPtr.gcTypeSize(tid)
+    return rtTypeSize(tid)
   }
   let ecap: Int = obj.load(fromByteOffset: 8)
-  let stride = RawPtr.gcTypeStride(tid)
+  let stride = rtTypeStride(tid)
   let elemStart = rtBufElemStart(tid)
   return elemStart + ecap * stride
 }
@@ -2194,17 +2717,17 @@ fun rtCopyObject(space: RawPtr, obj: RawPtr) -> RawPtr {
 // Count managed types with no payload word (fixed size < 16) — the forwarding record needs payload word 0
 // (§10.8). 0 confirms the payload-word-0 forwarding scheme is valid for every managed type in the program.
 fun rtCheckPayloadWord() -> Int {
-  let tcount = RawPtr.gcTypeCount()
+  let tcount = Runtime.gcTypeCount()
   var bad = 0
   var t = 0
   while t < tcount {
     // gcTypeCount() is the descriptor count; a type-id is a descriptor byte offset (task 100.4.7),
     // so ordinal `t` maps to offset `t * record-size` for the accessor reads (task 180: record size from
     // the runtime, one source of truth).
-    let off = t * RawPtr.gcDescSize()
-    let kind = RawPtr.gcTypeKind(off)
+    let off = t * rtDescSize
+    let kind = rtTypeKind(off)
     if kind == 0 {
-      let sz = RawPtr.gcTypeSize(off)
+      let sz = rtTypeSize(off)
       if sz < 16 {
         bad = bad + 1
       }
@@ -2266,8 +2789,8 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
   if rootNull {
     return root
   }
-  let cap = 1048576
-  let work = RawPtr.alloc(bytes: cap * 8, align: 8)
+  var wcap = 4096                   // grows on demand (rtStackGrow)
+  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
   var top = 0
   let newRoot = rtEvacuate(space, root)
   if rtTryMarkBare(newRoot) {
@@ -2278,14 +2801,14 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
     top = top - 1
     let obj: RawPtr = work.load(fromByteOffset: top * 8)
     let tid = rtObjTypeId(obj)
-    let kind = RawPtr.gcTypeKind(tid)
-    let nptr = RawPtr.gcLiveCount(tid, obj)
+    let kind = rtTypeKind(tid)
+    let nptr = rtLiveCount(tid, obj)
     var size = 0
     if kind == 0 {
-      size = RawPtr.gcTypeSize(tid)
+      size = rtTypeSize(tid)
     } else {
       let ecap: Int = obj.load(fromByteOffset: 8)
-      let stride = RawPtr.gcTypeStride(tid)
+      let stride = rtTypeStride(tid)
       let elemStart = rtBufElemStart(tid)
       size = elemStart + ecap * stride
     }
@@ -2293,13 +2816,17 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+        let off = rtLiveOffsetAt(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         let childNull = child.eq(RawPtr.null)
         if !childNull {
           let nc = rtEvacuate(space, child)
           obj.store(nc, toByteOffset: off)
           if rtTryMarkBare(nc) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(nc, toByteOffset: top * 8)
             top = top + 1
           }
@@ -2308,17 +2835,21 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
       }
     } else {
       let ecap2: Int = obj.load(fromByteOffset: 8)
-      let stride2 = RawPtr.gcTypeStride(tid)
+      let stride2 = rtTypeStride(tid)
       let elemStart = rtBufElemStart(tid)
       var hk = 0
-      let nhdr = RawPtr.gcHeaderPtrCount(tid)      // header managed pointers (task 180): evacuate + write back
+      let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180): evacuate + write back
       while hk < nhdr {
-        let hat = 16 + RawPtr.gcHeaderOffsetAt(tid, hk)
+        let hat = 16 + rtHeaderOffsetAt(tid, hk)
         let hchild: RawPtr = obj.load(fromByteOffset: hat)
         if !hchild.eq(RawPtr.null) {
           let hnc = rtEvacuate(space, hchild)
           obj.store(hnc, toByteOffset: hat)
           if rtTryMarkBare(hnc) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
             work.store(hnc, toByteOffset: top * 8)
             top = top + 1
           }
@@ -2326,17 +2857,17 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
         hk = hk + 1
       }
       var e = 0
-      let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
+      let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
       while e < ecap2 {
         let elemBase = elemStart + e * stride2
         let elemPtr = obj.advanced(by: elemBase)
         var en = nptr
         if elemShaped {
-          en = RawPtr.gcLiveCount(tid, elemPtr)
+          en = rtLiveCount(tid, elemPtr)
         }
         var i = 0
         while i < en {
-          let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
+          let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
           let child: RawPtr = obj.load(fromByteOffset: at)
           let childNull = child.eq(RawPtr.null)
@@ -2344,6 +2875,10 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
             let nc = rtEvacuate(space, child)
             obj.store(nc, toByteOffset: at)
             if rtTryMarkBare(nc) {
+              if top == wcap {
+                work = rtStackGrow(work, top)
+                wcap = wcap + wcap
+              }
               work.store(nc, toByteOffset: top * 8)
               top = top + 1
             }
@@ -2586,12 +3121,23 @@ fun rtMinorForward(space: RawPtr, fieldAddr: RawPtr, q: RawPtr, count: Int) -> I
   return count
 }
 
+// Double a full collector work stack: copy its `count` entries into a buffer twice the size, free the old
+// one, and return the new. The mark and unmark passes keep the stack and its capacity in locals and call this
+// only when a push finds it full. Raw memory, off the managed heap, so growth under stop-the-world never
+// re-enters collection.
+fun rtStackGrow(stack: RawPtr, count: Int) -> RawPtr {
+  let fresh = RawPtr.alloc(bytes: count * 16, align: 8)
+  fresh.copyBytes(from: stack, byteCount: count * 8)
+  stack.free()
+  return fresh
+}
+
 // The promotion queue is a growable dynamic array behind a stable 2-word handle {base @0, cap @8}: a minor's
 // promotion count is bounded only by the nursery's live objects, which grows with the nursery reserve, so a
 // fixed array can overflow (a large nursery promoting many survivors). Region/block collectors (Immix, G1,
 // MMTk) use growable work stacks for the same reason. `q` is passed by value into the scan helpers, so growth
 // must not move the value the callers hold — the handle stays put; only the buffer it points at is realloc'd.
-// The buffer is malloc-backed (rt_raw_alloc), off the GC heap, so growth during the STW never re-enters
+// The buffer is malloc-backed (`RawPtr.alloc`), off the GC heap, so growth during the STW never re-enters
 // collection. Doubling keeps the amortized cost O(1) and grows rare (starts at 64Ki entries).
 fun rtQueuePush(q: RawPtr, count: Int, obj: RawPtr) {
   var base: RawPtr = q.load(fromByteOffset: 0)
@@ -2614,37 +3160,37 @@ fun rtQueuePush(q: RawPtr, count: Int, obj: RawPtr) {
 fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
   var count = count0
   let tid = rtObjTypeId(obj)
-  let kind = RawPtr.gcTypeKind(tid)
-  let nptr = RawPtr.gcLiveCount(tid, obj)
+  let kind = rtTypeKind(tid)
+  let nptr = rtLiveCount(tid, obj)
   if kind == 0 {
     var i = 0
     while i < nptr {
-      let off = RawPtr.gcLiveOffsetAt(tid, obj, i)
+      let off = rtLiveOffsetAt(tid, obj, i)
       count = rtMinorForward(space, obj.advanced(by: off), q, count)
       i = i + 1
     }
   } else {
     let ecap: Int = obj.load(fromByteOffset: 8)
-    let stride = RawPtr.gcTypeStride(tid)
+    let stride = rtTypeStride(tid)
     let elemStart = rtBufElemStart(tid)
     var hk = 0
-    let nhdr = RawPtr.gcHeaderPtrCount(tid)        // header managed pointers (task 180)
+    let nhdr = rtHeaderPtrCount(tid)        // header managed pointers (task 180)
     while hk < nhdr {
-      count = rtMinorForward(space, obj.advanced(by: 16 + RawPtr.gcHeaderOffsetAt(tid, hk)), q, count)
+      count = rtMinorForward(space, obj.advanced(by: 16 + rtHeaderOffsetAt(tid, hk)), q, count)
       hk = hk + 1
     }
     var e = 0
-    let elemShaped = RawPtr.gcShapedCount(tid) > 0   // per-element live words (shaped elements)
+    let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
     while e < ecap {
       let elemBase = elemStart + e * stride
       let elemPtr = obj.advanced(by: elemBase)
       var en = nptr
       if elemShaped {
-        en = RawPtr.gcLiveCount(tid, elemPtr)
+        en = rtLiveCount(tid, elemPtr)
       }
       var i = 0
       while i < en {
-        let off = RawPtr.gcLiveOffsetAt(tid, elemPtr, i)
+        let off = rtLiveOffsetAt(tid, elemPtr, i)
         count = rtMinorForward(space, obj.advanced(by: elemBase + off), q, count)
         i = i + 1
       }
@@ -2771,7 +3317,7 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
 // by the STW coordinator with the world stopped. Returns the number of roots processed (0 before the first
 // managed allocation, while the space is null).
 fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
   let spaceNull = space.eq(RawPtr.null)
   if spaceNull {
     return 0
@@ -2781,11 +3327,11 @@ fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
     kind = 3
   }
   let collectStart = rtGcRecordEntry(kind)
-  let cap = 8192
-  let slots = RawPtr.alloc(bytes: cap * 8, align: 8)
+  let roots = rtRootsNew()
   let tw = rtGcPhaseOpen(2)
-  let ns = nomuSchedWalkSlots(sched, slots, cap)
+  let ns = nomuSchedWalkSlots(sched, roots)
   rtGcPhaseClose(2, tw)
+  let slots: RawPtr = roots.load(fromByteOffset: 0)
   rtGcCounter(1, ns)
   if forceAll != 0 {
     rtImmixCollectRoots(space, slots, ns)
@@ -2799,8 +3345,10 @@ fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
       rtImmixCollectRootsDefrag(space, slots, ns)
     }
   }
-  slots.free()
+  rtRootsFree(roots)
   rtGcRecordExit(collectStart)
+  rtCarriersResetTlabs()        // evacuation may have moved a carrier's block; refill on resume
+  rtCarriersResetModBufs()      // the collection consumed the remembered set; start empty next cycle
   return ns
 }
 
@@ -2817,39 +3365,40 @@ fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
 // Drive a minor (generational) collection at an STW (task 150.4.3): the stopped mutators' stack root slots
 // plus the drained per-carrier remembered set (the write barrier's mod-buffers) are the root set; the nursery
 // is promoted into mature Immix. Returns the number of objects promoted (0 while the space is null). The
-// drain (RawPtr.gcDrainModBufs) both collects and resets the mod-buffers, so the coordinator does not also
-// reset them; it does reset the mutator TLABs (their nursery blocks were reclaimed).
+// drain (rtCarriersDrainModBufs) both collects and empties the mod-buffers; the TLABs are reset after the
+// collection (their nursery blocks were reclaimed).
 fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
   let spaceNull = space.eq(RawPtr.null)
   if spaceNull {
     return 0
   }
   let collectStart = rtGcRecordEntry(1)
-  let cap = 8192
-  let slots = RawPtr.alloc(bytes: cap * 8, align: 8)
+  let roots = rtRootsNew()
   let tw = rtGcPhaseOpen(2)
-  let ns = nomuSchedWalkSlots(sched, slots, cap)
+  let ns = nomuSchedWalkSlots(sched, roots)
   rtGcPhaseClose(2, tw)
-  let remCap = 1048576
-  let rem = RawPtr.alloc(bytes: remCap * 8, align: 8)
+  let slots: RawPtr = roots.load(fromByteOffset: 0)
   let td = rtGcPhaseOpen(3)
-  let nrem = RawPtr.gcDrainModBufs(rem, remCap)
+  let remTotal = rtCarriersModBufTotal()
+  let rem = RawPtr.alloc(bytes: remTotal * 8 + 8, align: 8)   // exactly the remembered set (+8: never zero bytes)
+  let nrem = rtCarriersDrainModBufs(rem)
   rtGcPhaseClose(3, td)
   rtGcCounter(1, ns)
   rtGcCounter(3, nrem)
   let n = rtImmixCollectMinor(space, slots, ns, rem, nrem)
   rtGcCounter(2, n)
   rem.free()
-  slots.free()
+  rtRootsFree(roots)
   rtGcRecordExit(collectStart)
+  rtCarriersResetTlabs()        // the reclaimed nursery blocks moved out from under the carriers' TLABs
   return n
 }
 
 // Available empty blocks in the self-hosted Immix space (never-used + reclaimed-free) — the heap-pressure
 // gauge the GC-trigger thread polls. Returns -1 before the space exists (no managed allocation yet).
 fun nomuGcSpaceAvail() -> Int {
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
   let spaceNull = space.eq(RawPtr.null)
   if spaceNull {
     return -1
@@ -2862,7 +3411,7 @@ fun nomuGcSpaceAvail() -> Int {
 
 // Total blocks in the self-hosted Immix space (for the trigger threshold). 0 when it does not exist.
 fun nomuGcSpaceBlocks() -> Int {
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
   let spaceNull = space.eq(RawPtr.null)
   if spaceNull {
     return 0
@@ -2875,8 +3424,8 @@ fun nomuGcSpaceBlocks() -> Int {
 // interval is a piece of collector work (a phase, its start and duration, in a pause or concurrent); a cycle
 // is one logical collection (its kind, trigger and span), and the intervals inside it carry its number; a
 // counter is a value at a moment (heap snapshots are runs of counters). Present only under `gc.record`:
-// every call site sits under `RawPtr.gcRecordLevel() > 0`, a constant, so with the setting off it folds away
-// and the space's recorder slot stays null. Times are raw ticks (`RawPtr.ticks()`), converted when the
+// every call site sits under `Runtime.gcRecordLevel() > 0`, a constant, so with the setting off it folds away
+// and the space's recorder slot stays null. Times are raw ticks (`Runtime.ticks()`), converted when the
 // report is written.
 //
 // One recorder per recording thread; GenImmix records only on its STW coordinator. A recorder is written by
@@ -2928,14 +3477,14 @@ fun rtRecNew(thread: Int) -> RawPtr {
   rec.store(0, toByteOffset: 144)
   rec.store(0, toByteOffset: 152)
   rec.store(0, toByteOffset: 160)
-  rec.store(RawPtr.ticks(), toByteOffset: 168)
-  rec.store(RawPtr.wallNanos(), toByteOffset: 176)
+  rec.store(Runtime.ticks(), toByteOffset: 168)
+  rec.store(Runtime.wallNanos(), toByteOffset: 176)
   return rec
 }
 
 // The space's recorder: null before the space exists and when `gc.record` is off.
 fun rtRecSpace() -> RawPtr {
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
   let spaceNull = space.eq(RawPtr.null)
   if spaceNull {
     return RawPtr.null
@@ -2976,13 +3525,13 @@ fun rtRecOpen(rec: RawPtr, phase: Int) -> Int {
     rec.store(phase, toByteOffset: 80 + depth * 8)
   }
   rec.store(depth + 1, toByteOffset: 72)
-  return RawPtr.ticks()
+  return Runtime.ticks()
 }
 
 // Close the phase `phase` opened at `start`, recording its interval. `concurrent` is 1 for work that ran
 // beside the mutator, 0 for work in a pause.
 fun rtRecClose(rec: RawPtr, phase: Int, start: Int, concurrent: Int) {
-  let end = RawPtr.ticks()
+  let end = Runtime.ticks()
   rtRecAppend(rec, 1, phase, start, end - start, concurrent)
   let depth: Int = rec.load(fromByteOffset: 72)
   rec.store(depth - 1, toByteOffset: 72)
@@ -3003,18 +3552,18 @@ fun rtRecCycleEnd(rec: RawPtr) {
   let start: Int = rec.load(fromByteOffset: 56)
   let kind: Int = rec.load(fromByteOffset: 40)
   let trigger: Int = rec.load(fromByteOffset: 48)
-  rtRecAppend(rec, 2, kind, start, RawPtr.ticks() - start, trigger)
+  rtRecAppend(rec, 2, kind, start, Runtime.ticks() - start, trigger)
   rec.store(0, toByteOffset: 32)
 }
 
 // Record counter `id` as `value` at this moment.
 fun rtRecCounter(rec: RawPtr, id: Int, value: Int) {
-  rtRecAppend(rec, 3, id, RawPtr.ticks(), value, 0)
+  rtRecAppend(rec, 3, id, Runtime.ticks(), value, 0)
 }
 
 // Record an interval of phase `phase` from `start` to now, without opening it first.
 fun rtRecSpan(rec: RawPtr, phase: Int, start: Int) {
-  rtRecAppend(rec, 1, phase, start, RawPtr.ticks() - start, 0)
+  rtRecAppend(rec, 1, phase, start, Runtime.ticks() - start, 0)
 }
 
 // Reading: the number of published records, and the i-th (0-based) of them.
@@ -3079,15 +3628,15 @@ fun rtRecOpenPhase(rec: RawPtr) -> Int {
 //   counters:    1 roots, 2 objects promoted, 3 remembered entries, 4 defrag sources; a snapshot: 20 free
 //                blocks, 21 recyclable, 22 full, 23 nursery, 24 large objects, 25 blocks in the heap; since
 //                the last cycle: 30 blocks refilled, 31 large objects allocated, 32 their bytes.
-// The pause ends when the coordinator resumes the world, after the collector returns; that tail (TLAB and
-// mod-buffer resets, the wake) is the coordinator's, in C, and is not recorded.
+// The pause ends when the coordinator resumes the world, after the collector returns; that tail (the TLAB and
+// mod-buffer resets after the collect interval closes, and the coordinator's wake) is not recorded.
 
 // A mutator raising a collection, as the first carrier into the request, under the scheduler lock.
 fun rtGcRecordRequest(trigger: Int) {
-  if RawPtr.gcRecordLevel() > 0 {
+  if Runtime.gcRecordLevel() > 0 {
     let rec = rtRecSpace()
     if !rec.isNull {
-      rec.store(RawPtr.ticks(), toByteOffset: 128)
+      rec.store(Runtime.ticks(), toByteOffset: 128)
       rec.store(trigger, toByteOffset: 136)
     }
   }
@@ -3096,10 +3645,10 @@ fun rtGcRecordRequest(trigger: Int) {
 // The collector's entry, with the world stopped: begin a cycle of `kind` at its request, record the time to
 // safepoint and the allocation since the last cycle, and open the collect phase. Returns its start.
 fun rtGcRecordEntry(kind: Int) -> Int {
-  if RawPtr.gcRecordLevel() > 0 {
+  if Runtime.gcRecordLevel() > 0 {
     let rec = rtRecSpace()
     if !rec.isNull {
-      let entry = RawPtr.ticks()
+      let entry = Runtime.ticks()
       let requestedAt: Int = rec.load(fromByteOffset: 128)
       var start = entry
       if requestedAt != 0 {
@@ -3130,7 +3679,7 @@ fun rtGcRecordEntry(kind: Int) -> Int {
 
 // The collector's return: close the collect phase, take a snapshot, end the cycle.
 fun rtGcRecordExit(start: Int) {
-  if RawPtr.gcRecordLevel() > 0 {
+  if Runtime.gcRecordLevel() > 0 {
     let rec = rtRecSpace()
     if !rec.isNull {
       rtRecClose(rec, 18, start, 0)
@@ -3141,7 +3690,7 @@ fun rtGcRecordExit(start: Int) {
 }
 
 fun rtGcPhaseOpen(phase: Int) -> Int {
-  if RawPtr.gcRecordLevel() > 0 {
+  if Runtime.gcRecordLevel() > 0 {
     let rec = rtRecSpace()
     if !rec.isNull {
       return rtRecOpen(rec, phase)
@@ -3151,7 +3700,7 @@ fun rtGcPhaseOpen(phase: Int) -> Int {
 }
 
 fun rtGcPhaseClose(phase: Int, start: Int) {
-  if RawPtr.gcRecordLevel() > 0 {
+  if Runtime.gcRecordLevel() > 0 {
     let rec = rtRecSpace()
     if !rec.isNull {
       rtRecClose(rec, phase, start, 0)
@@ -3160,7 +3709,7 @@ fun rtGcPhaseClose(phase: Int, start: Int) {
 }
 
 fun rtGcCounter(id: Int, value: Int) {
-  if RawPtr.gcRecordLevel() > 0 {
+  if Runtime.gcRecordLevel() > 0 {
     let rec = rtRecSpace()
     if !rec.isNull {
       rtRecCounter(rec, id, value)
@@ -3170,7 +3719,7 @@ fun rtGcCounter(id: Int, value: Int) {
 
 // A block handed to a mutator's TLAB, under the pool lock.
 fun rtGcRecordRefill() {
-  if RawPtr.gcRecordLevel() > 0 {
+  if Runtime.gcRecordLevel() > 0 {
     let rec = rtRecSpace()
     if !rec.isNull {
       let n: Int = rec.load(fromByteOffset: 144)
@@ -3181,7 +3730,7 @@ fun rtGcRecordRefill() {
 
 // A large object of `bytes` allocated, under the pool lock.
 fun rtGcRecordLargeObject(bytes: Int) {
-  if RawPtr.gcRecordLevel() > 0 {
+  if Runtime.gcRecordLevel() > 0 {
     let rec = rtRecSpace()
     if !rec.isNull {
       let n: Int = rec.load(fromByteOffset: 152)
@@ -3196,7 +3745,7 @@ fun rtGcRecordLargeObject(bytes: Int) {
 // below the never-used cursor are read; the rest are free.
 fun rtGcRecordSnapshot(rec: RawPtr) {
   let start = rtRecOpen(rec, 17)
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
   let nb: Int = space.load(fromByteOffset: 8)
   let used: Int = space.load(fromByteOffset: 32)
   let tbl: RawPtr = space.load(fromByteOffset: 24)
@@ -3241,15 +3790,29 @@ fun rtGcRecordSnapshot(rec: RawPtr) {
 // `NOMU_GC_REPORT_DIR` names; `<time>` is the recorder's creation in UTC (`20261029T120405.123Z`), so runs
 // never overwrite each other. Times are integer microseconds from the recorder's creation; `dur` is a
 // duration. Its path is printed to stderr. Written in Nomu over raw buffers: the runtime subset calls no
-// `String` method, so text comes from literals (`RawPtr.copyLiteral`) and numbers are formatted here.
+// `String` method, so text comes from literals (`Runtime.copyLiteral`) and numbers are formatted here.
 
 fun rtGcRecordFinish() {
-  if RawPtr.gcRecordLevel() > 0 {
+  if Runtime.gcRecordLevel() > 0 {
     let rec = rtRecSpace()
     if !rec.isNull {
       rtGcReportWrite(rec)
     }
   }
+}
+
+// An array subscript out of range: generated code checks every subscript and calls this on a failure. Prints
+// the index and length to stderr and aborts; never returns. Its calls are gc-leaf.
+fun rtBoundsTrap(idx: Int, len: Int) {
+  let msg = rtBufNew(128)
+  rtBufGrew(msg, Runtime.copyLiteral(to: rtBufAt(msg, 32), "fatal error: array index "))
+  rtBufInt(msg, idx)
+  rtBufGrew(msg, Runtime.copyLiteral(to: rtBufAt(msg, 32), " out of range for length "))
+  rtBufInt(msg, len)
+  let md: RawPtr = msg.load(fromByteOffset: 0)
+  let ml: Int = msg.load(fromByteOffset: 8)
+  let w = Runtime.writeFd(fd: 2, buf: md, count: ml)
+  Runtime.fatal("")
 }
 
 // A growable byte buffer off the GC heap: { data: RawPtr @0, len: Int @8, cap: Int @16 }.
@@ -3378,48 +3941,48 @@ fun rtGcPutName(buf: RawPtr, table: Int, id: Int) {
   var n = 0
   let at = rtBufAt(buf, 64)
   if table == 1 {
-    if id == 1 { n = RawPtr.copyLiteral(to: at, "minor") }
-    else if id == 2 { n = RawPtr.copyLiteral(to: at, "major") }
-    else if id == 3 { n = RawPtr.copyLiteral(to: at, "forced") }
+    if id == 1 { n = Runtime.copyLiteral(to: at, "minor") }
+    else if id == 2 { n = Runtime.copyLiteral(to: at, "major") }
+    else if id == 3 { n = Runtime.copyLiteral(to: at, "forced") }
   } else if table == 2 {
-    if id == 0 { n = RawPtr.copyLiteral(to: at, "external driver") }
-    else if id == 1 { n = RawPtr.copyLiteral(to: at, "nursery full") }
-    else if id == 2 { n = RawPtr.copyLiteral(to: at, "mature floor") }
-    else if id == 3 { n = RawPtr.copyLiteral(to: at, "heap exhausted") }
-    else if id == 4 { n = RawPtr.copyLiteral(to: at, "allocation stress") }
+    if id == 0 { n = Runtime.copyLiteral(to: at, "external driver") }
+    else if id == 1 { n = Runtime.copyLiteral(to: at, "nursery full") }
+    else if id == 2 { n = Runtime.copyLiteral(to: at, "mature floor") }
+    else if id == 3 { n = Runtime.copyLiteral(to: at, "heap exhausted") }
+    else if id == 4 { n = Runtime.copyLiteral(to: at, "allocation stress") }
   } else if table == 3 {
-    if id == 1 { n = RawPtr.copyLiteral(to: at, "time to safepoint") }
-    else if id == 2 { n = RawPtr.copyLiteral(to: at, "root walk") }
-    else if id == 3 { n = RawPtr.copyLiteral(to: at, "remembered-set drain") }
-    else if id == 4 { n = RawPtr.copyLiteral(to: at, "stack roots") }
-    else if id == 5 { n = RawPtr.copyLiteral(to: at, "remembered set") }
-    else if id == 6 { n = RawPtr.copyLiteral(to: at, "large objects") }
-    else if id == 7 { n = RawPtr.copyLiteral(to: at, "scan") }
-    else if id == 8 { n = RawPtr.copyLiteral(to: at, "unmark and unlog") }
-    else if id == 9 { n = RawPtr.copyLiteral(to: at, "nursery reclaim") }
-    else if id == 10 { n = RawPtr.copyLiteral(to: at, "source selection") }
-    else if id == 11 { n = RawPtr.copyLiteral(to: at, "prepare") }
-    else if id == 12 { n = RawPtr.copyLiteral(to: at, "trace") }
-    else if id == 13 { n = RawPtr.copyLiteral(to: at, "sweep") }
-    else if id == 14 { n = RawPtr.copyLiteral(to: at, "large-object sweep") }
-    else if id == 15 { n = RawPtr.copyLiteral(to: at, "log-table clear") }
-    else if id == 16 { n = RawPtr.copyLiteral(to: at, "unmark") }
-    else if id == 17 { n = RawPtr.copyLiteral(to: at, "snapshot") }
-    else if id == 18 { n = RawPtr.copyLiteral(to: at, "collect") }
+    if id == 1 { n = Runtime.copyLiteral(to: at, "time to safepoint") }
+    else if id == 2 { n = Runtime.copyLiteral(to: at, "root walk") }
+    else if id == 3 { n = Runtime.copyLiteral(to: at, "remembered-set drain") }
+    else if id == 4 { n = Runtime.copyLiteral(to: at, "stack roots") }
+    else if id == 5 { n = Runtime.copyLiteral(to: at, "remembered set") }
+    else if id == 6 { n = Runtime.copyLiteral(to: at, "large objects") }
+    else if id == 7 { n = Runtime.copyLiteral(to: at, "scan") }
+    else if id == 8 { n = Runtime.copyLiteral(to: at, "unmark and unlog") }
+    else if id == 9 { n = Runtime.copyLiteral(to: at, "nursery reclaim") }
+    else if id == 10 { n = Runtime.copyLiteral(to: at, "source selection") }
+    else if id == 11 { n = Runtime.copyLiteral(to: at, "prepare") }
+    else if id == 12 { n = Runtime.copyLiteral(to: at, "trace") }
+    else if id == 13 { n = Runtime.copyLiteral(to: at, "sweep") }
+    else if id == 14 { n = Runtime.copyLiteral(to: at, "large-object sweep") }
+    else if id == 15 { n = Runtime.copyLiteral(to: at, "log-table clear") }
+    else if id == 16 { n = Runtime.copyLiteral(to: at, "unmark") }
+    else if id == 17 { n = Runtime.copyLiteral(to: at, "snapshot") }
+    else if id == 18 { n = Runtime.copyLiteral(to: at, "collect") }
   } else {
-    if id == 1 { n = RawPtr.copyLiteral(to: at, "roots") }
-    else if id == 2 { n = RawPtr.copyLiteral(to: at, "objects promoted") }
-    else if id == 3 { n = RawPtr.copyLiteral(to: at, "remembered entries") }
-    else if id == 4 { n = RawPtr.copyLiteral(to: at, "defrag sources") }
-    else if id == 20 { n = RawPtr.copyLiteral(to: at, "free blocks") }
-    else if id == 21 { n = RawPtr.copyLiteral(to: at, "recyclable blocks") }
-    else if id == 22 { n = RawPtr.copyLiteral(to: at, "full blocks") }
-    else if id == 23 { n = RawPtr.copyLiteral(to: at, "nursery blocks") }
-    else if id == 24 { n = RawPtr.copyLiteral(to: at, "large objects") }
-    else if id == 25 { n = RawPtr.copyLiteral(to: at, "heap blocks") }
-    else if id == 30 { n = RawPtr.copyLiteral(to: at, "blocks refilled") }
-    else if id == 31 { n = RawPtr.copyLiteral(to: at, "large objects allocated") }
-    else if id == 32 { n = RawPtr.copyLiteral(to: at, "large-object bytes allocated") }
+    if id == 1 { n = Runtime.copyLiteral(to: at, "roots") }
+    else if id == 2 { n = Runtime.copyLiteral(to: at, "objects promoted") }
+    else if id == 3 { n = Runtime.copyLiteral(to: at, "remembered entries") }
+    else if id == 4 { n = Runtime.copyLiteral(to: at, "defrag sources") }
+    else if id == 20 { n = Runtime.copyLiteral(to: at, "free blocks") }
+    else if id == 21 { n = Runtime.copyLiteral(to: at, "recyclable blocks") }
+    else if id == 22 { n = Runtime.copyLiteral(to: at, "full blocks") }
+    else if id == 23 { n = Runtime.copyLiteral(to: at, "nursery blocks") }
+    else if id == 24 { n = Runtime.copyLiteral(to: at, "large objects") }
+    else if id == 25 { n = Runtime.copyLiteral(to: at, "heap blocks") }
+    else if id == 30 { n = Runtime.copyLiteral(to: at, "blocks refilled") }
+    else if id == 31 { n = Runtime.copyLiteral(to: at, "large objects allocated") }
+    else if id == 32 { n = Runtime.copyLiteral(to: at, "large-object bytes allocated") }
   }
   rtBufGrew(buf, n)
   rtBufByte(buf, 34)
@@ -3427,19 +3990,19 @@ fun rtGcPutName(buf: RawPtr, table: Int, id: Int) {
 
 // `"names":{...}`: every id the report uses, by table.
 fun rtGcPutNames(buf: RawPtr) {
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "\"names\":{\"kinds\":{"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "\"names\":{\"kinds\":{"))
   rtGcPutNameList(buf, 1, 1, 3)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "},\"triggers\":{"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"triggers\":{"))
   rtGcPutNameList(buf, 2, 0, 4)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "},\"phases\":{"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"phases\":{"))
   rtGcPutNameList(buf, 3, 1, 18)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "},\"counters\":{"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"counters\":{"))
   rtGcPutNameList(buf, 4, 1, 4)
   rtBufByte(buf, 44)
   rtGcPutNameList(buf, 4, 20, 25)
   rtBufByte(buf, 44)
   rtGcPutNameList(buf, 4, 30, 32)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "}}"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "}}"))
 }
 
 fun rtGcPutNameList(buf: RawPtr, table: Int, from: Int, to: Int) {
@@ -3644,7 +4207,7 @@ fun rtBufUtc(buf: RawPtr, wallNs: Int, basic: Bool) {
 
 // Write `buf` to `path` (NUL-terminated). Returns whether it was written whole.
 fun rtGcWriteFile(path: RawPtr, buf: RawPtr) -> Bool {
-  let fd = RawPtr.createFile(path: path, mode: 420)   // 0644
+  let fd = Runtime.createFile(path: path, mode: 420)   // 0644
   if fd < 0 {
     return false
   }
@@ -3653,22 +4216,22 @@ fun rtGcWriteFile(path: RawPtr, buf: RawPtr) -> Bool {
   var off = 0
   var ok = true
   while off < len && ok {
-    let n = RawPtr.writeFd(fd: fd, buf: data.advanced(by: off), count: len - off)
+    let n = Runtime.writeFd(fd: fd, buf: data.advanced(by: off), count: len - off)
     if n <= 0 {
       ok = false
     } else {
       off = off + n
     }
   }
-  let closed = RawPtr.closeFd(fd: fd)
+  let closed = Runtime.closeFd(fd: fd)
   return ok && closed == 0
 }
 
 fun rtGcReportWrite(rec: RawPtr) {
-  let end = RawPtr.ticks()
+  let end = Runtime.ticks()
   let tb = RawPtr.alloc(bytes: 8, align: 8)
   tb.store(0, toByteOffset: 0)
-  let tbOk = RawPtr.timebase(info: tb)
+  let tbOk = Runtime.timebase(info: tb)
   let packed: Int = tb.load(fromByteOffset: 0)
   tb.free()
   let numer = packed % 4294967296
@@ -3682,7 +4245,7 @@ fun rtGcReportWrite(rec: RawPtr) {
   let exe = RawPtr.alloc(bytes: 4096, align: 8)
   let size = RawPtr.alloc(bytes: 8, align: 8)
   size.store(4096, toByteOffset: 0)
-  let got = RawPtr.executablePath(buf: exe, size: size)
+  let got = Runtime.executablePath(buf: exe, size: size)
   size.free()
   if got != 0 {
     exe.free()
@@ -3707,9 +4270,9 @@ fun rtGcReportWrite(rec: RawPtr) {
 
   // The directory: NOMU_GC_REPORT_DIR, or the executable's.
   let envName = RawPtr.alloc(bytes: 32, align: 8)
-  let envLen = RawPtr.copyLiteral(to: envName, "NOMU_GC_REPORT_DIR")
+  let envLen = Runtime.copyLiteral(to: envName, "NOMU_GC_REPORT_DIR")
   envName.store(0.uint8, toByteOffset: envLen)
-  let envDir = RawPtr.getenv(name: envName)
+  let envDir = Runtime.getenv(name: envName)
   envName.free()
   let path = rtBufNew(256)
   if !envDir.isNull {
@@ -3733,13 +4296,13 @@ fun rtGcReportWrite(rec: RawPtr) {
   let at = rtBufAt(path, nameLen)
   at.copyBytes(from: exe.advanced(by: nameStart), byteCount: nameLen)
   rtBufGrew(path, nameLen)
-  rtBufGrew(path, RawPtr.copyLiteral(to: rtBufAt(path, 16), "-gc-"))
+  rtBufGrew(path, Runtime.copyLiteral(to: rtBufAt(path, 16), "-gc-"))
   let originWall: Int = rec.load(fromByteOffset: 176)
   rtBufUtc(path, originWall, true)
   let stemLen: Int = path.load(fromByteOffset: 8)
 
   let report = rtGcReportJson(rec, exe.advanced(by: nameStart), nameLen, total, numer, denom)
-  rtBufGrew(path, RawPtr.copyLiteral(to: rtBufAt(path, 16), ".json"))
+  rtBufGrew(path, Runtime.copyLiteral(to: rtBufAt(path, 16), ".json"))
   rtBufByte(path, 0)
   let pathData: RawPtr = path.load(fromByteOffset: 0)
   let wroteReport = rtGcWriteFile(pathData, report)
@@ -3747,7 +4310,7 @@ fun rtGcReportWrite(rec: RawPtr) {
 
   let trace = rtGcTraceJson(rec, total, numer, denom)
   path.store(stemLen, toByteOffset: 8)
-  rtBufGrew(path, RawPtr.copyLiteral(to: rtBufAt(path, 16), ".trace.json"))
+  rtBufGrew(path, Runtime.copyLiteral(to: rtBufAt(path, 16), ".trace.json"))
   rtBufByte(path, 0)
   let tracePath: RawPtr = path.load(fromByteOffset: 0)
   let wroteTrace = rtGcWriteFile(tracePath, trace)
@@ -3756,12 +4319,12 @@ fun rtGcReportWrite(rec: RawPtr) {
   // Report the path (or the failure) on stderr.
   let msg = rtBufNew(256)
   if wroteReport && wroteTrace {
-    rtBufGrew(msg, RawPtr.copyLiteral(to: rtBufAt(msg, 32), "nomu-gc: report "))
+    rtBufGrew(msg, Runtime.copyLiteral(to: rtBufAt(msg, 32), "nomu-gc: report "))
   } else {
-    rtBufGrew(msg, RawPtr.copyLiteral(to: rtBufAt(msg, 48), "nomu-gc: cannot write the report "))
+    rtBufGrew(msg, Runtime.copyLiteral(to: rtBufAt(msg, 48), "nomu-gc: cannot write the report "))
   }
   path.store(stemLen, toByteOffset: 8)
-  rtBufGrew(path, RawPtr.copyLiteral(to: rtBufAt(path, 16), ".json"))
+  rtBufGrew(path, Runtime.copyLiteral(to: rtBufAt(path, 16), ".json"))
   let pd: RawPtr = path.load(fromByteOffset: 0)
   let pl: Int = path.load(fromByteOffset: 8)
   let mat = rtBufAt(msg, pl)
@@ -3770,7 +4333,7 @@ fun rtGcReportWrite(rec: RawPtr) {
   rtBufByte(msg, 10)
   let md: RawPtr = msg.load(fromByteOffset: 0)
   let ml: Int = msg.load(fromByteOffset: 8)
-  let w = RawPtr.writeFd(fd: 2, buf: md, count: ml)
+  let w = Runtime.writeFd(fd: 2, buf: md, count: ml)
   rtBufFree(msg)
   rtBufFree(path)
   exe.free()
@@ -3794,22 +4357,22 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
   var peakLarge = 0
   var heapBlocks = 0
 
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "{\"version\":1,\"binary\":\""))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "{\"version\":1,\"binary\":\""))
   rtBufJsonBytes(buf, name, nameLen)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "\",\"started\":\""))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "\",\"started\":\""))
   let originWall: Int = rec.load(fromByteOffset: 176)
   rtBufUtc(buf, originWall, false)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "\",\"record\":\""))
-  if RawPtr.gcRecordLevel() > 1 {
-    rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "full"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "\",\"record\":\""))
+  if Runtime.gcRecordLevel() > 1 {
+    rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), "full"))
   } else {
-    rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "limited"))
+    rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), "limited"))
   }
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "\",\"dur\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "\",\"dur\":"))
   rtBufInt(buf, total)
   rtBufByte(buf, 44)
   rtGcPutNames(buf)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"cycles\":["))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"cycles\":["))
   var runStart = 0
   var firstCycle = true
   var i = 0
@@ -3828,22 +4391,22 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
         rtBufByte(buf, 44)
       }
       firstCycle = false
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "{\"n\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), "{\"n\":"))
       rtBufInt(buf, c)
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"kind\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"kind\":"))
       rtBufInt(buf, id)
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"trigger\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"trigger\":"))
       rtBufInt(buf, trigger)
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"start\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"start\":"))
       rtBufInt(buf, s)
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"dur\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"dur\":"))
       rtBufInt(buf, d)
       pauses.store(s, toByteOffset: np * 16)
       pauses.store(s + d, toByteOffset: np * 16 + 8)
       durs.store(d, toByteOffset: np * 8)
       np = np + 1
       gcTime = gcTime + d
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"phases\":["))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"phases\":["))
       var first = true
       var k = runStart
       while k < i {
@@ -3874,7 +4437,7 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
         }
         k = k + 1
       }
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "],\"counters\":["))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), "],\"counters\":["))
       first = true
       var free = -1
       k = runStart
@@ -3909,7 +4472,7 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
         }
         k = k + 1
       }
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "]}"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), "]}"))
       runStart = i + 1
     }
     i = i + 1
@@ -3919,27 +4482,27 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
   // The metrics.
   rtSortInts(durs, np)
   rtSortInts(tts, nt)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"metrics\":{\"cycles\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"metrics\":{\"cycles\":"))
   rtBufInt(buf, np)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"gcTime\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"gcTime\":"))
   rtBufInt(buf, gcTime)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"mutatorTime\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"mutatorTime\":"))
   rtBufInt(buf, total - gcTime)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"pauses\":{\"p50\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"pauses\":{\"p50\":"))
   rtBufInt(buf, rtPercentile(durs, np, 50))
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"p90\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"p90\":"))
   rtBufInt(buf, rtPercentile(durs, np, 90))
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"p99\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"p99\":"))
   rtBufInt(buf, rtPercentile(durs, np, 99))
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"max\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"max\":"))
   rtBufInt(buf, rtPercentile(durs, np, 100))
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "},\"timeToSafepoint\":{\"p50\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"timeToSafepoint\":{\"p50\":"))
   rtBufInt(buf, rtPercentile(tts, nt, 50))
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"p99\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"p99\":"))
   rtBufInt(buf, rtPercentile(tts, nt, 99))
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"max\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"max\":"))
   rtBufInt(buf, rtPercentile(tts, nt, 100))
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), "},\"mmu\":["))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), "},\"mmu\":["))
   var w = 1000
   var firstW = true
   while w <= 1000000 {
@@ -3949,23 +4512,23 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
         rtBufByte(buf, 44)
       }
       firstW = false
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), "{\"window\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), "{\"window\":"))
       rtBufInt(buf, w)
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), ",\"mmu\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), ",\"mmu\":"))
       rtBufFraction(buf, mmu, 10000)
       rtBufByte(buf, 125)
     }
     w = w * 10
   }
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "],\"heap\":{\"blocks\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "],\"heap\":{\"blocks\":"))
   rtBufInt(buf, heapBlocks)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"peakBlocksInUse\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"peakBlocksInUse\":"))
   rtBufInt(buf, peakInUse)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"peakBytesInUse\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"peakBytesInUse\":"))
   rtBufInt(buf, peakInUse * 32768)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), ",\"peakLargeObjects\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"peakLargeObjects\":"))
   rtBufInt(buf, peakLarge)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "}}}\n"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), "}}}\n"))
   pauses.free()
   durs.free()
   tts.free()
@@ -3977,7 +4540,7 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
 // its phases nested inside, and the snapshot counters as counter tracks.
 fun rtGcTraceJson(rec: RawPtr, total: Int, numer: Int, denom: Int) -> RawPtr {
   let buf = rtBufNew(65536)
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 128), "{\"displayTimeUnit\":\"ms\",\"traceEvents\":[{\"ph\":\"M\",\"pid\":1,\"tid\":1,\"name\":\"thread_name\",\"args\":{\"name\":\"collector\"}}"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 128), "{\"displayTimeUnit\":\"ms\",\"traceEvents\":[{\"ph\":\"M\",\"pid\":1,\"tid\":1,\"name\":\"thread_name\",\"args\":{\"name\":\"collector\"}}"))
   let count = rtRecCount(rec)
   let chunks = rtRecChunks(rec)
   var i = 0
@@ -3990,28 +4553,28 @@ fun rtGcTraceJson(rec: RawPtr, total: Int, numer: Int, denom: Int) -> RawPtr {
     let flags: Int = r.load(fromByteOffset: 40)
     rtBufByte(buf, 44)
     if kind == 3 {
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "{\"ph\":\"C\",\"pid\":1,\"name\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "{\"ph\":\"C\",\"pid\":1,\"name\":"))
       rtGcPutName(buf, 4, id)
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"ts\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"ts\":"))
       rtBufInt(buf, rtGcMicros(rec, start, numer, denom))
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), ",\"args\":{\"value\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), ",\"args\":{\"value\":"))
       rtBufInt(buf, value)
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "}}"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), "}}"))
     } else {
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 64), "{\"ph\":\"X\",\"pid\":1,\"tid\":1,\"name\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "{\"ph\":\"X\",\"pid\":1,\"tid\":1,\"name\":"))
       if kind == 2 {
         rtGcPutName(buf, 1, id)
-        rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), ",\"cat\":\"cycle\""))
+        rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), ",\"cat\":\"cycle\""))
       } else {
         rtGcPutName(buf, 3, id)
-        rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), ",\"cat\":\"phase\""))
+        rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), ",\"cat\":\"phase\""))
       }
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"ts\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"ts\":"))
       rtBufInt(buf, rtGcMicros(rec, start, numer, denom))
-      rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), ",\"dur\":"))
+      rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), ",\"dur\":"))
       rtBufInt(buf, rtGcDuration(value, numer, denom))
       if kind == 2 {
-        rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 32), ",\"args\":{\"trigger\":"))
+        rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), ",\"args\":{\"trigger\":"))
         rtGcPutName(buf, 2, flags)
         rtBufByte(buf, 125)
       }
@@ -4019,7 +4582,7 @@ fun rtGcTraceJson(rec: RawPtr, total: Int, numer: Int, denom: Int) -> RawPtr {
     }
     i = i + 1
   }
-  rtBufGrew(buf, RawPtr.copyLiteral(to: rtBufAt(buf, 16), "]}\n"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), "]}\n"))
   chunks.free()
   return buf
 }
@@ -4143,7 +4706,7 @@ fun rtSchedMutexLockAt(m: RawPtr) {
       c = m.atomicExchange(2, atByteOffset: 0)
     }
     while c != 0 {
-      m.futexWait(expected: 2, timeoutMicros: 0)
+      Runtime.futexWait(at: m, expected: 2, timeoutMicros: 0)
       c = m.atomicExchange(2, atByteOffset: 0)
     }
   }
@@ -4152,7 +4715,7 @@ fun rtSchedMutexLockAt(m: RawPtr) {
 fun rtSchedMutexUnlockAt(m: RawPtr) {
   let prev: Int = m.atomicExchange(0, atByteOffset: 0)
   if prev == 2 {
-    m.futexWake(all: false)
+    Runtime.futexWake(at: m, all: false)
   }
 }
 
@@ -4206,14 +4769,14 @@ fun rtSchedDequeue(sched: RawPtr) -> RawPtr {
 fun rtSchedWake(sched: RawPtr, all: Bool) {
   let gw = sched.advanced(by: 24)
   gw.atomicFetchAdd(1, atByteOffset: 0)
-  gw.futexWake(all: all)
+  Runtime.futexWake(at: gw, all: all)
 }
 
 // Wake the timer thread (it waits on the timer-gen word at sched+56): bump the word, then futexWake.
 fun rtSchedWakeTimer(sched: RawPtr) {
   let tg = sched.advanced(by: 56)
   tg.atomicFetchAdd(1, atByteOffset: 0)
-  tg.futexWake(all: false)
+  Runtime.futexWake(at: tg, all: false)
 }
 
 // Raise the stop flag and wake everyone (idle carriers + the timer thread) so they exit for the join.
@@ -4324,11 +4887,11 @@ fun rtSchedTimerMain(sched: RawPtr) -> RawPtr {
         let tg = sched.advanced(by: 56)
         let gen: Int = tg.atomicLoad(fromByteOffset: 0)
         rtSchedMutexUnlockAt(sched.advanced(by: 48))
-        tg.futexWait(expected: gen, timeoutMicros: 1000000)
+        Runtime.futexWait(at: tg, expected: gen, timeoutMicros: 1000000)
       } else {
         let ents: RawPtr = sched.load(fromByteOffset: 72)
         let next: Int = ents.load(fromByteOffset: 0)
-        let now: Int = RawPtr.monotonicNanos()
+        let now: Int = Runtime.monotonicNanos()
         if next <= now {
           rtSchedTimerPopMin(sched, out)
           rtSchedMutexUnlockAt(sched.advanced(by: 48))
@@ -4339,7 +4902,7 @@ fun rtSchedTimerMain(sched: RawPtr) -> RawPtr {
           let gen: Int = tg.atomicLoad(fromByteOffset: 0)
           rtSchedMutexUnlockAt(sched.advanced(by: 48))
           let waitUs: Int = (next - now) / 1000
-          tg.futexWait(expected: gen, timeoutMicros: waitUs)
+          Runtime.futexWait(at: tg, expected: gen, timeoutMicros: waitUs)
         }
       }
     }
@@ -4368,7 +4931,7 @@ fun rtSchedFiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   fib.store(RawPtr.null, toByteOffset: 264)   // anchor-sp
   fib.store(0, toByteOffset: 272)             // anchor-pc
   fib.store(RawPtr.null, toByteOffset: 288)   // shadow-top — typed-root list head (erased non-POD T, 100.4.3.6)
-  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(rtSchedFiberMain), arg: fib)
+  Runtime.fiberInit(context: fib, stackTop: stackTop, entry: Runtime.ofFunc(rtSchedFiberMain), arg: fib)
   return fib
 }
 
@@ -4380,7 +4943,10 @@ fun rtSchedFiberMain(fib: RawPtr) -> RawPtr {
   rtSchedUnlock(sched)
   let entry: RawPtr = fib.load(fromByteOffset: 184)
   let arg: RawPtr = fib.load(fromByteOffset: 192)
-  let res = entry.callEntry(arg)
+  // The argument (a spawn's managed closure environment) is rooted at fib+192 only until the fiber starts;
+  // from here the entry's own frames hold it. Clear the word so the walk never roots a stale copy.
+  fib.store(RawPtr.null, toByteOffset: 192)
+  let res = Runtime.callEntry(entry, arg: arg)
   rtSchedLock(sched)
   fib.store(res, toByteOffset: 216)
   fib.store(3, toByteOffset: 168)
@@ -4402,13 +4968,14 @@ fun rtSchedFiberMain(fib: RawPtr) -> RawPtr {
     }
   }
   let carrierCtx: RawPtr = fib.load(fromByteOffset: 232)
-  fib.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: fib, to: carrierCtx)
   return fib
 }
 
-// The carrier loop: hold the lock, switch into each ready fiber (recording this carrier + rt_current), or
+// The carrier loop: hold the lock, switch into each ready fiber (recording it in this carrier's record), or
 // sleep on the wake-gen futex when the queue is empty. Exit when the stop flag is raised.
 fun rtSchedLoop(sched: RawPtr, myCtx: RawPtr) {
+  let rec = rtCarrier()
   rtSchedLock(sched)
   var go = true
   while go {
@@ -4428,13 +4995,13 @@ fun rtSchedLoop(sched: RawPtr, myCtx: RawPtr) {
           let gw = sched.advanced(by: 24)
           let gen: Int = gw.atomicLoad(fromByteOffset: 0)
           rtSchedUnlock(sched)
-          gw.futexWait(expected: gen, timeoutMicros: 1000000)
+          Runtime.futexWait(at: gw, expected: gen, timeoutMicros: 1000000)
           rtSchedLock(sched)
         } else {
           fib.store(myCtx, toByteOffset: 232)
           fib.store(1, toByteOffset: 168)
-          RawPtr.tlsSet(fib)
-          myCtx.ctxSwitchTo(fib)
+          rec.store(fib, toByteOffset: 64)
+          Runtime.ctxSwitch(from: myCtx, to: fib)
           // If the fiber stopped at a safepoint for STW (state 4), this carrier acks and waits, then
           // switches back into it to resume past the poll — repeating if another STW round follows.
           var fst: Int = fib.load(fromByteOffset: 168)
@@ -4443,8 +5010,8 @@ fun rtSchedLoop(sched: RawPtr, myCtx: RawPtr) {
             rtSchedStwParkCarrier(sched)
             rtSchedLock(sched)
             fib.store(1, toByteOffset: 168)
-            RawPtr.tlsSet(fib)
-            myCtx.ctxSwitchTo(fib)
+            rec.store(fib, toByteOffset: 64)
+            Runtime.ctxSwitch(from: myCtx, to: fib)
             fst = fib.load(fromByteOffset: 168)
           }
         }
@@ -4501,10 +5068,10 @@ fun rtSchedMailboxFiberMain(fib: RawPtr) -> RawPtr {
       fib.store(2, toByteOffset: 168)                                 // parked
       fib.store(RawPtr.null, toByteOffset: 264)                       // idle: no roots — STW walk skips it
       let carrierCtx: RawPtr = fib.load(fromByteOffset: 232)
-      fib.ctxSwitchTo(carrierCtx)                                     // hand lock to scheduler; resume with it held
+      Runtime.ctxSwitch(from: fib, to: carrierCtx)                                     // hand lock to scheduler; resume with it held
     } else {
       rtSchedUnlock(sched)
-      drainPtr.callEntry(mb)                                          // nomu_actor_drain(mb), lock-free
+      Runtime.callEntry(drainPtr, arg: mb)                                          // nomu_actor_drain(mb), lock-free
       rtSchedLock(sched)
     }
   }
@@ -4527,7 +5094,7 @@ fun rtSchedMailboxFiberNew(sched: RawPtr) -> RawPtr {
   fib.store(0, toByteOffset: 272)             // anchor-pc
   fib.store(RawPtr.null, toByteOffset: 288)   // shadow-top — typed-root list head (erased non-POD T, 100.4.3.6)
   rtSchedRegInsert(sched, fib)                // in the registry so a handler stopped mid-drain is STW-walked
-  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(rtSchedMailboxFiberMain), arg: fib)
+  Runtime.fiberInit(context: fib, stackTop: stackTop, entry: Runtime.ofFunc(rtSchedMailboxFiberMain), arg: fib)
   return fib
 }
 
@@ -4612,7 +5179,7 @@ fun rtSchedSetAnchor(fib: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
 
 // Link a caller-allocated node `{ prev(0), buffer(8), vwt(16) }` at the current fiber's shadow-top.
 fun rtShadowPush(node: RawPtr, buffer: RawPtr, vwt: RawPtr) {
-  let self = RawPtr.tlsGet()
+  let self = rtCurrentFiber()
   if self.isNull {
     return
   }
@@ -4625,7 +5192,7 @@ fun rtShadowPush(node: RawPtr, buffer: RawPtr, vwt: RawPtr) {
 
 // Restore the shadow-top to a value saved on entry (LIFO pop of every node a frame pushed, on any exit).
 fun rtShadowPopTo(savedTop: RawPtr) {
-  let self = RawPtr.tlsGet()
+  let self = rtCurrentFiber()
   if self.isNull {
     return
   }
@@ -4634,7 +5201,7 @@ fun rtShadowPopTo(savedTop: RawPtr) {
 
 // The current fiber's shadow-top (saved on entry to an erased frame, restored on exit).
 fun rtShadowSave() -> RawPtr {
-  let self = RawPtr.tlsGet()
+  let self = rtCurrentFiber()
   if self.isNull {
     return RawPtr.null
   }
@@ -4642,10 +5209,10 @@ fun rtShadowSave() -> RawPtr {
 }
 
 // Walk one fiber's typed-root shadow list, appending each registered buffer's interior managed-pointer
-// roots into `outBuf` (slot addresses when `emitSlots != 0` for a moving fixup, else values). The VWT's
+// roots into the growable buffer `roots` (slot addresses when `emitSlots != 0` for a moving fixup, else values). The VWT's
 // `type_id` (byte 8) is its value-layout GC descriptor offset (100.4.7.4), read through the same pointer
 // map the object walk uses. Called with the world stopped, so the buffers on the fiber's stack are stable.
-fun rtWalkShadow(fib: RawPtr, outBuf: RawPtr, n0: Int, cap: Int, emitSlots: Int) -> Int {
+fun rtWalkShadow(fib: RawPtr, roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
   var n = n0
   var node: RawPtr = fib.load(fromByteOffset: 288)
   while node.isNull == false {
@@ -4656,21 +5223,19 @@ fun rtWalkShadow(fib: RawPtr, outBuf: RawPtr, n0: Int, cap: Int, emitSlots: Int)
         let w: Int = vwt.load(fromByteOffset: 8)      // { type_id (low 32), flags (high 32) }
         let hi = w / 4294967296
         let tid = w - hi * 4294967296                 // type_id = value-layout descriptor offset
-        let nptr = RawPtr.gcLiveCount(tid, buf)
+        let nptr = rtLiveCount(tid, buf)
         var i = 0
         while i < nptr {
-          let off = RawPtr.gcLiveOffsetAt(tid, buf, i)
+          let off = rtLiveOffsetAt(tid, buf, i)
           let slotPtr = buf.advanced(by: off)
           let root: RawPtr = slotPtr.load(fromByteOffset: 0)
           if root.isNull == false {
-            if n < cap {
-              if emitSlots != 0 {
-                outBuf.store(slotPtr, toByteOffset: n * 8)
-              } else {
-                outBuf.store(root, toByteOffset: n * 8)
-              }
-              n = n + 1
+            if emitSlots != 0 {
+              rtQueuePush(roots, n, slotPtr)
+            } else {
+              rtQueuePush(roots, n, root)
             }
+            n = n + 1
           }
           i = i + 1
         }
@@ -4694,32 +5259,37 @@ fun rtSchedStwParkCarrier(sched: RawPtr) {
   let g: Int = gw.atomicLoad(fromByteOffset: 0)
   let ack = sched.advanced(by: 144)
   ack.atomicFetchAdd(1, atByteOffset: 0)
-  ack.futexWake(all: true)                       // the initiator waits on the ack count
+  Runtime.futexWake(at: ack, all: true)                       // the initiator waits on the ack count
   while gw.atomicLoad(fromByteOffset: 0) == g {
-    gw.futexWait(expected: g, timeoutMicros: 1000000)
+    Runtime.futexWait(at: gw, expected: g, timeoutMicros: 1000000)
   }
 }
 
-// The safepoint slow path under the Nomu plan (called from __nomu_gc_poll_slow when __nomu_stop_world is
+// The stop-the-world flag: an `Int32`, nonzero while a collection asks running fibers to stop. Codegen's
+// inline poll reads it by symbol (`nomu_static_rtStopWorld`) at every loop back-edge; the C coordinator
+// threads write it until they move into the runtime.
+let rtStopWorld = Runtime.staticStorage(bytes: 4, align: 4)
+
+// The safepoint slow path under the Nomu plan (called from __nomu_gc_poll_slow when `rtStopWorld` is
 // set). The running fiber records the user-frame anchor its C poll shim captured, marks itself
 // safepoint-stopped (state 4), and switches to its carrier — which then acks the STW and waits. On resume
 // the carrier switches back in and this returns, so the fiber continues past the poll. The carrier holds
 // the scheduler lock across the switch (the lock-coupled protocol), released here after switch-back-in.
 fun nomuSchedSafepoint(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
-  let self = RawPtr.tlsGet()
+  let self = rtCurrentFiber()
   rtSchedSetAnchor(self, anchorSp, anchorPc)
   rtSchedLock(sched)
   self.store(4, toByteOffset: 168)               // safepoint-stopped
   let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  self.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: self, to: carrierCtx)
   rtSchedUnlock(sched)
 }
 
 // Walk every parked fiber's roots from its stored user-frame anchor (rtWalkFrom, the self-hosted pcsp
-// walk). Appends roots into outBuf; returns the count. Skips running fibers (their roots are the caller's
+// walk). Appends roots into the growable buffer `roots`; returns the count. Skips running fibers (their roots are the caller's
 // live stack, reached differently) and fibers with no anchor. Caller has stopped the world (all target
 // fibers parked at a safepoint), so the registry + anchors are stable.
-fun nomuSchedWalkRoots(sched: RawPtr, outBuf: RawPtr, cap: Int, emitSlots: Int) -> Int {
+fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
   var n = 0
   var cur: RawPtr = sched.load(fromByteOffset: 128)
   while cur.isNull == false {
@@ -4731,11 +5301,23 @@ fun nomuSchedWalkRoots(sched: RawPtr, outBuf: RawPtr, cap: Int, emitSlots: Int) 
       let sp: RawPtr = cur.load(fromByteOffset: 264)
       if sp.isNull == false {
         let pc: Int = cur.load(fromByteOffset: 272)
-        n = rtWalkFrom(sp, pc, outBuf, n, cap, emitSlots)
+        n = rtWalkFrom(sp, pc, roots, n, emitSlots)
       }
       // Typed roots: the interior managed pointers of this fiber's live erased non-POD `T` buffers,
       // invisible to the stackmap walk above (task 100.4.3.6).
-      n = rtWalkShadow(cur, outBuf, n, cap, emitSlots)
+      n = rtWalkShadow(cur, roots, n, emitSlots)
+    }
+    // A spawned fiber that has not started yet: its argument, the spawn's managed closure environment, is
+    // reachable only through fib+192 (rtSchedFiberMain clears it on the first switch-in). Without this root a
+    // collection before the fiber runs frees the environment, and the fiber reads its captures from garbage.
+    let arg: RawPtr = cur.load(fromByteOffset: 192)
+    if arg.isNull == false {
+      if emitSlots != 0 {
+        rtQueuePush(roots, n, cur.advanced(by: 192))
+      } else {
+        rtQueuePush(roots, n, arg)
+      }
+      n = n + 1
     }
     if st == 3 {
       // Completed spawn fiber awaiting join (150.3.13): its result is a managed box at fib+216, reachable
@@ -4743,14 +5325,12 @@ fun nomuSchedWalkRoots(sched: RawPtr, outBuf: RawPtr, cap: Int, emitSlots: Int) 
       // moving collection rewrites it in place with the box's forwarded pointer), value mode emits the box.
       let box: RawPtr = cur.load(fromByteOffset: 216)
       if box.isNull == false {
-        if n < cap {
-          if emitSlots != 0 {
-            outBuf.store(cur.advanced(by: 216), toByteOffset: n * 8)
-          } else {
-            outBuf.store(box, toByteOffset: n * 8)
-          }
-          n = n + 1
+        if emitSlots != 0 {
+          rtQueuePush(roots, n, cur.advanced(by: 216))
+        } else {
+          rtQueuePush(roots, n, box)
         }
+        n = n + 1
       }
     }
     cur = cur.load(fromByteOffset: 240)
@@ -4765,41 +5345,62 @@ fun nomuSchedWalkRoots(sched: RawPtr, outBuf: RawPtr, cap: Int, emitSlots: Int) 
   // would leave it dangling into reclaimed from-space (nomuSchedActorSend reads it on the next enqueue).
   let mboxHead: RawPtr = sched.load(fromByteOffset: 80)
   if mboxHead.isNull == false {
-    if n < cap {
-      if emitSlots != 0 {
-        outBuf.store(sched.advanced(by: 80), toByteOffset: n * 8)
-      } else {
-        outBuf.store(mboxHead, toByteOffset: n * 8)
-      }
-      n = n + 1
+    if emitSlots != 0 {
+      rtQueuePush(roots, n, sched.advanced(by: 80))
+    } else {
+      rtQueuePush(roots, n, mboxHead)
     }
+    n = n + 1
     if emitSlots != 0 {
       let mboxTail: RawPtr = sched.load(fromByteOffset: 88)
       if mboxTail.isNull == false {
-        if n < cap {
-          outBuf.store(sched.advanced(by: 88), toByteOffset: n * 8)
-          n = n + 1
-        }
+        rtQueuePush(roots, n, sched.advanced(by: 88))
+        n = n + 1
       }
     }
   }
   return n
 }
 
-// Value mode (root object addresses) — for the STW root-recovery smoke / oracle diff.
+// A growable root buffer: the handle `{base @0, cap @8}` rtQueuePush grows. Free it with rtRootsFree.
+fun rtRootsNew() -> RawPtr {
+  let cap = 4096
+  let roots = RawPtr.alloc(bytes: 16, align: 8)
+  roots.store(RawPtr.alloc(bytes: cap * 8, align: 8), toByteOffset: 0)
+  roots.store(cap, toByteOffset: 8)
+  return roots
+}
+
+fun rtRootsFree(roots: RawPtr) {
+  let base: RawPtr = roots.load(fromByteOffset: 0)
+  base.free()
+  roots.free()
+}
+
+// Value mode (root object addresses) — for the C stop-the-world smoke driver (NOMU_STW_SELFHOST), which
+// passes a fixed buffer: copies up to `cap` roots into it and returns the total, which may exceed `cap`.
 fun nomuSchedWalkParked(sched: RawPtr, outBuf: RawPtr, cap: Int) -> Int {
-  return nomuSchedWalkRoots(sched, outBuf, cap, 0)
+  let roots = rtRootsNew()
+  let n = nomuSchedWalkRoots(sched, roots, 0)
+  var k = n
+  if k > cap {
+    k = cap
+  }
+  let base: RawPtr = roots.load(fromByteOffset: 0)
+  outBuf.copyBytes(from: base, byteCount: k * 8)
+  rtRootsFree(roots)
+  return n
 }
 
 // Slot mode (root slot addresses) — for a moving collection, which rewrites each slot with the survivor's
-// forwarded address.
-fun nomuSchedWalkSlots(sched: RawPtr, outBuf: RawPtr, cap: Int) -> Int {
-  return nomuSchedWalkRoots(sched, outBuf, cap, 1)
+// forwarded address. Fills the growable buffer `roots` (rtRootsNew) and returns the count.
+fun nomuSchedWalkSlots(sched: RawPtr, roots: RawPtr) -> Int {
+  return nomuSchedWalkRoots(sched, roots, 1)
 }
 
 // ---- C-callable entry points (symbols nomu_fn_nomuSched*; runtime.c dispatches to these) ----
 
-// Allocate + init a scheduler. Returns the opaque Sched handle the C side stashes as rt_nomu_sched.
+// Allocate + init a scheduler. Returns the opaque Sched handle; the runtime's is the startup global `rtSched`.
 fun nomuSchedNew() -> RawPtr {
   let sched = RawPtr.alloc(bytes: 256, align: 16)
   sched.store(RawPtr.null, toByteOffset: 0)
@@ -4818,7 +5419,7 @@ fun nomuSchedNew() -> RawPtr {
   sched.store(0, toByteOffset: 96)                       // active-drains
   sched.store(RawPtr.null, toByteOffset: 104)            // mbfiber-free (pool free-list)
   sched.store(0, toByteOffset: 112)                      // mbfiber-count
-  sched.store(RawPtr.null, toByteOffset: 120)            // drain-fn-ptr (set at boot)
+  sched.store(RawPtr.null, toByteOffset: 120)            // drain-fn-ptr (set when an actor is created)
   sched.store(RawPtr.null, toByteOffset: 128)            // live-fiber registry head
   sched.store(0, toByteOffset: 136)                      // stw-request
   sched.store(0, toByteOffset: 144)                      // stw-ack
@@ -4832,9 +5433,9 @@ fun nomuSchedNew() -> RawPtr {
 // the scheduler lock across both so the timer thread's unpark cannot re-queue us before our context is
 // saved (lock-handoff spanning scheduler↔timer). Returns `ms`. The C rt_sleep_ms shim dispatches here.
 fun nomuSchedSleep(sched: RawPtr, ms: Int, anchorSp: RawPtr, anchorPc: Int) -> Int {
-  let self = RawPtr.tlsGet()
+  let self = rtCurrentFiber()
   rtSchedSetAnchor(self, anchorSp, anchorPc)   // user-frame anchor for the STW walk (128.3.2)
-  let expiry: Int = RawPtr.monotonicNanos() + ms * 1000000
+  let expiry: Int = Runtime.monotonicNanos() + ms * 1000000
   rtSchedLock(sched)
   rtSchedMutexLockAt(sched.advanced(by: 48))
   rtSchedTimerPush(sched, expiry, self)
@@ -4842,27 +5443,201 @@ fun nomuSchedSleep(sched: RawPtr, ms: Int, anchorSp: RawPtr, anchorPc: Int) -> I
   rtSchedWakeTimer(sched)
   self.store(2, toByteOffset: 168)
   let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  self.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: self, to: carrierCtx)
   rtSchedUnlock(sched)
   return ms
-}
-
-// The running fiber's handle — for the C floor, which records it before parking it (the stdin waiter list).
-fun nomuSchedCurrent() -> RawPtr {
-  return RawPtr.tlsGet()
 }
 
 // Park the running fiber until some feeder unparks it (rtSchedUnpark). The caller holds the scheduler lock,
 // taken after it registered the fiber with that feeder, so the feeder's unpark cannot re-queue the fiber
 // before its context is saved — the lock handoff nomuSchedSleep uses. Returns with the lock released. The
-// anchor is the user frame the C shim captured, for the STW walk. Used by rt_read_line (the stdin poller).
+// anchor is the user frame the forwarder captured, for the STW walk. Used by rtReadLine (the stdin poller).
 fun nomuSchedParkLocked(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
-  let self = RawPtr.tlsGet()
+  let self = rtCurrentFiber()
   rtSchedSetAnchor(self, anchorSp, anchorPc)
   self.store(2, toByteOffset: 168)
   let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  self.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: self, to: carrierCtx)
   rtSchedUnlock(sched)
+}
+
+// ---- Line input and the stdin poller ----
+// `readLine` reads stdin through one line buffer. A fiber whose line is not buffered yet checks readiness
+// (`Runtime.poll`); when stdin has nothing to read it joins the waiter list and parks, so its carrier runs
+// other fibers meanwhile. One poller thread, started on first use, blocks in kevent(2) on a one-shot read
+// event for stdin and, when it fires, unparks every waiter; each re-checks the buffer, and one that still
+// finds nothing waits again. Every waiter shares the one kqueue registration: kqueue keys an event by
+// (fd, filter), so arming per fiber would overwrite an earlier waiter's wake-up.
+//
+// Lock order: the stdin lock, then the scheduler lock. A parking fiber takes the scheduler lock before it
+// releases the stdin lock, and the poller takes the scheduler lock (rtSchedUnpark) only after releasing the
+// stdin lock, so an unpark cannot re-queue a fiber whose context is not saved yet. The stdin lock is never
+// held across a park.
+//
+// rtStdin: 0 lock (futex mutex word) · 8 buffer · 16 head (first unread byte) · 24 end (bytes buffered)
+//          · 32 capacity · 40 end of input seen · 48 waiter list · 56 read event armed · 64 kqueue fd
+//          · 72 poller started · 80 poller thread handle
+// A waiter (16 bytes): 0 fiber · 8 next.
+let rtStdin = Runtime.staticStorage(bytes: 96, align: 8)
+
+// Read one line from stdin. Returns a raw block the caller frees: the line's byte count at 0, then its bytes
+// (without the newline) at 8. At end of input, the unterminated remainder, then empty lines. The anchor is
+// the user frame the `readLine` forwarder captured, recorded if the fiber parks.
+fun rtReadLine(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
+  let st = rtStdin
+  rtSchedMutexLockAt(st)
+  while true {
+    let buf: RawPtr = st.load(fromByteOffset: 8)
+    let head: Int = st.load(fromByteOffset: 16)
+    let end: Int = st.load(fromByteOffset: 24)
+    var i = head
+    var found = false
+    while !found && i < end {
+      let c: UInt8 = buf.load(fromByteOffset: i)
+      if c.int == 10 {
+        found = true
+      } else {
+        i = i + 1
+      }
+    }
+    let eof: Int = st.load(fromByteOffset: 40)
+    if found || eof != 0 {
+      // A line ends at i; at end of input the line is the rest of the buffer, past which i stops.
+      let line = rtStdinTake(st, buf, head, i - head)
+      var next = i
+      if found {
+        next = i + 1
+      }
+      if next >= end {
+        st.store(0, toByteOffset: 16)
+        st.store(0, toByteOffset: 24)
+      } else {
+        st.store(next, toByteOffset: 16)
+      }
+      rtSchedMutexUnlockAt(st)
+      return line
+    }
+    if Runtime.poll(fd: 0) == 0 {
+      // Nothing to read: wait for the poller, then re-check from the top.
+      rtStdinPollerStart(st)
+      let w = RawPtr.alloc(bytes: 16, align: 8)
+      w.store(rtCurrentFiber(), toByteOffset: 0)
+      let first: RawPtr = st.load(fromByteOffset: 48)
+      w.store(first, toByteOffset: 8)
+      st.store(w, toByteOffset: 48)
+      let armed: Int = st.load(fromByteOffset: 56)
+      if armed == 0 {
+        rtStdinArm(st)
+        st.store(1, toByteOffset: 56)
+      }
+      rtSchedLock(sched)
+      rtSchedMutexUnlockAt(st)
+      nomuSchedParkLocked(sched, anchorSp, anchorPc)   // returns with the scheduler lock released
+      rtSchedMutexLockAt(st)
+    } else {
+      // Readable: read what is there. Holding the stdin lock serializes readers; a readable fd does not
+      // block.
+      rtStdinReserve(st, 4096)
+      let rbuf: RawPtr = st.load(fromByteOffset: 8)
+      let rend: Int = st.load(fromByteOffset: 24)
+      let cap: Int = st.load(fromByteOffset: 32)
+      let n = Runtime.readFd(fd: 0, buf: rbuf.advanced(by: rend), count: cap - rend)
+      if n > 0 {
+        st.store(rend + n, toByteOffset: 24)
+      } else {
+        st.store(1, toByteOffset: 40)   // end of input (or a read error, treated the same)
+      }
+    }
+  }
+  return RawPtr.null
+}
+
+// Copy `n` bytes at `buf + from` into a fresh line block: the count at 0, the bytes at 8.
+fun rtStdinTake(st: RawPtr, buf: RawPtr, from: Int, n: Int) -> RawPtr {
+  let line = RawPtr.alloc(bytes: 8 + n, align: 8)
+  line.store(n, toByteOffset: 0)
+  if n > 0 {
+    line.advanced(by: 8).copyBytes(from: buf.advanced(by: from), byteCount: n)
+  }
+  return line
+}
+
+// Make room for at least `room` more bytes past the buffered end: move the unread bytes to the front of a
+// buffer of twice the capacity (8 KiB at first) when they do not fit.
+fun rtStdinReserve(st: RawPtr, room: Int) {
+  let cap: Int = st.load(fromByteOffset: 32)
+  let end: Int = st.load(fromByteOffset: 24)
+  if cap - end >= room {
+    return
+  }
+  let buf: RawPtr = st.load(fromByteOffset: 8)
+  let head: Int = st.load(fromByteOffset: 16)
+  var ncap = 8192
+  if cap > 0 {
+    ncap = cap * 2
+  }
+  let nbuf = RawPtr.alloc(bytes: ncap, align: 8)
+  if end > head {
+    nbuf.copyBytes(from: buf.advanced(by: head), byteCount: end - head)
+  }
+  if !buf.isNull {
+    buf.free()
+  }
+  st.store(nbuf, toByteOffset: 8)
+  st.store(0, toByteOffset: 16)
+  st.store(end - head, toByteOffset: 24)
+  st.store(ncap, toByteOffset: 32)
+}
+
+// Register the one-shot read event for stdin on the poller's kqueue. A `struct kevent` (32 bytes): ident at
+// 0, filter (int16) at 8, flags (uint16) at 10, fflags (uint32) at 12, data at 16, udata at 24. EVFILT_READ
+// is -1; flags are EV_ADD (0x1) | EV_ONESHOT (0x10).
+fun rtStdinArm(st: RawPtr) {
+  let ev = RawPtr.alloc(bytes: 32, align: 8)
+  ev.store(0, toByteOffset: 0)
+  ev.store(1179647, toByteOffset: 8)   // filter 0xFFFF, flags 0x0011, fflags 0
+  ev.store(0, toByteOffset: 16)
+  ev.store(0, toByteOffset: 24)
+  let kq: Int = st.load(fromByteOffset: 64)
+  Runtime.kevent(kq: kq, changes: ev, nchanges: 1, events: RawPtr.null, nevents: 0)
+  ev.free()
+}
+
+// Start the poller thread once: the first waiter to win the flag creates the kqueue and the thread. Called
+// with the stdin lock held, so the kqueue exists before any waiter arms it.
+fun rtStdinPollerStart(st: RawPtr) {
+  let started: Int = st.load(fromByteOffset: 72)
+  if started != 0 {
+    return
+  }
+  st.store(1, toByteOffset: 72)
+  st.store(Runtime.kqueue(), toByteOffset: 64)
+  Runtime.threadCreate(handle: st.advanced(by: 80), entry: Runtime.ofFunc(rtStdinPollerMain), arg: st)
+}
+
+// The poller thread: block in kevent until stdin is readable, then take every waiter and unpark it. Runs
+// for the life of the process.
+fun rtStdinPollerMain(st: RawPtr) -> RawPtr {
+  let evs = RawPtr.alloc(bytes: 32 * 8, align: 8)
+  while true {
+    let kq: Int = st.load(fromByteOffset: 64)
+    let n = Runtime.kevent(kq: kq, changes: RawPtr.null, nchanges: 0, events: evs, nevents: 8)
+    if n > 0 {
+      rtSchedMutexLockAt(st)
+      var w: RawPtr = st.load(fromByteOffset: 48)
+      st.store(RawPtr.null, toByteOffset: 48)
+      st.store(0, toByteOffset: 56)
+      rtSchedMutexUnlockAt(st)
+      while !w.isNull {
+        let nx: RawPtr = w.load(fromByteOffset: 8)
+        let fib: RawPtr = w.load(fromByteOffset: 0)
+        rtSchedUnpark(rtSched, fib)
+        w.free()
+        w = nx
+      }
+    }
+  }
+  return st
 }
 
 // Spawn a runnable fiber over the given C-ABI entry (void*(void*)). Returns the fiber handle, which the C
@@ -4880,19 +5655,19 @@ fun nomuSchedSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
 }
 
 // Await a fiber and return its result. Called from within the joining fiber, which parks lock-coupled
-// (identifying itself via rt_current) if the target has not completed.
+// (identifying itself through its carrier record) if the target has not completed.
 fun nomuSchedJoin(sched: RawPtr, target: RawPtr, anchorSp: RawPtr, anchorPc: Int, final: Int) -> RawPtr {
   rtSchedLock(sched)
   let st: Int = target.load(fromByteOffset: 168)
   if st == 3 {
     // already done — fall through holding the lock
   } else {
-    let me = RawPtr.tlsGet()
+    let me = rtCurrentFiber()
     rtSchedSetAnchor(me, anchorSp, anchorPc)   // user-frame anchor for the STW walk (128.3.2)
     target.store(me, toByteOffset: 224)
     me.store(2, toByteOffset: 168)
     let carrierCtx: RawPtr = me.load(fromByteOffset: 232)
-    me.ctxSwitchTo(carrierCtx)                 // resumes here holding the lock (lock-coupled)
+    Runtime.ctxSwitch(from: me, to: carrierCtx)                 // resumes here holding the lock (lock-coupled)
   }
   // The world is stopped for collection only at safepoints; this runs the join body lock-held without a
   // safepoint, so the box read + registry drop are atomic w.r.t. a collection (150.3.13). `final` (the
@@ -4969,11 +5744,10 @@ fun nomuSchedMailboxPop(sched: RawPtr, mailbox: RawPtr) -> RawPtr {
   return msg
 }
 
-// Boot the scheduler: record the actor drain function, spawn the main fiber over the user entry, start
-// ncarriers-1 carrier threads + the timer thread, run the scheduler loop on the calling thread too, and
-// return once quiescent (all carriers exited). Called from C main.
-fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int, drainFn: RawPtr) {
-  sched.store(drainFn, toByteOffset: 120)             // nomu_actor_drain, called by mailbox fibers
+// Boot the scheduler: spawn the main fiber over the user entry, start ncarriers-1 carrier threads + the
+// timer thread, run the scheduler loop on the calling thread too, and return once quiescent (all carriers
+// exited). Called from the process entry `main`, which codegen emits.
+fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int) {
   sched.store(ncarriers, toByteOffset: 160)           // total carriers, for the STW ack count (128.3.2)
   nomuSchedSpawn(sched, entryFn, RawPtr.null)
   let handles = RawPtr.alloc(bytes: 8 * ncarriers, align: 8)
@@ -4984,20 +5758,20 @@ fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int, drainFn: RawPt
     carg.store(sched, toByteOffset: 0)
     carg.store(ctx, toByteOffset: 8)
     let h = handles.advanced(by: 8 * c)
-    h.threadCreate(entry: RawPtr.ofFunc(rtSchedCarrierMain), arg: carg)
+    Runtime.threadCreate(handle: h, entry: Runtime.ofFunc(rtSchedCarrierMain), arg: carg)
     c = c + 1
   }
   // The timer thread (wakeup feeder): one raw thread draining the deadline heap.
   let th = RawPtr.alloc(bytes: 8, align: 8)
-  th.threadCreate(entry: RawPtr.ofFunc(rtSchedTimerMain), arg: sched)
+  Runtime.threadCreate(handle: th, entry: Runtime.ofFunc(rtSchedTimerMain), arg: sched)
   let mainCtx = RawPtr.alloc(bytes: 168, align: 16)
   rtSchedLoop(sched, mainCtx)
   var k = 1
   while k < ncarriers {
     let h = handles.advanced(by: 8 * k)
-    h.threadJoin()
+    Runtime.threadJoin(handle: h)
     k = k + 1
   }
-  th.threadJoin()
+  Runtime.threadJoin(handle: th)
   rtGcRecordFinish()
 }

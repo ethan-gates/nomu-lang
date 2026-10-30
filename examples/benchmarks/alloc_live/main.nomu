@@ -1,0 +1,44 @@
+// Allocation-bound benchmark with references live across allocations. Each round builds a 1000-node
+// list front to back, so the previous head is live across every allocation, then walks it. The list
+// escapes `build`, so every node is a heap allocation; each round's list dies before the next, so the
+// live heap stays small and the time goes to the allocation path rather than to collection.
+class Node {
+    var val: Int
+    var next: Option<Node>
+}
+
+fun build(n: Int, seed: Int) -> Option<Node> {
+    var head = Option<Node>.none
+    var i = 0
+    while i < n {
+        head = Option<Node>.some(Node(val: seed + i, next: head))
+        i = i + 1
+    }
+    return head
+}
+
+fun sum(list: Option<Node>) -> Int {
+    var acc = 0
+    var cur = list
+    var going = true
+    while going {
+        switch cur {
+        case .some(let node):
+            acc = acc + node.val
+            cur = node.next
+        case .none:
+            going = false
+        }
+    }
+    return acc
+}
+
+fun main() {
+    var total = 0
+    var round = 0
+    while round < 20000 {
+        total = total + sum(list: build(n: 1000, seed: round))
+        round = round + 1
+    }
+    print(total)
+}

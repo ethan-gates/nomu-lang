@@ -42,6 +42,7 @@ private struct ExtensionMerger {
             case .actorDecl(let a):  kinds[a.name] = .actor_
             case .interfaceDecl:     break   // interfaces aren't extension targets in A1.2
             case .funcDecl(let f):   funcNames.insert(f.name)
+            case .globalDecl:        break
             case .extensionDecl(let x): byType[x.typeName, default: []].append(x)
             }
         }
@@ -61,7 +62,7 @@ private struct ExtensionMerger {
             case .classDecl(let c):
                 let methods = merged(c.methods, into: c.name)
                 out.append(.classDecl(ClassDecl(name: c.name, generics: c.generics, fields: c.fields, properties: mergedProperties(c.properties, into: c.name), methods: methods, conformances: c.conformances + extConformances(c.name), visibility: c.visibility, span: c.span)))
-            case .actorDecl, .interfaceDecl, .funcDecl:
+            case .actorDecl, .interfaceDecl, .funcDecl, .globalDecl:
                 out.append(decl)
             case .extensionDecl:
                 break   // folded into its target above, or reported invalid

@@ -61,6 +61,9 @@ private func appendDecl(_ decl: NOIRDecl, ind: String, into lines: inout [String
     case .funcDecl(let f):
         lines.append("\(ind)fun \(f.name)\(signature(f.params, f.returnType))")
         for s in f.body { appendStmt(s, ind: ind + "  ", into: &lines) }
+    case .globalDecl(let g):
+        lines.append("\(ind)let \(g.name) : \(g.type)")
+        appendExpr(g.value, slot: "value", ind: ind + "  ", into: &lines)
     }
 }
 
@@ -172,7 +175,7 @@ private func flat(_ e: NOIRExpr) -> String? {
 
 private func children(_ e: NOIRExpr) -> [(slot: String, expr: NOIRExpr)] {
     switch e.kind {
-    case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .closure, .funcRef:
+    case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .globalRef, .closure, .funcRef:
         return []
     case .fieldAccess(let base, _):
         return [("base", base)]
@@ -204,6 +207,7 @@ private func head(_ e: NOIRExpr) -> String {
     case .boolLit(let v):          return "boolLit \(v)"
     case .stringLit(let v):        return "stringLit \"\(v)\""
     case .varRef(let n):           return "varRef \(n)"
+    case .globalRef(let n):        return "globalRef \(n)"
     case .fieldAccess(_, let f):   return "fieldAccess .\(f)"
     case .construct(let t, _):     return "construct \(t)"
     case .enumInit(let t, let c, _): return "enumInit \(t).\(c)"

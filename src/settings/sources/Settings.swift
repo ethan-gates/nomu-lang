@@ -43,6 +43,9 @@ public enum CompilerSettings {
             Setting("test.runtime_prelude", .bool, default: .bool(false),
                     doc: "Prepend the runtime prelude, so a white-box test calls runtime internals by name.",
                     targets: [.compile], granularity: .module),
+            Setting("test.runtime_tier", .bool, default: .bool(false),
+                    doc: "Admit the module to the runtime tier, so a test may call the runtime intrinsics on `Runtime` without the runtime prelude.",
+                    targets: [.compile], granularity: .module),
         ],
         configs: [("debug", nil), ("release", nil), ("test", "debug")])
 

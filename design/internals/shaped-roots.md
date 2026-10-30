@@ -348,7 +348,7 @@ rule and the frame-region generalization into two `verifySSAIR` invariants and a
   fingerprint legs below.
 - **Both-collector lockstep:** the `kind` 2 descriptor is read through one shared implementation —
   `nomu_gc_live_offsets` / `nomu_shape_desc_for_ordinal`, which the self-hosted tracer reaches via the
-  `RawPtr.gcLiveCount` / `gcLiveOffsetAt` / `gcShapeDescForOrdinal` intrinsics (they lower to those exact C
+  `Runtime.gcLiveCount` / `gcLiveOffsetAt` / `gcShapeDescForOrdinal` intrinsics (they lower to those exact C
   functions). The per-reference action (the ~10 self-hosted phases + MMTk scan sites) and the deopt-range
   parse (`nomu_gc_walk_context` / `rtWalkShadow`) stay per-collector, so each new shape adds a
   fingerprint/oracle leg (**T-lockstep**) exercising both, as the existing mark-verify legs do.

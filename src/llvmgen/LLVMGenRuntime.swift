@@ -1,3 +1,4 @@
+import mangle
 import support
 import LLVM_C
 
@@ -24,11 +25,14 @@ extension LLVMGen {
     // Runtime C functions that never allocate on the GC heap and never park the fiber — their calls
     // stay plain (no statepoint). Conservative: mislabeling a GC-triggering call as leaf is unsound.
     static let gcLeafRuntimeFns: Set<String> = [
-        "printf", "rt_mutex_new", "rt_mutex_unlock",
-        "rt_bounds_trap",   // aborts, never allocates
+        "printf",
         "memcpy",           // libc block copy — never allocates
         "memset",           // libc fill — never allocates
-        "rt_gc_write_barrier",   // remembers the mutated object; never triggers GC
+        "free",             // releases unmanaged memory (`RawPtr.free`)
+        "write",            // libc write(2) (`Runtime.writeFd`, `Runtime.fatal`) — never allocates or parks
+        "read",             // libc read(2) (`Runtime.readFd`) — never allocates or parks
+        "poll",             // libc poll(2) (`Runtime.poll`), zero timeout — never allocates or blocks
+        "abort",            // never returns
     ]
 
     var funcAttrIndex: LLVMAttributeIndex { LLVMAttributeIndex(bitPattern: Int32(LLVMAttributeFunctionIndex)) }
@@ -37,6 +41,12 @@ extension LLVMGen {
         let name = "gc-leaf-function"
         let attr = LLVMCreateStringAttribute(ctx, name, UInt32(name.utf8.count), "", 0)
         LLVMAddAttributeAtIndex(fn, funcAttrIndex, attr)
+    }
+
+    // Mark one call site `gc-leaf-function`: it never becomes a statepoint, whatever the callee's own marking.
+    func markCallGCLeaf(_ call: LLVMValueRef) {
+        let name = "gc-leaf-function"
+        LLVMAddCallSiteAttribute(call, funcAttrIndex, LLVMCreateStringAttribute(ctx, name, UInt32(name.utf8.count), "", 0))
     }
 
     // Is `fn` marked `gc-leaf-function`? A gc-leaf call never becomes a `gc.statepoint`, so a `"deopt"`
@@ -87,6 +97,17 @@ extension LLVMGen {
         let ty = fnType(ret, params, varArg: false)
         if let f = LLVMGetNamedFunction(mod, name) { return (f, ty) }
         return (LLVMAddFunction(mod, name, ty)!, ty)
+    }
+
+    // A function of the runtime prelude, by its Nomu name. A normal build has the prelude prepended, so the
+    // function is in `callables`; a package or library build (task 174.3.1) suppresses the prepend, so it is
+    // declared external by its runtime symbol (`nomu_fn_<name>`) and resolves against the runtime's weak-ODR
+    // definition in the final binary.
+    func runtimePreludeFn(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef]) -> (fn: LLVMValueRef, ty: LLVMTypeRef) {
+        declareFree(name)
+        if let c = callables["f:\(name)"] { return (c.fn, c.ty) }
+        let f = runtimeFn("nomu_fn_\(name)", ret: ret, params: params, varArg: false)
+        return (f.0, f.1)
     }
 
     func runtimeFn(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef], varArg: Bool)
@@ -182,16 +203,16 @@ extension LLVMGen {
 
     // Allocate a managed (GC-heap) object of `bytes` bytes through the `__nomu_gc_alloc` seam.
     //
-    // When shaped roots are live across this allocation (task 176), route through the `noinline` rooted-alloc
-    // variant instead of the `alwaysinline` seam. A GC can fire at the allocation, so the shaped roots must be
-    // recorded on a statepoint that covers this frame. The always-inliner drops a `"deopt"` operand bundle when
-    // it collapses `__nomu_gc_alloc`, so the bundle would never reach the inner allocation statepoint. The
-    // `noinline` variant survives both pipelines' inlining untouched, so RS4GC statepoint-converts the call site
-    // in place and threads the bundle onto it — the walker then finds the shaped roots in this frame when a GC
-    // fires inside the allocation. (`buildCall` attaches the pending bundle; the fast-path bump still lives
-    // inside the out-of-line callee.)
+    // When shaped roots are live across this allocation (task 176), the hit path is emitted here, in the
+    // allocating function, instead: a collection can run in the slow call, so the shaped roots must ride
+    // that call's `"deopt"` bundle, and the always-inliner drops a bundle on the call it collapses. Emitting
+    // the slow call in place lets RS4GC record the roots on its statepoint, as `emitSafepointPollWithDeopt`
+    // does for the poll.
     func rtAllocManaged(_ bytes: LLVMValueRef) -> LLVMValueRef {
-        let g = pendingDeoptApplies() ? nomuGcAllocRooted() : nomuGcAlloc()
+        if pendingDeoptApplies(), let fn = currentFn {
+            return emitAllocHitPath(fn, bytes, deoptOps: pendingDeopt!)
+        }
+        let g = nomuGcAlloc()
         return buildCall(g.0, g.1, [bytes])!
     }
 
@@ -264,10 +285,11 @@ extension LLVMGen {
         return sv!
     }
 
-    // The external stop-world flag (`volatile int __nomu_stop_world`) the poll tests.
+    // The stop-the-world flag the poll tests: the runtime's `rtStopWorld` static-storage block, an `Int32` read
+    // by symbol (declared here, defined by the runtime module; the same global when this is that module).
     func stopWorldGlobal() -> LLVMValueRef {
         if let g = stopWorldGlobalCache { return g }
-        let g = LLVMAddGlobal(mod, i32, "__nomu_stop_world")!   // no initializer → external declaration
+        let g = getOrAddGlobal(i32, Mangle.staticStorage("rtStopWorld", home: []))
         stopWorldGlobalCache = g
         return g
     }
@@ -281,7 +303,7 @@ extension LLVMGen {
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         addAlwaysInline(fn)   // not `gc-leaf`: the slow path calls a statepoint
         let flag = stopWorldGlobal()
-        let slow = runtimeFn("__nomu_gc_poll_slow", ret: voidTy, params: [], varArg: false)
+        let slow = nomuPollSlow()
         withStubBody(fn) {
             let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.slow")
             let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.cont")
@@ -313,7 +335,7 @@ extension LLVMGen {
     func emitSafepointPollWithDeopt(_ deoptOps: [LLVMValueRef?]) {
         guard let fn = currentFn else { emitSafepointPoll(); return }
         let flag = stopWorldGlobal()
-        let slow = runtimeFn("__nomu_gc_poll_slow", ret: voidTy, params: [], varArg: false)
+        let slow = nomuPollSlow()
         let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.slow")
         let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.cont")
         let v = LLVMBuildLoad2(b, i32, flag, "stopreq")!
@@ -326,202 +348,199 @@ extension LLVMGen {
         LLVMPositionBuilderAtEnd(b, contBB)
     }
 
-    // The `__nomu_gc_alloc` seam: forwards to the self-hosted allocation function (`__nomu_selfhost_alloc`),
-    // whose inline TLAB bump is the fast path. Returned memory is zeroed.
+    // The `__nomu_gc_alloc` seam: the allocation hit path, `alwaysinline`, so every allocation site bumps the
+    // carrier's TLAB in place and calls `__nomu_alloc_slow` only on a miss. Returned memory is zeroed.
     func nomuGcAlloc() -> (LLVMValueRef, LLVMTypeRef) {
         if let g = gcAllocFn { return g }
-        let g = buildGcAllocFn("__nomu_gc_alloc", alwaysInline: true)
-        gcAllocFn = g
-        return g
-    }
-
-    // The `noinline` rooted-alloc variant (task 176): the same body as `__nomu_gc_alloc`, but kept out of line
-    // so a `"deopt"` operand bundle on the call site survives to `rewrite-statepoints-for-gc`. The always-inliner
-    // (and `default<O3>`'s inliner) would drop the bundle while collapsing the `alwaysinline` seam; `noinline`
-    // leaves the call standing, and RS4GC statepoint-converts it in place, recording the shaped roots in the
-    // caller's frame. Used only when a shaped root is live across the allocation (see `rtAllocManaged`).
-    func nomuGcAllocRooted() -> (LLVMValueRef, LLVMTypeRef) {
-        if let g = gcAllocRootedFn { return g }
-        let g = buildGcAllocFn("__nomu_gc_alloc_rooted", alwaysInline: false)
-        gcAllocRootedFn = g
-        return g
-    }
-
-    // Build an allocation-seam function. `alwaysInline` collapses it at its call sites (the ordinary seam);
-    // `false` adds `noinline` so the call site survives to RS4GC with its deopt bundle intact (the rooted
-    // variant). The body is identical either way.
-    private func buildGcAllocFn(_ name: String, alwaysInline: Bool) -> (LLVMValueRef, LLVMTypeRef) {
         let ty = fnType(p1, [i64])
+        let fn = LLVMAddFunction(mod, "__nomu_gc_alloc", ty)!
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        LLVMSetGC(fn, "statepoint-example")   // its slow call is a statepoint
+        addAlwaysInline(fn)
+        withStubBody(fn) { LLVMBuildRet(b, emitAllocHitPath(fn, LLVMGetParam(fn, 0)!, deoptOps: [])) }
+        gcAllocFn = (fn, ty)
+        return gcAllocFn!
+    }
+
+    // The allocation hit path, built at the builder's position in `fn`. This carrier's record comes from the
+    // carrier-local slot (its TLAB is at offset 0); the request, rounded up to 8 bytes, is bumped within the
+    // current hole with no call and no lock, and the object is the old cursor, produced as `inttoptr` to `p1`
+    // (a fresh GC base the statepoint rewrite accepts). A hole never spans more than one 32 KiB block, so a
+    // large object never fits and takes the miss, which routes it to the large-object space. Under
+    // NOMU_GC_STRESS the limit stays 0, so every allocation misses; `opt.inline_alloc: false` sends every
+    // allocation to the miss for A/B measurement. A miss (no record yet, the hole exhausted, a large object)
+    // calls `__nomu_alloc_slow`, carrying `deoptOps`, the shaped roots live across the allocation, when there
+    // are any. Leaves the builder at the join and returns the object.
+    func emitAllocHitPath(_ fn: LLVMValueRef, _ size: LLVMValueRef, deoptOps: [LLVMValueRef?]) -> LLVMValueRef {
+        let slow = nomuAllocSlow()
+        let tlabBB = LLVMAppendBasicBlockInContext(ctx, fn, "tlab")!
+        let bumpBB = LLVMAppendBasicBlockInContext(ctx, fn, "tlab.bump")!
+        let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "tlab.slow")!
+        let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "tlab.done")!
+        let tlab = emitCarrierLocalGet()
+        LLVMBuildCondBr(b, LLVMBuildIsNull(b, tlab, "carrier.none"), slowBB, tlabBB)
+        LLVMPositionBuilderAtEnd(b, tlabBB)
+        let cur = LLVMBuildLoad2(b, i64, tlab, "tlab.cur")!
+        let lim = LLVMBuildLoad2(b, i64, gepByte(tlab, LLVMConstInt(i64, 8, 0)), "tlab.lim")!
+        let need = LLVMBuildAnd(b, LLVMBuildAdd(b, size, LLVMConstInt(i64, 7, 0), "sz+7"),
+                                LLVMConstInt(i64, ~UInt64(7), 0), "need")!
+        let newCur = LLVMBuildAdd(b, cur, need, "tlab.new")!
+        let fits = inlineAlloc ? LLVMBuildICmp(b, LLVMIntULE, newCur, lim, "tlab.fits")!
+                               : LLVMConstInt(LLVMInt1TypeInContext(ctx), 0, 0)!
+        LLVMBuildCondBr(b, fits, bumpBB, slowBB)
+        LLVMPositionBuilderAtEnd(b, bumpBB)
+        LLVMBuildStore(b, newCur, tlab)
+        let fastObj = LLVMBuildIntToPtr(b, cur, p1, "obj.fast")!
+        LLVMBuildBr(b, doneBB)
+        LLVMPositionBuilderAtEnd(b, slowBB)
+        let slowObj = buildCallWithDeopt(slow.0, slow.1, [size], deoptOps)!
+        LLVMBuildBr(b, doneBB)
+        LLVMPositionBuilderAtEnd(b, doneBB)
+        let obj = LLVMBuildPhi(b, p1, "obj")!
+        var ovals: [LLVMValueRef?] = [fastObj, slowObj]
+        var oblks: [LLVMBasicBlockRef?] = [bumpBB, slowBB]
+        ovals.withUnsafeMutableBufferPointer { vp in
+            oblks.withUnsafeMutableBufferPointer { bp in
+                LLVMAddIncoming(obj, vp.baseAddress, bp.baseAddress, 2)
+            }
+        }
+        return obj
+    }
+
+    // `__nomu_alloc_slow(size)`: the allocation miss path, at the runtime's TLAB allocator (`rtTlabAlloc`),
+    // which refills the hole from the shared block pool under the space lock, routes a large object to the
+    // large-object space, and collects when the heap is full. The block memory is zeroed on refill, so the
+    // object needs no memset. The result is produced as `inttoptr` to `p1`, as on the hit path.
+    //
+    // Never inlined: it anchors the collector's walk for a collection it triggers. The hit path is inlined
+    // into the allocating function, so that function calls this directly: `llvm.returnaddress(0)` is the
+    // caller's statepoint PC and `llvm.frameaddress(0)` + 16 the caller's SP (the RT_USER_ANCHOR convention),
+    // and the stop-the-world walk starts at the caller's frame and finds the in-flight allocation's roots.
+    func nomuAllocSlow() -> (LLVMValueRef, LLVMTypeRef) {
+        if let s = allocSlowFn { return s }
+        let ty = fnType(p1, [i64])
+        let fn = LLVMAddFunction(mod, "__nomu_alloc_slow", ty)!
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        LLVMSetGC(fn, "statepoint-example")
+        addNoInline(fn)
+        // `rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc: Int) -> RawPtr`.
+        let tlabAlloc = runtimePreludeFn("rtTlabAlloc", ret: i8ptr, params: [i8ptr, i8ptr, i64, i8ptr, i64])
+        // `rtCarrier() -> RawPtr`: this thread's record, bound on first use; a gc-leaf call (it allocates
+        // only raw memory).
+        let carrier = runtimePreludeFn("rtCarrier", ret: i8ptr, params: [])
+        withStubBody(fn) {
+            let size = LLVMGetParam(fn, 0)!
+            let (anchorSp, anchorPc) = emitCallerAnchor()
+            // The heap is one process-wide space the runtime creates at startup (`rtSpace`), so its descriptor
+            // is a constant by the time any allocation runs.
+            let space = loadRuntimeGlobal("rtSpace", i8ptr)
+            let tlab = buildCall(carrier.fn, carrier.ty, [])!
+            markCallGCLeaf(tlab)
+            let raw = buildCall(tlabAlloc.fn, tlabAlloc.ty, [tlab, space, size, anchorSp, anchorPc])!
+            LLVMBuildRet(b, LLVMBuildIntToPtr(b, LLVMBuildPtrToInt(b, raw, i64, "raw.i"), p1, "obj"))
+        }
+        allocSlowFn = (fn, ty)
+        return allocSlowFn!
+    }
+
+    // The process entry, emitted into the program's entry object: `int main(void)` runs the runtime's init
+    // function (the run settings, the scheduler, the heap), starts the collector's coordinator threads (still
+    // C, `rt_gc_threads_start`), and boots the scheduler on `rtCarrierCount` carriers with the program's
+    // `main` as the first fiber. Creating an actor fills the scheduler's drain slot (`registerActorDrain`).
+    // Its loads of the runtime's globals are plain: the init call that stores them is in this function.
+    func emitProcessEntry(main nomuMain: LLVMValueRef, _ mainTy: LLVMTypeRef) {
+        // The first fiber's entry, `ptr (ptr)` as the scheduler calls it (`Runtime.callEntry`): calls the
+        // program's `main` and returns null. Like the forwarders it has no GC strategy, so the walk of the
+        // main fiber ends at `main`'s frame; `noinline` keeps `main` from being inlined into it.
+        let entryTy = fnType(i8ptr, [i8ptr])
+        let entry = LLVMAddFunction(mod, "__nomu_main_entry", entryTy)!
+        LLVMSetLinkage(entry, LLVMInternalLinkage)
+        addNoInline(entry)
+        withStubBody(entry) {
+            let call = buildCall(nomuMain, mainTy, [])!
+            LLVMAddCallSiteAttribute(call, funcAttrIndex,
+                                     LLVMCreateEnumAttribute(ctx, LLVMGetEnumAttributeKindForName("noinline", 8), 0))
+            LLVMBuildRet(b, LLVMConstNull(i8ptr))
+        }
+
+        let i32 = LLVMInt32TypeInContext(ctx)!
+        let (fn, _) = emitFunction("main", ret: i32, params: [], gc: false)
+        let runtimeInit = preludeFn(Mangle.moduleInit(home: []), ret: voidTy, params: [])
+        let gcThreads = runtimeFn("rt_gc_threads_start", ret: voidTy, params: [], varArg: false)
+        let boot = runtimePreludeFn("nomuSchedBoot", ret: voidTy, params: [i8ptr, i8ptr, i64])
+        withStubBody(fn) {
+            _ = buildCall(runtimeInit.0, runtimeInit.1, [])
+            _ = buildCall(gcThreads.0, gcThreads.1, [])
+            let sched = LLVMBuildLoad2(b, i8ptr, getOrAddGlobal(i8ptr, Mangle.global("rtSched", home: [])), "sched")!
+            let carriers = LLVMBuildLoad2(b, i64, getOrAddGlobal(i64, Mangle.global("rtCarrierCount", home: [])),
+                                          "carriers")!
+            _ = buildCall(boot.fn, boot.ty, [sched, entry, carriers])
+            LLVMBuildRet(b, LLVMConstInt(i32, 0, 0))
+        }
+    }
+
+    // The caller's anchor for the collector's walk, read in a `noinline` function its caller calls directly:
+    // the caller's SP (`llvm.frameaddress(0)` + 16, past this frame's saved FP and LR) and the return address
+    // into it, a statepoint PC the walk matches. Returns (sp, pc as an i64).
+    func emitCallerAnchor() -> (LLVMValueRef, LLVMValueRef) {
+        let frameAddr = runtimeFn("llvm.frameaddress.p0", ret: i8ptr, params: [i32], varArg: false)
+        let retAddr = runtimeFn("llvm.returnaddress.p0", ret: i8ptr, params: [i32], varArg: false)
+        let fp = buildCall(frameAddr.0, frameAddr.1, [LLVMConstInt(i32, 0, 0)])!
+        let sp = gepByte(fp, LLVMConstInt(i64, 16, 0))
+        let ra = buildCall(retAddr.0, retAddr.1, [LLVMConstInt(i32, 0, 0)])!
+        return (sp, LLVMBuildPtrToInt(b, ra, i64, "anchor.pc")!)
+    }
+
+    // A scheduler forwarder that parks the calling fiber: a `noinline` internal function, called directly from
+    // generated code, that reads its caller's anchor (`emitCallerAnchor`) and the scheduler (`rtSched`) and
+    // passes both to the Nomu scheduler function `body` calls. The walk of a parked fiber starts at that
+    // anchor, so the forwarder's own frame is never walked: it uses no GC strategy and its calls are plain
+    // calls, with no stack-map records.
+    func schedForwarder(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef],
+                        _ body: (_ fn: LLVMValueRef, _ sched: LLVMValueRef, _ sp: LLVMValueRef,
+                                 _ pc: LLVMValueRef) -> LLVMValueRef?) -> (LLVMValueRef, LLVMTypeRef) {
+        if let f = forwarderFns[name] { return f }
+        let ty = fnType(ret, params)
         let fn = LLVMAddFunction(mod, name, ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
-        LLVMSetGC(fn, "statepoint-example")   // its allocation call is a statepoint
-        if alwaysInline { addAlwaysInline(fn) } else { addNoInline(fn) }
-        let alloc = nomuSelfhostAlloc()
-        withStubBody(fn) { LLVMBuildRet(b, buildCall(alloc.0, alloc.1, [LLVMGetParam(fn, 0)])!) }
+        addNoInline(fn)
+        forwarderFns[name] = (fn, ty)
+        withStubBody(fn) {
+            let (sp, pc) = emitCallerAnchor()
+            let sched = loadRuntimeGlobal("rtSched", i8ptr)
+            if let r = body(fn, sched, sp, pc) { LLVMBuildRet(b, r) } else { LLVMBuildRetVoid(b) }
+        }
         return (fn, ty)
     }
 
-    // The self-hosted allocation function (task 150): allocation at the Nomu Immix allocator in the runtime
-    // prelude (`rtImmixNew` / `rtTlabAlloc`). On first call it creates one Immix space and caches its
-    // descriptor in `__nomu_selfhost_space`; each call bumps within the carrier's per-carrier TLAB (150.3.10.1,
-    // refilling a whole block from the shared pool under the space lock on overflow) and produces the managed object
-    // via `ptrtoint`→`inttoptr` to `p1` — the same integer→`p1` step the fast path uses, which
-    // `RewriteStatepointsForGC` accepts as a fresh GC base (no `addrspacecast`, no intrinsic). The block
-    // memory is fresh-zeroed by `rt_raw_alloc` and never reused while non-collecting, so the object is
-    // zero-initialized with no memset. The allocator holds no `p1`; the seam produces it here. (Rung 1's
-    // single-arena bump `rtArenaNew`/`rtBumpAlloc` stays in the prelude for its own tests.)
-    func nomuSelfhostAlloc() -> (LLVMValueRef, LLVMTypeRef) {
-        if let s = selfhostAllocFn { return s }
-        let ty = fnType(p1, [i64])
-        let fn = LLVMAddFunction(mod, "__nomu_selfhost_alloc", ty)!
-        LLVMSetLinkage(fn, LLVMInternalLinkage)
-        LLVMSetGC(fn, "statepoint-example")
-        // The Immix space is a single process resource defined in the C floor (`runtime.c`, task 174.3.1), so
-        // every object — the entry, and a separately-compiled package that allocates — shares one heap.
-        // Reference it as an external global (no initializer); the double-checked lock below fills it once,
-        // process-wide. `RawPtr.gcSelfhostSpace()` (the tracer's reach) references the same symbol.
-        let gSpace = getOrAddGlobal(i8ptr, "__nomu_selfhost_space")
-        // The self-hosted allocator functions live in the runtime prelude. A normal build has them prepended
-        // (present in `callables`); a package/library build (task 174.3.1) suppresses the prepend, so declare
-        // them external by their bare runtime symbols — they resolve against the runtime's weak-ODR
-        // definitions in the final binary. Signatures: `rtImmixNew(numBlocks: Int) -> RawPtr`,
-        // `rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc: Int) -> RawPtr`.
-        let immixNew: (fn: LLVMValueRef, ty: LLVMTypeRef) = callables["f:rtImmixNew"].map { ($0.fn, $0.ty) }
-            ?? runtimeFn("nomu_fn_rtImmixNew", ret: i8ptr, params: [i64], varArg: false)
-        let tlabAlloc: (fn: LLVMValueRef, ty: LLVMTypeRef) = callables["f:rtTlabAlloc"].map { ($0.fn, $0.ty) }
-            ?? runtimeFn("nomu_fn_rtTlabAlloc", ret: i8ptr, params: [i8ptr, i8ptr, i64, i8ptr, i64], varArg: false)
-        let numBlocks = LLVMConstInt(i64, UInt64(8192), 0)   // 8192 × 32 KiB = 256 MiB heap
-        withStubBody(fn) {
-            let size = LLVMGetParam(fn, 0)!
-            let entryBB = LLVMGetInsertBlock(b)!
-            let lockBB = LLVMAppendBasicBlockInContext(ctx, fn, "space.lock")!
-            let mkBB = LLVMAppendBasicBlockInContext(ctx, fn, "space.mk")!
-            let unlockBB = LLVMAppendBasicBlockInContext(ctx, fn, "space.unlock")!
-            let useBB = LLVMAppendBasicBlockInContext(ctx, fn, "space.use")!
-            // The Immix space is a process singleton, created on the first self-hosted allocation. Multiple
-            // carriers race that first allocation (150.3.10.1), so creation is guarded by double-checked
-            // locking: an acquire-load fast path, and a C mutex around the create with a release store, so a
-            // carrier that observes a non-null space also observes the fully-initialized descriptor (arm64).
-            let space0 = LLVMBuildLoad2(b, i8ptr, gSpace, "space")!
-            LLVMSetOrdering(space0, LLVMAtomicOrderingAcquire)
-            LLVMSetAlignment(space0, 8)
-            let isNull0 = LLVMBuildICmp(b, LLVMIntEQ, space0, LLVMConstPointerNull(i8ptr), "space.null0")!
-            LLVMBuildCondBr(b, isNull0, lockBB, useBB)
-            LLVMPositionBuilderAtEnd(b, lockBB)
-            let lk = runtimeFn("rt_selfhost_space_lock_acquire", ret: voidTy, params: [], varArg: false)
-            _ = buildCall(lk.0, lk.1, [])
-            let space1 = LLVMBuildLoad2(b, i8ptr, gSpace, "space.l")!   // re-check under the lock
-            let isNull1 = LLVMBuildICmp(b, LLVMIntEQ, space1, LLVMConstPointerNull(i8ptr), "space.null1")!
-            LLVMBuildCondBr(b, isNull1, mkBB, unlockBB)
-            LLVMPositionBuilderAtEnd(b, mkBB)
-            let made = buildCall(immixNew.fn, immixNew.ty, [numBlocks])!
-            // Arm the object-remembering write barrier (task 150.4.2). The inline fast path
-            // (`__nomu_write_barrier`) reads globals defined in the C floor, 0 (barrier off) until here. Point
-            // them at the descriptor's log-bit table
-            // (@144) with a base that makes the fast path's absolute-address indexing (`(objInt>>3)>>3 + base`)
-            // land in the table: `base = tableInt − (heapBaseInt>>6)`. log_region = 3 (one bit per 8-byte
-            // region — matching the Nomu accessors). Set once here, under the space-creation lock, on the first
-            // managed allocation.
-            let i8t = LLVMInt8TypeInContext(ctx)!
-            let tableInt = LLVMBuildLoad2(b, i64, gepByte(made, LLVMConstInt(i64, 144, 0)), "logbit.table")!
-            let heapBaseForBarrier = LLVMBuildLoad2(b, i64, gepByte(made, LLVMConstInt(i64, 40, 0)), "logbit.heapbase")!
-            let baseOff = LLVMBuildLShr(b, heapBaseForBarrier, LLVMConstInt(i64, 6, 0), "logbit.baseoff")!
-            let logbitBase = LLVMBuildSub(b, tableInt, baseOff, "logbit.base.v")!
-            let gLogBase = LLVMGetNamedGlobal(mod, "__nomu_logbit_base") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_base")!
-            let gLogRegion = LLVMGetNamedGlobal(mod, "__nomu_logbit_log_region") ?? LLVMAddGlobal(mod, i8t, "__nomu_logbit_log_region")!
-            let gActive = LLVMGetNamedGlobal(mod, "__nomu_barrier_active") ?? LLVMAddGlobal(mod, i8t, "__nomu_barrier_active")!
-            // Narrow the inline fast path's heap-range guard to this Immix heap: [heapBase, heapBase + 256 MiB)
-            // (8192 × 32 KiB). A store into an off-heap object (self-hosted LOS / immortal buffer) skips the
-            // barrier — the log-bit table covers only this range.
-            let gLo = LLVMGetNamedGlobal(mod, "__nomu_logbit_heap_lo") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_heap_lo")!
-            let gHi = LLVMGetNamedGlobal(mod, "__nomu_logbit_heap_hi") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_heap_hi")!
-            let heapHi = LLVMBuildAdd(b, heapBaseForBarrier, LLVMConstInt(i64, 8192 * 32768, 0), "logbit.heaphi")!
-            LLVMBuildStore(b, logbitBase, gLogBase)
-            LLVMBuildStore(b, LLVMConstInt(i8t, 3, 0), gLogRegion)
-            LLVMBuildStore(b, LLVMConstInt(i8t, 1, 0), gActive)
-            LLVMBuildStore(b, heapBaseForBarrier, gLo)
-            LLVMBuildStore(b, heapHi, gHi)
-            let st = LLVMBuildStore(b, made, gSpace)!
-            LLVMSetOrdering(st, LLVMAtomicOrderingRelease)
-            LLVMSetAlignment(st, 8)
-            LLVMBuildBr(b, unlockBB)
-            LLVMPositionBuilderAtEnd(b, unlockBB)
-            let spaceL = LLVMBuildPhi(b, i8ptr, "space.lp")!   // PHI first (top of block), then release
-            var lvals: [LLVMValueRef?] = [space1, made]
-            var lblks: [LLVMBasicBlockRef?] = [lockBB, mkBB]
-            lvals.withUnsafeMutableBufferPointer { vp in
-                lblks.withUnsafeMutableBufferPointer { bp in
-                    LLVMAddIncoming(spaceL, vp.baseAddress, bp.baseAddress, 2)
-                }
-            }
-            let ul = runtimeFn("rt_selfhost_space_lock_release", ret: voidTy, params: [], varArg: false)
-            _ = buildCall(ul.0, ul.1, [])
-            LLVMBuildBr(b, useBB)
-            LLVMPositionBuilderAtEnd(b, useBB)
-            let space = LLVMBuildPhi(b, i8ptr, "space.p")!
-            var avals: [LLVMValueRef?] = [space0, spaceL]
-            var ablks: [LLVMBasicBlockRef?] = [entryBB, unlockBB]
-            avals.withUnsafeMutableBufferPointer { vp in
-                ablks.withUnsafeMutableBufferPointer { bp in
-                    LLVMAddIncoming(space, vp.baseAddress, bp.baseAddress, 2)
-                }
-            }
-            // Multi-carrier (150.3.10.1): bind this carrier's _Thread_local TLAB. rt_self_tlab_get returns a
-            // plain runtime pointer (not a managed p1).
-            let tlabGet = runtimeFn("rt_self_tlab_get", ret: i8ptr, params: [], varArg: false)
-            let tlab = buildCall(tlabGet.0, tlabGet.1, [])!
-            // Inline TLAB bump fast path (150.3.10.2): load the carrier's private cursor/limit and bump within
-            // the current hole with no call and no lock. `opt.inline_alloc: false` turns it off (every allocation
-            // calls rtTlabAlloc) for A/B measurement; NOMU_GC_STRESS leaves the limit 0 so it always misses.
-            // cursor/limit (@0/@8) are heap-relative byte offsets; `need` is the 8-aligned request. A hole never
-            // spans more than one 32 KiB block, so a large-object request (need > block) can never satisfy
-            // `cursor + need <= limit` and falls to the slow call, which routes it to LOS — no inline LOS check.
-            // On a hit the object address is heapBaseInt (@40) + cursor, produced as inttoptr→p1 (a fresh GC
-            // base the rewrite pass accepts). A miss (hole exhausted or large object) calls rtTlabAlloc, which
-            // refills under the space lock or routes to LOS, exactly as before.
-            let bumpBB = LLVMAppendBasicBlockInContext(ctx, fn, "tlab.bump")!
-            let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "tlab.slow")!
-            let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "tlab.done")!
-            let cur = LLVMBuildLoad2(b, i64, tlab, "tlab.cur")!
-            let lim = LLVMBuildLoad2(b, i64, gepByte(tlab, LLVMConstInt(i64, 8, 0)), "tlab.lim")!
-            let need = LLVMBuildAnd(b, LLVMBuildAdd(b, size, LLVMConstInt(i64, 7, 0), "sz+7"),
-                                    LLVMConstInt(i64, ~UInt64(7), 0), "need")!
-            let newCur = LLVMBuildAdd(b, cur, need, "tlab.new")!
-            let fits = inlineAlloc ? LLVMBuildICmp(b, LLVMIntULE, newCur, lim, "tlab.fits")!
-                                   : LLVMConstInt(LLVMInt1TypeInContext(ctx), 0, 0)!
-            LLVMBuildCondBr(b, fits, bumpBB, slowBB)
-            LLVMPositionBuilderAtEnd(b, bumpBB)
-            LLVMBuildStore(b, newCur, tlab)
-            let heapBaseInt = LLVMBuildLoad2(b, i64, gepByte(space, LLVMConstInt(i64, 40, 0)), "heapbaseint")!
-            let fastObj = LLVMBuildIntToPtr(b, LLVMBuildAdd(b, heapBaseInt, cur, "obj.off"), p1, "obj.fast")!
-            LLVMBuildBr(b, doneBB)
-            LLVMPositionBuilderAtEnd(b, slowBB)
-            // Capture the user-frame anchor for a synchronous collection at OOM (150.3.11). __nomu_selfhost_alloc
-            // is the immediate callee of user code, so returnaddress(0) is the user statepoint PC and
-            // frameaddress(0)+16 is the user frame's SP (the RT_USER_ANCHOR convention). Passed to rtTlabAlloc,
-            // which hands them to the OOM path so the STW walk finds this in-flight allocation's roots.
-            let frameAddr = runtimeFn("llvm.frameaddress.p0", ret: i8ptr, params: [i32], varArg: false)
-            let retAddr = runtimeFn("llvm.returnaddress.p0", ret: i8ptr, params: [i32], varArg: false)
-            let fp = buildCall(frameAddr.0, frameAddr.1, [LLVMConstInt(i32, 0, 0)])!
-            let anchorSp = gepByte(fp, LLVMConstInt(i64, 16, 0))
-            let ra = buildCall(retAddr.0, retAddr.1, [LLVMConstInt(i32, 0, 0)])!
-            let anchorPc = LLVMBuildPtrToInt(b, ra, i64, "anchor.pc")!
-            let raw = buildCall(tlabAlloc.fn, tlabAlloc.ty, [tlab, space, size, anchorSp, anchorPc])!
-            let slowObj = LLVMBuildIntToPtr(b, LLVMBuildPtrToInt(b, raw, i64, "raw.i"), p1, "obj.slow")!
-            LLVMBuildBr(b, doneBB)
-            LLVMPositionBuilderAtEnd(b, doneBB)
-            let obj = LLVMBuildPhi(b, p1, "obj")!
-            var ovals: [LLVMValueRef?] = [fastObj, slowObj]
-            var oblks: [LLVMBasicBlockRef?] = [bumpBB, slowBB]
-            ovals.withUnsafeMutableBufferPointer { vp in
-                oblks.withUnsafeMutableBufferPointer { bp in
-                    LLVMAddIncoming(obj, vp.baseAddress, bp.baseAddress, 2)
-                }
-            }
-            LLVMBuildRet(b, obj)
+    // `__nomu_gc_poll_slow()`: the safepoint slow path, called from the inline poll when the stop-the-world
+    // flag is set. Parks the fiber at its caller's anchor until the world resumes (`nomuSchedSafepoint`).
+    // Not gc-leaf: the call from the poll site is a statepoint.
+    func nomuPollSlow() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("nomuSchedSafepoint", ret: voidTy, params: [i8ptr, i8ptr, i64])
+        return schedForwarder("__nomu_gc_poll_slow", ret: voidTy, params: []) { _, sched, sp, pc in
+            _ = self.buildCall(target.fn, target.ty, [sched, sp, pc])
+            return nil
         }
-        selfhostAllocFn = (fn, ty)
-        return selfhostAllocFn!
+    }
+
+    // `__nomu_spawn_join(handle, final)`: await a spawned fiber, parking until it completes
+    // (`nomuSchedJoin`), and return its result box. `handle` is the spawn site's `{ fiber }` slot; `final`
+    // (the structured scope-exit join) drops the fiber from the live-fiber registry after the read.
+    func nomuSpawnJoin() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("nomuSchedJoin", ret: i8ptr, params: [i8ptr, i8ptr, i8ptr, i64, i64])
+        return schedForwarder("__nomu_spawn_join", ret: i8ptr, params: [i8ptr, i64]) { fn, sched, sp, pc in
+            let fiber = LLVMBuildLoad2(self.b, self.i8ptr, LLVMGetParam(fn, 0), "fiber")!
+            return self.buildCall(target.fn, target.ty, [sched, fiber, sp, pc, LLVMGetParam(fn, 1)])
+        }
+    }
+
+    // `__nomu_sleep_ms(ms)`: park the fiber for `ms` milliseconds (`nomuSchedSleep`); returns `ms`.
+    func nomuSleepMs() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("nomuSchedSleep", ret: i64, params: [i8ptr, i64, i8ptr, i64])
+        return schedForwarder("__nomu_sleep_ms", ret: i64, params: [i64]) { fn, sched, sp, pc in
+            self.buildCall(target.fn, target.ty, [sched, LLVMGetParam(fn, 0), sp, pc])
+        }
     }
 
     // The `__nomu_write_barrier` seam: a post-store object-remembering barrier with an inlined fast
@@ -555,14 +574,7 @@ extension LLVMGen {
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         markGCLeaf(fn)
         addAlwaysInline(fn)
-        let rtBarrier = runtimeFn("rt_gc_write_barrier", ret: voidTy, params: [i8ptr, i8ptr, i8ptr], varArg: false)
-        // Get-or-add: the self-hosted alloc seam (`nomuSelfhostAlloc`) arms these same globals at space
-        // creation and may have minted them first — share them rather than emitting a renamed duplicate.
-        let gActive = LLVMGetNamedGlobal(mod, "__nomu_barrier_active") ?? LLVMAddGlobal(mod, i8, "__nomu_barrier_active")!
-        let gBase = LLVMGetNamedGlobal(mod, "__nomu_logbit_base") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_base")!
-        let gRegion = LLVMGetNamedGlobal(mod, "__nomu_logbit_log_region") ?? LLVMAddGlobal(mod, i8, "__nomu_logbit_log_region")!
-        let gLo = LLVMGetNamedGlobal(mod, "__nomu_logbit_heap_lo") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_heap_lo")!
-        let gHi = LLVMGetNamedGlobal(mod, "__nomu_logbit_heap_hi") ?? LLVMAddGlobal(mod, i64, "__nomu_logbit_heap_hi")!
+        let slowPath = runtimePreludeFn("rtRememberStore", ret: voidTy, params: [i8ptr])
         withStubBody(fn) {
             // The object's address as an integer comes from a side-effecting inline asm (`pinnedAddress`). The
             // barrier is inlined before the statepoint rewrite, where the object is one unchanging SSA value
@@ -570,27 +582,24 @@ extension LLVMGen {
             // of the loop, and the rewrite cannot relocate an integer: the barrier would test where the object
             // was before a collection moved it (task 176.5.8). The asm is neither hoisted nor merged, so the
             // address is taken from the current, relocated pointer at every store.
+            // The heap and its log-bit table exist from startup (`rtSpace`), so the barrier is always on and
+            // its values (`rtHeapLo`, `rtHeapHi`, `rtLogbitBase`) are constants, read with invariant loads.
             let obj = LLVMGetParam(fn, 0)!
-            let onBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.on")!
             let inRangeBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.inrange")!
             let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.slow")!
             let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.done")!
-            let active = LLVMBuildLoad2(b, i8, gActive, "bar.active")
-            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, active, LLVMConstInt(i8, 0, 0), "bar.on?"), onBB, doneBB)
-            LLVMPositionBuilderAtEnd(b, onBB)
             let objInt = managedAddress(obj)
-            // Heap-range guard: the log-bit table only covers [heap_lo, heap_hi), the Immix heap range, so a
+            // Heap-range guard: the log-bit table only covers [rtHeapLo, rtHeapHi), the Immix heap range, so a
             // store into an off-heap object (LOS / immortal) skips the barrier rather than indexing the table
             // out of bounds.
-            let lo = LLVMBuildLoad2(b, i64, gLo, "heap.lo")
-            let hi = LLVMBuildLoad2(b, i64, gHi, "heap.hi")
+            let lo = loadRuntimeGlobal("rtHeapLo", i64)
+            let hi = loadRuntimeGlobal("rtHeapHi", i64)
             let below = LLVMBuildICmp(b, LLVMIntULT, objInt, lo, "obj.below")
             let above = LLVMBuildICmp(b, LLVMIntUGE, objInt, hi, "obj.above")
             LLVMBuildCondBr(b, LLVMBuildOr(b, below, above, "obj.oob"), doneBB, inRangeBB)
             LLVMPositionBuilderAtEnd(b, inRangeBB)
-            let logR = LLVMBuildZExt(b, LLVMBuildLoad2(b, i8, gRegion, "logR8"), i64, "logR")
-            let region = LLVMBuildLShr(b, objInt, logR, "region")
-            let baseV = LLVMBuildLoad2(b, i64, gBase, "logbit.base")
+            let region = LLVMBuildLShr(b, objInt, LLVMConstInt(i64, 3, 0), "region")   // one bit per 8-byte region
+            let baseV = loadRuntimeGlobal("rtLogbitBase", i64)
             let byteOff = LLVMBuildLShr(b, region, LLVMConstInt(i64, 3, 0), "byteoff")
             let metaPtr = LLVMBuildIntToPtr(b, LLVMBuildAdd(b, baseV, byteOff, "metaint"), i8ptr, "metaptr")
             let byte = LLVMBuildLoad2(b, i8, metaPtr, "logbyte")
@@ -598,8 +607,9 @@ extension LLVMGen {
             let bit = LLVMBuildAnd(b, LLVMBuildLShr(b, byte, bitpos, "sh"), LLVMConstInt(i8, 1, 0), "bit")
             LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, bit, LLVMConstInt(i8, 0, 0), "unlogged"), slowBB, doneBB)
             LLVMPositionBuilderAtEnd(b, slowBB)
-            let null = LLVMConstNull(i8ptr)!
-            _ = buildCall(rtBarrier.0, rtBarrier.1, [LLVMBuildIntToPtr(b, objInt, i8ptr, "obj.raw"), null, null])
+            // The slow path never polls or parks, so its call is gc-leaf.
+            let slow = buildCall(slowPath.fn, slowPath.ty, [LLVMBuildIntToPtr(b, objInt, i8ptr, "obj.raw")])!
+            markCallGCLeaf(slow)
             LLVMBuildBr(b, doneBB)
             LLVMPositionBuilderAtEnd(b, doneBB)
             LLVMBuildRetVoid(b)
@@ -635,6 +645,227 @@ extension LLVMGen {
         let name = "gc-leaf-function"
         LLVMAddCallSiteAttribute(call, funcAttrIndex, LLVMCreateStringAttribute(ctx, name, UInt32(name.utf8.count), "", 0))
         return call
+    }
+
+    // Unmanaged memory (`RawPtr.alloc`, `Ptr<T>.alloc`; `unsafe-memory.md`): `__nomu_raw_alloc(bytes, align)`,
+    // straight to libSystem. `bytes` at or below zero gives null; the alignment is raised to a pointer's, as
+    // `posix_memalign` requires; the memory is zero-filled, which the runtime's allocator relies on; failure
+    // prints "out of memory" and exits 1. It never touches the managed heap or parks, so it is gc-leaf and
+    // its calls are never statepoints. Never inlined: `posix_memalign` dominates its cost, and inlining it at
+    // every site only grows the code.
+    func nomuRawAlloc() -> (LLVMValueRef, LLVMTypeRef) {
+        if let f = rawAllocFn { return f }
+        let ty = fnType(i8ptr, [i64, i64])
+        let fn = LLVMAddFunction(mod, "__nomu_raw_alloc", ty)!
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        markGCLeaf(fn)
+        addNoInline(fn)
+        let memalign = runtimeFn("posix_memalign", ret: i32, params: [i8ptr, i64, i64], varArg: false)
+        let memset = runtimeFn("memset", ret: i8ptr, params: [i8ptr, i32, i64], varArg: false)
+        withStubBody(fn) {
+            let bytes = LLVMGetParam(fn, 0)!, align = LLVMGetParam(fn, 1)!
+            let allocBB = LLVMAppendBasicBlockInContext(ctx, fn, "raw.alloc")!
+            let emptyBB = LLVMAppendBasicBlockInContext(ctx, fn, "raw.empty")!
+            let oomBB = LLVMAppendBasicBlockInContext(ctx, fn, "raw.oom")!
+            let okBB = LLVMAppendBasicBlockInContext(ctx, fn, "raw.ok")!
+            let slot = LLVMBuildAlloca(b, i8ptr, "raw.p")!
+            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntSLE, bytes, LLVMConstInt(i64, 0, 0), "raw.none"), emptyBB, allocBB)
+            LLVMPositionBuilderAtEnd(b, emptyBB)
+            LLVMBuildRet(b, LLVMConstPointerNull(i8ptr))
+            LLVMPositionBuilderAtEnd(b, allocBB)
+            let word = LLVMConstInt(i64, 8, 0)
+            let small = LLVMBuildICmp(b, LLVMIntULT, align, word, "raw.small")
+            let a = LLVMBuildSelect(b, small, word, align, "raw.align")!
+            let rc = buildCall(memalign.0, memalign.1, [slot, a, bytes])!
+            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, rc, LLVMConstInt(i32, 0, 0), "raw.failed"), oomBB, okBB)
+            LLVMPositionBuilderAtEnd(b, oomBB)
+            emitOutOfMemoryExit()
+            LLVMPositionBuilderAtEnd(b, okBB)
+            let p = LLVMBuildLoad2(b, i8ptr, slot, "raw.mem")!
+            _ = buildCall(memset.0, memset.1, [p, LLVMConstInt(i32, 0, 0), bytes])
+            LLVMBuildRet(b, p)
+        }
+        rawAllocFn = (fn, ty)
+        return rawAllocFn!
+    }
+
+    // Print "out of memory" to stderr and exit 1, ending the current block.
+    func emitOutOfMemoryExit() {
+        let dprintf = runtimeFn("dprintf", ret: i32, params: [i32, i8ptr], varArg: true)
+        let exit = runtimeFn("exit", ret: voidTy, params: [i32], varArg: false)
+        let message = LLVMBuildGlobalStringPtr(b, "out of memory\n", "oom.msg")!
+        _ = buildCall(dprintf.0, dprintf.1, [LLVMConstInt(i32, 2, 0), message])
+        _ = buildCall(exit.0, exit.1, [LLVMConstInt(i32, 1, 0)])
+        LLVMBuildUnreachable(b)
+    }
+
+    // A zeroed reservation (`Runtime.reserveZeroed`): `__nomu_reserve_zeroed(bytes, align)` maps private
+    // anonymous memory, which the kernel guarantees reads as zero and backs with physical pages only as they
+    // are first touched, so reserving costs no resident memory. The size is rounded up to whole pages and
+    // the alignment raised to at least a page (the page size is read with `getpagesize`, since it differs
+    // by platform); `bytes + align` is mapped and the unaligned head and the tail beyond `bytes` are
+    // unmapped. Never freed. `bytes` at or below zero gives null; a failed map prints "out of memory" and
+    // exits 1. gc-leaf and never inlined, like `__nomu_raw_alloc`.
+    func nomuReserveZeroed() -> (LLVMValueRef, LLVMTypeRef) {
+        if let f = reserveZeroedFn { return f }
+        let platform = TargetPlatform.host
+        let ty = fnType(i8ptr, [i64, i64])
+        let fn = LLVMAddFunction(mod, "__nomu_reserve_zeroed", ty)!
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        markGCLeaf(fn)
+        addNoInline(fn)
+        let pageSize = runtimeFn("getpagesize", ret: i32, params: [], varArg: false)
+        let mmap = runtimeFn("mmap", ret: i8ptr, params: [i8ptr, i64, i32, i32, i32, i64], varArg: false)
+        let munmap = runtimeFn("munmap", ret: i32, params: [i8ptr, i64], varArg: false)
+        withStubBody(fn) {
+            let bytes = LLVMGetParam(fn, 0)!, align = LLVMGetParam(fn, 1)!
+            let mapBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.map")!
+            let emptyBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.empty")!
+            let oomBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.oom")!
+            let trimBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.trim")!
+            let headBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.head")!
+            let tailCheckBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.tailcheck")!
+            let tailBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.tail")!
+            let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.done")!
+            let zero = LLVMConstInt(i64, 0, 0), one = LLVMConstInt(i64, 1, 0)
+            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntSLE, bytes, zero, "reserve.none"), emptyBB, mapBB)
+            LLVMPositionBuilderAtEnd(b, emptyBB)
+            LLVMBuildRet(b, LLVMConstPointerNull(i8ptr))
+
+            LLVMPositionBuilderAtEnd(b, mapBB)
+            let page = LLVMBuildSExt(b, buildCall(pageSize.0, pageSize.1, [])!, i64, "reserve.page")!
+            let pageMask = LLVMBuildSub(b, page, one, "reserve.pagemask")!
+            let n = LLVMBuildAnd(b, LLVMBuildAdd(b, bytes, pageMask, "")!, LLVMBuildNot(b, pageMask, "")!, "reserve.bytes")!
+            let a = LLVMBuildSelect(b, LLVMBuildICmp(b, LLVMIntULT, align, page, ""), page, align, "reserve.align")!
+            let span = LLVMBuildAdd(b, n, a, "reserve.span")!
+            let base = buildCall(mmap.0, mmap.1, [LLVMConstPointerNull(i8ptr), span,
+                                                 LLVMConstInt(i32, UInt64(platform.protReadWrite), 0),
+                                                 LLVMConstInt(i32, UInt64(platform.mapPrivateAnonymous), 0),
+                                                 LLVMConstInt(i32, UInt64(bitPattern: -1), 1), zero])!
+            let baseInt = LLVMBuildPtrToInt(b, base, i64, "reserve.base")!
+            let failed = LLVMBuildICmp(b, LLVMIntEQ, baseInt, LLVMConstInt(i64, UInt64(bitPattern: -1), 1), "reserve.failed")
+            LLVMBuildCondBr(b, failed, oomBB, trimBB)
+            LLVMPositionBuilderAtEnd(b, oomBB)
+            emitOutOfMemoryExit()
+
+            LLVMPositionBuilderAtEnd(b, trimBB)
+            let alignMask = LLVMBuildSub(b, a, one, "reserve.alignmask")!
+            let start = LLVMBuildAnd(b, LLVMBuildAdd(b, baseInt, alignMask, "")!, LLVMBuildNot(b, alignMask, "")!, "reserve.start")!
+            let head = LLVMBuildSub(b, start, baseInt, "reserve.headlen")!
+            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, head, zero, ""), headBB, tailCheckBB)
+            LLVMPositionBuilderAtEnd(b, headBB)
+            _ = buildCall(munmap.0, munmap.1, [base, head])
+            LLVMBuildBr(b, tailCheckBB)
+            LLVMPositionBuilderAtEnd(b, tailCheckBB)
+            let end = LLVMBuildAdd(b, start, n, "reserve.end")!
+            let tail = LLVMBuildSub(b, LLVMBuildAdd(b, baseInt, span, "")!, end, "reserve.taillen")!
+            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, tail, zero, ""), tailBB, doneBB)
+            LLVMPositionBuilderAtEnd(b, tailBB)
+            _ = buildCall(munmap.0, munmap.1, [LLVMBuildIntToPtr(b, end, i8ptr, "")!, tail])
+            LLVMBuildBr(b, doneBB)
+            LLVMPositionBuilderAtEnd(b, doneBB)
+            LLVMBuildRet(b, LLVMBuildIntToPtr(b, start, i8ptr, "reserve.ptr")!)
+        }
+        reserveZeroedFn = (fn, ty)
+        return reserveZeroedFn!
+    }
+
+    // A runtime startup global (`runtime.nomu`), read by symbol from generated code. `nomu_runtime_init` sets
+    // it before any other code runs and it never changes after, so the load is invariant.
+    func loadRuntimeGlobal(_ name: String, _ ty: LLVMTypeRef) -> LLVMValueRef {
+        let load = LLVMBuildLoad2(b, ty, getOrAddGlobal(ty, Mangle.global(name, home: [])), name)!
+        markInvariantLoad(load)
+        return load
+    }
+
+    // Mark `load` invariant: the location it reads never changes once the program's init functions have run.
+    func markInvariantLoad(_ load: LLVMValueRef) {
+        let name = "invariant.load"
+        LLVMSetMetadata(load, LLVMGetMDKindIDInContext(ctx, name, UInt32(name.utf8.count)), LLVMMDNodeInContext(ctx, nil, 0))
+    }
+
+    // The carrier-local slot's thread-specific-data key (`Runtime.carrierLocal`, design in
+    // `tasks/223-retire-the-c-floor.md`, "The floor"): an `Int64` the `runtime` package defines and its init
+    // function fills before any other runtime code runs.
+    static let carrierKeySymbol = "nomu_carrier_key"
+    func carrierKeyGlobal() -> LLVMValueRef { getOrAddGlobal(i64, Self.carrierKeySymbol) }
+
+    func loadCarrierKey() -> LLVMValueRef {
+        let key = LLVMBuildLoad2(b, i64, carrierKeyGlobal(), "carrier.key")!
+        markInvariantLoad(key)
+        return key
+    }
+
+    // The address of this thread's carrier-local slot: the thread's TSD array (`tpidrro_el0`, its low three
+    // bits masked as libpthread and Go do on darwin) indexed by the key, as libpthread's own
+    // `pthread_getspecific` reads it. The register read is side-effecting asm, so it is redone after any call
+    // (a fiber can resume on another carrier after a park) and never becomes a safepoint.
+    func carrierLocalSlot(key: LLVMValueRef? = nil) -> LLVMValueRef {
+        let ty = fnType(i64, [])
+        let text = "mrs $0, tpidrro_el0"
+        let constraints = "=r"
+        let asm = text.withCString { a in
+            constraints.withCString { c in
+                LLVMGetInlineAsm(ty, UnsafeMutablePointer(mutating: a), text.utf8.count,
+                                 UnsafeMutablePointer(mutating: c), constraints.utf8.count,
+                                 1, 0, LLVMInlineAsmDialectATT, 0)
+            }
+        }!
+        let tp = LLVMBuildCall2(b, ty, asm, nil, 0, "tsd.base")!
+        let name = "gc-leaf-function"
+        LLVMAddCallSiteAttribute(tp, funcAttrIndex, LLVMCreateStringAttribute(ctx, name, UInt32(name.utf8.count), "", 0))
+        let base = LLVMBuildAnd(b, tp, LLVMConstInt(i64, ~UInt64(7), 0), "tsd.base.aligned")!
+        let offset = LLVMBuildShl(b, key ?? loadCarrierKey(), LLVMConstInt(i64, 3, 0), "tsd.off")!
+        return LLVMBuildIntToPtr(b, LLVMBuildAdd(b, base, offset, "tsd.slot")!, i8ptr, "tsd.slot.ptr")!
+    }
+
+    // `key` is the key's value when the caller has just loaded it (the init function, which writes the key and
+    // so must not read it invariantly); otherwise the invariant load.
+    func emitCarrierLocalGet(key: LLVMValueRef? = nil) -> LLVMValueRef {
+        if TargetPlatform.host.readsCarrierLocalDirectly {
+            return LLVMBuildLoad2(b, i8ptr, carrierLocalSlot(key: key), "carrier.local")!
+        }
+        let (fn, fty) = runtimeFn("pthread_getspecific", ret: i8ptr, params: [i64], varArg: false)
+        return buildCall(fn, fty, [key ?? loadCarrierKey()])!
+    }
+
+    func emitCarrierLocalSet(_ v: LLVMValueRef) {
+        if TargetPlatform.host.readsCarrierLocalDirectly {
+            LLVMBuildStore(b, v, carrierLocalSlot())
+            return
+        }
+        let (fn, fty) = runtimeFn("pthread_setspecific", ret: i32, params: [i64, i8ptr], varArg: false)
+        _ = buildCall(fn, fty, [loadCarrierKey(), v])
+    }
+
+    // Create the carrier-local key, then check the direct read against `pthread_getspecific` once: write a
+    // sentinel through `pthread_setspecific`, read it back both ways, and abort if they differ. Emitted at the
+    // start of the runtime's init function, on the main thread before the scheduler boots.
+    func emitCarrierKeySetup() {
+        let key = carrierKeyGlobal()
+        LLVMSetInitializer(key, LLVMConstInt(i64, 0, 0))
+        let create = runtimeFn("pthread_key_create", ret: i32, params: [i8ptr, i8ptr], varArg: false)
+        _ = buildCall(create.0, create.1, [key, LLVMConstPointerNull(i8ptr)])
+        let k = LLVMBuildLoad2(b, i64, key, "carrier.key.new")!
+        let set = runtimeFn("pthread_setspecific", ret: i32, params: [i64, i8ptr], varArg: false)
+        let get = runtimeFn("pthread_getspecific", ret: i8ptr, params: [i64], varArg: false)
+        _ = buildCall(set.0, set.1, [k, key])   // the sentinel: the key's own address
+        let viaLibrary = buildCall(get.0, get.1, [k])!
+        let direct = emitCarrierLocalGet(key: k)
+        guard let fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b)) else { return }
+        let bad = LLVMAppendBasicBlockInContext(ctx, fn, "carrier.key.bad")!
+        let ok = LLVMAppendBasicBlockInContext(ctx, fn, "carrier.key.ok")!
+        let same = LLVMBuildICmp(b, LLVMIntEQ, direct, viaLibrary, "carrier.key.same")
+        LLVMBuildCondBr(b, same, ok, bad)
+        LLVMPositionBuilderAtEnd(b, bad)
+        let message = LLVMBuildGlobalStringPtr(b, "nomu: the carrier-local slot's direct read disagrees with pthread_getspecific\n", "carrier.key.msg")!
+        let dprintf = runtimeFn("dprintf", ret: i32, params: [i32, i8ptr], varArg: true)
+        _ = buildCall(dprintf.0, dprintf.1, [LLVMConstInt(i32, 2, 0), message])
+        let abort = runtimeFn("abort", ret: voidTy, params: [], varArg: false)
+        _ = buildCall(abort.0, abort.1, [])
+        LLVMBuildUnreachable(b)
+        LLVMPositionBuilderAtEnd(b, ok)
+        _ = buildCall(set.0, set.1, [k, LLVMConstPointerNull(i8ptr)])
     }
 
     // Store `val` into a field at `slot` of object `objBase`. A store into a heap object goes through the

@@ -1,0 +1,39 @@
+// A mark stack deeper than the old fixed one (1,048,576 entries): one array of 1.1M distinct Boxes pushes
+// every element at once when a major collection marks it. Run major-only (NOMU_NURSERY_RESERVE=-1) with
+// enough garbage to fill the heap several times, so majors mark and evacuate the array while it is live.
+// Every Box must survive with its value. Run with escape analysis off so the Boxes are heap objects.
+class Box {
+  var v: Int
+}
+
+fun churn(n: Int) -> Int {
+  var g = 0
+  var j = 0
+  while j < n {
+    let t = Box(v: j)
+    g = g + t.v % 3
+    j = j + 1
+  }
+  return g
+}
+
+fun main() {
+  let n = 1100000
+  var xs: Array<Box> = []
+  var i = 0
+  while i < n {
+    xs.append(Box(v: i))
+    i = i + 1
+  }
+  let g = churn(40000000)              // 640 MB of garbage over a 256 MiB heap: several major collections
+  var s = 0
+  i = 0
+  while i < n {
+    s = s + xs[i].v
+    i = i + 1
+  }
+  print(s)
+  print("\n")
+  print(g)
+  print("\n")
+}

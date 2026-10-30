@@ -20,8 +20,12 @@ public struct Sema {
     let externalDecls: [TopDecl]
     let diags = DiagnosticSink()
     private let subsetFuncs: Set<String>   // task 149 — functions compiled under the runtime-subset rules
-    // The `gc.record` setting as the level `RawPtr.gcRecordLevel()` folds to: 0 off, 1 limited, 2 full.
+    // The `gc.record` setting as the level `Runtime.gcRecordLevel()` folds to: 0 off, 1 limited, 2 full.
     let gcRecordLevel: Int
+    // Whether this module is in the runtime tier, the only place `Runtime` (the runtime intrinsics) may be
+    // named: the `runtime` package, and suite fixtures built with `test.runtime_prelude` or
+    // `test.runtime_tier` (`internals/runtime-subset.md` §5).
+    let runtimeTier: Bool
 
     // Global declarations, by name.
     var structs: [String: StructDecl] = [:]
@@ -34,6 +38,16 @@ public struct Sema {
     // during declaration lowering and appended to the module's decls after the main pass.
     var pendingStaticFuncs: [NOIRDecl] = []
     var funcs:   [String: FnSig]      = [:]   // named functions + non-print builtins
+
+    // Globals (module-private top-level `let`s), by name: the declarations, and each one's lowered form once
+    // its initializer is checked. Initializers are checked before any function body, a global's first read
+    // checking it first; `globalsInProgress` catches a global whose initializer reads itself.
+    var globalDecls: [String: GlobalDecl] = [:]
+    var loweredGlobals: [String: NOIRGlobal] = [:]
+    var globalsInProgress: Set<String> = []
+    // The span of the global initializer being checked when that initializer is a call: the one place
+    // `Runtime.staticStorage` is legal.
+    var staticStorageSite: Span? = nil
 
     // Computed properties (M5 A1), by owning type then property name. Drives member
     // read → getter-call and assignment → setter-call routing during body lowering.
@@ -132,9 +146,10 @@ public struct Sema {
                 moduleFuncs: [String: Set<String>] = [:],
                 moduleTypes: [String: Set<String>] = [:],
                 externalMutatingMethods: Set<String> = [],
-                gcRecordLevel: Int = 0) {
+                gcRecordLevel: Int = 0, runtimeTier: Bool = false) {
         self.program = program
         self.gcRecordLevel = gcRecordLevel
+        self.runtimeTier = runtimeTier
         self.externalDecls = externalDecls
         self.subsetFuncs = subsetFuncs
         self.fileVisibleModules = fileVisibleModules
@@ -150,6 +165,10 @@ public struct Sema {
         InterfaceModel.validateInterfaceGraph(self)
         InterfaceModel.checkConformances(&self)
         var decls: [NOIRDecl] = []
+        // Globals first: function bodies read them, and a global's initializer may read another.
+        for decl in program.decls {
+            if case .globalDecl(let g) = decl { NOIRGen.lowerGlobal(&self, g.name) }
+        }
         for decl in program.decls {
             // Interfaces are abstract: validate them, but emit no IR (conformance in a
             // later slice generates the concrete witnesses that carry the defaults).
@@ -239,6 +258,7 @@ public struct Sema {
             case .classDecl(let c):  classes[c.name] = c
             case .actorDecl(let a):  actors[a.name]  = a
             case .interfaceDecl(let i): interfaces[i.name] = i; interfaceBases[i.name] = i.refines
+            case .globalDecl(let g): globalDecls[g.name] = g
             case .funcDecl, .extensionDecl:
                 break   // functions in phase 2 below; extensions merged before Sema (M4.12)
             }
@@ -610,6 +630,15 @@ public struct Sema {
     }
 
     // The declared visibility and origin file of a user type, or nil for a builtin / unknown name.
+    // `Runtime.x` names a runtime intrinsic in the runtime tier, unless a type declared in this module or
+    // imported into this file is itself called `Runtime`. Outside the tier `Runtime` is an ordinary name, so
+    // naming it without a declaration reads as any undefined name does.
+    func isRuntimeNamespace(_ name: String, at span: Span) -> Bool {
+        guard runtimeTier, name == "Runtime", typeVisibility(name) == nil else { return false }
+        let inScope = fileVisibleModules[span.file] ?? []
+        return !inScope.contains { moduleTypes[$0]?.contains(name) == true }
+    }
+
     func typeVisibility(_ name: String) -> (Visibility, String)? {
         if let d = structs[name] { return (d.visibility, d.span.file) }
         if let d = enums[name]   { return (d.visibility, d.span.file) }

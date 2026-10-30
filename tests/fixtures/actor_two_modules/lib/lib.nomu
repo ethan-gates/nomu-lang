@@ -1,0 +1,13 @@
+actor Pinger {
+    var n: Int = 0
+    on ping() {
+        n += 1
+        print(n)
+        print("\n")
+    }
+}
+
+package fun pingOnce() {
+    let p = Pinger()
+    p.ping()
+}

@@ -85,6 +85,12 @@ final class LLVMGen {
     // (`origin@name`, task 100.2.3.2), which names its own module. Prelude/runtime functions (source file in
     // `weakOriginFiles`) stay bare — the C runtime pins those names.
     var homeModule: Mangle.Module = []
+    // The modules this one imports directly, whose init functions its own calls first (globals design).
+    var dependencyModules: [Mangle.Module] = []
+    // Compiling the `runtime` package, which defines the runtime's init function.
+    var isRuntimePackage = false
+    // Compiling the program's entry module, whose object defines the process entry `main`.
+    var emitsProcessEntry = false
     // The GC type-map globals are single extern tables the C runtime reads by name, so only one object
     // may define them (the entry). Dependency objects skip the definition and reference it externally.
     // (Interim: cross-module type-ids/type-map unification is a later separate-compilation task.)
@@ -217,10 +223,12 @@ final class LLVMGen {
     var runtimeFns: [String: (fn: LLVMValueRef, ty: LLVMTypeRef)] = [:]
     var pollFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var gcAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
-    var gcAllocRootedFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // task 176 — `noinline` shaped-root alloc variant
-    var selfhostAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // task 150 — self-hosted alloc slow path
+    var allocSlowFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // the allocation miss path (`__nomu_alloc_slow`)
+    var forwarderFns: [String: (fn: LLVMValueRef, ty: LLVMTypeRef)] = [:]   // the scheduler forwarders
     var barrierFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var rememberFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
+    var rawAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
+    var reserveZeroedFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var stopWorldGlobalCache: LLVMValueRef?
     var intFmt: LLVMValueRef?
     var uintFmt: LLVMValueRef?

@@ -6,7 +6,7 @@ swift_library(
     name = "ssairgen",
     srcs = glob(["sources/*.swift"]),
     module_name = "ssairgen",
-    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/noir", "//src/midend/ssair"],
+    deps = ["//src/support", "//src/frontend/ast", "//src/frontend/noir", "//src/midend/ssair", "//src/inference"],
     visibility = ["//visibility:public"],
 )
 

@@ -119,6 +119,23 @@ public enum TopDecl {
     case interfaceDecl(InterfaceDecl)
     case funcDecl(FuncDecl)
     case extensionDecl(ExtensionDecl)
+    case globalDecl(GlobalDecl)
+}
+
+// A global: a top-level `let` (`modules.md` §Initialization & entry point). `isMutable` records a
+// top-level `var`, which the parser accepts so sema can report it; a global is always a `let`.
+public struct GlobalDecl {
+    public let name: String
+    public let type: TypeRef?
+    public let value: Expr
+    public let isMutable: Bool
+    public let visibility: Visibility
+    public let span: Span
+
+    public init(name: String, type: TypeRef?, value: Expr, isMutable: Bool, visibility: Visibility, span: Span) {
+        self.name = name; self.type = type; self.value = value; self.isMutable = isMutable
+        self.visibility = visibility; self.span = span
+    }
 }
 
 // A declaration's reach across the module system (modules.md §visibility), widest last. `private` is

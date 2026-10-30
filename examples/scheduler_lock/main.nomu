@@ -40,7 +40,7 @@ fun mutexLock(m: RawPtr) {
       c = m.atomicExchange(2, atByteOffset: 0)         // mark contended, learn the prior state
     }
     while c != 0 {
-      m.futexWait(expected: 2, timeoutMicros: 0)       // 0 = wait indefinitely
+      Runtime.futexWait(at: m, expected: 2, timeoutMicros: 0)       // 0 = wait indefinitely
       c = m.atomicExchange(2, atByteOffset: 0)
     }
   }
@@ -49,7 +49,7 @@ fun mutexLock(m: RawPtr) {
 fun mutexUnlock(m: RawPtr) {
   let prev: Int = m.atomicExchange(0, atByteOffset: 0) // release
   if prev == 2 {
-    m.futexWake(all: false)                            // waiters possible → wake one
+    Runtime.futexWake(at: m, all: false)                            // waiters possible → wake one
   }
 }
 
@@ -95,7 +95,7 @@ fun schedRun(sched: RawPtr) {
       sched.store(fib, toByteOffset: 24)
       fib.store(1, toByteOffset: 168)
       let carrierCtx: RawPtr = sched.load(fromByteOffset: 0)
-      carrierCtx.ctxSwitchTo(fib)          // switch in holding the lock; resumes here holding it
+      Runtime.ctxSwitch(from: carrierCtx, to: fib)          // switch in holding the lock; resumes here holding it
     }
   }
   mutexUnlock(sched.advanced(by: 32))
@@ -110,7 +110,7 @@ fun fiberMain(fib: RawPtr) -> RawPtr {
   mutexUnlock(sched.advanced(by: 32))      // release after switch-in
   let entry: RawPtr = fib.load(fromByteOffset: 184)
   let arg: RawPtr = fib.load(fromByteOffset: 192)
-  let res = entry.callEntry(arg)           // user body, lock-free
+  let res = Runtime.callEntry(entry, arg: arg)           // user body, lock-free
   mutexLock(sched.advanced(by: 32))        // re-acquire to complete
   fib.store(res, toByteOffset: 216)
   fib.store(3, toByteOffset: 168)
@@ -120,7 +120,7 @@ fun fiberMain(fib: RawPtr) -> RawPtr {
     unparkLocked(sched, joiner)            // already holding the lock
   }
   let carrierCtx: RawPtr = sched.load(fromByteOffset: 0)
-  fib.ctxSwitchTo(carrierCtx)              // switch back holding the lock
+  Runtime.ctxSwitch(from: fib, to: carrierCtx)              // switch back holding the lock
   return fib
 }
 
@@ -137,7 +137,7 @@ fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   fib.store(stack, toByteOffset: 208)
   fib.store(RawPtr.null, toByteOffset: 216)
   fib.store(RawPtr.null, toByteOffset: 224)
-  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberMain), arg: fib)
+  Runtime.fiberInit(context: fib, stackTop: stackTop, entry: Runtime.ofFunc(fiberMain), arg: fib)
   return fib
 }
 
@@ -166,7 +166,7 @@ fun parkLocked(sched: RawPtr) {
   let fib: RawPtr = sched.load(fromByteOffset: 24)
   fib.store(2, toByteOffset: 168)
   let carrierCtx: RawPtr = sched.load(fromByteOffset: 0)
-  fib.ctxSwitchTo(carrierCtx)              // save context holding the lock; switch to carrier
+  Runtime.ctxSwitch(from: fib, to: carrierCtx)              // save context holding the lock; switch to carrier
   mutexUnlock(sched.advanced(by: 32))      // resumed → release after switch-in
 }
 
@@ -284,7 +284,7 @@ fun main() {
   let s1 = newSched()
   let acc1 = RawPtr.alloc(bytes: 8, align: 8)
   acc1.store(0, toByteOffset: 0)
-  let body = RawPtr.ofFunc(addBody)
+  let body = Runtime.ofFunc(addBody)
   let a1 = RawPtr.alloc(bytes: 16, align: 8)
   a1.store(acc1, toByteOffset: 0)
   a1.store(1, toByteOffset: 8)
@@ -309,12 +309,12 @@ fun main() {
   let pArg = RawPtr.alloc(bytes: 16, align: 8)
   pArg.store(acc2, toByteOffset: 0)
   pArg.store(s2, toByteOffset: 8)
-  let pFib = fiberSpawn(s2, RawPtr.ofFunc(parkBody), pArg)
+  let pFib = fiberSpawn(s2, Runtime.ofFunc(parkBody), pArg)
   let qArg = RawPtr.alloc(bytes: 24, align: 8)
   qArg.store(acc2, toByteOffset: 0)
   qArg.store(s2, toByteOffset: 8)
   qArg.store(pFib, toByteOffset: 16)
-  fiberSpawn(s2, RawPtr.ofFunc(unparkBody), qArg)
+  fiberSpawn(s2, Runtime.ofFunc(unparkBody), qArg)
   schedRun(s2)
   let total2: Int = acc2.load(fromByteOffset: 0)
   print(total2)
@@ -324,12 +324,12 @@ fun main() {
   let s3 = newSched()
   let acc3 = RawPtr.alloc(bytes: 8, align: 8)
   acc3.store(0, toByteOffset: 0)
-  let cFib = fiberSpawn(s3, RawPtr.ofFunc(computeBody), RawPtr.null)
+  let cFib = fiberSpawn(s3, Runtime.ofFunc(computeBody), RawPtr.null)
   let dArg = RawPtr.alloc(bytes: 24, align: 8)
   dArg.store(acc3, toByteOffset: 0)
   dArg.store(s3, toByteOffset: 8)
   dArg.store(cFib, toByteOffset: 16)
-  fiberSpawn(s3, RawPtr.ofFunc(joinBody), dArg)
+  fiberSpawn(s3, Runtime.ofFunc(joinBody), dArg)
   schedRun(s3)
   let total3: Int = acc3.load(fromByteOffset: 0)
   print(total3)
@@ -348,8 +348,8 @@ fun main() {
   bArg.store(acc4, toByteOffset: 0)
   bArg.store(s4, toByteOffset: 8)
   bArg.store(1000, toByteOffset: 24)
-  let aFib = fiberSpawn(s4, RawPtr.ofFunc(relayBody), aArg)
-  let bFib = fiberSpawnParked(s4, RawPtr.ofFunc(relayBody), bArg)
+  let aFib = fiberSpawn(s4, Runtime.ofFunc(relayBody), aArg)
+  let bFib = fiberSpawnParked(s4, Runtime.ofFunc(relayBody), bArg)
   aArg.store(bFib, toByteOffset: 16)
   bArg.store(aFib, toByteOffset: 16)
   schedRun(s4)

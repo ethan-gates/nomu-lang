@@ -21,8 +21,8 @@ fun main() {
     i = i + 1
   }
 
-  let space = RawPtr.gcSelfhostSpace()
-  let tcount = RawPtr.gcTypeCount()
+  let space = rtSpace
+  let tcount = Runtime.gcTypeCount()
   let counts = RawPtr.alloc(bytes: tcount * 8, align: 8)
   let fp = RawPtr.alloc(bytes: 8, align: 8)
 

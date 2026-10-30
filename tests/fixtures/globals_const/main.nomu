@@ -1,0 +1,48 @@
+// Globals folded at compile time (task 224.2): literals, arithmetic, comparisons, globals reading other
+// globals, short and long string literals, a struct value, a payload-free enum case, and a private global.
+struct Point {
+  let x: Int
+  let y: Int
+}
+
+enum Mode {
+  case fast
+  case safe
+}
+
+let maxBlocks = blockSize / 8 + 1   // reads a global declared below
+let blockSize = 32 * 1024
+let ratio = 1.5 * 2.0
+let enabled = maxBlocks > 4000
+let greeting = "hi"
+let banner = "a string longer than fifteen bytes"
+let origin = Point(x: 3, y: -4)
+let mode = Mode.safe
+private let secret = 7
+
+fun describe(m: Mode) -> Int {
+  switch m {
+  case .fast: return 1
+  case .safe: return 2
+  }
+}
+
+fun main() {
+  print(blockSize)
+  print("\n")
+  print(maxBlocks)
+  print("\n")
+  print(ratio)
+  print(enabled)
+  print("\n")
+  print(greeting)
+  print("\n")
+  print(banner)
+  print("\n")
+  print(origin.x + origin.y)
+  print("\n")
+  print(describe(mode))
+  print("\n")
+  print(secret)
+  print("\n")
+}

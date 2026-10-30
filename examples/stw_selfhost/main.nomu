@@ -23,7 +23,7 @@ fun main() {
   spawn let r = worker()              // worker runs and parks at its sleep(200)
   sleep(10)                           // let worker park
 
-  let sched = RawPtr.schedHandle()
+  let sched = rtSched
   let buf = RawPtr.alloc(bytes: 512, align: 8)
   let nr = nomuSchedWalkParked(sched, buf, 64)
   print("nroots ")

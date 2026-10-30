@@ -1,6 +1,6 @@
 // Collections while a fiber is parked in `readLine` (suite case `read-line-gc`, NOMU_GC_STRESS, stdin fed
 // late): `main` holds a heap Box and a heap String across the park while `churn` allocates and forces
-// collections. The STW walks `main` from the anchor `rt_read_line` recorded, so both survive the moves.
+// collections. The STW walks `main` from the anchor the `readLine` forwarder recorded, so both survive the moves.
 class Box {
   var v: Int
 }

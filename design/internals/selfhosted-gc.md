@@ -263,7 +263,8 @@ across GC plans; `tools/arr-gc.sh`, `tools/gc-stress.sh`):
   statepoint-base production in front of hand-written code. Rung 1 keeps that production compiler-emitted;
   revisit if a later rung needs the fast path in Nomu. — **Deferred.**
 - **Returning OS memory.** NoGC never frees blocks; whether the mature collector returns empty blocks to
-  the OS (madvise/decommit) is a rung 3+ footprint question. — **Open.**
+  the OS (madvise/decommit) is a rung 3+ footprint question, now task
+  [225](../plans/tasks/225-return-memory-to-the-os.md). — **Open.**
 - **MMTk retirement.** Retired by [197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md), without a
   GenImmix-vs-MMTk benchmark: retirement was decided regardless of its result, so it would only have
   measured distance. Performance is benchmarked against Go and Swift once the language is complete. The
@@ -380,7 +381,7 @@ frame-pointer-free Nomu walk — swapping the seed for real stack roots under th
 **150.2 (mark-verify) progress — 150.2.1–150.2.8 built. Single-thread root scanning + the cross-run
 fingerprint diff are complete and oracle-checked.** ("Increment N" below = subtask 150.2.N.)
 - **150.2.1 · side-table reachability (built).** The Nomu tracer reads the codegen-emitted per-type-id
-  side tables (size, kind, stride, managed-pointer map; `c-types.md` §1/§3.2) through six `RawPtr.gcType*`
+  side tables (size, kind, stride, managed-pointer map; `c-types.md` §1/§3.2) through six `Runtime.gcType*`
   accessors that lower to the existing runtime accessors — **no new runtime C**. Differentially validated:
   a Nomu-side table dump is byte-identical to the C `NOMU_GC_TYPEMAPS` dump in one process
   (`examples/mark_types.nomu` + `tools/mark-types.sh`).
@@ -404,7 +405,7 @@ fingerprint diff are complete and oracle-checked.** ("Increment N" below = subta
 - **150.2.5 · stack-map access + parse (built).** Toward real roots: the `__llvm_stackmaps` (v3)
   section is reached from Nomu **libc-free** via the linker section-bracket symbols
   (`section$start$…`/`section$end$…`, `\01`-prefixed to skip Mach-O `_` mangling), exposed as
-  `RawPtr.gcStackmapBase` / `gcStackmapSize` — no `getsectiondata`, no new runtime C. The v3 structure is
+  `Runtime.gcStackmapBase` / `gcStackmapSize` — no `getsectiondata`, no new runtime C. The v3 structure is
   parsed in Nomu (`rtStackmapEnd` + `rtU16`/`rtU32`/`rtAlign8` in the prelude), self-validated: the version
   byte is 3 and stepping every variable-length record lands the cursor exactly on the section size
   (`examples/stackmap_probe.nomu` + `tools/stackmap-probe.sh`). The existing stackmap already carries the
@@ -415,7 +416,7 @@ fingerprint diff are complete and oracle-checked.** ("Increment N" below = subta
   (its SP is `llvm.frameaddress` + 16, its PC is `llvm.returnaddress`), look the PC up in the parsed
   stackmap, read each `kind==3` root slot (`SP + offset`, or `SP + StackSize − 16 + offset` for the
   FP-relative slots), then step to the caller by `SP += StackSize` — no frame-pointer chain, no libunwind.
-  Two anchor intrinsics (`RawPtr.gcFrameAddr`/`gcReturnAddr` → `llvm.frameaddress`/`returnaddress`) and a
+  Two anchor intrinsics (`Runtime.gcFrameAddr`/`gcReturnAddr` → `llvm.frameaddress`/`returnaddress`) and a
   `noinline` mark on `rtCollectRoots` (so the frame intrinsics resolve to its own frame) are the only new
   codegen; no runtime C. End-to-end (`examples/walk_mark.nomu` + `tools/walk-mark.sh`): the walk recovers
   the handle of a live `Array<Box>`, hands it to the tracer, which marks the live set (handle + buffer + 2
@@ -703,7 +704,7 @@ Rung 3 comes up in eight increments, each one mechanism with an oracle, mirrorin
    byte-identical to MMTk NoGC.
 4. **150.3.4 — line marking (diagnostic). Built.** `rtMarkVerifyImmix` traces as rung 2 and additionally
    marks each live *in-heap* object's lines (`rtMarkObjLines`; LOS objects header-marked only). A new
-   intrinsic `RawPtr.gcSelfhostSpace()` reaches the space the objects live in. `rtLineMarkCheck`
+   intrinsic `Runtime.gcSelfhostSpace()` reaches the space the objects live in. `rtLineMarkCheck`
    independently re-derives the line set (unmark-walk) and confirms completeness (every live object on
    marked lines) + soundness (marked-line count == live footprint), returning 0. No reclaim — a checkpoint
    like mark-verify; object marking + fingerprint are the rung-2 logic (checked cross-plan by `mark-verify`).
@@ -871,7 +872,7 @@ Rung 4 comes up one mechanism at a time, each diffed against MMTk GenImmix, mirr
 3. **150.4.3 — minor collection. Built.** `rtImmixCollectMinor` turns the NURSERY blocks into evacuation
    sources and promotes every survivor into fresh mature Immix (reusing `rtEvacuate` + the forwarding record):
    the roots are the stopped mutator's stack slots plus the drained per-carrier remembered set
-   (`RawPtr.gcDrainModBufs` → `rt_modbuf_drain`), and the trace is Cheney over promoted objects only — the
+   (`Runtime.gcDrainModBufs` → `rt_modbuf_drain`), and the trace is Cheney over promoted objects only — the
    mature space is never scanned, so a mature→young pointer survives solely via the remembered set. Promoted +
    remembered objects are re-marked unlogged; the emptied nursery blocks are reclaimed whole (mature is not
    swept). Fires when the nursery reaches its reserve (`rtImmixRefill` → `rtSelfhostMinorGc` parks the mutator;

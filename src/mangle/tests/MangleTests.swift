@@ -39,6 +39,24 @@ final class MangleTests: XCTestCase {
         ])
     }
 
+    func testGlobals() throws {
+        try check([
+            (Mangle.global("limit", home: util), "_RNvNmNmNmC4acme4shop3app4util5limit", "acme::shop::app::util::limit"),
+            (Mangle.global("acme/shop/lib@limit", home: app), "_RNvNmNmC4acme4shop3lib5limit", "acme::shop::lib::limit"),
+            (Mangle.function("global:limit", home: util), "_RNvNvNmNmNmC4acme4shop3app4util5limit4init",
+             "acme::shop::app::util::limit::init"),
+            (Mangle.staticStorage("flag", home: util), "_RNvNvNmNmNmC4acme4shop3app4util4flag7storage",
+             "acme::shop::app::util::flag::storage"),
+        ])
+        XCTAssertEqual(Mangle.global("rtStopWorld", home: []), "nomu_g_rtStopWorld")
+        XCTAssertEqual(Mangle.staticStorage("rtStopWorld", home: []), "nomu_static_rtStopWorld")
+    }
+
+    func testModuleInit() throws {
+        try check([(Mangle.moduleInit(home: util), "_RNiNmNmNmC4acme4shop3app4util4init", "acme::shop::app::util::init")])
+        XCTAssertEqual(Mangle.moduleInit(home: []), "nomu_runtime_init")
+    }
+
     func testFixedNames() {
         XCTAssertEqual(Mangle.function("main", home: app), "nomu_main")
         XCTAssertEqual(Mangle.function("rtTlabAlloc", home: []), "nomu_fn_rtTlabAlloc")

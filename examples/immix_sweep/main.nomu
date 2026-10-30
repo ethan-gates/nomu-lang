@@ -18,7 +18,7 @@ fun main() {
   live.append(Box(v: 111))
   live.append(Box(v: 222))
 
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
 
   // batch 1 — unreachable garbage, filling several blocks
   var i = 0

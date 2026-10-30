@@ -31,7 +31,7 @@ fun mutexLock(m: RawPtr) {
       c = m.atomicExchange(2, atByteOffset: 0)
     }
     while c != 0 {
-      m.futexWait(expected: 2, timeoutMicros: 0)
+      Runtime.futexWait(at: m, expected: 2, timeoutMicros: 0)
       c = m.atomicExchange(2, atByteOffset: 0)
     }
   }
@@ -40,7 +40,7 @@ fun mutexLock(m: RawPtr) {
 fun mutexUnlock(m: RawPtr) {
   let prev: Int = m.atomicExchange(0, atByteOffset: 0)
   if prev == 2 {
-    m.futexWake(all: false)
+    Runtime.futexWake(at: m, all: false)
   }
 }
 
@@ -73,14 +73,14 @@ fun dequeue(sched: RawPtr) -> RawPtr {
 fun wakeCarrier(sched: RawPtr, all: Bool) {
   let gw = sched.advanced(by: 24)
   gw.atomicFetchAdd(1, atByteOffset: 0)
-  gw.futexWake(all: all)
+  Runtime.futexWake(at: gw, all: all)
 }
 
 // Wake the timer thread (it waits on the timer-gen word): bump the word, then futexWake.
 fun wakeTimer(sched: RawPtr) {
   let tg = sched.advanced(by: 56)
   tg.atomicFetchAdd(1, atByteOffset: 0)
-  tg.futexWake(all: false)
+  Runtime.futexWake(at: tg, all: false)
 }
 
 // Raise the stop flag and wake everyone (idle carriers + the timer thread) so they exit for the join.
@@ -188,7 +188,7 @@ fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   fib.store(RawPtr.null, toByteOffset: 216)
   fib.store(RawPtr.null, toByteOffset: 224)
   fib.store(RawPtr.null, toByteOffset: 232)
-  fib.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberMain), arg: fib)
+  Runtime.fiberInit(context: fib, stackTop: stackTop, entry: Runtime.ofFunc(fiberMain), arg: fib)
   return fib
 }
 
@@ -213,8 +213,8 @@ fun unpark(sched: RawPtr, fib: RawPtr) {
 // Sleep `nanos`: register the deadline on the timer heap and park, holding the scheduler lock across both
 // so the timer thread cannot unpark us before our context is saved. Resumes when the timer thread fires.
 fun fiberSleep(sched: RawPtr, nanos: Int) {
-  let self = RawPtr.tlsGet()
-  let expiry: Int = RawPtr.monotonicNanos() + nanos
+  let self = Runtime.carrierLocal()
+  let expiry: Int = Runtime.monotonicNanos() + nanos
   mutexLock(sched.advanced(by: 16))          // scheduler lock (held across the park — handoff)
   mutexLock(sched.advanced(by: 48))          // timer lock (order: scheduler → timer)
   timerPush(sched, expiry, self)
@@ -222,7 +222,7 @@ fun fiberSleep(sched: RawPtr, nanos: Int) {
   wakeTimer(sched)
   self.store(2, toByteOffset: 168)
   let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  self.ctxSwitchTo(carrierCtx)               // save holding the scheduler lock; switch to the carrier
+  Runtime.ctxSwitch(from: self, to: carrierCtx)               // save holding the scheduler lock; switch to the carrier
   mutexUnlock(sched.advanced(by: 16))        // resumed → release
 }
 
@@ -231,7 +231,7 @@ fun fiberMain(fib: RawPtr) -> RawPtr {
   mutexUnlock(sched.advanced(by: 16))
   let entry: RawPtr = fib.load(fromByteOffset: 184)
   let arg: RawPtr = fib.load(fromByteOffset: 192)
-  let res = entry.callEntry(arg)
+  let res = Runtime.callEntry(entry, arg: arg)
   mutexLock(sched.advanced(by: 16))
   fib.store(res, toByteOffset: 216)
   fib.store(3, toByteOffset: 168)
@@ -240,7 +240,7 @@ fun fiberMain(fib: RawPtr) -> RawPtr {
     signalStop(sched)
   }
   let carrierCtx: RawPtr = fib.load(fromByteOffset: 232)
-  fib.ctxSwitchTo(carrierCtx)
+  Runtime.ctxSwitch(from: fib, to: carrierCtx)
   return fib
 }
 
@@ -257,13 +257,13 @@ fun schedLoop(sched: RawPtr, myCtx: RawPtr) {
         let gw = sched.advanced(by: 24)
         let gen: Int = gw.atomicLoad(fromByteOffset: 0)
         mutexUnlock(sched.advanced(by: 16))
-        gw.futexWait(expected: gen, timeoutMicros: 1000000)
+        Runtime.futexWait(at: gw, expected: gen, timeoutMicros: 1000000)
         mutexLock(sched.advanced(by: 16))
       } else {
         fib.store(myCtx, toByteOffset: 232)
         fib.store(1, toByteOffset: 168)
-        RawPtr.tlsSet(fib)
-        myCtx.ctxSwitchTo(fib)
+        Runtime.setCarrierLocal(fib)
+        Runtime.ctxSwitch(from: myCtx, to: fib)
       }
     }
   }
@@ -293,11 +293,11 @@ fun timerMain(sched: RawPtr) -> RawPtr {
         let tg = sched.advanced(by: 56)
         let gen: Int = tg.atomicLoad(fromByteOffset: 0)
         mutexUnlock(sched.advanced(by: 48))
-        tg.futexWait(expected: gen, timeoutMicros: 1000000)     // wait for a push (1 s backstop)
+        Runtime.futexWait(at: tg, expected: gen, timeoutMicros: 1000000)     // wait for a push (1 s backstop)
       } else {
         let ents: RawPtr = sched.load(fromByteOffset: 72)
         let next: Int = ents.load(fromByteOffset: 0)
-        let now: Int = RawPtr.monotonicNanos()
+        let now: Int = Runtime.monotonicNanos()
         if next <= now {
           timerPopMin(sched, out)
           mutexUnlock(sched.advanced(by: 48))
@@ -308,7 +308,7 @@ fun timerMain(sched: RawPtr) -> RawPtr {
           let gen: Int = tg.atomicLoad(fromByteOffset: 0)
           mutexUnlock(sched.advanced(by: 48))
           let waitUs: Int = (next - now) / 1000
-          tg.futexWait(expected: gen, timeoutMicros: waitUs)     // wait until the deadline (or a push)
+          Runtime.futexWait(at: tg, expected: gen, timeoutMicros: waitUs)     // wait until the deadline (or a push)
         }
       }
     }
@@ -354,7 +354,7 @@ fun main() {
   let seqBuf = RawPtr.alloc(bytes: 8 * n, align: 8)
   let seqIdx = RawPtr.alloc(bytes: 8, align: 8)
   seqIdx.atomicStore(0, toByteOffset: 0)
-  let body = RawPtr.ofFunc(sleepBody)
+  let body = Runtime.ofFunc(sleepBody)
 
   // Four fibers, deadlines 40/80/120/160 ms, ids 1..4 in that order.
   var i = 0
@@ -378,19 +378,19 @@ fun main() {
     carg.store(sched, toByteOffset: 0)
     carg.store(ctx, toByteOffset: 8)
     let h = handles.advanced(by: 8 * c)
-    h.threadCreate(entry: RawPtr.ofFunc(carrierMain), arg: carg)
+    Runtime.threadCreate(handle: h, entry: Runtime.ofFunc(carrierMain), arg: carg)
     c = c + 1
   }
   let th = RawPtr.alloc(bytes: 8, align: 8)
-  th.threadCreate(entry: RawPtr.ofFunc(timerMain), arg: sched)
+  Runtime.threadCreate(handle: th, entry: Runtime.ofFunc(timerMain), arg: sched)
 
   var k = 0
   while k < carriers {
     let h = handles.advanced(by: 8 * k)
-    h.threadJoin()
+    Runtime.threadJoin(handle: h)
     k = k + 1
   }
-  th.threadJoin()
+  Runtime.threadJoin(handle: th)
 
   // Wake order = deadline order = 1 2 3 4.
   var j = 0

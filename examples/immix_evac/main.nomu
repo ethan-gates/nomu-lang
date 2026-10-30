@@ -20,7 +20,7 @@ fun main() {
   live.append(Box(v: 222))
   live.append(Box(v: 333))
 
-  let space = RawPtr.gcSelfhostSpace()
+  let space = rtSpace
 
   // garbage to occupy (and fragment) several from-space blocks
   var i = 0
@@ -30,7 +30,7 @@ fun main() {
   }
 
   // fingerprint of the live set before evacuation, then clear the marks it set
-  let tc = RawPtr.gcTypeCount()
+  let tc = Runtime.gcTypeCount()
   let counts = RawPtr.alloc(bytes: tc * 8, align: 8)
   let fp = RawPtr.alloc(bytes: 8, align: 8)
   let before = rtMarkVerify(addrOf(live), counts, fp)

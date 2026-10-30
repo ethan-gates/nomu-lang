@@ -59,6 +59,8 @@ let settingTable: [String: SettingDef] = [
                                      help: "devirtualization (default on)"),
     "rt_prelude":         SettingDef(stage: .compile, carrier: .configWhen(true, "rt_prelude"),
                                      help: "compile against the runtime prelude (fixtures that call rt* directly)"),
+    "runtime_tier":       SettingDef(stage: .compile, carrier: .configWhen(true, "runtime_tier"),
+                                     help: "admit the fixture to the runtime tier (calls `Runtime` intrinsics directly)"),
     "gc_record":          SettingDef(stage: .compile, carrier: .configWhen(true, "gc_record"),
                                      help: "the collector's recorder at `limited` (`gc.record`)"),
     // Run settings.

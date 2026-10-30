@@ -1,0 +1,14 @@
+// Actors in two modules: each module emits the actor drain loop, and the copies fold to one at link.
+// Only the library's actor prints, since the two mailboxes drain on separate fibers in either order.
+import pkg/lib
+
+actor Counter {
+    var count: Int = 0
+    on bump(by: Int) { count += by }
+}
+
+fun main() {
+    pingOnce()
+    let c = Counter()
+    c.bump(by: 5)
+}

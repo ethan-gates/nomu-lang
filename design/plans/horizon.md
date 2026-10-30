@@ -26,14 +26,18 @@ and smaller than Go and Swift."
 
 **Order rule:** self-hosting is a *location* change (MMTk/Rust → Nomu); LXR is an *algorithm* change
 (GenImmix → RC-hybrid). Hold the algorithm constant while moving location, then hold location constant
-while changing the algorithm — so the two unknowns never multiply. LXR is the algorithm change that remains;
-the C floor's retirement (128.5) follows it.
+while changing the algorithm — so the two unknowns never multiply. The C floor's retirement (223) is the location change that
+remains, done on GenImmix before LXR: LXR is then built and compared on a runtime with no C under it, and
+new runtime work stops choosing between growing the C and adding edges to it.
 
 ```
 127  LXR — RC-primary reclamation, on Immix backing; then the GenImmix–LXR comparison   ◀ end goal
 └── benchmark against Go and Swift, on GenImmix (when the language is complete)
-    ├── 158  GC packaging — self-contained plans behind one trigger protocol   ◀ next
-    ├── 159.6  GC observability's `full` level — fast-path allocation counters  (after 128.5.2)
+    ├── 223  retire the C floor, from the floor up                         ◀ next
+    │   ├── 224  globals — module-private top-level `let` (223.1 needs 224.1–224.3)
+    │   ├── 226  collector work buffers that overflow silently — made growable  (built)
+    │   └── 159.6  GC observability's `full` level — fast-path allocation counters  (after 226)
+    ├── 158  GC packaging — self-contained plans behind one trigger protocol  (223.5 with it)
     ├── 104  fiber stack strategy — guard page, lazy commit, growth       (before any GC is measured)
     │   └── 219  runtime fault handling — one signal handler, reporters
     ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
@@ -43,7 +47,7 @@ the C floor's retirement (128.5) follows it.
     └── 217  build graph granularity — sliced keys, scheduler (staged jobs deferred)  (dev-productivity)
 ```
 
-**Order of the next run:** [158](tasks/158-gc-packaging.md) next, debugged with [159](tasks/159-gc-observability.md)'s collector report; then 159.6 (the `full` level: allocation counted on the fast path, for survival and allocation rates), which waits on [128](tasks/128-self-hosting-runtime.md).5.2 (carrier state and the allocation fast path in Nomu). [104](tasks/104-fiber-stack-strategy.md) (fiber stacks: overflow detection, lazy commit, growth) and its
+**Order of the next run:** [223](tasks/223-retire-the-c-floor.md) next, from the floor up: 223.1 (the floor: the `Runtime` namespace, globals, the carrier-local slot, raw memory) and 223.2 (carrier state and the allocation fast path in Nomu), then [226](tasks/226-collector-buffer-overflow.md) (the collector's root, remembered-set and mark buffers drop or overrun past a fixed size; a correctness fix). 223 continues as far as it goes before anything else: 223.3 (the forwarders, emitted by codegen), 223.4 (GC metadata), 223.5 short of the coordinator threads (`main`, line input and its poller), and 223.6 (the remainder). Then 159.6 (the `full` level: allocation counted on the fast path, for survival and allocation rates). [158](tasks/158-gc-packaging.md) follows, debugged with [159](tasks/159-gc-observability.md)'s collector report; 223.5 moves the coordinator threads with it. [104](tasks/104-fiber-stack-strategy.md) (fiber stacks: overflow detection, lazy commit, growth) and its
 prerequisite [219](tasks/219-runtime-fault-handling.md) (fault handling) come before any collector is
 measured, so the benchmarks run on large, fiber-heavy programs. 158 is what remains of the GC ladder
 ([150](tasks/150-selfhosted-gc-ladder.md)). [217](tasks/217-build-graph-granularity.md)'s
@@ -51,12 +55,6 @@ remaining design (the slice's closure, the header format and hash, per-declarati
 is paused. Off this chain: [204](tasks/204-yaml-parser-upgrades.md) (YAML parser upgrades),
 [205](tasks/205-config-upgrades.md) (configuration upgrades), and 176.4 (the escape-promotion placement route)
 with [148](tasks/148-ssair-optimizer-tier.md) / [179](tasks/179-value-level-gc-classification.md).
-
-**Off the chain, after 127:** [128.5](tasks/128-self-hosting-runtime.md) retires the C floor (`runtime.c`,
-`core.c`) that remains under the Nomu runtime, the last step to the end goal's "no C". It is a location
-change, so it follows LXR by the Order rule. Its blockers include FFI-like calls, C-ABI thread entries,
-safepoint-free functions and runtime globals, some of which need language surface agreed first. A candidate
-for its own task.
 
 **What the benchmark needs from the language.** The goal is a language complete enough to benchmark against
 Go and Swift, with results that reflect the language, compiler, scheduling and memory as designed, and not

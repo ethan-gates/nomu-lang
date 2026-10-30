@@ -109,6 +109,7 @@ private func renderKind(_ kind: SSAInstKind) -> String {
         let kw = onStack ? "stackclosure" : "closure"
         return env.map { "\(kw) \(name) env \(val($0))" } ?? "\(kw) \(name)"
     case .funcAddr(let name):                   return "funcAddr \(name)"
+    case .globalRead(let name):                 return "globalRead \(name)"
     }
 }
 

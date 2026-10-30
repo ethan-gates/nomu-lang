@@ -77,7 +77,7 @@ public indirect enum SSAInstKind {
 
     // Bounds check — an explicit op (Decided 2026-08-16, ssair.md) so BCE (7.5) is a pass
     // that proves it redundant and deletes it. The egress lowers a surviving `boundscheck` to the
-    // trap form (compare `index UGE length` → `rt_bounds_trap` → `unreachable`).
+    // trap form (compare `index UGE length` → the runtime's `rtBoundsTrap` → `unreachable`).
     case boundscheck(index: SSAValue, length: SSAValue)
 
     // Dispatch — the call kind is explicit so devirt rewrites `witness`→`direct` and inlining keys
@@ -125,10 +125,14 @@ public indirect enum SSAInstKind {
     case makeClosure(funcName: String, env: SSAValue?, onStack: Bool)
 
     // The C-ABI code address of a top-level non-capturing function, as an addrspace(0) raw pointer (task
-    // 128.2, `RawPtr.ofFunc`). Unlike `makeClosure` (a managed `{header, fn, env}` box), this is the bare
+    // 128.2, `Runtime.ofFunc`). Unlike `makeClosure` (a managed `{header, fn, env}` box), this is the bare
     // function pointer the asm floor / `pthread_create` call — a runtime-tier primitive, not first-class
     // functions. No SSA operands; the target is named by symbol.
     case funcAddr(String)
+
+    // Read a global (a module-private top-level `let`, task 224) by name: its value, of the result type.
+    // A global never changes after startup, so the read has no ordering against stores.
+    case globalRead(String)
 }
 
 // A call site. `typeArgs` is non-empty only for a residual generic call the mono pass left dynamic.
@@ -282,8 +286,24 @@ public struct SSAEnumCase {
 // The unit the passes and egress consume. Function bodies are CFGs (`functions`); type-layout and
 // witness metadata carry through from NOIR unchanged (the witness structs are reused directly, since
 // they hold no executable bodies).
+// A global defined in this module. `initFunction` names the SSA function that computes its value (no
+// parameters, returns `type`); for a constant global the egress folds that function's result into static
+// data and emits no code for it, and a startup global's runs once from the module's init function.
+public struct SSAGlobal {
+    public let name: String
+    public let type: Type
+    public let initFunction: String
+    public let isConstant: Bool
+    public let span: Span
+
+    public init(name: String, type: Type, initFunction: String, isConstant: Bool, span: Span) {
+        self.name = name; self.type = type; self.initFunction = initFunction; self.isConstant = isConstant; self.span = span
+    }
+}
+
 public struct SSAModule {
     public var functions: [SSAFunction]   // `var`: transform passes rewrite bodies in place (M7.3)
+    public var globals: [SSAGlobal] = []          // startup globals in the order they initialize
     public let aggregates: [SSAAggregate]           // struct / class / actor storage layout
     public let enums: [SSAEnum]                      // enum case layout
     public let interfaces: [NOIRInterface]           // drives witness-table type emission

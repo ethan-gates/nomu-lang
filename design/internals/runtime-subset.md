@@ -149,12 +149,24 @@ Diagnostics surface as ordinary Sema-level errors (the property set is known bef
 Subset code does real work by calling primitives that are subset-legal by construction. The allowlist:
 
 - **The 125 raw-memory surface** (`unsafe-memory.md`). `RawPtr` / `Ptr<T>` ops are gc-leaf, touch no
-  managed heap, and emit no barrier or poll (their alloc/free go to `rt_raw_alloc` / `rt_raw_free`, off
-  the managed heap). They pass the subset check with no special case — the interlock that makes the
+  managed heap, and emit no barrier or poll (their alloc/free go to `posix_memalign` / `free`, off the
+  managed heap). They pass the subset check with no special case — the interlock that makes the
   allocator (150 rung 1) written in 125 primitives legal, and the reason 125 lands first.
 - **Named runtime intrinsics** — `park` / `unpark`, the raw alloc entry, and GC-internal helpers blessed
   as subset leaves. These are the privileged calls `c-types.md` §6 reserves for the language/runtime
   tier, reached only from runtime code.
+
+**Runtime intrinsics are spelled on `Runtime` (Decided).** A runtime intrinsic is a compiler-provided
+operation that exists only for the runtime tier: GC metadata reads, the scheduler handle, the carrier-local
+slot, static storage, the clocks and OS calls the runtime makes, the context switch. They are spelled as
+members of `Runtime`, a type with no values that only the runtime tier may name
+(`Runtime.staticStorage(bytes: 8, align: 8)`, `Runtime.futexWait(...)`). Outside the runtime tier `Runtime`
+does not exist: naming it is the ordinary undefined-name error, as for an internal type of another module.
+The type is the namespace, so a privileged call never looks like ordinary user code, and the rule for the
+markers above (recognized only inside the runtime tier) holds for calls too. The unsafe raw-memory surface
+(`RawPtr`, `Ptr<T>`, `unsafe-memory.md`) is a separate layer: memory operations on a type, with its own
+question of user access. Built in [223](../plans/tasks/223-retire-the-c-floor.md).1, which moves the
+intrinsics off `RawPtr`.
 
 A subset function reaching outside this allowlist to an ordinary allocating/barriering callee is the
 error §4 reports.

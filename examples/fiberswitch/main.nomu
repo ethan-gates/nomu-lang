@@ -1,6 +1,6 @@
-// Task 128.2 · asm floor driven from Nomu — single-fiber context round-trip. Unlike asmswitch.nomu
-// (a C harness), here the fiber entry is a Nomu function reached through RawPtr.ofFunc, and main drives
-// the switch through the RawPtr intrinsics (fiberInit / ctxSwitchTo). This is the 128.1.2 checkpoint: a
+// Task 128.2 · asm floor driven from Nomu — single-fiber context round-trip, the asm floor's isolation
+// test. The fiber entry is a Nomu function reached through Runtime.ofFunc, and main drives the switch
+// through the RawPtr intrinsics (fiberInit / ctxSwitchTo). This is the 128.1.2 checkpoint: a
 // Nomu-seeded fiber runs on its own stack and returns control cleanly.
 //
 // The fiber's argument is a control block (off-heap RawPtr): slot 0 = the fiber's own context buffer,
@@ -12,7 +12,7 @@ fun fiberEntry(cb: RawPtr) -> RawPtr {
   cb.store(42, toByteOffset: 16)                 // witness: the fiber ran, with its argument delivered
   let fiberCtx: RawPtr = cb.load(fromByteOffset: 0)
   let mainCtx: RawPtr = cb.load(fromByteOffset: 8)
-  fiberCtx.ctxSwitchTo(mainCtx)                  // hand control back to main
+  Runtime.ctxSwitch(from: fiberCtx, to: mainCtx)                  // hand control back to main
   return cb                                      // unreached (the trampoline traps if we return)
 }
 
@@ -27,8 +27,8 @@ fun main() {
   cb.store(0, toByteOffset: 16)
 
   let stackTop = stack.advanced(by: 65536)
-  fiberCtx.fiberInit(stackTop: stackTop, entry: RawPtr.ofFunc(fiberEntry), arg: cb)
-  mainCtx.ctxSwitchTo(fiberCtx)                        // into the fiber; it records 42 and switches back
+  Runtime.fiberInit(context: fiberCtx, stackTop: stackTop, entry: Runtime.ofFunc(fiberEntry), arg: cb)
+  Runtime.ctxSwitch(from: mainCtx, to: fiberCtx)                        // into the fiber; it records 42 and switches back
 
   let w: Int = cb.load(fromByteOffset: 16)
   print(w)

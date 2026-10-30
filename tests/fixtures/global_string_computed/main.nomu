@@ -1,0 +1,8 @@
+// A global holding a String must be a literal (task 224): a String computed at startup would be a pointer
+// into the GC heap, which globals do not hold yet.
+let first = "nomu"
+let joined = first.concat(" lang")
+
+fun main() {
+  print(joined)
+}
