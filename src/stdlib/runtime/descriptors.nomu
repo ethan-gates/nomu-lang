@@ -1,0 +1,204 @@
+// GC type descriptors: the per-type size, kind and pointer maps codegen emits, read by type-id.
+// Part of the `runtime` module; see README.md.
+
+// ---- GC type descriptors ----
+// Every module emits a 32-byte descriptor per heap type into `__DATA,__nomu_descs` (weak, so duplicates across
+// modules fold at link), with each type's variable pointer map out of line in `__DATA,__nomu_ptrmaps`. A
+// type-id is a descriptor's byte offset from the section start (`Runtime.gcDescBase()`), stamped into object
+// headers and value-witness tables. A descriptor is eight `int32` fields (codegen's `gcDescType`, backend.md
+// §4): size @0 (0 for an array buffer), stride @4 (0 for a fixed object), kind @8 (0 fixed, 1 array buffer,
+// 2 shaped), nptr @12, ptrmapOff @16, nshaped @20, headerSize @24 (a buffer's user-header bytes), nheader @28.
+// A type's map, at the pointer-map base + ptrmapOff, holds the nheader header offsets, then the nptr field or
+// element offsets, then nshaped (field offset, sub-shape type-id) pairs; kind 2 has the discriminant-keyed
+// form rtLiveCount describes. Type-ids come from codegen and are always valid, so nothing range-checks them.
+let rtDescSize = 32
+
+fun rtDescField(tid: Int, at: Int) -> Int {
+  return Runtime.loadInt32(Runtime.gcDescBase(), at: tid + at)
+}
+
+fun rtTypeSize(tid: Int) -> Int {
+  return rtDescField(tid, 0)
+}
+
+fun rtTypeStride(tid: Int) -> Int {
+  return rtDescField(tid, 4)
+}
+
+fun rtTypeKind(tid: Int) -> Int {
+  return rtDescField(tid, 8)
+}
+
+fun rtShapedCount(tid: Int) -> Int {
+  return rtDescField(tid, 20)
+}
+
+fun rtTypeHeaderSize(tid: Int) -> Int {
+  return rtDescField(tid, 24)
+}
+
+fun rtHeaderPtrCount(tid: Int) -> Int {
+  return rtDescField(tid, 28)
+}
+
+fun rtTypeMap(tid: Int) -> RawPtr {
+  return Runtime.gcPtrmapBase().advanced(by: rtDescField(tid, 16))
+}
+
+// The k-th managed-pointer byte offset within a buffer's user header, relative to the header (`base + 16`).
+fun rtHeaderOffsetAt(tid: Int, k: Int) -> Int {
+  return Runtime.loadInt32(rtTypeMap(tid), at: k * 4)
+}
+
+// The live managed-pointer byte offsets of a value of type `tid` at `base`, as a count and an indexed read:
+// the one enumerator behind object fields, array elements and shaped roots.
+// - A fixed object or array element with no shaped fields: the static map after the header offsets; `base`
+//   is unused. For an array the offsets are an element's, and `base` is that element.
+// - With shaped fields (a `String` in a class): the direct offsets, then each shaped field's live
+//   sub-offsets, each offset by its field.
+// - Kind 2, a shaped value (`String`, an enum): the map is `[tagOff, tagShift, ncases, case…]`, each case
+//   `(tag, nflat, flat…, nshaped, (off, subId)…)`. The tag is the word at `base + tagOff` shifted right by
+//   `tagShift`; only the matching case's offsets are live, and none when no case matches (a small or
+//   immortal `String`, an enum's `.none`).
+// Both walk the map directly, keeping no scratch state, so any thread may call them; shaped maps hold a
+// handful of entries.
+fun rtLiveCount(tid: Int, base: RawPtr) -> Int {
+  let map = rtTypeMap(tid)
+  if rtTypeKind(tid) == 2 {
+    let c = rtShapedCase(map, base)
+    if c < 0 {
+      return 0
+    }
+    return rtCaseCount(map, c, base)
+  }
+  let nptr = rtDescField(tid, 12)
+  let nshaped = rtShapedCount(tid)
+  if nshaped == 0 {
+    return nptr
+  }
+  let flat = map.advanced(by: rtHeaderPtrCount(tid) * 4)
+  return nptr + rtPairsCount(flat.advanced(by: nptr * 4), nshaped, base)
+}
+
+fun rtLiveOffsetAt(tid: Int, base: RawPtr, i: Int) -> Int {
+  let map = rtTypeMap(tid)
+  if rtTypeKind(tid) == 2 {
+    let c = rtShapedCase(map, base)
+    if c < 0 {
+      return 0
+    }
+    return rtCaseOffsetAt(map, c, base, i)
+  }
+  let flat = map.advanced(by: rtHeaderPtrCount(tid) * 4)
+  let nptr = rtDescField(tid, 12)
+  if i < nptr {
+    return Runtime.loadInt32(flat, at: i * 4)
+  }
+  return rtPairsOffsetAt(flat.advanced(by: nptr * 4), rtShapedCount(tid), base, i - nptr)
+}
+
+// `n` (field offset, sub-shape type-id) pairs at `pairs`: the live sub-offsets they hold in all.
+fun rtPairsCount(pairs: RawPtr, n: Int, base: RawPtr) -> Int {
+  var total = 0
+  var k = 0
+  while k < n {
+    let off = Runtime.loadInt32(pairs, at: k * 8)
+    let sub = Runtime.loadInt32(pairs, at: k * 8 + 4)
+    total = total + rtLiveCount(sub, base.advanced(by: off))
+    k = k + 1
+  }
+  return total
+}
+
+// The j-th live sub-offset across `n` pairs, relative to `base`.
+fun rtPairsOffsetAt(pairs: RawPtr, n: Int, base: RawPtr, j0: Int) -> Int {
+  var j = j0
+  var k = 0
+  while k < n {
+    let off = Runtime.loadInt32(pairs, at: k * 8)
+    let sub = Runtime.loadInt32(pairs, at: k * 8 + 4)
+    let fieldBase = base.advanced(by: off)
+    let c = rtLiveCount(sub, fieldBase)
+    if j < c {
+      return off + rtLiveOffsetAt(sub, fieldBase, j)
+    }
+    j = j - c
+    k = k + 1
+  }
+  return 0
+}
+
+// The byte position within a kind-2 map of the case matching the value at `base`, or -1 when none does.
+fun rtShapedCase(map: RawPtr, base: RawPtr) -> Int {
+  let tagOff = Runtime.loadInt32(map, at: 0)
+  let shift = Runtime.loadInt32(map, at: 4)
+  let ncases = Runtime.loadInt32(map, at: 8)
+  let word: Int = base.load(fromByteOffset: tagOff)
+  let tag = rtShrLogical(word, shift)
+  var p = 12
+  var c = 0
+  while c < ncases {
+    let nflat = Runtime.loadInt32(map, at: p + 4)
+    if Runtime.loadInt32(map, at: p) == tag {
+      return p
+    }
+    let nshaped = Runtime.loadInt32(map, at: p + 8 + nflat * 4)
+    p = p + 12 + nflat * 4 + nshaped * 8
+    c = c + 1
+  }
+  return -1
+}
+
+fun rtCaseCount(map: RawPtr, p: Int, base: RawPtr) -> Int {
+  let nflat = Runtime.loadInt32(map, at: p + 4)
+  let nshaped = Runtime.loadInt32(map, at: p + 8 + nflat * 4)
+  if nshaped == 0 {
+    return nflat
+  }
+  return nflat + rtPairsCount(map.advanced(by: p + 12 + nflat * 4), nshaped, base)
+}
+
+fun rtCaseOffsetAt(map: RawPtr, p: Int, base: RawPtr, i: Int) -> Int {
+  let nflat = Runtime.loadInt32(map, at: p + 4)
+  if i < nflat {
+    return Runtime.loadInt32(map, at: p + 8 + i * 4)
+  }
+  let nshaped = Runtime.loadInt32(map, at: p + 8 + nflat * 4)
+  return rtPairsOffsetAt(map.advanced(by: p + 12 + nflat * 4), nshaped, base, i - nflat)
+}
+
+// The logical right shift of a 64-bit word by `s` (0 to 63), for the shaped-tag decode: Nomu has no shift
+// operator, so it is a division by a power of two, offset when the word's top bit is set (negative as an Int).
+fun rtShrLogical(w: Int, s: Int) -> Int {
+  if s == 0 {
+    return w
+  }
+  if s == 63 {
+    if w < 0 {
+      return 1
+    }
+    return 0
+  }
+  let p: Int = rtPow2Table.load(fromByteOffset: s * 8)
+  if w >= 0 {
+    return w / p
+  }
+  // w + 2^64 shifted right: (w + 2^63) / 2^s + 2^(63 - s), with w + 2^63 in range for a negative w.
+  let q: Int = rtPow2Table.load(fromByteOffset: (63 - s) * 8)
+  return (w + 9223372036854775807 + 1) / p + q
+}
+
+// 2^0 through 2^62, for rtShrLogical.
+let rtPow2Table = rtPow2TableNew()
+
+fun rtPow2TableNew() -> RawPtr {
+  let t = RawPtr.alloc(bytes: 63 * 8, align: 8)
+  var v = 1
+  var i = 0
+  while i < 63 {
+    t.store(v, toByteOffset: i * 8)
+    v = v + v
+    i = i + 1
+  }
+  return t
+}

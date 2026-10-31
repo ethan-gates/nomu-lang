@@ -1,0 +1,126 @@
+// The runtime's startup globals: the run settings read from the environment, the scheduler, and the heap.
+// Part of the `runtime` module; see README.md.
+
+// ---- Process-wide runtime state, set once at startup ----
+// Startup globals (`tasks/224-globals.md`): `nomu_runtime_init` computes them on the main thread before the
+// scheduler boots, in the order their reads require, and they never change after. Generated code reads the
+// heap and barrier values by symbol (`nomu_g_<name>`) with invariant loads; C reads `rtSched` and
+// `rtGcExternalDriver` as externs until its users move into Nomu.
+
+// Dev/test overrides from the environment; 0 means unset.
+// NOMU_NURSERY_RESERVE, in blocks: positive overrides the generational reserve, negative disables
+// generational collection (major-only); rtGenReserve resolves it against the descriptor's default.
+let rtNurseryReserveOverride = rtEnvNurseryReserve()
+// NOMU_MATURE_FLOOR, in blocks: below this many free mature blocks a nursery-full trigger escalates to a
+// full defrag major (rtImmixRefill).
+let rtMatureFloor = rtPositive(rtEnvMatureFloor())
+// NOMU_GC_STRESS, in bytes: every allocation takes the slow path and each carrier requests a collection
+// after this many allocated bytes.
+let rtGcStress = rtPositive(rtEnvGcStress())
+// 1 when an external stop-the-world driver (NOMU_STW_SELFHOST / NOMU_STW_COLLECT / NOMU_GC_PRESSURE) owns
+// collection, so the default coordinator is not started and rtGenReserve keeps generational collection off.
+let rtGcExternalDriver = rtEnvExternalDriver()
+// NOMU_CARRIERS: the number of carrier threads the scheduler boots with; 4 unless set to 1 or more.
+let rtCarrierCount = rtEnvCarrierCount()
+
+// The scheduler.
+let rtSched = nomuSchedNew()
+
+// The heap: one Immix space of `rtHeapBlocks` 32 KiB blocks, created here so its descriptor and the write
+// barrier's values are constants. Its memory is reserved, not committed (rtImmixNew).
+let rtHeapBlocks = 8192
+let rtSpace = rtImmixNew(rtHeapBlocks)
+// The heap's address range [rtHeapLo, rtHeapHi): the write barrier skips stores into objects outside it
+// (large and immortal objects), which the log-bit table does not cover.
+let rtHeapLo: Int = rtSpace.load(fromByteOffset: 40)
+let rtHeapHi = rtHeapLo + rtHeapBlocks * 32768
+// The log-bit table's base, biased so the barrier indexes it by absolute address: the byte for address `a`
+// is at `rtLogbitBase + (a >> 3 >> 3)` (one bit per 8-byte region).
+let rtLogbitBase = rtLogbitBaseOf(rtSpace)
+
+fun rtLogbitBaseOf(space: RawPtr) -> Int {
+  let table: RawPtr = space.load(fromByteOffset: 144)
+  let heapBase: Int = space.load(fromByteOffset: 40)
+  return table.toInt() - heapBase / 64
+}
+
+fun rtPositive(v: Int) -> Int {
+  if v > 0 {
+    return v
+  }
+  return 0
+}
+
+// The value of the environment variable whose name is the `len` bytes at `name`, NUL-terminated here; frees
+// `name`. Null when unset.
+fun rtEnvValue(name: RawPtr, len: Int) -> RawPtr {
+  name.store(0.uint8, toByteOffset: len)
+  let v = Runtime.getenv(name: name)
+  name.free()
+  return v
+}
+
+// A NUL-terminated string's leading signed decimal number, as `atol` reads it (no leading spaces); 0 for
+// null or no digits.
+fun rtEnvParseInt(s: RawPtr) -> Int {
+  if s.isNull {
+    return 0
+  }
+  var i = 0
+  var sign = 1
+  let first: UInt8 = s.load(fromByteOffset: 0)
+  if first.int == 45 {
+    sign = -1
+    i = 1
+  }
+  var n = 0
+  var more = true
+  while more {
+    let c: UInt8 = s.load(fromByteOffset: i)
+    let d = c.int - 48
+    if d < 0 || d > 9 {
+      more = false
+    } else {
+      n = n * 10 + d
+      i = i + 1
+    }
+  }
+  return sign * n
+}
+
+fun rtEnvNurseryReserve() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_NURSERY_RESERVE")))
+}
+
+fun rtEnvMatureFloor() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_MATURE_FLOOR")))
+}
+
+fun rtEnvGcStress() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_GC_STRESS")))
+}
+
+fun rtEnvCarrierCount() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  let n = rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_CARRIERS")))
+  if n >= 1 {
+    return n
+  }
+  return 4
+}
+
+fun rtEnvExternalDriver() -> Int {
+  let a = RawPtr.alloc(bytes: 32, align: 8)
+  let selfhost = rtEnvValue(a, Runtime.copyLiteral(to: a, "NOMU_STW_SELFHOST"))
+  let b = RawPtr.alloc(bytes: 32, align: 8)
+  let collect = rtEnvValue(b, Runtime.copyLiteral(to: b, "NOMU_STW_COLLECT"))
+  let c = RawPtr.alloc(bytes: 32, align: 8)
+  let pressure = rtEnvValue(c, Runtime.copyLiteral(to: c, "NOMU_GC_PRESSURE"))
+  if !selfhost.isNull || !collect.isNull || !pressure.isNull {
+    return 1
+  }
+  return 0
+}

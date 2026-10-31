@@ -66,13 +66,19 @@ private func parseEmbeddedPrelude(_ source: String, _ name: String) -> Program {
 // runtime-subset designation (its functions compile `noSafepoint`, like the package). The bare weak-ODR
 // definitions fold with the `runtime` package's, so this adds no runtime duplication to the test binary.
 func prependRuntimePrelude(_ program: Program) -> (Program, Set<String>) {
-    let runtime = parseEmbeddedPrelude(EmbeddedSources.runtimePreludeSource, EmbeddedSources.runtimePreludeName)
-    let subset = Set(runtime.decls.compactMap { decl -> String? in
+    let decls = zip(EmbeddedSources.runtimeFiles, runtimePrependFileNames).flatMap { file, name in
+        parseEmbeddedPrelude(file.source, name).decls
+    }
+    let subset = Set(decls.compactMap { decl -> String? in
         if case .funcDecl(let f) = decl { return f.name }
         return nil
     })
-    return (Program(decls: runtime.decls + program.decls, imports: program.imports), subset)
+    return (Program(decls: decls + program.decls, imports: program.imports), subset)
 }
+
+// The names the prepended runtime files parse under, which an ordinary module's weak-origin set lists. Each
+// keeps its `runtime/` directory so it cannot equal a user file's name.
+let runtimePrependFileNames = EmbeddedSources.runtimeFiles.map { "runtime/" + $0.name }
 
 // Rewrite an imported declaration to its per-origin identity (`origin@name`, task 100.2.3.2), and any
 // type reference inside it that names one of the module's own exported types to that type's identity.

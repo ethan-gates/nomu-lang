@@ -5,7 +5,7 @@
 
 ## Today
 
-`nomuSchedStwCollectMinor` (`runtime.nomu`) allocates a 1,048,576-entry (8 MiB) buffer for the drained
+`nomuSchedStwCollectMinor` (`runtime/collect.nomu`) allocates a 1,048,576-entry (8 MiB) buffer for the drained
 remembered set on every minor collection, and `rt_raw_alloc` zero-fills it. In the first report
 (`gen_minor`, eight-block nursery, 48 minors) that allocation took ~0.9 ms of the first minor's 1.1 ms
 collect: the gap between the root walk and the remembered-set drain. The stack-slot buffer (8192 entries)
@@ -25,5 +25,5 @@ instead of being cut off.
 
 ## Refs
 
-`nomuSchedStwCollectMinor`, `nomuSchedStwCollectPlan` (`src/stdlib/runtime.nomu`), `rt_raw_alloc`,
+`nomuSchedStwCollectMinor`, `nomuSchedStwCollectPlan` (`src/stdlib/runtime/collect.nomu`), `rt_raw_alloc`,
 `rt_modbuf_drain` (`src/runtime/embedded/runtime.c`).

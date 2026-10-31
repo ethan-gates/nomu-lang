@@ -8,7 +8,7 @@ half is [150](../plans/tasks/150-selfhosted-gc-ladder.md), climbed the same way.
 
 **The Nomu scheduler is the only scheduler.** The C scheduler and MMTk were retired
 ([197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md)); `fiber_spawn`, `spawn_join`, `rt_sleep_ms`, the
-actor mailbox and `main` in `runtime.c` forward to the `nomuSched*` functions in `runtime.nomu`. The rung logs
+actor mailbox and `main` in `runtime.c` forward to the `nomuSched*` functions in the `runtime` package (`src/stdlib/runtime/`). The rung logs
 below record the C-scheduler oracle each rung was diffed against when built; the `NOMU_SCHED` plan knob they
 name no longer exists. The kqueue I/O poller came back in 197.6 as a third feeder beside the timer: a C
 poller thread for stdin that unparks fibers waiting in `readLine` through `rtSchedUnpark`; the fiber parks
@@ -344,7 +344,7 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
    is 128.3.2. Three parts, all built:
    - **Consolidate.** The machinery (3-state futex mutex, MT-safe run queue, carriers + idle wake-gen
      sleep, `rt_current` TLS, lock-coupled park, timer heap + timer thread, actor mailbox + capped
-     mailbox-fiber pool) is consolidated into `src/stdlib/runtime.nomu` — the runtime-subset prelude
+     mailbox-fiber pool) is consolidated into `src/stdlib/runtime/` — the runtime-subset prelude
      compiled into every binary beside `rtWalkFrom` — under one canonical `Sched` (256 B) / `Fiber` (288 B)
      layout, as `rtSched*` helpers + C-callable `nomuSched*` entry points. The kqueue poller and the
      live-fiber registry are not consolidated yet (no user surface exercises the poller under NoGC; the

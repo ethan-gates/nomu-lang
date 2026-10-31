@@ -42,6 +42,6 @@ exit status and the system crash report are unchanged.
 
 ## Refs
 
-`rt_bounds_trap` (`src/runtime/embedded/runtime.c`), `rtSchedFiberNew` (`src/stdlib/runtime.nomu`);
+`rtBoundsTrap` (`src/stdlib/runtime/io.nomu`), `rtSchedFiberNew` (`src/stdlib/runtime/scheduler.nomu`);
 [159 GC observability](159-gc-observability.md), [104 fiber stack strategy](104-fiber-stack-strategy.md),
 [218 Linux support](218-linux-support.md) (signal numbers and `ucontext` differ).

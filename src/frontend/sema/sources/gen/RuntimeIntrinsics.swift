@@ -37,7 +37,7 @@ enum RuntimeIntrinsics {
             return s.ptrIntrinsic("__staticStorage", .rawPtr,
                                   [NOIRExpr(type: .int, span: span, kind: .intLit(bytes)),
                                    NOIRExpr(type: .int, span: span, kind: .intLit(align))], span)
-        // The GC type tables, read by the runtime's descriptor accessors (`runtime.nomu`, "GC type
+        // The GC type tables, read by the runtime's descriptor accessors (`runtime/descriptors.nomu`, "GC type
         // descriptors"). `gcTypeCount` is the number of descriptor records; `gcDescBase` and `gcPtrmapBase` are
         // the starts of the descriptor and pointer-map sections, through the linker's section-bracket symbols.
         // All are gc-leaf reads of read-only data.

@@ -4,7 +4,7 @@
 // allocation policy or collection here — this exercises the structure a collector reads and writes.
 //
 // Geometry (selfhosted-gc.md §10.1): 32768-byte block, 256-byte line, 128 lines/block. Side tables are
-// one byte per line / per block (§10.2). The functions live in the runtime prelude (src/stdlib/runtime.nomu),
+// one byte per line / per block (§10.2). The functions live in the runtime prelude (src/stdlib/runtime/immix.nomu),
 // auto-subset by default (task 149) — no --runtime-subset flag needed.
 //
 // Expected output: 1 / 1 / 2 / 261 / 5 / 2 / 1 / 0 / 1 / 0 / 0 / 1.

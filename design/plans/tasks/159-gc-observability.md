@@ -112,7 +112,7 @@ The model below is LXR's shape. GenImmix is its special case: every interval in 
   calls` line under `NOMU_GC_DEBUG_PRESSURE` (the pressure poller and the two smoke drivers print their
   own); two C debug counters (`rt_dbg_last_drain`, `rt_dbg_barrier_slow`); 34 suite cases set `gc_log` and
   26 assert the collection line with a minimum count, plus `require_collections` on variants. A
-  collection's phases are all in `runtime.nomu` (minor: stack slots, remembered set, large-object space,
+  collection's phases are all in `runtime/collect.nomu` (minor: stack slots, remembered set, large-object space,
   Cheney scan, unmark and unlog, nursery reclaim; major: slot walk, then defrag); the pause handshake is in
   `runtime.c`.
 
@@ -128,7 +128,7 @@ The model below is LXR's shape. GenImmix is its special case: every interval in 
   language workspace's included, and its cache keys. Two intrinsics: `RawPtr.gcRecordLevel()` folds to the
   setting's level (0, 1, 2) in sema, so recording code sits under a constant branch (`br i1 false` when
   off, removed by the optimizer; the runtime module compiles under `release`); `RawPtr.ticks()` reads
-  `mach_absolute_time`. The recorder (`runtime.nomu`, after the space accessors) is one per recording
+  `mach_absolute_time`. The recorder (`runtime/gcreport.nomu`) is one per recording
   thread, written without locks: chunks of 1024 48-byte records off the GC heap that never move, each
   record written whole before the counts advance; records are intervals (`rtRecOpen`/`rtRecClose`, nesting,
   pause or concurrent), cycles (`rtRecCycleBegin`/`rtRecCycleEnd`, numbering the intervals inside) and
@@ -144,7 +144,7 @@ The model below is LXR's shape. GenImmix is its special case: every interval in 
   `rtGcPhaseOpen`/`Close`, `rtGcCounter`, `rtGcRecordRefill`, `rtGcRecordLargeObject`), each empty unless
   `gc.record` is on; in a normal build with it off the release-built runtime has no call to any of them
   (checked in the disassembly; the recorder's own bodies stay in the binary, exported and uncalled). The
-  ids are listed above the hooks in `runtime.nomu`: cycle kinds (minor, major, forced), triggers (external
+  ids are listed above the hooks in `runtime/gcreport.nomu`: cycle kinds (minor, major, forced), triggers (external
   driver, nursery full, mature floor, heap exhausted, allocation stress), 18 phases (time to safepoint,
   root walk, remembered-set drain, the minor's six, the major's seven, snapshot, collect) and counters
   (roots, promoted, remembered entries, defrag sources; a snapshot of blocks by state, large objects and
@@ -163,7 +163,7 @@ The model below is LXR's shape. GenImmix is its special case: every interval in 
   lies inside its cycle.
 - **159.4** Output: the report file and its trace view; the derived metrics; open question 2.
 
-  **Done.** Written in Nomu (`runtime.nomu`, "The collector's report") over raw buffers, since the runtime
+  **Done.** Written in Nomu (`runtime/gcreport.nomu`, "The collector's report") over raw buffers, since the runtime
   subset calls no `String` method. Seven runtime-only intrinsics carry it: `RawPtr.wallNanos`,
   `RawPtr.timebase(info:)`, `RawPtr.getenv(name:)`, `RawPtr.executablePath(buf:size:)`,
   `RawPtr.createFile(path:mode:)`, `RawPtr.closeFd(fd:)`, and `RawPtr.copyLiteral(to:_:)`, which copies a
@@ -245,7 +245,7 @@ moves when 158 reshapes the coordinator.
 
 `rt_gc_sync_thread`, `rt_gc_pressure_thread`, `rt_dbg_last_drain`, `rt_dbg_barrier_slow`
 (`src/runtime/embedded/runtime.c`); `nomuSchedStwCollectMinor`, `nomuSchedStwCollectDefrag`
-(`src/stdlib/runtime.nomu`); `collectionLogPattern` (`src/compiler-test/sources/Manifest.swift`).
+(`src/stdlib/runtime/`); `collectionLogPattern` (`src/compiler-test/sources/Manifest.swift`).
 [158 GC packaging](158-gc-packaging.md), [150 GC ladder](150-selfhosted-gc-ladder.md),
 [127 LXR](127-lxr-collector.md), [193 compiler performance report](193-compiler-performance-report.md),
 [157 env-var audit](157-env-var-audit.md), [155 integration-suite harness](155-integration-suite-harness.md),

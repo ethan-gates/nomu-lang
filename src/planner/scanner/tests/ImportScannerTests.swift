@@ -240,8 +240,8 @@ final class ImportScannerTests: XCTestCase {
 
     // The language workspace's sources, which the compiler carries (`core`, `runtime`, `std`).
     func testConformsOnEmbeddedSources() {
-        var sources = [(EmbeddedSources.preludeName, EmbeddedSources.preludeSource),
-                       (EmbeddedSources.runtimePreludeName, EmbeddedSources.runtimePreludeSource)]
+        var sources = [(EmbeddedSources.preludeName, EmbeddedSources.preludeSource)]
+        sources += EmbeddedSources.runtimeFiles.map { ("runtime/\($0.name)", $0.source) }
         sources += EmbeddedSources.stdModules.map { ("std/\($0.module)/\($0.name)", $0.source) }
         for (name, source) in sources {
             guard let parsed = parsedImports(source, file: name) else { XCTFail("\(name) does not parse"); continue }

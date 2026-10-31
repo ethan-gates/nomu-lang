@@ -47,7 +47,7 @@ Until then, each Darwin-only or arm64-only choice is listed here with what repla
   (`TargetPlatform.readsCarrierLocalDirectly`). glibc keeps keys in a two-level table in its thread
   descriptor, so Linux's direct read is its own design: a thread-pointer-relative slot of our own
   (`TPIDR_EL0` on arm64, `fs` on x86-64) is the likely form.
-- **Line input.** `readLine`'s stdin poller (`rtReadLine` in `runtime.nomu`, from
+- **Line input.** `readLine`'s stdin poller (`rtReadLine` in `runtime/io.nomu`, from
   [223](223-retire-the-c-floor.md).5.2) waits on a one-shot kqueue read event through the `kqueue` /
   `kevent` intrinsics, and only the macOS path was ported from C (its blocking-`read` fallback was dropped).
   Linux: `epoll` (`EPOLLIN | EPOLLONESHOT`) in the same place. `Runtime.poll(fd:)`, the readiness check, is

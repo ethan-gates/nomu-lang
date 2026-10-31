@@ -1,0 +1,865 @@
+// Collection: forwarding and copying, evacuation, whole-heap and minor collection, and the defrag trigger.
+// Part of the `runtime` module; see README.md.
+
+// ---- Forwarding word + copy primitive (task 150 · rung 3, increment 150.3.6) ----
+// The mechanism evacuation (150.3.7) is built on. The forwarding record is §10.8 (Decided): the new address
+// goes in the stale copy's payload word 0 (offset 8), and header bit 33 flags "forwarded". Header layout:
+// bits 0–31 type-id, bit 32 mark (150.2.2), bit 33 forwarded. `rtObjTypeId` already strips all high bits, so
+// size/kind reads keep working on a marked or forwarded header. Overwriting payload word 0 is sound because
+// the object is copied first (size computed before the clobber) and the stale original is only ever read for
+// its forwarding pointer afterward. The payload-word-0 slot exists for every managed type — `rtCheckPayloadWord`
+// guards that (§10.8): a fixed object is header + ≥1 field (≥16 bytes), an array buffer is header + cap + ….
+
+// The object's total size in bytes from the type tables: fixed size, or 16 + cap*stride for a buffer. Must
+// be read before forwarding clobbers payload word 0 (a buffer's cap lives there).
+fun rtObjSize(obj: RawPtr) -> Int {
+  let tid = rtObjTypeId(obj)
+  let kind = rtTypeKind(tid)
+  if kind == 0 {
+    return rtTypeSize(tid)
+  }
+  let ecap: Int = obj.load(fromByteOffset: 8)
+  let stride = rtTypeStride(tid)
+  let elemStart = rtBufElemStart(tid)
+  return elemStart + ecap * stride
+}
+
+// Copy `bytes` (a multiple of 8) word by word — the whole object including its header.
+fun rtCopyWords(dst: RawPtr, src: RawPtr, bytes: Int) {
+  var o = 0
+  while o < bytes {
+    let w: Int = src.load(fromByteOffset: o)
+    dst.store(w, toByteOffset: o)
+    o = o + 8
+  }
+}
+
+// Header bit 33 set → the object has been evacuated; payload word 0 holds its new address.
+fun rtIsForwarded(obj: RawPtr) -> Bool {
+  let h: Int = obj.load(fromByteOffset: 0)
+  let hi = h / 4294967296
+  let bit33 = hi / 2 - hi / 4 * 2
+  if bit33 == 1 {
+    return true
+  }
+  return false
+}
+
+// The forwarding address (payload word 0) of an already-forwarded object.
+fun rtForwardingPointer(obj: RawPtr) -> RawPtr {
+  let p: RawPtr = obj.load(fromByteOffset: 8)
+  return p
+}
+
+// Flag `obj` forwarded (set header bit 33 if not already) and store its new address in payload word 0.
+fun rtSetForwarded(obj: RawPtr, newAddr: RawPtr) {
+  let h: Int = obj.load(fromByteOffset: 0)
+  let hi = h / 4294967296
+  let bit33 = hi / 2 - hi / 4 * 2
+  var nh = h
+  if bit33 == 0 {
+    nh = h + 8589934592
+  }
+  obj.store(nh, toByteOffset: 0)
+  obj.store(newAddr, toByteOffset: 8)
+}
+
+// Evacuate `obj`: allocate a fresh slot, copy the object into it, install the forwarding record in the
+// original, and return the new address (or null if allocation fails). Size is read before the copy so the
+// forwarding clobber of payload word 0 is safe. The copy inherits the original's header (mark bit, no
+// forwarded bit — that is set only on the original), which is the end state evacuation wants.
+fun rtCopyObject(space: RawPtr, obj: RawPtr) -> RawPtr {
+  let size = rtObjSize(obj)
+  let dst = rtImmixAlloc(space, size)
+  let dstNull = dst.eq(RawPtr.null)
+  if dstNull {
+    return RawPtr.null
+  }
+  rtCopyWords(dst, obj, size)
+  rtSetForwarded(obj, dst)
+  return dst
+}
+
+// Count managed types with no payload word (fixed size < 16) — the forwarding record needs payload word 0
+// (§10.8). 0 confirms the payload-word-0 forwarding scheme is valid for every managed type in the program.
+fun rtCheckPayloadWord() -> Int {
+  let tcount = Runtime.gcTypeCount()
+  var bad = 0
+  var t = 0
+  while t < tcount {
+    // gcTypeCount() is the descriptor count; a type-id is a descriptor byte offset (task 100.4.7),
+    // so ordinal `t` maps to offset `t * record-size` for the accessor reads (task 180: record size from
+    // the runtime, one source of truth).
+    let off = t * rtDescSize
+    let kind = rtTypeKind(off)
+    if kind == 0 {
+      let sz = rtTypeSize(off)
+      if sz < 16 {
+        bad = bad + 1
+      }
+    }
+    t = t + 1
+  }
+  return bad
+}
+
+// ---- Evacuation + pointer fixup — the moving collector (task 150 · rung 3, 150.3.7 / 150.3.8) ----
+// Forward-during-trace (selfhosted-gc.md §10.6/§10.7): as the tracer visits the graph it copies each
+// reachable object in a source block into fresh to-space (rtCopyObject, installing the forwarding record of
+// §10.8) and rewrites the slot it came through — and the root — to the survivor's new address. One store
+// added to the slot walk 150.2 already built. A block is an evacuation source iff its state byte is 3
+// (DEFRAG_SOURCE); everything else is marked in place. The two callers differ only in how they set that
+// flag: rtImmixEvacCollect (150.3.7) marks every used block a source (force-all); rtImmixCollectDefrag
+// (150.3.8) selects only fragmented blocks within a copy-reserve budget. Runs under the runtime subset's
+// noSafepoint (149), which is what makes holding raw pointers into the moving heap across the copy sound —
+// it closes 125 §3.3's deferred moving-heap gate.
+
+// The post-evacuation address of `obj`. A candidate (in the Immix heap, in a DEFRAG_SOURCE block, not yet
+// forwarded) is copied into to-space and its forwarding record installed; an already-forwarded object yields
+// its forwarding pointer; a non-candidate (LOS/off-heap, or in a non-source block) is returned unchanged and
+// marked in place by the caller.
+fun rtEvacuate(space: RawPtr, obj: RawPtr) -> RawPtr {
+  // Range-check before any dereference (150.4.5.1 hardening): an off-heap value — a real LOS/immortal object,
+  // or a stale/wild word — is returned unchanged without reading its header. LOS objects never move; a wild
+  // word must not fault the collector or be misread as a forwarding record.
+  let base: Int = space.load(fromByteOffset: 40)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let heapEnd = base + nb * 32768
+  let a = obj.toInt()
+  if a < base {
+    return obj                       // off-heap (LOS): never moves
+  }
+  if a >= heapEnd {
+    return obj
+  }
+  if rtIsForwarded(obj) {
+    return rtForwardingPointer(obj)
+  }
+  let d = a - base
+  let bi = d / 32768
+  if rtBlockState(space, bi) != 3 {
+    return obj                       // non-source (marked in place) or a to-space copy — do not move
+  }
+  let copy = rtCopyObject(space, obj)
+  return copy
+}
+
+// Forward-during-trace from `root`: evacuate the root and every reachable source-block object into to-space,
+// rewriting each managed slot (and the root itself) to the survivor's address as the trace visits it, and
+// line-marking each survivor at its final location so the following sweep reclaims the emptied source blocks
+// and keeps the marked-in-place survivors. Returns the root's post-evacuation address. Shared children and
+// cycles resolve through the forwarded-bit guard in rtEvacuate and the mark-bit guard here, so every object
+// is copied and scanned exactly once.
+fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
+  let rootNull = root.eq(RawPtr.null)
+  if rootNull {
+    return root
+  }
+  var wcap = 4096                   // grows on demand (rtStackGrow)
+  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
+  var top = 0
+  let newRoot = rtEvacuate(space, root)
+  if rtTryMarkBare(newRoot) {
+    work.store(newRoot, toByteOffset: 0)
+    top = 1
+  }
+  while top > 0 {
+    top = top - 1
+    let obj: RawPtr = work.load(fromByteOffset: top * 8)
+    let tid = rtObjTypeId(obj)
+    let kind = rtTypeKind(tid)
+    let nptr = rtLiveCount(tid, obj)
+    var size = 0
+    if kind == 0 {
+      size = rtTypeSize(tid)
+    } else {
+      let ecap: Int = obj.load(fromByteOffset: 8)
+      let stride = rtTypeStride(tid)
+      let elemStart = rtBufElemStart(tid)
+      size = elemStart + ecap * stride
+    }
+    rtMarkObjLines(space, obj, size)
+    if kind == 0 {
+      var i = 0
+      while i < nptr {
+        let off = rtLiveOffsetAt(tid, obj, i)
+        let child: RawPtr = obj.load(fromByteOffset: off)
+        let childNull = child.eq(RawPtr.null)
+        if !childNull {
+          let nc = rtEvacuate(space, child)
+          obj.store(nc, toByteOffset: off)
+          if rtTryMarkBare(nc) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
+            work.store(nc, toByteOffset: top * 8)
+            top = top + 1
+          }
+        }
+        i = i + 1
+      }
+    } else {
+      let ecap2: Int = obj.load(fromByteOffset: 8)
+      let stride2 = rtTypeStride(tid)
+      let elemStart = rtBufElemStart(tid)
+      var hk = 0
+      let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180): evacuate + write back
+      while hk < nhdr {
+        let hat = 16 + rtHeaderOffsetAt(tid, hk)
+        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        if !hchild.eq(RawPtr.null) {
+          let hnc = rtEvacuate(space, hchild)
+          obj.store(hnc, toByteOffset: hat)
+          if rtTryMarkBare(hnc) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
+            work.store(hnc, toByteOffset: top * 8)
+            top = top + 1
+          }
+        }
+        hk = hk + 1
+      }
+      var e = 0
+      let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
+      while e < ecap2 {
+        let elemBase = elemStart + e * stride2
+        let elemPtr = obj.advanced(by: elemBase)
+        var en = nptr
+        if elemShaped {
+          en = rtLiveCount(tid, elemPtr)
+        }
+        var i = 0
+        while i < en {
+          let off = rtLiveOffsetAt(tid, elemPtr, i)
+          let at = elemBase + off
+          let child: RawPtr = obj.load(fromByteOffset: at)
+          let childNull = child.eq(RawPtr.null)
+          if !childNull {
+            let nc = rtEvacuate(space, child)
+            obj.store(nc, toByteOffset: at)
+            if rtTryMarkBare(nc) {
+              if top == wcap {
+                work = rtStackGrow(work, top)
+                wcap = wcap + wcap
+              }
+              work.store(nc, toByteOffset: top * 8)
+              top = top + 1
+            }
+          }
+          i = i + 1
+        }
+        e = e + 1
+      }
+    }
+  }
+  work.free()
+  return newRoot
+}
+
+// Point the copy allocator at fresh to-space only for the evacuation trace: reset the bump cursor and skip
+// the recyclable scan past every used block, so copies draw from reclaimed-free and never-used blocks (both
+// FREE, never a source or a marked-in-place block). Shared setup for both evacuating collectors.
+fun rtSetupCopyAllocator(space: RawPtr) {
+  let fc: Int = space.load(fromByteOffset: 32)
+  space.store(fc, toByteOffset: 104)        // recyclable scan past every used block
+  space.store(-1, toByteOffset: 72)         // allocBlock: none → first copy draws a fresh/free block
+  space.store(0, toByteOffset: 80)          // allocLine
+  space.store(0, toByteOffset: 48)          // allocCursor
+  space.store(0, toByteOffset: 56)          // allocLimit
+}
+
+// Reset the mutator's allocator after a collection: no current block, rescan recyclable from the start so
+// reclaimed + recyclable space is reused by the next allocation.
+fun rtResetAllocator(space: RawPtr) {
+  space.store(-1, toByteOffset: 72)
+  space.store(0, toByteOffset: 80)
+  space.store(0, toByteOffset: 48)
+  space.store(0, toByteOffset: 56)
+  space.store(0, toByteOffset: 104)
+}
+
+// One force-all evacuating collection from `root` (150.3.7): mark every used block a source, so every live
+// object moves to fresh to-space; fix up all slots and the root; reclaim the emptied from-space by the
+// 150.3.5 sweep. Returns the root's new address (the root moves — the caller adopts it). The general
+// collector (rtImmixCollectDefrag, 150.3.8) selects sources by fragmentation; this is its evacuate-everything
+// special case, kept as a maximal-move stress path.
+fun rtImmixEvacCollect(space: RawPtr, root: RawPtr) -> RawPtr {
+  rtClearAllLines(space)
+  let fc: Int = space.load(fromByteOffset: 32)
+  var bi = 0
+  while bi < fc {
+    rtSetBlockState(space, bi, 3)           // every used block is a source
+    bi = bi + 1
+  }
+  space.store(0, toByteOffset: 96)          // free list empty — to-space is fresh (never-used) only
+  rtSetupCopyAllocator(space)
+  let newRoot = rtImmixEvacMark(space, root)
+  rtImmixSweepBlocks(space)
+  rtImmixSweepLos(space)
+  rtImmixUnmark(newRoot)
+  rtResetAllocator(space)
+  return newRoot
+}
+
+// ---- Whole-heap collection over a multi-mutator root-slot set (driven at a scheduler STW) ----
+// The multi-root generalisation of rtImmixEvacCollect: the 128.3.2 STW walk hands a set of root SLOT
+// addresses (every stopped mutator's live stack roots), and this evacuates the whole live graph and rewrites
+// each slot in place with its survivor's forwarded address — the moving-collection fixup on the stopped
+// mutator stacks. Force-all (every used block a source), so it is a maximal-move stress of the fixup path;
+// the fragmentation-selective version rides the defrag trigger below. Correct across shared subgraphs and
+// duplicate slots via the forwarded-bit guard in rtEvacuate (a second slot reaching an already-moved object
+// gets its forwarding pointer). Runs with the world stopped, so the raw root pointers are stable.
+fun rtImmixCollectRoots(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
+  rtClearAllLines(space)
+  let fc: Int = space.load(fromByteOffset: 32)
+  var bi = 0
+  while bi < fc {
+    rtSetBlockState(space, bi, 3)             // every used block is an evacuation source (force-all)
+    bi = bi + 1
+  }
+  space.store(0, toByteOffset: 96)            // free list empty — to-space is fresh (never-used) blocks only
+  rtSetupCopyAllocator(space)
+  var i = 0
+  while i < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
+    let old: RawPtr = slot.load(fromByteOffset: 0)
+    let oldNull = old.eq(RawPtr.null)
+    if !oldNull {
+      let new = rtImmixEvacMark(space, old)   // evacuate this root's reachable graph (shared state across calls)
+      slot.store(new, toByteOffset: 0)        // fix up the root slot on the stopped mutator's stack
+    }
+    i = i + 1
+  }
+  rtImmixSweepBlocks(space)
+  rtImmixSweepLos(space)
+  var j = 0
+  while j < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
+    let r: RawPtr = slot.load(fromByteOffset: 0)
+    let rNull = r.eq(RawPtr.null)
+    if !rNull {
+      rtImmixUnmark(r)                        // clear object mark bits for the next collection
+    }
+    j = j + 1
+  }
+  rtResetAllocator(space)
+  return nslots
+}
+
+// The defrag variant over a root-slot set — the general collector generalised to many mutators. Sources
+// are chosen by fragmentation within the copy reserve (rtSelectDefragSources), so it never runs out of
+// to-space and is non-moving when the heap is near-full — the collection to run under heap pressure, where
+// force-all cannot (no free blocks for to-space). Only source-block roots move; their slots are fixed up.
+fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
+  var tp = rtGcPhaseOpen(10)
+  let nSources = rtSelectDefragSources(space)
+  rtGcPhaseClose(10, tp)
+  rtGcCounter(4, nSources)
+  tp = rtGcPhaseOpen(11)
+  rtClearAllLines(space)
+  rtSetupCopyAllocator(space)
+  rtGcPhaseClose(11, tp)
+  tp = rtGcPhaseOpen(12)
+  var i = 0
+  while i < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
+    let old: RawPtr = slot.load(fromByteOffset: 0)
+    let oldNull = old.eq(RawPtr.null)
+    if !oldNull {
+      let new = rtImmixEvacMark(space, old)
+      slot.store(new, toByteOffset: 0)
+    }
+    i = i + 1
+  }
+  rtGcPhaseClose(12, tp)
+  tp = rtGcPhaseOpen(13)
+  rtImmixSweepBlocks(space)
+  rtGcPhaseClose(13, tp)
+  tp = rtGcPhaseOpen(14)
+  rtImmixSweepLos(space)
+  rtGcPhaseClose(14, tp)
+  tp = rtGcPhaseOpen(16)
+  var j = 0
+  while j < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
+    let r: RawPtr = slot.load(fromByteOffset: 0)
+    let rNull = r.eq(RawPtr.null)
+    if !rNull {
+      rtImmixUnmark(r)
+    }
+    j = j + 1
+  }
+  rtGcPhaseClose(16, tp)
+  rtResetAllocator(space)
+  return nSources
+}
+
+// The generational major (150.4.4, §11.4): rtImmixCollectRootsDefrag plus a post-collection pass that
+// re-establishes the log-bit invariant. A major escalated from a nursery-full trigger (mature pressure or a
+// promotion that would fail) collects the whole heap — nursery blocks participate as ordinary blocks, so
+// rtImmixSweepBlocks resets their state and nurseryUsed@136. After it, every live object is mature and the
+// nursery is empty; the log-bit table still holds stale unlogged bits at the old (now freed) addresses of
+// moved survivors, which future young objects would inherit and wrongly trip the barrier — the minor treats
+// a remembered object as mature and non-moving, so a young object in the remembered set corrupts the next
+// minor. Wipe the whole table to logged, then set every surviving object unlogged (rtGenUnmarkAndUnlog, which
+// also clears the header marks the walk would otherwise leave), so freed regions read logged and only mature
+// survivors trip the barrier. A missing unlog on a survivor would silently drop a mature→young pointer in the
+// next minor; a stale unlog on a freed region would falsely remember a young object. Only the driver differs
+// from the non-generational defrag — this path runs solely under NOMU_NURSERY_RESERVE (the minor is enabled).
+fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
+  var tp = rtGcPhaseOpen(10)
+  let nSources = rtSelectDefragSources(space)
+  rtGcPhaseClose(10, tp)
+  rtGcCounter(4, nSources)
+  tp = rtGcPhaseOpen(11)
+  rtClearAllLines(space)
+  rtSetupCopyAllocator(space)
+  rtGcPhaseClose(11, tp)
+  tp = rtGcPhaseOpen(12)
+  var i = 0
+  while i < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
+    let old: RawPtr = slot.load(fromByteOffset: 0)
+    let oldNull = old.eq(RawPtr.null)
+    if !oldNull {
+      let new = rtImmixEvacMark(space, old)
+      slot.store(new, toByteOffset: 0)
+    }
+    i = i + 1
+  }
+  rtGcPhaseClose(12, tp)
+  tp = rtGcPhaseOpen(13)
+  rtImmixSweepBlocks(space)
+  rtGcPhaseClose(13, tp)
+  tp = rtGcPhaseOpen(14)
+  rtImmixSweepLos(space)
+  rtGcPhaseClose(14, tp)
+  tp = rtGcPhaseOpen(15)
+  rtClearLogTable(space)                       // wipe stale unlogged bits; freed regions read logged
+  rtGcPhaseClose(15, tp)
+  tp = rtGcPhaseOpen(16)
+  var j = 0
+  while j < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
+    let r: RawPtr = slot.load(fromByteOffset: 0)
+    let rNull = r.eq(RawPtr.null)
+    if !rNull {
+      rtGenUnmarkAndUnlog(space, r)            // unmark + set every survivor unlogged (mature)
+    }
+    j = j + 1
+  }
+  rtGcPhaseClose(16, tp)
+  rtResetAllocator(space)
+  return nSources
+}
+
+// ---- Minor collection — the generational young-space collector (task 150 · 150.4.3, §11.4) ----
+// A minor GC evacuates only the nursery (from-space = the NURSERY blocks) into mature Immix, promoting every
+// survivor (promote-all, Appel-style). Its root set is the stack roots plus the drained remembered set (the
+// per-carrier mod-buffers the write barrier filled) — the mature space is never scanned, which is the whole
+// point of the barrier: mature→young pointers are reached through the remembered set, not a mature-heap walk.
+// The mature space is not swept. Reuses rtEvacuate + the forwarding record (§10.8): a NURSERY block is turned
+// into a DEFRAG_SOURCE (state 3) so rtEvacuate copies its objects, and the copy allocator draws fresh mature
+// (non-nursery) blocks, so every survivor is promoted. Emptied nursery blocks are reclaimed whole.
+
+// Forward one managed slot at `fieldAddr` for a minor GC: evacuate the referent (copies it to mature iff it is
+// a nursery source), rewrite the slot in place, and record a freshly-promoted object in `promoted` (the Cheney
+// queue + the post-fixup list). Returns the updated promoted count. A mature/off-heap referent is unchanged
+// and not recorded — a minor GC never scans the mature space.
+fun rtMinorForward(space: RawPtr, fieldAddr: RawPtr, q: RawPtr, count: Int) -> Int {
+  let old: RawPtr = fieldAddr.load(fromByteOffset: 0)
+  let oldNull = old.eq(RawPtr.null)
+  if oldNull {
+    return count
+  }
+  let new = rtEvacuate(space, old)
+  let moved = !new.eq(old)
+  if moved {
+    fieldAddr.store(new, toByteOffset: 0)      // fix the slot to the survivor's mature address
+    if rtTryMarkBare(new) {
+      rtQueuePush(q, count, new)               // first visit → enqueue for scanning + post-fixup (grows if full)
+      return count + 1
+    }
+  }
+  return count
+}
+
+// Double a full collector work stack: copy its `count` entries into a buffer twice the size, free the old
+// one, and return the new. The mark and unmark passes keep the stack and its capacity in locals and call this
+// only when a push finds it full. Raw memory, off the managed heap, so growth under stop-the-world never
+// re-enters collection.
+fun rtStackGrow(stack: RawPtr, count: Int) -> RawPtr {
+  let fresh = RawPtr.alloc(bytes: count * 16, align: 8)
+  fresh.copyBytes(from: stack, byteCount: count * 8)
+  stack.free()
+  return fresh
+}
+
+// The promotion queue is a growable dynamic array behind a stable 2-word handle {base @0, cap @8}: a minor's
+// promotion count is bounded only by the nursery's live objects, which grows with the nursery reserve, so a
+// fixed array can overflow (a large nursery promoting many survivors). Region/block collectors (Immix, G1,
+// MMTk) use growable work stacks for the same reason. `q` is passed by value into the scan helpers, so growth
+// must not move the value the callers hold — the handle stays put; only the buffer it points at is realloc'd.
+// The buffer is malloc-backed (`RawPtr.alloc`), off the GC heap, so growth during the STW never re-enters
+// collection. Doubling keeps the amortized cost O(1) and grows rare (starts at 64Ki entries).
+fun rtQueuePush(q: RawPtr, count: Int, obj: RawPtr) {
+  var base: RawPtr = q.load(fromByteOffset: 0)
+  let cap: Int = q.load(fromByteOffset: 8)
+  if count >= cap {
+    let newCap = cap + cap
+    let newBase = RawPtr.alloc(bytes: newCap * 8, align: 8)
+    newBase.copyBytes(from: base, byteCount: count * 8)
+    base.free()
+    q.store(newBase, toByteOffset: 0)
+    q.store(newCap, toByteOffset: 8)
+    base = newBase
+  }
+  base.store(obj, toByteOffset: count * 8)
+}
+
+// Scan one object's managed slots for a minor GC, forwarding each young referent (rtMinorForward). Used for
+// the remembered mature objects (find their young children) and, via the Cheney queue, for the promoted
+// objects (a promoted object may still point at other nursery objects). Returns the updated promoted count.
+fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
+  var count = count0
+  let tid = rtObjTypeId(obj)
+  let kind = rtTypeKind(tid)
+  let nptr = rtLiveCount(tid, obj)
+  if kind == 0 {
+    var i = 0
+    while i < nptr {
+      let off = rtLiveOffsetAt(tid, obj, i)
+      count = rtMinorForward(space, obj.advanced(by: off), q, count)
+      i = i + 1
+    }
+  } else {
+    let ecap: Int = obj.load(fromByteOffset: 8)
+    let stride = rtTypeStride(tid)
+    let elemStart = rtBufElemStart(tid)
+    var hk = 0
+    let nhdr = rtHeaderPtrCount(tid)        // header managed pointers (task 180)
+    while hk < nhdr {
+      count = rtMinorForward(space, obj.advanced(by: 16 + rtHeaderOffsetAt(tid, hk)), q, count)
+      hk = hk + 1
+    }
+    var e = 0
+    let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
+    while e < ecap {
+      let elemBase = elemStart + e * stride
+      let elemPtr = obj.advanced(by: elemBase)
+      var en = nptr
+      if elemShaped {
+        en = rtLiveCount(tid, elemPtr)
+      }
+      var i = 0
+      while i < en {
+        let off = rtLiveOffsetAt(tid, elemPtr, i)
+        count = rtMinorForward(space, obj.advanced(by: elemBase + off), q, count)
+        i = i + 1
+      }
+      e = e + 1
+    }
+  }
+  return count
+}
+
+// One minor collection (§11.4). `slotBuf`/`nslots` are the stopped mutators' stack root SLOTS (fixed up in
+// place); `remBuf`/`nrem` are the drained remembered set (mature objects the barrier logged). Promote every
+// live nursery object into mature Immix, rewrite each slot to its survivor, reclaim the emptied nursery blocks,
+// and re-establish the log bits (promoted + remembered objects are unlogged so their next mutation is caught).
+// The mature space is neither scanned nor swept. Returns the number of objects promoted.
+fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: RawPtr, nrem: Int) -> Int {
+  // From-space = the NURSERY blocks; turn each into a DEFRAG_SOURCE so rtEvacuate copies its objects.
+  let fc: Int = space.load(fromByteOffset: 32)
+  var bi = 0
+  while bi < fc {
+    if rtBlockState(space, bi) == 4 {
+      rtSetBlockState(space, bi, 3)
+    }
+    bi = bi + 1
+  }
+  rtSetupCopyAllocator(space)                    // to-space = fresh mature (non-nursery) blocks only
+  // Promotion queue: a growable dynamic array behind a stable 2-word handle {base @0, cap @8}. rtQueuePush
+  // doubles the buffer when full, so a minor promoting more than the initial capacity grows instead of
+  // overflowing. Starts small (64Ki entries = 512 KiB) — most minors promote little; a large-survivor minor
+  // grows to the nursery-bounded worst case. The queue is malloc-backed (off the GC heap).
+  let cap0 = 65536
+  let q = RawPtr.alloc(bytes: 16, align: 8)
+  q.store(RawPtr.alloc(bytes: cap0 * 8, align: 8), toByteOffset: 0)
+  q.store(cap0, toByteOffset: 8)
+  var count = 0
+  // Root source 1 — stack slots. A young root is promoted + its slot fixed up; a mature root is left alone.
+  var tp = rtGcPhaseOpen(4)
+  var s = 0
+  while s < nslots {
+    let slot: RawPtr = slotBuf.load(fromByteOffset: s * 8)
+    count = rtMinorForward(space, slot, q, count)
+    s = s + 1
+  }
+  rtGcPhaseClose(4, tp)
+  // Root source 2 — the remembered set: scan each logged mature object's slots for young referents, then
+  // re-unlog it so a store into it next cycle is remembered again.
+  tp = rtGcPhaseOpen(5)
+  var r = 0
+  while r < nrem {
+    let robj: RawPtr = remBuf.load(fromByteOffset: r * 8)
+    let robjNull = robj.eq(RawPtr.null)
+    if !robjNull {
+      count = rtMinorScanObj(space, robj, q, count)
+      rtSetUnlogged(space, robj)
+    }
+    r = r + 1
+  }
+  // Root source 3 — the large-object space (150.4.5.1.1). LOS objects are off-heap (never in the nursery, never
+  // moved) and carry no log bit, so the write barrier's heap-range guard skips stores into them and the
+  // remembered set never captures a mature LOS→young pointer (e.g. a large Array<class> that gains a young
+  // element). Treat every live LOS object as an old root: scan its managed slots for young referents each
+  // minor. The mature Immix space still relies on the barrier + remembered set; only the barrier-less off-heap
+  // space is scanned wholesale. Immortal buffers (String bytes) hold no managed pointers, so they need no
+  // scanning and are not on this list. A dead-but-unswept LOS object keeps its young referents alive until the
+  // next major sweeps it — conservative, not incorrect.
+  rtGcPhaseClose(5, tp)
+  tp = rtGcPhaseOpen(6)
+  var los: RawPtr = space.load(fromByteOffset: 64)
+  var losNull = los.eq(RawPtr.null)
+  while !losNull {
+    let losObj = los.advanced(by: 8)                 // object starts after the link word (rtLosAlloc)
+    count = rtMinorScanObj(space, losObj, q, count)
+    los = los.load(fromByteOffset: 0)                // next LOS node
+    losNull = los.eq(RawPtr.null)
+  }
+  rtGcPhaseClose(6, tp)
+  // Cheney: scan each promoted object for further nursery referents (its young children promote too).
+  tp = rtGcPhaseOpen(7)
+  var scan = 0
+  while scan < count {
+    let qbase: RawPtr = q.load(fromByteOffset: 0)
+    let obj: RawPtr = qbase.load(fromByteOffset: scan * 8)
+    scan = scan + 1
+    count = rtMinorScanObj(space, obj, q, count)
+  }
+  rtGcPhaseClose(7, tp)
+  // Clear each promoted object's transient mark bit and set its unlog bit — it is mature now, so a future
+  // store of a young object into it must be remembered.
+  tp = rtGcPhaseOpen(8)
+  var p = 0
+  let qbaseFix: RawPtr = q.load(fromByteOffset: 0)   // growth is done; the buffer no longer moves
+  while p < count {
+    let obj: RawPtr = qbaseFix.load(fromByteOffset: p * 8)
+    let un = rtUnmarkIfMarked(obj)
+    rtSetUnlogged(space, obj)
+    p = p + 1
+  }
+  rtGcPhaseClose(8, tp)
+  // Reclaim the emptied nursery blocks (every live object promoted out) onto the free list; mature blocks are
+  // left untouched (not swept).
+  tp = rtGcPhaseOpen(9)
+  let fl: RawPtr = space.load(fromByteOffset: 88)
+  var bj = 0
+  while bj < fc {
+    if rtBlockState(space, bj) == 3 {
+      rtSetBlockState(space, bj, 0)
+      let top: Int = space.load(fromByteOffset: 96)
+      fl.store(bj, toByteOffset: top * 8)
+      space.store(top + 1, toByteOffset: 96)
+    }
+    bj = bj + 1
+  }
+  space.store(0, toByteOffset: 136)              // the nursery is empty again
+  rtResetAllocator(space)
+  rtGcPhaseClose(9, tp)
+  let qbaseFree: RawPtr = q.load(fromByteOffset: 0)   // free the (possibly grown) buffer, then the handle
+  qbaseFree.free()
+  q.free()
+  return count
+}
+
+// Drive a self-hosted collection at an STW: walk every stopped mutator's root SLOTS and run the evacuating
+// collection over the self-hosted Immix space. `forceAll != 0` moves every live object
+// (a maximal-move fixup stress, needs free to-space); else the defrag collector (heap-pressure-safe). Called
+// by the STW coordinator with the world stopped. Returns the number of roots processed (0 before the first
+// managed allocation, while the space is null).
+fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
+  let space = rtSpace
+  let spaceNull = space.eq(RawPtr.null)
+  if spaceNull {
+    return 0
+  }
+  var kind = 2
+  if forceAll != 0 {
+    kind = 3
+  }
+  let collectStart = rtGcRecordEntry(kind)
+  let roots = rtRootsNew()
+  let tw = rtGcPhaseOpen(2)
+  let ns = nomuSchedWalkSlots(sched, roots)
+  rtGcPhaseClose(2, tw)
+  let slots: RawPtr = roots.load(fromByteOffset: 0)
+  rtGcCounter(1, ns)
+  if forceAll != 0 {
+    rtImmixCollectRoots(space, slots, ns)
+  } else {
+    // When generational is active (rtGenReserve > 0 — the default) a defrag major is also the minor/major
+    // escalation target (150.4.4), so re-establish the log-bit invariant post-collection; when disabled
+    // (NOMU_NURSERY_RESERVE negative) the plain defrag runs unchanged (the pre-generational path).
+    if rtGenReserve(space) > 0 {
+      rtImmixCollectRootsDefragGen(space, slots, ns)
+    } else {
+      rtImmixCollectRootsDefrag(space, slots, ns)
+    }
+  }
+  rtRootsFree(roots)
+  rtGcRecordExit(collectStart)
+  rtCarriersResetTlabs()        // evacuation may have moved a carrier's block; refill on resume
+  rtCarriersResetModBufs()      // the collection consumed the remembered set; start empty next cycle
+  return ns
+}
+
+// Force-all collection (the maximal-move fixup smoke).
+fun nomuSchedStwCollect(sched: RawPtr) -> Int {
+  return nomuSchedStwCollectPlan(sched, 1)
+}
+
+// Defrag collection (the heap-pressure path).
+fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
+  return nomuSchedStwCollectPlan(sched, 0)
+}
+
+// Drive a minor (generational) collection at an STW (task 150.4.3): the stopped mutators' stack root slots
+// plus the drained per-carrier remembered set (the write barrier's mod-buffers) are the root set; the nursery
+// is promoted into mature Immix. Returns the number of objects promoted (0 while the space is null). The
+// drain (rtCarriersDrainModBufs) both collects and empties the mod-buffers; the TLABs are reset after the
+// collection (their nursery blocks were reclaimed).
+fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
+  let space = rtSpace
+  let spaceNull = space.eq(RawPtr.null)
+  if spaceNull {
+    return 0
+  }
+  let collectStart = rtGcRecordEntry(1)
+  let roots = rtRootsNew()
+  let tw = rtGcPhaseOpen(2)
+  let ns = nomuSchedWalkSlots(sched, roots)
+  rtGcPhaseClose(2, tw)
+  let slots: RawPtr = roots.load(fromByteOffset: 0)
+  let td = rtGcPhaseOpen(3)
+  let remTotal = rtCarriersModBufTotal()
+  let rem = RawPtr.alloc(bytes: remTotal * 8 + 8, align: 8)   // exactly the remembered set (+8: never zero bytes)
+  let nrem = rtCarriersDrainModBufs(rem)
+  rtGcPhaseClose(3, td)
+  rtGcCounter(1, ns)
+  rtGcCounter(3, nrem)
+  let n = rtImmixCollectMinor(space, slots, ns, rem, nrem)
+  rtGcCounter(2, n)
+  rem.free()
+  rtRootsFree(roots)
+  rtGcRecordExit(collectStart)
+  rtCarriersResetTlabs()        // the reclaimed nursery blocks moved out from under the carriers' TLABs
+  return n
+}
+
+// Available empty blocks in the self-hosted Immix space (never-used + reclaimed-free) — the heap-pressure
+// gauge the GC-trigger thread polls. Returns -1 before the space exists (no managed allocation yet).
+fun nomuGcSpaceAvail() -> Int {
+  let space = rtSpace
+  let spaceNull = space.eq(RawPtr.null)
+  if spaceNull {
+    return -1
+  }
+  let nb: Int = space.load(fromByteOffset: 8)
+  let fc: Int = space.load(fromByteOffset: 32)
+  let flTop: Int = space.load(fromByteOffset: 96)
+  return nb - fc + flTop
+}
+
+// Total blocks in the self-hosted Immix space (for the trigger threshold). 0 when it does not exist.
+fun nomuGcSpaceBlocks() -> Int {
+  let space = rtSpace
+  let spaceNull = space.eq(RawPtr.null)
+  if spaceNull {
+    return 0
+  }
+  return space.load(fromByteOffset: 8)
+}
+
+// ---- Copy reserve + defrag trigger — the general collector (task 150 · rung 3, 150.3.8) ----
+// The defrag trigger replaces force-all: only fragmented blocks are evacuated, and only as many as fresh
+// to-space can absorb (the copy reserve). Fragmentation is read from defragTable — each block's live-line
+// count as of the last sweep (§10.6, MMTk's "previous GC mark histogram drives this GC's defrag"). A block
+// is a source iff it holds live data but is sparsely filled (0 < lastLiveLines ≤ threshold). The reserve
+// bounds the source count by available empty blocks: each source needs at most one to-space block, so
+// selecting at most (available − reserve) sources leaves the reserve free even if a source turned out full —
+// the guarantee that evacuation never runs out of to-space mid-collection. When the heap is near-full
+// (budget 0) no sources are selected and the collection is non-moving. Selection is deterministic (scan
+// order), so a collection is reproducible run to run.
+
+// Half a block — a block with at most this many live lines (more than half holes) is fragmented enough to
+// evacuate. The fragmentation threshold; tuning it (and the block-selection order) is the defrag policy knob.
+fun rtDefragThreshold() -> Int {
+  return 64
+}
+
+// Select evacuation sources for this collection and mark them DEFRAG_SOURCE (state 3). A block qualifies
+// when the last sweep found it sparsely live (0 < count ≤ threshold) and it is still a used block (state
+// RECYCLABLE/UNAVAILABLE). At most `budget` blocks are selected — budget is the available empty-block count
+// (free list + never-used) minus the copy reserve — so to-space can always absorb the survivors. Returns the
+// number selected (0 ⇒ the collection runs non-moving). Freshly allocated blocks with no histogram (count 0)
+// are never sources; the first collection therefore never evacuates and only seeds defragTable.
+fun rtSelectDefragSources(space: RawPtr) -> Int {
+  let fc: Int = space.load(fromByteOffset: 32)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let flTop: Int = space.load(fromByteOffset: 96)
+  let neverUsed = nb - fc
+  let available = flTop + neverUsed
+  var reserve = available / 16
+  if reserve < 1 {
+    reserve = 1
+  }
+  var budget = available - reserve
+  if budget < 0 {
+    budget = 0
+  }
+  let threshold = rtDefragThreshold()
+  let dt: RawPtr = space.load(fromByteOffset: 112)
+  var selected = 0
+  var bi = 0
+  while bi < fc {
+    if selected < budget {
+      let cnt: UInt8 = dt.load(fromByteOffset: bi)
+      let live = cnt.int
+      if live > 0 {
+        if live <= threshold {
+          let st = rtBlockState(space, bi)
+          if st != 0 {
+            rtSetBlockState(space, bi, 3)   // DEFRAG_SOURCE for this collection
+            selected = selected + 1
+          }
+        }
+      }
+    }
+    bi = bi + 1
+  }
+  return selected
+}
+
+// One collection from `root`, the general Immix collector (150.3.8): select fragmented blocks as evacuation
+// sources within the copy reserve, evacuate their live objects to fresh to-space while marking every other
+// live object in place, then reclaim the emptied sources + dead blocks by the 150.3.5 sweep (which also
+// records the next collection's fragmentation histogram). Returns the root's post-collection address — the
+// root moves only if it sat in a source block, so the caller adopts the returned pointer. With zero sources
+// this is exactly the non-moving collector (rtImmixCollect); with every used block a source it is force-all
+// (rtImmixEvacCollect) — one path, the evacuation set chosen by fragmentation.
+fun rtImmixCollectDefrag(space: RawPtr, root: RawPtr) -> RawPtr {
+  let nSources = rtSelectDefragSources(space)
+  rtClearAllLines(space)
+  rtSetupCopyAllocator(space)
+  let newRoot = rtImmixEvacMark(space, root)
+  rtImmixSweepBlocks(space)
+  rtImmixSweepLos(space)
+  rtImmixUnmark(newRoot)
+  rtResetAllocator(space)
+  return newRoot
+}

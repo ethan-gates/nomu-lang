@@ -770,7 +770,7 @@ extension LLVMGen {
         return reserveZeroedFn!
     }
 
-    // A runtime startup global (`runtime.nomu`), read by symbol from generated code. `nomu_runtime_init` sets
+    // A runtime startup global (`runtime/startup.nomu`), read by symbol from generated code. `nomu_runtime_init` sets
     // it before any other code runs and it never changes after, so the load is invariant.
     func loadRuntimeGlobal(_ name: String, _ ty: LLVMTypeRef) -> LLVMValueRef {
         let load = LLVMBuildLoad2(b, ty, getOrAddGlobal(ty, Mangle.global(name, home: [])), name)!

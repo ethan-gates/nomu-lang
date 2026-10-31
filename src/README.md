@@ -24,7 +24,7 @@ interface modules hold each IR's format, implementation modules hold the code;
 **runtime/** — the mandatory floor, linked into every emitted program (`c-types.md`)
 - **runtime/embedded** — the C floor under the Nomu runtime (process entry, GC driver threads, TLAB and
   mod-buffer registries, GC descriptor accessors, raw memory) + the C core floor (`core.c`: String,
-  primitives), bundled into `nomuc`. The scheduler and collector are Nomu code in `stdlib/runtime.nomu`.
+  primitives), bundled into `nomuc`. The scheduler and collector are Nomu code in `stdlib/runtime/` (its README lists the files).
 
 **stdlib** — the Nomu-written standard library (compiled alongside user code)
 

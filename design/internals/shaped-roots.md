@@ -79,7 +79,7 @@ hole: a language sum-type-over-references points at it the same way.
    carries `(field offset, shape-id)` so the tracer recurses into the conditional sub-shape at that offset.
    `collectManagedOffsets` grows a conditional entry kind, and the object-scan loop grows a branch.
 3. **Both collectors** read it identically — the C scanner/walker (`runtime.c`) and the self-hosted tracer
-   (`runtime.nomu`, the `while i < nptr` loops): read tag, select the case's offsets. This is the lockstep
+   (the `runtime` package (`src/stdlib/runtime/`), the `while i < nptr` loops): read tag, select the case's offsets. This is the lockstep
    obligation.
 
 ## Stage 2 — SSAIR marking + placement invariant
@@ -287,7 +287,7 @@ Findings:
 ## Stage 5 — collector consumption
 
 Both collectors consumed the shape descriptor: the MMTk-binding path (`gcbinding/lib.rs` + the C stack
-walker in `runtime.c`, both deleted with MMTk in task 197) and the self-hosted collector (`runtime.nomu`),
+walker in `runtime.c`, both deleted with MMTk in task 197) and the self-hosted collector (the `runtime` package (`src/stdlib/runtime/`)),
 now the only one. The self-hosted tracer runs the
 pointer-map loop in **ten phase functions** — `rtObjHash`, `rtMarkVerify`, `rtMarkVerifyImmix`,
 `rtLineMarkCheck`, `rtImmixMark`, `rtImmixUnmark`, `rtGenUnmarkAndUnlog`, `rtImmixEvacMark`,

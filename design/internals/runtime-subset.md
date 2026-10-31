@@ -12,7 +12,7 @@ intrinsics + pure leaves). Runs over the final NOIR module in `Sema.swift` (`che
 by `tools/subset.sh`.
 
 Designation sources (both feed the same `subsetFuncs` set, resolved in the driver):
-- **The runtime prelude** (`src/stdlib/runtime.nomu`) — every function in it is subset **by default**.
+- **The runtime prelude** (`src/stdlib/runtime/`) — every function in it is subset **by default**.
   This is the proper "designated file" surface A described, standing in for module membership until
   [100](../plans/tasks/100-modules.md); the self-hosted runtime (150) lives here. Verified: a violation
   injected into the prelude is flagged with no flag given (`tools/rt-prelude.sh`).

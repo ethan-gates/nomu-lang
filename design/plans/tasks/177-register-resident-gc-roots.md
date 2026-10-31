@@ -45,5 +45,5 @@ can share it.
 - **Correctness rests on register-recovery in both stack walkers.** The stackmap parser keeps register-kind
   locations, but the walk currently derives a stack address from `(base + off)`
   (`nomu_gc_walk_context` in `runtime.c`); handling true register-kind roots — recovering and updating a
-  callee-saved register per frame — is part of 177.1, and the self-hosted `rtWalkFrom` (`runtime.nomu`)
+  callee-saved register per frame — is part of 177.1, and the self-hosted `rtWalkFrom` (`runtime/stackwalk.nomu`)
   must match.

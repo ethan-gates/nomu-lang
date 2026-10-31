@@ -519,7 +519,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     // ordinary module marks the embedded prelude file names weak, which matters only for a white-box
     // `test.runtime_prelude` prepend.
     let weakOrigins: Set<String> = job.runtimeSubsetByMembership ? ownFiles
-        : options.compilingPrelude ? [] : [EmbeddedSources.preludeName, EmbeddedSources.runtimePreludeName]
+        : options.compilingPrelude ? [] : Set([EmbeddedSources.preludeName] + runtimePrependFileNames)
     var optimizer = OptimizerSettings()
     optimizer.devirt = jobSettings.bool("opt.devirt")
     optimizer.inline = jobSettings.bool("opt.inline")

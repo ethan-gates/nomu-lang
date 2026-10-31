@@ -167,7 +167,7 @@ Finding. A dual-root case exists today: a `String` field of a heap `class` is ro
 one buffer, two roots at one safepoint. Relocation must run once. Both collectors guarantee this with a
 forwarding pointer: MMTk Immix evacuation uses forwarding bits; the self-hosted collector's `rtEvacuate` sets
 the forwarded bit and `rtForwardDuringTrace` returns the forwarding pointer for an already-moved object
-(`runtime.nomu`). The second visitor reads the forwarding pointer and rewrites its root to the moved address.
+(the `runtime` package (`src/stdlib/runtime/`)). The second visitor reads the forwarding pointer and rewrites its root to the moved address.
 This is a collector property with nothing for `verifySSAIR` to check; recorded here as relied-on: every
 managed root, however reached, relocates idempotently through the forwarding pointer.
 
@@ -215,7 +215,7 @@ exist once; a new shape kind added to `nomu_gc_live_offsets` reaches both collec
 per-collector: the per-reference *action* (mark, trace, relocate, write back) across the self-hosted tracer's
 ~10 phase functions and the MMTk scan sites, each iterating the offsets the shared enumerator returns; and the
 deopt-range parse of the root walk, written twice (`nomu_gc_walk_context` in C, `rtWalkShadow` in
-`runtime.nomu`). Those two are where a new shape can diverge. The contract narrows to: (a) shape decode stays
+the `runtime` package (`src/stdlib/runtime/`)). Those two are where a new shape can diverge. The contract narrows to: (a) shape decode stays
 single-source — a new kind extends `nomu_gc_live_offsets` only; (b) every new shape adds a fingerprint-oracle
 leg that exercises the per-reference action and the root-walk parse in both collectors. `verifySSAIR` has no
 role here; it is a runtime-equivalence property.

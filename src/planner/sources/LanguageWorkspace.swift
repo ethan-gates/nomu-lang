@@ -4,7 +4,8 @@ import embedded
 // The planner reads it as an in-memory tree with the same layout an on-disk workspace has (a `nomu.yaml`,
 // one `pkg.json` per package), so it is planned like any other workspace.
 //
-// Three packages. `core` and `runtime` are single-module packages rooted at their own source file; `std` is
+// Three packages. `core` and `runtime` are single-module packages rooted at their own source files (`runtime`'s
+// module spans several); `std` is
 // a multi-module package (one leaf directory per module) whose `default-module` is `prelude`, the module the
 // implicit `import std` names. Every module is a product, and `std` lists `core` in its `dependencies`
 // (only `std` may import `core`).
@@ -32,8 +33,7 @@ public enum LanguageWorkspace {
                 files: [ModuleFile(dir: "", file: EmbeddedSources.preludeName, source: EmbeddedSources.preludeSource)],
                 defaultModule: nil),
         Package(name: "runtime",
-                files: [ModuleFile(dir: "", file: EmbeddedSources.runtimePreludeName,
-                                   source: EmbeddedSources.runtimePreludeSource)],
+                files: EmbeddedSources.runtimeFiles.map { ModuleFile(dir: "", file: $0.name, source: $0.source) },
                 defaultModule: nil),
         Package(name: "std",
                 files: EmbeddedSources.stdModules.map { ModuleFile(dir: $0.module, file: $0.name, source: $0.source) },

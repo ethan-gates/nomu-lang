@@ -1,5 +1,5 @@
 // Nomu privileged runtime — the C floor under the Nomu runtime: the GC driver threads. The scheduler
-// and the collector are Nomu code (src/stdlib/runtime.nomu); generated code calls them directly or through
+// and the collector are Nomu code (src/stdlib/runtime/); generated code calls them directly or through
 // codegen-emitted forwarders. Symbols generated code calls here have external linkage via runtime.h. (Design: m4.13-spec.md §1, level 1.)
 #define _XOPEN_SOURCE 600
 #define _DARWIN_C_SOURCE
@@ -11,7 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
-// ---- The Nomu scheduler (src/stdlib/runtime.nomu) ----
+// ---- The Nomu scheduler (src/stdlib/runtime/scheduler.nomu) ----
 // Its entry points are Nomu functions, so codegen names them `nomu_fn_<name>`; the GC threads call them.
 // The scheduler (`rtSched`) and whether an external stop-the-world driver owns collection
 // (`rtGcExternalDriver`): runtime startup globals, set by nomu_runtime_init before anything below runs.
@@ -38,7 +38,7 @@ extern volatile int nomu_static_rtStopWorld;
 // ---- GC driver threads ----
 // Forced self-hosted stop-the-world smoke (task 128.3.2, env NOMU_STW_SELFHOST). Drives a real STW over
 // the self-hosted scheduler's carriers and runs the self-hosted root walk (rtWalkFrom over the live-fiber
-// registry). This coordinator is a plain thread, not a fiber, so it never polls/parks itself. Sched field offsets mirror runtime.nomu.
+// registry). This coordinator is a plain thread, not a fiber, so it never polls/parks itself. Sched field offsets mirror runtime/scheduler.nomu.
 static int64_t rt_stw_ld(int off)  { return __atomic_load_n((int64_t*)((char*)nomu_g_rtSched + off), __ATOMIC_SEQ_CST); }
 static void    rt_stw_st(int off, int64_t v) { __atomic_store_n((int64_t*)((char*)nomu_g_rtSched + off), v, __ATOMIC_SEQ_CST); }
 

@@ -23,7 +23,7 @@ surface, under 149's subset rules: a `RawPtr` control block holds `{ base, curso
 the arena — no globals, no heap object), `bumpNew` carves an off-heap OS block, `bumpAlloc` bumps
 fixed-size chunks and returns null on overflow. It compiles under `--runtime-subset=bumpNew,bumpAlloc`
 with no violations (the first real client exercising the 125↔149 interlock), and is byte-identical under
-NoGC and Immix-evacuation (`examples/bump_alloc.nomu` + `tools/bump-alloc.sh`). **Slice B foundation built — the runtime prelude.** The allocator now lives in `src/stdlib/runtime.nomu`,
+NoGC and Immix-evacuation (`examples/bump_alloc.nomu` + `tools/bump-alloc.sh`). **Slice B foundation built — the runtime prelude.** The allocator now lives in `src/stdlib/runtime/`,
 a second embedded prelude compiled into every program (beside `core.nomu`) and **runtime-subset by
 default** — the proper "designated file" for 149, replacing the interim `--runtime-subset` flag. Its
 functions (`rtArenaNew` / `rtBumpAlloc`) are auto-subset-checked (a violation injected into the prelude is
@@ -737,7 +737,7 @@ Rung 3 comes up in eight increments, each one mechanism with an oracle, mirrorin
    Returns the root's new address — the root moves under force-all, so the caller adopts it (the pcsp-root
    rewrite is 128.3.2). Shared children and cycles resolve through the forwarded-bit guard in `rtEvacuate`
    and the mark-bit guard, so each object is copied and scanned once; LOS objects are out of heap range, so
-   they are scanned for fixup but never moved. `noSafepoint` (149, held by every `runtime.nomu` function)
+   they are scanned for fixup but never moved. `noSafepoint` (149, held by every the `runtime` package (`src/stdlib/runtime/`) function)
    is what makes holding raw pointers into the moving heap across the copy sound — this closes 125 §3.3's
    deferred moving-heap gate as its first real client. `rtImmixCollect` (non-moving, 150.3.5) stays as the
    separate path; unifying the two behind a defrag trigger is 150.3.8. `examples/immix_evac.nomu` +

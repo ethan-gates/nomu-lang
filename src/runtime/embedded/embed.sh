@@ -5,8 +5,13 @@
 # (##"""…"""##) mean the file contents pass through verbatim — no escaping.
 set -euo pipefail
 
-out="$1"; rt_h="$2"; rt_c="$3"; prelude="$4"; rt_prelude="$5"; rtasm_arm64="$6"
-shift 6   # the rest: the `std` package's module files, `.../std/<module>/<file>.nomu`
+out="$1"; rt_h="$2"; rt_c="$3"; prelude="$4"; rtasm_arm64="$5"
+shift 5
+# The rest: the `runtime` package's files (`.../runtime/<file>.nomu`), then `--`, then the `std` package's
+# module files (`.../std/<module>/<file>.nomu`).
+runtime_files=()
+while [ "$1" != "--" ]; do runtime_files+=("$1"); shift; done
+shift
 
 emit() {  # $1 = Swift constant name, $2 = source file
     printf '    public static let %s = ##"""\n' "$1"
@@ -22,8 +27,14 @@ emit() {  # $1 = Swift constant name, $2 = source file
     emit runtimeC "$rt_c"
     echo '    public static let preludeName = "core.nomu"'
     emit preludeSource "$prelude"
-    echo '    public static let runtimePreludeName = "runtime.nomu"'
-    emit runtimePreludeSource "$rt_prelude"
+    # The `runtime` package's files as (file name, source) pairs: one module over several files.
+    echo '    public static let runtimeFiles: [(name: String, source: String)] = ['
+    for f in "${runtime_files[@]}"; do
+        printf '        (name: "%s", source: ##"""\n' "$(basename "$f")"
+        cat "$f"
+        printf '\n"""##),\n'
+    done
+    echo '    ]'
     # The `std` package as (module, file name, source) triples, one per module file.
     echo '    public static let stdModules: [(module: String, name: String, source: String)] = ['
     for f in "$@"; do

@@ -1,0 +1,195 @@
+// Program I/O: stdin line input with its poller thread, and the array bounds trap.
+// Part of the `runtime` module; see README.md.
+
+// An array subscript out of range: generated code checks every subscript and calls this on a failure. Prints
+// the index and length to stderr and aborts; never returns. Its calls are gc-leaf.
+fun rtBoundsTrap(idx: Int, len: Int) {
+  let msg = rtBufNew(128)
+  rtBufGrew(msg, Runtime.copyLiteral(to: rtBufAt(msg, 32), "fatal error: array index "))
+  rtBufInt(msg, idx)
+  rtBufGrew(msg, Runtime.copyLiteral(to: rtBufAt(msg, 32), " out of range for length "))
+  rtBufInt(msg, len)
+  let md: RawPtr = msg.load(fromByteOffset: 0)
+  let ml: Int = msg.load(fromByteOffset: 8)
+  let w = Runtime.writeFd(fd: 2, buf: md, count: ml)
+  Runtime.fatal("")
+}
+
+// ---- Line input and the stdin poller ----
+// `readLine` reads stdin through one line buffer. A fiber whose line is not buffered yet checks readiness
+// (`Runtime.poll`); when stdin has nothing to read it joins the waiter list and parks, so its carrier runs
+// other fibers meanwhile. One poller thread, started on first use, blocks in kevent(2) on a one-shot read
+// event for stdin and, when it fires, unparks every waiter; each re-checks the buffer, and one that still
+// finds nothing waits again. Every waiter shares the one kqueue registration: kqueue keys an event by
+// (fd, filter), so arming per fiber would overwrite an earlier waiter's wake-up.
+//
+// Lock order: the stdin lock, then the scheduler lock. A parking fiber takes the scheduler lock before it
+// releases the stdin lock, and the poller takes the scheduler lock (rtSchedUnpark) only after releasing the
+// stdin lock, so an unpark cannot re-queue a fiber whose context is not saved yet. The stdin lock is never
+// held across a park.
+//
+// rtStdin: 0 lock (futex mutex word) · 8 buffer · 16 head (first unread byte) · 24 end (bytes buffered)
+//          · 32 capacity · 40 end of input seen · 48 waiter list · 56 read event armed · 64 kqueue fd
+//          · 72 poller started · 80 poller thread handle
+// A waiter (16 bytes): 0 fiber · 8 next.
+let rtStdin = Runtime.staticStorage(bytes: 96, align: 8)
+
+// Read one line from stdin. Returns a raw block the caller frees: the line's byte count at 0, then its bytes
+// (without the newline) at 8. At end of input, the unterminated remainder, then empty lines. The anchor is
+// the user frame the `readLine` forwarder captured, recorded if the fiber parks.
+fun rtReadLine(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
+  let st = rtStdin
+  rtSchedMutexLockAt(st)
+  while true {
+    let buf: RawPtr = st.load(fromByteOffset: 8)
+    let head: Int = st.load(fromByteOffset: 16)
+    let end: Int = st.load(fromByteOffset: 24)
+    var i = head
+    var found = false
+    while !found && i < end {
+      let c: UInt8 = buf.load(fromByteOffset: i)
+      if c.int == 10 {
+        found = true
+      } else {
+        i = i + 1
+      }
+    }
+    let eof: Int = st.load(fromByteOffset: 40)
+    if found || eof != 0 {
+      // A line ends at i; at end of input the line is the rest of the buffer, past which i stops.
+      let line = rtStdinTake(st, buf, head, i - head)
+      var next = i
+      if found {
+        next = i + 1
+      }
+      if next >= end {
+        st.store(0, toByteOffset: 16)
+        st.store(0, toByteOffset: 24)
+      } else {
+        st.store(next, toByteOffset: 16)
+      }
+      rtSchedMutexUnlockAt(st)
+      return line
+    }
+    if Runtime.poll(fd: 0) == 0 {
+      // Nothing to read: wait for the poller, then re-check from the top.
+      rtStdinPollerStart(st)
+      let w = RawPtr.alloc(bytes: 16, align: 8)
+      w.store(rtCurrentFiber(), toByteOffset: 0)
+      let first: RawPtr = st.load(fromByteOffset: 48)
+      w.store(first, toByteOffset: 8)
+      st.store(w, toByteOffset: 48)
+      let armed: Int = st.load(fromByteOffset: 56)
+      if armed == 0 {
+        rtStdinArm(st)
+        st.store(1, toByteOffset: 56)
+      }
+      rtSchedLock(sched)
+      rtSchedMutexUnlockAt(st)
+      nomuSchedParkLocked(sched, anchorSp, anchorPc)   // returns with the scheduler lock released
+      rtSchedMutexLockAt(st)
+    } else {
+      // Readable: read what is there. Holding the stdin lock serializes readers; a readable fd does not
+      // block.
+      rtStdinReserve(st, 4096)
+      let rbuf: RawPtr = st.load(fromByteOffset: 8)
+      let rend: Int = st.load(fromByteOffset: 24)
+      let cap: Int = st.load(fromByteOffset: 32)
+      let n = Runtime.readFd(fd: 0, buf: rbuf.advanced(by: rend), count: cap - rend)
+      if n > 0 {
+        st.store(rend + n, toByteOffset: 24)
+      } else {
+        st.store(1, toByteOffset: 40)   // end of input (or a read error, treated the same)
+      }
+    }
+  }
+  return RawPtr.null
+}
+
+// Copy `n` bytes at `buf + from` into a fresh line block: the count at 0, the bytes at 8.
+fun rtStdinTake(st: RawPtr, buf: RawPtr, from: Int, n: Int) -> RawPtr {
+  let line = RawPtr.alloc(bytes: 8 + n, align: 8)
+  line.store(n, toByteOffset: 0)
+  if n > 0 {
+    line.advanced(by: 8).copyBytes(from: buf.advanced(by: from), byteCount: n)
+  }
+  return line
+}
+
+// Make room for at least `room` more bytes past the buffered end: move the unread bytes to the front of a
+// buffer of twice the capacity (8 KiB at first) when they do not fit.
+fun rtStdinReserve(st: RawPtr, room: Int) {
+  let cap: Int = st.load(fromByteOffset: 32)
+  let end: Int = st.load(fromByteOffset: 24)
+  if cap - end >= room {
+    return
+  }
+  let buf: RawPtr = st.load(fromByteOffset: 8)
+  let head: Int = st.load(fromByteOffset: 16)
+  var ncap = 8192
+  if cap > 0 {
+    ncap = cap * 2
+  }
+  let nbuf = RawPtr.alloc(bytes: ncap, align: 8)
+  if end > head {
+    nbuf.copyBytes(from: buf.advanced(by: head), byteCount: end - head)
+  }
+  if !buf.isNull {
+    buf.free()
+  }
+  st.store(nbuf, toByteOffset: 8)
+  st.store(0, toByteOffset: 16)
+  st.store(end - head, toByteOffset: 24)
+  st.store(ncap, toByteOffset: 32)
+}
+
+// Register the one-shot read event for stdin on the poller's kqueue. A `struct kevent` (32 bytes): ident at
+// 0, filter (int16) at 8, flags (uint16) at 10, fflags (uint32) at 12, data at 16, udata at 24. EVFILT_READ
+// is -1; flags are EV_ADD (0x1) | EV_ONESHOT (0x10).
+fun rtStdinArm(st: RawPtr) {
+  let ev = RawPtr.alloc(bytes: 32, align: 8)
+  ev.store(0, toByteOffset: 0)
+  ev.store(1179647, toByteOffset: 8)   // filter 0xFFFF, flags 0x0011, fflags 0
+  ev.store(0, toByteOffset: 16)
+  ev.store(0, toByteOffset: 24)
+  let kq: Int = st.load(fromByteOffset: 64)
+  Runtime.kevent(kq: kq, changes: ev, nchanges: 1, events: RawPtr.null, nevents: 0)
+  ev.free()
+}
+
+// Start the poller thread once: the first waiter to win the flag creates the kqueue and the thread. Called
+// with the stdin lock held, so the kqueue exists before any waiter arms it.
+fun rtStdinPollerStart(st: RawPtr) {
+  let started: Int = st.load(fromByteOffset: 72)
+  if started != 0 {
+    return
+  }
+  st.store(1, toByteOffset: 72)
+  st.store(Runtime.kqueue(), toByteOffset: 64)
+  Runtime.threadCreate(handle: st.advanced(by: 80), entry: Runtime.ofFunc(rtStdinPollerMain), arg: st)
+}
+
+// The poller thread: block in kevent until stdin is readable, then take every waiter and unpark it. Runs
+// for the life of the process.
+fun rtStdinPollerMain(st: RawPtr) -> RawPtr {
+  let evs = RawPtr.alloc(bytes: 32 * 8, align: 8)
+  while true {
+    let kq: Int = st.load(fromByteOffset: 64)
+    let n = Runtime.kevent(kq: kq, changes: RawPtr.null, nchanges: 0, events: evs, nevents: 8)
+    if n > 0 {
+      rtSchedMutexLockAt(st)
+      var w: RawPtr = st.load(fromByteOffset: 48)
+      st.store(RawPtr.null, toByteOffset: 48)
+      st.store(0, toByteOffset: 56)
+      rtSchedMutexUnlockAt(st)
+      while !w.isNull {
+        let nx: RawPtr = w.load(fromByteOffset: 8)
+        let fib: RawPtr = w.load(fromByteOffset: 0)
+        rtSchedUnpark(rtSched, fib)
+        w.free()
+        w = nx
+      }
+    }
+  }
+  return st
+}

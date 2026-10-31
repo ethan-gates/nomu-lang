@@ -38,6 +38,6 @@ live heap down as well as up. `selfhosted-gc.md` §7 lists it as an open footpri
 
 ## Refs
 
-`rtImmixNew` and the block pool (`runtime.nomu`), `nomuReserveZeroed` and `TargetPlatform`
+`rtImmixNew` and the block pool (`runtime/immix.nomu`), `nomuReserveZeroed` and `TargetPlatform`
 (`src/llvmgen`), `../../internals/selfhosted-gc.md` §7, [127](127-lxr-collector.md),
 [159](159-gc-observability.md), [218](218-linux-support.md).

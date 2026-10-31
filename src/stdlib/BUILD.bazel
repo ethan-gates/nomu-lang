@@ -3,6 +3,13 @@
 # alongside user code at run time).
 exports_files(glob(["*.nomu"]))
 
+# The `runtime` package: one module over several files (`runtime/README.md`).
+filegroup(
+    name = "runtime_files",
+    srcs = glob(["runtime/*.nomu"]),
+    visibility = ["//visibility:public"],
+)
+
 # The `std` package's modules, one leaf directory per module (`std/<module>/<module>.nomu`).
 filegroup(
     name = "std_modules",

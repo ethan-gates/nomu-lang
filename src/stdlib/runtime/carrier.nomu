@@ -1,0 +1,556 @@
+// Per-carrier state: the carrier record (its TLAB and mod-buffer) and the write barrier.
+// Part of the `runtime` module; see README.md.
+
+// ---- Multi-carrier allocation (task 150 · 150.3.10.1) ----
+// Each carrier owns a TLAB and bumps within it privately (no lock). The shared block pool and large-object
+// list are pulled under the space's poolLock (@120). Mirrors Go's mcache/mcentral and MMTk's per-mutator
+// TLABs. The TLAB is the first part of the carrier record below; the collector resets every carrier's TLAB at
+// the end of a collection (evacuation may relocate a carrier's current block).
+
+// ---- The carrier record ----
+// One 128-byte record per carrier, behind the carrier-local slot (`Runtime.carrierLocal()`):
+//   0  TLAB (64 bytes): cursor @0, limit @8, block @16, line @24, stressLimit @32, stressBytes @40,
+//      allocObjects @48, allocBytes @56. Cursor and limit are addresses (0 when there is no hole); under
+//      NOMU_GC_STRESS the hole end lives in stressLimit and limit stays 0, so the inline bump always misses.
+//      allocObjects and allocBytes are reserved for the `full` recording level's allocation counts.
+//   64 the fiber running on this carrier
+//   72 the mod-buffer (24 bytes): count @72, cap @80, storage @88
+//   96 the next record in the registry
+// The TLAB sits at offset 0, so a record is its own TLAB pointer, and it fills the first cache line alone.
+// A record lives for the whole process. The registry is a list of every record, pushed with one CAS at bind
+// and walked only under stop-the-world.
+let rtCarriers = Runtime.staticStorage(bytes: 8, align: 8)
+
+// Create this thread's carrier record, register it, and store it in the carrier-local slot. Every carrier
+// binds on entry to its loop; the allocation and barrier slow paths bind a thread that has no record.
+fun rtCarrierBind() -> RawPtr {
+  let rec = RawPtr.alloc(bytes: 128, align: 64)
+  rec.store(-1, toByteOffset: 16)            // no current block: the first allocation refills
+  let cap = 4096
+  rec.store(cap, toByteOffset: 80)
+  rec.store(RawPtr.alloc(bytes: cap * 8, align: 8), toByteOffset: 88)
+  var done = false
+  while !done {
+    let old: Int = rtCarriers.atomicLoad(fromByteOffset: 0)
+    rec.store(old, toByteOffset: 96)
+    done = rtCarriers.atomicCas(old, rec.toInt(), atByteOffset: 0) == old
+  }
+  Runtime.setCarrierLocal(rec)
+  return rec
+}
+
+// This thread's carrier record, binding one if it has none.
+fun rtCarrier() -> RawPtr {
+  let rec = Runtime.carrierLocal()
+  if rec.isNull {
+    return rtCarrierBind()
+  }
+  return rec
+}
+
+// The fiber running on this carrier, or null on a thread with no record or between fibers.
+fun rtCurrentFiber() -> RawPtr {
+  let rec = Runtime.carrierLocal()
+  if rec.isNull {
+    return rec
+  }
+  return rec.load(fromByteOffset: 64)
+}
+
+// This carrier's mod-buffer.
+fun rtSelfModBuf() -> RawPtr {
+  return rtCarrier().advanced(by: 72)
+}
+
+// Drop every carrier's hole and current block, so the next allocation refills from the post-collection pool.
+// Under stop-the-world.
+fun rtCarriersResetTlabs() {
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while !rec.isNull {
+    rec.store(0, toByteOffset: 0)
+    rec.store(0, toByteOffset: 8)
+    rec.store(-1, toByteOffset: 16)
+    rec.store(0, toByteOffset: 24)
+    rec.store(0, toByteOffset: 32)
+    rec = rec.load(fromByteOffset: 96)
+  }
+}
+
+// Empty every carrier's mod-buffer, keeping its storage. Under stop-the-world.
+fun rtCarriersResetModBufs() {
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while !rec.isNull {
+    rec.store(0, toByteOffset: 72)
+    rec = rec.load(fromByteOffset: 96)
+  }
+}
+
+// The number of remembered objects across every carrier's mod-buffer, to size the drain. Under stop-the-world.
+fun rtCarriersModBufTotal() -> Int {
+  var total = 0
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while !rec.isNull {
+    let count: Int = rec.load(fromByteOffset: 72)
+    total = total + count
+    rec = rec.load(fromByteOffset: 96)
+  }
+  return total
+}
+
+// Copy every carrier's remembered objects into `out`, which holds rtCarriersModBufTotal() entries, empty the
+// buffers, and return the count: the minor collection's remembered set. Under stop-the-world.
+fun rtCarriersDrainModBufs(out: RawPtr) -> Int {
+  var total = 0
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while !rec.isNull {
+    let count: Int = rec.load(fromByteOffset: 72)
+    let storage: RawPtr = rec.load(fromByteOffset: 88)
+    var j = 0
+    while j < count {
+      let obj: RawPtr = storage.load(fromByteOffset: j * 8)
+      out.store(obj, toByteOffset: total * 8)
+      total = total + 1
+      j = j + 1
+    }
+    rec.store(0, toByteOffset: 72)
+    rec = rec.load(fromByteOffset: 96)
+  }
+  return total
+}
+
+// Synchronous collection at true OOM (task 150.3.11). rtImmixRefill calls this when the shared pool has no
+// block left. It parks this carrier at its alloc-site anchor so the stop-the-world walk finds the in-flight
+// allocation's roots (the anchor is the user frame that called the alloc seam — the seam's immediate caller,
+// a statepoint rtWalkFrom matches), initiates a stop-the-world, signals the GC coordinator (a plain pthread)
+// to run a defrag collection, and waits for it to finish; then reports whether the collection reclaimed space
+// so the refill can retry. Returns false when there is no self-hosted scheduler (no collector) or the
+// collection freed nothing (a genuine out-of-memory — the heap is full of live data). The collection resets
+// this carrier's TLAB before resuming it, so the caller re-reads the TLAB.
+//
+// The park mirrors nomuSchedSafepoint exactly: under the scheduler lock, set the user-frame anchor and the
+// fiber state (safepoint-stopped, 4), then switch to the carrier context. The carrier loop then acks the STW
+// (rtSchedStwParkCarrier) and waits, and switches back into this fiber on resume — so the ack accounting,
+// state discipline, and stack-save are the proven poll-site machinery, not an ad-hoc in-place block. The one
+// addition is initiating the STW: the first carrier into OOM sets the stw-request (sched+136) under the lock
+// and wakes the coordinator; because 136 is set before this fiber parks, the carrier's `while 136 != 0` wait
+// cannot race ahead of the request. Concurrent OOMs coalesce (only the first initiates; the rest just park).
+fun rtSelfhostOom(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+  let sched = rtSched
+  if sched.isNull {
+    return false
+  }
+  let self = rtCurrentFiber()
+  rtSchedSetAnchor(self, anchorSp, anchorPc)      // user-frame anchor for the STW walk (128.3.2 machinery)
+  rtSchedLock(sched)
+  if sched.atomicLoad(fromByteOffset: 136) == 0 {
+    rtGcRecordRequest(trigger)
+    sched.atomicStore(1, toByteOffset: 136)       // initiate the stop-the-world (this carrier is the initiator)
+    sched.atomicStore(1, toByteOffset: 168)       // signal the GC coordinator to run the collection
+    Runtime.futexWake(at: sched.advanced(by: 168), all: false)
+  }
+  self.store(4, toByteOffset: 168)                // safepoint-stopped; the carrier acks + waits, then resumes us
+  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
+  Runtime.ctxSwitch(from: self, to: carrierCtx)
+  rtSchedUnlock(sched)
+  // Retry-worthy iff the heap is not completely full after the collection: any free block suffices for a
+  // non-LOS allocation (a hole is at most one block). Checking `> 0` rather than a before/after delta avoids
+  // a false OOM when a concurrent carrier grabs the reclaimed blocks first — genuine OOM is a heap that a full
+  // collection left with zero free blocks (a live set the size of the heap).
+  let availAfter = nomuGcSpaceAvail()
+  return availAfter > 0
+}
+
+// Trigger a minor (generational) collection when the nursery reserve is exhausted (task 150.4.3). Mirrors
+// rtSelfhostOom's park exactly — the mutator parks at its alloc-site anchor and the GC coordinator runs the
+// collection — but sets the collection-kind flag (sched+176 = 1) so the coordinator runs a minor GC
+// (nomuSchedStwCollectMinor) rather than a major/defrag. Returns false when there is no self-hosted scheduler
+// (no collector — the reserve stays unenforced, as in 150.4.1); else true (a minor GC always empties the
+// nursery). The collection resets this carrier's TLAB before resuming it, so the caller re-reads the TLAB.
+fun rtSelfhostMinorGc(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+  let sched = rtSched
+  if sched.isNull {
+    return false
+  }
+  let self = rtCurrentFiber()
+  rtSchedSetAnchor(self, anchorSp, anchorPc)
+  rtSchedLock(sched)
+  if sched.atomicLoad(fromByteOffset: 136) == 0 {
+    rtGcRecordRequest(trigger)
+    sched.atomicStore(1, toByteOffset: 176)       // collection kind = minor (the coordinator reads this)
+    sched.atomicStore(1, toByteOffset: 136)       // initiate the stop-the-world
+    sched.atomicStore(1, toByteOffset: 168)       // signal the GC coordinator
+    Runtime.futexWake(at: sched.advanced(by: 168), all: false)
+  }
+  self.store(4, toByteOffset: 168)                // safepoint-stopped; the carrier acks + waits, then resumes us
+  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
+  Runtime.ctxSwitch(from: self, to: carrierCtx)
+  rtSchedUnlock(sched)
+  return true
+}
+
+// Run a generational collection at the alloc-site anchor: a minor, or a major when mature headroom is short
+// (150.4.4, §11.4). `minorTrigger` is the active nursery reserve in blocks (rtGenReserve, > 0). A minor
+// promotes the whole nursery into mature; when mature lacks headroom the copy allocator would return null
+// mid-promotion (a null stored into a slot — corruption), and a minor never reclaims dead mature objects, so
+// mature fills over time. When the free mature blocks fall below a floor, run a full defrag major instead — it
+// reclaims mature garbage and collects the nursery, so it handles both failed promotion and mature pressure.
+// The floor is the worst-case promotion (the whole nursery, minorTrigger blocks) plus a fragmentation margin,
+// raised by NOMU_MATURE_FLOOR (the mature-pressure knob) when set higher. The defrag major is
+// heap-pressure-safe (it selects sources within the copy reserve), so it runs even when the minor could not
+// place its promotions. Called without the pool lock held. `trigger` is why the collection was raised (the
+// recorder's trigger id: nursery full or allocation stress). Returns whether a collection ran.
+fun rtGenCollect(minorTrigger: Int, trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+  let avail = nomuGcSpaceAvail()
+  var floor = minorTrigger + minorTrigger        // 2× the reserve: promotion headroom + fragmentation margin
+  let matureFloor = rtMatureFloor
+  if matureFloor > floor {
+    floor = matureFloor
+  }
+  if avail < floor {
+    var why = trigger
+    if trigger == 1 {
+      why = 2                                    // a nursery-full minor escalated by the mature floor
+    }
+    return rtSelfhostOom(why, anchorSp, anchorPc)     // escalate → major (collection kind 0)
+  }
+  return rtSelfhostMinorGc(trigger, anchorSp, anchorPc)   // minor (collection kind 1)
+}
+
+// Allocation stress (env NOMU_GC_STRESS): count `need` bytes against this carrier's stress interval and, once
+// the interval is reached, request a collection at the alloc-site anchor — a generational one (rtGenCollect)
+// when generational is on, else a major. Off under an external STW driver, which runs no coordinator to service
+// the request. The collection resets every TLAB, so the caller re-reads it.
+fun rtStressTick(space: RawPtr, tlab: RawPtr, need: Int, stress: Int, anchorSp: RawPtr, anchorPc: Int) {
+  if rtGcExternalDriver != 0 {
+    return
+  }
+  let counted: Int = tlab.load(fromByteOffset: 40)
+  let total = counted + need
+  if total < stress {
+    tlab.store(total, toByteOffset: 40)
+    return
+  }
+  tlab.store(0, toByteOffset: 40)
+  let minorTrigger = rtGenReserve(space)
+  if minorTrigger > 0 {
+    let ran = rtGenCollect(minorTrigger, 4, anchorSp, anchorPc)
+  } else {
+    let ran = rtSelfhostOom(4, anchorSp, anchorPc)
+  }
+}
+
+// Refill the carrier's TLAB with the next hole big enough for `need` bytes, pulling blocks from the shared
+// pool under poolLock. The hole scan matches rtNextHole (skips live lines so recyclable-block holes are
+// respected) but runs on the TLAB's private block/line/cursor/limit. Whole-block-per-carrier: a fresh block
+// is pulled on block exhaustion; cross-carrier hole sharing is deferred (150.3.10.2). On block exhaustion it
+// triggers a synchronous collection at the alloc-site anchor and retries (150.3.11); returns false only on a
+// genuine OOM (a collection that reclaimed nothing).
+fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+  rtSchedMutexLockAt(space.advanced(by: 120))
+  var done = false
+  var result = false
+  while !done {
+    let ab: Int = tlab.load(fromByteOffset: 16)
+    if ab < 0 {
+      // Nursery-full → minor GC before handing out another young block (150.4.3, §11.1). The trigger threshold
+      // is the active nursery reserve (rtGenReserve, in blocks): the descriptor default (numBlocks/4) by
+      // default — generational is on (150.4.5.3) — overridable/disable-able via NOMU_NURSERY_RESERVE. A zero
+      // trigger means disabled (the pre-generational path: the nursery grows unbounded and only a major/defrag
+      // collection fires at OOM). Promote the nursery once it reaches the threshold, but only when a scheduler
+      // exists to run the STW. After a minor GC nurseryUsed is 0 and the TLAB is reset, so the loop retries and
+      // gets a fresh nursery block.
+      let minorTrigger: Int = rtGenReserve(space)
+      let nurseryNow: Int = space.load(fromByteOffset: 136)
+      var didGc = false
+      if minorTrigger > 0 && nurseryNow >= minorTrigger {
+        rtSchedMutexUnlockAt(space.advanced(by: 120))
+        didGc = rtGenCollect(minorTrigger, 1, anchorSp, anchorPc)
+        rtSchedMutexLockAt(space.advanced(by: 120))
+      }
+      if didGc {
+        done = false                       // retry: nursery emptied, TLAB reset — get a fresh block next pass
+      } else {
+        let nb = rtNextAllocBlock(space)
+      if nb < 0 {
+        // Pool exhausted → synchronous collection at true OOM (150.3.11). Release the pool lock (the collector
+        // runs under STW; parking while holding it would be wrong), trigger + wait, then re-acquire and retry
+        // the loop (which re-reads the TLAB the collection reset). A collection that freed nothing is genuine
+        // OOM: stop with result = false.
+        rtSchedMutexUnlockAt(space.advanced(by: 120))
+        let progressed = rtSelfhostOom(3, anchorSp, anchorPc)
+        rtSchedMutexLockAt(space.advanced(by: 120))
+        if !progressed {
+          done = true
+        }
+      } else {
+        rtGcRecordRefill()
+        // 150.4: a clean block (FREE/never-used, state 0) handed to a mutator holds only young objects, so
+        // tag it NURSERY (the minor GC's from-space) and count it against the nursery. A reused RECYCLABLE
+        // block (state 1) holds mature survivors from a prior sweep, so it stays mature (untagged).
+        if rtBlockState(space, nb) == 0 {
+          rtSetBlockState(space, nb, 4)
+          let nu: Int = space.load(fromByteOffset: 136)
+          space.store(nu + 1, toByteOffset: 136)
+        }
+        tlab.store(nb, toByteOffset: 16)
+        tlab.store(0, toByteOffset: 24)
+      }
+      }
+    } else {
+      let al: Int = tlab.load(fromByteOffset: 24)
+      if al >= 128 {
+        tlab.store(-1, toByteOffset: 16)       // block exhausted → pull another next iteration
+      } else {
+        let firstLine = ab * 128
+        let gi = firstLine + al
+        if rtLineMarked(space, gi) == 1 {
+          tlab.store(al + 1, toByteOffset: 24)
+        } else {
+          var e = al
+          var run = true
+          while run {
+            if e >= 128 {
+              run = false
+            } else {
+              let ge = firstLine + e
+              if rtLineMarked(space, ge) == 1 {
+                run = false
+              } else {
+                e = e + 1
+              }
+            }
+          }
+          tlab.store(e, toByteOffset: 24)       // advance past this run
+          let runLines = e - al
+          let holeBytes = runLines * 256
+          if holeBytes >= need {
+            let startOff = ab * 32768 + al * 256
+            let endOff = ab * 32768 + e * 256
+            // Bulk-zero the hole before handing it to the carrier (150.4.5.1). A reclaimed block/line holds the
+            // previous occupant's bytes; the allocator reuses it,
+            // so an over-allocated array buffer's unwritten tail would otherwise carry stale words the tracer
+            // reads as pointers. Zeroing on acquire restores the zero-init contract, matching Immix/MMTk.
+            let heap: RawPtr = space.load(fromByteOffset: 0)
+            heap.advanced(by: startOff).zeroBytes(endOff - startOff)
+            let heapLo: Int = space.load(fromByteOffset: 40)
+            tlab.store(heapLo + startOff, toByteOffset: 0)   // cursor and limit are addresses
+            tlab.store(heapLo + endOff, toByteOffset: 8)
+            done = true
+            result = true
+          }
+        }
+      }
+    }
+  }
+  rtSchedMutexUnlockAt(space.advanced(by: 120))
+  return result
+}
+
+// Allocate `n` bytes for a carrier via its TLAB (150.3.10.1). Private bump within the TLAB's current hole (no
+// lock); on overflow refill from the shared pool under poolLock. Objects larger than a block route to the
+// shared large-object space, also under the lock. Returns a RawPtr into the heap (or a LOS chunk), or
+// RawPtr.null on heap exhaustion. This is the mutator alloc target the codegen self-hosted-alloc seam routes
+// to; the collector's own copy allocator keeps using rtImmixAlloc on the descriptor bump state (single-thread,
+// under STW).
+fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
+  let bumped = n + 7
+  let need = bumped / 8 * 8
+  // Under NOMU_GC_STRESS the hole end lives at stressLimit (@32) and the inline limit (@8) stays 0, so every
+  // allocation reaches here and counts toward the carrier's stress interval.
+  let stress = rtGcStress
+  if stress > 0 {
+    rtStressTick(space, tlab, need, stress, anchorSp, anchorPc)
+  }
+  if need > 32768 {
+    rtSchedMutexLockAt(space.advanced(by: 120))
+    let los = rtLosAlloc(space, need)          // larger than a block → shared large-object space (off-heap malloc)
+    rtSchedMutexUnlockAt(space.advanced(by: 120))
+    return los
+  }
+  var done = false
+  var result = RawPtr.null
+  var limOff = 8
+  if stress > 0 {
+    limOff = 32
+  }
+  while !done {
+    let cur: Int = tlab.load(fromByteOffset: 0)
+    let lim: Int = tlab.load(fromByteOffset: limOff)
+    if cur + need <= lim {
+      let heap: RawPtr = space.load(fromByteOffset: 0)
+      let heapLo: Int = space.load(fromByteOffset: 40)
+      result = heap.advanced(by: cur - heapLo)          // the cursor is an address; heap is the same address as heapLo
+      tlab.store(cur + need, toByteOffset: 0)
+      done = true
+    } else {
+      // On overflow refill from the pool; a true-OOM refill triggers a synchronous collection at the alloc-site
+      // anchor and retries (150.3.11), returning false only on genuine OOM.
+      let ok = rtImmixRefill(space, tlab, need, anchorSp, anchorPc)
+      if !ok {
+        result = RawPtr.null
+        done = true
+      } else if stress > 0 {
+        let holeEnd: Int = tlab.load(fromByteOffset: 8)
+        tlab.store(holeEnd, toByteOffset: 32)    // move the hole end out of the inline fast path's reach
+        tlab.store(0, toByteOffset: 8)
+      }
+    }
+  }
+  return result
+}
+
+// ---- Write barrier: log-bit table + per-carrier mod-buffers (task 150 · 150.4.2, §11.2/§11.3) ----
+// The object-remembering barrier reuses the inline fast path (`__nomu_write_barrier`, LLVMGenRuntime.swift):
+// it region-shifts the object address, tests its log bit, and on the first mutation of an *unlogged* (mature)
+// object calls the slow path here. These accessors index the log-bit side table (descriptor @144) with the
+// exact region math the fast path uses so the two agree on which bit: byte = objInt/64 − heapBaseInt/64
+// (relative to the table start; the fast path folds the heapBaseInt term into `rtLogbitBase`), bit =
+// (objInt/8) mod 8. Bit 1 = unlogged (mature, remember on mutation), 0 = logged. Nomu has no bitwise ops, so
+// powers of two are built by doubling and a single bit is read/set/cleared arithmetically.
+
+// 2^n for n in 0..7 (the bit position within a log-bit byte).
+fun rtPow2(n: Int) -> Int {
+  var v = 1
+  var i = 0
+  while i < n {
+    v = v * 2
+    i = i + 1
+  }
+  return v
+}
+
+// The log-bit byte index (into logbitTable) for `obj`.
+fun rtLogByteIndex(space: RawPtr, obj: RawPtr) -> Int {
+  let base: Int = space.load(fromByteOffset: 40)   // heapBaseInt
+  let a = obj.toInt()
+  return a / 64 - base / 64
+}
+
+// The bit position (0..7) of `obj`'s log bit within its byte.
+fun rtLogBitPos(obj: RawPtr) -> Int {
+  let r = obj.toInt() / 8
+  return r - r / 8 * 8
+}
+
+// Read `obj`'s log bit: 1 = unlogged (mature, needs remembering), 0 = logged.
+fun rtLogBit(space: RawPtr, obj: RawPtr) -> Int {
+  let tbl: RawPtr = space.load(fromByteOffset: 144)
+  let byte: UInt8 = tbl.load(fromByteOffset: rtLogByteIndex(space, obj))
+  let mask = rtPow2(rtLogBitPos(obj))
+  let v = byte.int / mask
+  return v - v / 2 * 2
+}
+
+// Set `obj`'s log bit to 1 (unlogged/mature). Idempotent. The 150.4.2 test hook simulates promotion; 150.4.3
+// calls the equivalent on every object it promotes so post-promotion cross-generation stores are remembered.
+fun rtSetUnlogged(space: RawPtr, obj: RawPtr) {
+  if rtLogBit(space, obj) == 1 {
+    return
+  }
+  let tbl: RawPtr = space.load(fromByteOffset: 144)
+  let bi = rtLogByteIndex(space, obj)
+  let byte: UInt8 = tbl.load(fromByteOffset: bi)
+  tbl.store((byte.int + rtPow2(rtLogBitPos(obj))).uint8, toByteOffset: bi)
+}
+
+// Clear `obj`'s log bit to 0 (logged). Idempotent.
+fun rtClearLogged(space: RawPtr, obj: RawPtr) {
+  if rtLogBit(space, obj) == 0 {
+    return
+  }
+  let tbl: RawPtr = space.load(fromByteOffset: 144)
+  let bi = rtLogByteIndex(space, obj)
+  let byte: UInt8 = tbl.load(fromByteOffset: bi)
+  tbl.store((byte.int - rtPow2(rtLogBitPos(obj))).uint8, toByteOffset: bi)
+}
+
+// Reset the whole log-bit table to logged (0) — every 8-byte region unmarked (150.4.4). Used post-major to
+// wipe stale unlogged bits before re-establishing them per surviving object: after a full collection every
+// live object is mature and the nursery is empty, so freed regions (future young objects) must read logged so
+// they never trip the barrier, and only the survivors are then set unlogged. The table is numBlocks*512 bytes
+// (one bit per 8-byte region); zero it a machine word at a time.
+fun rtClearLogTable(space: RawPtr) {
+  let nb: Int = space.load(fromByteOffset: 8)
+  let tbl: RawPtr = space.load(fromByteOffset: 144)
+  let words = nb * 64                        // numBlocks*512 bytes / 8
+  var i = 0
+  while i < words {
+    tbl.store(0, toByteOffset: i * 8)
+    i = i + 1
+  }
+}
+
+// The per-carrier mod-buffer (the remembered set, §11.3) is a growable append buffer { count: Int @0,
+// cap: Int @8, storage: RawPtr @16 } inside the carrier record (at record + 72); the collector empties every
+// carrier's buffer at the end of a collection. storage holds `cap` eight-byte object slots. Append is
+// lock-free — each carrier owns its buffer and only its own thread appends.
+
+fun rtModBufCount(mb: RawPtr) -> Int {
+  return mb.load(fromByteOffset: 0)
+}
+
+// Append `obj` to the mod-buffer, doubling storage on overflow.
+fun rtModBufAppend(mb: RawPtr, obj: RawPtr) {
+  var count: Int = mb.load(fromByteOffset: 0)
+  let cap: Int = mb.load(fromByteOffset: 8)
+  if count >= cap {
+    let newCap = cap * 2
+    let old: RawPtr = mb.load(fromByteOffset: 16)
+    let fresh = RawPtr.alloc(bytes: newCap * 8, align: 8)
+    var i = 0
+    while i < count {
+      let p: RawPtr = old.load(fromByteOffset: i * 8)
+      fresh.store(p, toByteOffset: i * 8)
+      i = i + 1
+    }
+    mb.store(fresh, toByteOffset: 16)
+    mb.store(newCap, toByteOffset: 8)
+    old.free()
+  }
+  let storage: RawPtr = mb.load(fromByteOffset: 16)
+  storage.store(obj, toByteOffset: count * 8)
+  mb.store(count + 1, toByteOffset: 0)
+}
+
+// The barrier slow path (§11.2), with the carrier's mod-buffer and the mutated object. The inline fast path
+// already tested the log bit, but the scheduler's mailbox stores reach this through rtRememberStore without
+// that test, so re-check here: a logged (young, bit 0) object contributes nothing to the remembered set. On an unlogged
+// (mature) object, mark it logged so subsequent stores elide the slow path, then remember it — the minor GC
+// (150.4.3) rescans each remembered object's managed slots, forwarding any nursery referent.
+fun rtGcRemember(mb: RawPtr, obj: RawPtr) {
+  let space = rtSpace
+  if space.isNull {
+    return          // no managed allocation yet → no space, nothing to remember
+  }
+  // Off-heap objects (LOS / immortal buffers) have no log bit in the table, which covers only the Immix heap.
+  // The inline fast path skips them via its heap-range guard, but the actor/mailbox path calls this directly,
+  // so guard here too — indexing the table with an off-heap address would read out of bounds.
+  let base: Int = space.load(fromByteOffset: 40)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let a = obj.toInt()
+  if a < base {
+    return
+  }
+  if a >= base + nb * 32768 {
+    return
+  }
+  if rtLogBit(space, obj) == 0 {
+    return          // young / already-remembered → nothing to do
+  }
+  rtClearLogged(space, obj)
+  rtModBufAppend(mb, obj)
+}
+
+// Remember `obj` after a runtime-internal store of a young managed pointer into it (task 150.4.5.1). Runtime
+// code that links managed objects — the scheduler's mailbox/message enqueue — stores through gc-leaf raw
+// stores (`__rawStore`), which do not emit the inline write barrier, so a mature object that gains a young
+// referent would be missed by the next minor GC (the minor never rescans mature objects reached through a
+// root; it finds mature→young pointers only via the remembered set). This is the barrier slow path for those
+// stores: it fetches this carrier's mod-buffer and routes to rtGcRemember, which re-tests the log bit and
+// remembers only a mature (unlogged) in-heap object. A cheap no-op off the self-hosted generational plan (the
+// log table is all-logged, so rtGcRemember returns early) and for young targets. Generated code
+// (`__nomu_remember`) calls it too, on the first mutation of an unlogged object; that call is gc-leaf, since
+// this never polls or parks and its only allocation is raw memory.
+fun rtRememberStore(obj: RawPtr) {
+  rtGcRemember(rtSelfModBuf(), obj)
+}
