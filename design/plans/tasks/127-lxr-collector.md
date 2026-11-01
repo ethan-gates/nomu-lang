@@ -26,6 +26,14 @@ comparison confirms it. An earlier plan targeted LXR after the debugger against 
 shipped collector — superseded: GenImmix is now a rung in the self-hosted ladder, and LXR follows it in
 Nomu.
 
+## After the comparison: the default collector
+
+The comparison picks Nomu's default collector. Then each other plan either leaves the normal build (its code
+may stay in the tree, with nothing depending on it), or stays selectable through `gc.plan` only if keeping it
+is zero-cost: no binary size, run time or maintenance cost to programs that do not select it. Today a plan
+not selected still costs binary size, because unused functions with safepoints survive dead stripping
+([158.7](158-gc-packaging.md), [229](229-dead-strip-safepoint-code.md)).
+
 ## Dependencies
 
 - **Follows:** [150 self-hosted GC ladder](150-selfhosted-gc-ladder.md) through its GenImmix rung.

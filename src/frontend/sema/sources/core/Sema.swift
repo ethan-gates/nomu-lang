@@ -22,6 +22,8 @@ public struct Sema {
     private let subsetFuncs: Set<String>   // task 149 — functions compiled under the runtime-subset rules
     // The `gc.record` setting as the level `Runtime.gcRecordLevel()` folds to: 0 off, 1 limited, 2 full.
     let gcRecordLevel: Int
+    // The `gc.plan` setting as the id `Runtime.gcPlan()` folds to: 0 genimmix, 1 immix.
+    let gcPlan: Int
     // Whether this module is in the runtime tier, the only place `Runtime` (the runtime intrinsics) may be
     // named: the `runtime` package, and suite fixtures built with `test.runtime_prelude` or
     // `test.runtime_tier` (`internals/runtime-subset.md` §5).
@@ -146,9 +148,10 @@ public struct Sema {
                 moduleFuncs: [String: Set<String>] = [:],
                 moduleTypes: [String: Set<String>] = [:],
                 externalMutatingMethods: Set<String> = [],
-                gcRecordLevel: Int = 0, runtimeTier: Bool = false) {
+                gcRecordLevel: Int = 0, gcPlan: Int = 0, runtimeTier: Bool = false) {
         self.program = program
         self.gcRecordLevel = gcRecordLevel
+        self.gcPlan = gcPlan
         self.runtimeTier = runtimeTier
         self.externalDecls = externalDecls
         self.subsetFuncs = subsetFuncs

@@ -1,7 +1,8 @@
 # Retire the C floor — the runtime in Nomu all the way down
 
 **Avenue:** Risk · **Type/Lifecycle:** `runtime · language · refactor` · **Size:** L · **Status:** in
-progress; 223.1–223.6 built, short of the coordinator threads (with 158) and blocker 6 (192) ·
+progress; 223.1–223.6 built, the coordinator threads with 158.4 and `runtime.c` deleted; blocker 6 (192)
+remains ·
 **Source:** [128](128-self-hosting-runtime.md), whose goal "remove Rust and C" this finishes; split out
 when 128's other parts were built.
 
@@ -452,6 +453,10 @@ Stages, each deleting the C it replaces:
     lowers to the `Runtime.monotonicNanos` call (the same `CLOCK_MONOTONIC`). `rt_free` has no callers and
     goes.
   - `core.c` leaves the archive; `runtime.c` stays, holding only the coordinator threads, until 158.
+  - **`runtime.c` leaves the archive (158.4).** The coordinator is `rtGcCoordinatorMain` in
+    `runtime/collect.nomu`, started and joined by `nomuSchedBoot`; `main` no longer calls
+    `rt_gc_threads_start`. `runtime.c` and `runtime.h` are deleted with their embedding; the archive holds
+    only `rtasm.o`. The mailbox/message ABI notes `runtime.h` carried are in `scheduler.nomu`'s layout table.
   - As built: `EgressBuiltins.printDoubleFn` emits `__nomu_print_double` (internal, no GC strategy, its
     calls gc-leaf). `rtBoundsTrap` is in `runtime.nomu`. `core.c` is deleted, with its embedding
     (`embed.sh`, the genrule, `EmbeddedSources.coreC`) and archive member. The archive is `runtime.o`
@@ -465,7 +470,7 @@ Stages, each deleting the C it replaces:
 
 ## Refs
 
-`src/runtime/embedded/runtime.c`, `core.c`, `runtime.h`; `runtimeArchiveRecipe`
+`src/runtime/embedded/rtasm_arm64.s` (`runtime.c`, `core.c` and `runtime.h` are deleted); `runtimeArchiveRecipe`
 (`src/driver/sources/RuntimeArchive.swift`); `nomuSelfhostAlloc`, `gcLeafRuntimeFns`
 (`src/llvmgen/LLVMGenRuntime.swift`); `PointerIntrinsics.swift` (sema), `SSAIRToLLVM.swift` (intrinsic
 lowering). `../../internals/runtime-subset.md` §5 (runtime intrinsics on `Runtime`),

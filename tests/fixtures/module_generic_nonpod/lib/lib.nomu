@@ -1,4 +1,4 @@
-// Holds an erased, non-POD `T` across a long busy loop. Under a forced stop-the-world evacuation the
+// Holds an erased, non-POD `T` across a long busy loop. Under a moving collection requested mid-spin the
 // value is reachable only through the caller's opaque `T` buffer — a typed GC root (task 100.4.3.6):
 // the collection must find the managed pointer inside the buffer via the VWT's descriptor and fix it
 // up, or `return x` yields a stale (moved-from) address. `T` is erased — compiled once here — so the
@@ -6,7 +6,13 @@
 fun spin(n: Int) -> Int {
     var i = 0
     var acc = 0
-    while i < n {
+    var asked = false
+    var ticket = 0
+    while i < n || (asked && !rtGcCollected(ticket)) {
+        if i == 1000 {
+            ticket = rtGcRequest(1)    // collect at a poll of this loop, with the caller held mid-spin
+            asked = true
+        }
         acc = acc + (i % 7)
         i = i + 1
     }
@@ -14,6 +20,6 @@ fun spin(n: Int) -> Int {
 }
 
 package fun hold<T>(x: T) -> T {
-    let j = spin(400000000)
+    let j = spin(2000000)
     return x
 }

@@ -11,7 +11,13 @@ package interface Valued {
 package fun spin(n: Int) -> Int {
     var i = 0
     var acc = 0
-    while i < n {
+    var asked = false
+    var ticket = 0
+    while i < n || (asked && !rtGcCollected(ticket)) {
+        if i == 1000 {
+            ticket = rtGcRequest(1)    // collect at a poll of this loop, with the caller held mid-spin
+            asked = true
+        }
         acc = acc + (i % 7)
         i = i + 1
     }
@@ -19,6 +25,6 @@ package fun spin(n: Int) -> Int {
 }
 
 package fun holdGet<T: Valued>(x: T) -> Int {
-    let j = spin(400000000)
+    let j = spin(2000000)
     return x.get()
 }

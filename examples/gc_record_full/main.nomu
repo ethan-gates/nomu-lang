@@ -1,0 +1,24 @@
+// Allocation counting at the `full` recording level (suite case `gc-record-full`): 200,000 two-word objects
+// (16 bytes: the header and one Int), a fresh one per iteration, with every 1000th kept alive in an array so
+// minor collections promote a known fraction. The report's allocation metrics count every object.
+class Node {
+  var v: Int
+}
+
+fun main() {
+  var keep: Array<Node> = []
+  var i = 0
+  var sum = 0
+  while i < 200000 {
+    let n = Node(v: i)
+    sum = sum + n.v % 3
+    if i % 1000 == 0 {
+      keep.append(n)
+    }
+    i = i + 1
+  }
+  print(sum)
+  print(" ")
+  print(keep.count)
+  print("\n")
+}

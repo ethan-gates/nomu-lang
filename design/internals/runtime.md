@@ -6,7 +6,7 @@
 
 **Runtime is mandatory.** Per `vision.md` → "Library tiers," there is no runtime-less configuration; the GC and this scheduler are the always-present floor.
 
-**One runtime: the Nomu scheduler and collector.** Both are Nomu code (`src/stdlib/runtime/`) over a thin C floor (`runtime.c`: the GC coordinator threads, until [158](../plans/tasks/158-gc-packaging.md) moves them). The C scheduler and MMTk were retired ([197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md)). §6's MMTk mechanics and §8's C implementation record are history; the mechanisms themselves live in `selfhosted-scheduler.md` and `selfhosted-gc.md`.
+**One runtime: the Nomu scheduler and collector.** Both are Nomu code (`src/stdlib/runtime/`), including the GC coordinator thread ([158](../plans/tasks/158-gc-packaging.md)); below them is only the asm floor (`rtasm_arm64.s`: context switch and fiber init). The C scheduler and MMTk were retired ([197](../plans/tasks/197-retire-mmtk-and-c-scheduler.md)). §6's MMTk mechanics and §8's C implementation record are history; the mechanisms themselves live in `selfhosted-scheduler.md` and `selfhosted-gc.md`.
 
 ---
 

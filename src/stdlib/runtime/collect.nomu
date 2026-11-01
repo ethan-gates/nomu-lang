@@ -304,55 +304,11 @@ fun rtImmixEvacCollect(space: RawPtr, root: RawPtr) -> RawPtr {
   return newRoot
 }
 
-// ---- Whole-heap collection over a multi-mutator root-slot set (driven at a scheduler STW) ----
-// The multi-root generalisation of rtImmixEvacCollect: the 128.3.2 STW walk hands a set of root SLOT
-// addresses (every stopped mutator's live stack roots), and this evacuates the whole live graph and rewrites
-// each slot in place with its survivor's forwarded address — the moving-collection fixup on the stopped
-// mutator stacks. Force-all (every used block a source), so it is a maximal-move stress of the fixup path;
-// the fragmentation-selective version rides the defrag trigger below. Correct across shared subgraphs and
-// duplicate slots via the forwarded-bit guard in rtEvacuate (a second slot reaching an already-moved object
-// gets its forwarding pointer). Runs with the world stopped, so the raw root pointers are stable.
-fun rtImmixCollectRoots(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
-  rtClearAllLines(space)
-  let fc: Int = space.load(fromByteOffset: 32)
-  var bi = 0
-  while bi < fc {
-    rtSetBlockState(space, bi, 3)             // every used block is an evacuation source (force-all)
-    bi = bi + 1
-  }
-  space.store(0, toByteOffset: 96)            // free list empty — to-space is fresh (never-used) blocks only
-  rtSetupCopyAllocator(space)
-  var i = 0
-  while i < nslots {
-    let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
-    let old: RawPtr = slot.load(fromByteOffset: 0)
-    let oldNull = old.eq(RawPtr.null)
-    if !oldNull {
-      let new = rtImmixEvacMark(space, old)   // evacuate this root's reachable graph (shared state across calls)
-      slot.store(new, toByteOffset: 0)        // fix up the root slot on the stopped mutator's stack
-    }
-    i = i + 1
-  }
-  rtImmixSweepBlocks(space)
-  rtImmixSweepLos(space)
-  var j = 0
-  while j < nslots {
-    let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
-    let r: RawPtr = slot.load(fromByteOffset: 0)
-    let rNull = r.eq(RawPtr.null)
-    if !rNull {
-      rtImmixUnmark(r)                        // clear object mark bits for the next collection
-    }
-    j = j + 1
-  }
-  rtResetAllocator(space)
-  return nslots
-}
-
+// ---- Collection over a multi-mutator root-slot set (driven at a scheduler STW) ----
 // The defrag variant over a root-slot set — the general collector generalised to many mutators. Sources
 // are chosen by fragmentation within the copy reserve (rtSelectDefragSources), so it never runs out of
-// to-space and is non-moving when the heap is near-full — the collection to run under heap pressure, where
-// force-all cannot (no free blocks for to-space). Only source-block roots move; their slots are fixed up.
+// to-space and is non-moving when the heap is near-full, so it runs under heap pressure. Only source-block
+// roots move; their slots are fixed up.
 fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> Int {
   var tp = rtGcPhaseOpen(10)
   let nSources = rtSelectDefragSources(space)
@@ -646,14 +602,20 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
   // store of a young object into it must be remembered.
   tp = rtGcPhaseOpen(8)
   var p = 0
+  var promotedBytes = 0
+  let recording = Runtime.gcRecordLevel() > 0
   let qbaseFix: RawPtr = q.load(fromByteOffset: 0)   // growth is done; the buffer no longer moves
   while p < count {
     let obj: RawPtr = qbaseFix.load(fromByteOffset: p * 8)
+    if recording {
+      promotedBytes = promotedBytes + rtObjSize(obj)
+    }
     let un = rtUnmarkIfMarked(obj)
     rtSetUnlogged(space, obj)
     p = p + 1
   }
   rtGcPhaseClose(8, tp)
+  rtGcCounter(5, promotedBytes)
   // Reclaim the emptied nursery blocks (every live object promoted out) onto the free list; mature blocks are
   // left untouched (not swept).
   tp = rtGcPhaseOpen(9)
@@ -677,55 +639,36 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
   return count
 }
 
-// Drive a self-hosted collection at an STW: walk every stopped mutator's root SLOTS and run the evacuating
-// collection over the self-hosted Immix space. `forceAll != 0` moves every live object
-// (a maximal-move fixup stress, needs free to-space); else the defrag collector (heap-pressure-safe). Called
-// by the STW coordinator with the world stopped. Returns the number of roots processed (0 before the first
-// managed allocation, while the space is null).
-fun nomuSchedStwCollectPlan(sched: RawPtr, forceAll: Int) -> Int {
+// Drive a major (defrag) collection at an STW: walk every stopped mutator's root SLOTS and run the defrag
+// collector over the self-hosted Immix space (heap-pressure-safe). Called by the STW coordinator with the
+// world stopped. Returns the number of roots processed (0 before the first managed allocation, while the
+// space is null).
+fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
   let space = rtSpace
   let spaceNull = space.eq(RawPtr.null)
   if spaceNull {
     return 0
   }
-  var kind = 2
-  if forceAll != 0 {
-    kind = 3
-  }
-  let collectStart = rtGcRecordEntry(kind)
+  let collectStart = rtGcRecordEntry(2)
   let roots = rtRootsNew()
   let tw = rtGcPhaseOpen(2)
   let ns = nomuSchedWalkSlots(sched, roots)
   rtGcPhaseClose(2, tw)
   let slots: RawPtr = roots.load(fromByteOffset: 0)
   rtGcCounter(1, ns)
-  if forceAll != 0 {
-    rtImmixCollectRoots(space, slots, ns)
+  // When generational is active (rtGenReserve > 0 — the default) a defrag major is also the minor/major
+  // escalation target (150.4.4), so re-establish the log-bit invariant post-collection; when disabled
+  // (NOMU_NURSERY_RESERVE negative) the plain defrag runs unchanged (the pre-generational path).
+  if rtGenReserve(space) > 0 {
+    rtImmixCollectRootsDefragGen(space, slots, ns)
   } else {
-    // When generational is active (rtGenReserve > 0 — the default) a defrag major is also the minor/major
-    // escalation target (150.4.4), so re-establish the log-bit invariant post-collection; when disabled
-    // (NOMU_NURSERY_RESERVE negative) the plain defrag runs unchanged (the pre-generational path).
-    if rtGenReserve(space) > 0 {
-      rtImmixCollectRootsDefragGen(space, slots, ns)
-    } else {
-      rtImmixCollectRootsDefrag(space, slots, ns)
-    }
+    rtImmixCollectRootsDefrag(space, slots, ns)
   }
   rtRootsFree(roots)
   rtGcRecordExit(collectStart)
   rtCarriersResetTlabs()        // evacuation may have moved a carrier's block; refill on resume
   rtCarriersResetModBufs()      // the collection consumed the remembered set; start empty next cycle
   return ns
-}
-
-// Force-all collection (the maximal-move fixup smoke).
-fun nomuSchedStwCollect(sched: RawPtr) -> Int {
-  return nomuSchedStwCollectPlan(sched, 1)
-}
-
-// Defrag collection (the heap-pressure path).
-fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
-  return nomuSchedStwCollectPlan(sched, 0)
 }
 
 // Drive a minor (generational) collection at an STW (task 150.4.3): the stopped mutators' stack root slots
@@ -759,6 +702,60 @@ fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
   rtGcRecordExit(collectStart)
   rtCarriersResetTlabs()        // the reclaimed nursery blocks moved out from under the carriers' TLABs
   return n
+}
+
+// ---- The GC coordinator ----
+// A plain OS thread (never a fiber, so it never stops at a safepoint itself) that runs every collection. It
+// sleeps on gc-request (sched+168) until a mutator raises a request (rtGcRaise): a minor when the nursery
+// reserve fills, a major at true OOM, a stress collection, or a white-box test's rtGcRequest. The requester
+// has already set stw-request (+136) and the kind (+176) under the scheduler lock. The coordinator then stops the world: it
+// raises `rtStopWorld`, wakes idle carriers so they ack, and sleeps on the ack count (+144), which each
+// carrier's ack bumps and wakes (rtSchedStwParkCarrier), until every carrier has acked. With the world
+// stopped it reads the kind and runs that collection, then resumes the world: it resets the kind, the ack count and
+// the request, clears `rtStopWorld`, and bumps stw-gen (+152), which the parked carriers wait on. It exits
+// on the scheduler's stop flag (+40). nomuSchedBoot starts and joins it.
+fun rtGcCoordinatorMain(sched: RawPtr) -> RawPtr {
+  let req = sched.advanced(by: 168)
+  let ack = sched.advanced(by: 144)
+  var go = true
+  while go {
+    let stp: Int = sched.atomicLoad(fromByteOffset: 40)
+    let pending: Int = req.atomicLoad(fromByteOffset: 0)
+    if stp != 0 {
+      go = false
+    } else if pending == 0 {
+      Runtime.futexWait(at: req, expected: 0, timeoutMicros: 1000000)
+    } else {
+      req.atomicStore(0, toByteOffset: 0)                 // consume the request (stw-request is already set)
+      let ncarriers: Int = sched.atomicLoad(fromByteOffset: 160)
+      rtStopWorld.atomicStore(1, toByteOffset: 0)
+      rtSchedWake(sched, true)                            // idle carriers wake, see the request, and ack
+      var acked: Int = ack.atomicLoad(fromByteOffset: 0)
+      var waiting = acked < ncarriers
+      while waiting {
+        Runtime.futexWait(at: ack, expected: acked, timeoutMicros: 1000)
+        acked = ack.atomicLoad(fromByteOffset: 0)
+        let done: Int = sched.atomicLoad(fromByteOffset: 40)
+        waiting = acked < ncarriers && done == 0
+      }
+      // Read once every carrier has acked: a request that joins this one may still raise the kind to a major
+      // until then (rtGcRaise).
+      let kind: Int = sched.atomicLoad(fromByteOffset: 176)
+      if kind == 1 && Runtime.gcPlan() == 0 {     // a plan without a nursery compiles the minor out
+        nomuSchedStwCollectMinor(sched)
+      } else {
+        nomuSchedStwCollectDefrag(sched)
+      }
+      sched.atomicStore(0, toByteOffset: 176)             // the kind, for the next request
+      ack.atomicStore(0, toByteOffset: 0)
+      sched.atomicStore(0, toByteOffset: 136)
+      rtStopWorld.atomicStore(0, toByteOffset: 0)
+      let gw = sched.advanced(by: 152)
+      gw.atomicFetchAdd(1, atByteOffset: 0)
+      Runtime.futexWake(at: gw, all: true)                // resume the parked carriers
+    }
+  }
+  return sched
 }
 
 // Available empty blocks in the self-hosted Immix space (never-used + reclaimed-free) — the heap-pressure

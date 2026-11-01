@@ -26,8 +26,9 @@ private final class Box<T> {
     init(_ v: T) { value = v }
 }
 
-// Drain a pipe fd to EOF. Blocking; run on a background queue.
-private func drain(_ fd: Int32) -> Data {
+// Drain a pipe fd to EOF, calling `watch` with everything read so far after each read. Blocking; run on a
+// background queue.
+private func drain(_ fd: Int32, watch: ((Data) -> Void)? = nil) -> Data {
     var data = Data()
     let cap = 1 << 16
     let buf = UnsafeMutableRawPointer.allocate(byteCount: cap, alignment: 1)
@@ -36,6 +37,7 @@ private func drain(_ fd: Int32) -> Data {
         let n = read(fd, buf, cap)
         if n > 0 {
             data.append(buf.assumingMemoryBound(to: UInt8.self), count: n)
+            watch?(data)
         } else if n == 0 {
             break
         } else if errno == EINTR {
@@ -47,11 +49,13 @@ private func drain(_ fd: Int32) -> Data {
     return data
 }
 
-// Bytes fed to a child's stdin through a pipe, written `delayMs` after the launch and then closed (so the
-// child sees end of input). A delay lets a case observe a program waiting on input that has not arrived.
+// Bytes fed to a child's stdin through a pipe and then closed (so the child sees end of input). With `after`,
+// they are written once the child's stderr shows that text, which the program writes when it is waiting on
+// input that has not arrived; stderr is unbuffered, so the text arrives when written. A child that exits
+// without writing it gets the bytes then, into a closed pipe.
 struct StdinFeed {
     var data: Data
-    var delayMs: Int
+    var after: String?
 }
 
 // The host variables every child gets: the tool search path (`cc`, `nm`), the home directory (the host
@@ -149,11 +153,13 @@ func runProcess(path: String, args: [String], env: [String: String], timeout: Do
                           duration: Date().timeIntervalSince(start))
     }
 
-    // Feed stdin on a background queue: wait the delay, write everything, close (end of input).
+    // Feed stdin on a background queue: wait for the stderr text, write everything, close (end of input).
+    let marker = stdin?.after.map { Data($0.utf8) }
+    let markerSeen = DispatchSemaphore(value: 0)
     if let feed = stdin {
         let fd = inPipe[1]
         DispatchQueue.global().async {
-            if feed.delayMs > 0 { usleep(useconds_t(feed.delayMs) * 1000) }
+            if marker != nil { markerSeen.wait() }
             feed.data.withUnsafeBytes { raw in
                 var off = 0
                 while off < raw.count {
@@ -169,7 +175,13 @@ func runProcess(path: String, args: [String], env: [String: String], timeout: Do
     let errBox = Box(Data())
     let readers = DispatchGroup()
     DispatchQueue.global().async(group: readers) { outBox.value = drain(outPipe[0]) }
-    DispatchQueue.global().async(group: readers) { errBox.value = drain(errPipe[0]) }
+    DispatchQueue.global().async(group: readers) {
+        var signalled = marker == nil
+        errBox.value = drain(errPipe[0]) { soFar in
+            if !signalled, soFar.range(of: marker!) != nil { signalled = true; markerSeen.signal() }
+        }
+        if !signalled { markerSeen.signal() }   // end of stderr without the text: the child has exited
+    }
 
     let statusBox = Box<Int32>(0)
     let done = DispatchSemaphore(value: 0)

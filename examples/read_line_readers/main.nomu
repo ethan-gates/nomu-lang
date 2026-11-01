@@ -1,14 +1,35 @@
-// Three fibers wait in `readLine` at once (suite case `read-line-readers`, stdin fed late). They share one
-// poller registration for stdin, and each receives one whole line: 1 + 2 + 4 bytes = 7 in any order.
+// Three fibers wait in `readLine` at once (suite case `read-line-readers`, built with
+// `test.runtime_prelude`). A fourth fiber waits until all three are on the stdin waiter list, then tells the
+// harness to write stdin. They share one poller registration for stdin, and each receives one whole line:
+// 1 + 2 + 4 bytes = 7 in any order.
+
+// Tell the harness to write stdin (the suite case's `stdin_after`): stderr is unbuffered, so the line
+// arrives as it is written.
+fun signalReady() {
+  let buf = RawPtr.alloc(bytes: 16, align: 8)
+  let n = Runtime.copyLiteral(to: buf, "ready\n")
+  let w = Runtime.writeFd(fd: 2, buf: buf, count: n)
+  buf.free()
+}
+
 fun reader() -> Int {
   let s = readLine()
   return s.count
+}
+
+fun watcher() -> Int {
+  while rtStdinWaiters() < 3 {
+    sleep(1)                        // park, so the readers run even on one carrier
+  }
+  signalReady()
+  return 0
 }
 
 fun main() {
   spawn let a = reader()
   spawn let b = reader()
   spawn let c = reader()
-  print(a + b + c)
+  spawn let w = watcher()
+  print(a + b + c + w)
   print("\n")
 }

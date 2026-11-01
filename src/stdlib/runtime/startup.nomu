@@ -4,12 +4,12 @@
 // ---- Process-wide runtime state, set once at startup ----
 // Startup globals (`tasks/224-globals.md`): `nomu_runtime_init` computes them on the main thread before the
 // scheduler boots, in the order their reads require, and they never change after. Generated code reads the
-// heap and barrier values by symbol (`nomu_g_<name>`) with invariant loads; C reads `rtSched` and
-// `rtGcExternalDriver` as externs until its users move into Nomu.
+// heap and barrier values by symbol (`nomu_g_<name>`) with invariant loads; C reads `rtSched` as an extern
+// until its users move into Nomu.
 
 // Dev/test overrides from the environment; 0 means unset.
-// NOMU_NURSERY_RESERVE, in blocks: positive overrides the generational reserve, negative disables
-// generational collection (major-only); rtGenReserve resolves it against the descriptor's default.
+// NOMU_NURSERY_RESERVE, in blocks: positive overrides the generational reserve; rtGenReserve resolves it
+// against the descriptor's default. (Major-only collection is the `immix` plan, `gc.plan`.)
 let rtNurseryReserveOverride = rtEnvNurseryReserve()
 // NOMU_MATURE_FLOOR, in blocks: below this many free mature blocks a nursery-full trigger escalates to a
 // full defrag major (rtImmixRefill).
@@ -17,9 +17,6 @@ let rtMatureFloor = rtPositive(rtEnvMatureFloor())
 // NOMU_GC_STRESS, in bytes: every allocation takes the slow path and each carrier requests a collection
 // after this many allocated bytes.
 let rtGcStress = rtPositive(rtEnvGcStress())
-// 1 when an external stop-the-world driver (NOMU_STW_SELFHOST / NOMU_STW_COLLECT / NOMU_GC_PRESSURE) owns
-// collection, so the default coordinator is not started and rtGenReserve keeps generational collection off.
-let rtGcExternalDriver = rtEnvExternalDriver()
 // NOMU_CARRIERS: the number of carrier threads the scheduler boots with; 4 unless set to 1 or more.
 let rtCarrierCount = rtEnvCarrierCount()
 
@@ -110,17 +107,4 @@ fun rtEnvCarrierCount() -> Int {
     return n
   }
   return 4
-}
-
-fun rtEnvExternalDriver() -> Int {
-  let a = RawPtr.alloc(bytes: 32, align: 8)
-  let selfhost = rtEnvValue(a, Runtime.copyLiteral(to: a, "NOMU_STW_SELFHOST"))
-  let b = RawPtr.alloc(bytes: 32, align: 8)
-  let collect = rtEnvValue(b, Runtime.copyLiteral(to: b, "NOMU_STW_COLLECT"))
-  let c = RawPtr.alloc(bytes: 32, align: 8)
-  let pressure = rtEnvValue(c, Runtime.copyLiteral(to: c, "NOMU_GC_PRESSURE"))
-  if !selfhost.isNull || !collect.isNull || !pressure.isNull {
-    return 1
-  }
-  return 0
 }

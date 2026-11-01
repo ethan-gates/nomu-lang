@@ -95,25 +95,18 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
 }
 
 // The active nursery reserve (150.4.5.3): the generational minor trigger in blocks, and the predicate for
-// "generational active" (> 0). Generational is on by default — the reserve is the descriptor's default
-// (numBlocks/4, stored at ctl+128 by rtImmixNew) unless the NOMU_NURSERY_RESERVE dev/test override is set: a
-// positive value overrides the reserve; a negative value disables generational (returns 0 → major-only, the
-// pre-generational path). Both the nursery-full trigger in rtImmixRefill and the gen-defrag gate in
-// nomuSchedStwCollectPlan resolve through here so they share one predicate.
+// "generational active" (> 0). Under the `genimmix` plan the reserve is the descriptor's default
+// (numBlocks/4, stored at ctl+128 by rtImmixNew) unless the NOMU_NURSERY_RESERVE dev/test override sets a
+// positive value. Under the `immix` plan (`gc.plan`) it is 0, a constant, so the generational paths fold
+// away. Both the nursery-full trigger in rtImmixRefill and the gen-defrag gate in nomuSchedStwCollectDefrag
+// resolve through here so they share one predicate.
 fun rtGenReserve(space: RawPtr) -> Int {
-  // An external STW driver (NOMU_STW_SELFHOST / NOMU_STW_COLLECT / NOMU_GC_PRESSURE) replaces the default
-  // minor/OOM coordinator with its own collection thread, so the generational minor trigger has no coordinator
-  // to service its request — firing it would park a carrier forever. Defer: generational off under any external
-  // driver (that driver is the whole collection mechanism).
-  if rtGcExternalDriver != 0 {
+  if Runtime.gcPlan() != 0 {
     return 0
   }
   let env: Int = rtNurseryReserveOverride
   if env > 0 {
     return env
-  }
-  if env < 0 {
-    return 0
   }
   return space.load(fromByteOffset: 128)
 }

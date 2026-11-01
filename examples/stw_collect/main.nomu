@@ -1,10 +1,9 @@
-// Task 150.3.9 — a real evacuating Immix collection driven at a stop-the-world over the self-hosted
-// scheduler. `worker` allocates 500 dead Boxes (garbage) then holds one live Box (111) across a long busy
-// loop. While it runs, the forced-collect coordinator (NOMU_STW_COLLECT) stops the world and runs a
-// force-all evacuating collection over the self-hosted Immix space: the live Box moves to fresh to-space,
-// the worker's stack slot is fixed up in place, and the garbage blocks are reclaimed. The worker resumes
-// and reads the (moved) Box → 111. Output is unchanged by the collection (moving is transparent) — the
-// fixup-correctness proof. Run with NOMU_STW_COLLECT=1, compiled with NOMU_NO_ESCAPE=1.
+// A moving collection while a fiber spins in a loop holding a live object. `worker` allocates 500 dead Boxes
+// (garbage), then holds one live Box (111) across a busy loop. Partway through the loop it requests a minor
+// collection (`rtGcRequest`) and keeps spinning until it has run, so it stops at a poll of this loop: the minor moves the live Box out of
+// the nursery, fixes up the worker's stack slot in place, and reclaims the garbage. The worker resumes and
+// reads the moved Box → 111. Output is unchanged by the collection (moving is transparent), which is the
+// fixup-correctness proof. Built with `test.runtime_prelude` (for `rtGcRequest`) and escape analysis off.
 class Box {
   var v: Int
 }
@@ -12,7 +11,13 @@ class Box {
 fun spin(n: Int) -> Int {
   var i = 0
   var acc = 0
-  while i < n {
+  var asked = false
+  var ticket = 0
+  while i < n || (asked && !rtGcCollected(ticket)) {
+    if i == 1000 {
+      ticket = rtGcRequest(1)  // collect at a poll of this loop, with the worker mid-loop
+      asked = true
+    }
     acc = acc + (i % 7)
     i = i + 1
   }
@@ -33,7 +38,7 @@ fun makeGarbage(n: Int) -> Int {
 fun worker() -> Int {
   let keep = Box(v: 111)       // live across the collection — force-all moves it; its stack slot is fixed up
   let g = makeGarbage(500)
-  let j = spin(400000000)      // stay running so a collection fires mid-worker
+  let j = spin(2000000)        // the collection runs inside this loop
   return keep.v + (g % 1) + (j % 1)
 }
 

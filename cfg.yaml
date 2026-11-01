@@ -10,6 +10,8 @@ configs:
   rt_prelude: null
   runtime_tier: null
   gc_record: null
+  gc_record_full: null
+  gc_immix: null
 opt:
   mono mono_all: all
   mono mono_edge: edge
@@ -23,3 +25,7 @@ test runtime_tier:
   runtime_tier: true
 gc gc_record:
   record: limited
+gc gc_record_full:
+  record: full
+gc gc_immix:
+  plan: immix

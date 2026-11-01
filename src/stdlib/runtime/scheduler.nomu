@@ -4,8 +4,8 @@
 
 // ---- The M:N scheduler (task 128.1.9) ----
 // The machinery proved rung-by-rung in the examples/scheduler_*.nomu fixtures, consolidated here into one
-// canonical scheduler that runs real GC-registered user programs. The C entry points fiber_spawn /
-// spawn_join / rt_sleep_ms / main (runtime.c) forward to the `nomuSched*` functions below. A stop-the-world
+// canonical scheduler that runs real GC-registered user programs. Generated code and the codegen-emitted
+// process entry `main` call the `nomuSched*` functions below. A stop-the-world
 // over the carriers (128.3.2) parks each fiber at a recorded user-frame anchor, and the collector runs
 // rtWalkFrom over the live-fiber registry.
 //
@@ -21,10 +21,15 @@
 //                 · 112 mbfiber-count · 120 drain-fn-ptr (nomu_actor_drain) · 128 registry-head
 //                 · 136 stw-request · 144 stw-ack · 152 stw-gen · 160 ncarriers   (STW handshake, 128.3.2)
 //                 · 168 gc-request   (OOM initiator → GC coordinator signal, 150.3.11)
-//                 · 176 gc-kind      (collection kind for the coordinator: 1 minor, 0 major/defrag, 150.4.3)
+//                 · 176 gc-kind      (collection kind for the coordinator: 1 minor, 0 major/defrag, 150.4.3;
+//                                     bit 8 reserved for a concurrent request — rtGcRaise)
 //   Timer entry (16B): 0 expiry-ns · 8 fiber
-//   Mailbox (ABI, runtime.h): 0 header · 8 mb_head · 16 mb_tail · 24 scheduled · 32 sched_next
-//   Message (ABI, runtime.h): 0 header · 8 next · 16 thunk · 24 self · args…
+//   Mailbox (ABI with codegen): 0 header · 8 mb_head · 16 mb_tail · 24 scheduled · 32 sched_next
+//   Message (ABI with codegen): 0 header · 8 next · 16 thunk · 24 self · args…
+//     Both are GC objects codegen allocates (it supplies their pointer maps). An actor object is class-shaped
+//     with its mailbox in its last slot, which codegen loads at the send, so the runtime never parses an
+//     actor. mb_head, mb_tail, next, self and sched_next are GC-scanned (they chain live queued messages and
+//     the scheduled-mailbox queue, kept live with the receiver); thunk, a code pointer, is not.
 //   Fiber (296B): 0..167 ctx buffer · 168 state · 176 next-link · 184 entry · 192 arg · 200 sched
 //                 · 208 stackBase · 216 result · 224 joiner · 232 carrierCtx · 240 reg-next · 248 reg-prev
 //                 · 256 pool-next · 264 anchor-sp · 272 anchor-pc · 288 shadow-top (typed roots, 100.4.3.6)
@@ -115,11 +120,13 @@ fun rtSchedWakeTimer(sched: RawPtr) {
   Runtime.futexWake(at: tg, all: false)
 }
 
-// Raise the stop flag and wake everyone (idle carriers + the timer thread) so they exit for the join.
+// Raise the stop flag and wake everyone (idle carriers, the timer thread and the GC coordinator) so they
+// exit for the join.
 fun rtSchedSignalStop(sched: RawPtr) {
   sched.atomicStore(1, toByteOffset: 40)
   rtSchedWake(sched, true)
   rtSchedWakeTimer(sched)
+  Runtime.futexWake(at: sched.advanced(by: 168), all: false)
 }
 
 // ---- Timer heap (min-heap on the timer-entries buffer; entry i at i*16: expiry +0, fiber +8). Touched
@@ -369,8 +376,8 @@ fun rtSchedCarrierMain(carg: RawPtr) -> RawPtr {
 // message send: nomuSchedActorSend enqueues a message and returns; a pool of ≤64 reusable mailbox fibers
 // drains scheduled mailboxes by running the codegen-emitted nomu_actor_drain (which pops via the C
 // rt_mailbox_pop → nomuSchedMailboxPop and runs each message's thunk). The mailbox/message byte offsets are
-// the runtime.h ABI (codegen allocates them). The global scheduled-mailbox queue lives in the Sched; the STW
-// walk roots its head and tail (nomuSchedStwCollectPlan). ----
+// the ABI with codegen (the layout table above). The global scheduled-mailbox queue lives in the Sched; the STW
+// walk roots its head and tail (nomuSchedStwCollectDefrag). ----
 
 // Pop the head of the global scheduled-mailbox queue (mailbox sched_next at +32), or null. Caller holds
 // the scheduler lock; the returned mailbox stays scheduled — the caller is now its drainer.
@@ -524,10 +531,10 @@ fun rtSchedStwParkCarrier(sched: RawPtr) {
   }
 }
 
-// The stop-the-world flag: an `Int32`, nonzero while a collection asks running fibers to stop. Codegen's
-// inline poll reads it by symbol (`nomu_static_rtStopWorld`) at every loop back-edge; the C coordinator
-// threads write it until they move into the runtime.
-let rtStopWorld = Runtime.staticStorage(bytes: 4, align: 4)
+// The stop-the-world flag: an `Int`, nonzero while a collection asks running fibers to stop. Codegen's
+// inline poll reads it by symbol (`nomu_static_rtStopWorld`) at every loop back-edge; the GC coordinator
+// (rtGcCoordinatorMain) writes it.
+let rtStopWorld = Runtime.staticStorage(bytes: 8, align: 8)
 
 // The safepoint slow path under the Nomu plan (called from __nomu_gc_poll_slow when `rtStopWorld` is
 // set). The running fiber records the user-frame anchor its C poll shim captured, marks itself
@@ -544,7 +551,7 @@ fun nomuSchedSafepoint(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
   rtSchedUnlock(sched)
 }
 
-// ---- C-callable entry points (symbols nomu_fn_nomuSched*; runtime.c dispatches to these) ----
+// ---- Entry points generated code calls (symbols nomu_fn_nomuSched*) ----
 
 // Allocate + init a scheduler. Returns the opaque Sched handle; the runtime's is the startup global `rtSched`.
 fun nomuSchedNew() -> RawPtr {
@@ -648,7 +655,7 @@ fun nomuSchedJoin(sched: RawPtr, target: RawPtr, anchorSp: RawPtr, anchorPc: Int
   return res
 }
 
-// Fire-and-forget send: enqueue `msg` on `mailbox` (runtime.h ABI offsets) and return. On the 0→1
+// Fire-and-forget send: enqueue `msg` on `mailbox` (the ABI offsets above) and return. On the 0→1
 // schedule edge, append the mailbox to the global scheduled queue, bump active-drains, and dispatch a
 // mailbox fiber. The C rt_actor_send shim dispatches here.
 fun nomuSchedActorSend(sched: RawPtr, mailbox: RawPtr, msg: RawPtr) {
@@ -711,9 +718,9 @@ fun nomuSchedMailboxPop(sched: RawPtr, mailbox: RawPtr) -> RawPtr {
   return msg
 }
 
-// Boot the scheduler: spawn the main fiber over the user entry, start ncarriers-1 carrier threads + the
-// timer thread, run the scheduler loop on the calling thread too, and return once quiescent (all carriers
-// exited). Called from the process entry `main`, which codegen emits.
+// Boot the scheduler: spawn the main fiber over the user entry, start ncarriers-1 carrier threads, the timer
+// thread and the GC coordinator, run the scheduler loop on the calling thread too, and return once quiescent
+// (all carriers exited). Called from the process entry `main`, which codegen emits.
 fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int) {
   sched.store(ncarriers, toByteOffset: 160)           // total carriers, for the STW ack count (128.3.2)
   nomuSchedSpawn(sched, entryFn, RawPtr.null)
@@ -731,6 +738,9 @@ fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int) {
   // The timer thread (wakeup feeder): one raw thread draining the deadline heap.
   let th = RawPtr.alloc(bytes: 8, align: 8)
   Runtime.threadCreate(handle: th, entry: Runtime.ofFunc(rtSchedTimerMain), arg: sched)
+  // The GC coordinator: one raw thread that runs every collection (rtGcCoordinatorMain).
+  let gc = RawPtr.alloc(bytes: 8, align: 8)
+  Runtime.threadCreate(handle: gc, entry: Runtime.ofFunc(rtGcCoordinatorMain), arg: sched)
   let mainCtx = RawPtr.alloc(bytes: 168, align: 16)
   rtSchedLoop(sched, mainCtx)
   var k = 1
@@ -740,5 +750,6 @@ fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int) {
     k = k + 1
   }
   Runtime.threadJoin(handle: th)
+  Runtime.threadJoin(handle: gc)
   rtGcRecordFinish()
 }

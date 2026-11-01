@@ -605,8 +605,8 @@ fun rtRootsFree(roots: RawPtr) {
   roots.free()
 }
 
-// Value mode (root object addresses) — for the C stop-the-world smoke driver (NOMU_STW_SELFHOST), which
-// passes a fixed buffer: copies up to `cap` roots into it and returns the total, which may exceed `cap`.
+// Value mode (root object addresses) — for white-box tests (the `stw-selfhost` case), which pass a fixed
+// buffer: copies up to `cap` roots into it and returns the total, which may exceed `cap`.
 fun nomuSchedWalkParked(sched: RawPtr, outBuf: RawPtr, cap: Int) -> Int {
   let roots = rtRootsNew()
   let n = nomuSchedWalkRoots(sched, roots, 0)

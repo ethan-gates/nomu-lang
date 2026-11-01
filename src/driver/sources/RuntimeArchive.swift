@@ -3,10 +3,10 @@ import store
 import planner
 import embedded
 
-// Compile the runtime C sources to objects and archive them into `libnomuruntime.a` (the
-// `backend.md` "runtime library" item, real for the LLVM path). Replaces the C backend's
-// per-file `cc` co-compile. Returns the archive path, or nil on failure (message on stderr).
-// The runtime `.a` is identical across programs (the C floor is embedded in nomuc), so it lives in the
+// Assemble the runtime's asm floor and archive it into `libnomuruntime.a` (the `backend.md` "runtime
+// library" item). The rest of the runtime is the Nomu `runtime` package, compiled as a module. Returns the
+// archive path, or nil on failure (message on stderr).
+// The runtime `.a` is identical across programs (the asm floor is embedded in nomuc), so it lives in the
 // per-host cache (D4), under a key over the embedded runtime sources, the host architecture and
 // `runtimeArchiveRecipe` and the identities of the tools and SDK it runs (`HostCache.runtimeArchiveKey`): editing
 // the runtime rebuilds the compiler, which changes the key, and so do editing a command and a toolchain update. A cached archive is materialized into the build's `_runtime/`.
@@ -53,10 +53,10 @@ func cachedRuntimeArchive(_ job: RuntimeArchiveJob, store: ArtifactStore, track:
 // The commands that build the runtime archive, run in order in a directory holding the runtime sources
 // (`writeRuntimeSources`). The plan hashes them into the archive's key, so changing one rebuilds the archive.
 let runtimeArchiveRecipe: [[String]] = {
-    var commands = [["/usr/bin/cc", "-w", "-I", ".", "-c", "runtime.c", "-o", "runtime.o"]]
-    var members = ["runtime.o"]
+    var commands: [[String]] = []
+    var members: [String] = []
     // The asm floor (task 128.2): assemble the per-arch `.s` (clang assembles `.s` directly) and archive
-    // it beside the C objects, so its symbols (rtSwitch, rtFiberInit) resolve in every emitted binary.
+    // it, so its symbols (rtSwitch, rtFiberInit) resolve in every emitted binary.
     if HostCache.hostArch == "arm64" {
         commands.append(["/usr/bin/cc", "-c", "rtasm.s", "-o", "rtasm.o"])
         members.append("rtasm.o")
@@ -77,12 +77,9 @@ func buildRuntimeArchive(inDir dir: String) -> String? {
     return dir + "/libnomuruntime.a"
 }
 
-// Write the embedded runtime C source + ABI header into `dir` (M4.13).
+// Write the embedded runtime archive sources into `dir`.
 func writeRuntimeSources(toDir dir: String) {
-    var files = [
-        ("runtime.h", EmbeddedSources.runtimeHeader),
-        ("runtime.c", EmbeddedSources.runtimeC),
-    ]
+    var files: [(String, String)] = []
     // The asm floor (task 128.2), per-arch. arm64 only for now; x86-64 is deferred.
     if HostCache.hostArch == "arm64" { files.append(("rtasm.s", EmbeddedSources.rtAsmArm64)) }
     for (name, contents) in files {

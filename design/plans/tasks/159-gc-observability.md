@@ -1,7 +1,7 @@
 # GC observability — one model for every collector: intervals, cycles, counters, heap snapshots
 
 **Avenue:** Risk · **Type/Lifecycle:** `runtime · observability · needs-design` · **Size:** M ·
-**Status:** in progress (159.1–159.5 done; 159.6, the `full` level, open, after [223](223-retire-the-c-floor.md).2) ·
+**Status:** built (159.1–159.6) ·
 **Source:** grounded during 150.4.5.3 — debugging a minor-collector segfault and an STW deadlock, the only
 signal was a single per-collection line and a native backtrace that could not unwind the collector's carrier
 stack (frame #0 only). Ad-hoc `RawPtr.gcDbg` breadcrumbs localized both bugs, then were stripped.
@@ -225,6 +225,38 @@ The model below is LXR's shape. GenImmix is its special case: every interval in 
   **Depends on** [223](223-retire-the-c-floor.md).2: the TLABs move into Nomu first, with the counting fields in their
   layout and a registry the sum can walk. 158 reshapes the coordinator where the per-cycle sum is
   taken; doing 159.6 before 158 means moving that sum when 158 lands.
+
+  **Built.**
+  - Codegen counts on the inline hit path when the program's level is `full` (`LLVMGen.countsAllocations`,
+    from `gc.record` through `emitObject`): one more object at the carrier record's +48 and the rounded
+    size at +56, plain stores since only the owning carrier writes them. `rtTlabAlloc` counts every
+    allocation it returns, small or large (`rtCountAllocation`), so the miss path, stress mode, and the
+    large-object space are covered without double counting.
+  - At each cycle's entry the collector sums and zeroes every carrier's counts (`rtCarriersAllocCounts`,
+    over the carrier registry, with the world stopped) and records counters 33 (objects allocated) and 34
+    (bytes allocated). Minor collections record counter 5 (bytes promoted) beside 2 at any level.
+  - The report's metrics gain `promotion` (objects, bytes) at any level and, at `full`, `allocation`:
+    objects, bytes, `meanObjectBytes`, and `minorSurvival` (promoted bytes over the bytes allocated since
+    the previous cycle, summed over minors). The totals include the allocation after the last cycle,
+    read at exit.
+  - Checked by hand on `gc_record_full` (200,000 16-byte objects plus an array and its nine buffer
+    growths): 200,009 objects and 3,204,216 bytes, the same with every allocation forced through the slow
+    path (`NOMU_GC_STRESS`); mean 16.02 bytes.
+  - **Cost**, release builds, 30 runs each: `alloc_live` 108.9 ms off, 109.7 ms `limited` (+0.7%), 130.9 ms
+    `full` (+20%); `micro_alloc` is startup-bound (7.0 / 7.2 / 7.2 ms). `full` is the level that slows
+    allocation, by about a fifth on an allocation-bound loop.
+  - Tests: the suite checks the report's shape through a new manifest key, `report_metrics` (values under
+    `metrics` by path: exact, a range, or absent). `gc-record-full` (carriers 1 and 4, a 4-block nursery)
+    pins `allocation.objects` 200,009 and `allocation.bytes` 3,204,216 exactly, with ranges on promotion
+    and survival; `gc-record-full-stress` pins the same totals with every allocation on the slow path;
+    `gc-record-limited-shape` checks `allocation` is absent at `limited`. Removing the slow path's count
+    fails both `full` cases (199,911 and 0 objects). The runner keeps `full` when a case also asserts
+    collections (the `gc_record` config it adds would otherwise win).
+  - Off costs nothing by construction: the counting is emitted only at `full`, and the runtime's guards fold
+    (`Runtime.gcRecordLevel()` is a constant). Checked once on `alloc_live`: at `off` the generated code's
+    instruction sequence is identical to `limited`'s, and `rtTlabAlloc` never touches the counters. The rule
+    is written in `src/stdlib/runtime/README.md`.
+    The full tier (758 passed), `--check-reproducible` (1741 identical), the 18 Bazel test targets.
 
 Deterministic GC tests (suite cases that pass or fail by thread timing) moved to
 [158](158-gc-packaging.md), whose trigger protocol their fixes go through. 159 comes first, so 158's

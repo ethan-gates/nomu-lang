@@ -12,7 +12,8 @@
 //   0  TLAB (64 bytes): cursor @0, limit @8, block @16, line @24, stressLimit @32, stressBytes @40,
 //      allocObjects @48, allocBytes @56. Cursor and limit are addresses (0 when there is no hole); under
 //      NOMU_GC_STRESS the hole end lives in stressLimit and limit stays 0, so the inline bump always misses.
-//      allocObjects and allocBytes are reserved for the `full` recording level's allocation counts.
+//      allocObjects and allocBytes count this carrier's allocations at the `full` recording level (the
+//      inline hit path and rtTlabAlloc add to them; the collector takes them at each cycle's entry).
 //   64 the fiber running on this carrier
 //   72 the mod-buffer (24 bytes): count @72, cap @80, storage @88
 //   96 the next record in the registry
@@ -76,6 +77,38 @@ fun rtCarriersResetTlabs() {
   }
 }
 
+// Count one allocation of `need` bytes on this carrier, at the `full` recording level. The inline hit path
+// does the same in generated code.
+fun rtCountAllocation(tlab: RawPtr, need: Int) {
+  if Runtime.gcRecordLevel() > 1 {
+    let objects: Int = tlab.load(fromByteOffset: 48)
+    tlab.store(objects + 1, toByteOffset: 48)
+    let bytes: Int = tlab.load(fromByteOffset: 56)
+    tlab.store(bytes + need, toByteOffset: 56)
+  }
+}
+
+// Every carrier's allocation counts summed into `out` (objects at 0, bytes at 8), each carrier's then zeroed
+// when `take` is true. Under stop-the-world, or at exit with every carrier stopped.
+fun rtCarriersAllocCounts(out: RawPtr, take: Bool) {
+  var objects = 0
+  var bytes = 0
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while !rec.isNull {
+    let o: Int = rec.load(fromByteOffset: 48)
+    let b: Int = rec.load(fromByteOffset: 56)
+    objects = objects + o
+    bytes = bytes + b
+    if take {
+      rec.store(0, toByteOffset: 48)
+      rec.store(0, toByteOffset: 56)
+    }
+    rec = rec.load(fromByteOffset: 96)
+  }
+  out.store(objects, toByteOffset: 0)
+  out.store(bytes, toByteOffset: 8)
+}
+
 // Empty every carrier's mod-buffer, keeping its storage. Under stop-the-world.
 fun rtCarriersResetModBufs() {
   var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
@@ -118,10 +151,33 @@ fun rtCarriersDrainModBufs(out: RawPtr) -> Int {
   return total
 }
 
+// Raise a collection request of `kind` (0 major, 1 minor), with the scheduler lock held. The request is one
+// slot. The first requester sets the kind (sched+176), initiates the stop-the-world (stw-request +136), wakes
+// the coordinator (gc-request +168) and records `trigger`. A request raised before that collection runs joins
+// it, and a major outranks a pending minor: the kind becomes 0 and the recorded trigger becomes the major's.
+// The coordinator reads the kind only once every carrier has acked, so no requester can change it after.
+// The kind word's bit 8 is reserved for a concurrent request (a plan that collects without stopping the
+// world, LXR in task 127); every request today stops the world, with bit 8 clear.
+fun rtGcRaise(sched: RawPtr, kind: Int, trigger: Int) {
+  if sched.atomicLoad(fromByteOffset: 136) == 0 {
+    rtGcRecordRequest(trigger)
+    sched.atomicStore(kind, toByteOffset: 176)
+    sched.atomicStore(1, toByteOffset: 136)
+    sched.atomicStore(1, toByteOffset: 168)
+    Runtime.futexWake(at: sched.advanced(by: 168), all: false)
+  } else if kind == 0 {
+    let pending: Int = sched.atomicLoad(fromByteOffset: 176)
+    if pending != 0 {
+      sched.atomicStore(0, toByteOffset: 176)
+      rtGcRecordTrigger(trigger)
+    }
+  }
+}
+
 // Synchronous collection at true OOM (task 150.3.11). rtImmixRefill calls this when the shared pool has no
 // block left. It parks this carrier at its alloc-site anchor so the stop-the-world walk finds the in-flight
 // allocation's roots (the anchor is the user frame that called the alloc seam — the seam's immediate caller,
-// a statepoint rtWalkFrom matches), initiates a stop-the-world, signals the GC coordinator (a plain pthread)
+// a statepoint rtWalkFrom matches), initiates a stop-the-world, signals the GC coordinator (rtGcCoordinatorMain)
 // to run a defrag collection, and waits for it to finish; then reports whether the collection reclaimed space
 // so the refill can retry. Returns false when there is no self-hosted scheduler (no collector) or the
 // collection freed nothing (a genuine out-of-memory — the heap is full of live data). The collection resets
@@ -131,9 +187,8 @@ fun rtCarriersDrainModBufs(out: RawPtr) -> Int {
 // fiber state (safepoint-stopped, 4), then switch to the carrier context. The carrier loop then acks the STW
 // (rtSchedStwParkCarrier) and waits, and switches back into this fiber on resume — so the ack accounting,
 // state discipline, and stack-save are the proven poll-site machinery, not an ad-hoc in-place block. The one
-// addition is initiating the STW: the first carrier into OOM sets the stw-request (sched+136) under the lock
-// and wakes the coordinator; because 136 is set before this fiber parks, the carrier's `while 136 != 0` wait
-// cannot race ahead of the request. Concurrent OOMs coalesce (only the first initiates; the rest just park).
+// addition is raising the request (rtGcRaise) under the lock; because stw-request (sched+136) is set before
+// this fiber parks, the carrier's `while 136 != 0` wait cannot race ahead of it. Concurrent requests coalesce.
 fun rtSelfhostOom(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
   let sched = rtSched
   if sched.isNull {
@@ -142,12 +197,7 @@ fun rtSelfhostOom(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
   let self = rtCurrentFiber()
   rtSchedSetAnchor(self, anchorSp, anchorPc)      // user-frame anchor for the STW walk (128.3.2 machinery)
   rtSchedLock(sched)
-  if sched.atomicLoad(fromByteOffset: 136) == 0 {
-    rtGcRecordRequest(trigger)
-    sched.atomicStore(1, toByteOffset: 136)       // initiate the stop-the-world (this carrier is the initiator)
-    sched.atomicStore(1, toByteOffset: 168)       // signal the GC coordinator to run the collection
-    Runtime.futexWake(at: sched.advanced(by: 168), all: false)
-  }
+  rtGcRaise(sched, 0, trigger)                    // a major
   self.store(4, toByteOffset: 168)                // safepoint-stopped; the carrier acks + waits, then resumes us
   let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
   Runtime.ctxSwitch(from: self, to: carrierCtx)
@@ -162,8 +212,8 @@ fun rtSelfhostOom(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
 
 // Trigger a minor (generational) collection when the nursery reserve is exhausted (task 150.4.3). Mirrors
 // rtSelfhostOom's park exactly — the mutator parks at its alloc-site anchor and the GC coordinator runs the
-// collection — but sets the collection-kind flag (sched+176 = 1) so the coordinator runs a minor GC
-// (nomuSchedStwCollectMinor) rather than a major/defrag. Returns false when there is no self-hosted scheduler
+// collection — but raises a minor (kind 1), so the coordinator runs nomuSchedStwCollectMinor rather than a
+// major/defrag, unless a major request is already pending. Returns false when there is no self-hosted scheduler
 // (no collector — the reserve stays unenforced, as in 150.4.1); else true (a minor GC always empties the
 // nursery). The collection resets this carrier's TLAB before resuming it, so the caller re-reads the TLAB.
 fun rtSelfhostMinorGc(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
@@ -174,18 +224,40 @@ fun rtSelfhostMinorGc(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
   let self = rtCurrentFiber()
   rtSchedSetAnchor(self, anchorSp, anchorPc)
   rtSchedLock(sched)
-  if sched.atomicLoad(fromByteOffset: 136) == 0 {
-    rtGcRecordRequest(trigger)
-    sched.atomicStore(1, toByteOffset: 176)       // collection kind = minor (the coordinator reads this)
-    sched.atomicStore(1, toByteOffset: 136)       // initiate the stop-the-world
-    sched.atomicStore(1, toByteOffset: 168)       // signal the GC coordinator
-    Runtime.futexWake(at: sched.advanced(by: 168), all: false)
-  }
+  rtGcRaise(sched, 1, trigger)                    // a minor, unless a major is already pending
   self.store(4, toByteOffset: 168)                // safepoint-stopped; the carrier acks + waits, then resumes us
   let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
   Runtime.ctxSwitch(from: self, to: carrierCtx)
   rtSchedUnlock(sched)
   return true
+}
+
+// A collection the program requests itself, for white-box tests built with `test.runtime_prelude`: raise a
+// request of `kind` (1 minor, 0 major; a minor runs as a major when generational collection is off) through
+// the coordinator, and return without parking. The caller stops at its next safepoint poll, and every other
+// running fiber at its own, so a test chooses where its fibers stand when the collection runs. A request
+// already raised absorbs this one (rtGcRaise). Returns a ticket for rtGcCollected: the stop-the-world generation
+// (sched+152), which the coordinator bumps as it resumes the world.
+fun rtGcRequest(kind: Int) -> Int {
+  let sched = rtSched
+  if sched.isNull {
+    return 0
+  }
+  var k = kind
+  if rtGenReserve(rtSpace) == 0 {
+    k = 0
+  }
+  rtSchedLock(sched)
+  rtGcRaise(sched, k, 5)
+  let ticket = sched.atomicLoad(fromByteOffset: 152)
+  rtSchedUnlock(sched)
+  return ticket
+}
+
+// Whether a collection has run since rtGcRequest returned `ticket`. A test's loop runs until it has, so the
+// collection lands inside the loop however long the coordinator takes to wake.
+fun rtGcCollected(ticket: Int) -> Bool {
+  return rtSched.atomicLoad(fromByteOffset: 152) != ticket
 }
 
 // Run a generational collection at the alloc-site anchor: a minor, or a major when mature headroom is short
@@ -218,12 +290,8 @@ fun rtGenCollect(minorTrigger: Int, trigger: Int, anchorSp: RawPtr, anchorPc: In
 
 // Allocation stress (env NOMU_GC_STRESS): count `need` bytes against this carrier's stress interval and, once
 // the interval is reached, request a collection at the alloc-site anchor — a generational one (rtGenCollect)
-// when generational is on, else a major. Off under an external STW driver, which runs no coordinator to service
-// the request. The collection resets every TLAB, so the caller re-reads it.
+// when generational is on, else a major. The collection resets every TLAB, so the caller re-reads it.
 fun rtStressTick(space: RawPtr, tlab: RawPtr, need: Int, stress: Int, anchorSp: RawPtr, anchorPc: Int) {
-  if rtGcExternalDriver != 0 {
-    return
-  }
   let counted: Int = tlab.load(fromByteOffset: 40)
   let total = counted + need
   if total < stress {
@@ -365,6 +433,9 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
     rtSchedMutexLockAt(space.advanced(by: 120))
     let los = rtLosAlloc(space, need)          // larger than a block → shared large-object space (off-heap malloc)
     rtSchedMutexUnlockAt(space.advanced(by: 120))
+    if !los.isNull {
+      rtCountAllocation(tlab, need)
+    }
     return los
   }
   var done = false
@@ -395,6 +466,9 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
         tlab.store(0, toByteOffset: 8)
       }
     }
+  }
+  if !result.isNull {
+    rtCountAllocation(tlab, need)
   }
   return result
 }

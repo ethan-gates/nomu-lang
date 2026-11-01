@@ -148,14 +148,14 @@ final class PlanTests: XCTestCase {
     }
 
     func testRuntimeArchiveKeyFollowsRecipe() {
-        let a = HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "runtime.c"]])
-        XCTAssertEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "runtime.c"]]))
-        XCTAssertNotEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-O2", "-c", "runtime.c"]]))
-        XCTAssertNotEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-c"], ["runtime.c"]]))
+        let a = HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "rtasm.s"]])
+        XCTAssertEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "rtasm.s"]]))
+        XCTAssertNotEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-O2", "-c", "rtasm.s"]]))
+        XCTAssertNotEqual(a, HostCache.runtimeArchiveKey(recipe: [["cc", "-c"], ["rtasm.s"]]))
         // A toolchain update changes the key.
-        let tools = HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "runtime.c"]], toolchain: ["cc": "clang-2100"])
+        let tools = HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "rtasm.s"]], toolchain: ["cc": "clang-2100"])
         XCTAssertNotEqual(a, tools)
-        XCTAssertNotEqual(tools, HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "runtime.c"]], toolchain: ["cc": "clang-2200"]))
+        XCTAssertNotEqual(tools, HostCache.runtimeArchiveKey(recipe: [["cc", "-c", "rtasm.s"]], toolchain: ["cc": "clang-2200"]))
     }
 
     func testRuntimePackageJob() {

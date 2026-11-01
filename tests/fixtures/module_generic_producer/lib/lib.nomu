@@ -2,7 +2,7 @@
 // producer-internal composed buffers). `holdBoxed` is compiled once (erased) here; it *constructs* a
 // `Box<T>` from its argument and holds it across a long spin. The `Box`'s copy of the managed pointer
 // lives in an opaque `erased.box` buffer the stackmap can't see, so without registering that buffer's
-// `T`-component as a typed GC root, the forced evacuation would relocate the object but leave the box's
+// `T`-component as a typed GC root, the moving collection would relocate the object but leave the box's
 // copy dangling — `return b.value` would then read a moved-from address.
 package struct Box<T> {
     var value: T
@@ -11,7 +11,13 @@ package struct Box<T> {
 package fun spin(n: Int) -> Int {
     var i = 0
     var acc = 0
-    while i < n {
+    var asked = false
+    var ticket = 0
+    while i < n || (asked && !rtGcCollected(ticket)) {
+        if i == 1000 {
+            ticket = rtGcRequest(1)    // collect at a poll of this loop, with the caller held mid-spin
+            asked = true
+        }
         acc = acc + (i % 7)
         i = i + 1
     }
@@ -20,6 +26,6 @@ package fun spin(n: Int) -> Int {
 
 package fun holdBoxed<T>(x: T) -> T {
     let b = Box(value: x)
-    let j = spin(400000000)
+    let j = spin(2000000)
     return b.value
 }

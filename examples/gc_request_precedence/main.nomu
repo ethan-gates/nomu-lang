@@ -1,0 +1,20 @@
+// A major request outranks a pending minor. `main` requests a minor collection, then a major, with no
+// safepoint poll between them, so the major joins the pending request (`rtGcRaise`) and the one collection
+// that runs is a major. The loop then spins until that collection has run, and the live Box reads back after
+// it. Suite case `gc-request-precedence` asserts one major cycle and no minor; built with
+// `test.runtime_prelude` (for `rtGcRequest`).
+class Box {
+  var v: Int
+}
+
+fun main() {
+  let keep = Box(v: 42)
+  let ticket = rtGcRequest(1)       // a minor
+  let joined = rtGcRequest(0)       // a major, raised before the minor runs
+  var spins = 0
+  while !rtGcCollected(ticket) {
+    spins = spins + 1
+  }
+  print(keep.v + (joined - ticket))  // 42: both requests return the same ticket
+  print("\n")
+}

@@ -419,6 +419,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
                         moduleFuncs: moduleFuncs, moduleTypes: moduleTypes,
                         externalMutatingMethods: externalMutating(),
                         gcRecordLevel: ["off": 0, "limited": 1, "full": 2][jobSettings.choice("gc.record")]!,
+                        gcPlan: gcPlanId(jobSettings),
                         runtimeTier: job.runtimeSubsetByMembership || jobSettings.bool("test.runtime_prelude")
                             || jobSettings.bool("test.runtime_tier"))
         let result = sema.check()
@@ -520,6 +521,8 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     // `test.runtime_prelude` prepend.
     let weakOrigins: Set<String> = job.runtimeSubsetByMembership ? ownFiles
         : options.compilingPrelude ? [] : Set([EmbeddedSources.preludeName] + runtimePrependFileNames)
+    let gcRecordLevel = ["off": 0, "limited": 1, "full": 2][jobSettings.choice("gc.record")]!
+    let gcPlan = gcPlanId(jobSettings)
     var optimizer = OptimizerSettings()
     optimizer.devirt = jobSettings.bool("opt.devirt")
     optimizer.inline = jobSettings.bool("opt.inline")
@@ -540,7 +543,8 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
                          externalFuncNames: extFuncs, externalGenericSigs: extGenerics,
                          weakOriginFiles: weakOrigins, homeModule: job.origin,
                          dependencyModules: job.dependencies.map(\.origin),
-                         isRuntimePackage: job.runtimeSubsetByMembership, facts: store, optimizer: optimizer)
+                         isRuntimePackage: job.runtimeSubsetByMembership, facts: store, optimizer: optimizer,
+                         gcRecordLevel: gcRecordLevel, gcPlan: gcPlan)
         if err == nil, emitLLVM { fputs(debugStem! + ".ll\n", stderr) }
     } else {
         err = emitObject(gen.module, from: monoModule, to: job.outputs.object, optimize: jobSettings.optimize,
@@ -548,10 +552,16 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
                          requireMain: false, externalFuncNames: extFuncs, externalGenericSigs: extGenerics,
                          weakOriginFiles: weakOrigins, emitTypeMaps: false,
                          homeModule: job.origin, dependencyModules: job.dependencies.map(\.origin),
-                         isRuntimePackage: job.runtimeSubsetByMembership, facts: store, optimizer: optimizer)
+                         isRuntimePackage: job.runtimeSubsetByMembership, facts: store, optimizer: optimizer,
+                         gcRecordLevel: gcRecordLevel, gcPlan: gcPlan)
     }
     if let err { fputs("error: \(err)\n", stderr); return false }
     return true
+}
+
+// The `gc.plan` setting as the id `Runtime.gcPlan()` folds to and codegen reads: 0 genimmix, 1 immix.
+func gcPlanId(_ settings: JobSettings) -> Int {
+    ["genimmix": 0, "immix": 1][settings.choice("gc.plan")]!
 }
 
 // A source file's text. A path under the language workspace's root (`<nomu>/…`) is served from the sources

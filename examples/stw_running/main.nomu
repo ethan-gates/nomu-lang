@@ -1,32 +1,46 @@
-// Task 128.3.2 — self-hosted stop-the-world over actively-running mutators. Two workers spin in a busy
-// loop (hitting back-edge safepoint polls) holding a live Box across the loop; while they run, the forced
-// STW coordinator (NOMU_STW_SELFHOST) stops the world — each running worker parks at its next poll with a
-// user-frame anchor captured by the C poll shim — and runs the self-hosted pcsp walk (rtWalkFrom) over the
-// live-fiber registry, recovering {111, 222} with no libunwind. The C-plan STW (libunwind) on the same
-// shape is the differential oracle.
+// Stop-the-world over actively running mutators. Two workers each hold a live Box across a busy loop (hitting
+// back-edge safepoint polls). Each counts itself in before its loop, with no poll between the count and the
+// loop; worker 222 waits in its loop until both are in, then requests a minor collection (`rtGcRequest`).
+// Both workers stop at their next back-edge poll with a user-frame anchor, the self-hosted pcsp walk
+// (rtWalkFrom) finds both Boxes, and the minor moves them and fixes up both stack slots. Each worker then
+// reads its moved Box: 111 + 222 = 333. Built with `test.runtime_prelude` (for `rtGcRequest`); runs on two or
+// more carriers, so both workers run at once.
 class Box {
   var v: Int
 }
 
-fun spin(n: Int) -> Int {
+// Spin `n` iterations. The requester also keeps spinning until both workers are inside their loops, requests
+// the collection once, and keeps spinning until it has run.
+fun spin(n: Int, inLoop: RawPtr, requester: Bool) -> Int {
   var i = 0
   var acc = 0
-  while i < n {
+  var asked = !requester
+  var ticket = 0
+  while i < n || !asked || (requester && !rtGcCollected(ticket)) {
+    if !asked {
+      if inLoop.atomicLoad(fromByteOffset: 0) == 2 {
+        ticket = rtGcRequest(1)       // both workers are mid-loop; they stop at their next poll
+        asked = true
+      }
+    }
     acc = acc + (i % 7)
     i = i + 1
   }
   return acc
 }
 
-fun worker(id: Int) -> Int {
+fun worker(id: Int, inLoop: RawPtr) -> Int {
   let a = Box(v: id)
-  let j = spin(400000000)             // long busy loop; the STW stops it mid-loop at a back-edge poll
+  inLoop.atomicFetchAdd(1, atByteOffset: 0)   // counted in; the next poll is the loop's
+  let j = spin(50000000, inLoop, id == 222)
   return a.v + (j % 1)                // a is live across the loop (used here)
 }
 
 fun main() {
-  spawn let x = worker(111)
-  spawn let y = worker(222)
+  let inLoop = RawPtr.alloc(bytes: 8, align: 8)
+  inLoop.atomicStore(0, toByteOffset: 0)
+  spawn let x = worker(111, inLoop)
+  spawn let y = worker(222, inLoop)
   print(x + y)                        // 333 — joins the workers (keeps main alive while they spin)
   print("\n")
 }

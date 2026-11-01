@@ -34,11 +34,12 @@ Enumerate every `NOMU_*` var (grep `getenv` / `environment[` across `src/`, plus
 in `tools/`), and for each classify + decide:
 
 - **Product selection.** None remains (197). Confirm nothing else selects an implementation.
-- **GC test drivers.** `NOMU_GC_STRESS` (a collection every N allocated bytes), `NOMU_GC_PRESSURE`,
-  `NOMU_STW_COLLECT`, `NOMU_STW_SELFHOST` — dev/test-only, set by suite cases. (`NOMU_GC_DEBUG_PRESSURE`
+- **GC test drivers.** `NOMU_GC_STRESS` (a collection every N allocated bytes) — dev/test-only, set by
+  suite cases. `NOMU_GC_PRESSURE`, `NOMU_STW_COLLECT` and `NOMU_STW_SELFHOST` were removed with their driver
+  threads in 158.3. (`NOMU_GC_DEBUG_PRESSURE`
   retired with the collection log in 159.5; `NOMU_GC_REPORT_DIR`, 159's report directory, is new.)
-- **GC/scheduler tuning.** `NOMU_NURSERY_RESERVE`, `NOMU_MATURE_FLOOR`, `NOMU_CARRIERS`,
-  `NOMU_GC_TRIGGER_RESERVE`, and the like. Each should carry an internal default (the descriptor
+- **GC/scheduler tuning.** `NOMU_NURSERY_RESERVE`, `NOMU_MATURE_FLOOR`, `NOMU_CARRIERS`, and the like
+  (`NOMU_GC_TRIGGER_RESERVE` was removed in 158.3). Each should carry an internal default (the descriptor
   already holds `nurseryReserve = numBlocks/4`, for instance) and drop the env, or demote it to a
   dev-only override. When the generational trigger flips on by default (150.4.5), the reserve + floor
   knobs fold into internal defaults.

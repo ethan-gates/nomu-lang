@@ -65,12 +65,10 @@ public enum HostCache {
     public static var languageSourcesDigest: String { planner.languageSourcesDigest }
 }
 
-// The runtime's C and asm sources, hashed once per process.
+// The runtime archive's sources (the asm floor), hashed once per process.
 private let runtimeSourcesDigest: String = {
     var h = Hasher64()
-    h.mix(EmbeddedSources.runtimeHeader)
-    h.mix(EmbeddedSources.runtimeC)
-    h.mix(EmbeddedSources.rtAsmArm64)   // the asm floor is archived in
+    h.mix(EmbeddedSources.rtAsmArm64)
     return h.hex
 }()
 

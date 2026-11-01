@@ -285,11 +285,11 @@ extension LLVMGen {
         return sv!
     }
 
-    // The stop-the-world flag the poll tests: the runtime's `rtStopWorld` static-storage block, an `Int32` read
+    // The stop-the-world flag the poll tests: the runtime's `rtStopWorld` static-storage block, an `Int` read
     // by symbol (declared here, defined by the runtime module; the same global when this is that module).
     func stopWorldGlobal() -> LLVMValueRef {
         if let g = stopWorldGlobalCache { return g }
-        let g = getOrAddGlobal(i32, Mangle.staticStorage("rtStopWorld", home: []))
+        let g = getOrAddGlobal(i64, Mangle.staticStorage("rtStopWorld", home: []))
         stopWorldGlobalCache = g
         return g
     }
@@ -307,9 +307,9 @@ extension LLVMGen {
         withStubBody(fn) {
             let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.slow")
             let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.cont")
-            let v = LLVMBuildLoad2(b, i32, flag, "stopreq")!
+            let v = LLVMBuildLoad2(b, i64, flag, "stopreq")!
             LLVMSetVolatile(v, 1)
-            let stop = LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstInt(i32, 0, 0), "stop")
+            let stop = LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstInt(i64, 0, 0), "stop")
             LLVMBuildCondBr(b, stop, slowBB, contBB)
             LLVMPositionBuilderAtEnd(b, slowBB)
             _ = buildCall(slow.0, slow.1, [])
@@ -338,9 +338,9 @@ extension LLVMGen {
         let slow = nomuPollSlow()
         let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.slow")
         let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.cont")
-        let v = LLVMBuildLoad2(b, i32, flag, "stopreq")!
+        let v = LLVMBuildLoad2(b, i64, flag, "stopreq")!
         LLVMSetVolatile(v, 1)
-        let stop = LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstInt(i32, 0, 0), "stop")
+        let stop = LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstInt(i64, 0, 0), "stop")
         LLVMBuildCondBr(b, stop, slowBB, contBB)
         LLVMPositionBuilderAtEnd(b, slowBB)
         _ = buildCallWithDeopt(slow.0, slow.1, [], deoptOps)
@@ -390,6 +390,15 @@ extension LLVMGen {
         LLVMBuildCondBr(b, fits, bumpBB, slowBB)
         LLVMPositionBuilderAtEnd(b, bumpBB)
         LLVMBuildStore(b, newCur, tlab)
+        if countsAllocations {
+            // `full` recording: one more object and `need` more bytes on this carrier (only it writes them).
+            let objectsAt = gepByte(tlab, LLVMConstInt(i64, 48, 0))
+            let bytesAt = gepByte(tlab, LLVMConstInt(i64, 56, 0))
+            let objects = LLVMBuildLoad2(b, i64, objectsAt, "tlab.objs")!
+            LLVMBuildStore(b, LLVMBuildAdd(b, objects, LLVMConstInt(i64, 1, 0), "tlab.objs1"), objectsAt)
+            let bytes = LLVMBuildLoad2(b, i64, bytesAt, "tlab.bytes")!
+            LLVMBuildStore(b, LLVMBuildAdd(b, bytes, need, "tlab.bytes1"), bytesAt)
+        }
         let fastObj = LLVMBuildIntToPtr(b, cur, p1, "obj.fast")!
         LLVMBuildBr(b, doneBB)
         LLVMPositionBuilderAtEnd(b, slowBB)
@@ -444,9 +453,8 @@ extension LLVMGen {
     }
 
     // The process entry, emitted into the program's entry object: `int main(void)` runs the runtime's init
-    // function (the run settings, the scheduler, the heap), starts the collector's coordinator threads (still
-    // C, `rt_gc_threads_start`), and boots the scheduler on `rtCarrierCount` carriers with the program's
-    // `main` as the first fiber. Creating an actor fills the scheduler's drain slot (`registerActorDrain`).
+    // function (the run settings, the scheduler, the heap) and boots the scheduler on `rtCarrierCount` carriers
+    // with the program's `main` as the first fiber; the boot starts the GC coordinator. Creating an actor fills the scheduler's drain slot (`registerActorDrain`).
     // Its loads of the runtime's globals are plain: the init call that stores them is in this function.
     func emitProcessEntry(main nomuMain: LLVMValueRef, _ mainTy: LLVMTypeRef) {
         // The first fiber's entry, `ptr (ptr)` as the scheduler calls it (`Runtime.callEntry`): calls the
@@ -466,11 +474,9 @@ extension LLVMGen {
         let i32 = LLVMInt32TypeInContext(ctx)!
         let (fn, _) = emitFunction("main", ret: i32, params: [], gc: false)
         let runtimeInit = preludeFn(Mangle.moduleInit(home: []), ret: voidTy, params: [])
-        let gcThreads = runtimeFn("rt_gc_threads_start", ret: voidTy, params: [], varArg: false)
         let boot = runtimePreludeFn("nomuSchedBoot", ret: voidTy, params: [i8ptr, i8ptr, i64])
         withStubBody(fn) {
             _ = buildCall(runtimeInit.0, runtimeInit.1, [])
-            _ = buildCall(gcThreads.0, gcThreads.1, [])
             let sched = LLVMBuildLoad2(b, i8ptr, getOrAddGlobal(i8ptr, Mangle.global("rtSched", home: [])), "sched")!
             let carriers = LLVMBuildLoad2(b, i64, getOrAddGlobal(i64, Mangle.global("rtCarrierCount", home: [])),
                                           "carriers")!
@@ -544,7 +550,8 @@ extension LLVMGen {
     }
 
     // The `__nomu_write_barrier` seam: a post-store object-remembering barrier with an inlined fast
-    // path (barrier off / already-remembered) and an out-of-line slow path on first mutation.
+    // path (barrier off / already-remembered) and an out-of-line slow path on first mutation. Without a
+    // write barrier (`emitsWriteBarrier` off) it is the store alone.
     func nomuWriteBarrier() -> (LLVMValueRef, LLVMTypeRef) {
         if let g = barrierFn { return g }
         let ty = fnType(voidTy, [p1, p1, p1])
@@ -556,7 +563,7 @@ extension LLVMGen {
         withStubBody(fn) {
             let obj = LLVMGetParam(fn, 0)!, slot = LLVMGetParam(fn, 1)!, val = LLVMGetParam(fn, 2)!
             LLVMBuildStore(b, val, slot)   // *slot = val (barrier is post-store)
-            _ = buildCall(remember.0, remember.1, [obj])
+            if emitsWriteBarrier { _ = buildCall(remember.0, remember.1, [obj]) }
             LLVMBuildRetVoid(b)
         }
         barrierFn = (fn, ty)
@@ -574,6 +581,12 @@ extension LLVMGen {
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         markGCLeaf(fn)
         addAlwaysInline(fn)
+        // Without a write barrier (`gc.plan: immix`) the seam is empty and inlines away.
+        guard emitsWriteBarrier else {
+            withStubBody(fn) { LLVMBuildRetVoid(b) }
+            rememberFn = (fn, ty)
+            return rememberFn!
+        }
         let slowPath = runtimePreludeFn("rtRememberStore", ret: voidTy, params: [i8ptr])
         withStubBody(fn) {
             // The object's address as an integer comes from a side-effecting inline asm (`pinnedAddress`). The

@@ -78,15 +78,10 @@ final class Suite {
         if selected.isEmpty { die("no cases selected") }
 
         cache.compileAll(selected, ctx: ctx, gate: gate, progress: progress)
-        // Timing-sensitive cases run after the rest, one at a time, each taking the whole pool, so no other
-        // run competes with them for the host.
-        let pooled = selected.filter { !$0.timingSensitive }
-        let alone = selected.filter { $0.timingSensitive }
         var rounds: [[CaseResult]] = []
         for _ in 0..<ctx.repeatCount {
             results = []
-            guard runPhase(pooled, weight: { max(1, $0.weight) }),
-                  runPhase(alone, weight: { _ in self.ctx.poolCapacity }) else {
+            guard runPhase(selected, weight: { max(1, $0.weight) }) else {
                 FileHandle.standardError.write(Data(
                     "error: suite deadline (\(fmt(ctx.deadline))) exceeded — a case cap failed to fire\n".utf8))
                 return 3

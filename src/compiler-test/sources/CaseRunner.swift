@@ -93,7 +93,7 @@ struct CaseRunner {
             guard let data = try? Data(contentsOf: URL(fileURLWithPath: ctx.fixturePath(f))) else {
                 return result(.fail, ["  stdin_file '\(f)' missing"])
             }
-            stdinFeed = StdinFeed(data: data, delayMs: c.stdinDelayMs)
+            stdinFeed = StdinFeed(data: data, after: c.stdinAfter)
         }
 
         var totalRun = 0.0
@@ -106,7 +106,7 @@ struct CaseRunner {
                 if let carrier = carrier { env["NOMU_CARRIERS"] = String(carrier) }
                 // A case asserting collections reads them from the run's collector report, written into a
                 // directory of its own (cases share binaries and run concurrently).
-                let reportDir = c.collections.isEmpty ? nil
+                let reportDir = c.collections.isEmpty && c.reportMetrics.isEmpty ? nil
                     : NSTemporaryDirectory() + "nomu-gc-report-" + UUID().uuidString
                 if let dir = reportDir {
                     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -151,18 +151,26 @@ struct CaseRunner {
                     }
                 }
                 if let dir = reportDir {
-                    switch collectionCounts(in: dir) {
+                    switch reportCycles(in: dir) {
                     case .failure(let why):
                         return result(.fail, ["  collector report (\(at)): \(why)", "  repro: \(runRepro)"],
                                       runTime: totalRun)
-                    case .success(let counts):
+                    case .success(let cycles):
+                        if let why = metricFailure(c.reportMetrics, in: dir) {
+                            return result(.fail, ["  metric assertion failed (\(at)): \(why)", "  repro: \(runRepro)"],
+                                          runTime: totalRun)
+                        }
                         for m in c.collections {
-                            let n = m.kind.map { counts[$0] ?? 0 } ?? counts.values.reduce(0, +)
-                            let what = m.kind.map { "\($0) cycles" } ?? "cycles"
+                            let n = cycles.filter { cy in
+                                (m.kind.map { $0 == cy.kind } ?? true) && (m.trigger.map { $0 == cy.trigger } ?? true)
+                                    && (m.roots.map { $0 == cy.roots } ?? true)
+                            }.count
+                            let what = ([m.kind, m.trigger.map { "'\($0)'" }, m.roots.map { "\($0)-root" }]
+                                .compactMap { $0 } + ["cycles"]).joined(separator: " ")
                             let bad = (m.min.map { n < $0 } ?? false) ? "min \(m.min!)"
                                     : (m.max.map { n > $0 } ?? false) ? "max \(m.max!)" : nil
                             if let bound = bad {
-                                let seen = counts.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }
+                                let seen = cycles.map { "\($0.kind) '\($0.trigger)' \($0.roots.map(String.init) ?? "-") roots" }
                                     .joined(separator: ", ")
                                 return result(.fail, ["  collection assertion failed (\(at)): \(n) \(what) (\(bound));"
                                                       + " report: \(seen.isEmpty ? "no cycles" : seen)",
@@ -217,11 +225,18 @@ private func countOccurrences(_ haystack: String, _ needle: String) -> Int {
         .reduce(0) { $0 + ($1.contains(needle) ? 1 : 0) }
 }
 
-// Cycles by kind name in the one collector report (`*-gc-*.json`, beside its `.trace.json`) a run wrote into `dir`.
-func collectionCounts(in dir: String) -> Result<[String: Int], CollectionReportError> {
+// The cycles in the report written into `dir` (which must hold exactly one): each one's kind and trigger, by
+// name, and its stack-root count (the `roots` counter; nil when the cycle recorded none).
+struct ReportCycle {
+    var kind: String
+    var trigger: String
+    var roots: Int?
+}
+
+func reportCycles(in dir: String) -> Result<[ReportCycle], CollectionReportError> {
     struct Report: Decodable {
-        struct Names: Decodable { var kinds: [String: String] }
-        struct Cycle: Decodable { var kind: Int }
+        struct Names: Decodable { var kinds: [String: String]; var triggers: [String: String]; var counters: [String: String] }
+        struct Cycle: Decodable { var kind: Int; var trigger: Int; var counters: [[Int]] }
         var names: Names
         var cycles: [Cycle]
     }
@@ -235,9 +250,37 @@ func collectionCounts(in dir: String) -> Result<[String: Int], CollectionReportE
           let report = try? JSONDecoder().decode(Report.self, from: data) else {
         return .failure(CollectionReportError("cannot read \(files[0])"))
     }
-    var counts: [String: Int] = [:]
-    for c in report.cycles { counts[report.names.kinds[String(c.kind)] ?? "kind \(c.kind)", default: 0] += 1 }
-    return .success(counts)
+    let rootsId = report.names.counters.first { $0.value == "roots" }.flatMap { Int($0.key) }
+    return .success(report.cycles.map { c in
+        ReportCycle(kind: report.names.kinds[String(c.kind)] ?? "kind \(c.kind)",
+                    trigger: report.names.triggers[String(c.trigger)] ?? "trigger \(c.trigger)",
+                    roots: c.counters.first { $0.count == 3 && $0[0] == rootsId }.map { $0[2] })
+    })
+}
+
+// The first failed metric assertion over the report in `dir` (whose single report `reportCycles` has
+// already checked), described, or nil when all hold.
+func metricFailure(_ matches: [MetricMatch], in dir: String) -> String? {
+    if matches.isEmpty { return nil }
+    let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
+        .filter { $0.hasSuffix(".json") && !$0.hasSuffix(".trace.json") }
+    guard let file = files.first, let data = FileManager.default.contents(atPath: dir + "/" + file),
+          let report = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let metrics = report["metrics"] as? [String: Any] else { return "cannot read the report's metrics" }
+    for m in matches {
+        var node: Any? = metrics
+        for key in m.path.split(separator: ".") { node = (node as? [String: Any])?[String(key)] }
+        if m.absent == true {
+            if node != nil { return "'\(m.path)' present (expected absent)" }
+            continue
+        }
+        guard let v = (node as? NSNumber)?.doubleValue else { return "'\(m.path)' missing or not a number" }
+        let show = v == v.rounded() ? String(Int(v)) : String(v)
+        if let e = m.equals, v != e { return "'\(m.path)' is \(show), expected \(e == e.rounded() ? String(Int(e)) : String(e))" }
+        if let lo = m.min, v < lo { return "'\(m.path)' is \(show) (min \(lo))" }
+        if let hi = m.max, v > hi { return "'\(m.path)' is \(show) (max \(hi))" }
+    }
+    return nil
 }
 
 struct CollectionReportError: Error, CustomStringConvertible {

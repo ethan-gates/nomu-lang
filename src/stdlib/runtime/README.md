@@ -14,11 +14,17 @@ One module over these files; a name declared in any file is visible in all of th
 | `immix.nomu` | the Immix heap: regions, allocation, line marking, sweep, large objects |
 | `descriptors.nomu` | GC type descriptors read by type-id |
 | `stackwalk.nomu` | stack maps, the frame index, the pcsp walk, parked-fiber walks, the shadow stack |
-| `collect.nomu` | forwarding, evacuation, whole-heap and minor collection, the defrag trigger |
+| `collect.nomu` | forwarding, evacuation, whole-heap and minor collection, the defrag trigger, the GC coordinator thread |
 | `gcreport.nomu` | the collector's recorder and report |
 | `scheduler.nomu` | the M:N scheduler, timers, actor mailboxes, the stop-the-world handshake, entry points |
 | `io.nomu` | stdin line input and its poller, the array bounds trap |
 | `verify.nomu` | the bump allocator and mark-verify tracer (early collector rungs) |
+
+**Recording costs nothing when off.** Every recording path is guarded by `Runtime.gcRecordLevel()` (0 off,
+1 `limited`, 2 `full`), which folds to a constant when the runtime compiles, so a lower level's build has
+none of the higher levels' code. Generated code follows the same rule through `LLVMGen.countsAllocations`
+(the `full` level's allocation counting on the inline hit path). New recording code keeps to it. The
+suite's `gc-record-*` cases check what each level reports; the cost of `full` is measured in task 159.6.
 
 The compiler embeds these files (`src/runtime/embedded/embed.sh`) and the language workspace serves them
 as the `runtime` package (`LanguageWorkspace.swift`). Struct-like layouts are byte offsets into raw

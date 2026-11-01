@@ -4,40 +4,44 @@
 // so its only safepoint is the loop-header poll. T6 proves that poll survives the inline transform — the
 // stop-the-world still stops the carrier while it spins in the inlined loop.
 //
-// Run under NOMU_STW_SELFHOST (suite case `stw-inlined-loop`, two or more carriers): three STW rounds stop
-// the spinning carrier and the parked fiber and walk their roots — 777 (the inlined loop's live Box) and 888
-// (the parked fiber's). If inlining dropped the poll, the carrier would never reach a safepoint and the STW
-// would hang, so completion is part of the assertion.
+// Suite case `stw-inlined-loop` (two or more carriers, built with `test.runtime_prelude`): `spin` raises a
+// flag just before the loop, with no poll between the flag and the loop; `parker` waits for the flag,
+// requests a minor collection (`rtGcRequest`), and parks holding its own root. The collection stops the
+// spinning carrier in the inlined loop and the parked fiber, and moves both roots — 777 (the inlined loop's
+// live Box) and 888 (the parked fiber's). If inlining dropped the poll, the carrier would never reach a
+// safepoint and the stop-the-world would hang, so completion is part of the assertion.
 class Box {
   var v: Int
 }
-
 // A bare compute loop, no calls or allocations inside — the field load `x.v` is not a safepoint.
 // Multi-block (entry / header / body / exit), so it inlines into `spin` via 7.5 phase B.
 fun loopSum(x: Box) -> Int {
   var i = 0
   var acc = 0
-  while i < 2000000000 {        // long loop → a back-edge poll each iteration; x live across it
+  while i < 200000000 {         // long loop → a back-edge poll each iteration; x live across it
     acc = acc + x.v
     i = i + 1
   }
   return acc
 }
-
 // The carrier body. After inlining, `spin`'s CFG *contains* loopSum's loop — an inlined loop whose
 // only safepoint is the loop-header poll.
-fun spin(x: Box) -> Int {
+fun spin(x: Box, inLoop: RawPtr) -> Int {
+  inLoop.atomicStore(1, toByteOffset: 0)   // the next poll is the inlined loop's
   return loopSum(x)
 }
-
-fun parker() -> Int {
+fun parker(inLoop: RawPtr) -> Int {
   let p = Box(v: 888)
-  sleep(200)                    // park holding p live across the safepoint
+  while inLoop.atomicLoad(fromByteOffset: 0) == 0 {
+  }
+  rtGcRequest(1)                // the spinner is in the inlined loop
+  sleep(20)                     // park holding p live across the safepoint
   return p.v
 }
-
 fun main() {
-  spawn let s = spin(Box(v: 777))   // a carrier runs the inlined compute loop
-  spawn let q = parker()            // another fiber parks holding a root
-  print(s + q)                      // joins both
+  let inLoop = RawPtr.alloc(bytes: 8, align: 8)
+  inLoop.atomicStore(0, toByteOffset: 0)
+  spawn let s = spin(Box(v: 777), inLoop)   // a carrier runs the inlined compute loop
+  spawn let q = parker(inLoop)              // another fiber requests the collection, then parks holding a root
+  print(s + q)                              // joins both
 }

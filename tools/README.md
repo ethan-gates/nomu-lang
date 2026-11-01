@@ -15,6 +15,8 @@ bazel-bin/src/compiler-test/compiler-test tests/suite.json
 
 - `escape-diff.sh` — builds and runs every example module with escape analysis on and off
   (`-c no_escape`) and asserts identical output and exit status, on one carrier.
+- `gc-baseline.py` — times the benchmark workloads on 1 and 4 carriers, under the `genimmix` and `immix` plans (best
+  of N runs), and records each run's GC report metrics (cycles, pauses, time to safepoint, peak heap).
 - `memcap.py` — runs a command under a memory cap and a time limit (default 2 GB, 60 s), killing it past
   either (`--stop` freezes it for a debugger instead); macOS does not enforce `ulimit -v`. For iterating
   on new tests and compiler features; the suite's steady-state cases run without it.

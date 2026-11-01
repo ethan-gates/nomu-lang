@@ -1,8 +1,8 @@
 // A non-POD type argument crossing an erased generic boundary, scanned under a moving GC (task
 // 100.4.3.6 — lifts the POD guardrail). `hold` is compiled once (erased) in the dependency; this
 // module calls it at `T = Box`, a managed pointer. `keep` is dead in this frame after the call, so the
-// Box is reachable only through the erased argument buffer. While `hold` spins, the forced-collect
-// coordinator evacuates the whole heap: the trace follows the typed root into the buffer, moves the
+// Box is reachable only through the erased argument buffer. While `hold` spins, it requests a minor
+// collection, which moves the young Box: the trace follows the typed root into the buffer, moves the
 // Box, and fixes up the pointer in place, so the returned value reads 111 (unchanged vs non-moving).
 import pkg/lib
 

@@ -1,7 +1,7 @@
 // Heap-pressure-triggered self-hosted Immix collection on the Nomu scheduler. A single fiber keeps a
 // sliding window of 100 live Boxes in an array while allocating millions of Boxes — far more than the
-// 256 MiB self-hosted heap — so the overwritten Boxes become garbage. Under NOMU_GC_PRESSURE the GC
-// thread collects when the heap fills (a defrag collection at a scheduler STW), relocating the survivors,
+// 256 MiB self-hosted heap — so the overwritten Boxes become garbage. The GC coordinator collects
+// when an allocation finds the heap full (generational minors, and a major at a scheduler STW), relocating the survivors,
 // fixing up the array buffer's element pointers and the root, and reclaiming the garbage — so the program
 // survives with the same checksum as a run that never collects. Without collection the heap would exhaust.
 class Box {

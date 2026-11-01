@@ -43,12 +43,27 @@ struct StderrMatch: Decodable {
 }
 
 // A collection-count assertion, read from the run's collector report (`gc.record`, written into a directory
-// the runner names through `NOMU_GC_REPORT_DIR`): cycles of `kind` (a name from the report's `names.kinds`,
-// e.g. `minor`), or of any kind when absent. A case that asserts collections compiles with `gc_record`.
+// the runner names through `NOMU_GC_REPORT_DIR`): the cycles of `kind` (a name from the report's `names.kinds`,
+// e.g. `minor`), raised by `trigger` (a name from `names.triggers`, e.g. `program request`), and with exactly
+// `roots` stack roots; an absent field matches every cycle. A case that asserts collections compiles with
+// `gc_record`.
 struct CollectionMatch: Decodable {
     var kind: String?
+    var trigger: String?
+    var roots: Int?
     var min: Int?
     var max: Int?
+}
+
+// A metric assertion, read from the same report: the value at `path` (dot-separated keys under the report's
+// `metrics`, e.g. `allocation.objects`) equals `equals`, or lies within `min`/`max`; or, with `absent`, the
+// path is not in the report (`allocation` below the `full` level). A case with one compiles with `gc_record`.
+struct MetricMatch: Decodable {
+    var path: String
+    var equals: Double?
+    var min: Double?
+    var max: Double?
+    var absent: Bool?
 }
 
 // A symbol-count assertion over the fixture's own object (`<binary>.o`): lines naming a symbol that contains
@@ -113,14 +128,12 @@ struct Case: Decodable {
     var compile: CompileSpec?
     var stderrMatch: [StderrMatch]?
     var collections: [CollectionMatch]?
+    var reportMetrics: [MetricMatch]?
     var objectSymbols: [SymbolMatch]?
     var objectReferences: [SymbolMatch]?
     var stdinFile: String?
-    var stdinDelayMs: Int?
+    var stdinAfter: String?
     var tier: Tier?
-    // Run alone, after the pool drains, with the host otherwise idle: a case whose result depends on
-    // timing (a delayed stdin feed racing other fibers).
-    var timingSensitive: Bool?
 }
 
 // A case with all defaults folded in — what the runner actually executes.
@@ -139,12 +152,12 @@ struct ResolvedCase {
     var compile: CompileSpec?
     var stderrMatch: [StderrMatch]
     var collections: [CollectionMatch]
+    var reportMetrics: [MetricMatch]
     var objectSymbols: [SymbolMatch]
     var objectReferences: [SymbolMatch]
     var stdinFile: String?   // repo-relative file fed to the program's stdin (default: /dev/null)
-    var stdinDelayMs: Int    // how long after start the file's bytes are written into the stdin pipe
+    var stdinAfter: String?  // the file's bytes are written into the stdin pipe once stderr shows this text
     var tier: Tier
-    var timingSensitive: Bool
     var dims: [String: String]   // dimension → value, for a group run (selection by `--where`)
 
     // Key for shared compilation — a fixture built once per distinct (compile-env, compile-args).
@@ -154,9 +167,10 @@ struct ResolvedCase {
     }
 }
 
-// A case that asserts collections records them: its compile settings gain `gc_record`.
-func recording(_ settings: Settings, _ collections: [CollectionMatch]) -> Settings {
-    if collections.isEmpty { return settings }
+// A case that reads the collector's report (asserting collections or metrics) records: its compile settings gain
+// `gc_record`, unless they already record at `full` (the later config would win and lower the level).
+func recording(_ settings: Settings, reads: Bool) -> Settings {
+    if !reads || settings["gc_record_full"] == .bool(true) { return settings }
     var s = settings
     s["gc_record"] = .bool(true)
     return s
@@ -188,7 +202,8 @@ extension Manifest {
         var out: [ResolvedCase] = cases.map { c in
             let carriers = c.carriers ?? d?.carriers ?? [1]
             let owner = "case '\(c.name)'"
-            let compile = lower(recording(c.compileSettings ?? [:], c.collections ?? []), at: .compile, in: owner)
+            let reads = !(c.collections ?? []).isEmpty || !(c.reportMetrics ?? []).isEmpty
+            let compile = lower(recording(c.compileSettings ?? [:], reads: reads), at: .compile, in: owner)
             let run = lower(c.runSettings ?? [:], at: .run, in: owner)
             return ResolvedCase(
                 name: c.name,
@@ -206,12 +221,12 @@ extension Manifest {
                 compile: c.compile,
                 stderrMatch: c.stderrMatch ?? [],
                 collections: c.collections ?? [],
+                reportMetrics: c.reportMetrics ?? [],
                 objectSymbols: c.objectSymbols ?? [],
                 objectReferences: c.objectReferences ?? [],
                 stdinFile: c.stdinFile,
-                stdinDelayMs: c.stdinDelayMs ?? 0,
+                stdinAfter: c.stdinAfter,
                 tier: c.tier ?? .fast,
-                timingSensitive: c.timingSensitive ?? false,
                 dims: [:]
             )
         }
@@ -255,7 +270,7 @@ extension Manifest {
                     tier = max(tier, v.tier ?? .fast)
                 }
                 let owner = "group '\(g.name)'"
-                let compile = lower(recording(compileSettings, collections), at: .compile, in: owner)
+                let compile = lower(recording(compileSettings, reads: !collections.isEmpty), at: .compile, in: owner)
                 let run = lower(runSettings, at: .run, in: owner)
                 out.append(ResolvedCase(
                     name: name, fixture: fixture,
@@ -266,9 +281,10 @@ extension Manifest {
                     runTimeout: g.timeoutSec ?? d?.timeoutSec ?? 60,
                     compileTimeout: d?.compileTimeoutSec ?? 120,
                     weight: Manifest.weight(explicit: g.weight, heavy: false, carriers: carriers, capacity: capacity),
-                    compile: nil, stderrMatch: match, collections: collections, objectSymbols: [], objectReferences: [],
-                    stdinFile: nil, stdinDelayMs: 0,
-                    tier: tier, timingSensitive: false,
+                    compile: nil, stderrMatch: match, collections: collections, reportMetrics: [],
+                    objectSymbols: [], objectReferences: [],
+                    stdinFile: nil, stdinAfter: nil,
+                    tier: tier,
                     dims: Dictionary(uniqueKeysWithValues: combo.map { ($0.0, $0.1.name) })))
             }
         }
@@ -306,8 +322,8 @@ private let caseKeys: Set<String> = [
     "name", "fixture", "compile_args", "compile_settings", "run_settings", "expect", "iterations",
     "full_iterations", "carriers",
     "timeout_sec", "compile_timeout_sec", "heavy", "weight", "compile", "stderr_match", "collections",
-    "object_symbols",
-    "object_references", "stdin_file", "stdin_delay_ms", "tier", "timing_sensitive",
+    "report_metrics", "object_symbols",
+    "object_references", "stdin_file", "stdin_after", "tier",
 ]
 private let groupKeys: Set<String> = [
     "name", "fixtures", "across", "expect", "compile_settings", "run_settings", "iterations", "full_iterations",

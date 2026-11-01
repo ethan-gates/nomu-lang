@@ -15,7 +15,9 @@ Flags:
 - `--disable a,b,gc-*` — run everything except these.
 - `--where axis=value,…` — run only group runs with these dimension values (`--where gc=stress-major`).
 - `--tier fast|full` — `fast` (the default) or `full` (fast plus the expensive legs). See "Tiers".
-- `--repeat N` — run the selection N times and report each case's pass rate (for hunting flakes).
+- `--repeat N` — run the selection N times and report each case's pass rate. The rounds share the pool, so
+  cases load each other, and a case whose result changes between rounds fails as flaky. This is the
+  determinism check: `--tier full --repeat 3` before a change that touches the runtime or the suite.
 - `--compiler PATH` — the `nomu` to test, e.g. an older build to check that a case catches its bug.
 - `--deadline SEC` — overall wall-clock backstop (default 300, scaled by `--repeat`).
 - `--check-reproducible` — instead of compiling and running, build the selection twice from clean, the second time
@@ -65,20 +67,27 @@ since no package may sit at a workspace root. Fields:
 - `iterations` (repeat; all must pass), `carriers` (one run per count, sets `NOMU_CARRIERS`). Set
   `"carriers": []` to run once without setting `NOMU_CARRIERS` — for fixtures that manage their own
   threads (the self-hosted scheduler/actor cases).
-- `stderr_match` — `[ { "pattern": "STW-ROOT 111", "min": 1 } ]`, a per-line substring count over the
+- `stderr_match` — `[ { "pattern": "nomu-gc: report", "min": 1 } ]`, a per-line substring count over the
   run's stderr. `min` / `max` both optional.
-- `collections` — `[ { "kind": "minor", "min": 10 } ]`, a count of the run's collection cycles of `kind`
-  (`minor`, `major`, `forced`; any kind when absent), read from the collector report. A case with it
-  compiles with `gc_record` and runs with `NOMU_GC_REPORT_DIR` set to a directory of its own, which the
-  runner reads after each run. `min` / `max` both optional.
+- `collections` — `[ { "kind": "minor", "min": 10 } ]`, a count of the run's collection cycles, read from the
+  collector report. Each field narrows the cycles counted: `kind` (`minor`, `major`), `trigger` (a name from
+  the report's `names.triggers`, e.g. `program request`), `roots` (exactly this many stack roots); an absent
+  field matches every cycle. A case with it compiles with `gc_record` and runs with `NOMU_GC_REPORT_DIR` set
+  to a directory of its own, which the runner reads after each run. `min` / `max` both optional.
+- `report_metrics` — `[ { "path": "allocation.objects", "equals": 200009 } ]`, values from the same report's
+  `metrics` by dot-separated path: `equals`, or `min` / `max`, or `"absent": true` for a path the report must
+  not have. Like `collections`, it turns on `gc_record` (a case compiled with `gc_record_full` keeps `full`).
+  `gc-record-full` and its stress leg pin the allocation counts exactly.
 - `object_symbols` — `[ { "pattern": "_nomu_fn_rt", "max": 0 } ]`, a count of defined symbols (`nm -U`)
   containing the substring in the fixture's own object (`<binary>.o`), checked once after compile. `min` /
   `max` both optional. Pins what the program's object defines, e.g. no duplicated runtime / `std` copies.
 - `object_references` — the same shape over undefined symbols (`nm -u`): what the object calls out to,
   e.g. `__nomu_gc_poll_slow` absent from runtime-subset code.
-- `stdin_file` / `stdin_delay_ms` — a repo-relative file fed to the program's stdin through a pipe, written
-  `stdin_delay_ms` after launch and then closed (end of input). Without it stdin is `/dev/null`. The delay
-  lets a case observe a program waiting on input (`read-line`: other fibers run meanwhile).
+- `stdin_file` / `stdin_after` — a repo-relative file fed to the program's stdin through a pipe, then closed
+  (end of input). Without it stdin is `/dev/null`. With `stdin_after`, the file is written once the
+  program's stderr shows that text (stdout is buffered on a pipe, stderr is not). A case that observes a
+  program waiting on input builds with `rt_prelude` and writes the text when the wait is certain, e.g. once
+  `rtStdinWaiters()` counts its readers (`read-line`, `read-line-readers`, `read-line-gc`).
 - `timeout_sec` / `compile_timeout_sec` — per-run and per-compile caps (defaults 60 / 120). Every
   run is bounded; on expiry the whole process group is killed and the case reports `TIMEOUT`.
 - `weight` — lanes the case occupies in the fixed-8 pool (default 1). A self-parallelizing case
@@ -91,8 +100,6 @@ since no package may sit at a workspace root. Fields:
 - `full_iterations` — repetitions under `--tier full`, when more than `iterations`: a case repeated to catch
   a timing-dependent race runs `iterations` times in the fast tier and `full_iterations` in the full tier.
   Groups take it too.
-- `timing_sensitive` — run the case alone after the rest, with the pool otherwise idle (a delayed stdin
-  feed racing other fibers, an external driver thread that must fire before a short program exits). There are no automatic retries; use `--repeat` to measure a flake.
 
 Unknown keys are an error, at every level of the manifest.
 
@@ -107,19 +114,25 @@ setting at the wrong stage, is an error. Compile settings select configs declare
 - Compile: `optimize` (`-c release`), `inline`, `escape`, `scalar`, `devirt` (each default `true`; `false`
   selects `no_inline` and the like, turning the pass off), `rt_prelude` (fixtures that call `rt*` directly),
   `runtime_tier` (fixtures that call the `Runtime` intrinsics without the runtime prelude),
-  `gc_record` (the collector's recorder at `limited`; `collections` turns it on).
+  `gc_record` (the collector's recorder at `limited`; `collections` turns it on), `gc_immix` (the `immix`
+  collector plan: whole-heap collection only, no write barrier).
 - Run: `gc_stress_bytes` (a
   collection every N bytes a carrier allocates), `nursery_blocks` (a minor collection when the nursery
-  fills N 32 KiB blocks), `mature_floor` (every collection major below this mature size),
-  `gc_trigger_reserve`, and the external driver threads `gc_pressure_driver` (heap-pressure defrag),
-  `stw_collect_driver` (timed forced evacuation) and `stw_selfhost_driver` (timed root-walk STW).
+  fills N 32 KiB blocks), `mature_floor` (every collection major below this mature size).
+
+A case that needs a collection at an exact point builds with `rt_prelude` and calls `rtGcRequest(kind)`
+from the fixture: the request goes through the coordinator, and the caller stops at its next safepoint poll.
+It returns a ticket; a loop that spins until `rtGcCollected(ticket)` holds the caller in the loop until the
+collection has run. Assert the requested cycle with `"trigger": "program request"` (`stw-collect`,
+`stw-running`, `stw-inlined-loop` and the `module-generic-*` evacuation cases).
 
 ## GC legs
 
 Every program runs on the Nomu runtime (the Nomu scheduler and collector). A fixture's plain case runs it
 with no setting; its collecting legs force collections and check with `collections` (on the case or a
 dimension value) that they ran: `-evac` cases use `gc_stress_bytes`, `-nursery` cases
-`nursery_blocks`.
+`nursery_blocks`. The `gc` dimension's `immix-stress` value (full tier) builds under the `immix` plan
+(`gc_immix`) and asserts major collections only.
 
 ## Dimensions and groups
 

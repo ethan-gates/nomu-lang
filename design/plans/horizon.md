@@ -8,11 +8,11 @@ detail and status; this doc carries only the goals and their order. Everything n
 parallel/cheap work tracked in `tasks.md`.
 
 Two epics are live. **Epic A (self-hosted GC + runtime) is the active priority.** The runtime is the Nomu
-scheduler and collector over a small C floor. The **modules build-out** sits beneath the benchmark, which needs
+scheduler and collector over the asm floor (context switch and fiber init). The **modules build-out** sits beneath the benchmark, which needs
 programs large enough to be meaningful and the perf-affecting module capabilities real: build graph granularity
 for dev-productivity, then the perf-relevant capabilities (cross-module generics residuals, cross-module
-inlining). The benchmark against Go and Swift sits above that, when the language is complete, with the GC
-packaging (158) and fiber stacks (104) ready before any collector is measured.
+inlining). The benchmark against Go and Swift sits above that, when the language is complete, with fiber
+stacks (104) ready before any collector is measured.
 Epic B (strings) has only independent follow-ons left.
 
 ---
@@ -26,20 +26,15 @@ and smaller than Go and Swift."
 
 **Order rule:** self-hosting is a *location* change (MMTk/Rust → Nomu); LXR is an *algorithm* change
 (GenImmix → RC-hybrid). Hold the algorithm constant while moving location, then hold location constant
-while changing the algorithm — so the two unknowns never multiply. The C floor's retirement (223) is the location change that
-remains, done on GenImmix before LXR: LXR is then built and compared on a runtime with no C under it, and
-new runtime work stops choosing between growing the C and adding edges to it.
+while changing the algorithm — so the two unknowns never multiply. The location change is done on GenImmix:
+no C remains under the runtime. (223's blocker 6, the asm floor moving into the runtime's object, serves only
+[192](tasks/192-bazel-friendliness.md), off this chain.)
 
 ```
 127  LXR — RC-primary reclamation, on Immix backing; then the GenImmix–LXR comparison   ◀ end goal
 └── benchmark against Go and Swift, on GenImmix (when the language is complete)
-    ├── 223  retire the C floor, from the floor up                         ◀ next
-    │   ├── 224  globals — module-private top-level `let` (223.1 needs 224.1–224.3)
-    │   ├── 226  collector work buffers that overflow silently — made growable  (built)
-    │   └── 159.6  GC observability's `full` level — fast-path allocation counters  (after 226)
-    ├── 158  GC packaging — self-contained plans behind one trigger protocol  (223.5 with it)
     ├── 104  fiber stack strategy — guard page, lazy commit, growth       (before any GC is measured)
-    │   └── 219  runtime fault handling — one signal handler, reporters
+    │   └── 219  runtime fault handling — one signal handler, reporters  ◀ next
     ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
     │        complements 179 (value-level GC classification)
     ├── 171  modules cleanup — cross-module generics residuals           (perf-accuracy)
@@ -47,10 +42,9 @@ new runtime work stops choosing between growing the C and adding edges to it.
     └── 217  build graph granularity — sliced keys, scheduler (staged jobs deferred)  (dev-productivity)
 ```
 
-**Order of the next run:** [223](tasks/223-retire-the-c-floor.md) next, from the floor up: 223.1 (the floor: the `Runtime` namespace, globals, the carrier-local slot, raw memory) and 223.2 (carrier state and the allocation fast path in Nomu), then [226](tasks/226-collector-buffer-overflow.md) (the collector's root, remembered-set and mark buffers drop or overrun past a fixed size; a correctness fix). 223 continues as far as it goes before anything else: 223.3 (the forwarders, emitted by codegen), 223.4 (GC metadata), 223.5 short of the coordinator threads (`main`, line input and its poller), and 223.6 (the remainder). Then [228](tasks/228-split-runtime-nomu.md) (`runtime.nomu` split into ten files of one module, a pure move), then 159.6 (the `full` level: allocation counted on the fast path, for survival and allocation rates). [158](tasks/158-gc-packaging.md) follows, debugged with [159](tasks/159-gc-observability.md)'s collector report; 223.5 moves the coordinator threads with it. [104](tasks/104-fiber-stack-strategy.md) (fiber stacks: overflow detection, lazy commit, growth) and its
-prerequisite [219](tasks/219-runtime-fault-handling.md) (fault handling) come before any collector is
-measured, so the benchmarks run on large, fiber-heavy programs. 158 is what remains of the GC ladder
-([150](tasks/150-selfhosted-gc-ladder.md)). [217](tasks/217-build-graph-granularity.md)'s
+**Order of the next run:** [219](tasks/219-runtime-fault-handling.md) (fault handling), then
+[104](tasks/104-fiber-stack-strategy.md) (fiber stacks: overflow detection, lazy commit, growth), both
+before any collector is measured, so the benchmarks run on large, fiber-heavy programs. [217](tasks/217-build-graph-granularity.md)'s
 remaining design (the slice's closure, the header format and hash, per-declaration keys on direct dependencies)
 is paused. Off this chain: [204](tasks/204-yaml-parser-upgrades.md) (YAML parser upgrades),
 [205](tasks/205-config-upgrades.md) (configuration upgrades), and 176.4 (the escape-promotion placement route)

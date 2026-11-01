@@ -1,11 +1,26 @@
-// Collections while a fiber is parked in `readLine` (suite case `read-line-gc`, NOMU_GC_STRESS, stdin fed
-// late): `main` holds a heap Box and a heap String across the park while `churn` allocates and forces
-// collections. The STW walks `main` from the anchor the `readLine` forwarder recorded, so both survive the moves.
+// Collections while a fiber is parked in `readLine` (suite case `read-line-gc`, NOMU_GC_STRESS, built with
+// `test.runtime_prelude`): `main` holds a heap Box and a heap String across the park while `churn`
+// allocates and forces collections. `churn` starts only once `main` is on the stdin waiter list and tells the
+// harness to write stdin only when it is done, so every collection runs with `main` parked. The STW walks
+// `main` from the anchor the `readLine` forwarder recorded, so both survive the moves.
+
+// Tell the harness to write stdin (the suite case's `stdin_after`): stderr is unbuffered, so the line
+// arrives as it is written.
+fun signalReady() {
+  let buf = RawPtr.alloc(bytes: 16, align: 8)
+  let n = Runtime.copyLiteral(to: buf, "ready\n")
+  let w = Runtime.writeFd(fd: 2, buf: buf, count: n)
+  buf.free()
+}
+
 class Box {
   var v: Int
 }
 
 fun churn() -> Int {
+  while rtStdinWaiters() < 1 {
+    sleep(1)
+  }
   var sum = 0
   var i = 0
   while i < 60000 {
@@ -13,6 +28,7 @@ fun churn() -> Int {
     sum = sum + b.v % 7
     i = i + 1
   }
+  signalReady()
   return sum
 }
 

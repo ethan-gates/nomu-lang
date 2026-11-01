@@ -184,6 +184,12 @@ enum RuntimeIntrinsics {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return NOIRExpr(type: .int, span: span, kind: .intLit(s.gcRecordLevel))
+        // The `gc.plan` setting as a constant (0 genimmix, 1 immix), so code for the plan not chosen folds away.
+        case "gcPlan":
+            guard PointerIntrinsics.checkArgLabels(&s, args, [], "Runtime.gcPlan", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return NOIRExpr(type: .int, span: span, kind: .intLit(s.gcPlan))
         // The carrier-local slot: one word per carrier thread, holding the running fiber, so a fiber that
         // parks can find itself without threading its handle through user code. A direct read of the
         // thread's TSD slot for a key the runtime creates at startup (`tasks/223-retire-the-c-floor.md`,

@@ -61,8 +61,12 @@ let settingTable: [String: SettingDef] = [
                                      help: "compile against the runtime prelude (fixtures that call rt* directly)"),
     "runtime_tier":       SettingDef(stage: .compile, carrier: .configWhen(true, "runtime_tier"),
                                      help: "admit the fixture to the runtime tier (calls `Runtime` intrinsics directly)"),
+    "gc_immix":           SettingDef(stage: .compile, carrier: .configWhen(true, "gc_immix"),
+                                     help: "the `immix` collector plan: whole-heap collection, no write barrier (`gc.plan`)"),
     "gc_record":          SettingDef(stage: .compile, carrier: .configWhen(true, "gc_record"),
                                      help: "the collector's recorder at `limited` (`gc.record`)"),
+    "gc_record_full":     SettingDef(stage: .compile, carrier: .configWhen(true, "gc_record_full"),
+                                     help: "the collector's recorder at `full`: allocation counted (`gc.record`)"),
     // Run settings.
     "gc_stress_bytes":    SettingDef(stage: .run, carrier: .envValue("NOMU_GC_STRESS"),
                                      help: "a collection every N bytes a carrier allocates"),
@@ -70,14 +74,6 @@ let settingTable: [String: SettingDef] = [
                                      help: "minor collection when the nursery fills N 32 KiB blocks"),
     "mature_floor":       SettingDef(stage: .run, carrier: .envValue("NOMU_MATURE_FLOOR"),
                                      help: "mature-space size below which every collection is major"),
-    "gc_trigger_reserve": SettingDef(stage: .run, carrier: .envValue("NOMU_GC_TRIGGER_RESERVE"),
-                                     help: "free-block reserve that triggers a collection"),
-    "gc_pressure_driver": SettingDef(stage: .run, carrier: .envWhen(true, "NOMU_GC_PRESSURE"),
-                                     help: "external heap-pressure defrag driver thread"),
-    "stw_collect_driver": SettingDef(stage: .run, carrier: .envWhen(true, "NOMU_STW_COLLECT"),
-                                     help: "external timed forced-evacuation driver thread"),
-    "stw_selfhost_driver": SettingDef(stage: .run, carrier: .envWhen(true, "NOMU_STW_SELFHOST"),
-                                      help: "external timed root-walk STW driver thread"),
 ]
 
 // The manifest decoder's snake_case conversion also rewrites dictionary keys (`gc_record` arrives as `gcRecord`),

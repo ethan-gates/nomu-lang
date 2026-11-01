@@ -199,17 +199,19 @@ fun rtRecOpenPhase(rec: RawPtr) -> Int {
 // ---- What the collector records (GenImmix) ----
 // The collector calls these hooks; each is empty unless `gc.record` is on, so with it off they fold away in
 // the release-built runtime. Ids, which the report names:
-//   cycle kinds: 1 minor, 2 major, 3 forced (every object moved; the smoke driver).
-//   triggers:    0 an external driver (no request), 1 nursery full, 2 mature floor (a minor escalated to a
-//                major), 3 heap exhausted, 4 allocation stress.
+//   cycle kinds: 1 minor, 2 major.
+//   triggers:    0 none recorded, 1 nursery full, 2 mature floor (a minor escalated to a major), 3 heap
+//                exhausted, 4 allocation stress, 5 a request from the program (rtGcRequest, white-box tests).
 //   phases:      1 time to safepoint (the request to the collector's entry, with every carrier stopped),
 //                2 root walk, 3 remembered-set drain, 4 stack roots, 5 remembered set, 6 large objects,
 //                7 scan, 8 unmark and unlog, 9 nursery reclaim, 10 source selection, 11 prepare, 12 trace,
 //                13 sweep, 14 large-object sweep, 15 log-table clear, 16 unmark, 17 snapshot, 18 collect
 //                (the collector's entry to its return; the rest nest in it).
-//   counters:    1 roots, 2 objects promoted, 3 remembered entries, 4 defrag sources; a snapshot: 20 free
-//                blocks, 21 recyclable, 22 full, 23 nursery, 24 large objects, 25 blocks in the heap; since
-//                the last cycle: 30 blocks refilled, 31 large objects allocated, 32 their bytes.
+//   counters:    1 roots, 2 objects promoted, 3 remembered entries, 4 defrag sources, 5 bytes promoted; a
+//                snapshot: 20 free blocks, 21 recyclable, 22 full, 23 nursery, 24 large objects, 25 blocks
+//                in the heap; since the last cycle: 30 blocks refilled, 31 large objects allocated, 32 their
+//                bytes, and at the `full` level 33 objects allocated, 34 bytes allocated (every allocation,
+//                counted per carrier).
 // The pause ends when the coordinator resumes the world, after the collector returns; that tail (the TLAB and
 // mod-buffer resets after the collect interval closes, and the coordinator's wake) is not recorded.
 
@@ -219,6 +221,16 @@ fun rtGcRecordRequest(trigger: Int) {
     let rec = rtRecSpace()
     if !rec.isNull {
       rec.store(Runtime.ticks(), toByteOffset: 128)
+      rec.store(trigger, toByteOffset: 136)
+    }
+  }
+}
+
+// A major request outranking a pending minor (rtGcRaise): the cycle's trigger becomes the major's.
+fun rtGcRecordTrigger(trigger: Int) {
+  if Runtime.gcRecordLevel() > 0 {
+    let rec = rtRecSpace()
+    if !rec.isNull {
       rec.store(trigger, toByteOffset: 136)
     }
   }
@@ -252,6 +264,15 @@ fun rtGcRecordEntry(kind: Int) -> Int {
       rec.store(0, toByteOffset: 144)
       rec.store(0, toByteOffset: 152)
       rec.store(0, toByteOffset: 160)
+      if Runtime.gcRecordLevel() > 1 {
+        let counts = RawPtr.alloc(bytes: 16, align: 8)
+        rtCarriersAllocCounts(counts, true)
+        let objects: Int = counts.load(fromByteOffset: 0)
+        let bytes: Int = counts.load(fromByteOffset: 8)
+        rtRecCounter(rec, 33, objects)
+        rtRecCounter(rec, 34, bytes)
+        counts.free()
+      }
       rtGcRecordSnapshot(rec)
       return rtRecOpen(rec, 18)
     }
@@ -511,13 +532,13 @@ fun rtGcPutName(buf: RawPtr, table: Int, id: Int) {
   if table == 1 {
     if id == 1 { n = Runtime.copyLiteral(to: at, "minor") }
     else if id == 2 { n = Runtime.copyLiteral(to: at, "major") }
-    else if id == 3 { n = Runtime.copyLiteral(to: at, "forced") }
   } else if table == 2 {
-    if id == 0 { n = Runtime.copyLiteral(to: at, "external driver") }
+    if id == 0 { n = Runtime.copyLiteral(to: at, "none") }
     else if id == 1 { n = Runtime.copyLiteral(to: at, "nursery full") }
     else if id == 2 { n = Runtime.copyLiteral(to: at, "mature floor") }
     else if id == 3 { n = Runtime.copyLiteral(to: at, "heap exhausted") }
     else if id == 4 { n = Runtime.copyLiteral(to: at, "allocation stress") }
+    else if id == 5 { n = Runtime.copyLiteral(to: at, "program request") }
   } else if table == 3 {
     if id == 1 { n = Runtime.copyLiteral(to: at, "time to safepoint") }
     else if id == 2 { n = Runtime.copyLiteral(to: at, "root walk") }
@@ -542,6 +563,7 @@ fun rtGcPutName(buf: RawPtr, table: Int, id: Int) {
     else if id == 2 { n = Runtime.copyLiteral(to: at, "objects promoted") }
     else if id == 3 { n = Runtime.copyLiteral(to: at, "remembered entries") }
     else if id == 4 { n = Runtime.copyLiteral(to: at, "defrag sources") }
+    else if id == 5 { n = Runtime.copyLiteral(to: at, "bytes promoted") }
     else if id == 20 { n = Runtime.copyLiteral(to: at, "free blocks") }
     else if id == 21 { n = Runtime.copyLiteral(to: at, "recyclable blocks") }
     else if id == 22 { n = Runtime.copyLiteral(to: at, "full blocks") }
@@ -551,6 +573,8 @@ fun rtGcPutName(buf: RawPtr, table: Int, id: Int) {
     else if id == 30 { n = Runtime.copyLiteral(to: at, "blocks refilled") }
     else if id == 31 { n = Runtime.copyLiteral(to: at, "large objects allocated") }
     else if id == 32 { n = Runtime.copyLiteral(to: at, "large-object bytes allocated") }
+    else if id == 33 { n = Runtime.copyLiteral(to: at, "objects allocated") }
+    else if id == 34 { n = Runtime.copyLiteral(to: at, "bytes allocated") }
   }
   rtBufGrew(buf, n)
   rtBufByte(buf, 34)
@@ -559,17 +583,17 @@ fun rtGcPutName(buf: RawPtr, table: Int, id: Int) {
 // `"names":{...}`: every id the report uses, by table.
 fun rtGcPutNames(buf: RawPtr) {
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "\"names\":{\"kinds\":{"))
-  rtGcPutNameList(buf, 1, 1, 3)
+  rtGcPutNameList(buf, 1, 1, 2)
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"triggers\":{"))
-  rtGcPutNameList(buf, 2, 0, 4)
+  rtGcPutNameList(buf, 2, 0, 5)
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"phases\":{"))
   rtGcPutNameList(buf, 3, 1, 18)
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"counters\":{"))
-  rtGcPutNameList(buf, 4, 1, 4)
+  rtGcPutNameList(buf, 4, 1, 5)
   rtBufByte(buf, 44)
   rtGcPutNameList(buf, 4, 20, 25)
   rtBufByte(buf, 44)
-  rtGcPutNameList(buf, 4, 30, 32)
+  rtGcPutNameList(buf, 4, 30, 34)
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "}}"))
 }
 
@@ -924,6 +948,14 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
   var peakInUse = 0
   var peakLarge = 0
   var heapBlocks = 0
+  // Allocation (the `full` level) and promotion totals; a minor's promoted bytes over the bytes allocated
+  // since the cycle before it is its survival, summed over the minors.
+  var allocObjects = 0
+  var allocBytes = 0
+  var promotedObjects = 0
+  var promotedBytes = 0
+  var minorAlloc = 0
+  var minorPromoted = 0
 
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "{\"version\":1,\"binary\":\""))
   rtBufJsonBytes(buf, name, nameLen)
@@ -1036,6 +1068,20 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
             }
           } else if qid == 24 && qv > peakLarge {
             peakLarge = qv
+          } else if qid == 33 {
+            allocObjects = allocObjects + qv
+          } else if qid == 34 {
+            allocBytes = allocBytes + qv
+            if id == 1 {
+              minorAlloc = minorAlloc + qv
+            }
+          } else if qid == 2 {
+            promotedObjects = promotedObjects + qv
+          } else if qid == 5 {
+            promotedBytes = promotedBytes + qv
+            if id == 1 {
+              minorPromoted = minorPromoted + qv
+            }
           }
         }
         k = k + 1
@@ -1088,7 +1134,31 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
     }
     w = w * 10
   }
-  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "],\"heap\":{\"blocks\":"))
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "],\"promotion\":{\"objects\":"))
+  rtBufInt(buf, promotedObjects)
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), ",\"bytes\":"))
+  rtBufInt(buf, promotedBytes)
+  rtBufByte(buf, 125)
+  if Runtime.gcRecordLevel() > 1 {
+    // The allocation after the last cycle, which no cycle took: every carrier is stopped at exit.
+    let tail = RawPtr.alloc(bytes: 16, align: 8)
+    rtCarriersAllocCounts(tail, false)
+    let tailObjects: Int = tail.load(fromByteOffset: 0)
+    let tailBytes: Int = tail.load(fromByteOffset: 8)
+    tail.free()
+    allocObjects = allocObjects + tailObjects
+    allocBytes = allocBytes + tailBytes
+    rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"allocation\":{\"objects\":"))
+    rtBufInt(buf, allocObjects)
+    rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), ",\"bytes\":"))
+    rtBufInt(buf, allocBytes)
+    rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), ",\"meanObjectBytes\":"))
+    rtBufFraction(buf, allocBytes, allocObjects)
+    rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 32), ",\"minorSurvival\":"))
+    rtBufFraction(buf, minorPromoted, minorAlloc)
+    rtBufByte(buf, 125)
+  }
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"heap\":{\"blocks\":"))
   rtBufInt(buf, heapBlocks)
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"peakBlocksInUse\":"))
   rtBufInt(buf, peakInUse)

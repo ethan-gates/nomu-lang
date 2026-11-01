@@ -46,7 +46,7 @@ final class LLVMGen {
     let i64: LLVMTypeRef
     let f64: LLVMTypeRef        // `Double` — LLVM's native double
     let voidTy: LLVMTypeRef
-    let strTy: LLVMTypeRef      // { i64 word0, i64 word1 } — the bit-stealing String (task 121/176); matches runtime.h `String`
+    let strTy: LLVMTypeRef      // { i64 word0, i64 word1 } — the bit-stealing String (task 121/176)
     let closureHdrTy: LLVMTypeRef  // { i64 header, i8ptr fn } — the fixed prefix of a heap closure { fn, caps… }
     let anyBoxTy: LLVMTypeRef      // { i64 header, i8ptr witness (addr0), p1 payload } — the `any I` heap box (D1)
     let spawnHandleTy: LLVMTypeRef // { i8ptr fiber (addr0, runtime-owned) } — SpawnHandle (8.2.6)
@@ -236,6 +236,12 @@ final class LLVMGen {
     // §6.6 — inline the allocation TLAB bump fast path; off (`opt.inline_alloc: false`) sends every allocation
     // to the out-of-line `rtTlabAlloc` for A/B measurement.
     var inlineAlloc = true
+    // The `full` recording level (`gc.record: full`): the inline allocation hit path counts each object and
+    // its bytes in the carrier record's TLAB (`allocObjects` @48, `allocBytes` @56).
+    var countsAllocations = false
+    // The write barrier, which only a generational plan needs (`gc.plan: genimmix`). Off (`immix`), the
+    // barrier seams are a plain store and nothing.
+    var emitsWriteBarrier = true
 
     init(ctx: LLVMContextRef, mod: LLVMModuleRef) {
         self.ctx = ctx

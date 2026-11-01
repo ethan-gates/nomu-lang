@@ -106,6 +106,22 @@ fun rtReadLine(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
   return RawPtr.null
 }
 
+// The number of fibers on the stdin waiter list, for white-box tests built with `test.runtime_prelude`: a
+// fiber joins the list before it parks in rtReadLine, so a test waits until its readers are on it before it
+// tells the harness to write stdin (the suite's `stdin_after`).
+fun rtStdinWaiters() -> Int {
+  let st = rtStdin
+  rtSchedMutexLockAt(st)
+  var n = 0
+  var w: RawPtr = st.load(fromByteOffset: 48)
+  while !w.isNull {
+    n = n + 1
+    w = w.load(fromByteOffset: 8)
+  }
+  rtSchedMutexUnlockAt(st)
+  return n
+}
+
 // Copy `n` bytes at `buf + from` into a fresh line block: the count at 0, the bytes at 8.
 fun rtStdinTake(st: RawPtr, buf: RawPtr, from: Int, n: Int) -> RawPtr {
   let line = RawPtr.alloc(bytes: 8 + n, align: 8)

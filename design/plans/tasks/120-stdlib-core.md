@@ -25,6 +25,11 @@ into `std`.
   borrowed and where the copy happens. The byte-level `String` already exposes byte reads via `byte(at:)`.
 - **Basic I/O to get programs started:** file I/O and network I/O on the colorless blocking model
   (syscall offload, `runtime.md` §5). Likely also env, process, time, stdio.
+  - **Open (stdio): whether `readLine` flushes stdout before it waits.** Today `print` output is buffered
+    when stdout is a pipe and flushed only at exit, so a prompt printed before `readLine` never shows on a
+    pipe, and on a terminal only after a newline. C++ ties `cin` to `cout` and flushes before every read.
+    Found in [158.6](158-gc-packaging.md), where the suite needed a signal from a waiting program and used
+    stderr, which is unbuffered.
 
 ## Cross-cutting — where does it belong
 

@@ -1,7 +1,17 @@
 // `readLine` parks the calling fiber until stdin has a line, so its carrier keeps running other fibers. The
-// suite feeds stdin late (suite case `read-line`): on one carrier the ticker's three ticks must all print
-// while `main` waits for its first line. Then: a second line, an unterminated last line returned whole, and
-// end of input as an empty string.
+// suite writes stdin only once the ticker has printed its three ticks (suite case `read-line`, built with
+// `test.runtime_prelude`): `main` waits for its first line while they print, even on one carrier. Then: a
+// second line, an unterminated last line returned whole, and end of input as an empty string.
+
+// Tell the harness to write stdin (the suite case's `stdin_after`): stderr is unbuffered, so the line
+// arrives as it is written.
+fun signalReady() {
+  let buf = RawPtr.alloc(bytes: 16, align: 8)
+  let n = Runtime.copyLiteral(to: buf, "ready\n")
+  let w = Runtime.writeFd(fd: 2, buf: buf, count: n)
+  buf.free()
+}
+
 fun ticker() -> Int {
   var i = 0
   while i < 3 {
@@ -9,6 +19,7 @@ fun ticker() -> Int {
     print("tick\n")
     i = i + 1
   }
+  signalReady()
   return i
 }
 
