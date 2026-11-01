@@ -1,0 +1,14 @@
+// Programs that call the runtime prelude directly: an Immix region, the prelude's own entry points.
+//
+// A bundle (tests/README.md, "Bundles"): each module is a former fixture whose `main` became
+// `bundleMain`; this entry runs them in turn, each after a `== <module>` line, so a failing diff names
+// the part that broke.
+import pkg/immix_region
+import pkg/rt_prelude
+
+fun main() {
+  print("== immix_region\n")
+  immix_region.bundleMain()
+  print("== rt_prelude\n")
+  rt_prelude.bundleMain()
+}

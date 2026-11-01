@@ -6,10 +6,10 @@ import Foundation
 // off the project root and the manifest.
 
 let USAGE = """
-    usage: compiler-test <config> [--enable a,b,*] [--disable a,b,*] [--where axis=value,…] [--tier fast|full]
+    usage: compiler-test <manifest> [--enable a,b,*] [--disable a,b,*] [--where axis=value,…] [--tier fast|full]
                          [--repeat N] [--compiler PATH] [--deadline SEC] [--jobs N] [--check-reproducible]
 
-    config           manifest path (required)
+    manifest         the manifest directory, e.g. tests/suite (required)
     --enable LIST    run only these cases (base becomes empty, then these are added)
     --disable LIST   run everything except these
     --where LIST     run only group runs with these dimension values (axis=value, comma-separated)
@@ -170,10 +170,8 @@ struct Ctx {
             i += 1
         }
 
-        guard let configPath = configArg else { die("no config given — specify a manifest path\n\n" + USAGE) }
-        let manifest: Manifest
-        do { manifest = try loadManifest(configPath) }
-        catch { die("failed to read manifest \(configPath): \(error)") }
+        guard let configPath = configArg else { die("no manifest given — specify the manifest directory\n\n" + USAGE) }
+        let manifest = loadManifest(configPath)
 
         let root = findProjectRoot()
         // Default the pool to the host's cores minus a small buffer (the harness's own I/O / timer threads

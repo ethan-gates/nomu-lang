@@ -234,7 +234,7 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
    (check+register+park under the lock, closing the join lost-wakeup window), and the `fiberMain`
    completion path are all threaded through it. Added one substrate primitive — `RawPtr.atomicExchange`
    (`__atomicExchange`, LLVM `atomicrmw xchg`, the mutex's swap), covered directly in `tools/atomics.sh`.
-   Four scenarios green (`tools/scheduler-lock.sh`, `examples/scheduler_lock.nomu`): spawn/run/complete=6,
+   Four scenarios green (`tools/scheduler-lock.sh`, `tests/fixtures/scheduler_lock.nomu`): spawn/run/complete=6,
    park/unpark=111, join=42, and a **parking-heavy relay** (two fibers bounce a token 1000 rounds each,
    2000 lock-coupled park/unpark cycles) = 2000 — subset-legal and identical under the moving collector,
    watchdogged so a lost wakeup fails loud. Still single-carrier (the lock is uncontended, so the futex
@@ -250,7 +250,7 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
    idle carrier exits for `main` to join. This is the **first rung where the scheduler lock actually
    contends** — `main` and the carriers all take it, so the mutex slow path (`__ulock_wait`) fires for
    real. A fiber records the carrier that switched into it (fiber offset 232) so it can switch back to the
-   right one without TLS. Fixture `examples/scheduler_mc.nomu` (`tools/scheduler-mc.sh`): 4 carriers drain
+   right one without TLS. Fixture `tests/fixtures/scheduler_mc.nomu` (`tools/scheduler-mc.sh`): 4 carriers drain
    100 pre-queued fibers, go idle, then 100 more are pushed from `main` ~50 ms later (each a cross-thread
    wake of a sleeping carrier); every fiber adds 3 to a shared atomic accumulator, so the sum is 600
    regardless of interleaving. NoGC-only and looped 30× (raw carriers are not registered mutators, same
@@ -272,7 +272,7 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
      that switched into it (fiber offset 232) and switches back to that one (built at 128.1.5). Isolated
      TLS check: each thread's slot is independent across a `threadCreate`.
    - **The cross-thread park/unpark stress (the M6 6.4 race), deferred from 128.1.5, now closed.** With
-     `rt_current`, `examples/scheduler_tls.nomu` (`tools/scheduler-tls.sh`) runs 16 A↔B token-pair rings
+     `rt_current`, `tests/fixtures/scheduler_tls.nomu` (`tools/scheduler-tls.sh`) runs 16 A↔B token-pair rings
      bouncing a token via a **lock-coupled hand-off** while 4 carriers steal them off the shared queue,
      racing to claim a fixed work budget. The hand-off makes the partner runnable *and* parks the caller
      under a single scheduler-lock hold (`concurrency.md` §2 `unlockAndPark`): the partner cannot run — so
@@ -285,13 +285,13 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
    - **The live-fiber registry** (`runtime.md` §6) is an intrusive doubly-linked list threaded through
      link slots in the fiber, so the scheduler inserts on spawn and removes on completion in O(1) (no
      scan), and a STW walk iterates it to reach every parked fiber's roots. Built + tested in isolation
-     (`examples/fiber_registry.nomu`, `tools/fiber-registry.sh`): insert, O(1) remove of a middle/head/
+     (`tests/fixtures/fiber_registry.nomu`, `tools/fiber-registry.sh`): insert, O(1) remove of a middle/head/
      tail node, and full iteration report the right live set; subset-legal and GC-independent. 128.3.2
      drives the iteration from a real STW over all mutators.
 7. **128.1.7 — wakeup feeders. Built (both).** The two layer-2 feeders (`concurrency.md` §2), each a
    dedicated thread that unparks a fiber when its wait resolves, each with the 6.4 handoff spanning the
    feeder and the scheduler.
-   - **Timer heap** (`examples/scheduler_timer.nomu`, `tools/scheduler-timer.sh`) — a Nomu min-heap of
+   - **Timer heap** (`tests/fixtures/scheduler_timer.nomu`, `tools/scheduler-timer.sh`) — a Nomu min-heap of
      `(deadline, fiber)` guarded by a second lock (the timer lock), and a timer thread that waits on a
      timer-gen futex until the earliest deadline (or a push) and unparks the due fiber. `fiberSleep` reads
      the monotonic clock, pushes its deadline, and parks holding the *scheduler* lock across the push so
@@ -300,7 +300,7 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
      scheduler lock (in unpark), so the two orders cannot deadlock (the C runtime's rule). Four fibers
      sleeping 40/80/120/160 ms wake in deadline order → 1 2 3 4. No new substrate — the monotonic clock and
      futex timeout are from 128.1.1.
-   - **I/O poller (kqueue)** (`examples/scheduler_poller.nomu`, `tools/scheduler-poller.sh`) — a poller
+   - **I/O poller (kqueue)** (`tests/fixtures/scheduler_poller.nomu`, `tools/scheduler-poller.sh`) — a poller
      thread blocks in `kevent()` and unparks the fiber stashed in a ready event's udata; `waitReadable`
      registers an fd (`EV_ADD|EV_ONESHOT`, udata = the fiber) and parks holding the scheduler lock across
      the register, while the poller does its `kevent()` wait *without* that lock and takes it only to
@@ -312,7 +312,7 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
      (as on the C side). Both fixtures are NoGC-only (raw carriers + feeder threads) and watchdogged.
 8. **128.1.8 — actor mailbox + mailbox-fiber pool. Built.** The fire-and-forget message-send model
    (`concurrency.md` §9), self-hosted over the 128.1.6/128.1.7 machinery in
-   `examples/scheduler_actor.nomu` (`tools/scheduler-actor.sh`), mirroring the C `rt_actor_send` /
+   `tests/fixtures/scheduler_actor.nomu` (`tools/scheduler-actor.sh`), mirroring the C `rt_actor_send` /
    `rt_mailbox_pool` oracle:
    - **Mailbox** — an MT-safe FIFO of messages (`mb_head`/`mb_tail`) plus a `scheduled` flag and a
      `sched_next` link. **`actorSend`** enqueues a message and returns; on the 0→1 schedule edge it appends

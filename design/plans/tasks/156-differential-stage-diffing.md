@@ -14,8 +14,8 @@ byte-identical stage output, and this tool proves it.
 ## Target UX
 
 ```
-nomuc-diff --baseline v0.4.2 examples/gc_stress.nomu --stage=ssair
-nomuc-diff --baseline HEAD~1 examples/gc_stress.nomu --stage=auto      # infer from staged edits
+nomuc-diff --baseline v0.4.2 tests/fixtures/gc_stress.nomu --stage=ssair
+nomuc-diff --baseline HEAD~1 tests/fixtures/gc_stress.nomu --stage=auto      # infer from staged edits
 nomuc-diff --baseline main examples/                  --stage=all      # whole corpus, every stage
 ```
 

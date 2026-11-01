@@ -1,0 +1,739 @@
+# Cases: the collector: allocation, Immix, generations, stop-the-world, root walks, shaped values, the recorder.
+
+cases:
+  - name: gc-anybox
+    fixture: tests/fixtures/gc_anybox
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "10432\n"
+    iterations: 6
+    collections:
+      - min: 1
+
+  - name: gc-string
+    fixture: tests/fixtures/gc_string
+    compile_settings:
+      escape: false
+    expect:
+      stdout_file: tests/expected/gc_string.txt
+    carriers:
+      - 1
+      - 2
+      - 4
+    iterations: 1
+    full_iterations: 4
+    weight: 4
+    collections:
+      - min: 1
+
+  - name: gc-string-field
+    fixture: tests/fixtures/gc_string_field
+    compile_settings:
+      escape: false
+    expect:
+      stdout_file: tests/expected/gc_string_field.txt
+    carriers:
+      - 1
+      - 2
+      - 4
+    iterations: 1
+    full_iterations: 4
+    weight: 4
+    collections:
+      - min: 1
+
+  - name: gc-string-relocate-evac
+    fixture: tests/fixtures/gc_string_relocate
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 256
+    expect:
+      stdout_file: tests/expected/gc_string_relocate.txt
+    iterations: 1
+    full_iterations: 2
+    weight: 4
+    collections:
+      - min: 1
+
+  - name: gc-string-relocate-nursery
+    fixture: tests/fixtures/gc_string_relocate
+    compile_settings:
+      escape: false
+    run_settings:
+      nursery_blocks: 1
+    expect:
+      stdout_file: tests/expected/gc_string_relocate.txt
+    collections:
+      - min: 1
+
+  - name: pair-string-gc
+    fixture: tests/fixtures/pair_string_gc
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "2246000\n"
+    carriers: []
+
+  - name: pair-string-gc-evac
+    fixture: tests/fixtures/pair_string_gc
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 64
+    expect:
+      stdout: "2246000\n"
+    iterations: 1
+    full_iterations: 3
+    weight: 4
+    collections:
+      - min: 1
+
+  - name: pair-string-gc-nursery
+    fixture: tests/fixtures/pair_string_gc
+    compile_settings:
+      escape: false
+    run_settings:
+      nursery_blocks: 1
+    expect:
+      stdout: "2246000\n"
+    collections:
+      - min: 1
+
+  - name: option-string-gc
+    fixture: tests/fixtures/option_string_gc
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "2232000\n"
+    carriers: []
+
+  - name: option-string-gc-evac
+    fixture: tests/fixtures/option_string_gc
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 64
+    expect:
+      stdout: "2232000\n"
+    iterations: 1
+    full_iterations: 3
+    weight: 4
+    collections:
+      - min: 1
+
+  - name: option-string-gc-nursery
+    fixture: tests/fixtures/option_string_gc
+    compile_settings:
+      escape: false
+    run_settings:
+      nursery_blocks: 1
+    expect:
+      stdout: "2232000\n"
+    collections:
+      - min: 1
+
+  - name: enum-nonshaped-gc
+    fixture: tests/fixtures/enum_nonshaped_gc
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "246913578000\n"
+    carriers: []
+
+  - name: enum-nonshaped-gc-evac
+    fixture: tests/fixtures/enum_nonshaped_gc
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 16
+    expect:
+      stdout: "246913578000\n"
+    iterations: 1
+    full_iterations: 3
+    weight: 4
+    collections:
+      - min: 1
+
+  - name: enum-nonshaped-gc-nursery
+    fixture: tests/fixtures/enum_nonshaped_gc
+    compile_settings:
+      escape: false
+    run_settings:
+      nursery_blocks: 1
+    expect:
+      stdout: "246913578000\n"
+    collections:
+      - min: 1
+
+  - name: gen-minor
+    fixture: tests/fixtures/gen_minor
+    run_settings:
+      nursery_blocks: 8
+    expect:
+      stdout: "42\n4242\n94950\n"
+    iterations: 5
+
+  - name: gen-major
+    fixture: tests/fixtures/gen_major
+    run_settings:
+      nursery_blocks: 8
+      mature_floor: 8176
+    expect:
+      stdout: "77\n4242\n94950\n"
+    iterations: 5
+    collections:
+      - kind: minor
+        min: 10
+      - kind: major
+        min: 2
+
+  - name: gen-los
+    fixture: tests/fixtures/gc_los_gen
+    compile_settings:
+      escape: false
+    run_settings:
+      nursery_blocks: 32
+    expect:
+      stdout: "777\n"
+    carriers:
+      - 1
+    iterations: 5
+
+  - name: stw-collect
+    fixture: tests/fixtures/stw_collect
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "111\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+    iterations: 3
+    full_iterations: 15
+    weight: 4
+    collections:
+      - kind: minor
+        trigger: "program request"
+        roots: 2
+        min: 1
+        max: 1
+
+  - name: stw-inlined-loop
+    fixture: tests/fixtures/gc_smoke_t6
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "155400000888"
+    carriers:
+      - 2
+      - 4
+    collections:
+      - kind: minor
+        trigger: "program request"
+        roots: 4
+        min: 1
+        max: 1
+
+  - name: gc-actor
+    fixture: tests/fixtures/gc_actor
+    compile_settings:
+      escape: false
+    expect:
+      stdout_file: tests/expected/gc_actor.txt
+    carriers:
+      - 1
+    iterations: 4
+    collections:
+      - min: 1
+
+  - name: gc-oom
+    fixture: tests/fixtures/gc_pressure
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "94950\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+    iterations: 3
+    collections:
+      - min: 1
+
+  - name: gc-many-carriers
+    fixture: tests/fixtures/gc_many_carriers
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "697728\n"
+    carriers:
+      - 1
+      - 4
+      - 320
+    iterations: 1
+    full_iterations: 3
+    collections:
+      - min: 1
+
+  - name: gc-overflow-roots
+    fixture: tests/fixtures/gc_overflow_roots
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "691040\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - kind: minor
+        min: 1
+
+  - name: gc-overflow-remembered
+    fixture: tests/fixtures/gc_overflow_remembered
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "8400000\n9999998\n"
+    carriers:
+      - 1
+    collections:
+      - kind: minor
+        min: 2
+
+  - name: gc-request-precedence
+    fixture: tests/fixtures/gc_request_precedence
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "42\n"
+    carriers:
+      - 1
+      - 4
+    iterations: 3
+    collections:
+      - kind: major
+        trigger: "program request"
+        min: 1
+        max: 1
+      - kind: minor
+        max: 0
+
+  - name: gc-overflow-mark
+    fixture: tests/fixtures/gc_overflow_mark
+    compile_settings:
+      escape: false
+      gc_immix: true
+    expect:
+      stdout: "604999450000\n39999999\n"
+    carriers:
+      - 1
+    collections:
+      - kind: major
+        min: 1
+
+  - name: gc-oom-concurrent
+    fixture: tests/fixtures/gc_concurrent
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "392320\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+      - 8
+    iterations: 3
+    collections:
+      - min: 1
+
+  - name: gen-mc-actor
+    fixture: tests/fixtures/gc_actor_mc
+    compile_settings:
+      escape: false
+    run_settings:
+      nursery_blocks: 64
+    expect:
+      stdout: ""
+    carriers:
+      - 1
+      - 2
+      - 4
+      - 8
+    iterations: 3
+    collections:
+      - kind: minor
+        min: 1
+
+  - name: gen-mc-concurrent
+    fixture: tests/fixtures/gc_concurrent
+    compile_settings:
+      escape: false
+    run_settings:
+      nursery_blocks: 64
+    expect:
+      stdout: "392320\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+      - 8
+    iterations: 3
+    collections:
+      - kind: minor
+        min: 1
+
+  - name: mark-verify
+    fixture: tests/fixtures/mark_verify
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "99\nTOTAL 2\nLIVE 0 1\nLIVE 1 1\nLIVE 2 0\nLIVE 3 0\nFP 32523553956047741\n"
+    carriers: []
+
+  - name: mark-verify-arr
+    fixture: tests/fixtures/mark_verify_arr
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "TOTAL 5\nLIVE 0 1\nLIVE 1 1\nLIVE 2 3\nLIVE 3 0\nLIVE 4 0\nFP 219055701645145072\n"
+    carriers: []
+
+  - name: walk-mark
+    fixture: tests/fixtures/walk_mark
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "nroots 2 total 4\nFP 156878319082112616\n30\n"
+    carriers: []
+
+  - name: walk-multiframe
+    fixture: tests/fixtures/walk_multiframe
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "NOMU-ROOT 33\nNOMU-ROOT 33\nNOMU-ROOT 44\nNOMU-ROOT 44\nNOMU-ROOT 11\nNOMU-ROOT 11\nNOMU-ROOT 22\nNOMU-ROOT 22\n110\n"
+    carriers:
+      - 1
+      - 4
+
+  - name: stw-selfhost
+    fixture: tests/fixtures/stw_selfhost
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "999\nnroots 4\nPARKED-ROOT 111\nPARKED-ROOT 111\nPARKED-ROOT 222\nPARKED-ROOT 222\n333\n"
+    carriers:
+      - 1
+    iterations: 3
+
+  - name: stw-running
+    fixture: tests/fixtures/stw_running
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "333\n"
+    carriers:
+      - 2
+      - 4
+    iterations: 3
+    collections:
+      - kind: minor
+        trigger: "program request"
+        roots: 4
+        min: 1
+        max: 1
+
+  - name: gc-record-full
+    fixture: tests/fixtures/gc_record_full
+    compile_settings:
+      gc_record_full: true
+    run_settings:
+      nursery_blocks: 4
+    expect:
+      stdout: "199999 200\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - kind: minor
+        min: 10
+    report_metrics:
+      - path: allocation.objects
+        equals: 200009
+      - path: allocation.bytes
+        equals: 3204216
+      - path: promotion.objects
+        min: 100
+        max: 400
+      - path: allocation.minorSurvival
+        min: 0.001
+        max: 0.01
+
+  - name: gc-record-full-stress
+    fixture: tests/fixtures/gc_record_full
+    compile_settings:
+      gc_record_full: true
+    run_settings:
+      gc_stress_bytes: 65536
+    expect:
+      stdout: "199999 200\n"
+    carriers:
+      - 1
+      - 4
+    report_metrics:
+      - path: allocation.objects
+        equals: 200009
+      - path: allocation.bytes
+        equals: 3204216
+
+  - name: gc-record-limited-shape
+    fixture: tests/fixtures/gc_record_full
+    run_settings:
+      nursery_blocks: 4
+    expect:
+      stdout: "199999 200\n"
+    carriers:
+      - 1
+    collections:
+      - kind: minor
+        min: 10
+    report_metrics:
+      - path: allocation
+        absent: true
+      - path: promotion.objects
+        min: 100
+
+  - name: arr-gc
+    fixture: tests/fixtures/arr_gc
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "200\n19900\n"
+    carriers: []
+    object_symbols:
+      - pattern: __nomu_alloc_slow
+        min: 1
+
+  - name: arr-gc-evac
+    fixture: tests/fixtures/arr_gc
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 512
+    expect:
+      stdout: "200\n19900\n"
+    carriers: []
+    collections:
+      - min: 1
+
+  - name: escape-nonleaf
+    fixture: tests/fixtures/escape_nonleaf
+    expect:
+      stdout: "12345\n7\n4999950000\n"
+    carriers: []
+
+  - name: escape-nonleaf-evac
+    fixture: tests/fixtures/escape_nonleaf
+    run_settings:
+      gc_stress_bytes: 512
+    expect:
+      stdout: "12345\n7\n4999950000\n"
+    carriers: []
+    collections:
+      - min: 1
+
+  - name: gc-stress
+    fixture: tests/fixtures/gc_stress
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "42\n7\n42\n499500\n"
+    carriers: []
+
+  - name: gc-stress-evac
+    fixture: tests/fixtures/gc_stress
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 1024
+    expect:
+      stdout: "42\n7\n42\n499500\n"
+    carriers: []
+    collections:
+      - min: 1
+
+  - name: gc-record
+    fixture: tests/fixtures/gc_record
+    compile_settings:
+      escape: false
+      rt_prelude: true
+      gc_record: true
+    expect:
+      stdout: "1\n1\n1\n3\n1\n0\n1 3 1\n1 1 1\n2 7 1\n3 9 0\n1\n2504\n2499\n"
+    carriers: []
+
+  - name: gc-record-off
+    fixture: tests/fixtures/gc_record
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "1\n0\n1\n"
+    carriers: []
+
+  - name: gc-record-minor
+    fixture: tests/fixtures/gc_record_cycles
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    run_settings:
+      nursery_blocks: 1
+    expect:
+      stdout: "1 1 1\n"
+    collections:
+      - min: 1
+    carriers: []
+
+  - name: gc-record-major
+    fixture: tests/fixtures/gc_record_cycles
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    run_settings:
+      nursery_blocks: 1
+      mature_floor: 1000000
+    expect:
+      stdout: "2 2 1\n"
+    collections:
+      - min: 1
+    carriers: []
+
+  - name: gc-record-stress
+    fixture: tests/fixtures/gc_record_cycles
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    run_settings:
+      gc_stress_bytes: 262144
+    expect:
+      stdout: "1 4 1\n"
+    collections:
+      - min: 1
+    carriers: []
+
+  - name: scalar-carried
+    fixture: tests/fixtures/scalar_carried_nonleaf
+    expect:
+      stdout: "12345\n50\n99950000\n"
+    carriers: []
+
+  - name: scalar-carried-evac
+    fixture: tests/fixtures/scalar_carried_nonleaf
+    run_settings:
+      gc_stress_bytes: 512
+    expect:
+      stdout: "12345\n50\n99950000\n"
+    carriers: []
+    collections:
+      - min: 1
+
+  - name: gc-gen
+    fixture: tests/fixtures/gc_gen
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "42\n4242\n"
+    carriers: []
+
+  - name: gc-gen-evac
+    fixture: tests/fixtures/gc_gen
+    compile_settings:
+      escape: false
+    run_settings:
+      nursery_blocks: 1
+    expect:
+      stdout: "42\n4242\n"
+    carriers: []
+    collections:
+      - min: 1
+
+  - name: immix-defrag
+    fixture: tests/fixtures/immix_defrag
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "1\n1\n1000\n1\n1\n"
+    carriers: []
+    iterations: 2
+
+  - name: immix-evac
+    fixture: tests/fixtures/immix_evac
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "1\n1\n111\n1\n1\n"
+    carriers: []
+    iterations: 2
+
+  - name: immix-forward
+    fixture: tests/fixtures/immix_forward
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "12345\n1\n1\n0\n0\n"
+    carriers: []
+    iterations: 2
+
+  - name: immix-line-mark
+    fixture: tests/fixtures/immix_line_mark
+    compile_settings:
+      rt_prelude: true
+    expect:
+      stdout: "TOTAL 52\nLINECHECK 0\nLINES>0 1\n"
+    carriers: []
+    iterations: 2
+
+  - name: immix-sweep
+    fixture: tests/fixtures/immix_sweep
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "1\n1\n111\n222\n2\n"
+    carriers: []
+    iterations: 2
+
+  - name: gen-barrier
+    fixture: tests/fixtures/gen_barrier
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "1\n1\n1\n3\n"
+    carriers: []
+    iterations: 2
+
+  - name: gen-nursery
+    fixture: tests/fixtures/gen_nursery
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "1\n1\n1\n199990000\n"
+    carriers: []
+    iterations: 2

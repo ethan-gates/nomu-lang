@@ -264,7 +264,7 @@ remaining 121.1 work restructures that into the settled **`StringBase` (internal
       after a collection now fold the bytes with a local `strsum` helper (`sum of byte(at:)`), which reads
       every byte just the same; their asserted values were recomputed (e.g. `pair-string-gc` → `2246000`,
       `option-string-gc` → `2232000`, `gc_string` → `540180000`, module-generic-string → `4147`) and the
-      `tests/expected/*.txt` files updated. Suite 133/133. (`examples/benchmarks/hashmap.nomu` brings its own
+      `tests/expected/*.txt` files updated. Suite 133/133. (`benchmarks/hashmap.nomu` brings its own
       `hash()` over a custom struct, so it was unaffected — and demonstrates UInt64 xor + wrapping-multiply
       exist in Nomu.)
     - *`byte(at:)` → Nomu, unchecked — done + green.* `byte(at:)` is a Nomu method on `String` (core.nomu)

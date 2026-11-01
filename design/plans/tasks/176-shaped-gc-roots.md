@@ -116,7 +116,7 @@ collector still finds and fixes up exactly the references that are live.
     - The one new runtime piece: the **ordinal→descriptor table** `__nomu_shape_table` (emitted by
       `emitShapeOrdinalTable`, read by a generalized `nomu_shape_desc_for_ordinal` — both walkers, one place).
     - Zero-init of the shaped slot (I11b) + volatile `word0` on `String`-typed loads (I11a).
-    Oracle: `examples/pair_string_gc.nomu` (nogc = `immix` evac = `7366794707792290656`); suite 129/129.
+    Oracle: `tests/fixtures/pair_string_gc.nomu` (nogc = `immix` evac = `7366794707792290656`); suite 129/129.
     - **`verifySSAIR` I11 aggregate-rooting check (done).** A value aggregate that transitively contains a
       `String`, live across a safepoint, must be a frame slot (an address op codegen records); a first-class
       SSA aggregate is flagged (`SSAIRVerify.swift`, with `SSAAggregate` field types threaded in). Teeth:
@@ -142,8 +142,8 @@ collector still finds and fixes up exactly the references that are live.
       descriptor build (would alias the scratch) — the deferred edge.
     - `shapeOrdinal` routes an enum slot to its kind-2 descriptor; `transitivelyContainsShaped` (egress +
       `verifySSAIR`) and the I11 aggregate-rooting check extend to enums (teeth: `testUnrootedShapedEnumCaught`).
-    Oracles: `examples/option_string_gc.nomu` (`Option<String>`, nogc = evac = `7366794707792276656`) and
-    `examples/enum_nonshaped_gc.nomu` (the **conditional-soundness** oracle — a non-shaped `.count(Int)` case
+    Oracles: `tests/fixtures/option_string_gc.nomu` (`Option<String>`, nogc = evac = `7366794707792276656`) and
+    `tests/fixtures/enum_nonshaped_gc.nomu` (the **conditional-soundness** oracle — a non-shaped `.count(Int)` case
     held across evac reads back intact, proving the tag is read before the payload is scanned). Suite 133/133.
     **Absorbed into [179](179-value-level-gc-classification.md):** nested enum-in-enum managed payloads
     (fail-stopped at build today, not silent — resolving it wants a reentrant enumerator scratch).

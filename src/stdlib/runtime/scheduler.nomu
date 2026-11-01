@@ -3,7 +3,7 @@
 // Part of the `runtime` module; see README.md.
 
 // ---- The M:N scheduler (task 128.1.9) ----
-// The machinery proved rung-by-rung in the examples/scheduler_*.nomu fixtures, consolidated here into one
+// The machinery proved rung-by-rung in the tests/fixtures/scheduler_*.nomu fixtures, consolidated here into one
 // canonical scheduler that runs real GC-registered user programs. Generated code and the codegen-emitted
 // process entry `main` call the `nomuSched*` functions below. A stop-the-world
 // over the carriers (128.3.2) parks each fiber at a recorded user-frame anchor, and the collector runs

@@ -12,7 +12,7 @@ scheduler and collector over the asm floor (context switch and fiber init). The 
 programs large enough to be meaningful and the perf-affecting module capabilities real: build graph granularity
 for dev-productivity, then the perf-relevant capabilities (cross-module generics residuals, cross-module
 inlining). The benchmark against Go and Swift sits above that, when the language is complete, with fiber
-stacks (104) ready before any collector is measured.
+stacks (104) and heap sizing (230) ready before any collector is measured.
 Epic B (strings) has only independent follow-ons left.
 
 ---
@@ -35,6 +35,7 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 └── benchmark against Go and Swift, on GenImmix (when the language is complete)
     ├── 104  fiber stack strategy — guard page, lazy commit, growth       (before any GC is measured)
     │   └── 219  runtime fault handling — one signal handler, reporters  ◀ next
+    ├── 230  heap sizing — a heap that grows, a clean out-of-memory      (before any GC is measured)
     ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
     │        complements 179 (value-level GC classification)
     ├── 171  modules cleanup — cross-module generics residuals           (perf-accuracy)
@@ -43,8 +44,10 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 ```
 
 **Order of the next run:** [219](tasks/219-runtime-fault-handling.md) (fault handling), then
-[104](tasks/104-fiber-stack-strategy.md) (fiber stacks: overflow detection, lazy commit, growth), both
-before any collector is measured, so the benchmarks run on large, fiber-heavy programs. [217](tasks/217-build-graph-granularity.md)'s
+[104](tasks/104-fiber-stack-strategy.md) (fiber stacks: overflow detection, lazy commit, growth), then
+[230](tasks/230-heap-sizing.md) (heap sizing: growth and a clean out-of-memory), all before any collector is
+measured, so the benchmarks run on large, fiber-heavy programs. 230 is what lets a benchmark's live data
+exceed 256 MiB: binary-trees at the standard depth 21 crashes today. [217](tasks/217-build-graph-granularity.md)'s
 remaining design (the slice's closure, the header format and hash, per-declaration keys on direct dependencies)
 is paused. Off this chain: [204](tasks/204-yaml-parser-upgrades.md) (YAML parser upgrades),
 [205](tasks/205-config-upgrades.md) (configuration upgrades), and 176.4 (the escape-promotion placement route)

@@ -1,0 +1,83 @@
+# The integration suite's manifest (task 155): the defaults, the dimensions and the groups. The cases are in
+# cases/<area>.yaml; the harness loads every file there. Schema and settings: tests/README.md.
+
+defaults:
+  timeout_sec: 60
+  compile_timeout_sec: 120
+  iterations: 1
+  carriers:
+    - 1
+  heavy: false
+
+dimensions:
+  pipeline:
+    - name: debug
+    - name: release
+      compile_settings:
+        optimize: true
+      tier: full
+    - name: noinline
+      compile_settings:
+        inline: false
+      tier: full
+  gc:
+    - name: default
+    - name: nursery
+      run_settings:
+        nursery_blocks: 64
+      collections:
+        - min: 1
+    - name: nursery-tight
+      run_settings:
+        nursery_blocks: 1
+      collections:
+        - min: 1
+    - name: stress-minor
+      run_settings:
+        gc_stress_bytes: 4096
+      collections:
+        - min: 100
+    - name: immix-stress
+      compile_settings:
+        gc_immix: true
+      run_settings:
+        gc_stress_bytes: 4096
+      collections:
+        - kind: major
+          min: 100
+        - kind: minor
+          max: 0
+      tier: full
+    - name: stress-major
+      run_settings:
+        gc_stress_bytes: 4096
+        mature_floor: 8192
+      collections:
+        - min: 100
+      tier: full
+
+groups:
+  - name: shape
+    fixtures: tests/fixtures/shape_matrix/*
+    across:
+      - pipeline
+      - gc
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "bad 0\n"
+  - name: layout
+    fixtures: tests/fixtures/layout_matrix/*
+    across:
+      - pipeline
+    compile_settings:
+      escape: false
+  # The user-facing demos in examples/, each checked against the expected.txt beside it.
+  - name: examples
+    fixtures: examples/*
+    # generics: task 232 (a String property read through a generic bound fails LLVM verification).
+    # table: an empty main.nomu.
+    exclude:
+      - generics
+      - table
+    across: []

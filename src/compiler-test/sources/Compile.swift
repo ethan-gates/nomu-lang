@@ -81,12 +81,19 @@ func builtBinary(_ target: String) -> String? {
 }
 
 // Copy a built binary and its object to a configuration's path. Returns an error message on failure.
+//
+// A kept file whose bytes already match is left in place. macOS checks an executable file the first time it
+// runs (0.1–0.4 s per file, more under load), keyed by the file itself: a rebuild writes a new file even when
+// nothing changed, and a copy of it is new again, but the kept file has run before and runs at once.
 private func keepBinary(_ built: String, at dest: String) -> String? {
     let fm = FileManager.default
     do {
         try fm.createDirectory(atPath: (dest as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         for (from, to) in [(built, dest), (built + ".o", dest + ".o")] {
-            if fm.fileExists(atPath: to) { try fm.removeItem(atPath: to) }
+            if fm.fileExists(atPath: to) {
+                if fm.contentsEqual(atPath: from, andPath: to) { continue }
+                try fm.removeItem(atPath: to)
+            }
             if fm.fileExists(atPath: from) { try fm.copyItem(atPath: from, toPath: to) }
         }
         guard fm.fileExists(atPath: dest) else { return "no binary at '\(built)' after the build" }

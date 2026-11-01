@@ -70,7 +70,7 @@ separate link-selection step. This replaces today's over-linking of all of `std`
   only): each gains `import core`, and its suite entry passes the flag through `compile_args`. Codegen in a
   user module needs no `core` interface: heap `String` allocation lowers to the runtime's
   `__stringAllocHeap`, and only source that names `ManagedBuffer` resolves it. Covered by `core-import`
-  (the gate lifted) and `core-import-rejected` (the gate's error); `examples/managed_buffer*` also take the
+  (the gate lifted) and `core-import-rejected` (the gate's error); `tests/fixtures/managed_buffer*` also take the
   flag. The gate sits in `resolveImport` until the planner (190.3) takes it.
 - **190.2 — scanner.** **Done** (`ImportScanner`, 13 unit tests). The `scanner` sub-target (D5, `//src/planner/scanner`): header-only import scan per file (D3), returning each
   file's raw imports with offsets and line/column, plus errors as data. Its own byte-level recognizer

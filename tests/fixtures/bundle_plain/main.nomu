@@ -1,0 +1,63 @@
+// Cheap programs with no compile or run settings: Doubles, atomics, raw memory, typed pointers, Immix
+// allocation, generic code compiled as one module, a module of several files.
+//
+// A bundle (tests/README.md, "Bundles"): each module is a former fixture whose `main` became
+// `bundleMain`; this entry runs them in turn, each after a `== <module>` line, so a failing diff names
+// the part that broke.
+import pkg/double_core
+import pkg/double_print
+import pkg/atomics
+import pkg/raw_struct
+import pkg/typed_ptr
+import pkg/immix_alloc
+import pkg/immix_los
+import pkg/selfhost_gc
+import pkg/module_shared
+import pkg/wp_generic_mut_method
+import pkg/erased_generic_fn
+import pkg/wp_generic_fn
+import pkg/wp_generic_nested
+import pkg/wp_generic_privcallee
+import pkg/wp_generic_field
+import pkg/wp_generic_method
+import pkg/wp_generic_class_method
+import pkg/wp_generic_enum_method
+
+fun main() {
+  print("== double_core\n")
+  double_core.bundleMain()
+  print("== double_print\n")
+  double_print.bundleMain()
+  print("== atomics\n")
+  atomics.bundleMain()
+  print("== raw_struct\n")
+  raw_struct.bundleMain()
+  print("== typed_ptr\n")
+  typed_ptr.bundleMain()
+  print("== immix_alloc\n")
+  immix_alloc.bundleMain()
+  print("== immix_los\n")
+  immix_los.bundleMain()
+  print("== selfhost_gc\n")
+  selfhost_gc.bundleMain()
+  print("== module_shared\n")
+  module_shared.bundleMain()
+  print("== wp_generic_mut_method\n")
+  wp_generic_mut_method.bundleMain()
+  print("== erased_generic_fn\n")
+  erased_generic_fn.bundleMain()
+  print("== wp_generic_fn\n")
+  wp_generic_fn.bundleMain()
+  print("== wp_generic_nested\n")
+  wp_generic_nested.bundleMain()
+  print("== wp_generic_privcallee\n")
+  wp_generic_privcallee.bundleMain()
+  print("== wp_generic_field\n")
+  wp_generic_field.bundleMain()
+  print("== wp_generic_method\n")
+  wp_generic_method.bundleMain()
+  print("== wp_generic_class_method\n")
+  wp_generic_class_method.bundleMain()
+  print("== wp_generic_enum_method\n")
+  wp_generic_enum_method.bundleMain()
+}

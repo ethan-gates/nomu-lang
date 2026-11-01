@@ -276,9 +276,9 @@ func metricFailure(_ matches: [MetricMatch], in dir: String) -> String? {
         }
         guard let v = (node as? NSNumber)?.doubleValue else { return "'\(m.path)' missing or not a number" }
         let show = v == v.rounded() ? String(Int(v)) : String(v)
-        if let e = m.equals, v != e { return "'\(m.path)' is \(show), expected \(e == e.rounded() ? String(Int(e)) : String(e))" }
-        if let lo = m.min, v < lo { return "'\(m.path)' is \(show) (min \(lo))" }
-        if let hi = m.max, v > hi { return "'\(m.path)' is \(show) (max \(hi))" }
+        if let e = m.equals?.value, v != e { return "'\(m.path)' is \(show), expected \(e == e.rounded() ? String(Int(e)) : String(e))" }
+        if let lo = m.min?.value, v < lo { return "'\(m.path)' is \(show) (min \(lo))" }
+        if let hi = m.max?.value, v > hi { return "'\(m.path)' is \(show) (max \(hi))" }
     }
     return nil
 }

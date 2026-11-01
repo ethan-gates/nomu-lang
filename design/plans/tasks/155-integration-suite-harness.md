@@ -1,7 +1,9 @@
 # Integration-suite harness (one entry, rich output, source-declared env, no script sprawl)
 
 **Avenue:** Infra · **Type/Lifecycle:** `tooling · observability` · **Size:** L ·
-**Status:** Phase 3 (matrix, named settings, hermetic runs, tiers) built: `tests/suite.json` uses named settings throughout, the `shape` and `layout` groups expand to 450 full-tier runs, and the fast tier runs in about 40 s. Phase 1 (MVP) built and green — `src/compiler-test/` Swift tool (`bazel build //src/compiler-test:compiler-test`),
+**Status:** The manifest is now YAML split by area in `tests/suite/`, and the run order a local cache
+(`build/compiler-test/order.txt`): [231](231-suite-manifest-and-fixtures.md). The JSON schema below is the
+same schema in YAML. Phase 3 (matrix, named settings, hermetic runs, tiers) built: the manifest uses named settings throughout, the `shape` and `layout` groups expand to 450 full-tier runs, and the fast tier runs in about 40 s. Phase 1 (MVP) built and green — `src/compiler-test/` Swift tool (`bazel build //src/compiler-test:compiler-test`),
 `tests/suite.json` manifest, `tests/README.md`, `tools/README.md`. 68 cases cover ~42 retired `tools/*.sh`
 drivers (the run-and-check families: plan-differential golden, self-hosted GC oracle, scheduler/runtime stdout);
 full run 68/68 green in ~49s with a release compiler (~78s with a debug one; the old serial loop was ~273s for a
@@ -225,7 +227,7 @@ in the phase noted (P1 = MVP).
   "cases": [
     {
       "name": "gc-anybox",
-      "fixture": "examples/gc_anybox.nomu",
+      "fixture": "tests/fixtures/gc_anybox.nomu",
       "compile_env": { "NOMU_NO_ESCAPE": "1" },
       "run_env":     { "NOMU_RUNTIME": "selfhost" },
       "expect":      { "stdout": "10432\n" },
@@ -270,13 +272,13 @@ a `stats` assertion (`{ "minors_min": 10 }`) reading the machine-readable record
 **Worked examples** (the shapes the current drivers reduce to):
 
 ```json
-{ "name": "gen-major", "fixture": "examples/gen_major.nomu",
+{ "name": "gen-major", "fixture": "tests/fixtures/gen_major.nomu",
   "run_env": { "NOMU_RUNTIME": "selfhost", "NOMU_NURSERY_RESERVE": "8", "NOMU_MATURE_FLOOR": "8176",
                "NOMU_GC_DEBUG_PRESSURE": "1" },
   "expect": { "stdout": "77\n4242\n94950" }, "iterations": 5,
   "stderr_match": [ { "pattern": "(minor)", "min": 10 }, { "pattern": "(major)", "min": 2 } ] }
 
-{ "name": "gc-string", "fixture": "examples/gc_string.nomu",
+{ "name": "gc-string", "fixture": "tests/fixtures/gc_string.nomu",
   "compile_env": { "NOMU_NO_ESCAPE": "1" }, "run_env": { "NOMU_RUNTIME": "selfhost" },
   "expect": { "stdout_file": "tests/expected/gc_string.txt" }, "carriers": [1, 2, 4], "iterations": 4 }
 ```

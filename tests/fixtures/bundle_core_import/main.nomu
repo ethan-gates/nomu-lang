@@ -1,0 +1,14 @@
+// Programs that import `core` (`--allow-core-import`): the managed buffer, a core import.
+//
+// A bundle (tests/README.md, "Bundles"): each module is a former fixture whose `main` became
+// `bundleMain`; this entry runs them in turn, each after a `== <module>` line, so a failing diff names
+// the part that broke.
+import pkg/managed_buffer
+import pkg/core_import
+
+fun main() {
+  print("== managed_buffer\n")
+  managed_buffer.bundleMain()
+  print("== core_import\n")
+  core_import.bundleMain()
+}

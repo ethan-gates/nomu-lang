@@ -252,7 +252,7 @@ to decide before building `create`/`elementPtr`:
 Fork resolved: the existing `monoTypeArgs` table (specializer-recorded, already threaded to codegen) maps the
 instantiation name → `[Header, Element]`; `managedBufferArgs` reads it. No new `Type` case.
 
-**Built + green** (`examples/managed_buffer.nomu`, cases `managed-buffer` / `managed-buffer-evac`, full suite
+**Built + green** (`tests/fixtures/managed_buffer.nomu`, cases `managed-buffer` / `managed-buffer-evac`, full suite
 121/121): `create(capacity:)` (tail-alloc + stamp + cap, returns the tracked `p1`), `capacity()`,
 `headerPtr()`, `elementPtr(at:)`. The evac case exercises a nonzero (`Int`) header through the sizing path —
 180.1.2 geometry validated on a real headered buffer.
@@ -262,7 +262,7 @@ instantiation name → `[Header, Element]`; `managedBufferArgs` reads it. No new
 `rtImmixMark`, `rtImmixUnmark`, `rtGenUnmarkAndUnlog`, `rtImmixEvacMark`, `rtMinorScanObj`) and in `lib.rs`
 `scan_object`, each mirroring that phase's per-reference action. The hash functions skip the header region
 identically in both collectors, so they stay in lockstep without change (the trace following the header
-pointer to its child is what the fingerprint covers). Validated by `examples/managed_buffer_ref.nomu` (cases
+pointer to its child is what the fingerprint covers). Validated by `tests/fixtures/managed_buffer_ref.nomu` (cases
 `managed-buffer-ref` / `-evac` / `-self`): a `ManagedBuffer<Box, Box>` with a managed pointer in both header
 and element, reachable only through the buffer, held live across relocating GC — the header and element
 pointers relocate correctly under MMTk evacuation and the self-hosted STW collector, matching the NoGC
@@ -276,7 +276,7 @@ non-reference type arg with a targeted diagnostic (a scalar/value element uses t
 codegen computes the slot off the buffer `p1` (staying addrspace(1)) and routes the store through `storeField`
 (the write barrier), the load as a plain `p1` load — the same mechanism as the array element store. The
 managed reference passed as a call argument escapes conservatively through the ordinary points-to path, so the
-stored object is kept live with no special escape modelling. The oracle `examples/managed_buffer_ref.nomu` now
+stored object is kept live with no special escape modelling. The oracle `tests/fixtures/managed_buffer_ref.nomu` now
 stores through `storeHeaderRef` / `storeRef` and reads back through `headerRef` / `ref`, so the three oracle
 cases exercise the barrier path end to end on both moving collectors; `managed-buffer-scalar-ref-bad` pins the
 reference-only diagnostic.

@@ -1,39 +1,64 @@
 import Foundation
+import yaml
 
 // The declarative case list — the single source of truth for a case's settings, so a run can never
-// silently forget or duplicate a flag (the silent-green hazard). Keys are snake_case in JSON;
-// `.convertFromSnakeCase` maps them to these camelCase properties. Unknown keys are rejected
-// (`checkKeys`), so a mistyped or retired field fails the load rather than being ignored.
+// silently forget or duplicate a flag (the silent-green hazard). The manifest is a directory: `suite.yaml`
+// (defaults, dimensions, groups) and `cases/*.yaml`, each a `cases` list. Keys are snake_case in YAML; each
+// type's `CodingKeys` maps them to its camelCase properties. `YAMLDecoder` rejects unknown keys, so a
+// mistyped or retired field fails the load with its position.
 //
 // Two ways to declare runs: a flat `case` (one fixture, one configuration), and a `group`, which names
 // fixtures by a directory glob and spans the `dimensions` it lists — one run per fixture and combination
 // of dimension values, named `group/fixture/value/…`.
 
-struct Manifest: Decodable {
+struct Manifest {
     var defaults: Defaults?
     var dimensions: [String: [DimensionValue]]?
     var groups: [Group]?
     var cases: [Case]
-    // Persisted longest-first dispatch order (see Ordering.swift). Optional: absent on a fresh manifest,
-    // written back by full runs.
-    var computedOrder: [String]?
+}
+
+// `suite.yaml`.
+struct SuiteFile: Decodable {
+    var defaults: Defaults?
+    var dimensions: [String: [DimensionValue]]?
+    var groups: [Group]?
+}
+
+// One `cases/<area>.yaml`.
+struct CasesFile: Decodable {
+    var cases: [Case]
+}
+
+// A number written either way, `60` or `0.5`: YAML Core reads `60` as an integer, which `Double` refuses.
+struct Number: Decodable, Equatable {
+    var value: Double
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let i = try? c.decode(Int.self) { value = Double(i) } else { value = try c.decode(Double.self) }
+    }
 }
 
 struct Defaults: Decodable {
-    var timeoutSec: Double?
-    var compileTimeoutSec: Double?
+    var timeoutSec: Number?
+    var compileTimeoutSec: Number?
     var iterations: Int?
     var carriers: [Int]?
     var heavy: Bool?
+    enum CodingKeys: String, CodingKey {
+        case timeoutSec = "timeout_sec", compileTimeoutSec = "compile_timeout_sec", iterations, carriers, heavy
+    }
 }
 
 struct Expect: Decodable {
     var stdout: String?
     var stdoutFile: String?
+    enum CodingKeys: String, CodingKey { case stdout, stdoutFile = "stdout_file" }
 }
 
 struct CompileSpec: Decodable {
     var expectError: String?
+    enum CodingKeys: String, CodingKey { case expectError = "expect_error" }
 }
 
 struct StderrMatch: Decodable {
@@ -60,9 +85,9 @@ struct CollectionMatch: Decodable {
 // path is not in the report (`allocation` below the `full` level). A case with one compiles with `gc_record`.
 struct MetricMatch: Decodable {
     var path: String
-    var equals: Double?
-    var min: Double?
-    var max: Double?
+    var equals: Number?
+    var min: Number?
+    var max: Number?
     var absent: Bool?
 }
 
@@ -91,11 +116,15 @@ struct DimensionValue: Decodable {
     var runSettings: Settings?
     var collections: [CollectionMatch]?
     var tier: Tier?
+    enum CodingKeys: String, CodingKey {
+        case name, compileSettings = "compile_settings", runSettings = "run_settings", collections, tier
+    }
 }
 
 struct Group: Decodable {
     var name: String
     var fixtures: String          // a directory glob: `dir/*` (every subdirectory of `dir`)
+    var exclude: [String]?        // subdirectories the glob leaves out, by name
     var across: [String]          // dimension names, in name order
     var expect: Expect?           // the default; a fixture's own `expected.txt` wins
     var compileSettings: Settings?
@@ -103,10 +132,15 @@ struct Group: Decodable {
     var iterations: Int?
     var fullIterations: Int?
     var carriers: [Int]?
-    var timeoutSec: Double?
+    var timeoutSec: Number?
     var weight: Int?
     var tier: Tier?
     var stderrMatch: [StderrMatch]?
+    enum CodingKeys: String, CodingKey {
+        case name, fixtures, exclude, across, expect, compileSettings = "compile_settings", runSettings = "run_settings",
+             iterations, fullIterations = "full_iterations", carriers, timeoutSec = "timeout_sec", weight, tier,
+             stderrMatch = "stderr_match"
+    }
 }
 
 struct Case: Decodable {
@@ -121,8 +155,8 @@ struct Case: Decodable {
     // race runs a few times in the fast tier and its full count in the full tier.
     var fullIterations: Int?
     var carriers: [Int]?
-    var timeoutSec: Double?
-    var compileTimeoutSec: Double?
+    var timeoutSec: Number?
+    var compileTimeoutSec: Number?
     var heavy: Bool?
     var weight: Int?
     var compile: CompileSpec?
@@ -134,6 +168,14 @@ struct Case: Decodable {
     var stdinFile: String?
     var stdinAfter: String?
     var tier: Tier?
+    enum CodingKeys: String, CodingKey {
+        case name, fixture, compileArgs = "compile_args", compileSettings = "compile_settings",
+             runSettings = "run_settings", expect, iterations, fullIterations = "full_iterations", carriers,
+             timeoutSec = "timeout_sec", compileTimeoutSec = "compile_timeout_sec", heavy, weight, compile,
+             stderrMatch = "stderr_match", collections, reportMetrics = "report_metrics",
+             objectSymbols = "object_symbols", objectReferences = "object_references", stdinFile = "stdin_file",
+             stdinAfter = "stdin_after", tier
+    }
 }
 
 // A case with all defaults folded in — what the runner actually executes.
@@ -214,8 +256,8 @@ extension Manifest {
                 expect: c.expect,
                 iterations: iterations(c.iterations, c.fullIterations, tier: tier),
                 carriers: carriers,
-                runTimeout: c.timeoutSec ?? d?.timeoutSec ?? 60,
-                compileTimeout: c.compileTimeoutSec ?? d?.compileTimeoutSec ?? 120,
+                runTimeout: (c.timeoutSec ?? d?.timeoutSec)?.value ?? 60,
+                compileTimeout: (c.compileTimeoutSec ?? d?.compileTimeoutSec)?.value ?? 120,
                 weight: Manifest.weight(explicit: c.weight, heavy: c.heavy ?? d?.heavy ?? false,
                                         carriers: carriers, capacity: capacity),
                 compile: c.compile,
@@ -251,7 +293,12 @@ extension Manifest {
         }
         let carriers = g.carriers ?? d?.carriers ?? [1]
         var out: [ResolvedCase] = []
-        for fixture in expandFixtureGlob(g.fixtures, group: g.name, projectRoot: projectRoot) {
+        let excluded = Set(g.exclude ?? [])
+        let fixtures = expandFixtureGlob(g.fixtures, group: g.name, projectRoot: projectRoot)
+        for name in excluded where !fixtures.contains(where: { ($0 as NSString).lastPathComponent == name }) {
+            die("group '\(g.name)': excludes '\(name)', which its glob does not name")
+        }
+        for fixture in fixtures where !excluded.contains((fixture as NSString).lastPathComponent) {
             let leaf = (fixture as NSString).lastPathComponent
             let own = projectRoot + "/" + fixture + "/expected.txt"
             let expect = FileManager.default.fileExists(atPath: own)
@@ -278,8 +325,8 @@ extension Manifest {
                     expect: expect,
                     iterations: iterations(g.iterations, g.fullIterations, tier: runTier),
                     carriers: carriers,
-                    runTimeout: g.timeoutSec ?? d?.timeoutSec ?? 60,
-                    compileTimeout: d?.compileTimeoutSec ?? 120,
+                    runTimeout: (g.timeoutSec ?? d?.timeoutSec)?.value ?? 60,
+                    compileTimeout: d?.compileTimeoutSec?.value ?? 120,
                     weight: Manifest.weight(explicit: g.weight, heavy: false, carriers: carriers, capacity: capacity),
                     compile: nil, stderrMatch: match, collections: collections, reportMetrics: [],
                     objectSymbols: [], objectReferences: [],
@@ -307,42 +354,32 @@ private func expandFixtureGlob(_ glob: String, group: String, projectRoot: Strin
     }.map { dir + "/" + $0 }
 }
 
-func loadManifest(_ path: String) throws -> Manifest {
-    let data = try Data(contentsOf: URL(fileURLWithPath: path))
-    checkKeys(try JSONSerialization.jsonObject(with: data), path: path)
-    let dec = JSONDecoder()
-    dec.keyDecodingStrategy = .convertFromSnakeCase
-    return try dec.decode(Manifest.self, from: data)
+// Load the manifest directory: `suite.yaml`, then every `cases/*.yaml` in name order. A YAML or schema error
+// stops the load with its file, line and column.
+func loadManifest(_ dir: String) -> Manifest {
+    let suite = decodeFile(SuiteFile.self, dir + "/suite.yaml")
+    let fm = FileManager.default
+    guard let names = try? fm.contentsOfDirectory(atPath: dir + "/cases") else { die("\(dir): no cases directory") }
+    var cases: [Case] = []
+    for name in names.sorted() where name.hasSuffix(".yaml") {
+        cases += decodeFile(CasesFile.self, dir + "/cases/" + name).cases
+    }
+    return Manifest(defaults: suite.defaults, dimensions: suite.dimensions, groups: suite.groups, cases: cases)
 }
 
-// Reject keys the schema does not define, at every level that has a fixed set.
-private let topKeys: Set<String> = ["defaults", "dimensions", "groups", "cases", "computed_order"]
-private let defaultsKeys: Set<String> = ["timeout_sec", "compile_timeout_sec", "iterations", "carriers", "heavy"]
-private let caseKeys: Set<String> = [
-    "name", "fixture", "compile_args", "compile_settings", "run_settings", "expect", "iterations",
-    "full_iterations", "carriers",
-    "timeout_sec", "compile_timeout_sec", "heavy", "weight", "compile", "stderr_match", "collections",
-    "report_metrics", "object_symbols",
-    "object_references", "stdin_file", "stdin_after", "tier",
-]
-private let groupKeys: Set<String> = [
-    "name", "fixtures", "across", "expect", "compile_settings", "run_settings", "iterations", "full_iterations",
-    "carriers",
-    "timeout_sec", "weight", "tier", "stderr_match",
-]
-private let dimensionValueKeys: Set<String> = ["name", "compile_settings", "run_settings", "collections", "tier"]
-
-private func checkKeys(_ json: Any, path: String) {
-    func check(_ obj: Any?, _ allowed: Set<String>, _ owner: String) {
-        guard let o = obj as? [String: Any] else { return }
-        for k in o.keys where !allowed.contains(k) { die("\(path): \(owner): unknown key '\(k)'") }
-    }
-    guard let top = json as? [String: Any] else { return }
-    check(top, topKeys, "manifest")
-    check(top["defaults"], defaultsKeys, "defaults")
-    for c in top["cases"] as? [[String: Any]] ?? [] { check(c, caseKeys, "case '\(c["name"] ?? "?")'") }
-    for g in top["groups"] as? [[String: Any]] ?? [] { check(g, groupKeys, "group '\(g["name"] ?? "?")'") }
-    for (axis, values) in top["dimensions"] as? [String: Any] ?? [:] {
-        for v in values as? [[String: Any]] ?? [] { check(v, dimensionValueKeys, "dimension '\(axis)'") }
+private func decodeFile<T: Decodable>(_ type: T.Type, _ path: String) -> T {
+    guard let bytes = FileManager.default.contents(atPath: path).map(Array.init) else { die("cannot read \(path)") }
+    do {
+        return try YAMLDecoder().decode(T.self, from: bytes)
+    } catch {
+        var starts: [UInt32] = [0]
+        for (i, b) in bytes.enumerated() where b == 0x0A { starts.append(UInt32(i + 1)) }
+        let lines = LineIndex(lineStarts: starts)
+        // A rendered YAML error carries its own `error:` prefix.
+        var text = "error: \(path): \(error)"
+        if let e = error as? YAMLErrors { text = e.render(file: path, lines: lines) }
+        if let e = error as? YAMLError { text = e.render(file: path, lines: lines) }
+        FileHandle.standardError.write(Data((text + "\n").utf8))
+        exit(2)
     }
 }

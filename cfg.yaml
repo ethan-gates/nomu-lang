@@ -1,4 +1,4 @@
-# Configs the integration suite and the tools select (tests/suite.json, tools/). Each sets one setting, so
+# Configs the integration suite and the tools select (tests/suite, tools/). Each sets one setting, so
 # they combine: `-c release -c no_escape`.
 configs:
   mono_all: null

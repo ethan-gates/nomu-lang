@@ -132,7 +132,7 @@ The parts this task owns directly (the delegated prerequisites 125/149/150/127 k
   - **128.1.8** — actor mailbox + mailbox-fiber pool. *Built:* self-hosted `actorSend` + MT-safe FIFO
     mailbox + global scheduled-mailbox queue + the single-drain invariant + a capped pool of reusable
     mailbox fibers (free-list park, dispatch-or-create-to-cap) + drain-to-quiescence shutdown
-    (`examples/scheduler_actor.nomu`, `tools/scheduler-actor.sh`). 8 actors × 50 msgs drained FIFO by ≤4
+    (`tests/fixtures/scheduler_actor.nomu`, `tools/scheduler-actor.sh`). 8 actors × 50 msgs drained FIFO by ≤4
     reused fibers, handled=400 errors=0, clean 250×. The drain loop is plain Nomu (off-heap messages, no
     GC roots to track, unlike the codegen-emitted C loop). The M6 pthread-mutex actor is retired.
   - **128.1.9** — integration: the self-hosted scheduler runs real user programs behind `NOMU_SCHED=nomu`.

@@ -18,7 +18,7 @@ in the repository's root cfg.yaml):
 Usage:
   tools/perf-tier.py [--iters N] [--release] [workload ...]
 
-`workload` is a module directory, or a bare name resolved under examples/benchmarks/.
+`workload` is a module directory, or a bare name resolved under benchmarks/.
 Default workloads are the tier microbenchmarks plus binary_tree. Compilation goes through
 the built `nomu` (run `bazel build -c opt //src/nomu-cli:nomu` first). Runs use one carrier
 (NOMU_CARRIERS=1) so timings and output are free of scheduling noise.
@@ -32,7 +32,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NOMU = os.path.join(ROOT, "bazel-bin", "src", "nomu-cli", "nomu")
-BENCH_DIR = os.path.join(ROOT, "examples", "benchmarks")
+BENCH_DIR = os.path.join(ROOT, "benchmarks")
 
 # name -> the configs selected (root cfg.yaml). A pass is *enabled* by the absence of its `no_*` config;
 # `off` disables all three.

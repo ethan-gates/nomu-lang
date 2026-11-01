@@ -1,6 +1,8 @@
 import Foundation
 
-// LPT (longest-processing-time-first) dispatch order, persisted in the manifest as `computed_order`.
+// LPT (longest-processing-time-first) dispatch order, persisted per machine in `build/compiler-test/order.txt`
+// (one case name per line, longest first). Timings belong to the machine that measured them, so the file stays
+// out of the repository; a missing file means every case is unranked.
 // Dispatching the long tails first keeps the fixed-8 pool saturated — they overlap instead of trailing
 // the fast cases and draining the lanes at the end.
 
@@ -24,15 +26,16 @@ func computeOrder(_ results: [CaseResult]) -> [String] {
         .map { $0.name }
 }
 
-// Splice a single-line `computed_order` into the manifest, preserving all other formatting. Only that
-// one line changes (or is inserted right after the opening brace), so the hand-authored file stays
-// intact and the git diff stays to one line.
-func writeComputedOrder(_ order: [String], to configPath: String) {
-    guard let text = try? String(contentsOfFile: configPath, encoding: .utf8) else { return }
-    var lines = text.components(separatedBy: "\n")
-    lines.removeAll { $0.trimmingCharacters(in: .whitespaces).hasPrefix("\"computed_order\"") }
-    guard let brace = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "{" }) else { return }
-    let arr = order.map { "\"\($0)\"" }.joined(separator: ", ")
-    lines.insert("  \"computed_order\": [\(arr)],", at: brace + 1)
-    try? lines.joined(separator: "\n").write(toFile: configPath, atomically: true, encoding: .utf8)
+func orderPath(projectRoot: String) -> String { projectRoot + "/build/compiler-test/order.txt" }
+
+func readOrder(projectRoot: String) -> [String] {
+    guard let text = try? String(contentsOfFile: orderPath(projectRoot: projectRoot), encoding: .utf8) else { return [] }
+    return text.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+}
+
+func writeOrder(_ order: [String], projectRoot: String) {
+    let path = orderPath(projectRoot: projectRoot)
+    try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
+                                             withIntermediateDirectories: true)
+    try? (order.joined(separator: "\n") + "\n").write(toFile: path, atomically: true, encoding: .utf8)
 }

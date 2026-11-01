@@ -219,13 +219,13 @@ final class ImportScannerTests: XCTestCase {
         }
     }
 
-    // The suite's fixtures and examples, through runfiles.
+    // The suite's fixtures, the examples and the benchmarks, through runfiles.
     func testConformsOnCorpus() throws {
         let env = ProcessInfo.processInfo.environment
         guard let srcdir = env["TEST_SRCDIR"] else { throw XCTSkip("not under bazel test") }
         let root = srcdir + "/_main"
         var checked = 0
-        for dir in ["tests/fixtures", "examples"] {
+        for dir in ["tests/fixtures", "examples", "benchmarks"] {
             guard let walk = FileManager.default.enumerator(atPath: root + "/" + dir) else { continue }
             for case let rel as String in walk where rel.hasSuffix(".nomu") {
                 let path = root + "/" + dir + "/" + rel

@@ -4,7 +4,7 @@ Coverage matrix for one shape per type (task 176.5): a heap `String`, held in ea
 hold one, read back across collections that reuse moved-from memory. Each case prints `bad N`, the count of
 reads that saw wrong bytes; correct is `bad 0`. The suite's `shape` group runs every case across the
 `pipeline` and `gc` dimensions (`tests/README.md`, "Dimensions and groups"):
-`compiler-test tests/suite.json --enable 'shape/*'`, with `--tier full` for the release and no-inline
+`compiler-test tests/suite --enable 'shape/*'`, with `--tier full` for the release and no-inline
 pipelines and the major-collection leg. A case needs no manifest edit: add a directory here.
 
 - `layout_*` hold `Bool` fields before a managed field, where the descriptor's 8-byte-slot offsets and the

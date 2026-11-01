@@ -1,0 +1,14 @@
+// `import core` under the hidden `--allow-core-import` (the suite's way to test `core` directly): its
+// compiler-backed `ManagedBuffer` resolves through the import.
+import core
+
+package fun bundleMain() {
+    let b = ManagedBuffer<Int, Int>.create(capacity: 3)
+    let e = b.elementPtr(at: 1)
+    e.store(9, toByteOffset: 0)
+    let v: Int = e.load(fromByteOffset: 0)
+    print(b.capacity())
+    print("\n")
+    print(v)
+    print("\n")
+}

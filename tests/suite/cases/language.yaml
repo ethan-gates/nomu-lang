@@ -1,0 +1,81 @@
+# Cases: the language: globals, strings, Doubles, escape analysis, inlining.
+
+cases:
+  - name: nested-call-inline
+    fixture: tests/fixtures/nested_call_inline
+    expect:
+      stdout: "42\nnomu!\n"
+
+  - name: string-surface
+    fixture: tests/fixtures/string_surface
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "Hello, world\n12\nempty\nHello, world\neq-ok\nlt-ok\n"
+    carriers: []
+
+  - name: escape-stack
+    fixture: tests/fixtures/escape
+    expect:
+      stdout: "10000"
+    carriers: []
+    object_symbols:
+      - pattern: __nomu_alloc_slow
+        max: 0
+      - pattern: __nomu_gc_poll_slow
+        min: 1
+
+  - name: globals-const
+    fixture: tests/fixtures/globals_const
+    expect:
+      stdout: "32768\n4097\n3.0\n1\nhi\na string longer than fifteen bytes\n-1\n2\n7\n"
+    carriers: []
+
+  - name: globals-const-release
+    fixture: tests/fixtures/globals_const
+    compile_settings:
+      optimize: true
+    expect:
+      stdout: "32768\n4097\n3.0\n1\nhi\na string longer than fifteen bytes\n-1\n2\n7\n"
+    carriers: []
+
+  - name: global-string-computed
+    fixture: tests/fixtures/global_string_computed
+    compile:
+      expect_error: "a global holding a 'String' must be a literal"
+
+  - name: globals-startup
+    fixture: tests/fixtures/globals_startup
+    expect:
+      stdout: "base\ndoubled\nviaInterface\nscale\nviaClosure\nindependent\n62000\n110\n56\n21\n62\n1\n"
+    carriers: []
+
+  - name: globals-startup-release
+    fixture: tests/fixtures/globals_startup
+    compile_settings:
+      optimize: true
+    expect:
+      stdout: "base\ndoubled\nviaInterface\nscale\nviaClosure\nindependent\n62000\n110\n56\n21\n62\n1\n"
+    carriers: []
+
+  - name: globals-startup-modules
+    fixture: tests/fixtures/globals_startup_modules
+    expect:
+      stdout: "base\nleft\nright\nmain\n83\n"
+    carriers: []
+
+  - name: global-init-cycle
+    fixture: tests/fixtures/global_init_cycle
+    compile:
+      expect_error: "initialization cycle: 'a' reads 'b', and 'b' reads 'a'"
+
+  - name: global-init-self-cycle
+    fixture: tests/fixtures/global_init_self_cycle
+    compile:
+      expect_error: "initialization cycle: global 'a' reads its own value through a call"
+
+  - name: bundle-plain
+    fixture: tests/fixtures/bundle_plain
+    expect:
+      stdout_file: tests/fixtures/bundle_plain/expected.txt
+    carriers: []

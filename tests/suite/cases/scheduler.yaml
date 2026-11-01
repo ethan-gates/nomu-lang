@@ -1,0 +1,186 @@
+# Cases: the scheduler: fibers, carriers, timers, the poller, actors, futexes, line input.
+
+cases:
+  - name: read-line
+    fixture: tests/fixtures/read_line
+    compile_settings:
+      rt_prelude: true
+    stdin_file: tests/input/read_line.txt
+    stdin_after: "ready\n"
+    expect:
+      stdout: "tick\ntick\ntick\ngot 'first' 5\ngot 'second' 6\ngot 'tail' 4\ngot '' 0\n3\n"
+    carriers:
+      - 1
+      - 4
+
+  - name: read-line-readers
+    fixture: tests/fixtures/read_line_readers
+    compile_settings:
+      rt_prelude: true
+    stdin_file: tests/input/read_line_readers.txt
+    stdin_after: "ready\n"
+    expect:
+      stdout: "7\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+    iterations: 3
+
+  - name: read-line-gc
+    fixture: tests/fixtures/read_line_gc
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    stdin_file: tests/input/read_line_gc.txt
+    stdin_after: "ready\n"
+    run_settings:
+      gc_stress_bytes: 256
+    expect:
+      stdout: "4242 held string late 179994\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - min: 1
+
+  - name: read-line-long
+    fixture: tests/fixtures/read_line_long
+    compile_settings:
+      escape: false
+    stdin_file: tests/input/read_line_long.txt
+    run_settings:
+      gc_stress_bytes: 256
+    expect:
+      stdout: "15 fifteen bytes!!\n16 sixteen bytes!!!\n38 this line is longer than fifteen bytes\n10000 97 122\n20 unterminated tail 20\n0 \n179994\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - min: 1
+
+  - name: fiber-registry
+    fixture: tests/fixtures/fiber_registry
+    compile_args:
+      - "--runtime-subset=regInsert,regRemove,regCount,regSum"
+    expect:
+      stdout: "5 15\n4 12\n3 7\n2 6\n"
+    carriers: []
+
+  - name: fiberswitch
+    fixture: tests/fixtures/fiberswitch
+    compile_settings:
+      runtime_tier: true
+    expect:
+      stdout: "42\n"
+    carriers: []
+
+  - name: scheduler
+    fixture: tests/fixtures/scheduler
+    compile_settings:
+      runtime_tier: true
+    compile_args:
+      - "--runtime-subset=enqueue,dequeue,schedRun,fiberMain,fiberSpawn,park,unpark,joinFiber"
+    expect:
+      stdout: "6\n111\n42\n"
+    carriers: []
+
+  - name: scheduler-lock
+    fixture: tests/fixtures/scheduler_lock
+    compile_settings:
+      runtime_tier: true
+    compile_args:
+      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,schedRun,fiberMain,fiberNew,fiberSpawn,fiberSpawnParked,park,parkLocked,unpark,unparkLocked,joinFiber"
+    expect:
+      stdout: "6\n111\n42\n2000\n"
+    carriers: []
+
+  - name: scheduler-mc
+    fixture: tests/fixtures/scheduler_mc
+    compile_settings:
+      runtime_tier: true
+    compile_args:
+      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,fiberNew,fiberSpawn,fiberMain,schedLoop,carrierMain"
+    expect:
+      stdout: "600\n"
+    carriers: []
+    iterations: 30
+    weight: 3
+
+  - name: scheduler-poller
+    fixture: tests/fixtures/scheduler_poller
+    compile_settings:
+      runtime_tier: true
+    compile_args:
+      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,signalStop,fiberNew,fiberSpawn,unpark,waitReadable,fiberMain,schedLoop,carrierMain,pollerMain"
+    expect:
+      stdout: "36\n"
+    carriers: []
+    iterations: 30
+    weight: 3
+
+  - name: scheduler-timer
+    fixture: tests/fixtures/scheduler_timer
+    compile_settings:
+      runtime_tier: true
+    compile_args:
+      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,wakeTimer,signalStop,heapSwap,timerPush,timerPopMin,fiberNew,fiberSpawn,unpark,fiberSleep,fiberMain,schedLoop,carrierMain,timerMain"
+    expect:
+      stdout: "1\n2\n3\n4\n"
+    carriers: []
+    iterations: 8
+    weight: 3
+
+  - name: scheduler-tls
+    fixture: tests/fixtures/scheduler_tls
+    compile_settings:
+      runtime_tier: true
+    compile_args:
+      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,fiberNew,handOff,unpark,fiberMain,schedLoop,carrierMain,ringBody"
+    expect:
+      stdout: "2000\n"
+    carriers: []
+    iterations: 40
+    weight: 3
+
+  - name: scheduler-actor
+    fixture: tests/fixtures/scheduler_actor
+    compile_settings:
+      runtime_tier: true
+    compile_args:
+      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,signalStop,schedMbPush,schedMbPop,mailboxFiberNew,mailboxDispatch,actorSend,mailboxPop,mailboxDrain,mailboxFiberMain,schedLoop,carrierMain"
+    expect:
+      stdout: "400\n0\n"
+    carriers: []
+    iterations: 40
+    weight: 3
+
+  - name: futex
+    fixture: tests/fixtures/futex
+    compile_settings:
+      runtime_tier: true
+    expect:
+      stdout: "111\n"
+    carriers: []
+
+  - name: futex-subset
+    fixture: tests/fixtures/futex
+    compile_settings:
+      runtime_tier: true
+    compile_args:
+      - "--runtime-subset=futexProbe"
+    expect:
+      stdout: "111\n"
+    carriers: []
+
+  - name: pingpong
+    fixture: tests/fixtures/pingpong
+    compile_settings:
+      runtime_tier: true
+    compile_args:
+      - "--runtime-subset=worker"
+    expect:
+      stdout: "111\n"
+    carriers: []
+    iterations: 10
+    weight: 2

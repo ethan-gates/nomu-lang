@@ -23,11 +23,11 @@ surface, under 149's subset rules: a `RawPtr` control block holds `{ base, curso
 the arena — no globals, no heap object), `bumpNew` carves an off-heap OS block, `bumpAlloc` bumps
 fixed-size chunks and returns null on overflow. It compiles under `--runtime-subset=bumpNew,bumpAlloc`
 with no violations (the first real client exercising the 125↔149 interlock), and is byte-identical under
-NoGC and Immix-evacuation (`examples/bump_alloc.nomu` + `tools/bump-alloc.sh`). **Slice B foundation built — the runtime prelude.** The allocator now lives in `src/stdlib/runtime/`,
+NoGC and Immix-evacuation (`tests/fixtures/bump_alloc.nomu` + `tools/bump-alloc.sh`). **Slice B foundation built — the runtime prelude.** The allocator now lives in `src/stdlib/runtime/`,
 a second embedded prelude compiled into every program (beside `core.nomu`) and **runtime-subset by
 default** — the proper "designated file" for 149, replacing the interim `--runtime-subset` flag. Its
 functions (`rtArenaNew` / `rtBumpAlloc`) are auto-subset-checked (a violation injected into the prelude is
-flagged with no flag given) and callable from user code with no import (`examples/rt_prelude.nomu` +
+flagged with no flag given) and callable from user code with no import (`tests/fixtures/rt_prelude.nomu` +
 `tools/rt-prelude.sh`).
 
 **Rung 1 complete — slice B built. The self-hosted allocator is a selectable plan.** Under
@@ -390,14 +390,14 @@ fingerprint diff are complete and oracle-checked.** ("Increment N" below = subta
   the type-id occupies the low 32 bits, high bits zero, so marking leaves the type-id recoverable). No
   reclaim, no move. `addrOf(obj)` (a `ptrtoint` on the managed `p1`, codegen-only) supplies the seed.
   Validated on a graph exercising reachability, a shared child counted once (the mark bit), and a dead
-  heap object excluded (`examples/mark_verify.nomu` + `tools/mark-verify.sh`).
+  heap object excluded (`tests/fixtures/mark_verify.nomu` + `tools/mark-verify.sh`).
 - **150.2.3 · address-independent fingerprint (built).** Each live object contributes its type-id and
   its scalar (non-pointer) field words to a summed, order-independent fingerprint; every managed slot and
   the header are skipped, so no address enters it. Because it excludes addresses, it is byte-identical
   across the two GC plans (MMTk and the self-hosted allocator use different address ranges) — the sharp
   test that no pointer leaked in, and the precondition for the cross-run diff. Word-granularity for now
   (8-byte-aligned fields; sub-word scalars are a later refinement).
-- **150.2.4 · array coverage (built).** `examples/mark_verify_arr.nomu` seeds from an `Array<Box>`
+- **150.2.4 · array coverage (built).** `tests/fixtures/mark_verify_arr.nomu` seeds from an `Array<Box>`
   handle, exercising the tracer's variable-size (`kind==1`) path in both the mark loop and the content hash:
   the handle's `bufptr` is followed into the buffer, each element slot scanned via the per-element pointer
   map, and every live Box marked. `TOTAL 5` (handle + buffer + 3 Boxes) tests buffer scanning; the
@@ -418,7 +418,7 @@ fingerprint diff are complete and oracle-checked.** ("Increment N" below = subta
   FP-relative slots), then step to the caller by `SP += StackSize` — no frame-pointer chain, no libunwind.
   Two anchor intrinsics (`Runtime.gcFrameAddr`/`gcReturnAddr` → `llvm.frameaddress`/`returnaddress`) and a
   `noinline` mark on `rtCollectRoots` (so the frame intrinsics resolve to its own frame) are the only new
-  codegen; no runtime C. End-to-end (`examples/walk_mark.nomu` + `tools/walk-mark.sh`): the walk recovers
+  codegen; no runtime C. End-to-end (`tests/fixtures/walk_mark.nomu` + `tools/walk-mark.sh`): the walk recovers
   the handle of a live `Array<Box>`, hands it to the tracer, which marks the live set (handle + buffer + 2
   Boxes = 4) and emits a fingerprint **identical across both GC plans** — a stale/garbage root would fault
   or diverge, so the match proves the recovered root is real and the whole self-hosted chain (walk →
@@ -441,7 +441,7 @@ fingerprint diff are complete and oracle-checked.** ("Increment N" below = subta
     *saved* context, where roots were already spilled at the park/safepoint) does not depend on this
     caller-spill effect, so it can factor the loop freely — the coupling is specific to reading the walk's
     own live caller.
-- **150.2.7 · multi-frame walk, differential vs the C walk (built).** `examples/walk_multiframe.nomu`
+- **150.2.7 · multi-frame walk, differential vs the C walk (built).** `tests/fixtures/walk_multiframe.nomu`
   holds roots in two frames (inner: 33, 44; outer: 11, 22) and runs `rtCollectRoots` immediately before
   `sleep(0)`; under `NOMU_GC_SMOKE` the C libunwind walk runs at that same safepoint. The Nomu pcsp walk
   recovers `{33,44}` from inner and `{11,22}` from outer — stepping `inner → outer → main` and terminating
@@ -685,12 +685,12 @@ Rung 3 comes up in eight increments, each one mechanism with an oracle, mirrorin
    `rtImmixNew` / `rtBlockAddr` / `rtBlockIndexOf` / `rtLineIndexOf` / `rtBlockState` / `rtSetBlockState` /
    `rtLineMarked` / `rtMarkLine` / `rtClearLine` / `rtAcquireBlock`; byte-per-entry line/block tables over
    zero-filled 125 memory; one new intrinsic `RawPtr.toInt()` (ptrtoint) for addr→index math.
-   `examples/immix_region.nomu` + `tools/immix-region.sh`.
+   `tests/fixtures/immix_region.nomu` + `tools/immix-region.sh`.
 2. **150.3.2 — region-structured allocator. Built.** `rtImmixAlloc`: 8-align, bump within the current
    32 KiB block, refill a fresh block from the pool on overflow; routed behind the codegen
    self-hosted-alloc seam under `NOMU_GC_PLAN=nomu` (`nomuSelfhostAlloc`, 8192-block / 256 MiB space).
    Non-collecting, heap grows. Byte-identical to MMTk NoGC across `selfhost-gc` (classes/closures/arrays/
-   heavy) and a 3-block-crossing fixture (`examples/immix_alloc.nomu` + `tools/immix-alloc.sh`). Hole
+   heavy) and a 3-block-crossing fixture (`tests/fixtures/immix_alloc.nomu` + `tools/immix-alloc.sh`). Hole
    reuse *within* swept blocks (line-granular hole scan) is not needed until recyclable blocks exist, so it
    lands with reclamation (150.3.5); objects larger than a block need the LOS (150.3.3).
 3. **150.3.3 — large-object space (LOS). Built.** `rtLosAlloc`: an object larger than a block is allocated
@@ -700,7 +700,7 @@ Rung 3 comes up in eight increments, each one mechanism with an oracle, mirrorin
    near-block objects also skip blocks) is an evacuation-efficiency tuning item (150.3.7), and the
    medium-object *overflow allocator* (routing >line objects to fresh blocks to avoid small holes) only
    matters once swept recyclable blocks exist, so it folds into 150.3.5. Validated by a large `Array<Int>`
-   whose buffer grows past a block into the LOS (`examples/immix_los.nomu` + `tools/immix-los.sh`),
+   whose buffer grows past a block into the LOS (`tests/fixtures/immix_los.nomu` + `tools/immix-los.sh`),
    byte-identical to MMTk NoGC.
 4. **150.3.4 — line marking (diagnostic). Built.** `rtMarkVerifyImmix` traces as rung 2 and additionally
    marks each live *in-heap* object's lines (`rtMarkObjLines`; LOS objects header-marked only). A new
@@ -708,14 +708,14 @@ Rung 3 comes up in eight increments, each one mechanism with an oracle, mirrorin
    independently re-derives the line set (unmark-walk) and confirms completeness (every live object on
    marked lines) + soundness (marked-line count == live footprint), returning 0. No reclaim — a checkpoint
    like mark-verify; object marking + fingerprint are the rung-2 logic (checked cross-plan by `mark-verify`).
-   `examples/immix_line_mark.nomu` + `tools/immix-line-mark.sh` (Array<Box>, 52 live, LINECHECK 0).
+   `tests/fixtures/immix_line_mark.nomu` + `tools/immix-line-mark.sh` (Array<Box>, 52 live, LINECHECK 0).
 5. **150.3.5 — sweep reclamation (non-moving). Built — the first functioning self-hosted collector.**
    `rtImmixCollect` = clear line marks → mark live (header + line marks) → reclaim by block
    (`rtImmixSweepBlocks`: dead block → free list, mixed → recyclable, full → unavailable) → reclaim the LOS
    by whole chunk (`rtImmixSweepLos`) → unmark → reset the allocator. The allocator became hole-aware
    (`rtNextHole` scans free-line runs; `rtNextAllocBlock` draws reclaimed-free → recyclable → never-used),
    so reclaimed + recyclable space is reused and the heap does not grow when garbage was collected.
-   Validated by `examples/immix_sweep.nomu` + `tools/immix-sweep.sh`: two equal garbage batches bracket a
+   Validated by `tests/fixtures/immix_sweep.nomu` + `tools/immix-sweep.sh`: two equal garbage batches bracket a
    collection; blocks are reclaimed, the heap does not grow across the second batch, the live set survives
    (non-moving). Driven explicitly on a deterministic single-thread root set (as mark-verify drove the
    tracer); driving it automatically at a real STW so whole programs (`arr-gc`/`gc-stress`) collect
@@ -726,7 +726,7 @@ Rung 3 comes up in eight increments, each one mechanism with an oracle, mirrorin
    word 0 (§10.8). `rtCopyObject` (size read → fresh slot → `rtCopyWords` → `rtSetForwarded`),
    `rtIsForwarded` / `rtForwardingPointer`, `rtObjSize`. `rtCheckPayloadWord` confirmed **0** types lack a
    payload word (the §10.8 assumption holds for every managed type). Unit-tested in isolation (copy, forward,
-   read back): `examples/immix_forward.nomu` + `tools/immix-forward.sh`.
+   read back): `tests/fixtures/immix_forward.nomu` + `tools/immix-forward.sh`.
 7. **150.3.7 — evacuation + pointer fixup. Built — the moving collector.** `rtImmixEvacCollect` snapshots
    `freeCursor` as a from-space boundary (force-all: every block handed out before the collection is a
    candidate), points the copy allocator past all candidates (free list emptied, recyclable scan set to the
@@ -740,7 +740,7 @@ Rung 3 comes up in eight increments, each one mechanism with an oracle, mirrorin
    they are scanned for fixup but never moved. `noSafepoint` (149, held by every the `runtime` package (`src/stdlib/runtime/`) function)
    is what makes holding raw pointers into the moving heap across the copy sound — this closes 125 §3.3's
    deferred moving-heap gate as its first real client. `rtImmixCollect` (non-moving, 150.3.5) stays as the
-   separate path; unifying the two behind a defrag trigger is 150.3.8. `examples/immix_evac.nomu` +
+   separate path; unifying the two behind a defrag trigger is 150.3.8. `tests/fixtures/immix_evac.nomu` +
    `tools/immix-evac.sh` (root moved, a live Box moved and its value reads back through the fixed-up slot,
    the address-independent fingerprint is invariant across the move — a missed fixup diverges it — and
    from-space was reclaimed).
@@ -758,7 +758,7 @@ Rung 3 comes up in eight increments, each one mechanism with an oracle, mirrorin
    fragmentation-selected middle = `rtImmixCollectDefrag`. `defragTable` is a per-block side table added to
    the space descriptor (now 120 bytes, `defragTable@112`); the sweep records the histogram for the next
    collection. The first collection has no histogram (table zeroed), so it never evacuates and only seeds it
-   — evacuation is thereby demonstrably conditional. `examples/immix_defrag.nomu` + `tools/immix-defrag.sh`
+   — evacuation is thereby demonstrably conditional. `tests/fixtures/immix_defrag.nomu` + `tools/immix-defrag.sh`
    (sparse survivors fragment the heap; the first collection is non-moving, the second selects the fragmented
    blocks and compacts their survivors to new addresses, the fingerprint is invariant, and the sources are
    reclaimed). Remaining defrag-policy tuning (the threshold value and a spill-based block-selection order in
@@ -866,7 +866,7 @@ Rung 4 comes up one mechanism at a time, each diffed against MMTk GenImmix, mirr
    re-tests the log bit (the actor path bypasses the inline test), clears it, and appends the object to the
    carrier's mod-buffer (`rt_self_modbuf_get`, reset at end-of-collection by `rt_modbuf_reset_all`). The table
    starts all-logged, so young objects never trip the barrier; only promotion (150.4.3) sets the unlogged bit,
-   so the remembered set stays empty non-collecting and the suite is unchanged. `examples/gen_barrier.nomu`
+   so the remembered set stays empty non-collecting and the suite is unchanged. `tests/fixtures/gen_barrier.nomu`
    verifies it: an `rtSetUnlogged` hook simulates promotion, an old→young store remembers the object once, a
    second store to it elides the slow path. Still non-collecting (the buffer just fills).
 3. **150.4.3 — minor collection. Built.** `rtImmixCollectMinor` turns the NURSERY blocks into evacuation
@@ -879,7 +879,7 @@ Rung 4 comes up one mechanism at a time, each diffed against MMTk GenImmix, mirr
    the STW coordinator reads a collection-kind flag at sched+176 and runs `nomuSchedStwCollectMinor` rather
    than the defrag major), opt-in via `NOMU_NURSERY_RESERVE` (0 = disabled) so the default path stays major-
    only until the minor collector is robust across all object types + multi-carrier (150.4.5).
-   `examples/gen_minor.nomu` drives ~48 real minor GCs; a Holder promoted to mature then pointed at a fresh
+   `tests/fixtures/gen_minor.nomu` drives ~48 real minor GCs; a Holder promoted to mature then pointed at a fresh
    nursery Box survives via the remembered set, checksum-identical to MMTk GenImmix. *Deferred:* mature-garbage
    reclaim + minor/major escalation → 150.4.4; multi-carrier remset + full suite under the minor collector →
    150.4.5.
@@ -890,7 +890,7 @@ Rung 4 comes up one mechanism at a time, each diffed against MMTk GenImmix, mirr
    pressure. Under the generational trigger the major (`rtImmixCollectRootsDefragGen`) re-establishes the
    log-bit invariant post-collection — wipe the table to logged (`rtClearLogTable`), set every survivor
    unlogged in the final unmark walk (`rtGenUnmarkAndUnlog`); the pre-150.4.4 path (no reserve) runs the plain
-   defrag unchanged. `examples/gen_major.nomu` drives ~128 minors interleaved with ~18 majors; a
+   defrag unchanged. `tests/fixtures/gen_major.nomu` drives ~128 minors interleaved with ~18 majors; a
    cross-generation pointer created *after* a major survives the next minor, checksum-identical to MMTk
    GenImmix (77 / 4242 / 94950). *Deferred:* multi-carrier remset + full suite under the minor collector →
    150.4.5.

@@ -74,7 +74,8 @@ final class Suite {
     init(_ ctx: Ctx) { self.ctx = ctx; self.gate = WeightedGate(capacity: ctx.poolCapacity) }
 
     func run() -> Int32 {
-        let selected = lptSort(ctx.selectedCases(), order: ctx.manifest.computedOrder ?? [])
+        let order = readOrder(projectRoot: ctx.projectRoot)
+        let selected = lptSort(ctx.selectedCases(), order: order)
         if selected.isEmpty { die("no cases selected") }
 
         cache.compileAll(selected, ctx: ctx, gate: gate, progress: progress)
@@ -133,7 +134,7 @@ final class Suite {
         return finished
     }
 
-    // Persist the longest-first order into the manifest — only when the selection is a whole tier, so a
+    // Persist the longest-first order (`build/compiler-test/order.txt`) — only when the selection is a whole tier, so a
     // filtered run reads the order but never rewrites it from partial data. Cases the tier did not run (the
     // `full` tier's extra legs, on a `fast` run) keep their earlier ranking, after the measured ones.
     private func writeBackOrder(ran selected: [ResolvedCase]) {
@@ -141,8 +142,8 @@ final class Suite {
         let measured = computeOrder(results)
         let ran = Set(measured)
         let known = Set(ctx.cases.map { $0.name })
-        let rest = (ctx.manifest.computedOrder ?? []).filter { !ran.contains($0) && known.contains($0) }
-        writeComputedOrder(measured + rest, to: ctx.configPath)
+        let rest = readOrder(projectRoot: ctx.projectRoot).filter { !ran.contains($0) && known.contains($0) }
+        writeOrder(measured + rest, projectRoot: ctx.projectRoot)
     }
 
     private func report() -> Int32 {

@@ -1,0 +1,261 @@
+# Cases: generic module code: erased and monomorphized generics across modules, their mangling.
+
+cases:
+  - name: gc-generic-two-consumers-evac
+    fixture: tests/fixtures/gc_generic_two_consumers
+    compile_settings:
+      escape: false
+    compile_args:
+      - "--config=mono_all"
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "26\n"
+    carriers:
+      - 1
+      - 2
+    collections:
+      - min: 1
+
+  - name: module-generic-type
+    fixture: tests/fixtures/module_generic_type
+    expect:
+      stdout: "427\n"
+    carriers: []
+
+  - name: module-generic-method
+    fixture: tests/fixtures/module_generic_method
+    expect:
+      stdout: "7\n1\n"
+    carriers: []
+
+  - name: module-generic-mut-method
+    fixture: tests/fixtures/module_generic_mut_method
+    expect:
+      stdout: "7\n42\n3\n99\n"
+    carriers: []
+
+  - name: module-generic-fn
+    fixture: tests/fixtures/module_generic_fn
+    expect:
+      stdout: "42\n"
+    carriers: []
+
+  - name: module-generic-fn-mono
+    fixture: tests/fixtures/module_generic_fn
+    compile_args:
+      - "--config=mono_all"
+    expect:
+      stdout: "42\n"
+    carriers: []
+
+  - name: module-generic-nested
+    fixture: tests/fixtures/module_generic_nested
+    expect:
+      stdout: "7\n"
+    carriers: []
+
+  - name: module-generic-nested-mono
+    fixture: tests/fixtures/module_generic_nested
+    compile_args:
+      - "--config=mono_all"
+    expect:
+      stdout: "7\n"
+    carriers: []
+
+  - name: module-generic-nested-edge
+    fixture: tests/fixtures/module_generic_nested
+    compile_args:
+      - "--config=mono_edge"
+    expect:
+      stdout: "7\n"
+    carriers: []
+
+  - name: module-generic-fold
+    fixture: tests/fixtures/module_generic_fold
+    expect:
+      stdout: "40\n"
+    carriers: []
+
+  - name: module-generic-fold-mono
+    fixture: tests/fixtures/module_generic_fold
+    compile_args:
+      - "--config=mono_all"
+    expect:
+      stdout: "40\n"
+    carriers: []
+
+  - name: mangle-generic-two-consumers
+    fixture: tests/fixtures/mangle_generic_two_consumers
+    compile_args:
+      - "--config=mono_all"
+    expect:
+      stdout: "726\n"
+    carriers: []
+
+  - name: module-generic-privcallee
+    fixture: tests/fixtures/module_generic_privcallee
+    expect:
+      stdout: "40\n"
+    carriers: []
+
+  - name: module-generic-privcallee-mono
+    fixture: tests/fixtures/module_generic_privcallee
+    compile_args:
+      - "--config=mono_all"
+    expect:
+      stdout: "40\n"
+    carriers: []
+
+  - name: module-generic-bound
+    fixture: tests/fixtures/module_generic_bound
+    expect:
+      stdout: "3\n"
+    carriers: []
+
+  - name: module-generic-bound-nonpod
+    fixture: tests/fixtures/module_generic_bound_nonpod
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "333\n"
+    carriers:
+      - 1
+      - 2
+    iterations: 3
+    weight: 2
+    collections:
+      - kind: minor
+        trigger: "program request"
+        roots: 1
+        min: 1
+        max: 1
+
+  - name: module-generic-field
+    fixture: tests/fixtures/module_generic_field
+    expect:
+      stdout: "42\n"
+    carriers: []
+
+  - name: module-generic-compose
+    fixture: tests/fixtures/module_generic_compose
+    expect:
+      stdout: "7\n"
+    carriers: []
+
+  - name: module-generic-enum
+    fixture: tests/fixtures/module_generic_enum
+    expect:
+      stdout: "5\n9\n"
+    carriers: []
+
+  - name: module-generic-enum-method
+    fixture: tests/fixtures/module_generic_enum_method
+    expect:
+      stdout: "1\n5\n0\n9\n"
+    carriers: []
+
+  - name: module-generic-class-method
+    fixture: tests/fixtures/module_generic_class_method
+    expect:
+      stdout: "7\n1\n"
+    carriers: []
+
+  - name: module-generic-static-computed
+    fixture: tests/fixtures/module_generic_static_computed
+    expect:
+      stdout: "7\n10\n1\n0\n"
+    carriers: []
+
+  - name: module-generic-nonpod
+    fixture: tests/fixtures/module_generic_nonpod
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "111\n"
+    carriers:
+      - 1
+      - 2
+    iterations: 3
+    weight: 2
+    collections:
+      - kind: minor
+        trigger: "program request"
+        roots: 1
+        min: 1
+        max: 1
+
+  - name: module-generic-producer
+    fixture: tests/fixtures/module_generic_producer
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "222\n"
+    carriers:
+      - 1
+      - 2
+    iterations: 1
+    full_iterations: 3
+    weight: 2
+    collections:
+      - kind: minor
+        trigger: "program request"
+        roots: 2
+        min: 1
+        max: 1
+
+  - name: module-generic-producer-loop
+    fixture: tests/fixtures/module_generic_producer_loop
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "222\n"
+    carriers:
+      - 1
+      - 2
+    iterations: 1
+    full_iterations: 2
+    weight: 2
+    collections:
+      - kind: minor
+        trigger: "program request"
+        roots: 2
+        min: 60
+        max: 60
+
+  - name: module-generic-string-evac
+    fixture: tests/fixtures/module_generic_string
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "4147\n"
+    carriers:
+      - 1
+      - 2
+    iterations: 3
+    weight: 2
+    collections:
+      - kind: minor
+        trigger: "program request"
+        roots: 1
+        min: 1
+        max: 1
+
+  - name: module-generic-global
+    fixture: tests/fixtures/module_generic_global
+    expect:
+      stdout: "40\n"
+    carriers: []
+
+  - name: module-generic-global-mono
+    fixture: tests/fixtures/module_generic_global
+    compile_args:
+      - "--config=mono_all"
+    expect:
+      stdout: "40\n"
+    carriers: []

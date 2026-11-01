@@ -98,7 +98,7 @@ The buffer is the first variable-size GC object. Its type-id is registered as **
 
 The handle is an ordinary fixed object (kind 0); tracing it follows `bufptr` to the buffer, which is
 then sized and scanned as above. Both objects relocate under evacuation; element references inside the
-buffer are updated. Validated: `examples/arr_gc.nomu` + `tools/arr-gc.sh` (an `Array<Box>` built by
+buffer are updated. Validated: `tests/fixtures/arr_gc.nomu` + `tools/arr-gc.sh` (an `Array<Box>` built by
 `append` is byte-identical under NoGC and constant Immix evacuation).
 
 ### 3.3 Operations (codegen-lowered)

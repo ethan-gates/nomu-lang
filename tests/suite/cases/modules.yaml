@@ -1,0 +1,275 @@
+# Cases: modules, packages and workspaces: visibility, imports, collisions, the prelude, cross-module GC.
+
+cases:
+  - name: module-private
+    fixture: tests/fixtures/module_private
+    compile:
+      expect_error: "is private to its file"
+
+  - name: module-dup
+    fixture: tests/fixtures/module_dup
+    compile:
+      expect_error: "duplicate function 'label'"
+
+  - name: module-visibility
+    fixture: tests/fixtures/module_visibility
+    compile:
+      expect_error: "exposes internal type 'Hidden'"
+
+  - name: module-reexport
+    fixture: tests/fixtures/module_reexport
+    expect:
+      stdout: "50\n"
+    carriers: []
+
+  - name: module-link-diamond
+    fixture: tests/fixtures/module_link_diamond
+    expect:
+      stdout: "23\n"
+    carriers: []
+
+  - name: gc-roots-across-modules-evac
+    fixture: tests/fixtures/gc_roots_across_modules
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 1024
+    expect:
+      stdout: "2014000\n6042\n"
+    carriers:
+      - 1
+      - 2
+    collections:
+      - min: 1
+
+  - name: gc-shapes-across-modules-evac
+    fixture: tests/fixtures/gc_shapes_across_modules
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 1024
+    expect:
+      stdout: "7114012\n"
+    carriers:
+      - 1
+      - 2
+    collections:
+      - min: 1
+
+  - name: module-perfile-import
+    fixture: tests/fixtures/module_perfile_import
+    compile:
+      expect_error: "not imported in this file"
+
+  - name: module-qualified
+    fixture: tests/fixtures/module_qualified
+    expect:
+      stdout: "45\n"
+    carriers: []
+
+  - name: multipackage-basic
+    fixture: tests/fixtures/multipackage_basic/app
+    expect:
+      stdout: "42\n42\n"
+    carriers: []
+
+  - name: multipackage-coexist
+    fixture: tests/fixtures/multipackage_coexist/app
+    expect:
+      stdout: "30\n"
+    carriers: []
+
+  - name: multipackage-undeclared
+    fixture: tests/fixtures/multipackage_undeclared/app
+    compile:
+      expect_error: "package 'greetlib' is not listed in this package's 'dependencies'"
+
+  - name: multipackage-cycle
+    fixture: tests/fixtures/multipackage_cycle/p
+    compile:
+      expect_error: "package dependency cycle"
+
+  - name: multipackage-nonproduct
+    fixture: tests/fixtures/multipackage_nonproduct/app
+    compile:
+      expect_error: "is not a product of package 'greetlib'"
+
+  - name: multipackage-package-hidden
+    fixture: tests/fixtures/multipackage_package_hidden/app
+    compile:
+      expect_error: "module 'lib' has no member 'secret'"
+
+  - name: module-public-nonproduct
+    fixture: tests/fixtures/module_public_nonproduct
+    compile:
+      expect_error: "only a product module may expose `public` symbols"
+
+  - name: multipackage-testimport-foreign
+    fixture: tests/fixtures/multipackage_testimport_foreign/app
+    compile:
+      expect_error: "'test import' may not cross a package boundary"
+
+  - name: module-test-import
+    fixture: tests/fixtures/module_test_import
+    expect:
+      stdout: "42\n"
+    carriers: []
+
+  - name: module-test-import-blackbox
+    fixture: tests/fixtures/module_test_import_blackbox
+    compile:
+      expect_error: "undefined name 'secret_answer'"
+
+  - name: module-collision
+    fixture: tests/fixtures/module_collision
+    compile:
+      expect_error: "exported by more than one imported module"
+
+  - name: module-leaf-collision
+    fixture: tests/fixtures/module_leaf_collision
+    compile:
+      expect_error: "share the qualifier"
+
+  - name: module-collision-resolve
+    fixture: tests/fixtures/module_collision_resolve
+    expect:
+      stdout: "33\n"
+    carriers: []
+
+  - name: module-method
+    fixture: tests/fixtures/module_method
+    expect:
+      stdout: "42\n84\n42\n23\n"
+    carriers: []
+
+  - name: module-mut-method-bad
+    fixture: tests/fixtures/module_mut_method_bad
+    compile:
+      expect_error: "cannot call mutating method on an immutable value"
+
+  - name: mangle-module-boundary
+    fixture: tests/fixtures/mangle_module_boundary
+    expect:
+      stdout: "21\n"
+    carriers: []
+
+  - name: mangle-same-type-name
+    fixture: tests/fixtures/mangle_same_type_name
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "12\n"
+    collections:
+      - min: 1
+
+  - name: module-static-computed
+    fixture: tests/fixtures/module_static_computed
+    expect:
+      stdout: "25\n2\n45\n16\n"
+    carriers: []
+
+  - name: module-gc-deptype
+    fixture: tests/fixtures/module_gc_deptype
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "12345\n7\n4999950000\n"
+    carriers: []
+
+  - name: module-gc-deptype-evac
+    fixture: tests/fixtures/module_gc_deptype
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 512
+    expect:
+      stdout: "12345\n7\n4999950000\n"
+    carriers: []
+    collections:
+      - min: 1
+
+  - name: xworkspace-basic
+    fixture: tests/fixtures/xworkspace_basic/consumer/app
+    expect:
+      stdout: "42\n"
+    carriers: []
+
+  - name: xworkspace-alias
+    fixture: tests/fixtures/xworkspace_alias/consumer/app
+    expect:
+      stdout: "100\n200\n"
+    carriers: []
+
+  - name: reserved-pkg-std
+    fixture: tests/fixtures/reserved_pkg_std/app
+    compile:
+      expect_error: "package name 'std' is reserved"
+
+  - name: reserved-pkg-pkg
+    fixture: tests/fixtures/reserved_pkg_pkg/app
+    compile:
+      expect_error: "package name 'pkg' is reserved"
+
+  - name: prelude-implicit
+    fixture: tests/fixtures/prelude_implicit
+    expect:
+      stdout: "7\n5\nodd\nabcdef\n6\nqualified\n"
+    carriers: []
+
+  - name: prelude-single-definition
+    fixture: tests/fixtures/prelude_implicit
+    object_symbols:
+      - pattern: _nomu_main
+        min: 1
+      - pattern: _nomu_fn_rt
+        max: 0
+      - pattern: _nomu_fn_nomu_
+        max: 0
+      - pattern: _nomu_m_nomu_
+        max: 0
+    expect:
+      stdout: "7\n5\nodd\nabcdef\n6\nqualified\n"
+    carriers: []
+
+  - name: actor-two-modules
+    fixture: tests/fixtures/actor_two_modules
+    expect:
+      stdout: "1\n"
+    object_symbols:
+      - pattern: _nomu_actor_drain
+        min: 1
+
+  - name: core-import-rejected
+    fixture: tests/fixtures/core_import_rejected
+    compile:
+      expect_error: "package 'core' is not listed in this package's 'dependencies'"
+
+  - name: std-module-import
+    fixture: tests/fixtures/std_module_import
+    expect:
+      stdout: "3\n8\n2\nseeded\n15\n"
+    carriers: []
+
+  - name: std-module-missing
+    fixture: tests/fixtures/std_module_missing
+    compile:
+      expect_error: "undefined name 'max'"
+
+  - name: prelude-cross-module
+    fixture: tests/fixtures/prelude_cross_module
+    expect:
+      stdout: "one\nnone\n40\nnegative\n"
+    carriers: []
+
+  - name: module-foreign-type
+    fixture: tests/fixtures/module_foreign_type
+    expect:
+      stdout: "3\n7\n5\n0\n"
+    carriers: []
+
+  - name: module-foreign-type-unnamed
+    fixture: tests/fixtures/module_foreign_type_unnamed
+    compile:
+      expect_error: "'Point' is defined in module"

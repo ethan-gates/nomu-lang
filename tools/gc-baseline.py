@@ -24,7 +24,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NOMU = os.path.join(ROOT, "bazel-bin", "src", "nomu-cli", "nomu")
-BENCH_DIR = os.path.join(ROOT, "examples", "benchmarks")
+BENCH_DIR = os.path.join(ROOT, "benchmarks")
 DEFAULT_WORKLOADS = ["micro_alloc", "alloc_live", "binary_tree", "gc_barrier", "gc_footprint", "micro_carried",
                      "micro_dispatch"]
 MODES = [("gen", []), ("major", ["gc_immix"])]

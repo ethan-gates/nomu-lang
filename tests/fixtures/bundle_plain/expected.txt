@@ -1,0 +1,93 @@
+== double_core
+5.5
+1.5
+7.0
+1.75
+1.5
+232.5
+32-1.5
+116.0
+== double_print
+0.1
+0.3333333333333333
+0.6666666666666666
+1e+02
+123456789.0
+1e+21
+1e+22
+1e-07
+1e-06
+5e-324
+2.2250738585072014e-308
+1.7976931348623157e+308
+0.30000000000000004
+0.0
+0.0
+inf
+-inf
+nan
+1== atomics
+100
+100
+105
+105
+200
+200
+200
+200
+55
+== raw_struct
+123
+456
+123
+1
+0
+1
+0
+== typed_ptr
+10
+20
+30
+30
+7
+== immix_alloc
+12497500
+42
+7
+== immix_los
+5000
+12497500
+4999
+== selfhost_gc
+42
+7
+100
+== module_shared
+12
+42
+== wp_generic_mut_method
+7
+42
+3
+99
+== erased_generic_fn
+42
+== wp_generic_fn
+42
+== wp_generic_nested
+7
+== wp_generic_privcallee
+40
+== wp_generic_field
+42
+== wp_generic_method
+7
+1
+== wp_generic_class_method
+7
+1
+== wp_generic_enum_method
+1
+5
+0
+9

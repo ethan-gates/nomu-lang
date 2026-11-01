@@ -1,6 +1,6 @@
 # tools/
 
-Integration drivers live in the declarative suite (`tests/suite.json`), run by the `compiler-test`
+Integration drivers live in the declarative suite (`tests/suite/`), run by the `compiler-test`
 harness (see `tests/README.md`). What remains here runs across the whole example corpus or measures
 performance, which the per-case suite does not express.
 
@@ -8,7 +8,7 @@ performance, which the per-case suite does not express.
 
 ```
 bazel build -c opt //src/nomu-cli:nomu //src/compiler-test:compiler-test
-bazel-bin/src/compiler-test/compiler-test tests/suite.json
+bazel-bin/src/compiler-test/compiler-test tests/suite
 ```
 
 ## Scripts

@@ -29,7 +29,7 @@ if [[ "${1:-}" == "--one" ]]; then
 fi
 [[ -x "$NOMU" ]] || { echo "FAIL: $NOMU not built (bazel build -c opt //src/nomu-cli:nomu)"; exit 1; }
 ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 8)
-dirs=( "$ROOT"/examples/*/main.nomu(N:h) "$ROOT"/examples/benchmarks/*/main.nomu(N:h) )
+dirs=( "$ROOT"/examples/*/main.nomu(N:h) "$ROOT"/benchmarks/*/main.nomu(N:h) )
 res=$(print -l $dirs | xargs -P "$ncpu" -I{} zsh "$0" --one {})
 pass=$(echo "$res" | grep -c '^OK ');  fail=$(echo "$res" | grep -c '^DIFF '); skip=$(echo "$res" | grep -c '^SKIP '); cfail=$(echo "$res" | grep -c '^CFAIL ')
 echo "identical=$pass differ=$fail off-build-fail=$cfail skipped(no default build)=$skip"

@@ -7,7 +7,7 @@ One command runs the whole suite from a declarative manifest. Design and rationa
 
 ```
 bazel build //src/compiler-test:compiler-test
-bazel-bin/src/compiler-test/compiler-test tests/suite.json   # the manifest path is required
+bazel-bin/src/compiler-test/compiler-test tests/suite   # the manifest directory is required
 ```
 
 Flags:
@@ -26,7 +26,7 @@ Flags:
   fast tier. Exit 1 on a difference, with each file and its first differing byte; the rounds are kept for
   inspection. `nomu build --verify-cache` checks one build against the host cache.
 
-The manifest path is a required positional argument. List tokens match a case `name`; `all` is the
+The manifest directory is a required positional argument. List tokens match a case `name`; `all` is the
 wildcard; a trailing `*` matches by prefix. The pool is 8 lanes; a case occupies `weight` of them.
 Exit codes: 0 all pass · 1 a case failed/timed out · 2 usage · 3 deadline.
 
@@ -48,37 +48,44 @@ CI (not a TTY) it prints a sorted, deterministic batch at the end instead.
 
 ## Add a case
 
-Add an object to `cases` in `tests/suite.json` and a fixture directory — no new shell script. A fixture is a
+The manifest is `tests/suite/`: `suite.yaml` holds the defaults, dimensions and groups, and
+`cases/<area>.yaml` holds the cases, one file per area (gc, generics, modules, runtime, scheduler, language).
+The harness loads every file in `cases/` and rejects a name used twice. Files are in the YAML subset of
+`src/yaml/spec.md`: block collections only (a list is one `- item` per line; `[]` is the only flow form),
+and a scalar on one line. Quote a string that would read as another type, or that holds `\n`.
+
+Add a case to the area file it belongs to, with a fixture directory under `tests/fixtures/` — no new shell
+script. A fixture is a
 package: a `pkg.json` declaring its `name` (the directory's name, matching `[a-z][a-z0-9_]*`) beside its
 `.nomu` files. A fixture that is its own workspace (a `nomu.yaml`) keeps its packages in subdirectories,
 since no package may sit at a workspace root. Fields:
 
 - `name` (unique), `fixture` (a module directory, path from the project root).
-- `compile_args` — extra `nomu build` flags, e.g. `["--runtime-subset=enqueue,dequeue"]` for a
+- `compile_args` — extra `nomu build` flags, e.g. `- "--runtime-subset=enqueue,dequeue"` for a
   subset-legality build. Part of the compile key.
 - `compile_settings` / `run_settings` — named settings (see "Settings"), declared here and nowhere else,
   so a run cannot silently forget or duplicate one. Compilation is shared: a fixture is built once per
   distinct compile configuration; a case's runs vary only `run_settings` / `carriers`. Two cases sharing a
   fixture and compile settings (e.g. a default leg and a stress leg) compile once.
-- `expect` — `{ "stdout": "…" }` (literal, exact) or `{ "stdout_file": "tests/expected/x.txt" }`
+- `expect` — `stdout: "…"` (literal, exact) or `stdout_file: tests/expected/x.txt`
   (golden file, for computed/large output). A golden is captured once and refreshed only when the
   correct output legitimately changes. Omit `expect` to
   only require a clean exit.
 - `iterations` (repeat; all must pass), `carriers` (one run per count, sets `NOMU_CARRIERS`). Set
-  `"carriers": []` to run once without setting `NOMU_CARRIERS` — for fixtures that manage their own
+  `carriers: []` to run once without setting `NOMU_CARRIERS` — for fixtures that manage their own
   threads (the self-hosted scheduler/actor cases).
-- `stderr_match` — `[ { "pattern": "nomu-gc: report", "min": 1 } ]`, a per-line substring count over the
+- `stderr_match` — entries of `pattern: "nomu-gc: report"`, `min: 1`, a per-line substring count over the
   run's stderr. `min` / `max` both optional.
-- `collections` — `[ { "kind": "minor", "min": 10 } ]`, a count of the run's collection cycles, read from the
+- `collections` — entries of `kind: minor`, `min: 10`, a count of the run's collection cycles, read from the
   collector report. Each field narrows the cycles counted: `kind` (`minor`, `major`), `trigger` (a name from
   the report's `names.triggers`, e.g. `program request`), `roots` (exactly this many stack roots); an absent
   field matches every cycle. A case with it compiles with `gc_record` and runs with `NOMU_GC_REPORT_DIR` set
   to a directory of its own, which the runner reads after each run. `min` / `max` both optional.
-- `report_metrics` — `[ { "path": "allocation.objects", "equals": 200009 } ]`, values from the same report's
+- `report_metrics` — entries of `path: allocation.objects`, `equals: 200009`, values from the same report's
   `metrics` by dot-separated path: `equals`, or `min` / `max`, or `"absent": true` for a path the report must
   not have. Like `collections`, it turns on `gc_record` (a case compiled with `gc_record_full` keeps `full`).
   `gc-record-full` and its stress leg pin the allocation counts exactly.
-- `object_symbols` — `[ { "pattern": "_nomu_fn_rt", "max": 0 } ]`, a count of defined symbols (`nm -U`)
+- `object_symbols` — entries of `pattern: _nomu_fn_rt`, `max: 0`, a count of defined symbols (`nm -U`)
   containing the substring in the fixture's own object (`<binary>.o`), checked once after compile. `min` /
   `max` both optional. Pins what the program's object defines, e.g. no duplicated runtime / `std` copies.
 - `object_references` — the same shape over undefined symbols (`nm -u`): what the object calls out to,
@@ -101,7 +108,7 @@ since no package may sit at a workspace root. Fields:
   a timing-dependent race runs `iterations` times in the fast tier and `full_iterations` in the full tier.
   Groups take it too.
 
-Unknown keys are an error, at every level of the manifest.
+Unknown keys are an error, at every level of the manifest, reported with the file, line and column.
 
 Unset fields fall back to `defaults`.
 
@@ -147,10 +154,27 @@ A `group` names fixtures by a directory glob (`dir/*`, every subdirectory), the 
 shared settings and a default `expect`. It expands to one run per fixture and combination of values, named
 `group/fixture/value/…` (`shape/local_string/release/stress-major`). A fixture's own `expected.txt`, beside
 its source, wins over the group's `expect`. A run's tier is the highest of its group's and its values'.
+`exclude` lists subdirectories the glob leaves out, by name; each must exist, and the manifest says why it is
+excluded.
 - `shape` — `tests/fixtures/shape_matrix/*` across `pipeline` × `gc`: a heap `String` held in every
   position a program can hold one, read back across collections (task 176.5). Each prints `bad 0`.
 - `layout` — `tests/fixtures/layout_matrix/*` across `pipeline`: value layouts a mono caller and an erased
   body must agree on.
+- `examples` — `examples/*`, the user-facing demos, each against its `expected.txt`, so they keep working.
+
+## Bundles
+
+A bundle is one fixture holding several small programs, so they cost one build, one link and one first
+run. Each program is a module of the bundle's package, and its `main` is `package fun bundleMain()`; the
+bundle's own `main` runs them in turn, each after a `== <module>` line, so a failing diff names the part that
+broke. `bundle-plain`, `bundle-rt-prelude` and `bundle-core-import` are the bundles today, one per set of
+compile settings.
+
+A program fits a bundle when it shares the bundle's compile settings, compile arguments and run settings,
+checks only its stdout, runs in a few milliseconds, and its output does not depend on what ran before it in
+the process. Programs that print heap addresses, fingerprints or live counts (the mark-verify and root-walk
+fixtures), that print while globals initialize, or whose module layout is the thing under test keep a
+fixture of their own, as does a fixture another case also uses with other settings.
 
 ## Tiers
 
@@ -162,13 +186,13 @@ its budget, and every run lists its five slowest cases.
 ## Scheduling order
 
 The runner dispatches longest-first (LPT), so the long tails start early and overlap instead of
-draining the pool at the end. The order lives in the manifest as an optional top-level
-`computed_order` (the longest-first list of case names), written back as a single line — failures and
-timeouts included, so a slow-failing case keeps its front-of-line slot. Never-measured cases sort
-first (run early, get ranked next time). It is rewritten only on a whole-tier run (no `--enable`, `--disable` or `--where`; cases outside the tier
-keep their earlier ranking after the measured ones),
-sorted by that run's measured times, so a subset run reads the order but never rewrites it from partial
-data. Safe to commit (CI/fresh checkouts inherit the order) or to delete (a full run rebuilds it).
+draining the pool at the end. The order is a local cache, `build/compiler-test/order.txt`: the case names
+longest first, one per line, failures and timeouts included, so a slow-failing case keeps its
+front-of-line slot. Never-measured cases sort first (run early, get ranked next time). It is rewritten only
+on a whole-tier run (no `--enable`, `--disable` or `--where`; cases outside the tier keep their earlier
+ranking after the measured ones), sorted by that run's measured times, so a subset run reads the order but
+never rewrites it from partial data. Timings belong to the machine, so the file stays out of git; deleting
+it costs one unordered run.
 
 ## Golden files
 
@@ -176,7 +200,7 @@ data. Safe to commit (CI/fresh checkouts inherit the order) or to delete (a full
 fixture's correct output legitimately changes, e.g.:
 
 ```
-nomu build -c no_escape examples/gc_string && build/no_escape/examples/gc_string > tests/expected/gc_string.txt
+nomu build -c no_escape tests/fixtures/gc_string && build/no_escape/tests/fixtures/gc_string > tests/expected/gc_string.txt
 ```
 
 ## Status

@@ -245,7 +245,7 @@ Stages, each deleting the C it replaces:
   Work:
   - **223.2.1** Baseline: an allocation-bound benchmark with references live across allocations, the
     instructions at one allocation site, and stack-map records per binary, before any change. **Done.**
-    New benchmark `examples/benchmarks/alloc_live`: 20,000 rounds each build a 1000-node list front to
+    New benchmark `benchmarks/alloc_live`: 20,000 rounds each build a 1000-node list front to
     back (the previous head live across every allocation) and walk it; 98% mutator time (`gc_record`: 9
     cycles, 3.4 ms of 156 ms). `tools/stackmap-count.py` counts stack-map records. Apple M3 Max, release,
     `hyperfine -N`, 20 runs:

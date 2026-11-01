@@ -20,12 +20,12 @@ tracking reference.
 **► 150.1 (NoGC) · slice A built.** The bump-allocator policy written in Nomu over 125 raw memory, under 149's
 subset rules: a `RawPtr` control block `{ base, cursor, limit }`, `bumpNew` (carve an off-heap block),
 `bumpAlloc` (bump + overflow→null). Compiles under `--runtime-subset=bumpNew,bumpAlloc` (first real
-125↔149 client); byte-identical under NoGC and Immix-evacuation. `examples/bump_alloc.nomu` +
+125↔149 client); byte-identical under NoGC and Immix-evacuation. `tests/fixtures/bump_alloc.nomu` +
 `tools/bump-alloc.sh`; design `internals/selfhosted-gc.md` §3.
 
 **► Slice B foundation built — the runtime prelude.** The allocator now lives in `src/stdlib/runtime.nomu`
 (embedded, compiled into every program, runtime-subset by default — the 149 "designated file"). Auto-subset
-verified, callable from user code (`examples/rt_prelude.nomu` + `tools/rt-prelude.sh`). The
+verified, callable from user code (`tests/fixtures/rt_prelude.nomu` + `tools/rt-prelude.sh`). The
 `addrspace(1)`-production question is **resolved**: the allocator returns a `RawPtr`, the seam does
 `ptrtoint`→`inttoptr` to `p1` (the fast path's existing integer→`p1` step) — no `addrspacecast`, no
 intrinsic.
@@ -34,7 +34,7 @@ intrinsic.
 allocator: an extern flag (`__nomu_selfhosted_alloc`, Rust `AtomicU8` set in `nomu_gc_init`) disables the
 MMTk fast path and branches the seam's slow path to `__nomu_selfhost_alloc` (lazy arena + `rtBumpAlloc`,
 `ptrtoint`→`inttoptr` to `p1`); MMTk runs NoGC-idle as the diff oracle. Class objects, closures, arrays,
-and heavy allocation are byte-identical under `nogc` vs `nomu` (`examples/selfhost_gc.nomu` +
+and heavy allocation are byte-identical under `nogc` vs `nomu` (`tests/fixtures/selfhost_gc.nomu` +
 `tools/selfhost-gc.sh`); the full GC suite (through GenImmix) is unaffected. First-cut limits: single
 256 MiB arena, no refill; single (not per-carrier) arena.
 
@@ -153,28 +153,28 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
   oracle:
   - 150.3.1 — region substrate: block pool over 125 + side metadata tables (line marks, block state).
     **Built.** Prelude `rtImmix*` (space descriptor, block pool, addr↔index math, byte-per-entry line/block
-    tables), one new intrinsic `RawPtr.toInt()` (ptrtoint) for addr→index math. `examples/immix_region.nomu`
+    tables), one new intrinsic `RawPtr.toInt()` (ptrtoint) for addr→index math. `tests/fixtures/immix_region.nomu`
     + `tools/immix-region.sh` (adjacency, index round-trip, state transitions, pool exhaustion;
     byte-identical NoGC vs Immix, auto-subset).
   - 150.3.2 — region-structured allocator (`rtImmixAlloc`: bump within block, refill fresh block on
     overflow), routed behind the self-hosted-alloc seam (`NOMU_GC_PLAN=nomu`, 256 MiB space), non-collecting.
     **Built.** Byte-identical to MMTk NoGC on `selfhost-gc` + a 3-block-crossing fixture
-    (`examples/immix_alloc.nomu` + `tools/immix-alloc.sh`). Line-granular hole reuse lands with sweep (150.3.5).
+    (`tests/fixtures/immix_alloc.nomu` + `tools/immix-alloc.sh`). Line-granular hole reuse lands with sweep (150.3.5).
   - 150.3.3 — large-object space (`rtLosAlloc`: objects larger than a block allocated whole off-heap,
     linked off `losHead`, never moved), non-collecting. **Built.** Diff vs MMTk NoGC on a large `Array<Int>`
-    (`examples/immix_los.nomu` + `tools/immix-los.sh`). First-cut LOS threshold = block size; the
+    (`tests/fixtures/immix_los.nomu` + `tools/immix-los.sh`). First-cut LOS threshold = block size; the
     medium-object overflow allocator folds into 150.3.5.
   - 150.3.4 — line marking in the tracer (diagnostic, no reclaim). **Built.** `rtMarkVerifyImmix` marks
     each live in-heap object's lines; `rtLineMarkCheck` verifies completeness + soundness (returns 0); new
-    `RawPtr.gcSelfhostSpace()` intrinsic. `examples/immix_line_mark.nomu` + `tools/immix-line-mark.sh`.
+    `RawPtr.gcSelfhostSpace()` intrinsic. `tests/fixtures/immix_line_mark.nomu` + `tools/immix-line-mark.sh`.
   - 150.3.5 — sweep reclamation (non-moving). **Built — first functioning self-hosted collector.**
     `rtImmixCollect` (clear lines → mark → reclaim by block + LOS → unmark → reset); hole-aware allocator
-    (`rtNextHole`/`rtNextAllocBlock`) reuses reclaimed + recyclable space. `examples/immix_sweep.nomu` +
+    (`rtNextHole`/`rtNextAllocBlock`) reuses reclaimed + recyclable space. `tests/fixtures/immix_sweep.nomu` +
     `tools/immix-sweep.sh` (reclamation + reuse + live survival). Driven explicitly on a deterministic root
     set; automatic collection at a real STW (whole-program `arr-gc`/`gc-stress` under `nomu`) is 128.3.2.
   - 150.3.6 — forwarding word (header bit 33 + new address in payload word 0) + copy primitive
     (`rtCopyObject`/`rtIsForwarded`/`rtForwardingPointer`). **Built.** `rtCheckPayloadWord` = 0 (assumption
-    holds). `examples/immix_forward.nomu` + `tools/immix-forward.sh`.
+    holds). `tests/fixtures/immix_forward.nomu` + `tools/immix-forward.sh`.
   - 150.3.7 — evacuation forward-during-trace + pointer fixup (slots + roots). **Built — the moving
     collector.** `rtImmixEvacCollect` (returns the new root) snapshots `freeCursor` as a from-space boundary
     (force-all), points the copy allocator at fresh to-space only, then `rtImmixEvacMark`/`rtEvacuate` copy
@@ -182,7 +182,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
     survivor as the trace visits it; the 150.3.5 sweep reclaims the emptied from-space. LOS never moves;
     shared/cyclic refs resolve once via the forwarded-/mark-bit guards. `noSafepoint` (149) closes 125 §3.3's
     moving-heap gate. `rtImmixCollect` (non-moving) stays separate; unifying behind a defrag trigger is
-    150.3.8. `examples/immix_evac.nomu` + `tools/immix-evac.sh` (root + Box moved, value reads back through
+    150.3.8. `tests/fixtures/immix_evac.nomu` + `tools/immix-evac.sh` (root + Box moved, value reads back through
     the fixed-up slot, fingerprint invariant, from-space reclaimed).
   - 150.3.8 — copy reserve + defrag trigger. **Built — rung 3 complete as a hosted collector.**
     `rtImmixCollectDefrag` is the general collector: `rtSelectDefragSources` reads a new per-block
@@ -193,7 +193,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
     (`rtImmixEvacMark`) serves non-moving (0 sources), force-all (all used blocks sources,
     `rtImmixEvacCollect`), and the fragmentation-selected middle. The first collection has no histogram, so
     it never moves and only seeds `defragTable`. Descriptor grew to 120 bytes (`defragTable@112`).
-    `examples/immix_defrag.nomu` + `tools/immix-defrag.sh` (first collection non-moving, second compacts the
+    `tests/fixtures/immix_defrag.nomu` + `tools/immix-defrag.sh` (first collection non-moving, second compacts the
     fragmented blocks' survivors, fingerprint invariant, sources reclaimed). Remaining policy knobs (the
     threshold value, a spill-based selection order) ride on the histogram.
   - *First cut is single-carrier + `gcForceCollect`-driven on deterministic fixtures;* multi-mutator STW
@@ -209,7 +209,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
     (`RawPtr.gcSelfhostSpace()`, requires `NOMU_GC_PLAN=nomu` + `NOMU_SCHED=nomu`). Proof is transparency: a
     force-all move relocates every live object, so a wrong slot fixup would resume the mutator on a stale
     pointer into reclaimed space; instead the program prints the MMTk/NoGC value.
-    `examples/stw_collect.nomu` + `tools/stw-collect.sh` (a live Box relocated across the collection, its
+    `tests/fixtures/stw_collect.nomu` + `tools/stw-collect.sh` (a live Box relocated across the collection, its
     stack slot fixed up, the worker resumes and reads it → 111, output-identical to MMTk over 15 runs). This
     is the first time the Nomu collector reclaims memory at a whole-program STW on the Nomu scheduler.
     - *Heap-pressure auto-trigger.* **Built.** A GC thread (`NOMU_GC_PRESSURE`) polls the self-hosted heap's
@@ -217,7 +217,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
       collection (`rtImmixCollectRootsDefrag` / `nomuSchedStwCollectDefrag`) at the same STW handshake —
       defrag, not force-all, because a near-full heap has no free to-space, and defrag is non-moving when
       full. The mutator stops at its next back-edge safepoint poll (a clean user statepoint), so collection
-      lands between allocations and the roots are walkable. `examples/gc_pressure.nomu` +
+      lands between allocations and the roots are walkable. `tests/fixtures/gc_pressure.nomu` +
       `tools/gc-pressure.sh`: a fiber allocates 640 MiB (a 100-Box sliding window live, the rest garbage) on
       the 256 MiB heap and survives via repeated collections, checksum-identical to MMTk NoGC — which also
       exercises internal-pointer fixup (the array buffer's element pointers relocate). Trigger reserve
@@ -242,7 +242,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
       Also closed a latent race the split exposed: the seam's lazy creation of the process-singleton Immix space
       (`__nomu_selfhost_space`) was unguarded, so concurrent carriers each built their own 256 MiB heap — now
       double-checked locking around the create (`rt_selfhost_space_lock_*` + an acquire/release global). Proof:
-      `tools/gc-concurrent.sh` (`examples/gc_concurrent.nomu`) runs four fibers allocating concurrently on 2/4/8
+      `tools/gc-concurrent.sh` (`tests/fixtures/gc_concurrent.nomu`) runs four fibers allocating concurrently on 2/4/8
       carriers, checksum-identical to MMTk NoGC; `gc-pressure.sh` and `stw-collect.sh` extended to 1/2/4 carriers
       (single allocating fiber) exercise the TLAB reset. All 28 drivers green. With 150.3.13 landed,
       `gc-concurrent.sh` runs the collecting form — four fibers over-allocating 384 MiB on the 256 MiB heap,
@@ -295,7 +295,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
       holds under `NOMU_RUNTIME=selfhost`: the buffers live off-heap relative to the self-hosted Immix space,
       so `rtEvacuate`'s off-heap guard (addr < base / ≥ heapEnd → return unchanged) leaves them in place and
       the sweep never touches them — a String reads back intact across a collection. `tools/gc-string.sh`
-      (`examples/gc_string.nomu`): a String-heavy program folds a content hash identical to MMTk NoGC while
+      (`tests/fixtures/gc_string.nomu`): a String-heavy program folds a content hash identical to MMTk NoGC while
       collections fire at true OOM, single- and multi-carrier. Routing immortal allocations to the self-hosted
       LOS is deferred to the MMTk-retirement pass (a self-host-purity item, not a correctness gap now).
     - 150.3.12.3 — header + pointer map for witness value-payload boxes (the 150.3.13 follow-up folded here).
@@ -308,7 +308,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
       the wrinkle: the three value-payload readers now reach the value at payload+8 via a `payloadValue`
       helper — `bridgeThunkSelf` (by-value load and the by-pointer `toUnmanaged`), `propThunk`'s stored-field
       GEP. Class/actor payloads (already headered objects) are unchanged. `tools/gc-anybox.sh`
-      (`examples/gc_anybox.nomu`): 64 boxed value structs survive collections under default block-on-OOM and
+      (`tests/fixtures/gc_anybox.nomu`): 64 boxed value structs survive collections under default block-on-OOM and
       force-all evacuation, read back identical to MMTk (10432); pre-fix the same program crashed/emptied
       under a moving collection. The witness suite (interfaces/composition/opaque/refinement/extensions) is
       output-unchanged. *Adjacent limitation left in place:* a value type with a managed field boxed as
@@ -348,7 +348,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
     `nurseryUsed` (a collection empties the nursery). Non-collecting: no minor GC yet, so the reserve bound is
     unenforced and the existing collector treats `NURSERY` as any used block (sweep overwrites its state,
     defrag-select includes it, evac skips non-source). Introspection `rtNurseryBlocksUsed` /
-    `rtNurseryReserve`. `examples/gen_nursery.nomu` + `tools/gen-nursery.sh` (young allocation tagged +
+    `rtNurseryReserve`. `tests/fixtures/gen_nursery.nomu` + `tools/gen-nursery.sh` (young allocation tagged +
     counted, equals the blocks handed out, bounded by the reserve). All 33 drivers + gen-nursery + gc-gen
     (MMTk GenImmix oracle) + unit tests green.
   - 150.4.2 — self-hosted log-bit table + barrier activation under `NOMU_GC_PLAN=nomu`; Nomu slow path fills
@@ -364,7 +364,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
     this carrier's mod-buffer — a growable per-carrier append buffer bound in the C runtime
     (`rt_self_modbuf_get`), reset at end-of-collection (`rt_modbuf_reset_all`) beside `rt_tlab_reset_all`. The
     table starts all-logged, so young objects never trip the barrier and the whole suite is unchanged
-    (remembered set empty while non-collecting). `examples/gen_barrier.nomu` + `tools/gen-barrier.sh` exercise
+    (remembered set empty while non-collecting). `tests/fixtures/gen_barrier.nomu` + `tools/gen-barrier.sh` exercise
     it non-collecting: a `rtSetUnlogged` hook simulates promotion, then an old→young store fires the barrier
     and appends once (1), a second store to the same object elides the slow path (1), the computation reads
     back. All 33 drivers + gen-nursery + gen-barrier + gc-gen (MMTk GenImmix oracle) + unit tests green.
@@ -381,7 +381,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
     at sched+176 and runs `nomuSchedStwCollectMinor` instead of the defrag major). The trigger is opt-in via
     `NOMU_NURSERY_RESERVE` (blocks; 0 = disabled) — until the minor collector is robust across every object
     type and multi-carrier (150.4.5), the default path stays major-only at OOM, so the whole existing suite is
-    unchanged. `examples/gen_minor.nomu` + `tools/gen-minor.sh`: a sliding-window allocator drives ~48 real
+    unchanged. `tests/fixtures/gen_minor.nomu` + `tools/gen-minor.sh`: a sliding-window allocator drives ~48 real
     minor GCs; a Holder promoted to mature then pointed at a fresh nursery Box survives via the remembered set,
     checksum-identical to MMTk GenImmix (42 / 4242 / window checksum). All drivers + unit tests green.
     *Deferred:* minor/major escalation on mature pressure / failed promotion → 150.4.4; mature-garbage reclaim
@@ -404,7 +404,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
     bit on a freed region would falsely remember a young object (the minor treats a remembered object as mature
     and non-moving — corruption); a missing unlog on a survivor would silently drop a mature→young pointer in
     the next minor. The pre-150.4.4 path (no `NOMU_NURSERY_RESERVE`) runs the plain defrag unchanged, so the
-    existing suite is byte-identical. `examples/gen_major.nomu` + `tools/gen-major.sh`: under a tiny reserve +
+    existing suite is byte-identical. `tests/fixtures/gen_major.nomu` + `tools/gen-major.sh`: under a tiny reserve +
     `NOMU_MATURE_FLOOR`, a sliding-window allocator drives ~128 minor GCs interleaved with ~18 major GCs; a
     cross-generation store made *after* majors have fired survives (proving the post-major log bits are
     re-armed), checksum-identical to MMTk GenImmix (77 / 4242 / 94950). The trigger stays opt-in (env-gated);
@@ -448,7 +448,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
       `rtImmixCollectMinor` walks the `losHead` chain and `rtMinorScanObj`s each object for young referents
       (immortal String buffers hold no managed pointers, so they need no scanning and are not on the list; a
       dead-but-unswept LOS object conservatively keeps its young referents alive until the next major). Proof:
-      `examples/gc_los_gen.nomu` + `tools/gen-los.sh` — a young Box stored into a mature ~48 KiB LOS buffer,
+      `tests/fixtures/gc_los_gen.nomu` + `tools/gen-los.sh` — a young Box stored into a mature ~48 KiB LOS buffer,
       reachable only through the off-heap buffer, survives repeated minors (777); confirmed to read garbage
       (789823) with the LOS scan disabled, so the fixture genuinely exercises the gap. Checksum-identical to
       MMTk GenImmix.
@@ -460,7 +460,7 @@ The ladder rungs, as tracking references. 150.2's increments are logged per-incr
       races (a lost clear only keeps an object remembered-eligible, and a remembered object is rescanned in full
       regardless of which carrier logged it, so no store's remembering is lost); the drain runs at STW with all
       carriers parked. Verified: `gc_concurrent` checksum-identical to MMTk at 1/2/4/8 carriers, and a new
-      self-checking actor fixture (`examples/gc_actor_mc.nomu` — `report` prints only on a wrong sum, so the
+      self-checking actor fixture (`tests/fixtures/gc_actor_mc.nomu` — `report` prints only on a wrong sum, so the
       pass condition is empty output, robust to concurrent-`print` interleaving) shows no cross-generation
       message lost across many runs at 1/2/4/8 carriers. Driver: `tools/gen-multicarrier.sh`. *Note:* the
       original `gc_actor` per-actor prints garble line structure under >1 carrier (two `report`s interleaving

@@ -1,0 +1,144 @@
+# Cases: the runtime tier: the subset rule, intrinsics, raw memory, static storage, the clocks.
+
+cases:
+  - name: bump-alloc
+    fixture: tests/fixtures/bump_alloc
+    compile_args:
+      - "--runtime-subset=bumpNew,bumpAlloc"
+    expect:
+      stdout: "42\n99\n1\n1\n"
+    carriers: []
+
+  - name: raw-mem
+    fixture: tests/fixtures/raw_mem
+    expect:
+      stdout: "42\n7\n99\n255\n1\n"
+    carriers: []
+    object_references:
+      - pattern: rt_raw_
+        max: 0
+      - pattern: posix_memalign
+        min: 1
+
+  - name: managed-buffer-ref
+    fixture: tests/fixtures/managed_buffer_ref
+    compile_args:
+      - "--allow-core-import"
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "111\n222\n"
+    carriers: []
+
+  - name: managed-buffer-ref-evac
+    fixture: tests/fixtures/managed_buffer_ref
+    compile_args:
+      - "--allow-core-import"
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 64
+    expect:
+      stdout: "111\n222\n"
+    carriers: []
+    collections:
+      - min: 1
+
+  - name: managed-buffer-scalar-ref-bad
+    fixture: tests/fixtures/managed_buffer_scalar_ref_bad
+    compile_args:
+      - "--allow-core-import"
+    compile:
+      expect_error: "requires a reference Element"
+    carriers: []
+
+  - name: sysclock
+    fixture: tests/fixtures/sysclock
+    compile_settings:
+      runtime_tier: true
+    expect:
+      stdout: "1\n1\n"
+    carriers: []
+
+  - name: sysclock-subset
+    fixture: tests/fixtures/sysclock
+    compile_settings:
+      runtime_tier: true
+    compile_args:
+      - "--runtime-subset=elapsed"
+    expect:
+      stdout: "1\n1\n"
+    carriers: []
+
+  - name: subset-ok
+    fixture: tests/fixtures/subset_ok
+    compile_args:
+      - "--runtime-subset=carve,advance"
+    expect:
+      stdout: "42\n"
+    carriers: []
+
+  - name: subset-bad
+    fixture: tests/fixtures/subset_bad
+    compile_args:
+      - "--runtime-subset=bad"
+    compile:
+      expect_error: "may not allocate a 'Box'"
+
+  - name: subset-bad-call
+    fixture: tests/fixtures/subset_bad
+    compile_args:
+      - "--runtime-subset=bad"
+    compile:
+      expect_error: "may not call 'helper'"
+
+  - name: subset-poll
+    fixture: tests/fixtures/subset_poll
+    compile_args:
+      - "--runtime-subset=ramp"
+    compile_settings:
+      inline: false
+    expect:
+      stdout: "45\n"
+    carriers: []
+    object_symbols:
+      - pattern: __nomu_gc_poll_slow
+        max: 0
+
+  - name: static-storage
+    fixture: tests/fixtures/static_storage
+    compile_settings:
+      runtime_tier: true
+    expect:
+      stdout: "0\n3\n1\n1\n1\n"
+    carriers: []
+
+  - name: static-storage-release
+    fixture: tests/fixtures/static_storage
+    compile_settings:
+      runtime_tier: true
+      optimize: true
+    expect:
+      stdout: "0\n3\n1\n1\n1\n"
+    carriers: []
+
+  - name: runtime-intrinsic-rejected
+    fixture: tests/fixtures/runtime_intrinsic_rejected
+    compile:
+      expect_error: "undefined name 'Runtime'"
+
+  - name: bundle-rt-prelude
+    fixture: tests/fixtures/bundle_rt_prelude
+    compile_settings:
+      rt_prelude: true
+    expect:
+      stdout_file: tests/fixtures/bundle_rt_prelude/expected.txt
+    carriers: []
+
+  - name: bundle-core-import
+    fixture: tests/fixtures/bundle_core_import
+    compile_args:
+      - "--allow-core-import"
+    expect:
+      stdout_file: tests/fixtures/bundle_core_import/expected.txt
+    carriers: []
