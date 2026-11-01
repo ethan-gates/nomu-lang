@@ -53,7 +53,16 @@ struct Defaults: Decodable {
 struct Expect: Decodable {
     var stdout: String?
     var stdoutFile: String?
-    enum CodingKeys: String, CodingKey { case stdout, stdoutFile = "stdout_file" }
+    // The signal the run must die from (`SIGSEGV`, `SIGABRT`, …), for a case that crashes on purpose; absent, a
+    // run must exit 0.
+    var signal: String? = nil
+    enum CodingKeys: String, CodingKey { case stdout, stdoutFile = "stdout_file", signal }
+}
+
+// The signal named `name` (`SIGSEGV`), or nil for a name the harness does not know.
+func signalNumber(_ name: String) -> Int32? {
+    ["SIGILL": SIGILL, "SIGTRAP": SIGTRAP, "SIGABRT": SIGABRT, "SIGBUS": SIGBUS, "SIGSEGV": SIGSEGV,
+     "SIGKILL": SIGKILL][name]
 }
 
 struct CompileSpec: Decodable {

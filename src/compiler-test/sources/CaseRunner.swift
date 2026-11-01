@@ -87,6 +87,11 @@ struct CaseRunner {
         guard let want = loadGolden(c.expect) else {
             return result(.fail, ["  golden file missing for expect.stdout_file"])
         }
+        var wantSignal: Int32? = nil
+        if let name = c.expect?.signal {
+            guard let n = signalNumber(name) else { return result(.fail, ["  expect.signal: unknown signal '\(name)'"]) }
+            wantSignal = n
+        }
 
         var stdinFeed: StdinFeed? = nil
         if let f = c.stdinFile {
@@ -123,12 +128,19 @@ struct CaseRunner {
                                   ["  run TIMEOUT (\(at)) after \(fmt(r.duration))"] + partial(r) + ["  repro: \(runRepro)"],
                                   runTime: totalRun)
                 }
-                if let sig = r.signal {
+                if let sig = r.signal, sig != wantSignal {
+                    let expected = wantSignal.map { ", expected \(c.expect?.signal ?? "") (\($0))" } ?? ""
                     return result(.fail,
-                                  ["  run crashed (\(at), signal \(sig))"] + partial(r) + ["  repro: \(runRepro)"],
+                                  ["  run crashed (\(at), signal \(sig)\(expected))"] + partial(r) + ["  repro: \(runRepro)"],
                                   runTime: totalRun)
                 }
-                if r.exitCode != 0 {
+                if r.signal == nil, let w = wantSignal {
+                    return result(.fail,
+                                  ["  run exited \(r.exitCode ?? -1) (\(at)), expected \(c.expect?.signal ?? "") (\(w))"]
+                                      + partial(r) + ["  repro: \(runRepro)"],
+                                  runTime: totalRun)
+                }
+                if r.signal == nil, r.exitCode != 0 {
                     return result(.fail,
                                   ["  run exited \(r.exitCode ?? -1) (\(at))"] + partial(r) + ["  repro: \(runRepro)"],
                                   runTime: totalRun)

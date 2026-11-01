@@ -8,7 +8,7 @@ workspaces
 
 job nomu.nomu:runtime
   package runtime at @nomu.nomu/runtime (product)
-  files carrier.nomu collect.nomu descriptors.nomu gcreport.nomu immix.nomu io.nomu scheduler.nomu stackwalk.nomu startup.nomu verify.nomu
+  files carrier.nomu collect.nomu descriptors.nomu fault.nomu gcreport.nomu immix.nomu io.nomu scheduler.nomu stackwalk.nomu startup.nomu verify.nomu
   library, language, runtime-subset
   out @nomu.cons/build/_external/nomu.nomu/runtime/runtime
 job nomu.nomu:std/prelude

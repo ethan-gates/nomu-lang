@@ -270,7 +270,8 @@ enum RuntimeIntrinsics {
         // runtime-tier primitive for handing an entry point to the asm floor (rtFiberInit) or
         // pthread_create — deliberately not first-class functions (task 128 note: full first-class
         // functions/closures for user code are a later, separate language step). The argument must name a
-        // top-level `fun (_: RawPtr) -> RawPtr` — the carrier/fiber-entry ABI (a bare pointer, no env).
+        // top-level `fun (_: RawPtr) -> RawPtr` — the carrier/fiber-entry ABI (a bare pointer, no env) — or a
+        // `fun (_: Int, _: RawPtr, _: RawPtr)`, the `SA_SIGINFO` signal handler's (`Runtime.sigaction`).
         case "ofFunc":
             guard args.count == 1, args[0].label == nil else {
                 s.diags.error("Runtime.ofFunc takes one argument: a top-level function name", at: span)
@@ -284,11 +285,44 @@ enum RuntimeIntrinsics {
                 s.diags.error("no top-level function named '\(fname)'", at: span)
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
-            guard sig.generics.isEmpty, sig.params == [.rawPtr], sig.ret == .rawPtr else {
-                s.diags.error("Runtime.ofFunc requires a non-generic 'fun \(fname)(_: RawPtr) -> RawPtr'", at: span)
+            let entryShape = sig.params == [.rawPtr] && sig.ret == .rawPtr
+            let handlerShape = sig.params == [.int, .rawPtr, .rawPtr] && sig.ret == .void
+            guard sig.generics.isEmpty, entryShape || handlerShape else {
+                s.diags.error("Runtime.ofFunc requires a non-generic 'fun \(fname)(_: RawPtr) -> RawPtr' or "
+                              + "'fun \(fname)(_: Int, _: RawPtr, _: RawPtr)'", at: span)
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return NOIRExpr(type: .rawPtr, span: span, kind: .funcRef(name: fname))
+        // Fault handling (task 219): install a signal handler, give the calling thread an alternate signal
+        // stack, read the stack the calling thread has, and send a signal to the calling thread. libSystem
+        // externs; the `struct sigaction` and `stack_t` layouts are built in the lowering. Each returns the C
+        // call's result (0 on success), except `currentAltStack`.
+        //   sigaction(signal:handler:flags:)  handler from Runtime.ofFunc (the SA_SIGINFO shape); no mask
+        //   sigaltstack(base:size:)           the stack for this thread's handlers, enabled
+        //   currentAltStack()                 this thread's alternate stack base, or null when it has none
+        //   raise(signal:)                    the signal, sent to the calling thread
+        //   imageHeader()                     the executable's Mach-O header, where it is loaded
+        case "sigaction":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["signal", "handler", "flags"], "Runtime.sigaction", span) else { return err(span) }
+            let sg = PointerIntrinsics.intArg(&s, args[0].value, "Runtime.sigaction", "signal")
+            let h = PointerIntrinsics.ptrArg(&s, args[1].value, "Runtime.sigaction", "handler")
+            let fl = PointerIntrinsics.intArg(&s, args[2].value, "Runtime.sigaction", "flags")
+            return s.ptrIntrinsic("__sysSigaction", .int, [sg, h, fl], span)
+        case "sigaltstack":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["base", "size"], "Runtime.sigaltstack", span) else { return err(span) }
+            let base = PointerIntrinsics.ptrArg(&s, args[0].value, "Runtime.sigaltstack", "base")
+            let size = PointerIntrinsics.intArg(&s, args[1].value, "Runtime.sigaltstack", "size")
+            return s.ptrIntrinsic("__sysSigaltstack", .int, [base, size], span)
+        case "currentAltStack":
+            guard PointerIntrinsics.checkArgLabels(&s, args, [], "Runtime.currentAltStack", span) else { return err(span) }
+            return s.ptrIntrinsic("__sysCurrentAltStack", .rawPtr, [], span)
+        case "imageHeader":
+            guard PointerIntrinsics.checkArgLabels(&s, args, [], "Runtime.imageHeader", span) else { return err(span) }
+            return s.ptrIntrinsic("__sysImageHeader", .rawPtr, [], span)
+        case "raise":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["signal"], "Runtime.raise", span) else { return err(span) }
+            let sg = PointerIntrinsics.intArg(&s, args[0].value, "Runtime.raise", "signal")
+            return s.ptrIntrinsic("__sysRaise", .int, [sg], span)
         // Asm-floor context switch (task 128.2). `from` is the context buffer to save into (≥168 bytes, the
         // callee-saved set); `to` is the context to resume. Saves the current registers into `from` and jumps
         // into `to` (rtSwitch). Subset-legal (`__sys`).

@@ -109,6 +109,8 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
     let rootJobs = table.roots.compactMap { root in plan.jobs.first { $0.module == root } }
     guard rootJobs.count == table.roots.count else { return result }
     profile.package = table.modules[table.entry]?.package.name ?? ""
+    profile.entry = table.entry.description
+    profile.recordHistory = !options.noHistory
 
     // One building invocation per workspace (210): held from the first write until the build returns.
     guard let lock = WorkspaceLock.acquire(workspaceRoot: workspaces.root.root) else { return result }

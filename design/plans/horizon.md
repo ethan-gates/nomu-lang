@@ -33,8 +33,7 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 ```
 127  LXR — RC-primary reclamation, on Immix backing; then the GenImmix–LXR comparison   ◀ end goal
 └── benchmark against Go and Swift, on GenImmix (when the language is complete)
-    ├── 104  fiber stack strategy — guard page, lazy commit, growth       (before any GC is measured)
-    │   └── 219  runtime fault handling — one signal handler, reporters  ◀ next
+    ├── 104  fiber stack strategy — Go-style copying stacks              (before any GC is measured)  ◀ next
     ├── 230  heap sizing — a heap that grows, a clean out-of-memory      (before any GC is measured)
     ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
     │        complements 179 (value-level GC classification)
@@ -43,8 +42,8 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
     └── 217  build graph granularity — sliced keys, scheduler (staged jobs deferred)  (dev-productivity)
 ```
 
-**Order of the next run:** [219](tasks/219-runtime-fault-handling.md) (fault handling), then
-[104](tasks/104-fiber-stack-strategy.md) (fiber stacks: overflow detection, lazy commit, growth), then
+**Order of the next run:** [104](tasks/104-fiber-stack-strategy.md) (fiber stacks: small stacks copied on
+growth, as Go's; overflow past the limit reports through [219](tasks/219-runtime-fault-handling.md)), then
 [230](tasks/230-heap-sizing.md) (heap sizing: growth and a clean out-of-memory), all before any collector is
 measured, so the benchmarks run on large, fiber-heavy programs. 230 is what lets a benchmark's live data
 exceed 256 MiB: binary-trees at the standard depth 21 crashes today. [217](tasks/217-build-graph-granularity.md)'s

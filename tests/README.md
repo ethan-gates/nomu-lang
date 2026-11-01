@@ -70,7 +70,9 @@ since no package may sit at a workspace root. Fields:
 - `expect` — `stdout: "…"` (literal, exact) or `stdout_file: tests/expected/x.txt`
   (golden file, for computed/large output). A golden is captured once and refreshed only when the
   correct output legitimately changes. Omit `expect` to
-  only require a clean exit.
+  only require a clean exit. `signal: SIGSEGV` (or `SIGABRT`, `SIGBUS`, `SIGILL`, `SIGTRAP`, `SIGKILL`) is
+  for a case that crashes on purpose: each run must die from that signal, and `stdout` and `stderr_match`
+  are still checked (the `crash-*` cases, the fault handler's report).
 - `iterations` (repeat; all must pass), `carriers` (one run per count, sets `NOMU_CARRIERS`). Set
   `carriers: []` to run once without setting `NOMU_CARRIERS` — for fixtures that manage their own
   threads (the self-hosted scheduler/actor cases).

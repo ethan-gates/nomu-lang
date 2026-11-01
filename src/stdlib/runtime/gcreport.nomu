@@ -196,6 +196,59 @@ fun rtRecOpenPhase(rec: RawPtr) -> Int {
   return rec.load(fromByteOffset: 80 + top * 8)
 }
 
+// The recorder's reporter for the fault handler (task 219): one crash-report line naming the collector's
+// cycle and its open phases, outermost first, written at `buf + n`; returns the new length. With `gc.record`
+// off, or before the heap exists, it writes nothing. It reads the coordinator's recorder from whichever thread
+// faulted, without its lock: the cycle and the open-phase stack are single words, each whole when read, so a
+// torn read across them names a neighbouring moment of the same collection at worst.
+fun rtGcFaultReport(buf: RawPtr, n: Int) -> Int {
+  if Runtime.gcRecordLevel() == 0 {
+    return n
+  }
+  let rec = rtRecSpace()
+  if rec.isNull {
+    return n
+  }
+  var m = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: gc: ")
+  let cycle: Int = rec.load(fromByteOffset: 32)
+  if cycle == 0 {
+    let cycles: Int = rec.load(fromByteOffset: 64)
+    m = m + Runtime.copyLiteral(to: buf.advanced(by: m), "between cycles, ")
+    m = rtFaultPutDec(buf, m, cycles)
+    m = m + Runtime.copyLiteral(to: buf.advanced(by: m), " completed\n")
+    return m
+  }
+  let kind: Int = rec.load(fromByteOffset: 40)
+  m = m + Runtime.copyLiteral(to: buf.advanced(by: m), "cycle ")
+  m = rtFaultPutDec(buf, m, cycle)
+  m = m + Runtime.copyLiteral(to: buf.advanced(by: m), " (")
+  m = m + rtGcName(buf.advanced(by: m), 1, kind)
+  m = m + Runtime.copyLiteral(to: buf.advanced(by: m), ")")
+  let depth: Int = rec.load(fromByteOffset: 72)
+  var shown = depth
+  if shown > 6 {
+    shown = 6
+  }
+  var i = 0
+  while i < shown {
+    let phase: Int = rec.load(fromByteOffset: 80 + i * 8)
+    if i == 0 {
+      m = m + Runtime.copyLiteral(to: buf.advanced(by: m), ", in ")
+    } else {
+      m = m + Runtime.copyLiteral(to: buf.advanced(by: m), " > ")
+    }
+    m = m + rtGcName(buf.advanced(by: m), 3, phase)
+    i = i + 1
+  }
+  if depth > 6 {
+    m = m + Runtime.copyLiteral(to: buf.advanced(by: m), " > (")
+    m = rtFaultPutDec(buf, m, depth - 6)
+    m = m + Runtime.copyLiteral(to: buf.advanced(by: m), " deeper)")
+  }
+  m = m + Runtime.copyLiteral(to: buf.advanced(by: m), "\n")
+  return m
+}
+
 // ---- What the collector records (GenImmix) ----
 // The collector calls these hooks; each is empty unless `gc.record` is on, so with it off they fold away in
 // the release-built runtime. Ids, which the report names:
@@ -527,8 +580,14 @@ fun rtGcDuration(ticks: Int, numer: Int, denom: Int) -> Int {
 // The name of id `id` in table `table` (1 cycle kinds, 2 triggers, 3 phases, 4 counters), as a JSON string.
 fun rtGcPutName(buf: RawPtr, table: Int, id: Int) {
   rtBufByte(buf, 34)
+  rtBufGrew(buf, rtGcName(rtBufAt(buf, 64), table, id))
+  rtBufByte(buf, 34)
+}
+
+// The name of id `id` in table `table`, written at `at` (64 bytes suffice); returns its length, 0 for an id
+// without one. Writes nothing else, so the fault handler can call it.
+fun rtGcName(at: RawPtr, table: Int, id: Int) -> Int {
   var n = 0
-  let at = rtBufAt(buf, 64)
   if table == 1 {
     if id == 1 { n = Runtime.copyLiteral(to: at, "minor") }
     else if id == 2 { n = Runtime.copyLiteral(to: at, "major") }
@@ -576,8 +635,7 @@ fun rtGcPutName(buf: RawPtr, table: Int, id: Int) {
     else if id == 33 { n = Runtime.copyLiteral(to: at, "objects allocated") }
     else if id == 34 { n = Runtime.copyLiteral(to: at, "bytes allocated") }
   }
-  rtBufGrew(buf, n)
-  rtBufByte(buf, 34)
+  return n
 }
 
 // `"names":{...}`: every id the report uses, by table.

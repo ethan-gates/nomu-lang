@@ -49,7 +49,7 @@ final class CompileCache {
                 // `nomu build <fixture dir>`: plans the fixture's build, compiles every module, and links. Its
                 // report (`build/_perf/report.json` in the fixture's workspace) names the binary.
                 let r = runProcess(path: ctx.nomu,
-                                   args: ["build"] + job.compileArgs + [target],
+                                   args: ["build", "--no-history"] + job.compileArgs + [target],
                                    env: job.compileEnv, timeout: job.compileTimeout)
                 var res = CompileResult(ok: r.succeeded, timedOut: r.timedOut, stderr: r.stderr, duration: r.duration)
                 if res.ok, job.compile?.expectError == nil {

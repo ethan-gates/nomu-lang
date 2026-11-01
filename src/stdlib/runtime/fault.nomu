@@ -1,0 +1,303 @@
+// The fault handler (task 219): one handler for the signals a crash raises. It prints a crash report to
+// stderr, then the signal's default action runs, so the exit status and the system crash report are as
+// without it. Part of the `runtime` module; see README.md.
+//
+// The handler runs on the faulting thread at an arbitrary instruction, so it takes no locks, allocates
+// nothing, and calls only `write(2)`, `creat(2)`, `close(2)` and `raise(3)`. Each runtime thread gives itself an alternate signal
+// stack at its entry (`rtFaultThreadStart`), so a stack overflow is reported too; the stack's first bytes
+// name the thread, and the next are the report's scratch buffer:
+//
+//   [0] kind: 0 main · 1 carrier · 2 timer · 3 GC coordinator · 4 stdin poller
+//   [8] index (a carrier's number)
+//   [16, 16 + 1024) the report's text
+//
+// The report is lines prefixed `nomu-crash: `, so it can be picked out of interleaved stderr; the first
+// gives the format's version. After the signal, address and thread come the reporters, a fixed list the
+// handler calls by name: each writes what its component knows, reading only data an interrupted writer leaves
+// whole, and writes nothing when it has nothing to say. The first is the collector's recorder
+// (`rtGcFaultReport`). Then the backtrace, as raw addresses for symbolizing elsewhere (the binary carries no
+// symbols for it): the executable's build ID and load address, the registers, and one line per frame from a
+// frame-pointer walk. A last `end` line says the report is whole; a walk that faults on a bad frame pointer
+// dies with the default action before it, the lines so far already written.
+//
+//   nomu-crash: image: 6F1C…-…  0x0000000100000000      build ID (LC_UUID), load address
+//   nomu-crash: registers: pc 0x… lr 0x… sp 0x… fp 0x…
+//   nomu-crash: frame 0: 0x…                            pc, then each frame record's return address
+//   nomu-crash: end
+//
+// When `NOMU_CRASH_REPORT` names a file at startup, the report is written there too (created or truncated):
+// `nomu run` sets it and symbolizes the frames from the file once its program has died.
+//
+// `atos -o <binary> -l <load address> <frame addresses…>` names the frames. Frames after 0 are return
+// addresses, the instruction after the call, so a symbolizer looks up each less one: a call that never returns
+// (`abort`) can end its function, and its return address is then the next function's first. A leaf function
+// sets no frame record, so when the fault is in one its caller is missing from the walk; `lr` holds it.
+//
+// Darwin values, kept here for Linux (task 218): SIGILL 4, SIGTRAP 5, SIGABRT 6, SIGBUS 10, SIGSEGV 11;
+// SA_ONSTACK 0x1 | SA_RESETHAND 0x4 | SA_SIGINFO 0x40 = 69; `siginfo_t` has si_signo (i32) at 0 and si_addr
+// at 24; `ucontext_t` has uc_mcontext (a pointer) at 48, and the arm64 machine context has fp at 248, lr 256,
+// sp 264 and pc 272; a Mach-O header has ncmds (u32) at 16 and its load commands from 32, LC_UUID is 0x1b
+// with the 16-byte ID at 8. The `struct sigaction` and `stack_t` layouts are in the lowering of `Runtime.sigaction` and
+// `Runtime.sigaltstack`.
+
+// The scratch buffer of a thread without an alternate stack (one the runtime did not start). Two such threads
+// crashing at once may garble each other's report.
+let rtFaultScratch = Runtime.staticStorage(bytes: 1024, align: 8)
+
+// `NOMU_CRASH_REPORT` as it was at startup, NUL-terminated; empty when unset. Read once at install, so the
+// handler never reads the environment.
+let rtFaultReportPath = Runtime.staticStorage(bytes: 1024, align: 8)
+
+// Install the handler and give the main thread its alternate stack. The process entry calls it first, before
+// the runtime's startup globals, so it reads none of them.
+fun rtFaultInstall() {
+  rtFaultThreadStart(0, 0)
+  let nameLen = Runtime.copyLiteral(to: rtFaultScratch, "NOMU_CRASH_REPORT")
+  rtFaultScratch.store(0.uint8, toByteOffset: nameLen)
+  let path = Runtime.getenv(name: rtFaultScratch)
+  var i = 0
+  if !path.isNull {
+    var more = true
+    while more && i < 1023 {
+      let c: UInt8 = path.load(fromByteOffset: i)
+      if c.int == 0 {
+        more = false
+      } else {
+        rtFaultReportPath.store(c, toByteOffset: i)
+        i = i + 1
+      }
+    }
+  }
+  rtFaultReportPath.store(0.uint8, toByteOffset: i)
+  let h = Runtime.ofFunc(rtFaultHandler)
+  Runtime.sigaction(signal: 11, handler: h, flags: 69)
+  Runtime.sigaction(signal: 10, handler: h, flags: 69)
+  Runtime.sigaction(signal: 4, handler: h, flags: 69)
+  Runtime.sigaction(signal: 5, handler: h, flags: 69)
+  Runtime.sigaction(signal: 6, handler: h, flags: 69)
+}
+
+// Give the calling thread its alternate signal stack, 64 KiB, labelled with the thread's kind and index.
+// Called at the entry of every thread the runtime starts.
+fun rtFaultThreadStart(kind: Int, index: Int) {
+  let base = RawPtr.alloc(bytes: 65536, align: 16)
+  base.store(kind, toByteOffset: 0)
+  base.store(index, toByteOffset: 8)
+  Runtime.sigaltstack(base: base, size: 65536)
+}
+
+// The handler, in the `SA_SIGINFO` shape. The signal comes from `siginfo`: the `int` argument's high bits are
+// undefined on arm64. Installed with SA_RESETHAND, so the `raise` here is delivered with the default action
+// once the handler returns.
+fun rtFaultHandler(sig: Int, info: RawPtr, uctx: RawPtr) {
+  let signo = Runtime.loadInt32(info, at: 0)
+  let alt = Runtime.currentAltStack()
+  var kind = -1
+  var index = 0
+  var buf = rtFaultScratch
+  if !alt.isNull {
+    kind = alt.load(fromByteOffset: 0)
+    index = alt.load(fromByteOffset: 8)
+    buf = alt.advanced(by: 16)
+  }
+  var fd = -1
+  let first: UInt8 = rtFaultReportPath.load(fromByteOffset: 0)
+  if first.int != 0 {
+    fd = Runtime.createFile(path: rtFaultReportPath, mode: 420)
+  }
+  var n = Runtime.copyLiteral(to: buf, "nomu-crash: format 1\nnomu-crash: signal: ")
+  n = rtFaultPutSignal(buf, n, signo)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " (")
+  n = rtFaultPutDec(buf, n, signo)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), ")\n")
+  if signo != 6 {
+    let addr: Int = info.load(fromByteOffset: 24)
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: address: ")
+    n = rtFaultPutHex(buf, n, addr)
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\n")
+  }
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: thread: ")
+  n = rtFaultPutThread(buf, n, kind, index)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\n")
+  // The reporters, each a line or none: the collector's recorder.
+  n = rtGcFaultReport(buf, n)
+  rtFaultEmit(fd, buf, n)
+  rtFaultBacktrace(fd, buf, uctx)
+  if fd >= 0 {
+    Runtime.closeFd(fd: fd)
+  }
+  Runtime.raise(signal: signo)
+}
+
+// Write `n` bytes of the report at `buf` to stderr, and to the report file when `fd` is one.
+fun rtFaultEmit(fd: Int, buf: RawPtr, n: Int) {
+  Runtime.writeFd(fd: 2, buf: buf, count: n)
+  if fd >= 0 {
+    Runtime.writeFd(fd: fd, buf: buf, count: n)
+  }
+}
+
+// The backtrace part of the report, written a piece at a time through `buf`: the image, the registers, the
+// frames, then `end`.
+fun rtFaultBacktrace(fd: Int, buf: RawPtr, uctx: RawPtr) {
+  let mc: RawPtr = uctx.load(fromByteOffset: 48)
+  let pc: Int = mc.load(fromByteOffset: 272)
+  let lr: Int = mc.load(fromByteOffset: 256)
+  let sp: Int = mc.load(fromByteOffset: 264)
+  let fp0: RawPtr = mc.load(fromByteOffset: 248)
+  var n = Runtime.copyLiteral(to: buf, "nomu-crash: image: ")
+  let header = Runtime.imageHeader()
+  n = rtFaultPutUUID(buf, n, header)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " ")
+  n = rtFaultPutHex(buf, n, header.toInt())
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\nnomu-crash: registers: pc ")
+  n = rtFaultPutHex(buf, n, pc)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " lr ")
+  n = rtFaultPutHex(buf, n, lr)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " sp ")
+  n = rtFaultPutHex(buf, n, sp)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " fp ")
+  n = rtFaultPutHex(buf, n, fp0.toInt())
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\n")
+  n = rtFaultPutFrame(buf, n, 0, pc)
+  rtFaultEmit(fd, buf, n)
+  // Each frame record is { the caller's fp, the return address }. The walk stops at a null or misaligned fp,
+  // a null return address, a record that does not lie above the last (stacks grow down), or 64 frames.
+  var fp = fp0
+  var i = 1
+  var go = true
+  while go && i < 64 {
+    if fp.isNull || fp.toInt() % 8 != 0 {
+      go = false
+    } else {
+      let next: RawPtr = fp.load(fromByteOffset: 0)
+      let ret: Int = fp.load(fromByteOffset: 8)
+      if ret == 0 {
+        go = false
+      } else {
+        rtFaultEmit(fd, buf, rtFaultPutFrame(buf, 0, i, ret))
+        if next.toInt() <= fp.toInt() {
+          go = false
+        }
+        fp = next
+        i = i + 1
+      }
+    }
+  }
+  rtFaultEmit(fd, buf, Runtime.copyLiteral(to: buf, "nomu-crash: end\n"))
+}
+
+// One `frame i: 0x…` line at `buf + n`; returns the new length.
+fun rtFaultPutFrame(buf: RawPtr, n: Int, i: Int, addr: Int) -> Int {
+  var m = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: frame ")
+  m = rtFaultPutDec(buf, m, i)
+  m = m + Runtime.copyLiteral(to: buf.advanced(by: m), ": ")
+  m = rtFaultPutHex(buf, m, addr)
+  return m + Runtime.copyLiteral(to: buf.advanced(by: m), "\n")
+}
+
+// The build ID of the image whose Mach-O header is at `header`, in the canonical form
+// (`6F1C2A3B-…`, upper-case hex, dashes after bytes 4, 6, 8 and 10), at `buf + n`; `none` when it has no
+// LC_UUID. Returns the new length.
+fun rtFaultPutUUID(buf: RawPtr, n: Int, header: RawPtr) -> Int {
+  let ncmds = Runtime.loadInt32(header, at: 16)
+  var cmd = header.advanced(by: 32)
+  var k = 0
+  while k < ncmds {
+    let kind = Runtime.loadInt32(cmd, at: 0)
+    if kind == 27 {
+      var m = n
+      var b = 0
+      while b < 16 {
+        if b == 4 || b == 6 || b == 8 || b == 10 {
+          buf.store(45.uint8, toByteOffset: m)
+          m = m + 1
+        }
+        let byte: UInt8 = cmd.load(fromByteOffset: 8 + b)
+        m = rtFaultPutHexDigit(buf, m, byte.int >> 4)
+        m = rtFaultPutHexDigit(buf, m, byte.int & 15)
+        b = b + 1
+      }
+      return m
+    }
+    cmd = cmd.advanced(by: Runtime.loadInt32(cmd, at: 4))
+    k = k + 1
+  }
+  return n + Runtime.copyLiteral(to: buf.advanced(by: n), "none")
+}
+
+// One upper-case hex digit for `d` (0–15) at `buf + n`; returns the new length.
+fun rtFaultPutHexDigit(buf: RawPtr, n: Int, d: Int) -> Int {
+  var c = 48 + d
+  if d > 9 {
+    c = 55 + d
+  }
+  buf.store(c.uint8, toByteOffset: n)
+  return n + 1
+}
+
+// The signal's name at `buf + n`; returns the new length.
+fun rtFaultPutSignal(buf: RawPtr, n: Int, signo: Int) -> Int {
+  let at = buf.advanced(by: n)
+  if signo == 11 { return n + Runtime.copyLiteral(to: at, "SIGSEGV") }
+  if signo == 10 { return n + Runtime.copyLiteral(to: at, "SIGBUS") }
+  if signo == 4 { return n + Runtime.copyLiteral(to: at, "SIGILL") }
+  if signo == 5 { return n + Runtime.copyLiteral(to: at, "SIGTRAP") }
+  if signo == 6 { return n + Runtime.copyLiteral(to: at, "SIGABRT") }
+  return n + Runtime.copyLiteral(to: at, "signal")
+}
+
+// The thread's name at `buf + n`; returns the new length.
+fun rtFaultPutThread(buf: RawPtr, n: Int, kind: Int, index: Int) -> Int {
+  let at = buf.advanced(by: n)
+  if kind == 0 { return n + Runtime.copyLiteral(to: at, "main") }
+  if kind == 1 {
+    let m = n + Runtime.copyLiteral(to: at, "carrier ")
+    return rtFaultPutDec(buf, m, index)
+  }
+  if kind == 2 { return n + Runtime.copyLiteral(to: at, "timer") }
+  if kind == 3 { return n + Runtime.copyLiteral(to: at, "GC coordinator") }
+  if kind == 4 { return n + Runtime.copyLiteral(to: at, "stdin poller") }
+  return n + Runtime.copyLiteral(to: at, "unknown (not started by the runtime)")
+}
+
+// `v` in decimal at `buf + n`; returns the new length.
+fun rtFaultPutDec(buf: RawPtr, n: Int, v: Int) -> Int {
+  var m = n
+  var x = v
+  if x < 0 {
+    buf.store(45.uint8, toByteOffset: m)
+    m = m + 1
+    x = 0 - x
+  }
+  var digits = 1
+  var p = 10
+  while p <= x && digits < 19 {
+    digits = digits + 1
+    p = p * 10
+  }
+  var i = digits - 1
+  while i >= 0 {
+    buf.store((48 + x % 10).uint8, toByteOffset: m + i)
+    x = x / 10
+    i = i - 1
+  }
+  return m + digits
+}
+
+// `v` as `0x` and 16 hex digits at `buf + n`; returns the new length.
+fun rtFaultPutHex(buf: RawPtr, n: Int, v: Int) -> Int {
+  buf.store(48.uint8, toByteOffset: n)
+  buf.store(120.uint8, toByteOffset: n + 1)
+  var i = 0
+  while i < 16 {
+    let d = (v >> (60 - 4 * i)) & 15
+    var c = 48 + d
+    if d > 9 {
+      c = 87 + d
+    }
+    buf.store(c.uint8, toByteOffset: n + 2 + i)
+    i = i + 1
+  }
+  return n + 18
+}

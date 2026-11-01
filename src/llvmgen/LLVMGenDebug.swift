@@ -34,15 +34,28 @@ extension LLVMGen {
         return (String(path[path.index(after: slash)...]), String(path[..<slash]))
     }
 
-    // A `DISubprogram` for a source-backed function; nil for thunks (`di` nil or no debug requested).
-    func makeSubprogram(_ displayName: String, linkage: String, line: Int) -> LLVMMetadataRef? {
+    // A `DISubprogram` for a source-backed function; nil for thunks (`di` nil or no debug requested). `file` is
+    // the function's own source file (its span's `debugFile`): a module of several files puts each function, and
+    // the lines inside it, in its own file. Blank falls back to the compile unit's.
+    func makeSubprogram(_ displayName: String, linkage: String, line: Int, file: String = "") -> LLVMMetadataRef? {
         guard let dib = di else { return nil }
-        let subTy = LLVMDIBuilderCreateSubroutineType(dib, diFile, nil, 0, LLVMDIFlagZero)
+        let fileMD = debugFile(file)
+        let subTy = LLVMDIBuilderCreateSubroutineType(dib, fileMD, nil, 0, LLVMDIFlagZero)
         let ln = UInt32(max(line, 1))
         return LLVMDIBuilderCreateFunction(
             dib, diCU, displayName, displayName.utf8.count, linkage, linkage.utf8.count,
-            diFile, ln, subTy, /*IsLocalToUnit=*/0, /*IsDefinition=*/1, /*ScopeLine=*/ln,
+            fileMD, ln, subTy, /*IsLocalToUnit=*/0, /*IsDefinition=*/1, /*ScopeLine=*/ln,
             LLVMDIFlagZero, /*IsOptimized=*/0)
+    }
+
+    // The DIFile for the source at `path`, made once; the compile unit's file for a blank path.
+    func debugFile(_ path: String) -> LLVMMetadataRef? {
+        guard let dib = di, !path.isEmpty else { return diFile }
+        if let f = diFiles[path] { return f }
+        let (name, dir) = splitPath(path)
+        let f = LLVMDIBuilderCreateFile(dib, name, name.utf8.count, dir, dir.utf8.count)
+        diFiles[path] = f
+        return f
     }
 
     // Point the builder's current debug location at `span`, scoped to the active subprogram.

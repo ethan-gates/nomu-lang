@@ -12,11 +12,11 @@ extension LLVMGen {
     // declarations pass `gc: false`.
     func emitFunction(_ name: String, ret: LLVMTypeRef, params: [LLVMTypeRef],
                       varArg: Bool = false, gc: Bool = true,
-                      debug: (name: String, line: Int)? = nil) -> (fn: LLVMValueRef, ty: LLVMTypeRef) {
+                      debug: (name: String, line: Int, file: String)? = nil) -> (fn: LLVMValueRef, ty: LLVMTypeRef) {
         let ty = fnType(ret, params, varArg: varArg)
         let fn = LLVMAddFunction(mod, name, ty)!
         if gc { LLVMSetGC(fn, "statepoint-example") }
-        if let debug = debug, let sp = makeSubprogram(debug.name, linkage: name, line: debug.line) {
+        if let debug = debug, let sp = makeSubprogram(debug.name, linkage: name, line: debug.line, file: debug.file) {
             LLVMSetSubprogram(fn, sp)
         }
         return (fn, ty)
@@ -461,8 +461,9 @@ extension LLVMGen {
         // program's `main` and returns null. Like the forwarders it has no GC strategy, so the walk of the
         // main fiber ends at `main`'s frame; `noinline` keeps `main` from being inlined into it.
         let entryTy = fnType(i8ptr, [i8ptr])
+        // External, so a backtrace names it: the link strips local symbols (`-x`), and the frame between the
+        // fiber's start and `main` would otherwise take the name of whatever precedes it.
         let entry = LLVMAddFunction(mod, "__nomu_main_entry", entryTy)!
-        LLVMSetLinkage(entry, LLVMInternalLinkage)
         addNoInline(entry)
         withStubBody(entry) {
             let call = buildCall(nomuMain, mainTy, [])!
@@ -475,7 +476,11 @@ extension LLVMGen {
         let (fn, _) = emitFunction("main", ret: i32, params: [], gc: false)
         let runtimeInit = preludeFn(Mangle.moduleInit(home: []), ret: voidTy, params: [])
         let boot = runtimePreludeFn("nomuSchedBoot", ret: voidTy, params: [i8ptr, i8ptr, i64])
+        // The fault handler first (`runtime/fault.nomu`), so a fault while the startup globals are computed is
+        // reported too.
+        let faultInstall = runtimePreludeFn("rtFaultInstall", ret: voidTy, params: [])
         withStubBody(fn) {
+            _ = buildCall(faultInstall.fn, faultInstall.ty, [])
             _ = buildCall(runtimeInit.0, runtimeInit.1, [])
             let sched = LLVMBuildLoad2(b, i8ptr, getOrAddGlobal(i8ptr, Mangle.global("rtSched", home: [])), "sched")!
             let carriers = LLVMBuildLoad2(b, i64, getOrAddGlobal(i64, Mangle.global("rtCarrierCount", home: [])),

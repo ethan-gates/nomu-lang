@@ -22,6 +22,7 @@ let buildFlags: [Flag] = [
     Flag("explain", help: "say why each module compiled, compared with the last build, and record this build's "
          + "inputs for the next"),
     Flag("emit-jobs", help: "write each module's job file beside its outputs", hidden: true),
+    Flag("no-history", help: "leave this build out of the build history", hidden: true),
 ]
 let buildOptionList: [Opt] = [
     Opt("config", short: "c", valueName: "names",
@@ -115,6 +116,7 @@ func buildOptions(_ args: Parsed) -> EmitOptions {
     options.allowCoreImport = args.has("allow-core-import")
     options.emitJobs = args.has("emit-jobs")
     options.explain = args.has("explain")
+    options.noHistory = args.has("no-history")
     options.verifyCache = args.has("verify-cache")
     options.subsetFuncs.formUnion(args.values("runtime-subset"))
     if let s = args.value("stop") { options.stopAt = Stage(rawValue: s) ?? .binary }

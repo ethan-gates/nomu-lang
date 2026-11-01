@@ -9,6 +9,7 @@ import store
 final class BuildTests: XCTestCase {
     private var repo = ""
     private var cache = ""
+    private var history = ""
     private var nomu = ""
 
     // What one `nomu build` did, read from its report.
@@ -28,6 +29,9 @@ final class BuildTests: XCTestCase {
         let unique = UUID().uuidString
         repo = tmp + "/repo-" + unique
         cache = tmp + "/cache-" + unique
+        // Every build a test starts records into this test's own history, never the user's.
+        history = tmp + "/history-" + unique
+        setenv("NOMU_HISTORY_DIR", history, 1)
         try copyTree(from: srcdir + "/_main", to: repo, entries: ["nomu.yaml", "tests/fixtures"])
         nomu = srcdir + "/_main/" + (env["NOMU_BINARY"] ?? "src/nomu-cli/nomu")
     }
@@ -197,6 +201,63 @@ final class BuildTests: XCTestCase {
         XCTAssertTrue(warm.units.filter { $0.name != "build" }.allSatisfy { $0.outcome == "cached" && $0.cost != nil })
         XCTAssertEqual(warm.criticalPath.unrecorded, [])
         XCTAssertEqual(warm.criticalPath.units, cold.criticalPath.units)
+    }
+
+    // `nomu run` of a program that crashes (task 219): the fault handler's report, then the run's symbolized
+    // backtrace naming the crashing line, and the exit status a shell gives a death by SIGSEGV.
+    func testRunSymbolizesCrash() throws {
+        let r = try run(nomu, ["run", repo + "/tests/fixtures/crash_segv"], env: ["NOMU_CACHE_DIR": cache])
+        XCTAssertEqual(r.status, 128 + 11, r.stderr)
+        XCTAssertTrue(r.stderr.contains("nomu-crash: signal: SIGSEGV (11)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("nomu: crash backtrace"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("nomu_main (main.nomu:5)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("rtFiberTrampoline"), r.stderr)
+    }
+
+    // The build history (task 233), one per user (`NOMU_HISTORY_DIR` here): each build adds a line to `history.js`
+    // and its report page under `builds/`, beside the list page; `--no-history` adds nothing; a build older than
+    // the window is pruned with its page as the next build is added.
+    func testBuildHistory() throws {
+        let fixture = "tests/fixtures/module_link_diamond"
+        let dir = history + "/"
+        struct Entry: Decodable {
+            var id: String; var entry: String; var workspace: String; var started: String; var dur: Int; var status: String
+        }
+        func entries() throws -> [Entry] {
+            let text = (try? String(contentsOfFile: dir + "history.js", encoding: .utf8)) ?? ""
+            return try text.split(separator: "\n").map { line in
+                XCTAssertTrue(line.hasPrefix("H.push(") && line.hasSuffix(");"), String(line))
+                return try JSONDecoder().decode(Entry.self, from: Data(line.dropFirst(7).dropLast(2).utf8))
+            }
+        }
+        XCTAssertNotNil(try build(fixture).binary)
+        XCTAssertNotNil(try build(fixture).binary)
+        var es = try entries()
+        XCTAssertEqual(es.count, 2)
+        XCTAssertEqual(Set(es.map(\.entry)), ["nomu.nomu_lang:" + fixture])
+        XCTAssertEqual(es.map(\.status), ["built", "built"])
+        XCTAssertEqual(Set(es.map(\.workspace)), [repo])
+        for e in es { XCTAssertTrue(FileManager.default.fileExists(atPath: dir + "builds/" + e.id + ".html"), e.id) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir + "index.html"))
+        // Each report page links to the list, by its path from the page's own directory.
+        let kept = try String(contentsOfFile: dir + "builds/" + es[1].id + ".html", encoding: .utf8)
+        XCTAssertTrue(kept.contains(#"href="../index.html""#))
+        let latest = try String(contentsOfFile: repo + "/build/_perf/index.html", encoding: .utf8)
+        XCTAssertTrue(latest.contains("href=\"" + URL(fileURLWithPath: dir + "index.html").absoluteString + "\""))
+
+        XCTAssertNotNil(try build(fixture, ["--no-history"]).binary)
+        XCTAssertEqual(try entries().count, 2, "--no-history adds nothing")
+
+        // A build from before the window, written ahead of the others.
+        let old = #"H.push({"dur":1,"entry":"x","id":"20200101000000000","started":"2020-01-01T00:00:00.000Z","status":"built","workspace":"/w"});"#
+        let current = try String(contentsOfFile: dir + "history.js", encoding: .utf8)
+        try (old + "\n" + current).write(toFile: dir + "history.js", atomically: true, encoding: .utf8)
+        try "".write(toFile: dir + "builds/20200101000000000.html", atomically: true, encoding: .utf8)
+        XCTAssertNotNil(try build(fixture).binary)
+        es = try entries()
+        XCTAssertEqual(es.count, 3)
+        XCTAssertFalse(es.contains { $0.id == "20200101000000000" }, "the old build is pruned")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir + "builds/20200101000000000.html"), "with its page")
     }
 
     // Every build writes its timeline (`build/_perf/trace.json`, task 193): one named track per unit, and on each

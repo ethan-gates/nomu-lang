@@ -715,6 +715,7 @@ fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
 // the request, clears `rtStopWorld`, and bumps stw-gen (+152), which the parked carriers wait on. It exits
 // on the scheduler's stop flag (+40). nomuSchedBoot starts and joins it.
 fun rtGcCoordinatorMain(sched: RawPtr) -> RawPtr {
+  rtFaultThreadStart(3, 0)
   let req = sched.advanced(by: 168)
   let ack = sched.advanced(by: 144)
   var go = true

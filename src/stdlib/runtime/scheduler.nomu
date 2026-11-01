@@ -217,6 +217,7 @@ fun rtSchedTimerPopMin(sched: RawPtr, out: RawPtr) {
 // due fiber. Exits on the stop flag. A raw thread that touches only off-heap memory (no user code), so it
 // needs no mutator registration.
 fun rtSchedTimerMain(sched: RawPtr) -> RawPtr {
+  rtFaultThreadStart(2, 0)
   let out = RawPtr.alloc(bytes: 16, align: 8)
   var go = true
   while go {
@@ -364,8 +365,11 @@ fun rtSchedLoop(sched: RawPtr, myCtx: RawPtr) {
   rtSchedUnlock(sched)
 }
 
-// A carrier thread's entry (started via threadCreate). `carg` is [0] sched · [8] context buffer.
+// A carrier thread's entry (started via threadCreate). `carg` is [0] sched · [8] context buffer · [16] the
+// carrier's number.
 fun rtSchedCarrierMain(carg: RawPtr) -> RawPtr {
+  let index: Int = carg.load(fromByteOffset: 16)
+  rtFaultThreadStart(1, index)
   let sched: RawPtr = carg.load(fromByteOffset: 0)
   let ctx: RawPtr = carg.load(fromByteOffset: 8)
   rtSchedLoop(sched, ctx)
@@ -728,9 +732,10 @@ fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int) {
   var c = 1
   while c < ncarriers {
     let ctx = RawPtr.alloc(bytes: 168, align: 16)
-    let carg = RawPtr.alloc(bytes: 16, align: 8)
+    let carg = RawPtr.alloc(bytes: 24, align: 8)
     carg.store(sched, toByteOffset: 0)
     carg.store(ctx, toByteOffset: 8)
+    carg.store(c, toByteOffset: 16)
     let h = handles.advanced(by: 8 * c)
     Runtime.threadCreate(handle: h, entry: Runtime.ofFunc(rtSchedCarrierMain), arg: carg)
     c = c + 1

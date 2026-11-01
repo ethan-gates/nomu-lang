@@ -136,11 +136,14 @@ result (`compiled`, `cached`).
 - **193.6 — `index.html`.** The self-contained page over the same data.
 
   **Done.** `ReportPage` (`ReportPage.swift`): one page, a fixed template with `report.json` embedded and
-  rendered by an inline script (light and dark, no network). The summary and headline numbers (critical
-  path, summed cost, this build's time, setup, hit rate, source read); the units, sortable by plan order,
-  time or cost, critical-path units marked; a click opens the unit's breakdown in a side panel (its facts and
-  reason, then phase → stage times with bars, as the old timing table showed them, or for a cached unit its
-  recorded cost); the stage totals over every unit; the planner's steps and counts; the critical path. The
+  rendered by an inline script (light and dark, no network). The wall time as the headline, then the summary
+  and the other numbers (critical path, binary size, summed cost, setup, source read); the modules, sortable by
+  plan order, time or cost, critical-path modules marked, and the archive and link steps in their own table (a
+  link with its binary's size, from the report's `binaryBytes`); a click opens
+  a row's breakdown in a side panel (its facts and reason, then phase → stage times with bars, as the old
+  timing table showed them, or for a cached module its recorded cost); the stage totals over the build, each
+  phase's stages collapsed under it until its row is clicked; the
+  planner's steps and counts; the critical path. Times under a second show whole milliseconds. The
   build prints the page's `file://` link under the summary line. Checked by running the page's script over a
   stand-in DOM (every panel renders) and in `build_tests` (the page embeds the report).
 - **193.7 — tests.** Every build writes the three files; `report.json` lists every planned module with

@@ -71,7 +71,9 @@ _rtFiberInit:
 // The fresh-fiber trampoline: the first rtSwitch into a seeded fiber `ret`s here. Call entry(arg) with a
 // terminated frame chain. If entry returns (the fiber ran to completion), fall into a trap — the
 // completion path (switching back to the scheduler) is wired by the scheduler rung; a return here in the
-// isolation test means the fiber failed to switch back, which is a bug worth catching loudly.
+// isolation test means the fiber failed to switch back, which is a bug worth catching loudly. Global, so a
+// backtrace names it: it is every fiber's bottom frame, and the link strips local symbols.
+.global _rtFiberTrampoline
 .p2align 2
 _rtFiberTrampoline:
     mov x29, #0          // no parent frame

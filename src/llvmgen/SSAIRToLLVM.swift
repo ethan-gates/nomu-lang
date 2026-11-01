@@ -679,7 +679,7 @@ final class SSAIRToLLVM {
         // its own root. (Closures never cross the boundary, so their env stays `p1`.)
         if f.name.hasPrefix("spawn:"), !paramTys.isEmpty { paramTys[0] = e.i8ptr }
         let (fn, fnTy) = e.emitFunction(symbol, ret: retTy, params: paramTys,
-                                        debug: (f.name, f.span.begin.line))
+                                        debug: (f.name, f.span.begin.line, f.span.debugFile))
         // Prelude functions are compiled into every module's object (interim, task 100.3.7); weak
         // linkage lets the linker fold the duplicate definitions to one.
         // Weak-ODR so duplicate definitions fold at link: a prelude function (compiled into every object,
@@ -719,7 +719,7 @@ final class SSAIRToLLVM {
             retTy = r
         }
         let (fn, fnTy) = e.emitFunction(symbol, ret: retTy, params: paramTys,
-                                        debug: (f.name, f.span.begin.line))
+                                        debug: (f.name, f.span.begin.line, f.span.debugFile))
         // Weak-ODR so duplicate definitions fold at link: a prelude function (compiled into every object,
         // task 100.3.7) or a cross-module generic specialized under its producer-keyed name in more than
         // one consumer (task 100.5.5 — the name is identical across consumers, so the copies coalesce).
@@ -1809,6 +1809,52 @@ final class SSAIRToLLVM {
             let r = e.buildCall(fn, fty, [slot, LLVMConstInt(e.i32, 1, 0), LLVMConstInt(e.i32, 0, 0)])!
             let ready = LLVMBuildICmp(b, LLVMIntSGT, r, LLVMConstInt(e.i32, 0, 0), "poll.ready")
             return LLVMBuildZExt(b, ready, e.i64, "poll.r")
+        // Fault handling (task 219). The Darwin layouts: `struct sigaction` is { handler ptr @0, sa_mask u32 @8,
+        // sa_flags i32 @12 } (16 bytes); `stack_t` is { ss_sp ptr @0, ss_size u64 @8, ss_flags i32 @16 }
+        // (24 bytes), where SS_DISABLE is 4. Linux differs in both (task 218).
+        case "__sysSigaction":
+            let i32 = e.i32
+            let saTy = e.structTy([e.i8ptr, i32, i32])
+            let sa = e.entryAlloca(saTy, "sigaction")
+            LLVMBuildStore(b, val(args[1]), e.structGEP(saTy, sa, 0))
+            LLVMBuildStore(b, LLVMConstInt(i32, 0, 0), e.structGEP(saTy, sa, 1))
+            LLVMBuildStore(b, LLVMBuildTrunc(b, val(args[2]), i32, "sa.flags"), e.structGEP(saTy, sa, 2))
+            let (fn, fty) = e.runtimeFn("sigaction", ret: i32, params: [i32, e.i8ptr, e.i8ptr], varArg: false)
+            let r = e.buildCall(fn, fty, [LLVMBuildTrunc(b, val(args[0]), i32, "sig"), sa, LLVMConstNull(e.i8ptr)])
+            return LLVMBuildSExt(b, r!, e.i64, "sigaction.r")
+        case "__sysSigaltstack":
+            let i32 = e.i32
+            let ssTy = e.structTy([e.i8ptr, e.i64, i32])
+            let ss = e.entryAlloca(ssTy, "stack_t")
+            LLVMBuildStore(b, val(args[0]), e.structGEP(ssTy, ss, 0))
+            LLVMBuildStore(b, val(args[1]), e.structGEP(ssTy, ss, 1))
+            LLVMBuildStore(b, LLVMConstInt(i32, 0, 0), e.structGEP(ssTy, ss, 2))
+            let (fn, fty) = e.runtimeFn("sigaltstack", ret: i32, params: [e.i8ptr, e.i8ptr], varArg: false)
+            let r = e.buildCall(fn, fty, [ss, LLVMConstNull(e.i8ptr)])
+            return LLVMBuildSExt(b, r!, e.i64, "sigaltstack.r")
+        case "__sysCurrentAltStack":
+            // sigaltstack(NULL, &old): the base when a stack is set and enabled, else null.
+            let i32 = e.i32
+            let ssTy = e.structTy([e.i8ptr, e.i64, i32])
+            let old = e.entryAlloca(ssTy, "stack_t.old")
+            LLVMBuildStore(b, LLVMConstNull(e.i8ptr), e.structGEP(ssTy, old, 0))
+            LLVMBuildStore(b, LLVMConstInt(i32, 4, 0), e.structGEP(ssTy, old, 2))
+            let (fn, fty) = e.runtimeFn("sigaltstack", ret: i32, params: [e.i8ptr, e.i8ptr], varArg: false)
+            _ = e.buildCall(fn, fty, [LLVMConstNull(e.i8ptr), old])
+            let base = LLVMBuildLoad2(b, e.i8ptr, e.structGEP(ssTy, old, 0), "ss.sp")!
+            let flags = LLVMBuildLoad2(b, i32, e.structGEP(ssTy, old, 2), "ss.flags")!
+            let off = LLVMBuildICmp(b, LLVMIntNE, LLVMBuildAnd(b, flags, LLVMConstInt(i32, 4, 0), "ss.dis"),
+                                    LLVMConstInt(i32, 0, 0), "ss.off")
+            return LLVMBuildSelect(b, off, LLVMConstNull(e.i8ptr), base, "altstack")
+        case "__sysImageHeader":
+            // The linker's `__mh_execute_header`: the executable's Mach-O header, its load address.
+            let g = e.getOrAddGlobal(LLVMInt8TypeInContext(e.ctx)!, "_mh_execute_header")
+            return g
+        case "__sysRaise":
+            let i32 = e.i32
+            let (fn, fty) = e.runtimeFn("raise", ret: i32, params: [i32], varArg: false)
+            let r = e.buildCall(fn, fty, [LLVMBuildTrunc(b, val(args[0]), i32, "sig")])
+            return LLVMBuildSExt(b, r!, e.i64, "raise.r")
         // Asm-floor context switch (task 128.2): rtSwitch(from, to). Void — returns a dummy word.
         case "__sysCtxSwitch":
             let (fn, fty) = e.runtimeFn("rtSwitch", ret: e.voidTy, params: [e.i8ptr, e.i8ptr], varArg: false)

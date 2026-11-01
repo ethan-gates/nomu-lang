@@ -235,6 +235,21 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     LLVMDisposeMessage(dlStr)
     LLVMDisposeTargetData(dl)
 
+    // Frame pointers in every function that makes calls (`frame-pointer`=`non-leaf`, clang's default on Apple
+    // arm64, which the platform's ABI expects): each such function sets x29 to its frame record, so the fault
+    // handler's backtrace (task 219, `runtime/fault.nomu`) can walk the chain. Without it LLVM keeps x29 as an
+    // ordinary callee-saved register and the chain breaks at the first Nomu frame.
+    let fpKey = "frame-pointer", fpValue = "non-leaf"
+    var fnIter = LLVMGetFirstFunction(mod)
+    while let f = fnIter {
+        if LLVMCountBasicBlocks(f) > 0 {
+            let attr = LLVMCreateStringAttribute(LLVMGetModuleContext(mod), fpKey, UInt32(fpKey.utf8.count),
+                                                 fpValue, UInt32(fpValue.utf8.count))
+            LLVMAddAttributeAtIndex(f, LLVMAttributeIndex(bitPattern: Int32(LLVMAttributeFunctionIndex)), attr)
+        }
+        fnIter = LLVMGetNextFunction(f)
+    }
+
     // 8.4.1 — GC substrate pass pipeline. `mem2reg`/`sroa` promote our alloca-per-local lowering
     // to SSA so `RewriteStatepointsForGC` can see the `addrspace(1)` roots (a correctness
     // prerequisite, backend.md GC backend substrate), then the rewrite turns every non-`gc-leaf` call in a

@@ -1,0 +1,9 @@
+// An out-of-range index: the runtime's fatal error, then the fault handler's report for the abort that
+// follows (task 219), and death by SIGABRT.
+fun main() {
+  let a = [1, 2, 3]
+  var i = 2
+  i = i + 5
+  print(a[i])
+  print("\n")
+}

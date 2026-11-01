@@ -1,0 +1,8 @@
+// A read through a null pointer: the fault handler's crash report (task 219), then death by SIGSEGV. The
+// read is used, so it is not optimized away.
+fun main() {
+  let p = RawPtr.null
+  let x: Int = p.load(fromByteOffset: 16)
+  print(x)
+  print("\n")
+}

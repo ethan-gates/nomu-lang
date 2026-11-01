@@ -142,3 +142,62 @@ cases:
     expect:
       stdout_file: tests/fixtures/bundle_core_import/expected.txt
     carriers: []
+
+  # The fault handler (task 219): a crash prints the report, then the signal's default action ends the run.
+  # Each crash also leaves a system crash report in ~/Library/Logs/DiagnosticReports.
+  - name: crash-segv
+    fixture: tests/fixtures/crash_segv
+    expect:
+      signal: SIGSEGV
+    stderr_match:
+      - pattern: "nomu-crash: format 1"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: signal: SIGSEGV (11)"
+        min: 1
+      - pattern: "nomu-crash: address: 0x0000000000000010"
+        min: 1
+      - pattern: "nomu-crash: thread: "
+        min: 1
+      - pattern: "nomu-crash: image: "
+        min: 1
+      - pattern: "nomu-crash: registers: pc "
+        min: 1
+      - pattern: "nomu-crash: frame "
+        min: 3
+      - pattern: "nomu-crash: gc: "
+        max: 0
+      - pattern: "nomu-crash: end"
+        min: 1
+    carriers: []
+
+  - name: crash-bounds
+    fixture: tests/fixtures/crash_bounds
+    expect:
+      signal: SIGABRT
+    stderr_match:
+      - pattern: "fatal error: array index 7 out of range for length 3"
+        min: 1
+      - pattern: "nomu-crash: signal: SIGABRT (6)"
+        min: 1
+      - pattern: "nomu-crash: address: "
+        max: 0
+      - pattern: "nomu-crash: frame "
+        min: 3
+      - pattern: "nomu-crash: end"
+        min: 1
+    carriers: []
+
+  # The collector's recorder reports through the handler when `gc.record` is on.
+  - name: crash-gc-record
+    fixture: tests/fixtures/crash_segv
+    compile_settings:
+      gc_record: true
+    expect:
+      signal: SIGSEGV
+    stderr_match:
+      - pattern: "nomu-crash: gc: between cycles, 0 completed"
+        min: 1
+      - pattern: "nomu-crash: end"
+        min: 1
+    carriers: []

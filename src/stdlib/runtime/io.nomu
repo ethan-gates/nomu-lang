@@ -188,6 +188,7 @@ fun rtStdinPollerStart(st: RawPtr) {
 // The poller thread: block in kevent until stdin is readable, then take every waiter and unpark it. Runs
 // for the life of the process.
 fun rtStdinPollerMain(st: RawPtr) -> RawPtr {
+  rtFaultThreadStart(4, 0)
   let evs = RawPtr.alloc(bytes: 32 * 8, align: 8)
   while true {
     let kq: Int = st.load(fromByteOffset: 64)

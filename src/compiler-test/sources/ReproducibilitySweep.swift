@@ -108,7 +108,7 @@ struct ReproducibilitySweep {
         WeightedGate(capacity: ctx.poolCapacity).dispatch(order) { fixture in
             for c in byFixture[fixture]! {
                 let target = (fixture as NSString).isAbsolutePath ? fixture : src + "/" + fixture
-                let r = runProcess(path: ctx.nomu, args: ["build"] + c.compileArgs + [target],
+                let r = runProcess(path: ctx.nomu, args: ["build", "--no-history"] + c.compileArgs + [target],
                                    env: c.compileEnv.merging(["NOMU_CACHE_DIR": cache]) { $1 }, timeout: c.compileTimeout)
                 if !r.succeeded {
                     let line = r.stderr.split(separator: "\n").first { $0.contains("error") } ?? "exit \(r.exitCode ?? -1)"

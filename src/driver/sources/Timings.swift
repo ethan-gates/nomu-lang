@@ -103,6 +103,9 @@ public final class BuildProfile {
 
     // Context the report records.
     public var package = ""   // the entry's package identity (manifest name, or the default)
+    public var entry = ""     // the entry module, `<workspace>:<path>`
+    // Whether the build is added to the user's build history (`BuildHistory`); the suite's builds are not.
+    public var recordHistory = true
     public var optimize = false
     // How the build ended; the summary line says so.
     public enum Status { case built, stopped, failed }
@@ -189,7 +192,12 @@ public final class BuildProfile {
                 if Layout.makeDirectory(dir, buildRoot: buildRoot), let json = report.encoded(),
                    PerfReport.replace(dir + "/" + PerfReport.fileName, with: json) {
                     _ = TraceFile.write(report, to: dir)
-                    if ReportPage.write(json: json, to: dir) { page = dir + "/" + ReportPage.fileName }
+                    let html = ReportPage.render(json: json, history: recordHistory ? BuildHistory.listURL : nil)
+                    if PerfReport.replace(dir + "/" + ReportPage.fileName, with: html) { page = dir + "/" + ReportPage.fileName }
+                    if recordHistory {
+                        BuildHistory.record(report, page: ReportPage.render(json: json, history: "../index.html"),
+                                            workspace: (buildRoot as NSString).deletingLastPathComponent)
+                    }
                 }
             } else {
                 for name in [PerfReport.fileName, TraceFile.fileName, ReportPage.fileName] {

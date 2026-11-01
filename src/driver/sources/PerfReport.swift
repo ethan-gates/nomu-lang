@@ -50,6 +50,7 @@ struct PerfReport: Codable {
     var version = 1
     var status: String                // built | stopped | failed
     var package: String
+    var entry: String                 // the entry module, `<workspace>:<path>`
     var optimize: Bool
     var started: String               // the build's start, ISO 8601 wall clock
     var dur: Int                      // wall time
@@ -57,6 +58,7 @@ struct PerfReport: Codable {
     var modules: Counts
     var links: Counts
     var binaries: [String]            // absolute paths, in the targets' order
+    var binaryBytes: [Int]            // each binary's size, in `binaries`' order; 0 when it cannot be read
     var planner: Planner?
     var phases: [Phase]               // over every unit
     var stages: [Stage]               // over every unit, in first-appearance order
@@ -87,6 +89,7 @@ struct PerfReport: Codable {
 
         self.status = status(profile.status)
         package = profile.package
+        entry = profile.entry
         optimize = profile.optimize
         started = iso8601(profile.startedAt)
         dur = us(profile.build.end)
@@ -95,6 +98,10 @@ struct PerfReport: Codable {
         modules = counts(.module)
         links = counts(.link)
         self.binaries = binaries
+        binaryBytes = binaries.map { path in
+            var st = stat()
+            return stat(path, &st) == 0 ? Int(st.st_size) : 0
+        }
         planner = profile.planner.map { p in
             Planner(steps: Dictionary(uniqueKeysWithValues: PlanTimings.Step.allCases.map { ($0.rawValue, us(p.seconds[$0] ?? 0)) }),
                     directoriesListed: p.directoriesListed, filesScanned: p.filesScanned, modules: p.modules)

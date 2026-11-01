@@ -209,6 +209,7 @@ final class LLVMGen {
     // subprogram, set per function by whichever walker is emitting a body.
     var di: LLVMDIBuilderRef?
     var diFile: LLVMMetadataRef?
+    var diFiles: [String: LLVMMetadataRef] = [:]   // each source file's DIFile, by its debug path
     var diCU: LLVMMetadataRef?
     var currentScope: LLVMMetadataRef?
     var diTypeCache: [String: LLVMMetadataRef] = [:]

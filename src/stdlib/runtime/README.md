@@ -18,6 +18,7 @@ One module over these files; a name declared in any file is visible in all of th
 | `gcreport.nomu` | the collector's recorder and report |
 | `scheduler.nomu` | the M:N scheduler, timers, actor mailboxes, the stop-the-world handshake, entry points |
 | `io.nomu` | stdin line input and its poller, the array bounds trap |
+| `fault.nomu` | the fault handler: the crash report, each runtime thread's alternate signal stack |
 | `verify.nomu` | the bump allocator and mark-verify tracer (early collector rungs) |
 
 **Recording costs nothing when off.** Every recording path is guarded by `Runtime.gcRecordLevel()` (0 off,

@@ -97,19 +97,31 @@ public func buildResolved(_ m: ResolvedModule, options: EmitOptions = EmitOption
 
 // `nomu run <path> [-- args]` (task 173.5.3): build the target module, then exec the produced binary,
 // forwarding `args` and propagating its exit status. A module without a `main` is not executable — its
-// build fails, which surfaces here as a non-zero exit. Returns the process exit code.
+// build fails, which surfaces here as a non-zero exit. Returns the process exit code: the program's, or
+// 128 plus the signal that ended it, as a shell reports it. When the program dies from a signal, its crash
+// report (task 219), written also to the file `NOMU_CRASH_REPORT` names, is printed again symbolized
+// (`CrashReport`).
 public func runTarget(path: String, args: [String], options: EmitOptions = EmitOptions(),
                       selection: ConfigSelection = ConfigSelection()) -> Int32 {
     guard let binary = buildTarget(path: path, options: options, selection: selection) else { return 1 }
+    let report = CrashReport.reportPath()
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: binary)
     proc.arguments = args
+    proc.environment = ProcessInfo.processInfo.environment.merging(["NOMU_CRASH_REPORT": report]) { $1 }
     do { try proc.run() } catch {
         fputs("error: cannot run '\(binary)': \(error)\n", stderr)
         return 1
     }
     proc.waitUntilExit()
-    return proc.terminationStatus
+    guard proc.terminationReason == .uncaughtSignal else {
+        try? FileManager.default.removeItem(atPath: report)
+        return proc.terminationStatus
+    }
+    if let text = CrashReport.symbolize(reportPath: report, binary: binary) {
+        FileHandle.standardError.write(Data(text.utf8))
+    }
+    return 128 + proc.terminationStatus
 }
 
 // `nomu test [target]` (task 173.5.4): build and run a test module. Resolution is the shared single-module

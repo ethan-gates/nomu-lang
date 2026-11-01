@@ -59,6 +59,9 @@ public struct EmitOptions: Codable {
     // `--explain`: say why each module compiled, compared with the workspace's last build, and record this
     // build's key inputs for the next one (`BuildRecord`).
     public var explain = false
+    // Hidden `--no-history`: leave the build out of the user's build history (`BuildHistory`). The test suite
+    // passes it, so its hundreds of builds do not fill the history.
+    public var noHistory = false
 
     public init() {}
 }
