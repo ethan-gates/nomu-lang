@@ -1,0 +1,44 @@
+import std/time
+
+// The register swap alone: the main fiber and one raw context switch to each other directly, with no
+// scheduler, lock or queue. Each round trip is two switches. Built with `--config=runtime_tier` and
+// `--runtime-subset=swapPeer,swapRounds` (Runtime.ctxSwitch and Runtime.fiberInit are runtime-tier).
+//
+// Shared state (off-heap): 0 the main side's context · 8 the peer's context.
+fun swapPeer(st: RawPtr) -> RawPtr {
+    let mine: RawPtr = st.load(fromByteOffset: 8)
+    let back: RawPtr = st.load(fromByteOffset: 0)
+    var go = true
+    while go {
+        Runtime.ctxSwitch(from: mine, to: back)
+    }
+    return st
+}
+
+fun swapRounds(n: Int) -> Int {
+    let st = RawPtr.alloc(bytes: 16, align: 8)
+    let mainCtx = RawPtr.alloc(bytes: 168, align: 16)
+    let peerCtx = RawPtr.alloc(bytes: 168, align: 16)
+    let stack = RawPtr.alloc(bytes: 65536, align: 16)
+    st.store(mainCtx, toByteOffset: 0)
+    st.store(peerCtx, toByteOffset: 8)
+    Runtime.fiberInit(context: peerCtx, stackTop: stack.advanced(by: 65536), entry: Runtime.ofFunc(swapPeer), arg: st)
+    var i = 0
+    while i < n {
+        Runtime.ctxSwitch(from: mainCtx, to: peerCtx)
+        i = i + 1
+    }
+    return i
+}
+
+fun main() {
+    let n = 10000000
+    let t = Time()
+    let t0 = t.now
+    let r = swapRounds(n)
+    print("ctx_swap rounds ")
+    print(r)
+    print(" ns ")
+    print(t.ns_diff(t0, t.now))
+    print("\n")
+}

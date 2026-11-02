@@ -1,0 +1,47 @@
+import std/time
+
+// 1,024 fibers each sleep 1 ms and do a little work, 20 times over: many parked fibers, woken in bursts by
+// the timer thread. Prints the total time; the floor is 20 ms.
+
+fun spin(work: Int, seed: Int) -> Int {
+    var x = seed
+    var i = 0
+    while i < work {
+        x = x * 6364136223846793005 + 1442695040888963407
+        i += 1
+    }
+    return x
+}
+
+fun sleeper(seed: Int) -> Int {
+    var x = seed
+    var r = 0
+    while r < 20 {
+        sleep(1)
+        x = spin(work: 200, seed: x)
+        r += 1
+    }
+    return x
+}
+
+fun tree(depth: Int, seed: Int) -> Int {
+    if depth == 0 {
+        return sleeper(seed: seed)
+    }
+    spawn let a = tree(depth: depth - 1, seed: seed * 2)
+    spawn let b = tree(depth: depth - 1, seed: seed * 2 + 1)
+    return a + b
+}
+
+fun main() {
+    let t = Time()
+    let t0 = t.now
+    let r = tree(depth: 10, seed: 1)
+    let ns = t.ns_diff(t0, t.now)
+    print("sleepers_fiber fibers 1024 ns ")
+    print(ns)
+    print("\n")
+    if r == 42 {
+        print("\n")
+    }
+}

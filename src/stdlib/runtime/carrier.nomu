@@ -17,9 +17,13 @@
 //   64 the fiber running on this carrier
 //   72 the mod-buffer (24 bytes): count @72, cap @80, storage @88
 //   96 the next record in the registry
+//   104 the run-queue slot: a fiber readied by this carrier's running fiber, to run next here (rtSchedReadyNext)
+//   112 when this carrier switched into its current fiber, in ticks (a searcher ages the slot by it)
+//   120 when this carrier's current slice began, in ticks (fibers taken from the slot inherit it)
 // The TLAB sits at offset 0, so a record is its own TLAB pointer, and it fills the first cache line alone.
 // A record lives for the whole process. The registry is a list of every record, pushed with one CAS at bind
-// and walked only under stop-the-world.
+// and walked under stop-the-world, and by searching carriers looking at slots (records are never removed,
+// so that walk needs no lock).
 let rtCarriers = Runtime.staticStorage(bytes: 8, align: 8)
 
 // Create this thread's carrier record, register it, and store it in the carrier-local slot. Every carrier
@@ -30,6 +34,9 @@ fun rtCarrierBind() -> RawPtr {
   let cap = 4096
   rec.store(cap, toByteOffset: 80)
   rec.store(RawPtr.alloc(bytes: cap * 8, align: 8), toByteOffset: 88)
+  rec.store(RawPtr.null, toByteOffset: 104)
+  rec.store(0, toByteOffset: 112)
+  rec.store(0, toByteOffset: 120)
   var done = false
   while !done {
     let old: Int = rtCarriers.atomicLoad(fromByteOffset: 0)

@@ -1,0 +1,75 @@
+import std/time
+
+// Items flow through a chain of 8 stage actors, each doing `work` loop iterations, to a hub actor that
+// fed them. Rounds grow the stage's work; each prints its total time for 20,000 items. Measures a chain of
+// handoffs where every stage stays busy.
+
+fun spin(work: Int, seed: Int) -> Int {
+    var x = seed
+    var i = 0
+    while i < work {
+        x = x * 6364136223846793005 + 1442695040888963407
+        i += 1
+    }
+    return x
+}
+
+actor Stage {
+    on item(v: Int, i: Int, work: Int, items: Int, stages: Array<Stage>, hub: Hub) {
+        let w = spin(work: work, seed: v)
+        if i + 1 < stages.count {
+            stages[i + 1].item(v: w, i: i + 1, work: work, items: items, stages: stages, hub: hub)
+        } else {
+            hub.done(v: w, work: work, items: items, stages: stages, me: hub)
+        }
+    }
+}
+
+actor Hub {
+    var got: Int = 0
+    var sum: Int = 0
+    var t0: Int = 0
+    on start(work: Int, items: Int, stages: Array<Stage>, me: Hub) {
+        got = 0
+        t0 = Time().now
+        var i = 0
+        while i < items {
+            stages[0].item(v: i, i: 0, work: work, items: items, stages: stages, hub: me)
+            i += 1
+        }
+    }
+    on done(v: Int, work: Int, items: Int, stages: Array<Stage>, me: Hub) {
+        sum = sum + v
+        got += 1
+        if got == items {
+            let t = Time()
+            print("pipeline_actor work ")
+            print(work)
+            print(" items ")
+            print(items)
+            print(" ns ")
+            print(t.ns_diff(t0, t.now))
+            print("\n")
+            if work < 1000 {
+                var next = work * 10
+                if work == 0 {
+                    next = 100
+                }
+                me.start(work: next, items: items, stages: stages, me: me)
+            } else if sum == 1 {
+                print("\n")
+            }
+        }
+    }
+}
+
+fun main() {
+    var stages: Array<Stage> = []
+    var s = 0
+    while s < 8 {
+        stages.append(Stage())
+        s += 1
+    }
+    let hub = Hub()
+    hub.start(work: 0, items: 20000, stages: stages, me: hub)
+}

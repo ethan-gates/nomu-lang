@@ -1,0 +1,54 @@
+import std/time
+
+// Two fibers take turns through the scheduler's own park and unpark: the lock-coupled park
+// (nomuSchedParkLocked), and an unpark that readies the partner into the carrier's run-queue slot and wakes
+// a carrier, as a join's completion does (and as a channel would). Each hop parks one fiber and resumes the other through the carrier: two context
+// switches plus the scheduler's work. Built with the runtime prelude (`--config=rt_prelude`), which makes
+// the scheduler's functions callable here.
+//
+// Shared state (off-heap, 24 B): 0 whose turn (0 or 1) · 8 player 0's parked fiber · 16 player 1's.
+fun player(st: RawPtr, me: Int, n: Int) -> Int {
+    let sched = rtSched
+    let other = 1 - me
+    var i = 0
+    while i < n {
+        rtSchedLock(sched)
+        var turn: Int = st.load(fromByteOffset: 0)
+        while turn != me {
+            st.store(rtCurrentFiber(), toByteOffset: 8 + 8 * me)
+            nomuSchedParkLocked(sched, RawPtr.null, 0)
+            rtSchedLock(sched)
+            turn = st.load(fromByteOffset: 0)
+        }
+        st.store(other, toByteOffset: 0)
+        let w: RawPtr = st.load(fromByteOffset: 8 + 8 * other)
+        if w.isNull {
+            rtSchedUnlock(sched)
+        } else {
+            st.store(RawPtr.null, toByteOffset: 8 + 8 * other)
+            rtSchedReadyNext(sched, w)
+            rtSchedUnlock(sched)
+            rtSchedWake(sched, false)
+        }
+        i = i + 1
+    }
+    return i
+}
+
+fun main() {
+    let n = 1000000
+    let st = RawPtr.alloc(bytes: 24, align: 8)
+    st.store(0, toByteOffset: 0)
+    st.store(RawPtr.null, toByteOffset: 8)
+    st.store(RawPtr.null, toByteOffset: 16)
+    let t = Time()
+    let t0 = t.now
+    spawn let a = player(st, 0, n)
+    spawn let b = player(st, 1, n)
+    let hops = a + b
+    print("pingpong_fiber hops ")
+    print(hops)
+    print(" ns ")
+    print(t.ns_diff(t0, t.now))
+    print("\n")
+}

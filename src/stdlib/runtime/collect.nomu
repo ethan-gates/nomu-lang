@@ -731,11 +731,15 @@ fun rtGcCoordinatorMain(sched: RawPtr) -> RawPtr {
       let ncarriers: Int = sched.atomicLoad(fromByteOffset: 160)
       rtStopWorld.atomicStore(1, toByteOffset: 0)
       rtSchedWake(sched, true)                            // idle carriers wake, see the request, and ack
-      var acked: Int = ack.atomicLoad(fromByteOffset: 0)
+      // The ack word carries this STW's generation tag over the count (rtSchedStwParkCarrier); the futex
+      // compares the count, its low 32 bits.
+      let ackWord: Int = ack.atomicLoad(fromByteOffset: 0)
+      var acked = ackWord % 4294967296
       var waiting = acked < ncarriers
       while waiting {
         Runtime.futexWait(at: ack, expected: acked, timeoutMicros: 1000)
-        acked = ack.atomicLoad(fromByteOffset: 0)
+        let aw: Int = ack.atomicLoad(fromByteOffset: 0)
+        acked = aw % 4294967296
         let done: Int = sched.atomicLoad(fromByteOffset: 40)
         waiting = acked < ncarriers && done == 0
       }
@@ -748,10 +752,13 @@ fun rtGcCoordinatorMain(sched: RawPtr) -> RawPtr {
         nomuSchedStwCollectDefrag(sched)
       }
       sched.atomicStore(0, toByteOffset: 176)             // the kind, for the next request
-      ack.atomicStore(0, toByteOffset: 0)
+      // Reset the count under the next generation's tag before clearing the request, so a late ack for
+      // this STW is dropped instead of counted toward the next.
+      let gw = sched.advanced(by: 152)
+      let gen: Int = gw.atomicLoad(fromByteOffset: 0)
+      ack.atomicStore(rtStwAckTag(gen + 1), toByteOffset: 0)
       sched.atomicStore(0, toByteOffset: 136)
       rtStopWorld.atomicStore(0, toByteOffset: 0)
-      let gw = sched.advanced(by: 152)
       gw.atomicFetchAdd(1, atByteOffset: 0)
       Runtime.futexWake(at: gw, all: true)                // resume the parked carriers
     }

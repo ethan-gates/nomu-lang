@@ -1,0 +1,24 @@
+import std/time
+
+// Two actors pass a counter back and forth; each hop is one fire-and-forget send and one handler run.
+// A handler has no `self` handle, so each message carries both players.
+actor Player {
+    var hops: Int = 0
+    on ball(n: Int, me: Player, peer: Player, t0: Int) {
+        hops += 1
+        if n == 0 {
+            let t = Time()
+            print("pingpong_actor ns ")
+            print(t.ns_diff(t0, t.now))
+            print("\n")
+        } else {
+            peer.ball(n: n - 1, me: peer, peer: me, t0: t0)
+        }
+    }
+}
+
+fun main() {
+    let a = Player()
+    let b = Player()
+    a.ball(n: 1000000, me: a, peer: b, t0: Time().now)
+}

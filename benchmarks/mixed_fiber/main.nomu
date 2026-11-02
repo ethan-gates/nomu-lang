@@ -1,0 +1,86 @@
+import std/time
+
+// Compute beside handoffs: a tree of 256 fibers each computing about 200 µs runs alongside two fibers
+// passing a turn back and forth 200,000 times each through the scheduler's park and the run-queue slot.
+// Prints when each side finished, from a common start. Built with the runtime prelude
+// (`--config=rt_prelude`). With no preemption, a carrier running a compute fiber is lost to the pair until
+// that fiber finishes; the slice and the run-queue check decide how the pair's chain shares a carrier
+// with queued compute fibers.
+//
+// Shared state (off-heap, 24 B): 0 whose turn (0 or 1) · 8 player 0's parked fiber · 16 player 1's.
+
+fun spin(work: Int, seed: Int) -> Int {
+    var x = seed
+    var i = 0
+    while i < work {
+        x = x * 6364136223846793005 + 1442695040888963407
+        i += 1
+    }
+    return x
+}
+
+fun tree(depth: Int, seed: Int) -> Int {
+    if depth == 0 {
+        return spin(work: 260000, seed: seed)
+    }
+    spawn let a = tree(depth: depth - 1, seed: seed * 2)
+    spawn let b = tree(depth: depth - 1, seed: seed * 2 + 1)
+    return a + b
+}
+
+fun background() -> Int {
+    let r = tree(depth: 8, seed: 1)
+    if r == 42 {
+        print("\n")
+    }
+    return Time().now
+}
+
+fun player(st: RawPtr, me: Int, n: Int) -> Int {
+    let sched = rtSched
+    let other = 1 - me
+    var i = 0
+    while i < n {
+        rtSchedLock(sched)
+        var turn: Int = st.load(fromByteOffset: 0)
+        while turn != me {
+            st.store(rtCurrentFiber(), toByteOffset: 8 + 8 * me)
+            nomuSchedParkLocked(sched, RawPtr.null, 0)
+            rtSchedLock(sched)
+            turn = st.load(fromByteOffset: 0)
+        }
+        st.store(other, toByteOffset: 0)
+        let w: RawPtr = st.load(fromByteOffset: 8 + 8 * other)
+        if w.isNull {
+            rtSchedUnlock(sched)
+        } else {
+            st.store(RawPtr.null, toByteOffset: 8 + 8 * other)
+            rtSchedReadyNext(sched, w)
+            rtSchedUnlock(sched)
+            rtSchedWake(sched, false)
+        }
+        i = i + 1
+    }
+    return Time().now
+}
+
+fun main() {
+    let st = RawPtr.alloc(bytes: 24, align: 8)
+    st.store(0, toByteOffset: 0)
+    st.store(RawPtr.null, toByteOffset: 8)
+    st.store(RawPtr.null, toByteOffset: 16)
+    let t0 = Time().now
+    spawn let bg = background()
+    spawn let a = player(st, 0, 200000)
+    spawn let b = player(st, 1, 200000)
+    var pairEnd = a
+    if b > pairEnd {
+        pairEnd = b
+    }
+    let bgEnd = bg
+    print("mixed_fiber pair_ns ")
+    print(pairEnd - t0)
+    print(" bg_ns ")
+    print(bgEnd - t0)
+    print("\n")
+}

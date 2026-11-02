@@ -2,7 +2,7 @@
 
 **Avenue:** Risk (the "better than Go" concurrency thesis) · **Type/Lifecycle:** `perf · needs-design`
 (runtime + compiler architecture) · **Size:** L · **Status:** direction decided (Go-style copying stacks);
-the design of its parts is open; built before any collector is measured · **Source:** deferred.md
+104.1 (baseline) done; the design of its parts is open; built before any collector is measured · **Source:** deferred.md
 
 **Scheduled before any collector is measured** (the benchmark against Go and Swift on GenImmix, then the
 GenImmix–LXR comparison), so the benchmarks run on large, fiber-heavy programs. Today's three stack
@@ -43,12 +43,45 @@ few percent), which inference can drop on most paths (below).
   concurrency is colorless. An inferred version would be colorless but would have to treat every call
   through an interface or a function value as one that suspends, transforming most of a program.
 
+## Decided: the entry check
+
+Every non-runtime function checks on entry that its fiber's stack has room for its frame: it compares the
+stack pointer, less the frame, with the stack limit, and calls into the runtime to grow when short.
+
+- **The frame size: emitted in IR, verified after code generation.** LLVM computes frame sizes only in its
+  code generator, and its split-stack prologue support covers x86 and 32-bit ARM, not arm64. The check is
+  emitted in IR with an assumed size; LLVM's report of each function's final frame size is then checked
+  against it, and the build fails (or re-emits with the reported size) when a frame exceeds its check. No
+  size is ever trusted unverified. The report: prologue/epilogue insertion emits an analysis remark per
+  function (`prologepilog`, `StackSize`, "N stack bytes in function"), delivered to the diagnostic handler
+  of the LLVM context compiling it, so it works for Mach-O and for modules compiled in parallel; the remark
+  is enabled once with `-pass-remarks-analysis=prologepilog` through `LLVMParseCommandLineOptions`. (The
+  `.stack_sizes` section is ELF-only; `-stack-usage-file` writes one file per process.) A function with a
+  variable-sized stack allocation has no fixed frame; Nomu emits none, and the verification rejects one.
+  Rejected: extending LLVM's AArch64 prologue lowering (exact, but a patched LLVM to maintain), and LLVM's
+  stack probes (they touch pages below the stack, needing a guard page and page-granular stacks).
+- **The limit: in the fiber record; how the check reaches it is measured.** Two candidates:
+  - **A reserved register holding the current fiber** (x28; AArch64 allows reserving x20–x28, and Go uses
+    x28 for its goroutine). The check is one load, a compare and a branch. The register holds the fiber,
+    not the carrier record, because a fiber resumes on whichever carrier picks it; the context switch saves
+    and restores it with the other callee-saved registers (`Runtime.fiberInit` seeds a new fiber's with the
+    fiber itself), and libc preserves it. It also serves the runtime's other reads of the current fiber.
+    Its cost: one fewer callee-saved register for every function, so more spills where registers run short.
+  - **The carrier-local slot** (on darwin a read of `tpidrro_el0`, a mask, an index by the slot key, then
+    the slot and the fiber's limit: two dependent loads per function entry). No register is taken.
+
+  Both are cheap to build (the first is an LLVM target feature, `+reserve-x28`, and a seeded register); the
+  choice is made on the compute benchmarks and the switch benchmarks. Rejected: the limit itself in a
+  register (no load, but another thread cannot change it, which the next point needs).
+- **Preemption shares it** ([236](236-fiber-preemption.md)). The runtime sets a running fiber's limit to a
+  value no stack pointer passes, so its next check enters the runtime, which sees a preemption request
+  instead of a short stack, as Go's stack check does.
+- **Every function is checked at first,** except the runtime's own code (below). The cost is measured
+  against 104.1's baseline; skipping checks by inference is [238](238-stack-check-elision.md), a measured
+  optimization on top.
+
 ## Open design
 
-- **The entry check.** It compares the stack pointer, less the frame (or the call tree, below), with the
-  fiber's stack limit, and calls into the runtime to grow when short. LLVM computes frame sizes only in its
-  code generator, and its split-stack prologue support covers x86 and 32-bit ARM, not arm64: either the
-  check is emitted in IR with an estimated frame size, or LLVM's AArch64 prologue lowering is extended.
 - **Moving a stack.** Every pointer into the stack is fixed when it moves: frame pointers, and pointers to
   objects Nomu placed in frames, wherever they sit (slots, registers saved in frames). The stack maps must
   describe these, beyond the GC pointers they describe today. Escape analysis must guarantee no pointer into
@@ -56,40 +89,79 @@ few percent), which inference can drop on most paths (below).
 - **The runtime's own code.** Runtime-subset functions hold raw addresses the stack maps do not describe, so
   a stack must not move under them: they run where a stack cannot grow (no checks, a fixed reserve), or on
   the carrier's stack (Go's `systemstack`).
-- **Calls into C.** A small stack cannot run C code, which needs a large one: a call into C switches to the
-  carrier's stack first, as Go's `cgo` does. The runtime's system calls (`write`, `kevent`) are the first
-  such calls.
+- **Calls into libc.** Nomu has no C of its own, but compiled code and the runtime call libc on fiber stacks:
+  memory (`memcpy`, `memset`, `posix_memalign`, `free`, `mmap`), I/O and formatting (`write`, `read`,
+  `snprintf` for a `Double`, `strtod`), time and futexes (`clock_gettime_nsec_np`, `mach_absolute_time`,
+  `__ulock_wait`/`__ulock_wake`). Rule: **no stack bound is ever declared for code Nomu does not own.**
+  libc's stack use differs by platform (libSystem, glibc, musl) and version, and with its inputs, so a
+  declared bound is a guess, and a wrong guess is a silent overflow. Each libc call either runs on the
+  carrier's stack (a stack-pointer swap around the call, as Go's `libcCall` does for every libc call on
+  macOS), or is replaced by Nomu's own implementation, which is checked like any Nomu function. The
+  hot leaf calls are the candidates to own: `memcpy`/`memset` beyond what LLVM inlines, and the clock
+  (`mach_absolute_time` reads a counter Nomu can read directly). FFI, later, uses the same stack switch.
 - **Shrinking.** At collections, a stack using under a quarter of its size is copied to one half the size.
 - **The limit.** A maximum stack size per fiber; past it, a fatal error through the runtime's fatal path,
   which [219](219-runtime-fault-handling.md)'s handler reports.
-
-## Dropping the check by inference
-
-A check asks whether there is room *from where the stack pointer is now*, whatever the callers used. So:
-
-- **A bound per call tree.** Inference gives each function `max_stack(f)`: its own frame plus the largest
-  bound among its callees. It exists when the whole tree is known: no recursion, no calls through an
-  interface or a function value, every callee's bound known (from other modules through their interface
-  summaries).
-- **One check covers the tree.** When `f` checks for `max_stack(f)` on entry, everything `f` calls has room
-  by construction, so its callees skip their checks when called from `f`.
-- **Two entries per function.** A function is compiled once and called from many places: a checked entry
-  for callers that have not covered it (calls through an interface, unanalyzed code, a fiber's start), an
-  unchecked one for callers whose check covered its tree. The bound belongs to the callee; each caller
-  chooses the entry from what its own check covered.
-- **Limits.** Recursion and dynamic calls keep per-call checks, though bounded trees below them are still
-  covered. A tree whose bound is large is not folded into one check, which would grow small stacks for a
-  rarely taken deep path; only trees under a threshold of a few KiB are.
-- **Precedent.** Go keeps a guard zone of a few hundred bytes at the end of every stack, runs small
-  `nosplit` functions with no check, and has its linker verify across the program that each chain of them
-  fits in the zone: the same reasoning, for leaf code.
 
 ## Work
 
 - **104.1** Baseline: a ping-pong benchmark (two fibers, and two actors) against Go's goroutines and
   channels, with the switch's cost split between the register swap and the scheduler's own work. 104's
-  later measurements (the entry check's cost, growth) compare against it.
-- Further steps are numbered when the open design above is settled.
+  later measurements (the entry check's cost, growth) compare against it. **Done** (results below).
+- Further steps are numbered when the open design above is settled; the entry check is decided (above).
+
+## Baseline (104.1)
+
+`tools/pingpong.py` builds and runs the set: `benchmarks/ctx_swap` (two contexts switching directly),
+`benchmarks/pingpong_fiber` (two fibers through the scheduler's lock-coupled park and its unpark, built with
+the runtime prelude), `benchmarks/pingpong_actor` (two actors sending a counter back and forth), and a
+Go program kept outside the repository (unbuffered channels, a buffered channel per goroutine as a mailbox,
+and `runtime.Gosched` in turn; the script runs it from the gitignored `practice/go/pingpong` when present).
+Apple Silicon, 12 performance cores; best of 3; ns per hop (`ctx_swap`: per
+round trip of two switches); columns are carriers, or `GOMAXPROCS` for Go:
+
+| benchmark | 1 | 2 | 4 |
+|---|---|---|---|
+| ctx_swap | 11.9 | 11.9 | 11.9 |
+| pingpong_fiber | 116.5 | 194.4 | 416.2 |
+| pingpong_actor | 20.4 | 288.3 | 809.7 |
+| go chan | 83.0 | 94.7 | 109.5 |
+| go mailbox | 84.0 | 95.6 | 109.1 |
+| go gosched | 41.6 | 118.0 | 122.3 |
+
+**The split, on one carrier.** A fiber hop is two switches (fiber to carrier, carrier to fiber), the same
+shape as Go's `gopark` and `schedule`. Of its 116 ns:
+
+- **Register swap:** 12 ns (6 ns a switch).
+- **Lock, run queue and state:** about 5 ns (a lock and unlock pair alone is 2.3 ns).
+- **The wake:** about 99 ns. Every unpark calls `rtSchedWake`, which makes a `futexWake` system call
+  whether or not a carrier is asleep. The same benchmark without it runs at 17 ns a hop, under Go's 42 ns
+  `Gosched` hop and 83 ns channel hop.
+
+**Findings.**
+
+- **Unconditional wakes dominate a switch.** Go wakes another processor only when one is idle and none is
+  already spinning (`wakep`); Nomu's unpark, spawn, join completion and actor dispatch all wake
+  unconditionally.
+- **More carriers make a ping-pong slower.** Nomu goes from 116 ns to 416 ns at four carriers, Go from
+  83 ns to 110 ns. Each wake sends an idle carrier (538 ns a wake) to find the work already taken by the
+  carrier that parked; with the wake removed a hop is 17 ns at every carrier count.
+- **Two actors on one carrier never switch.** The mailbox fiber that drains one actor pops the other's
+  mailbox next, so a hop is a send and a handler run (20 ns, a quarter of Go's channel hop). Across
+  carriers the hop takes a wake, as above (810 ns at four; 21 ns with the dispatch's wake removed).
+- **The mailbox pool grows to its cap.** Each send that schedules a mailbox, finding no free mailbox fiber,
+  makes a new one, so two actors in ping-pong leave all 64 fibers (8 MiB of stacks) allocated while one
+  does the work.
+- **The register swap is cheap.** At 6 ns a switch, the stack strategy's entry check, paid on every call,
+  is the cost to watch.
+- **Spawning is slow.** `forkjoin_fiber` (a binary tree of 8,190 spawned and joined fibers, from 234.3)
+  costs 4.5–6 µs a fiber under every scheduler setting, against a few hundred ns for a goroutine. Each
+  spawn allocates a 128 KiB stack and a fiber record; small stacks should cut it most, and it is the
+  figure to compare against after.
+
+The wake and the pool's growth are defined as [234](234-scheduler-wake-and-pool.md), which also rules out
+the single lock for these workloads (with the wake removed, a hop is 17 ns at every carrier count). The
+register swap and the one-carrier hop without the wake are the figures 104's later steps compare against.
 
 ## Dependencies & triggers
 
@@ -98,6 +170,8 @@ A check asks whether there is room *from where the stack pointer is now*, whatev
 - **Reports through:** [219](219-runtime-fault-handling.md)'s fault handler for faults, and the runtime's
   fatal path for a stack past its limit. Growth never involves the fault handler, which prints and dies once
   (`SA_RESETHAND`).
+- **Shares the entry check with:** [236](236-fiber-preemption.md) (preemption), which wants a poll at function
+  entry; one check can serve a stack that must grow and a fiber asked to stop, as Go's stack check does.
 - **Couples with:** [TCO](129-tail-call-optimization.md) (lowers stack depth), GC statepoints and the
   parked-fiber scan (the stack maps a move reuses), escape analysis (pointers into frames), the dynamic
   spawn group.

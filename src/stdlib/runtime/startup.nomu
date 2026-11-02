@@ -19,6 +19,21 @@ let rtMatureFloor = rtPositive(rtEnvMatureFloor())
 let rtGcStress = rtPositive(rtEnvGcStress())
 // NOMU_CARRIERS: the number of carrier threads the scheduler boots with; 4 unless set to 1 or more.
 let rtCarrierCount = rtEnvCarrierCount()
+// NOMU_MBOX_AGE_NS: how long the scheduled-mailbox queue must go unpopped before a searching carrier readies
+// a mailbox fiber for it; 3000 unless set.
+let rtMboxAgeNanos = rtEnvMboxAgeNanos()
+// NOMU_SLOT: 0 turns off the run-queue slot (rtSchedReadyNext readies onto the run queue instead); on unless set.
+let rtSlotOn = rtEnvSlot()
+// NOMU_SLOT_STEAL_NS: how long a carrier's current fiber must have run before a searcher may take the fiber
+// waiting in its slot; 3000 unless set. NOMU_SLICE_NS: how long a chain of fibers handed through one
+// carrier's slot runs before the next one goes to the back of the run queue; 1 ms unless set. Both are
+// kept in ticks (`Runtime.ticks()`). NOMU_GLOBAL_CHECK: a carrier takes from the run queue before its slot
+// every this many picks; 61 unless set.
+let rtSlotStealTicks = rtNanosToTicks(rtEnvSlotStealNanos())
+let rtSliceTicks = rtNanosToTicks(rtEnvSliceNanos())
+let rtGlobalCheck = rtEnvGlobalCheck()
+// NOMU_SEARCH_NS: how long a woken carrier searches before sleeping again; 20000 unless set.
+let rtSearchNanos = rtEnvSearchNanos()
 
 // The scheduler.
 let rtSched = nomuSchedNew()
@@ -107,4 +122,69 @@ fun rtEnvCarrierCount() -> Int {
     return n
   }
   return 4
+}
+
+// An integer setting from the environment (`v`, rtEnvValue's result): its value when set, else `dflt`.
+fun rtEnvIntOr(v: RawPtr, dflt: Int) -> Int {
+  if v.isNull {
+    return dflt
+  }
+  return rtEnvParseInt(v)
+}
+
+fun rtEnvSlot() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_SLOT")), 1)
+}
+
+fun rtEnvSlotStealNanos() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_SLOT_STEAL_NS")), 3000)
+}
+
+fun rtEnvSliceNanos() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_SLICE_NS")), 1000000)
+}
+
+fun rtEnvGlobalCheck() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  let n = rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_GLOBAL_CHECK")), 61)
+  if n >= 1 {
+    return n
+  }
+  return 61
+}
+
+fun rtEnvSearchNanos() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  let n = rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_SEARCH_NS")), 20000)
+  if n >= 1 {
+    return n
+  }
+  return 20000
+}
+
+// Nanoseconds as `Runtime.ticks()` units, by the system timebase (ticks × numer / denom = ns).
+fun rtNanosToTicks(ns: Int) -> Int {
+  let tb = RawPtr.alloc(bytes: 8, align: 8)
+  tb.store(0, toByteOffset: 0)
+  let ok = Runtime.timebase(info: tb)
+  let packed: Int = tb.load(fromByteOffset: 0)
+  tb.free()
+  let numer = packed % 4294967296
+  let denom = packed / 4294967296
+  if numer == 0 || denom == 0 {
+    return ns
+  }
+  return ns * denom / numer
+}
+
+fun rtEnvMboxAgeNanos() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  let n = rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_MBOX_AGE_NS")))
+  if n >= 1 {
+    return n
+  }
+  return 3000
 }

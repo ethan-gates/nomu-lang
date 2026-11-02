@@ -1,0 +1,42 @@
+import std/time
+
+// Mostly idle: 200 times, sleep 2 ms, then run a small burst (a tree of 14 fibers doing little work). The
+// time is close to 400 ms whatever the scheduler does; what differs is the CPU time it burns while idle
+// (spinning searchers, the monitor), which the sweep reads from the process's resource usage.
+
+fun spin(work: Int, seed: Int) -> Int {
+    var x = seed
+    var i = 0
+    while i < work {
+        x = x * 6364136223846793005 + 1442695040888963407
+        i += 1
+    }
+    return x
+}
+
+fun node(depth: Int, seed: Int) -> Int {
+    if depth == 0 {
+        return spin(work: 500, seed: seed)
+    }
+    spawn let a = node(depth: depth - 1, seed: seed * 2)
+    spawn let b = node(depth: depth - 1, seed: seed * 2 + 1)
+    return a + b
+}
+
+fun main() {
+    let t = Time()
+    let t0 = t.now
+    var x = 0
+    var i = 0
+    while i < 200 {
+        sleep(2)
+        x = x + node(depth: 3, seed: i)
+        i += 1
+    }
+    print("idle_fiber bursts 200 ns ")
+    print(t.ns_diff(t0, t.now))
+    print("\n")
+    if x == 42 {
+        print("\n")
+    }
+}

@@ -1,0 +1,47 @@
+import std/time
+
+// A binary tree of fibers, 12 levels deep (8,190 fibers): each node spawns two children and joins them,
+// and each leaf runs `work` loop iterations. Rounds grow the leaf's work; each prints its total time.
+// Measures spawning, joining (a completion readies its joiner) and how fresh fibers spread across carriers.
+
+fun spin(work: Int, seed: Int) -> Int {
+    var x = seed
+    var i = 0
+    while i < work {
+        x = x * 6364136223846793005 + 1442695040888963407
+        i += 1
+    }
+    return x
+}
+
+fun node(depth: Int, work: Int, seed: Int) -> Int {
+    if depth == 0 {
+        return spin(work: work, seed: seed)
+    }
+    spawn let a = node(depth: depth - 1, work: work, seed: seed * 2)
+    spawn let b = node(depth: depth - 1, work: work, seed: seed * 2 + 1)
+    return a + b
+}
+
+fun main() {
+    var work = 0
+    while work <= 10000 {
+        let t = Time()
+        let t0 = t.now
+        let r = node(depth: 12, work: work, seed: 1)
+        let ns = t.ns_diff(t0, t.now)
+        print("forkjoin_fiber work ")
+        print(work)
+        print(" fibers 8190 ns ")
+        print(ns)
+        print("\n")
+        if r == 42 {
+            print("\n")
+        }
+        if work == 0 {
+            work = 100
+        } else {
+            work = work * 10
+        }
+    }
+}

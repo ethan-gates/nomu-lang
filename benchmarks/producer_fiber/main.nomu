@@ -1,0 +1,177 @@
+import std/time
+
+// A readier that keeps running: one producer readies 8 consumer fibers in turn, computing about 20 µs
+// after each readying, for 20,000 items. Each consumer measures how long it waited between being readied
+// and running; prints the p50, p99 and largest wait, rounded down to a quarter power of two. Built with the
+// runtime prelude (`--config=rt_prelude`); readies through the run-queue slot, as a channel would.
+//
+// Shared state (off-heap): 0 stop · 8 the 8 parked consumers · 72 their ready stamps (ns; 0 at the stop)
+// · 136 misses (a consumer not yet parked again) · 256 the wait histogram (256 counts).
+
+fun spin(work: Int, seed: Int) -> Int {
+    var x = seed
+    var i = 0
+    while i < work {
+        x = x * 6364136223846793005 + 1442695040888963407
+        i += 1
+    }
+    return x
+}
+
+// The histogram bucket of `v` ns: exact below 16, then four per power of two.
+fun bucket(v: Int) -> Int {
+    if v < 16 {
+        if v < 0 {
+            return 0
+        }
+        return v
+    }
+    var p = 1
+    var k = 0
+    while p * 2 <= v {
+        p = p * 2
+        k += 1
+    }
+    let sub = v / (p / 4) - 4
+    return 16 + (k - 4) * 4 + sub
+}
+
+// The smallest value in bucket `b`.
+fun bucketFloor(b: Int) -> Int {
+    if b < 16 {
+        return b
+    }
+    let k = (b - 16) / 4 + 4
+    let sub = (b - 16) % 4
+    var p = 1
+    var i = 0
+    while i < k {
+        p = p * 2
+        i += 1
+    }
+    return p / 4 * (4 + sub)
+}
+
+fun consumer(st: RawPtr, me: Int) -> Int {
+    let sched = rtSched
+    var n = 0
+    var go = true
+    while go {
+        rtSchedLock(sched)
+        let stop: Int = st.load(fromByteOffset: 0)
+        if stop != 0 {
+            rtSchedUnlock(sched)
+            go = false
+        } else {
+            st.store(rtCurrentFiber(), toByteOffset: 8 + 8 * me)
+            nomuSchedParkLocked(sched, RawPtr.null, 0)
+            let now = Time().now
+            rtSchedLock(sched)
+            let stamp: Int = st.load(fromByteOffset: 72 + 8 * me)
+            if stamp != 0 {
+                let off = 256 + 8 * bucket(v: now - stamp)
+                let c: Int = st.load(fromByteOffset: off)
+                st.store(c + 1, toByteOffset: off)
+                n += 1
+            }
+            rtSchedUnlock(sched)
+        }
+    }
+    return n
+}
+
+fun producer(st: RawPtr, items: Int, work: Int) -> Int {
+    let sched = rtSched
+    var x = 0
+    var k = 0
+    while k < items {
+        let i = k % 8
+        rtSchedLock(sched)
+        let w: RawPtr = st.load(fromByteOffset: 8 + 8 * i)
+        if w.isNull {
+            let m: Int = st.load(fromByteOffset: 136)
+            st.store(m + 1, toByteOffset: 136)
+            rtSchedUnlock(sched)
+        } else {
+            st.store(RawPtr.null, toByteOffset: 8 + 8 * i)
+            st.store(Time().now, toByteOffset: 72 + 8 * i)
+            rtSchedReadyNext(sched, w)
+            rtSchedUnlock(sched)
+            rtSchedWake(sched, false)
+        }
+        x = spin(work: work, seed: x)
+        k += 1
+    }
+    rtSchedLock(sched)
+    st.store(1, toByteOffset: 0)
+    var i = 0
+    while i < 8 {
+        let w: RawPtr = st.load(fromByteOffset: 8 + 8 * i)
+        if w.isNull {
+        } else {
+            st.store(RawPtr.null, toByteOffset: 8 + 8 * i)
+            st.store(0, toByteOffset: 72 + 8 * i)
+            w.store(0, toByteOffset: 168)
+            rtSchedEnqueue(sched, w)
+        }
+        i += 1
+    }
+    rtSchedUnlock(sched)
+    rtSchedWake(sched, true)
+    return x
+}
+
+fun percentile(st: RawPtr, total: Int, num: Int, den: Int) -> Int {
+    let want = (total * num + den - 1) / den
+    var seen = 0
+    var b = 0
+    while b < 256 {
+        let c: Int = st.load(fromByteOffset: 256 + 8 * b)
+        seen = seen + c
+        if seen >= want {
+            return bucketFloor(b: b)
+        }
+        b += 1
+    }
+    return -1
+}
+
+fun main() {
+    let st = RawPtr.alloc(bytes: 2304, align: 8)
+    var o = 0
+    while o < 2304 {
+        st.store(0, toByteOffset: o)
+        o += 8
+    }
+    let t = Time()
+    let t0 = t.now
+    spawn let c0 = consumer(st, 0)
+    spawn let c1 = consumer(st, 1)
+    spawn let c2 = consumer(st, 2)
+    spawn let c3 = consumer(st, 3)
+    spawn let c4 = consumer(st, 4)
+    spawn let c5 = consumer(st, 5)
+    spawn let c6 = consumer(st, 6)
+    spawn let c7 = consumer(st, 7)
+    spawn let p = producer(st, 20000, 25000)
+    let x = p
+    let ns = t.ns_diff(t0, t.now)
+    let total = c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7
+    let misses: Int = st.load(fromByteOffset: 136)
+    print("producer_fiber items 20000 ns ")
+    print(ns)
+    print(" waits ")
+    print(total)
+    print(" misses ")
+    print(misses)
+    print(" p50 ")
+    print(percentile(st, total, 1, 2))
+    print(" p99 ")
+    print(percentile(st, total, 99, 100))
+    print(" max ")
+    print(percentile(st, total, 1, 1))
+    print("\n")
+    if x == 42 {
+        print("\n")
+    }
+}

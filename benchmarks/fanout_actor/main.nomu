@@ -1,0 +1,71 @@
+import std/time
+
+// One hub actor sends short jobs round-robin to 16 worker actors; each worker computes and replies to the
+// hub. Rounds grow the job from nothing to about 10 µs; each prints its total time. Measures how fast
+// work sent from one actor spreads to idle carriers.
+
+fun spin(work: Int, seed: Int) -> Int {
+    var x = seed
+    var i = 0
+    while i < work {
+        x = x * 6364136223846793005 + 1442695040888963407
+        i += 1
+    }
+    return x
+}
+
+actor Worker {
+    on job(work: Int, seed: Int, msgs: Int, hub: Hub, workers: Array<Worker>) {
+        hub.done(v: spin(work: work, seed: seed), work: work, msgs: msgs, me: hub, workers: workers)
+    }
+}
+
+actor Hub {
+    var got: Int = 0
+    var sum: Int = 0
+    var t0: Int = 0
+    on start(work: Int, msgs: Int, me: Hub, workers: Array<Worker>) {
+        got = 0
+        t0 = Time().now
+        let k = workers.count
+        var i = 0
+        while i < msgs {
+            workers[i % k].job(work: work, seed: i, msgs: msgs, hub: me, workers: workers)
+            i += 1
+        }
+    }
+    on done(v: Int, work: Int, msgs: Int, me: Hub, workers: Array<Worker>) {
+        sum = sum + v
+        got += 1
+        if got == msgs {
+            let t = Time()
+            print("fanout_actor work ")
+            print(work)
+            print(" msgs ")
+            print(msgs)
+            print(" ns ")
+            print(t.ns_diff(t0, t.now))
+            print("\n")
+            if work < 10000 {
+                var next = work * 10
+                if work == 0 {
+                    next = 10
+                }
+                me.start(work: next, msgs: msgs, me: me, workers: workers)
+            } else if sum == 1 {
+                print("\n")
+            }
+        }
+    }
+}
+
+fun main() {
+    var workers: Array<Worker> = []
+    var w = 0
+    while w < 16 {
+        workers.append(Worker())
+        w += 1
+    }
+    let hub = Hub()
+    hub.start(work: 0, msgs: 50000, me: hub, workers: workers)
+}
