@@ -38,8 +38,8 @@ an LLVM pass, is in scope where LLVM's ordering causes friction.
 
 ## Output
 
-The requirements document is [`internals/frames-contract.md`](../../internals/frames-contract.md), part 5 of
-245's series: stopping points, value kinds (H1–H3, S1–S2, S3, R), requirements R1–R8, guarantees G1–G4,
+The requirements document is [`internals/frames-contract.md`](../../internals/frames-contract.md), one of the
+frames design documents: stopping points, value kinds (H1–H3, S1–S2, S3, R), requirements R1–R8, guarantees G1–G4,
 toolchain T1–T3, the tests, and a measurement of today's generated code. Found on the way: task
 [246](246-raw-pointers-into-managed-memory.md), a live bug (`String.eq` reading a moved buffer).
 

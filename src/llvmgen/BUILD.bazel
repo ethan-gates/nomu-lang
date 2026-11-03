@@ -24,6 +24,7 @@ swift_library(
         "//src/midend/ssairpasses",  # the optimizer pipeline + GC-precision verifier (M7.3)
         "//src/facts",  # FactStore — the inference facts emitObject reads (task 164)
         "//src/frontend/sema",  # Builtins (the builtin-function table codegen shares)
+        "//src/llvmpasses",  # Nomu's machine passes (the frame-address split), registered before emission
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Analysis",  # LLVMVerifyModule
         # 8.1.4 object emission (llvm-c/TargetMachine.h): the TargetMachine C API lives in

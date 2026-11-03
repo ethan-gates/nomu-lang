@@ -533,6 +533,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     optimizer.noShapedHomes = jobSettings.bool("measure.no_shaped_homes")
     optimizer.noLoopPolls = jobSettings.bool("measure.no_loop_polls")
     optimizer.gcValueRegs = Int(jobSettings.choice("measure.gc_value_regs")) ?? 0
+    optimizer.noFrameSplit = jobSettings.bool("measure.no_frame_split")
     switch jobSettings.choice("opt.escape_provider") {
     case "graph": optimizer.escapeProvider = .graph
     case "graph_precise": optimizer.escapeProvider = .graphPrecise

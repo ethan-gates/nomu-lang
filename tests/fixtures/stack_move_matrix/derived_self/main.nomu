@@ -1,0 +1,72 @@
+// A pointer into a caller's frame passed down three calls across stack moves (task 243, claim 3). `run`,
+// `step` and `deep` write fields of `State`, so each takes `self` by address: `run`'s points into `main`'s
+// frame and is passed on to `step` and `deep`. `deep` sleeps every 200 rounds, so the fiber parks and (under
+// NOMU_STACK_MOVE) its stack moves while all three hold `self` and field addresses derived from it; each
+// reads and writes its fields after. The heap `String` field is read back across the collections the GC legs
+// force.
+class Box {
+  var v: Int
+}
+fun churn(i: Int) -> Int {
+  let b = Box(v: i)
+  return b.v % 3
+}
+fun heapString() -> String {
+  return "seed".concat("-heap-string-xxxxxxxxxxxxxxxx")
+}
+fun probe(s: String) -> Int {
+  return s.byte(at: 5).int + s.byte(at: 20).int
+}
+struct State {
+  var pad: Int
+  var s: String
+  var n: Int
+  var count: Int
+  fun deep(i: Int) -> Int {
+    n = n + 1
+    if i % 200 == 0 {
+      sleep(1)
+    }
+    var t = 0
+    var k = 0
+    while k < 50 {
+      t = t + churn(k + i)
+      k = k + 1
+    }
+    n = n + 1
+    return probe(s) + t * 0
+  }
+  fun step(i: Int) -> Int {
+    let r = self.deep(i: i)
+    n = n + 1
+    return r
+  }
+  fun run(want: Int, rounds: Int) -> Int {
+    var bad = 0
+    var i = 0
+    while i < rounds {
+      if self.step(i: i) != want {
+        bad = bad + 1
+      }
+      count = count + 1
+      i = i + 1
+    }
+    if n != rounds * 3 {
+      bad = bad + 1
+    }
+    if count != rounds {
+      bad = bad + 1
+    }
+    if pad != 7 {
+      bad = bad + 1
+    }
+    return bad
+  }
+}
+fun main() {
+  var st = State(pad: 7, s: heapString(), n: 0, count: 0)
+  let bad = st.run(want: probe(heapString()), rounds: 4000)
+  print("bad ")
+  print(bad)
+  print("\n")
+}

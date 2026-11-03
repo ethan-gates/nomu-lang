@@ -1,6 +1,6 @@
 # Frame mechanism designs: the candidates, judged against the contract
 
-Part of the frames series ([frames.md](frames.md)); the output of task 242. It lays out the ways Nomu could
+One of the frames design documents ([frames.md](frames.md)); the output of task 242. It lays out the ways Nomu could
 meet [the contract](frames-contract.md), judges each requirement by requirement in the contract's priority
 order (soundness as a gate, then run-time performance and predictability, then implementation cost), and
 names the design task 243 tries to break. Requirement numbers (R1–R8, G1–G4, T1–T3) are the contract's;

@@ -18,6 +18,9 @@ interface modules hold each IR's format, implementation modules hold the code;
 
 **Backend & driver**
 - **llvmgen** — NOIR → LLVM IR (C API) → native object; the GC pass pipeline
+- **llvmpasses** — Nomu's own LLVM passes (C++), called from llvmgen: the frame-address split, which keeps
+  addresses into the frame out of registers across stops, and the frame-address tracking, which makes
+  pointers that may point into a caller's frame recorded values at stops
 - **driver** — pipeline orchestration: parse → sema → midend → llvmgen → `cc`; owns `EmitMode`
 - **nomu-cli** — `nomuc` binary; argument parsing, calls into driver
 

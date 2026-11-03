@@ -66,6 +66,17 @@ groups:
       escape: false
     expect:
       stdout: "bad 0\n"
+  - name: stack-move
+    fixtures: tests/fixtures/stack_move_matrix/*
+    across:
+      - pipeline
+      - gc
+    compile_settings:
+      escape: false
+    run_settings:
+      stack_move: 1
+    expect:
+      stdout: "bad 0\n"
   - name: layout
     fixtures: tests/fixtures/layout_matrix/*
     across:

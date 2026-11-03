@@ -467,11 +467,11 @@ fun rtSchedTimerMain(sched: RawPtr) -> RawPtr {
   return sched
 }
 
-// Allocate + seed a fresh fiber: a 128 KB stack (matching the C RT_STACK_SIZE) and a handle whose first
+// Allocate + seed a fresh fiber: a 128 KB stack (rtStackNew) and a handle whose first
 // switch-in lands in rtSchedFiberMain. Created parked; the spawner readies and enqueues it.
 fun rtSchedFiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
-  let stack = RawPtr.alloc(bytes: 131072, align: 16)
-  let stackTop = stack.advanced(by: 131072)
+  let stack = rtStackNew()
+  let stackTop = stack.advanced(by: rtStackBytes)
   let fib = RawPtr.alloc(bytes: 304, align: 16)
   fib.store(2, toByteOffset: 168)
   fib.store(RawPtr.null, toByteOffset: 176)
@@ -631,6 +631,9 @@ fun rtSchedLoop(sched: RawPtr, myCtx: RawPtr) {
           fib.store(myCtx, toByteOffset: 232)
           fib.store(1, toByteOffset: 168)
           rec.store(fib, toByteOffset: 64)
+          if rtStackMoveOn {
+            rtStackMove(fib)                         // the stress mode: a new stack at every resume
+          }
           Runtime.ctxSwitch(from: myCtx, to: fib)
           // If the fiber stopped at a safepoint for STW (state 4), this carrier acks and waits, then
           // switches back into it to resume past the poll — repeating if another STW round follows.
@@ -641,6 +644,9 @@ fun rtSchedLoop(sched: RawPtr, myCtx: RawPtr) {
             rtSchedLock(sched)
             fib.store(1, toByteOffset: 168)
             rec.store(fib, toByteOffset: 64)
+            if rtStackMoveOn {
+              rtStackMove(fib)
+            }
             Runtime.ctxSwitch(from: myCtx, to: fib)
             fst = fib.load(fromByteOffset: 168)
           }
@@ -733,8 +739,8 @@ fun rtSchedMailboxFiberMain(fib: RawPtr) -> RawPtr {
 // Allocate a fresh mailbox fiber, seeded to enter rtSchedMailboxFiberMain. Infrastructure — not counted
 // in `active`. Caller holds the scheduler lock.
 fun rtSchedMailboxFiberNew(sched: RawPtr) -> RawPtr {
-  let stack = RawPtr.alloc(bytes: 131072, align: 16)
-  let stackTop = stack.advanced(by: 131072)
+  let stack = rtStackNew()
+  let stackTop = stack.advanced(by: rtStackBytes)
   let fib = RawPtr.alloc(bytes: 304, align: 16)
   fib.store(0, toByteOffset: 168)
   fib.store(RawPtr.null, toByteOffset: 176)

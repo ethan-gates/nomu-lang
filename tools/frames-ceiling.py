@@ -5,7 +5,7 @@ Builds each workload under configurations that remove a cost of finding roots, u
 configs in cfg.yaml), runs each with a nursery large enough that nothing collects, checks its output matches
 the sound build's, and reports the median time and the change against today.
 
-  python3 tools/frames-ceiling.py [--iters N] [--only name,name]
+  python3 tools/frames-ceiling.py [--iters N] [--only name,name] [--configs name,name]
 
 Needs the release compiler (`bazel build -c opt //src/nomu-cli:nomu`). Workloads that print their own
 timing (`ns <n>` as the last field) are timed by that; the rest by wall clock.
@@ -22,6 +22,7 @@ WORKLOADS = [
     ("frames_strings", []),
     ("frames_loops", []),
     ("frames_fib", []),
+    ("frames_mutating", []),
     ("micro_carried", []),
     ("pingpong_fiber", ["rt_prelude"]),
     ("pingpong_actor", []),
@@ -36,6 +37,8 @@ CONFIGS = [
     ("no-statepoints", ["measure_no_statepoints"]),
     ("no-sp+homes", ["measure_no_statepoints", "measure_no_shaped_homes"]),
     ("ceiling", ["measure_no_statepoints", "measure_no_shaped_homes", "measure_no_loop_polls"]),
+    # Without what makes stacks movable (task 243, claim 5): the frame-address split and tracking.
+    ("no-move-safety", ["measure_no_frame_split"]),
 ]
 
 
@@ -66,17 +69,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=7)
     ap.add_argument("--only", default="")
+    ap.add_argument("--configs", default="", help="configurations after `today` to run (default: all)")
     a = ap.parse_args()
     only = set(a.only.split(",")) - {""}
-    names = [c[0] for c in CONFIGS]
+    picked = set(a.configs.split(",")) - {""}
+    configs = [c for c in CONFIGS if c[0] == "today" or not picked or c[0] in picked]
+    names = [c[0] for c in configs]
     print(f"{'workload':16}" + "".join(f"{n:>16}" for n in names))
     for name, extra in WORKLOADS:
         if only and name not in only:
             continue
         base_out, base_t = None, None
         row = []
-        for cname, configs in CONFIGS:
-            binary = build(name, extra + configs)
+        for cname, cfgs in configs:
+            binary = build(name, extra + cfgs)
             outs, times = set(), []
             for _ in range(a.iters):
                 o, t = run(binary)

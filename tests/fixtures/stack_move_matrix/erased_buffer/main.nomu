@@ -1,0 +1,27 @@
+// An erased generic's argument and result buffers across stack moves (task 243, claim 3): `hold<T>` gets
+// both as addresses in this frame, parks with them live, and copies the argument into the result after.
+// `T` is a struct holding a heap `String`, so the buffers carry a managed word too.
+import pkg/lib
+
+struct Pair {
+  var s: String
+  var n: Int
+}
+fun fresh() -> String {
+  return "seed".concat("-heap-string-xxxxxxxxxxxxxxxx")
+}
+fun main() {
+  let want = probe(fresh())
+  var i = 0
+  var bad = 0
+  while i < 4000 {
+    let p = hold(Pair(s: fresh(), n: i), i)
+    if probe(p.s) != want || p.n != i {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

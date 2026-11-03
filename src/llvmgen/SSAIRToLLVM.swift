@@ -782,6 +782,23 @@ final class SSAIRToLLVM {
             }
         }
 
+        // Pointers that may point into a caller's frame, marked where they enter (`markFrameAddress`): a
+        // `mutating` value receiver, and an erased generic's result buffer and `T`-typed argument buffers.
+        if let entry = f.blocks.first {
+            LLVMPositionBuilderAtEnd(b, blockMap[entry.id])
+            let (_, selfType, byPointer, _) = keyAndSelf(f)
+            if let st = selfType, byPointer, e.classMap[st] == nil, e.actorMap[st] == nil,
+               let p = f.params.first, let v = values[p.id] {
+                values[p.id] = e.markFrameAddress(v)
+            }
+            if !f.generics.isEmpty {
+                for p in f.params where mentionsTypeParam(p.type) {
+                    if let v = values[p.id], LLVMTypeOf(v) == e.i8ptr { values[p.id] = e.markFrameAddress(v) }
+                }
+                if let sret = curSretParam { curSretParam = e.markFrameAddress(sret) }
+            }
+        }
+
         // Shaped-value frame homes (task 176 Stage 3): a shaped value live across a safepoint gets an alloca
         // home, zero-initialized so a not-yet-stored home scans as holding no managed word (Stage 5 zero-scan
         // safety). Reads/writes route through the home (`val`/`define`).
@@ -1390,7 +1407,9 @@ final class SSAIRToLLVM {
         // by buffer), a plain store for a concrete scalar field (task 100.4.3.3.4).
         if case .generic(let base, let args) = t, let s = e.structMap[base] {
             guard let size = erasedTypeSize(t, span) else { return nil }
-            let buf = LLVMBuildArrayAlloca(b, e.i8, size, "erased.box")!
+            // Runtime-sized, so its address has no frame index the frame-address split could recompute: marked,
+            // so it is recorded at stops like a pointer into a caller's frame.
+            let buf = e.markFrameAddress(LLVMBuildArrayAlloca(b, e.i8, size, "erased.box")!)
             let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
             for (i, f) in s.fields.enumerated() where i < fields.count {
                 guard let off = erasedFieldOffset(t, i, span) else { return nil }
@@ -1428,7 +1447,9 @@ final class SSAIRToLLVM {
         // tag word at offset 0, then each payload field copied to its offset (task 100.4.3.3.4).
         if case .generic(let base, let args) = t, let en = e.enumMap[base], caseIndex < en.cases.count {
             guard let size = erasedTypeSize(t, span) else { return nil }
-            let buf = LLVMBuildArrayAlloca(b, e.i8, size, "erased.enum")!
+            // Runtime-sized, so its address has no frame index the frame-address split could recompute: marked,
+            // so it is recorded at stops like a pointer into a caller's frame.
+            let buf = e.markFrameAddress(LLVMBuildArrayAlloca(b, e.i8, size, "erased.enum")!)
             LLVMBuildStore(b, LLVMConstInt(e.i64, UInt64(caseIndex), 0), buf)   // tag (i64) at offset 0
             let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
             for (i, f) in en.cases[caseIndex].fields.enumerated() where i < fields.count {
@@ -1852,6 +1873,11 @@ final class SSAIRToLLVM {
             // The linker's `__mh_execute_header`: the executable's Mach-O header, its load address.
             let g = e.getOrAddGlobal(LLVMInt8TypeInContext(e.ctx)!, "_mh_execute_header")
             return g
+        case "__sysProtect":
+            let i32 = e.i32
+            let (fn, fty) = e.runtimeFn("mprotect", ret: i32, params: [e.i8ptr, e.i64, i32], varArg: false)
+            let r = e.buildCall(fn, fty, [val(args[0]), val(args[1]), LLVMBuildTrunc(b, val(args[2]), i32, "prot")])
+            return LLVMBuildSExt(b, r!, e.i64, "mprotect.r")
         case "__sysRaise":
             let i32 = e.i32
             let (fn, fty) = e.runtimeFn("raise", ret: i32, params: [i32], varArg: false)

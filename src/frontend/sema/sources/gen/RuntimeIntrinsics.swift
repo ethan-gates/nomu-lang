@@ -319,6 +319,14 @@ enum RuntimeIntrinsics {
         case "imageHeader":
             guard PointerIntrinsics.checkArgLabels(&s, args, [], "Runtime.imageHeader", span) else { return err(span) }
             return s.ptrIntrinsic("__sysImageHeader", .rawPtr, [], span)
+        // Page protection (the stack copier's stress mode, which makes a moved-from stack fault on any use):
+        // mprotect over whole pages from `base`; `access` 0 is none, 3 is read and write. Returns 0 on success.
+        case "protect":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["base", "bytes", "access"], "Runtime.protect", span) else { return err(span) }
+            let base = PointerIntrinsics.ptrArg(&s, args[0].value, "Runtime.protect", "base")
+            let bytes = PointerIntrinsics.intArg(&s, args[1].value, "Runtime.protect", "bytes")
+            let access = PointerIntrinsics.intArg(&s, args[2].value, "Runtime.protect", "access")
+            return s.ptrIntrinsic("__sysProtect", .int, [base, bytes, access], span)
         case "raise":
             guard PointerIntrinsics.checkArgLabels(&s, args, ["signal"], "Runtime.raise", span) else { return err(span) }
             let sg = PointerIntrinsics.intArg(&s, args[0].value, "Runtime.raise", "signal")

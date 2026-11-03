@@ -28,7 +28,7 @@ Memory is not a source here: each claim cites a document, a paper, a commit or c
 
 ## Output
 
-The survey is [`internals/frames-prior-art.md`](../../internals/frames-prior-art.md), the prior-art part of 245's series;
+The survey is [`internals/frames-prior-art.md`](../../internals/frames-prior-art.md), one of the frames design documents;
 what bears on the decision is listed in 194 ("What prior art says"). Three papers were read only through
 their abstracts or through papers quoting them (Diwan, Moss and Hudson 1992; Cheng, Harper and Lee 1998;
 the Scala Native paper); the survey says so where it cites them.

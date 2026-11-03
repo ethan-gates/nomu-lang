@@ -74,6 +74,8 @@ let settingTable: [String: SettingDef] = [
                                      help: "minor collection when the nursery fills N 32 KiB blocks"),
     "mature_floor":       SettingDef(stage: .run, carrier: .envValue("NOMU_MATURE_FLOOR"),
                                      help: "mature-space size below which every collection is major"),
+    "stack_move":         SettingDef(stage: .run, carrier: .envValue("NOMU_STACK_MOVE"),
+                                     help: "move a fiber's stack at every resume and protect the old one"),
 ]
 
 // The manifest decoder's snake_case conversion also rewrites dictionary keys (`gc_record` arrives as `gcRecord`),

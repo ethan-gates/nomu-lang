@@ -1,7 +1,7 @@
 # Frame mechanism generality: what other LLVM languages could reuse
 
-**Avenue:** Risk · **Type/Lifecycle:** `research` · **Size:** M · **Status:** not started; sixth of
-[194](194-gc-frame-metadata.md)'s children (with 242 and 243) · **Source:** 194
+**Avenue:** Risk · **Type/Lifecycle:** `research` · **Size:** M · **Status:** in progress, open until the
+passes are tested on another target (x86-64 at least); sixth of [194](194-gc-frame-metadata.md)'s children (with 242 and 243) · **Source:** 194
 
 ## Deliverable
 
@@ -19,7 +19,16 @@ with copying stacks on LLVM could use it, and what they would need.
 
 ## Output
 
-The evaluation; the generality part of 245's series.
+The evaluation, [`internals/frames-generality.md`](../../internals/frames-generality.md).
+
+## Results
+
+The evaluation is [`internals/frames-generality.md`](../../internals/frames-generality.md). In short: the
+two passes (K2 and the tracking, about 500 lines of C++) depend only on LLVM; the rest rests on seven
+guarantees from Nomu's frontend and runtime (stack addresses only flow down, none in frame memory across a
+stop, possibly-stack pointers marked, none into the heap's interior, foreign code and the runtime hold none
+across a stop, frame pointers kept). Packaging as a library is close to what exists (the tracking is now a named pass in Nomu's pipeline); upstreaming needs an
+intrinsic in place of the inline-asm marker, x86-64 testing and a second user.
 
 ## Refs
 

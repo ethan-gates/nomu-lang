@@ -8,6 +8,7 @@ import Foundation
 let USAGE = """
     usage: compiler-test <manifest> [--enable a,b,*] [--disable a,b,*] [--where axis=value,…] [--tier fast|full]
                          [--repeat N] [--compiler PATH] [--deadline SEC] [--jobs N] [--check-reproducible]
+                         [--run-setting name=value]
 
     manifest         the manifest directory, e.g. tests/suite (required)
     --enable LIST    run only these cases (base becomes empty, then these are added)
@@ -18,6 +19,8 @@ let USAGE = """
     --compiler PATH  the nomu to test (default: the newest release build)
     --deadline SEC   overall wall-clock backstop (default 300; scaled by --repeat)
     --jobs N         pool capacity in cores (default: host cores − 2)
+    --run-setting S  add a run setting (name=value, as in a manifest's run_settings) to every run, over the
+                     case's own; repeatable. E.g. `--run-setting stack_move=1` runs the suite moving stacks.
     --check-reproducible
                      instead of compiling and running, build the selection twice from clean (the second
                      time at other source and cache paths) and compare the outputs byte for byte
@@ -43,6 +46,7 @@ struct Ctx {
     let nomu: String
     let cases: [ResolvedCase]
     let checkReproducible: Bool   // run the reproducibility sweep instead of the suite (`--check-reproducible`)
+    let extraRunEnv: [String: String]   // `--run-setting`s, lowered: added to every run's environment
 
     // The tier's cases; base = all of them, or empty if --enable was given; add --enable; remove --disable;
     // keep only group runs matching every --where.
@@ -57,7 +61,7 @@ struct Ctx {
 
     // Whether the selection is the whole tier (no name or dimension filter): only then does a run rewrite
     // the persisted order.
-    var selectsWholeTier: Bool { enableList.isEmpty && disableList.isEmpty && whereList.isEmpty }
+    var selectsWholeTier: Bool { enableList.isEmpty && disableList.isEmpty && whereList.isEmpty && extraRunEnv.isEmpty }
 
     // Where a configuration's binary is kept: each (fixture, compile settings) gets its own directory under
     // `build/compiler-test/`, so builds of one fixture under different settings never share a path. The
@@ -104,6 +108,7 @@ struct Ctx {
         var deadline = 300.0   // suite-level wall-clock backstop (seconds)
         var jobs: Int? = nil   // pool capacity override; default derives from host cores below
         var checkReproducible = false
+        var runSettings: Settings = [:]
 
         func parseValued(_ flag: String, _ v: String) {
             switch flag {
@@ -113,6 +118,12 @@ struct Ctx {
                     guard parts.count == 2 else { die("--where takes axis=value, got '\(item)'") }
                     whereList.append((parts[0], parts[1]))
                 }
+            case "--run-setting":
+                let parts = v.split(separator: "=", maxSplits: 1).map(String.init)
+                guard parts.count == 2 else { die("--run-setting takes name=value, got '\(v)'") }
+                let value: SettingValue = parts[1] == "true" ? .bool(true) : parts[1] == "false" ? .bool(false)
+                    : Int(parts[1]).map { .int($0) } ?? .string(parts[1])
+                runSettings[parts[0]] = value
             case "--tier":
                 guard let t = Tier(rawValue: v) else { die("--tier takes fast or full") }
                 tier = t
@@ -138,11 +149,11 @@ struct Ctx {
             case "--disable":
                 i += 1; guard i < argv.count else { die("--disable needs a list") }
                 disableList += splitList(argv[i])
-            case "--where", "--tier", "--repeat", "--compiler":
+            case "--where", "--tier", "--repeat", "--compiler", "--run-setting":
                 i += 1; guard i < argv.count else { die("\(a) needs a value") }
                 parseValued(a, argv[i])
             case let f where f.hasPrefix("--where=") || f.hasPrefix("--tier=") || f.hasPrefix("--repeat=")
-                || f.hasPrefix("--compiler="):
+                || f.hasPrefix("--compiler=") || f.hasPrefix("--run-setting="):
                 let eq = f.firstIndex(of: "=")!
                 parseValued(String(f[..<eq]), String(f[f.index(after: eq)...]))
             case "--deadline":
@@ -190,7 +201,8 @@ struct Ctx {
         return Ctx(enableList: enableList, disableList: disableList, whereList: whereList, tier: tier,
                    repeatCount: repeatCount, deadline: deadline * Double(repeatCount),
                    poolCapacity: capacity, configPath: configPath, manifest: manifest, projectRoot: root,
-                   nomu: resolveNomu(projectRoot: root, override: compiler), cases: cases, checkReproducible: checkReproducible)
+                   nomu: resolveNomu(projectRoot: root, override: compiler), cases: cases, checkReproducible: checkReproducible,
+                   extraRunEnv: lower(runSettings, at: .run, in: "--run-setting").env)
     }
 }
 

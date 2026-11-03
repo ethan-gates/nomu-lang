@@ -11,6 +11,7 @@ import support
 // → `rewrite-statepoints-for-gc`, or `-O2` in release), and object emission via `llvm-c/TargetMachine.h`.
 import Foundation
 import LLVM_C
+import NomuLLVMPasses
 
 // Codegen sub-stage timing. When the driver passes a `StageSink` (`onStage`), each sub-stage reports
 // up into the phase-categorized `Timings` table (so the `ssair`/`llvm` phases break down rather than
@@ -43,6 +44,7 @@ public struct OptimizerSettings {
     public var noShapedHomes = false
     public var noLoopPolls = false
     public var gcValueRegs = 0
+    public var noFrameSplit = false
     public init() {}
 }
 
@@ -273,21 +275,23 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     // needs to find SSA roots, keeping Tier-0 debug info intact. `rewrite-statepoints-for-gc` runs
     // last either way (8.0.7), so opts see ordinary pointers and statepoint spill/reload noise is
     // introduced only after optimization.
-    let opts = LLVMCreatePassBuilderOptions()
-    defer { LLVMDisposePassBuilderOptions(opts) }
     // `always-inline` (M6 · 6.2.3) collapses the mutator seams (poll / alloc / write-barrier) into
     // their call sites before the statepoint rewrite, so the poll's fast path is a bare load+branch
     // and only its cold slow-path call carries a statepoint. `default<O2>` already inlines.
-    // `measure.no_statepoints` (task 243.1) drops the rewrite: calls stay plain, references are not spilled.
+    // The frame-address tracking (`nomu-track-frame-addresses`, `src/llvmpasses`) runs on the optimized IR,
+    // before the rewrite. `measure.no_frame_split` drops its markers instead; `measure.no_statepoints`
+    // (task 243.1) drops the rewrite, so calls stay plain and references are not spilled.
+    let track = optimizer.noFrameSplit ? ",nomu-drop-frame-addresses" : ",nomu-track-frame-addresses"
     let rewrite = optimizer.noStatepoints ? "" : ",rewrite-statepoints-for-gc"
-    let pipeline = optimize
-        ? "default<O3>" + rewrite
-        : "function(mem2reg,sroa),always-inline" + rewrite
+    let pipeline = (optimize ? "default<O3>" : "function(mem2reg,sroa),always-inline") + track + rewrite
     if optimizer.gcValueRegs > 0 { setGCValueRegisters(optimizer.gcValueRegs) }
+    // The frame-address split (`src/llvmpasses`): no address into the frame stays in a register across a stop,
+    // so a copied stack leaves no stale address behind. Registered process-wide, once.
+    if !optimizer.noFrameSplit { nomuRegisterFrameAddressSplit() }
     if ProcessInfo.processInfo.environment["NOMU_DUMP_LLVM"] != nil {
         (path + ".pre.ll").withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }
     }
-    let passErr = cgStage("llvm", "opt", onStage) { LLVMRunPasses(mod, pipeline, tm, opts) }
+    let passErr = cgStage("llvm", "opt", onStage) { nomuRunPasses(mod, pipeline, tm) }
     if let err = passErr {
         let m = LLVMGetErrorMessage(err).map { String(cString: $0) } ?? "unknown"
         LLVMConsumeError(err)

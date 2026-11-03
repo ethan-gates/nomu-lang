@@ -1,0 +1,41 @@
+// Frame-mechanism measurement (task 243, claim 5): a pointer into a caller's frame live across calls. `run`
+// writes its struct's fields, so it takes `self` by address, an address in its caller's frame; its loop calls
+// a doubly recursive function (which stays a call) each iteration, so `self` is live across a stop every
+// iteration and, tracked, is spilled to a recorded slot and reloaded after each call. `run` recurses on
+// itself, so it is not inlined into its caller, where `self` would be the caller's own slot. Allocates nothing.
+fun mix(x: Int, d: Int) -> Int {
+    if d == 0 {
+        return x % 7
+    }
+    return (mix(x: x * 3 + 1, d: d - 1) + mix(x: x + 2, d: d - 1)) % 11
+}
+
+struct Acc {
+    var a: Int
+    var b: Int
+    var c: Int
+
+    fun run(n: Int, k: Int, depth: Int) {
+        if depth > 0 {
+            self.run(n: n, k: k + 1, depth: depth - 1)
+        }
+        var i = 0
+        while i < n {
+            a = a + mix(x: i + k, d: 2)
+            b = b + a % 5
+            c = c + b % 3
+            i = i + 1
+        }
+    }
+}
+
+fun main() {
+    var acc = Acc(a: 0, b: 0, c: 0)
+    var round = 0
+    while round < 40 {
+        acc.run(n: 250000, k: round, depth: 3)
+        round = round + 1
+    }
+    print(acc.a + acc.b + acc.c)
+    print("\n")
+}

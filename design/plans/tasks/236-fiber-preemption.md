@@ -80,7 +80,7 @@ describe its innermost frame. The options:
   array counts and buffer pointers are reloaded every iteration. Running the loop in chunks of about a
   thousand iterations, with the poll only between chunks, lets the optimizer hoist within each chunk and
   bounds the delay to a stop by the chunk's length (HotSpot's C2 does this). It needs no signals and no new
-  frame mechanism, so it works with every candidate. Task [247](247-loop-strip-mining.md).
+  frame mechanism, so it works with every candidate. Task [245](245-loop-strip-mining.md).
 
 Only (a) removes loop polls with a moving collector and copying stacks, and (e) removes most of their cost
 without removing them; it is the third of candidate 3's

@@ -458,21 +458,32 @@ fun rtShadowPush(node: RawPtr, buffer: RawPtr, vwt: RawPtr) {
 }
 
 // Restore the shadow-top to a value saved on entry (LIFO pop of every node a frame pushed, on any exit).
+// The saved value is rtShadowSave's offset from the stack top, turned back into an address in the fiber's
+// current stack, which may have moved since the save.
 fun rtShadowPopTo(savedTop: RawPtr) {
   let self = rtCurrentFiber()
   if self.isNull {
     return
   }
-  self.store(savedTop, toByteOffset: 288)
+  if savedTop.isNull {
+    self.store(RawPtr.null, toByteOffset: 288)
+    return
+  }
+  self.store(rtAnchorAt(self, savedTop.toInt()), toByteOffset: 288)
 }
 
-// The current fiber's shadow-top (saved on entry to an erased frame, restored on exit).
+// The current fiber's shadow-top (saved on entry to an erased frame, restored on exit), as an offset from
+// the stack top (null for an empty list): the caller holds it across calls that can move the stack.
 fun rtShadowSave() -> RawPtr {
   let self = rtCurrentFiber()
   if self.isNull {
     return RawPtr.null
   }
-  return self.load(fromByteOffset: 288)
+  let top: RawPtr = self.load(fromByteOffset: 288)
+  if top.isNull {
+    return top
+  }
+  return RawPtr.null.advanced(by: rtAnchorOffset(top))
 }
 
 // Walk one fiber's typed-root shadow list, appending each registered buffer's interior managed-pointer
@@ -529,6 +540,9 @@ fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
       let sp: RawPtr = cur.load(fromByteOffset: 264)
       if sp.isNull == false {
         let pc: Int = cur.load(fromByteOffset: 272)
+        if rtStackMoveOn {
+          rtStackCheckAnchor(cur, sp)
+        }
         n = rtWalkFrom(sp, pc, roots, n, emitSlots)
       }
       // Typed roots: the interior managed pointers of this fiber's live erased non-POD `T` buffers,
@@ -623,5 +637,46 @@ fun nomuSchedWalkParked(sched: RawPtr, outBuf: RawPtr, cap: Int) -> Int {
 // Slot mode (root slot addresses) — for a moving collection, which rewrites each slot with the survivor's
 // forwarded address. Fills the growable buffer `roots` (rtRootsNew) and returns the count.
 fun nomuSchedWalkSlots(sched: RawPtr, roots: RawPtr) -> Int {
-  return nomuSchedWalkRoots(sched, roots, 1)
+  let n = nomuSchedWalkRoots(sched, roots, 1)
+  return rtKeepManagedSlots(roots, n)
+}
+
+// Keep only the slots whose word is a managed object: in the Immix heap or a large-object chunk. A recorded
+// slot can also hold an address into a stack or a global (a `mutating` method's `self`, an erased generic's
+// buffer), recorded so the stack copier can adjust it; the collector must not treat it as an object. Compacts
+// the slot list in place and returns the count kept.
+fun rtKeepManagedSlots(roots: RawPtr, n: Int) -> Int {
+  let space = rtSpace
+  if space.isNull {
+    return n
+  }
+  let base: RawPtr = roots.load(fromByteOffset: 0)
+  let lo: Int = space.load(fromByteOffset: 40)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let hi = lo + nb * 32768
+  var kept = 0
+  var i = 0
+  while i < n {
+    let slot: RawPtr = base.load(fromByteOffset: i * 8)
+    let w: RawPtr = slot.load(fromByteOffset: 0)
+    let a = w.toInt()
+    if (a >= lo && a < hi) || rtLosHolds(space, a) {
+      base.store(slot, toByteOffset: kept * 8)
+      kept = kept + 1
+    }
+    i = i + 1
+  }
+  return kept
+}
+
+// Whether `a` is the object of a chunk in the large-object list.
+fun rtLosHolds(space: RawPtr, a: Int) -> Bool {
+  var cur: RawPtr = space.load(fromByteOffset: 64)
+  while cur.isNull == false {
+    if cur.toInt() + 8 == a {
+      return true
+    }
+    cur = cur.load(fromByteOffset: 0)
+  }
+  return false
 }

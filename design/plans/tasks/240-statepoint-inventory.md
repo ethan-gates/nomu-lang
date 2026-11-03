@@ -24,8 +24,8 @@ provide, and which problems are the machinery's and which are Nomu's.
 
 ## Output
 
-The inventory is [`internals/frames-statepoints.md`](../../internals/frames-statepoints.md), part 4 of 245's
-series: 22 problems, 15 tracing wholly or partly to the machinery, each with its cause, owner, status and
+The inventory is [`internals/frames-statepoints.md`](../../internals/frames-statepoints.md), one of the frames
+design documents: 22 problems, 15 tracing wholly or partly to the machinery, each with its cause, owner, status and
 whether a replacement removes it.
 
 ## Refs

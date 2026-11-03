@@ -34,12 +34,12 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 127  LXR — RC-primary reclamation, on Immix backing; then the GenImmix–LXR comparison   ◀ end goal
 └── benchmark against Go and Swift, on GenImmix (when the language is complete)
     ├── 104  fiber stack strategy — Go-style copying stacks              (before any GC is measured)
-    │   └── 194  GC frame metadata — statepoints or our own (epic: 239–245)
-    │       └── 243  frame mechanism feasibility — experiments to break extended statepoints  ◀ next
+    │   └── 194  GC frame metadata — statepoints or our own (epic: 239–244)
+    │       └── 244  frame mechanism generality — what other LLVM languages could reuse  ◀ next
     ├── 235  scheduler run queues — per-carrier queues in place of one lock
     ├── 236  fiber preemption — take a carrier back from a computing fiber
     │        couples with 104 (the entry check)
-    ├── 247  loop strip mining — polls out of the loops the optimizer sees (29% on array loops)
+    ├── 245  loop strip mining — polls out of the loops the optimizer sees (29% on array loops)
     ├── 230  heap sizing — a heap that grows, a clean out-of-memory      (before any GC is measured)
     ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
     │        complements 179 (value-level GC classification)

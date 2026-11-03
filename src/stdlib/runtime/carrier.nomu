@@ -196,13 +196,13 @@ fun rtGcRaise(sched: RawPtr, kind: Int, trigger: Int) {
 // state discipline, and stack-save are the proven poll-site machinery, not an ad-hoc in-place block. The one
 // addition is raising the request (rtGcRaise) under the lock; because stw-request (sched+136) is set before
 // this fiber parks, the carrier's `while 136 != 0` wait cannot race ahead of it. Concurrent requests coalesce.
-fun rtSelfhostOom(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+fun rtSelfhostOom(trigger: Int, anchorOff: Int, anchorPc: Int) -> Bool {
   let sched = rtSched
   if sched.isNull {
     return false
   }
   let self = rtCurrentFiber()
-  rtSchedSetAnchor(self, anchorSp, anchorPc)      // user-frame anchor for the STW walk (128.3.2 machinery)
+  rtSchedSetAnchor(self, rtAnchorAt(self, anchorOff), anchorPc)      // user-frame anchor for the STW walk (128.3.2 machinery)
   rtSchedLock(sched)
   rtGcRaise(sched, 0, trigger)                    // a major
   self.store(4, toByteOffset: 168)                // safepoint-stopped; the carrier acks + waits, then resumes us
@@ -223,13 +223,13 @@ fun rtSelfhostOom(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
 // major/defrag, unless a major request is already pending. Returns false when there is no self-hosted scheduler
 // (no collector — the reserve stays unenforced, as in 150.4.1); else true (a minor GC always empties the
 // nursery). The collection resets this carrier's TLAB before resuming it, so the caller re-reads the TLAB.
-fun rtSelfhostMinorGc(trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+fun rtSelfhostMinorGc(trigger: Int, anchorOff: Int, anchorPc: Int) -> Bool {
   let sched = rtSched
   if sched.isNull {
     return false
   }
   let self = rtCurrentFiber()
-  rtSchedSetAnchor(self, anchorSp, anchorPc)
+  rtSchedSetAnchor(self, rtAnchorAt(self, anchorOff), anchorPc)
   rtSchedLock(sched)
   rtGcRaise(sched, 1, trigger)                    // a minor, unless a major is already pending
   self.store(4, toByteOffset: 168)                // safepoint-stopped; the carrier acks + waits, then resumes us
@@ -278,7 +278,7 @@ fun rtGcCollected(ticket: Int) -> Bool {
 // heap-pressure-safe (it selects sources within the copy reserve), so it runs even when the minor could not
 // place its promotions. Called without the pool lock held. `trigger` is why the collection was raised (the
 // recorder's trigger id: nursery full or allocation stress). Returns whether a collection ran.
-fun rtGenCollect(minorTrigger: Int, trigger: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+fun rtGenCollect(minorTrigger: Int, trigger: Int, anchorOff: Int, anchorPc: Int) -> Bool {
   let avail = nomuGcSpaceAvail()
   var floor = minorTrigger + minorTrigger        // 2× the reserve: promotion headroom + fragmentation margin
   let matureFloor = rtMatureFloor
@@ -290,15 +290,15 @@ fun rtGenCollect(minorTrigger: Int, trigger: Int, anchorSp: RawPtr, anchorPc: In
     if trigger == 1 {
       why = 2                                    // a nursery-full minor escalated by the mature floor
     }
-    return rtSelfhostOom(why, anchorSp, anchorPc)     // escalate → major (collection kind 0)
+    return rtSelfhostOom(why, anchorOff, anchorPc)     // escalate → major (collection kind 0)
   }
-  return rtSelfhostMinorGc(trigger, anchorSp, anchorPc)   // minor (collection kind 1)
+  return rtSelfhostMinorGc(trigger, anchorOff, anchorPc)   // minor (collection kind 1)
 }
 
 // Allocation stress (env NOMU_GC_STRESS): count `need` bytes against this carrier's stress interval and, once
 // the interval is reached, request a collection at the alloc-site anchor — a generational one (rtGenCollect)
 // when generational is on, else a major. The collection resets every TLAB, so the caller re-reads it.
-fun rtStressTick(space: RawPtr, tlab: RawPtr, need: Int, stress: Int, anchorSp: RawPtr, anchorPc: Int) {
+fun rtStressTick(space: RawPtr, tlab: RawPtr, need: Int, stress: Int, anchorOff: Int, anchorPc: Int) {
   let counted: Int = tlab.load(fromByteOffset: 40)
   let total = counted + need
   if total < stress {
@@ -308,9 +308,9 @@ fun rtStressTick(space: RawPtr, tlab: RawPtr, need: Int, stress: Int, anchorSp: 
   tlab.store(0, toByteOffset: 40)
   let minorTrigger = rtGenReserve(space)
   if minorTrigger > 0 {
-    let ran = rtGenCollect(minorTrigger, 4, anchorSp, anchorPc)
+    let ran = rtGenCollect(minorTrigger, 4, anchorOff, anchorPc)
   } else {
-    let ran = rtSelfhostOom(4, anchorSp, anchorPc)
+    let ran = rtSelfhostOom(4, anchorOff, anchorPc)
   }
 }
 
@@ -320,7 +320,7 @@ fun rtStressTick(space: RawPtr, tlab: RawPtr, need: Int, stress: Int, anchorSp: 
 // is pulled on block exhaustion; cross-carrier hole sharing is deferred (150.3.10.2). On block exhaustion it
 // triggers a synchronous collection at the alloc-site anchor and retries (150.3.11); returns false only on a
 // genuine OOM (a collection that reclaimed nothing).
-fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anchorPc: Int) -> Bool {
+fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorOff: Int, anchorPc: Int) -> Bool {
   rtSchedMutexLockAt(space.advanced(by: 120))
   var done = false
   var result = false
@@ -339,7 +339,7 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
       var didGc = false
       if minorTrigger > 0 && nurseryNow >= minorTrigger {
         rtSchedMutexUnlockAt(space.advanced(by: 120))
-        didGc = rtGenCollect(minorTrigger, 1, anchorSp, anchorPc)
+        didGc = rtGenCollect(minorTrigger, 1, anchorOff, anchorPc)
         rtSchedMutexLockAt(space.advanced(by: 120))
       }
       if didGc {
@@ -352,7 +352,7 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
         // the loop (which re-reads the TLAB the collection reset). A collection that freed nothing is genuine
         // OOM: stop with result = false.
         rtSchedMutexUnlockAt(space.advanced(by: 120))
-        let progressed = rtSelfhostOom(3, anchorSp, anchorPc)
+        let progressed = rtSelfhostOom(3, anchorOff, anchorPc)
         rtSchedMutexLockAt(space.advanced(by: 120))
         if !progressed {
           done = true
@@ -428,13 +428,16 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorSp: RawPtr, anch
 // to; the collector's own copy allocator keeps using rtImmixAlloc on the descriptor bump state (single-thread,
 // under STW).
 fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
+  // The anchor as an offset from the stack's top: a collection here can move the stack, and the retry may
+  // park again, so the address is recomputed at each park (rtAnchorAt).
+  let anchorOff = rtAnchorOffset(anchorSp)
   let bumped = n + 7
   let need = bumped / 8 * 8
   // Under NOMU_GC_STRESS the hole end lives at stressLimit (@32) and the inline limit (@8) stays 0, so every
   // allocation reaches here and counts toward the carrier's stress interval.
   let stress = rtGcStress
   if stress > 0 {
-    rtStressTick(space, tlab, need, stress, anchorSp, anchorPc)
+    rtStressTick(space, tlab, need, stress, anchorOff, anchorPc)
   }
   if need > 32768 {
     rtSchedMutexLockAt(space.advanced(by: 120))
@@ -463,7 +466,7 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
     } else {
       // On overflow refill from the pool; a true-OOM refill triggers a synchronous collection at the alloc-site
       // anchor and retries (150.3.11), returning false only on genuine OOM.
-      let ok = rtImmixRefill(space, tlab, need, anchorSp, anchorPc)
+      let ok = rtImmixRefill(space, tlab, need, anchorOff, anchorPc)
       if !ok {
         result = RawPtr.null
         done = true

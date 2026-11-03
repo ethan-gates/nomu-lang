@@ -127,7 +127,11 @@ setting at the wrong stage, is an error. Compile settings select configs declare
   collector plan: whole-heap collection only, no write barrier).
 - Run: `gc_stress_bytes` (a
   collection every N bytes a carrier allocates), `nursery_blocks` (a minor collection when the nursery
-  fills N 32 KiB blocks), `mature_floor` (every collection major below this mature size).
+  fills N 32 KiB blocks), `mature_floor` (every collection major below this mature size), `stack_move`
+  (a fiber's stack moved at every resume and the old one made inaccessible, `NOMU_STACK_MOVE`).
+
+`--run-setting name=value` adds a run setting to every run of the selection, over each case's own: for
+example `--run-setting stack_move=1` runs the whole suite moving stacks.
 
 A case that needs a collection at an exact point builds with `rt_prelude` and calls `rtGcRequest(kind)`
 from the fixture: the request goes through the coordinator, and the caller stops at its next safepoint poll.
@@ -160,6 +164,9 @@ its source, wins over the group's `expect`. A run's tier is the highest of its g
 excluded.
 - `shape` — `tests/fixtures/shape_matrix/*` across `pipeline` × `gc`: a heap `String` held in every
   position a program can hold one, read back across collections (task 176.5). Each prints `bad 0`.
+- `stack-move` — `tests/fixtures/stack_move_matrix/*` across `pipeline` × `gc`, every run moving stacks
+  (`stack_move`): addresses into a moved stack held across parks — a field-writing method's `self` passed
+  down three calls, an erased generic's buffers, a shadow-stack node (task 243, claim 3). Each prints `bad 0`.
 - `layout` — `tests/fixtures/layout_matrix/*` across `pipeline`: value layouts a mono caller and an erased
   body must agree on.
 - `examples` — `examples/*`, the user-facing demos, each against its `expected.txt`, so they keep working.

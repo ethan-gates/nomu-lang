@@ -41,8 +41,8 @@ stress modes would catch that.
 
 ## Output
 
-The comparison is [`internals/frames-designs.md`](../../internals/frames-designs.md), the design half of part 6
-of 245's series: four layers (recording, no stray copies, the frame table, the stack), five candidates
+The comparison is [`internals/frames-designs.md`](../../internals/frames-designs.md), one of the frames
+design documents: four layers (recording, no stray copies, the frame table, the stack), five candidates
 judged against the contract, and the leading one, **extended statepoints** (a Nomu GC strategy where
 `addrspace(1)` means "may be managed or on a stack", `ni:1`, a machine pass keeping frame addresses out of
 registers across stops, a per-function frame table), with six claims for 243 to try to break. Found on the

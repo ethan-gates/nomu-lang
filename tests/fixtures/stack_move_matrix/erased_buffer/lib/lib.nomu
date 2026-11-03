@@ -1,0 +1,26 @@
+class Box {
+  var v: Int
+}
+package fun churn(i: Int) -> Int {
+  var t = 0
+  var k = 0
+  while k < 25 {
+    let b = Box(v: i + k)
+    t = t + b.v % 3
+    k = k + 1
+  }
+  return t
+}
+package fun probe(s: String) -> Int {
+  return s.byte(at: 5).int + s.byte(at: 20).int
+}
+// Erased across modules: the argument and result buffers are addresses in the caller's frame, held across a
+// park (the stack moves under NOMU_STACK_MOVE) and the collections the GC legs force.
+package fun hold<T>(x: T, i: Int) -> T {
+  var t = churn(i)
+  if i % 200 == 0 {
+    sleep(1)
+  }
+  t = t + churn(i + 1)
+  return x
+}

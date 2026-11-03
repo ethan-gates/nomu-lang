@@ -1,7 +1,7 @@
 # GC frame metadata — LLVM statepoints or our own
 
 **Avenue:** Risk · **Type/Lifecycle:** `epic · evaluate` (codegen + runtime) · **Size:** XL ·
-**Status:** a tracking epic, opened; its work is in child tasks, 239–245 first (below), with
+**Status:** a tracking epic, opened; its work is in child tasks, 239–244 first (below), with
 implementation and post-implementation tasks added as it goes · **Source:** raised by [190](190-explicit-module-builds.md) 190.6 F1 (stack scanning
 across objects), now [195](195-link-time-gc-frame-index.md); grown by [104](104-fiber-stack-strategy.md)'s
 moving stacks and interprocedural stack promotion, both blocked on statepoints
@@ -9,7 +9,7 @@ moving stacks and interprocedural stack promotion, both blocked on statepoints
 This is a tracking epic: it holds the deliverable, the evidence, the order of its children and the
 decision record, and no implementation. Each child is its own task so it can grow as much detail as it
 needs. It spans the whole effort, not only the decision: research and design, implementation, then the work
-after a working system (verification, generalizing, the literature, polish). A production-grade mechanism
+after a working system (verification, generalizing, polish). A production-grade mechanism
 can be running well before 194 is complete; 194 is complete when its children are. If the decision is to replace statepoints, this is likely the largest and most defining piece of
 Nomu, so it is done with the discipline below.
 
@@ -26,8 +26,7 @@ decision.
   (as [195](195-link-time-gc-frame-index.md) does over today's stackmaps).
 - **Replace them:** our code generation emits the table's per-object input directly.
 
-Alongside the decision: **literature** that explains the problem and the solution to engineers and
-compiler engineers (245), and an **evaluation of generality**, whether the solution can serve other
+Alongside the decision: an **evaluation of generality**, whether the solution can serve other
 language implementers who want moving collectors with copying stacks on LLVM (244). 239 found no system
 that has done this combination on LLVM (below).
 
@@ -43,7 +42,6 @@ In order; each produces a written output, and none is done without it.
 | [242](242-frame-mechanism-designs.md) | candidate mechanisms (an IR discipline, a machine-level pass, others 239 finds), each judged against 241, with failure modes | a design comparison |
 | [243](243-frame-mechanism-feasibility.md) | experiments that could falsify the leading design: IR cases, a stack moved at every check, the old stack made inaccessible, measured costs | results |
 | [244](244-frame-mechanism-generality.md) | what depends on Nomu's frontend and what another LLVM language could reuse; its preconditions; packaging as a library or upstream | an evaluation |
-| [245](245-frame-literature.md) | the explanatory series, written as each step above finishes | the series in `design/` |
 
 The decision is recorded here once 239–243 are done; implementation tasks (the frame-table format, its
 link-time step, the producer in codegen, the runtime's readers, the stack copier) are opened from it.
@@ -53,7 +51,6 @@ link-time step, the producer in codegen, the runtime's readers, the stack copier
 - Requirements (241) before design (242).
 - Every design claim is tied to an experiment that could disprove it (243).
 - The stress modes are in the test suite before anything depends on them.
-- The literature is written with the evidence, as each step finishes, not after.
 
 ## Evidence so far
 
@@ -193,7 +190,7 @@ Children added from the decision, in two groups. **Implementation:**
 
 **After a working system:** verification beyond the stress modes (for example, checking that generated
 code keeps no untracked copy, across the suite and large programs); generalizing it for other languages
-(244's findings acted on); finishing the literature (245); polish (diagnostics, tooling, the frame table's
+(244's findings acted on); polish (diagnostics, tooling, the frame table's
 size and lookup speed). 194 stays open until these are done.
 
 ## Dependencies & triggers

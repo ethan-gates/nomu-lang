@@ -1,0 +1,28 @@
+class Box {
+  var v: Int
+}
+package fun churn(i: Int) -> Int {
+  var t = 0
+  var k = 0
+  while k < 25 {
+    let b = Box(v: i + k)
+    t = t + b.v % 3
+    k = k + 1
+  }
+  return t
+}
+package struct Wrap<T> {
+  var value: T
+  var tag: Int
+}
+// An erased body that builds a `Wrap<T>` in a runtime-sized frame buffer and registers it on the shadow
+// stack (its `T` may hold managed words), then parks and collects with it live before reading it back.
+package fun wrapHold<T>(x: T, i: Int) -> T {
+  let w = Wrap(value: x, tag: i)
+  var t = churn(i)
+  if i % 200 == 0 {
+    sleep(1)
+  }
+  t = t + churn(i + 1)
+  return w.value
+}

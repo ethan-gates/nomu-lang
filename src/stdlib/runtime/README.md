@@ -14,6 +14,7 @@ One module over these files; a name declared in any file is visible in all of th
 | `immix.nomu` | the Immix heap: regions, allocation, line marking, sweep, large objects |
 | `descriptors.nomu` | GC type descriptors read by type-id |
 | `stackwalk.nomu` | stack maps, the frame index, the pcsp walk, parked-fiber walks, the shadow stack |
+| `stackmove.nomu` | moving a suspended fiber's stack (the copier) and its stress mode, `NOMU_STACK_MOVE` |
 | `collect.nomu` | forwarding, evacuation, whole-heap and minor collection, the defrag trigger, the GC coordinator thread |
 | `gcreport.nomu` | the collector's recorder and report |
 | `scheduler.nomu` | the M:N scheduler, timers, actor mailboxes, the stop-the-world handshake, entry points |

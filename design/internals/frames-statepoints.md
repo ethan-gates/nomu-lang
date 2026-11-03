@@ -1,6 +1,6 @@
 # What Nomu built on LLVM's statepoints, and where it fell short
 
-Part of the frames series ([frames.md](frames.md)); the output of task 240. It lists what Nomu uses LLVM's
+One of the frames design documents ([frames.md](frames.md)); the output of task 240. It lists what Nomu uses LLVM's
 statepoints and stack maps for, file by file, then every problem they have caused, each with its root
 cause, whether it is the machinery's or Nomu's, and whether replacing the machinery would remove it. Tasks
 241 (the contract) and 242 (the candidate designs) work from it.

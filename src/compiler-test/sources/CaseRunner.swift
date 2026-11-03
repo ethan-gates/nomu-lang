@@ -107,7 +107,7 @@ struct CaseRunner {
         let carrierRuns: [Int?] = c.carriers.isEmpty ? [nil] : c.carriers.map { Optional($0) }
         for carrier in carrierRuns {
             for iter in 1...c.iterations {
-                var env = c.runEnv
+                var env = c.runEnv.merging(ctx.extraRunEnv) { _, extra in extra }
                 if let carrier = carrier { env["NOMU_CARRIERS"] = String(carrier) }
                 // A case asserting collections reads them from the run's collector report, written into a
                 // directory of its own (cases share binaries and run concurrently).

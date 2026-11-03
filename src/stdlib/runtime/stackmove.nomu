@@ -1,0 +1,193 @@
+// Moving a fiber's stack: the copier, and the stress mode that moves a stack at every resume.
+// Part of the `runtime` module; see README.md.
+//
+// A suspended fiber's stack can be copied to a new address and fixed up so it resumes there. The carrier
+// does it, on its own stack, holding the scheduler lock, just before it switches the fiber back in. What is
+// fixed is what the frame contract names (`design/internals/frames-contract.md`): the saved stack and frame
+// pointers in the fiber's context, the frame-pointer chain, the anchor, the shadow-stack list, and every
+// recorded root slot whose word points into the old stack. Callee-saved registers in the context are not
+// adjusted: a word there has no recorded kind, and an address held in one across a stop is what the
+// compiler must rule out.
+//
+// NOMU_STACK_MOVE=1 is the stress mode: every resume of a suspended fiber moves its stack, and the old stack
+// is made inaccessible, so the first use of a stale address into it faults instead of reading an intact
+// copy. Moved-from stacks wait in a quarantine of `rtStackQuarantine` stacks before they are made accessible
+// again and reused, which bounds the memory the mode holds. Stacks come from page-aligned reservations
+// while it is on, so they can be protected.
+
+// NOMU_STACK_MOVE: 1 moves a fiber's stack at every resume; off unless set.
+let rtStackMoveOn = rtEnvStackMove() > 0
+
+let rtStackBytes = 131072
+let rtStackQuarantine = 256
+
+// { 0 free-list head, 8 quarantine next index, 16 quarantine ring (rtStackQuarantine words) }. Touched only
+// under the scheduler lock.
+let rtStackPool = Runtime.staticStorage(bytes: 2064, align: 8)
+
+fun rtEnvStackMove() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_STACK_MOVE")))
+}
+
+// A new fiber's stack of `rtStackBytes`: page-aligned under the stress mode, so it can be protected once
+// moved from. Called without the scheduler lock, so it does not touch the pool.
+fun rtStackNew() -> RawPtr {
+  if rtStackMoveOn {
+    return Runtime.reserveZeroed(bytes: rtStackBytes, align: 16384)
+  }
+  return RawPtr.alloc(bytes: rtStackBytes, align: 16)
+}
+
+// A stack to move into: one back from quarantine, else a new reservation. Caller holds the scheduler lock.
+fun rtStackTake() -> RawPtr {
+  let head: RawPtr = rtStackPool.load(fromByteOffset: 0)
+  if head.isNull == false {
+    let next: RawPtr = head.load(fromByteOffset: 0)
+    rtStackPool.store(next, toByteOffset: 0)
+    return head
+  }
+  return Runtime.reserveZeroed(bytes: rtStackBytes, align: 16384)
+}
+
+// Retire a moved-from stack: protect it and put it in the quarantine; the stack it displaces there becomes
+// accessible again and goes on the free list.
+fun rtStackRetire(old: RawPtr) {
+  let i: Int = rtStackPool.load(fromByteOffset: 8)
+  let slot = rtStackPool.advanced(by: 16 + i * 8)
+  let evicted: RawPtr = slot.load(fromByteOffset: 0)
+  if evicted.isNull == false {
+    Runtime.protect(base: evicted, bytes: rtStackBytes, access: 3)
+    let head: RawPtr = rtStackPool.load(fromByteOffset: 0)
+    evicted.store(head, toByteOffset: 0)
+    rtStackPool.store(evicted, toByteOffset: 0)
+  }
+  slot.store(old, toByteOffset: 0)
+  Runtime.protect(base: old, bytes: rtStackBytes, access: 0)
+  rtStackPool.store((i + 1) % rtStackQuarantine, toByteOffset: 8)
+}
+
+// An anchor that must survive a stop: runtime code that captures its caller's anchor and may park more than
+// once keeps it as an offset from the current fiber's stack top, which a move does not change, and turns it
+// back into an address at each park. Off a fiber the offset is the address itself.
+fun rtAnchorOffset(sp: RawPtr) -> Int {
+  let fib = rtCurrentFiber()
+  if fib.isNull {
+    return sp.toInt()
+  }
+  let base: RawPtr = fib.load(fromByteOffset: 208)
+  return base.toInt() + rtStackBytes - sp.toInt()
+}
+
+fun rtAnchorAt(fib: RawPtr, off: Int) -> RawPtr {
+  if fib.isNull {
+    return RawPtr.null.advanced(by: off)
+  }
+  let base: RawPtr = fib.load(fromByteOffset: 208)
+  return base.advanced(by: rtStackBytes - off)
+}
+
+// `p` moved by `delta` when it points into [lo, hi), else unchanged.
+fun rtStackAdjust(p: RawPtr, lo: Int, hi: Int, delta: Int) -> RawPtr {
+  let a = p.toInt()
+  if a >= lo && a < hi {
+    return p.advanced(by: delta)
+  }
+  return p
+}
+
+// Adjust the word at `at` when it points into [lo, hi).
+fun rtStackAdjustAt(at: RawPtr, lo: Int, hi: Int, delta: Int) {
+  let w: RawPtr = at.load(fromByteOffset: 0)
+  at.store(rtStackAdjust(w, lo, hi, delta), toByteOffset: 0)
+}
+
+// Move suspended fiber `fib`'s stack to a fresh one and fix every pointer into it the contract names. The
+// caller holds the scheduler lock and runs on its carrier's stack.
+fun rtStackMove(fib: RawPtr) {
+  let old: RawPtr = fib.load(fromByteOffset: 208)
+  let sp: RawPtr = fib.load(fromByteOffset: 96)
+  let lo = old.toInt()
+  let hi = lo + rtStackBytes
+  let spAt = sp.toInt()
+  if spAt < lo || spAt > hi {
+    Runtime.fatal("nomu: stack move: the fiber's saved stack pointer is outside its stack")
+  }
+  let fresh = rtStackTake()
+  let delta = fresh.toInt() - lo
+  // The used part: from the saved stack pointer to the top.
+  let used = hi - spAt
+  fresh.advanced(by: rtStackBytes - used).copyBytes(from: sp, byteCount: used)
+
+  // The context: sp and fp (x29 at +80). The frame-pointer chain from there: each frame record's saved fp.
+  fib.store(sp.advanced(by: delta), toByteOffset: 96)
+  rtStackAdjustAt(fib.advanced(by: 80), lo, hi, delta)
+  var fp: RawPtr = fib.load(fromByteOffset: 80)
+  var chaining = true
+  while chaining {
+    let at = fp.toInt()
+    if fp.isNull || at < lo + delta || at >= hi + delta {
+      chaining = false
+    } else {
+      rtStackAdjustAt(fp, lo, hi, delta)
+      fp = fp.load(fromByteOffset: 0)
+    }
+  }
+
+  // The recorded root slots, from the anchor: a recorded word pointing into the old stack moves with it.
+  let anchor: RawPtr = fib.load(fromByteOffset: 264)
+  if anchor.isNull == false {
+    let newAnchor = rtStackAdjust(anchor, lo, hi, delta)
+    fib.store(newAnchor, toByteOffset: 264)
+    let pc: Int = fib.load(fromByteOffset: 272)
+    let slots = rtRootsNew()
+    let n = rtWalkFrom(newAnchor, pc, slots, 0, 1)
+    let base: RawPtr = slots.load(fromByteOffset: 0)
+    var k = 0
+    while k < n {
+      let slot: RawPtr = base.load(fromByteOffset: k * 8)
+      rtStackAdjustAt(slot, lo, hi, delta)
+      k = k + 1
+    }
+    rtRootsFree(slots)
+  }
+
+  // The shadow stack: its head, and each node's `prev` and buffer, all in the moved frames.
+  rtStackAdjustAt(fib.advanced(by: 288), lo, hi, delta)
+  var node: RawPtr = fib.load(fromByteOffset: 288)
+  while node.isNull == false {
+    rtStackAdjustAt(node, lo, hi, delta)
+    rtStackAdjustAt(node.advanced(by: 8), lo, hi, delta)
+    node = node.load(fromByteOffset: 0)
+  }
+
+  fib.store(fresh, toByteOffset: 208)
+  rtStackRetire(old)
+}
+
+// Under the stress mode, the walk checks that a stopped fiber's anchor lies in its current stack: an anchor
+// left in a moved-from stack (runtime code holding the address across a stop) stops the program here, with
+// the fiber's state and addresses, instead of faulting somewhere in the walk.
+fun rtStackCheckAnchor(fib: RawPtr, anchor: RawPtr) {
+  let base: RawPtr = fib.load(fromByteOffset: 208)
+  let a = anchor.toInt()
+  if a >= base.toInt() && a < base.toInt() + rtStackBytes {
+    return
+  }
+  let buf = RawPtr.alloc(bytes: 256, align: 8)
+  var n = Runtime.copyLiteral(to: buf, "nomu: stack move: stale anchor: fib ")
+  n = rtFaultPutHex(buf, n, fib.toInt())
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " state ")
+  let st: Int = fib.load(fromByteOffset: 168)
+  n = rtFaultPutHex(buf, n, st)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " anchor ")
+  n = rtFaultPutHex(buf, n, a)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " base ")
+  n = rtFaultPutHex(buf, n, base.toInt())
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " sp ")
+  let sp: Int = fib.load(fromByteOffset: 96)
+  n = rtFaultPutHex(buf, n, sp)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\n")
+  Runtime.writeFd(fd: 2, buf: buf, count: n)
+  Runtime.fatal("nomu: stack move: a stopped fiber's anchor is outside its stack")
+}

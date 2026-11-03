@@ -1,0 +1,23 @@
+// A shadow-stack node across stack moves (task 243, claim 3): `wrapHold<T>` builds a `Wrap<T>` in a
+// runtime-sized buffer in its frame and links a node for it on the fiber's shadow stack; the node, its
+// buffer pointer and the saved shadow-stack top all point into the stack the move relocates. `T` is a class,
+// so the buffer holds a managed pointer the collector reaches only through the node.
+import pkg/lib
+
+class Obj {
+  var v: Int
+}
+fun main() {
+  var i = 0
+  var bad = 0
+  while i < 4000 {
+    let r = wrapHold(Obj(v: 1000 + i), i)
+    if r.v != 1000 + i {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

@@ -1,6 +1,6 @@
 # The frame contract: what must hold wherever a fiber can stop
 
-Part of the frames series ([frames.md](frames.md)); the output of task 241. It states what any mechanism
+One of the frames design documents ([frames.md](frames.md)); the output of task 241. It states what any mechanism
 describing Nomu's frames must guarantee, precisely enough to test. Task 242 judges candidate designs
 against it and 243 tests the leading one. Requirements are numbered (R1…) so designs and tests can cite
 them.

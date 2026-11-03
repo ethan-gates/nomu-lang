@@ -33,6 +33,11 @@ address operations. The sources:
   (task 180), with nothing to enforce it; user-visible through the core package.
 - `__gcObjAddr`: documented as sound only on a non-moving heap.
 
+The frame-address split (243, claim 2) finds the stack half independently: in `String.eq` and `String.lt`
+it reports two frame-derived values it cannot recompute, the select between a `small` string's inline bytes
+and its heap buffer. A fix here has to keep both halves off the poll; the split cannot recompute a merged
+address.
+
 ## Options
 
 - **(a) Rewrite the callers** so no raw pointer spans a poll: `eq`/`lt` reload per iteration or per chunk.

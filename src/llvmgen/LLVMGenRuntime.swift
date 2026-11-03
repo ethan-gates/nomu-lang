@@ -57,6 +57,23 @@ extension LLVMGen {
         return name.withCString { LLVMGetStringAttributeAtIndex(fn, funcAttrIndex, $0, UInt32(name.utf8.count)) } != nil
     }
 
+    // Mark a pointer that may point into a caller's frame (a `mutating` receiver, an erased generic's buffer)
+    // where it enters the function: `nomu.frame.addr(p)`, an identity the optimizer cannot see through.
+    // After optimization the frame-address tracking (`src/llvmpasses/TrackFrameAddresses.cpp`) makes it a
+    // tracked value, so the statepoint rewrite records it at every stop and a stack move can adjust it.
+    func markFrameAddress(_ p: LLVMValueRef) -> LLVMValueRef {
+        let (fn, ty) = runtimeFn("nomu.frame.addr", ret: i8ptr, params: [i8ptr], varArg: false)
+        if !isGCLeafFn(fn) {
+            markGCLeaf(fn)
+            for (name, value) in [("memory", UInt64(0)), ("nounwind", 0), ("willreturn", 0)] {
+                let k = LLVMGetEnumAttributeKindForName(name, name.utf8.count)
+                LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, k, value))
+            }
+        }
+        var args: [LLVMValueRef?] = [p]
+        return LLVMBuildCall2(b, ty, fn, &args, 1, "frame.addr")!
+    }
+
     func addAlwaysInline(_ fn: LLVMValueRef) {
         let k = LLVMGetEnumAttributeKindForName("alwaysinline", "alwaysinline".utf8.count)
         LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, k, 0))

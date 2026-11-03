@@ -1,6 +1,6 @@
 # Prior art: moving collectors, stack maps and growable stacks
 
-Part of the frames series ([frames.md](frames.md)). This part surveys how other language implementations
+One of the frames design documents ([frames.md](frames.md)). This part surveys how other language implementations
 solved, or avoided, the two problems Nomu has: letting a collector move heap objects that compiled code
 refers to, and growing a fiber's stack by moving it. Every claim cites a source; where a source could not
 be read in full, that is said.

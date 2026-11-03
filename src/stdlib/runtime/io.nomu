@@ -38,6 +38,8 @@ let rtStdin = Runtime.staticStorage(bytes: 96, align: 8)
 // (without the newline) at 8. At end of input, the unterminated remainder, then empty lines. The anchor is
 // the user frame the `readLine` forwarder captured, recorded if the fiber parks.
 fun rtReadLine(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
+  // Parks repeatedly, and the stack may move at each: the anchor is kept as an offset from the stack's top.
+  let anchorOff = rtAnchorOffset(anchorSp)
   let st = rtStdin
   rtSchedMutexLockAt(st)
   while true {
@@ -86,7 +88,7 @@ fun rtReadLine(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
       }
       rtSchedLock(sched)
       rtSchedMutexUnlockAt(st)
-      nomuSchedParkLocked(sched, anchorSp, anchorPc)   // returns with the scheduler lock released
+      nomuSchedParkLocked(sched, rtAnchorAt(rtCurrentFiber(), anchorOff), anchorPc)   // returns with the scheduler lock released
       rtSchedMutexLockAt(st)
     } else {
       // Readable: read what is there. Holding the stdin lock serializes readers; a readable fd does not
