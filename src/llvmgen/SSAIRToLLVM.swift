@@ -245,7 +245,7 @@ final class SSAIRToLLVM {
     // loaded early is an SSA value the statepoint rewrite relocates. A heap (`addrspace(1)`) load needs none,
     // since its base is relocated.
     func loadReloading(_ p: LLVMValueRef, _ t: Type, _ lt: LLVMTypeRef) -> LLVMValueRef {
-        let frame = LLVMGetPointerAddressSpace(LLVMTypeOf(p)) == 0
+        let frame = LLVMGetPointerAddressSpace(LLVMTypeOf(p)) == 0 && !e.measureNoShapedHomes
         let words = frame ? e.shapes.shape(t).conditionalWords : []
         if words.isEmpty { return LLVMBuildLoad2(b, lt, p, "ld") }
         if let leaf = e.shapes.leaf(t) { return loadLeafWords(p, leaf) }
@@ -347,6 +347,7 @@ final class SSAIRToLLVM {
     // The loop-header safepoint poll, recording the shaped values live at the header as shaped roots on the
     // poll's statepoint (task 176). A header with no live homed shaped value emits the plain poll.
     private func emitHeaderPoll(_ blockId: Int) {
+        if e.measureNoLoopPolls { return }
         let ops = shapedDeoptOps(homed: shapedLive?.liveInBlock[blockId] ?? [],
                                  slots: slotRoot.roots(shapedSlotLive?.liveInBlock[blockId] ?? []))
         if ops.isEmpty { e.emitSafepointPoll(); return }
@@ -847,6 +848,7 @@ final class SSAIRToLLVM {
     // `crossingInst` at exactly the same sites), or a value crossing an allocation but no call would be
     // recorded with no home and silently dropped. Each home is zero-initialized at entry.
     private func setUpShapedHomes(_ f: SSAFunction) {
+        if e.measureNoShapedHomes { return }
         let live = computeShapedLiveness(f, e.shapes)
         shapedLive = live
         // Recorded slots (`recordedSlots`): their liveness tracks the slot and every address derived from it,

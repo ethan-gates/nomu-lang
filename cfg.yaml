@@ -12,6 +12,10 @@ configs:
   gc_record: null
   gc_record_full: null
   gc_immix: null
+  measure_no_statepoints: null
+  measure_no_shaped_homes: null
+  measure_no_loop_polls: null
+  measure_gc_regs: null
 opt:
   mono mono_all: all
   mono mono_edge: edge
@@ -29,3 +33,12 @@ gc gc_record_full:
   record: full
 gc gc_immix:
   plan: immix
+# Measurement only (task 243.1): unsound while anything collects.
+measure measure_no_statepoints:
+  no_statepoints: true
+measure measure_no_shaped_homes:
+  no_shaped_homes: true
+measure measure_no_loop_polls:
+  no_loop_polls: true
+measure measure_gc_regs:
+  gc_value_regs: "8"

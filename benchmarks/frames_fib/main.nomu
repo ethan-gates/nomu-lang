@@ -1,0 +1,20 @@
+// Frame-mechanism measurement (task 243.1), the control: recursive calls with no references live across
+// them, so statepoints record nothing to spill. Recursive Fibonacci, the argument varying by round so no
+// round can be skipped. Allocates nothing.
+fun fib(n: Int) -> Int {
+    if n <= 1 {
+        return n
+    }
+    return fib(n: n - 1) + fib(n: n - 2)
+}
+
+fun main() {
+    var total = 0
+    var round = 0
+    while round < 12 {
+        total = total + fib(n: 30 + round % 3)
+        round = round + 1
+    }
+    print(total)
+    print("\n")
+}

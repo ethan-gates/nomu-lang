@@ -1,0 +1,49 @@
+// Frame-mechanism measurement (task 243.1): `String` values live across calls. Builds 20,000 heap strings
+// once, then for each, many times, runs a recursive byte checksum that holds the string live across every
+// recursive call (with a per-round key, so no round can be skipped), so the string sits in a frame home with a volatile reload after each. Allocates a few MB,
+// so a run need not collect.
+fun piece(k: Int) -> String {
+    let m = k % 8
+    if m == 0 { return "alpha-" }
+    if m == 1 { return "bravo-" }
+    if m == 2 { return "charlie-" }
+    if m == 3 { return "delta-" }
+    if m == 4 { return "echo-" }
+    if m == 5 { return "foxtrot-" }
+    if m == 6 { return "golf-" }
+    return "hotel-"
+}
+
+fun make(i: Int) -> String {
+    return piece(k: i).concat(piece(k: i / 8)).concat(piece(k: i / 64)).concat(piece(k: i / 512))
+}
+
+fun check(s: String, i: Int, k: Int) -> Int {
+    if i < 0 {
+        return 0
+    }
+    let b = s.byte(at: i).int
+    return b * (i + k) + check(s: s, i: i - 1, k: k)
+}
+
+fun main() {
+    var xs: Array<String> = []
+    var i = 0
+    while i < 20000 {
+        xs.append(make(i: i))
+        i = i + 1
+    }
+    var total = 0
+    var round = 0
+    while round < 100 {
+        var j = 0
+        while j < xs.count {
+            let s = xs[j]
+            total = total + check(s: s, i: s.count - 1, k: round) + s.count
+            j = j + 1
+        }
+        round = round + 1
+    }
+    print(total)
+    print("\n")
+}

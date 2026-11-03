@@ -237,6 +237,12 @@ final class LLVMGen {
     // §6.6 — inline the allocation TLAB bump fast path; off (`opt.inline_alloc: false`) sends every allocation
     // to the out-of-line `rtTlabAlloc` for A/B measurement.
     var inlineAlloc = true
+    // Measurement only (`measure.*`, task 243.1), each unsound while anything collects: no deopt bundles (the
+    // statepoint rewrite is skipped, so a bundle would ride an ordinary call), no shaped homes or volatile
+    // reloads, no loop-header polls.
+    var measureNoStatepoints = false
+    var measureNoShapedHomes = false
+    var measureNoLoopPolls = false
     // The `full` recording level (`gc.record: full`): the inline allocation hit path counts each object and
     // its bytes in the carrier record's TLAB (`allocObjects` @48, `allocBytes` @56).
     var countsAllocations = false

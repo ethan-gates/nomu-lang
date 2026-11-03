@@ -33,10 +33,13 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 ```
 127  LXR — RC-primary reclamation, on Immix backing; then the GenImmix–LXR comparison   ◀ end goal
 └── benchmark against Go and Swift, on GenImmix (when the language is complete)
-    ├── 104  fiber stack strategy — Go-style copying stacks              (before any GC is measured)  ◀ next
+    ├── 104  fiber stack strategy — Go-style copying stacks              (before any GC is measured)
+    │   └── 194  GC frame metadata — statepoints or our own (epic: 239–245)
+    │       └── 243  frame mechanism feasibility — experiments to break extended statepoints  ◀ next
     ├── 235  scheduler run queues — per-carrier queues in place of one lock
     ├── 236  fiber preemption — take a carrier back from a computing fiber
     │        couples with 104 (the entry check)
+    ├── 247  loop strip mining — polls out of the loops the optimizer sees (29% on array loops)
     ├── 230  heap sizing — a heap that grows, a clean out-of-memory      (before any GC is measured)
     ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
     │        complements 179 (value-level GC classification)
@@ -46,8 +49,10 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 ```
 
 **Order of the next run:** [234](tasks/234-scheduler-wake-and-pool.md) (the scheduler's wakes, found by 104's
-baseline) is done; next [104](tasks/104-fiber-stack-strategy.md) (fiber stacks: small stacks copied on
-growth, as Go's; overflow past the limit reports through [219](tasks/219-runtime-fault-handling.md)), then
+baseline) is done; next [194](tasks/194-gc-frame-metadata.md) (GC frame metadata: keep LLVM's statepoints or
+replace them; copying stacks cannot be built soundly on them, and interprocedural stack promotion is blocked
+on them), then [104](tasks/104-fiber-stack-strategy.md) (fiber stacks: small stacks copied on growth, as Go's;
+overflow past the limit reports through [219](tasks/219-runtime-fault-handling.md)), then
 [230](tasks/230-heap-sizing.md) (heap sizing: growth and a clean out-of-memory), all before any collector is
 measured, so the benchmarks run on large, fiber-heavy programs. [235](tasks/235-scheduler-run-queues.md)
 (per-carrier run queues) and [236](tasks/236-fiber-preemption.md) (preemption), found by 234's workloads,

@@ -38,6 +38,11 @@ public struct OptimizerSettings {
     public var scalar = true
     public var escapeProvider = EscapeProvider.legacy
     public var inlineAlloc = true
+    // Measurement only (`measure.*`, task 243.1): unsound switches that remove a cost of finding roots.
+    public var noStatepoints = false
+    public var noShapedHomes = false
+    public var noLoopPolls = false
+    public var gcValueRegs = 0
     public init() {}
 }
 
@@ -108,6 +113,9 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
     egress.e.isRuntimePackage = isRuntimePackage
     egress.e.emitsProcessEntry = requireMain
     egress.e.inlineAlloc = optimizer.inlineAlloc
+    egress.e.measureNoStatepoints = optimizer.noStatepoints
+    egress.e.measureNoShapedHomes = optimizer.noShapedHomes
+    egress.e.measureNoLoopPolls = optimizer.noLoopPolls
     egress.e.countsAllocations = gcRecordLevel > 1
     egress.e.emitsWriteBarrier = gcPlan == 0
     cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: noirModule) }
@@ -129,7 +137,7 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
         llpath.withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }
     }
     if stopAfterEgress { return nil }
-    return emitModuleObject(mod, to: path, optimize: optimize, onStage: onStage)
+    return emitModuleObject(mod, to: path, optimize: optimize, optimizer: optimizer, onStage: onStage)
 }
 
 /// A value the runtime reads from a global in the settings object: an `int64_t`, a `uint8_t` 0 or 1, or a
@@ -195,6 +203,7 @@ private func checkHostSlotLayout(_ gen: LLVMGen) -> String? {
 }
 
 private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: Bool,
+                              optimizer: OptimizerSettings = OptimizerSettings(),
                               onStage: StageSink? = nil) -> String? {
     let triple = LLVMGetDefaultTargetTriple()!
     defer { LLVMDisposeMessage(triple) }
@@ -228,10 +237,13 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     let keepStackmaps = ".no_dead_strip __LLVM_StackMaps\n"
     keepStackmaps.withCString { LLVMAppendModuleInlineAsm(mod, $0, keepStackmaps.utf8.count) }
 
-    // Stamp the target's data layout onto the module so it and the object agree.
+    // Stamp the target's data layout onto the module so it and the object agree, with the managed address
+    // space marked non-integral (`ni:1`): the optimizer may then not turn a managed pointer into an integer
+    // and back, which the statepoint rewrite could not relocate (`internals/frames-statepoints.md`, problem 23).
     let dl = LLVMCreateTargetDataLayout(tm)
-    let dlStr = LLVMCopyStringRepOfTargetData(dl)
-    LLVMSetDataLayout(mod, dlStr)
+    let dlStr = LLVMCopyStringRepOfTargetData(dl)!
+    let layout = String(cString: dlStr) + "-ni:1"
+    LLVMSetDataLayout(mod, layout)
     LLVMDisposeMessage(dlStr)
     LLVMDisposeTargetData(dl)
 
@@ -266,9 +278,12 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     // `always-inline` (M6 · 6.2.3) collapses the mutator seams (poll / alloc / write-barrier) into
     // their call sites before the statepoint rewrite, so the poll's fast path is a bare load+branch
     // and only its cold slow-path call carries a statepoint. `default<O2>` already inlines.
+    // `measure.no_statepoints` (task 243.1) drops the rewrite: calls stay plain, references are not spilled.
+    let rewrite = optimizer.noStatepoints ? "" : ",rewrite-statepoints-for-gc"
     let pipeline = optimize
-        ? "default<O3>,rewrite-statepoints-for-gc"
-        : "function(mem2reg,sroa),always-inline,rewrite-statepoints-for-gc"
+        ? "default<O3>" + rewrite
+        : "function(mem2reg,sroa),always-inline" + rewrite
+    if optimizer.gcValueRegs > 0 { setGCValueRegisters(optimizer.gcValueRegs) }
     if ProcessInfo.processInfo.environment["NOMU_DUMP_LLVM"] != nil {
         (path + ".pre.ll").withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }
     }
@@ -292,4 +307,21 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
         return "LLVM: object emission failed: \(m)"
     }
     return nil
+}
+
+// `measure.gc_value_regs` (task 243.1): LLVM's statepoint lowering keeps up to `n` references in registers,
+// callee-saved ones included, instead of spilling them. These are process-wide LLVM options, parsed once: the
+// first module compiled with a nonzero value sets them for the process.
+private var gcValueRegistersSet = false
+private func setGCValueRegisters(_ n: Int) {
+    if gcValueRegistersSet { return }
+    gcValueRegistersSet = true
+    let args = ["nomu", "-max-registers-for-gc-values=\(n)", "-fixup-allow-gcptr-in-csr"]
+    var cargs = args.map { strdup($0) }
+    cargs.withUnsafeMutableBufferPointer { buf in
+        buf.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: buf.count) {
+            LLVMParseCommandLineOptions(Int32(args.count), $0, nil)
+        }
+    }
+    for c in cargs { free(c) }
 }

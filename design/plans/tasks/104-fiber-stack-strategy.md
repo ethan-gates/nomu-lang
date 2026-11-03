@@ -2,7 +2,7 @@
 
 **Avenue:** Risk (the "better than Go" concurrency thesis) · **Type/Lifecycle:** `perf · needs-design`
 (runtime + compiler architecture) · **Size:** L · **Status:** direction decided (Go-style copying stacks);
-104.1 (baseline) done; the design of its parts is open; built before any collector is measured · **Source:** deferred.md
+104.1 (baseline) done; the entry check decided; waits on [194](194-gc-frame-metadata.md) (the stack copier needs its contract, and 104's other parts wait with it); built before any collector is measured · **Source:** deferred.md
 
 **Scheduled before any collector is measured** (the benchmark against Go and Swift on GenImmix, then the
 GenImmix–LXR comparison), so the benchmarks run on large, fiber-heavy programs. Today's three stack
@@ -86,6 +86,11 @@ stack pointer, less the frame, with the stack limit, and calls into the runtime 
   objects Nomu placed in frames, wherever they sit (slots, registers saved in frames). The stack maps must
   describe these, beyond the GC pointers they describe today. Escape analysis must guarantee no pointer into
   a frame lives outside its fiber's stack, as Go's does.
+  **Gated on [194](194-gc-frame-metadata.md).** On stock LLVM this cannot be done soundly: statepoints
+  record only `addrspace(1)` values, and raw frame addresses (stack-promoted objects, struct-return and
+  by-reference slots, frame addresses LLVM keeps in callee-saved registers) are live across calls. 194's
+  replacement for statepoints carries the contract copying needs; if no route meets it, the fallback is
+  segmented stacks (gccgo's and gollvm's choice), which never move.
 - **The runtime's own code.** Runtime-subset functions hold raw addresses the stack maps do not describe, so
   a stack must not move under them: they run where a stack cannot grow (no checks, a fixed reserve), or on
   the carrier's stack (Go's `systemstack`).

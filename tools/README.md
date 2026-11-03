@@ -22,6 +22,17 @@ bazel-bin/src/compiler-test/compiler-test tests/suite
   on new tests and compiler features; the suite's steady-state cases run without it.
 - `perf-tier.py` — times benchmark workloads under each optimizer-pass configuration (best of N runs)
   and flags any configuration whose output differs from the all-passes-off baseline.
+- `frames-ir-cases/` — hand-written IR cases for task 243's claim 1 (stack addresses as tracked values
+  through the statepoint rewrite and the arm64 backend); `run.sh` prints each case's code and records.
+- `frames-ceiling.py` — builds the `frames_*` workloads (and a few others) under the `measure_*` configs,
+  which remove a cost of finding roots unsoundly, and reports each one's change in time against the sound
+  build (task 243.1). Runs with a nursery large enough that nothing collects.
+- `frame-stackaddr-asm.py` — scans linked arm64 binaries for stack addresses (computed from `sp`/`x29`) held
+  in callee-saved registers across statepoint calls, and stores of stack addresses; a heuristic linear scan
+  (task 241). `python3 tools/frame-stackaddr-asm.py <binaries…>`.
+- `frame-stackaddr-ir.py` — classifies the non-GC pointers live across each statepoint in post-rewrite LLVM
+  IR (`NOMU_DUMP_LLVM=1 nomu build --emit-llvm …` writes `<object>.post.ll`) by origin: alloca, parameter,
+  load, call (task 241).
 - `stackmap-count.py` — counts the stack-map records (statepoints) in a binary or object, per linked
   object and in total.
 - `workspace_status.sh` — feeds the build's commit stamp (`.bazelrc`).

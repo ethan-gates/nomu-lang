@@ -142,7 +142,7 @@ extension LLVMGen {
     // `pendingDeopt` is set, must not pick up the caller's roots — its slots live in another function — so the
     // check is guarded on the current insert block's parent being `currentFn`.
     func pendingDeoptApplies() -> Bool {
-        guard let d = pendingDeopt, !d.isEmpty,
+        guard !measureNoStatepoints, let d = pendingDeopt, !d.isEmpty,
               let ib = LLVMGetInsertBlock(b), LLVMGetBasicBlockParent(ib) == currentFn else { return false }
         return true
     }
@@ -153,7 +153,7 @@ extension LLVMGen {
     // statepoint (the poll/alloc slow call), so the stackmap records `(shape-id, slot)` for the walker.
     func buildCallWithDeopt(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?],
                             _ deoptOps: [LLVMValueRef?]) -> LLVMValueRef? {
-        if deoptOps.isEmpty { return buildCall(fn, ty, args) }
+        if deoptOps.isEmpty || measureNoStatepoints { return buildCall(fn, ty, args) }
         var ops = deoptOps
         let bundle = ops.withUnsafeMutableBufferPointer { op in
             "deopt".withCString { LLVMCreateOperandBundle($0, 5, op.baseAddress, UInt32(op.count)) }

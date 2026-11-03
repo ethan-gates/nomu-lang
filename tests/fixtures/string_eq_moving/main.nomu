@@ -1,0 +1,53 @@
+// String.eq holds raw byte pointers across its loop's safepoint poll. One fiber allocates to force minor
+// collections; another compares two equal, freshly built heap strings. A collection at the poll that moves a
+// buffer leaves the comparison reading the old copy.
+class Box {
+  var v: Int
+}
+
+fun churner(n: Int) -> Int {
+  var i = 0
+  var s = 0
+  while i < n {
+    let b = Box(v: i)
+    s = s + b.v
+    i = i + 1
+  }
+  return s % 7
+}
+
+fun mk() -> String {
+  var s = "x".concat("yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy")
+  var j = 0
+  while j < 8 {
+    s = s.concat(s)
+    j = j + 1
+  }
+  return s
+}
+
+fun comparer(rounds: Int) -> Int {
+  var bad = 0
+  var r = 0
+  let a = mk()
+  while r < rounds {
+    let b = mk()
+    if a.eq(other: b) {
+      bad = bad + 0
+    } else {
+      bad = bad + 1
+    }
+    r = r + 1
+  }
+  return bad
+}
+
+fun main() {
+  spawn let c = churner(20000000)
+  spawn let x = comparer(20000)
+  print("bad ")
+  print(x)
+  print(" ")
+  print(c)
+  print("\n")
+}

@@ -1,0 +1,72 @@
+// Frame-mechanism measurement (task 243.1): call-free loops, where the loop-header safepoint poll is the
+// only cost of the frame mechanism. A sieve over 2,000,000 integers repeated 20 times, and a 160x160 matrix
+// product repeated 20 times; the arrays are allocated once (about 17 MB), so a run need not collect. Each round's inputs depend on the round, so no round can be skipped.
+fun sieve(flags: Array<Int>, n: Int) -> Int {
+    var i = 0
+    while i < n {
+        flags[i] = 1
+        i = i + 1
+    }
+    var count = 0
+    var p = 2
+    while p < n {
+        if flags[p] == 1 {
+            count = count + 1
+            var m = p + p
+            while m < n {
+                flags[m] = 0
+                m = m + p
+            }
+        }
+        p = p + 1
+    }
+    return count
+}
+
+fun matmul(a: Array<Int>, b: Array<Int>, c: Array<Int>, n: Int, k0: Int) -> Int {
+    var i = 0
+    while i < n {
+        var j = 0
+        while j < n {
+            var s = 0
+            var k = 0
+            while k < n {
+                s = s + a[i * n + k] * (b[k * n + j] + k0)
+                k = k + 1
+            }
+            c[i * n + j] = s % 1000003
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return c[n * n - 1]
+}
+
+fun main() {
+    let n = 2000000
+    var flags: Array<Int> = []
+    var i = 0
+    while i < n {
+        flags.append(0)
+        i = i + 1
+    }
+    let m = 160
+    var a: Array<Int> = []
+    var b: Array<Int> = []
+    var c: Array<Int> = []
+    i = 0
+    while i < m * m {
+        a.append(i % 97)
+        b.append(i % 89)
+        c.append(0)
+        i = i + 1
+    }
+    var total = 0
+    var round = 0
+    while round < 20 {
+        total = total + sieve(flags: flags, n: n - round) + matmul(a: a, b: b, c: c, n: m, k0: round)
+        round = round + 1
+    }
+    print(total)
+    print("\n")
+}

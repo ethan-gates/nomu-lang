@@ -1,0 +1,47 @@
+// Frame-mechanism measurement (task 243.1): references live across calls. Builds one binary tree of 2^20
+// leaves once, then sums it recursively 40 times, each round with a different key so no round can be skipped. Each `sum` call holds its node live across the recursive
+// call on the left child, so a statepoint spills and reloads it there. Allocates about 120 MB in all, under
+// the heap with a large nursery reserve, so a run need not collect.
+class Node {
+    var v: Int
+    var left: Option<Node>
+    var right: Option<Node>
+}
+
+fun build(depth: Int, v: Int) -> Node {
+    if depth == 0 {
+        return Node(v: v, left: Option<Node>.none, right: Option<Node>.none)
+    }
+    let l = build(depth: depth - 1, v: v * 2)
+    let r = build(depth: depth - 1, v: v * 2 + 1)
+    return Node(v: v, left: Option<Node>.some(l), right: Option<Node>.some(r))
+}
+
+fun sum(n: Node, k: Int) -> Int {
+    var s = (n.v + k) % 1000
+    switch n.left {
+    case .some(let l):
+        s = s + sum(n: l, k: k)
+    case .none:
+        s = s + 1
+    }
+    switch n.right {
+    case .some(let r):
+        s = s + sum(n: r, k: k)
+    case .none:
+        s = s + 1
+    }
+    return s
+}
+
+fun main() {
+    let root = build(depth: 20, v: 1)
+    var total = 0
+    var round = 0
+    while round < 40 {
+        total = total + sum(n: root, k: round)
+        round = round + 1
+    }
+    print(total)
+    print("\n")
+}

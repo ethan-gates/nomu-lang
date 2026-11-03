@@ -30,6 +30,21 @@ public enum CompilerSettings {
             Setting("opt.inline_alloc", .bool, default: .bool(true),
                     doc: "The inline TLAB bump fast path; off sends every allocation to the runtime call.",
                     targets: [.compile], granularity: .module),
+            // Measurement only (task 243.1): each removes a cost of finding roots, unsoundly, to bound what a
+            // different frame mechanism could save. A binary built with any of them is correct only while no
+            // collection runs.
+            Setting("measure.no_statepoints", .bool, default: .bool(false),
+                    doc: "Measurement only, unsound: skip the statepoint rewrite, so references are not spilled and reloaded at calls. Correct only while nothing collects.",
+                    targets: [.compile], granularity: .module),
+            Setting("measure.no_shaped_homes", .bool, default: .bool(false),
+                    doc: "Measurement only, unsound: keep shaped values (`String`) in registers across calls, with no frame home and no volatile reload. Correct only while nothing collects.",
+                    targets: [.compile], granularity: .module),
+            Setting("measure.no_loop_polls", .bool, default: .bool(false),
+                    doc: "Measurement only, unsound: emit no safepoint poll at loop headers, so a fiber in a call-free loop never stops for a collection.",
+                    targets: [.compile], granularity: .module),
+            Setting("measure.gc_value_regs", .choice(["0", "4", "8", "16"]), default: .choice("0"),
+                    doc: "Measurement only: let up to this many references stay in registers across a statepoint, callee-saved registers included (LLVM `max-registers-for-gc-values`, `fixup-allow-gcptr-in-csr`). The stack walkers read only stack slots, so nonzero is correct only while nothing collects. Process-wide: the first module compiled sets it.",
+                    targets: [.compile], granularity: .module),
             Setting("gc.record", .choice(["off", "limited", "full"]), default: .choice("off"),
                     doc: "The collector's recorder, for tuning the collector: `off` compiles it out; `limited` records pauses, phases, cycles, heap snapshots and counters kept on slow paths; `full` also counts on the allocation fast path, which slows allocation.",
                     targets: [.compile], granularity: .program),
