@@ -154,9 +154,7 @@ float-literal exponent syntax.
 
 Not yet built; listed so the doc is the map when they land.
 
-- **Spawn group / structured wait.** `spawn let x = …` exists (single static binding, joined on read /
-  scope exit via `spawn_join`). A group waiting on a dynamic number of spawned tasks is a library type
-  over the existing fiber-join machinery (`runtime.c` `joiner`) — likely no new grammar.
+- **Fan-out.** An array of tasks and a loop (`concurrency.md` §8); no new grammar.
 
 ---
 

@@ -26,9 +26,9 @@ fun doWork(c: Counter, amount: Int) -> Int {
 // Spawns the three workers and joins them at return (structured concurrency — no work escapes the
 // scope), so every bump has been enqueued on the Counter by the time this returns.
 fun runWorkers(c: Counter) {
-    spawn let a = doWork(c, 1)
-    spawn let b = doWork(c, 2)
-    spawn let d = doWork(c, 3)
+    fiber let a = doWork(c, 1)
+    fiber let b = doWork(c, 2)
+    fiber let d = doWork(c, 3)
 }
 
 fun main() {

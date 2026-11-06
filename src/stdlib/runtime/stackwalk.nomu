@@ -251,8 +251,8 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
         }
         di = di + 2
       }
-      var li = 3                              // skip the 3 leading meta locations
-      while li < nloc {
+      var li = deoptEnd                       // the GC pointers' (base, derived) pairs: the base is the root
+      while li + 1 < nloc {
         let locOff = recCur + 16 + li * 12
         let w0: Int = base.load(fromByteOffset: locOff)
         let kind = w0 - w0 / 256 * 256          // u8 kind at +0
@@ -273,7 +273,7 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
             n = n + 1
           }
         }
-        li = li + 1
+        li = li + 2
       }
     }
     if !found {
@@ -378,8 +378,12 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, roots: RawPtr, n0: Int, emitSlots: Int) 
         }
         di = di + 2
       }
-      var li = 3
-      while li < nloc {
+      // The GC pointers: (base, derived) location pairs after the deopt values, then the recorded allocas
+      // (Direct, skipped). The base is the root. A derived pointer in a slot of its own is an interior
+      // pointer (`nomu.raw.interior`); slot mode keeps the pair (`rtRootsAddDerived`), so a moving
+      // collection recomputes it from its base and the stack copier adjusts it.
+      var li = deoptEnd
+      while li + 1 < nloc {
         let locOff = recCur + 16 + li * 12
         let w0: Int = base.load(fromByteOffset: locOff)
         let kind = w0 - w0 / 256 * 256
@@ -402,9 +406,20 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, roots: RawPtr, n0: Int, emitSlots: Int) 
               rtQueuePush(roots, n, root)
             }
             n = n + 1
+            let dw: Int = base.load(fromByteOffset: locOff + 12)
+            if emitSlots != 0 && dw - dw / 256 * 256 == 3 {
+              var dBase = sp
+              if rtU16(base, locOff + 16) == 29 {
+                dBase = frameFp
+              }
+              let dSlot = dBase.advanced(by: rtI32(base, locOff + 20))
+              if dSlot.toInt() != slotPtr.toInt() {
+                rtRootsAddDerived(roots, slotPtr, dSlot)
+              }
+            }
           }
         }
-        li = li + 1
+        li = li + 2
       }
     }
     if !found {
@@ -524,8 +539,8 @@ fun rtWalkShadow(fib: RawPtr, roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
   return n
 }
 
-// Walk every parked fiber's roots from its stored user-frame anchor (rtWalkFrom, the self-hosted pcsp
-// walk). Appends roots into the growable buffer `roots`; returns the count. Skips running fibers (their roots are the caller's
+// Walk the roots of every fiber not running, from its stored user-frame anchor (rtWalkFrom, the self-hosted
+// pcsp walk): parked, stopped, and ready after a park. A ready fiber that never ran has no anchor. Appends roots into the growable buffer `roots`; returns the count. Skips running fibers (their roots are the caller's
 // live stack, reached differently) and fibers with no anchor. Caller has stopped the world (all target
 // fibers parked at a safepoint), so the registry + anchors are stable.
 fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
@@ -534,6 +549,7 @@ fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
   while cur.isNull == false {
     let st: Int = cur.load(fromByteOffset: 168)
     var stopped = false
+    if st == 0 { stopped = true }        // ready: parked and since woken, its frames as it left them
     if st == 2 { stopped = true }        // parked at sleep/join
     if st == 4 { stopped = true }        // stopped at a safepoint poll (STW)
     if stopped {
@@ -604,19 +620,77 @@ fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
   return n
 }
 
-// A growable root buffer: the handle `{base @0, cap @8}` rtQueuePush grows. Free it with rtRootsFree.
+// A growable root buffer: the handle `{base @0, cap @8}` rtQueuePush grows, and at 16 the derived
+// pointers' list (`rtRootsAddDerived`) with its word count at 24. Free it with rtRootsFree.
 fun rtRootsNew() -> RawPtr {
   let cap = 4096
-  let roots = RawPtr.alloc(bytes: 16, align: 8)
+  let roots = RawPtr.alloc(bytes: 32, align: 8)
   roots.store(RawPtr.alloc(bytes: cap * 8, align: 8), toByteOffset: 0)
   roots.store(cap, toByteOffset: 8)
+  roots.store(RawPtr.null, toByteOffset: 16)
+  roots.store(0, toByteOffset: 24)
   return roots
 }
 
 fun rtRootsFree(roots: RawPtr) {
   let base: RawPtr = roots.load(fromByteOffset: 0)
   base.free()
+  let derived: RawPtr = roots.load(fromByteOffset: 16)
+  if derived.isNull == false {
+    let dbase: RawPtr = derived.load(fromByteOffset: 0)
+    dbase.free()
+    derived.free()
+  }
   roots.free()
+}
+
+// Record a derived pointer at `dSlot` whose base is at `bSlot`, as (base slot, derived slot, offset) words.
+fun rtRootsAddDerived(roots: RawPtr, bSlot: RawPtr, dSlot: RawPtr) {
+  var derived: RawPtr = roots.load(fromByteOffset: 16)
+  if derived.isNull {
+    derived = RawPtr.alloc(bytes: 16, align: 8)
+    derived.store(RawPtr.alloc(bytes: 64 * 8, align: 8), toByteOffset: 0)
+    derived.store(64, toByteOffset: 8)
+    roots.store(derived, toByteOffset: 16)
+  }
+  let b: RawPtr = bSlot.load(fromByteOffset: 0)
+  let d: RawPtr = dSlot.load(fromByteOffset: 0)
+  let k: Int = roots.load(fromByteOffset: 24)
+  rtQueuePush(derived, k, bSlot)
+  rtQueuePush(derived, k + 1, dSlot)
+  rtQueuePush(derived, k + 2, RawPtr.null.advanced(by: d.toInt() - b.toInt()))
+  roots.store(k + 3, toByteOffset: 24)
+}
+
+// The derived pointers' list: its words (`rtRootsDerivedWords` of them, three per pointer).
+fun rtRootsDerived(roots: RawPtr) -> RawPtr {
+  let derived: RawPtr = roots.load(fromByteOffset: 16)
+  if derived.isNull {
+    return RawPtr.null
+  }
+  let dbase: RawPtr = derived.load(fromByteOffset: 0)
+  return dbase
+}
+
+fun rtRootsDerivedWords(roots: RawPtr) -> Int {
+  let k: Int = roots.load(fromByteOffset: 24)
+  return k
+}
+
+// After a moving collection rewrote the base slots: each derived pointer is its base's new address plus its
+// offset.
+fun rtRootsFixDerived(roots: RawPtr) {
+  let d = rtRootsDerived(roots)
+  let k = rtRootsDerivedWords(roots)
+  var i = 0
+  while i < k {
+    let bSlot: RawPtr = d.load(fromByteOffset: i * 8)
+    let dSlot: RawPtr = d.load(fromByteOffset: i * 8 + 8)
+    let off: RawPtr = d.load(fromByteOffset: i * 8 + 16)
+    let b: RawPtr = bSlot.load(fromByteOffset: 0)
+    dSlot.store(b.advanced(by: off.toInt()), toByteOffset: 0)
+    i = i + 3
+  }
 }
 
 // Value mode (root object addresses) — for white-box tests (the `stw-selfhost` case), which pass a fixed

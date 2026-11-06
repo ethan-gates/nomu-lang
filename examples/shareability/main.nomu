@@ -21,18 +21,18 @@ fun apply(f: (Int) -> Int, x: Int) -> Int {
 fun main() {
     // Structs are value types — shareable across task boundaries.
     let p = Point(x: 3, y: 4)
-    spawn let s = sumPoint(p)
+    fiber let s = sumPoint(p)
     print(s)   // 7
 
     // Primitives (Int) are shareable.
     let base = 10
-    spawn let d = twice(base)
+    fiber let d = twice(base)
     print(d)   // 20
 
     // A closure with only shareable captures is itself shareable.
     let offset = 5
     let addOffset = { (x: Int) -> Int in return x + offset }
-    spawn let r = apply(addOffset, 100)
+    fiber let r = apply(addOffset, 100)
     print(r)   // 105
 }
 
@@ -44,6 +44,6 @@ fun main() {
 // fun getVal(b: Box) -> Int { return b.val }
 // fun badMain() {
 //     let b = Box(val: 42)
-//     spawn let v = getVal(b)   // error: 'b' has type 'Box' which cannot cross a task boundary
+//     fiber let v = getVal(b)   // error: 'b' has type 'Box' which cannot cross a task boundary
 //     print(v)
 // }

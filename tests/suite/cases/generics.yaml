@@ -156,6 +156,26 @@ cases:
       stdout: "1\n5\n0\n9\n"
     carriers: []
 
+  - name: module-generic-class-fields
+    fixture: tests/fixtures/module_generic_class_fields
+    expect:
+      stdout: "2 9 25\na string longer than fifteen bytes 1 11\n"
+
+  - name: module-generic-erased-calls
+    fixture: tests/fixtures/module_generic_erased_calls
+    expect:
+      stdout: "via method\nvia local\nthrough option\n7\nprivate\n"
+
+  - name: module-generic-construct-infer
+    fixture: tests/fixtures/module_generic_construct_infer
+    expect:
+      stdout: "literal\nnone\nnone\n0\n1\n"
+
+  - name: module-generic-construct-uninferred
+    fixture: tests/fixtures/module_generic_construct_uninferred
+    compile:
+      expect_error: "cannot infer type parameter 'T'"
+
   - name: module-generic-class-method
     fixture: tests/fixtures/module_generic_class_method
     expect:
@@ -223,7 +243,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 2
+        roots: 3             # the object, the box's `T`, and `r`'s own copy
         min: 60
         max: 60
 

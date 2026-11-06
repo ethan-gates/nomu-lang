@@ -41,6 +41,6 @@ fun loopCheck(s: String, n: Int) -> Int {
 }
 fun main() {
   let s = heapString()
-  spawn let r = loopCheck(s, 1000000)
+  fiber let r = loopCheck(s, 1000000)
   report(r)
 }

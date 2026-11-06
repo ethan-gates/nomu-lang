@@ -35,7 +35,7 @@ fun churn() -> Int {
 fun main() {
   let keep = Box(v: 4242)
   let name = "held".concat(" string")
-  spawn let c = churn()
+  fiber let c = churn()
   let line = readLine()
   print(keep.v)
   print(" ")

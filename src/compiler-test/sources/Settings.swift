@@ -76,6 +76,12 @@ let settingTable: [String: SettingDef] = [
                                      help: "mature-space size below which every collection is major"),
     "stack_move":         SettingDef(stage: .run, carrier: .envValue("NOMU_STACK_MOVE"),
                                      help: "move a fiber's stack at every resume and protect the old one"),
+    "stack_move_checks":  SettingDef(stage: .run, carrier: .envValue("NOMU_STACK_MOVE_CHECKS"),
+                                     help: "move a fiber's stack at every Nth function-entry stack check"),
+    "stack_start":        SettingDef(stage: .run, carrier: .envValue("NOMU_STACK_START"),
+                                     help: "a new fiber's stack size in bytes (a power of two, at least 32 KiB)"),
+    "stack_max":          SettingDef(stage: .run, carrier: .envValue("NOMU_STACK_MAX"),
+                                     help: "the size in bytes past which a fiber's stack does not grow"),
 ]
 
 // The manifest decoder's snake_case conversion also rewrites dictionary keys (`gc_record` arrives as `gcRecord`),

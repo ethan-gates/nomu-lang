@@ -23,8 +23,8 @@ fun tree(depth: Int, seed: Int) -> Int {
     if depth == 0 {
         return spin(work: 260000, seed: seed)
     }
-    spawn let a = tree(depth: depth - 1, seed: seed * 2)
-    spawn let b = tree(depth: depth - 1, seed: seed * 2 + 1)
+    fiber let a = tree(depth: depth - 1, seed: seed * 2)
+    fiber let b = tree(depth: depth - 1, seed: seed * 2 + 1)
     return a + b
 }
 
@@ -70,9 +70,9 @@ fun main() {
     st.store(RawPtr.null, toByteOffset: 8)
     st.store(RawPtr.null, toByteOffset: 16)
     let t0 = Time().now
-    spawn let bg = background()
-    spawn let a = player(st, 0, 200000)
-    spawn let b = player(st, 1, 200000)
+    fiber let bg = background()
+    fiber let a = player(st, 0, 200000)
+    fiber let b = player(st, 1, 200000)
     var pairEnd = a
     if b > pairEnd {
         pairEnd = b

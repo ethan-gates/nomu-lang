@@ -268,6 +268,7 @@ public struct NOIRStmt {
 public indirect enum StmtKind {
     case letBinding(name: String, isMutable: Bool, value: NOIRExpr)
     case spawnLet(name: String, value: NOIRExpr, resultType: Type)
+    case fiberStart(call: NOIRExpr)
     case assign(target: NOIRExpr, value: NOIRExpr)
     case compoundAssign(target: NOIRExpr, value: NOIRExpr)
     case ret(NOIRExpr?)

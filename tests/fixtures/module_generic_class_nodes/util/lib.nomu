@@ -1,0 +1,51 @@
+// Generic classes as references in compiled-once bodies: linked nodes behind `Option<Node<T>>`, field reads and
+// writes on a parameter, and bindings that own their copy of a `T`.
+package class Node<T> {
+    var value: T
+    var next: Option<Node<T>>
+}
+
+package class Q<T> {
+    var head: Option<Node<T>>
+    var seed: T
+    var count: Int
+
+    fun push(n: Node<T>) {
+        n.next = head
+        head = .some(value: n)
+        count = count + 1
+    }
+
+    fun pop() -> T {
+        switch head {
+        case .some(let n):
+            head = n.next
+            count = count - 1
+            return n.value
+        case .none:
+            return seed
+        }
+    }
+
+    fun swapSeed(v: T) -> T {
+        let old = seed
+        seed = v
+        return old
+    }
+
+    fun swapHead(fallback: T) -> Option<T> {
+        switch head {
+        case .some(let n):
+            let held = n.value
+            n.value = fallback
+            let out: Option<T> = .some(value: held)
+            return out
+        case .none:
+            return .none
+        }
+    }
+}
+
+package fun setValue<T>(n: Node<T>, v: T) {
+    n.value = v
+}

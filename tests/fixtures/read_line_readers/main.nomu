@@ -26,10 +26,10 @@ fun watcher() -> Int {
 }
 
 fun main() {
-  spawn let a = reader()
-  spawn let b = reader()
-  spawn let c = reader()
-  spawn let w = watcher()
+  fiber let a = reader()
+  fiber let b = reader()
+  fiber let c = reader()
+  fiber let w = watcher()
   print(a + b + c + w)
   print("\n")
 }

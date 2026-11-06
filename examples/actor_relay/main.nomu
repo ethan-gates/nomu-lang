@@ -34,10 +34,10 @@ fun worker(r: Relay) -> Int {
 }
 
 fun runWorkers(r: Relay) {
-    spawn let a = worker(r)
-    spawn let b = worker(r)
-    spawn let c = worker(r)
-    spawn let d = worker(r)
+    fiber let a = worker(r)
+    fiber let b = worker(r)
+    fiber let c = worker(r)
+    fiber let d = worker(r)
 }
 
 fun main() {

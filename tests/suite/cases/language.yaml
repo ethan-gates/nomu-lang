@@ -1,6 +1,18 @@
 # Cases: the language: globals, strings, Doubles, escape analysis, inlining.
 
 cases:
+  # An expression nested 1,700 levels deep compiles: the compiler's recursion fits its 1 GiB stack.
+  - name: deep-expression
+    fixture: tests/fixtures/deep_expression
+    expect:
+      stdout: "2888300\n"
+
+  # A function of 300 parameters and a struct of 300 fields: no limit on either.
+  - name: wide-signature
+    fixture: tests/fixtures/wide_signature
+    expect:
+      stdout: "299\n1197\n"
+
   - name: nested-call-inline
     fixture: tests/fixtures/nested_call_inline
     expect:

@@ -139,6 +139,8 @@ public struct Typechecker {
             if !b.isMutable { lets.insert(b.name) }
         case .spawnLet(let name, _, _, _):
             lets.insert(name)   // a spawn binding is immutable
+        case .fiberStart:
+            break
         case .assign(let lhs, _, let span):
             rejectLetTarget(lhs, lets: lets, span: span)
         case .compoundAssign(let lhs, _, let span):

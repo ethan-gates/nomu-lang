@@ -8,4 +8,7 @@ the runtime so a moving collector and copying fiber stacks are both sound on LLV
 - [The contract](frames-contract.md): what must hold wherever a fiber can stop (241).
 - [The designs](frames-designs.md): the candidates and the leading one (242); its evidence is
   [243](../plans/tasks/243-frame-mechanism-feasibility.md)'s results.
+
+The decision is candidate 1, extended statepoints; 194 records it, with what was built and the
+implementation it opens.
 - [Limits and generality](frames-generality.md): what another LLVM language could reuse (244).

@@ -14,6 +14,10 @@ linear/`defer`) alongside this. Design-ahead, not build-ahead.
 - **Linear types** — the type discipline behind resume-once (continuations) and resource cleanup
   (a resource must be consumed exactly once). First hard requirement is continuations ([135](135-cancellation-continuations.md)).
 
+**Open:** continuations check resume-once at runtime (`concurrency.md` §3), so they no longer need linear
+types, and a linear type would carry behavior in the type system. Whether linear types remain wanted for
+resources is part of deciding this task.
+
 ## Why deferred
 
 Linear types' first concrete consumers are [continuations](135-cancellation-continuations.md)

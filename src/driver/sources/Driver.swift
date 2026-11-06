@@ -211,7 +211,8 @@ public func build(targets: [[String]], options: EmitOptions = EmitOptions(),
         record.update(j.module.description, key: jobKey, details: details, explain: options.explain)
 
         // The files a job writes, by name within its output directory.
-        let outputNames = j.product == .library ? [j.stem + ".o", j.stem + ".nmi", j.stem + ".bir"] : [j.stem + ".o"]
+        let outputNames = j.product == .library ? [j.stem + ".o", j.stem + ".frames", j.stem + ".nmi", j.stem + ".bir"]
+            : [j.stem + ".o", j.stem + ".frames"]
         guard makeDirectory(j.outputDir) else { return result }
         if options.emitJobs, let data = JobFile(job: job, options: jobOptions).encoded() {
             try? data.write(to: URL(fileURLWithPath: j.outputDir + "/" + j.stem + ".job.json"))

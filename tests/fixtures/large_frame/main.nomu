@@ -1,0 +1,362 @@
+// Functions whose frames are larger than the 1 KiB stack reserve holds: each is split into a wrapper that
+// checks for its frame and an unchecked body (task 104). `wide` builds a 2400-byte struct in its frame and
+// recurses through `step`; `bump` holds one across a call while mutating a caller's value through `self`.
+// Run on several fibers from the 2 KiB starting size, every stack grows through the wrappers' checks.
+struct Wide {
+  var f0: Int
+  var f1: Int
+  var f2: Int
+  var f3: Int
+  var f4: Int
+  var f5: Int
+  var f6: Int
+  var f7: Int
+  var f8: Int
+  var f9: Int
+  var f10: Int
+  var f11: Int
+  var f12: Int
+  var f13: Int
+  var f14: Int
+  var f15: Int
+  var f16: Int
+  var f17: Int
+  var f18: Int
+  var f19: Int
+  var f20: Int
+  var f21: Int
+  var f22: Int
+  var f23: Int
+  var f24: Int
+  var f25: Int
+  var f26: Int
+  var f27: Int
+  var f28: Int
+  var f29: Int
+  var f30: Int
+  var f31: Int
+  var f32: Int
+  var f33: Int
+  var f34: Int
+  var f35: Int
+  var f36: Int
+  var f37: Int
+  var f38: Int
+  var f39: Int
+  var f40: Int
+  var f41: Int
+  var f42: Int
+  var f43: Int
+  var f44: Int
+  var f45: Int
+  var f46: Int
+  var f47: Int
+  var f48: Int
+  var f49: Int
+  var f50: Int
+  var f51: Int
+  var f52: Int
+  var f53: Int
+  var f54: Int
+  var f55: Int
+  var f56: Int
+  var f57: Int
+  var f58: Int
+  var f59: Int
+  var f60: Int
+  var f61: Int
+  var f62: Int
+  var f63: Int
+  var f64: Int
+  var f65: Int
+  var f66: Int
+  var f67: Int
+  var f68: Int
+  var f69: Int
+  var f70: Int
+  var f71: Int
+  var f72: Int
+  var f73: Int
+  var f74: Int
+  var f75: Int
+  var f76: Int
+  var f77: Int
+  var f78: Int
+  var f79: Int
+  var f80: Int
+  var f81: Int
+  var f82: Int
+  var f83: Int
+  var f84: Int
+  var f85: Int
+  var f86: Int
+  var f87: Int
+  var f88: Int
+  var f89: Int
+  var f90: Int
+  var f91: Int
+  var f92: Int
+  var f93: Int
+  var f94: Int
+  var f95: Int
+  var f96: Int
+  var f97: Int
+  var f98: Int
+  var f99: Int
+  var f100: Int
+  var f101: Int
+  var f102: Int
+  var f103: Int
+  var f104: Int
+  var f105: Int
+  var f106: Int
+  var f107: Int
+  var f108: Int
+  var f109: Int
+  var f110: Int
+  var f111: Int
+  var f112: Int
+  var f113: Int
+  var f114: Int
+  var f115: Int
+  var f116: Int
+  var f117: Int
+  var f118: Int
+  var f119: Int
+  var f120: Int
+  var f121: Int
+  var f122: Int
+  var f123: Int
+  var f124: Int
+  var f125: Int
+  var f126: Int
+  var f127: Int
+  var f128: Int
+  var f129: Int
+  var f130: Int
+  var f131: Int
+  var f132: Int
+  var f133: Int
+  var f134: Int
+  var f135: Int
+  var f136: Int
+  var f137: Int
+  var f138: Int
+  var f139: Int
+  var f140: Int
+  var f141: Int
+  var f142: Int
+  var f143: Int
+  var f144: Int
+  var f145: Int
+  var f146: Int
+  var f147: Int
+  var f148: Int
+  var f149: Int
+  var f150: Int
+  var f151: Int
+  var f152: Int
+  var f153: Int
+  var f154: Int
+  var f155: Int
+  var f156: Int
+  var f157: Int
+  var f158: Int
+  var f159: Int
+  var f160: Int
+  var f161: Int
+  var f162: Int
+  var f163: Int
+  var f164: Int
+  var f165: Int
+  var f166: Int
+  var f167: Int
+  var f168: Int
+  var f169: Int
+  var f170: Int
+  var f171: Int
+  var f172: Int
+  var f173: Int
+  var f174: Int
+  var f175: Int
+  var f176: Int
+  var f177: Int
+  var f178: Int
+  var f179: Int
+  var f180: Int
+  var f181: Int
+  var f182: Int
+  var f183: Int
+  var f184: Int
+  var f185: Int
+  var f186: Int
+  var f187: Int
+  var f188: Int
+  var f189: Int
+  var f190: Int
+  var f191: Int
+  var f192: Int
+  var f193: Int
+  var f194: Int
+  var f195: Int
+  var f196: Int
+  var f197: Int
+  var f198: Int
+  var f199: Int
+  var f200: Int
+  var f201: Int
+  var f202: Int
+  var f203: Int
+  var f204: Int
+  var f205: Int
+  var f206: Int
+  var f207: Int
+  var f208: Int
+  var f209: Int
+  var f210: Int
+  var f211: Int
+  var f212: Int
+  var f213: Int
+  var f214: Int
+  var f215: Int
+  var f216: Int
+  var f217: Int
+  var f218: Int
+  var f219: Int
+  var f220: Int
+  var f221: Int
+  var f222: Int
+  var f223: Int
+  var f224: Int
+  var f225: Int
+  var f226: Int
+  var f227: Int
+  var f228: Int
+  var f229: Int
+  var f230: Int
+  var f231: Int
+  var f232: Int
+  var f233: Int
+  var f234: Int
+  var f235: Int
+  var f236: Int
+  var f237: Int
+  var f238: Int
+  var f239: Int
+  var f240: Int
+  var f241: Int
+  var f242: Int
+  var f243: Int
+  var f244: Int
+  var f245: Int
+  var f246: Int
+  var f247: Int
+  var f248: Int
+  var f249: Int
+  var f250: Int
+  var f251: Int
+  var f252: Int
+  var f253: Int
+  var f254: Int
+  var f255: Int
+  var f256: Int
+  var f257: Int
+  var f258: Int
+  var f259: Int
+  var f260: Int
+  var f261: Int
+  var f262: Int
+  var f263: Int
+  var f264: Int
+  var f265: Int
+  var f266: Int
+  var f267: Int
+  var f268: Int
+  var f269: Int
+  var f270: Int
+  var f271: Int
+  var f272: Int
+  var f273: Int
+  var f274: Int
+  var f275: Int
+  var f276: Int
+  var f277: Int
+  var f278: Int
+  var f279: Int
+  var f280: Int
+  var f281: Int
+  var f282: Int
+  var f283: Int
+  var f284: Int
+  var f285: Int
+  var f286: Int
+  var f287: Int
+  var f288: Int
+  var f289: Int
+  var f290: Int
+  var f291: Int
+  var f292: Int
+  var f293: Int
+  var f294: Int
+  var f295: Int
+  var f296: Int
+  var f297: Int
+  var f298: Int
+  var f299: Int
+}
+
+struct Counter {
+  var n: Int
+  fun bump(xs: Array<Int>) {
+    var w = Wide(f0: xs[0] + 0, f1: xs[1] + 1, f2: xs[2] + 2, f3: xs[3] + 3, f4: xs[4] + 4, f5: xs[5] + 5, f6: xs[6] + 6, f7: xs[0] + 7, f8: xs[1] + 8, f9: xs[2] + 9, f10: xs[3] + 10, f11: xs[4] + 11, f12: xs[5] + 12, f13: xs[6] + 13, f14: xs[0] + 14, f15: xs[1] + 15, f16: xs[2] + 16, f17: xs[3] + 17, f18: xs[4] + 18, f19: xs[5] + 19, f20: xs[6] + 20, f21: xs[0] + 21, f22: xs[1] + 22, f23: xs[2] + 23, f24: xs[3] + 24, f25: xs[4] + 25, f26: xs[5] + 26, f27: xs[6] + 27, f28: xs[0] + 28, f29: xs[1] + 29, f30: xs[2] + 30, f31: xs[3] + 31, f32: xs[4] + 32, f33: xs[5] + 33, f34: xs[6] + 34, f35: xs[0] + 35, f36: xs[1] + 36, f37: xs[2] + 37, f38: xs[3] + 38, f39: xs[4] + 39, f40: xs[5] + 40, f41: xs[6] + 41, f42: xs[0] + 42, f43: xs[1] + 43, f44: xs[2] + 44, f45: xs[3] + 45, f46: xs[4] + 46, f47: xs[5] + 47, f48: xs[6] + 48, f49: xs[0] + 49, f50: xs[1] + 50, f51: xs[2] + 51, f52: xs[3] + 52, f53: xs[4] + 53, f54: xs[5] + 54, f55: xs[6] + 55, f56: xs[0] + 56, f57: xs[1] + 57, f58: xs[2] + 58, f59: xs[3] + 59, f60: xs[4] + 60, f61: xs[5] + 61, f62: xs[6] + 62, f63: xs[0] + 63, f64: xs[1] + 64, f65: xs[2] + 65, f66: xs[3] + 66, f67: xs[4] + 67, f68: xs[5] + 68, f69: xs[6] + 69, f70: xs[0] + 70, f71: xs[1] + 71, f72: xs[2] + 72, f73: xs[3] + 73, f74: xs[4] + 74, f75: xs[5] + 75, f76: xs[6] + 76, f77: xs[0] + 77, f78: xs[1] + 78, f79: xs[2] + 79, f80: xs[3] + 80, f81: xs[4] + 81, f82: xs[5] + 82, f83: xs[6] + 83, f84: xs[0] + 84, f85: xs[1] + 85, f86: xs[2] + 86, f87: xs[3] + 87, f88: xs[4] + 88, f89: xs[5] + 89, f90: xs[6] + 90, f91: xs[0] + 91, f92: xs[1] + 92, f93: xs[2] + 93, f94: xs[3] + 94, f95: xs[4] + 95, f96: xs[5] + 96, f97: xs[6] + 97, f98: xs[0] + 98, f99: xs[1] + 99, f100: xs[2] + 100, f101: xs[3] + 101, f102: xs[4] + 102, f103: xs[5] + 103, f104: xs[6] + 104, f105: xs[0] + 105, f106: xs[1] + 106, f107: xs[2] + 107, f108: xs[3] + 108, f109: xs[4] + 109, f110: xs[5] + 110, f111: xs[6] + 111, f112: xs[0] + 112, f113: xs[1] + 113, f114: xs[2] + 114, f115: xs[3] + 115, f116: xs[4] + 116, f117: xs[5] + 117, f118: xs[6] + 118, f119: xs[0] + 119, f120: xs[1] + 120, f121: xs[2] + 121, f122: xs[3] + 122, f123: xs[4] + 123, f124: xs[5] + 124, f125: xs[6] + 125, f126: xs[0] + 126, f127: xs[1] + 127, f128: xs[2] + 128, f129: xs[3] + 129, f130: xs[4] + 130, f131: xs[5] + 131, f132: xs[6] + 132, f133: xs[0] + 133, f134: xs[1] + 134, f135: xs[2] + 135, f136: xs[3] + 136, f137: xs[4] + 137, f138: xs[5] + 138, f139: xs[6] + 139, f140: xs[0] + 140, f141: xs[1] + 141, f142: xs[2] + 142, f143: xs[3] + 143, f144: xs[4] + 144, f145: xs[5] + 145, f146: xs[6] + 146, f147: xs[0] + 147, f148: xs[1] + 148, f149: xs[2] + 149, f150: xs[3] + 150, f151: xs[4] + 151, f152: xs[5] + 152, f153: xs[6] + 153, f154: xs[0] + 154, f155: xs[1] + 155, f156: xs[2] + 156, f157: xs[3] + 157, f158: xs[4] + 158, f159: xs[5] + 159, f160: xs[6] + 160, f161: xs[0] + 161, f162: xs[1] + 162, f163: xs[2] + 163, f164: xs[3] + 164, f165: xs[4] + 165, f166: xs[5] + 166, f167: xs[6] + 167, f168: xs[0] + 168, f169: xs[1] + 169, f170: xs[2] + 170, f171: xs[3] + 171, f172: xs[4] + 172, f173: xs[5] + 173, f174: xs[6] + 174, f175: xs[0] + 175, f176: xs[1] + 176, f177: xs[2] + 177, f178: xs[3] + 178, f179: xs[4] + 179, f180: xs[5] + 180, f181: xs[6] + 181, f182: xs[0] + 182, f183: xs[1] + 183, f184: xs[2] + 184, f185: xs[3] + 185, f186: xs[4] + 186, f187: xs[5] + 187, f188: xs[6] + 188, f189: xs[0] + 189, f190: xs[1] + 190, f191: xs[2] + 191, f192: xs[3] + 192, f193: xs[4] + 193, f194: xs[5] + 194, f195: xs[6] + 195, f196: xs[0] + 196, f197: xs[1] + 197, f198: xs[2] + 198, f199: xs[3] + 199, f200: xs[4] + 200, f201: xs[5] + 201, f202: xs[6] + 202, f203: xs[0] + 203, f204: xs[1] + 204, f205: xs[2] + 205, f206: xs[3] + 206, f207: xs[4] + 207, f208: xs[5] + 208, f209: xs[6] + 209, f210: xs[0] + 210, f211: xs[1] + 211, f212: xs[2] + 212, f213: xs[3] + 213, f214: xs[4] + 214, f215: xs[5] + 215, f216: xs[6] + 216, f217: xs[0] + 217, f218: xs[1] + 218, f219: xs[2] + 219, f220: xs[3] + 220, f221: xs[4] + 221, f222: xs[5] + 222, f223: xs[6] + 223, f224: xs[0] + 224, f225: xs[1] + 225, f226: xs[2] + 226, f227: xs[3] + 227, f228: xs[4] + 228, f229: xs[5] + 229, f230: xs[6] + 230, f231: xs[0] + 231, f232: xs[1] + 232, f233: xs[2] + 233, f234: xs[3] + 234, f235: xs[4] + 235, f236: xs[5] + 236, f237: xs[6] + 237, f238: xs[0] + 238, f239: xs[1] + 239, f240: xs[2] + 240, f241: xs[3] + 241, f242: xs[4] + 242, f243: xs[5] + 243, f244: xs[6] + 244, f245: xs[0] + 245, f246: xs[1] + 246, f247: xs[2] + 247, f248: xs[3] + 248, f249: xs[4] + 249, f250: xs[5] + 250, f251: xs[6] + 251, f252: xs[0] + 252, f253: xs[1] + 253, f254: xs[2] + 254, f255: xs[3] + 255, f256: xs[4] + 256, f257: xs[5] + 257, f258: xs[6] + 258, f259: xs[0] + 259, f260: xs[1] + 260, f261: xs[2] + 261, f262: xs[3] + 262, f263: xs[4] + 263, f264: xs[5] + 264, f265: xs[6] + 265, f266: xs[0] + 266, f267: xs[1] + 267, f268: xs[2] + 268, f269: xs[3] + 269, f270: xs[4] + 270, f271: xs[5] + 271, f272: xs[6] + 272, f273: xs[0] + 273, f274: xs[1] + 274, f275: xs[2] + 275, f276: xs[3] + 276, f277: xs[4] + 277, f278: xs[5] + 278, f279: xs[6] + 279, f280: xs[0] + 280, f281: xs[1] + 281, f282: xs[2] + 282, f283: xs[3] + 283, f284: xs[4] + 284, f285: xs[5] + 285, f286: xs[6] + 286, f287: xs[0] + 287, f288: xs[1] + 288, f289: xs[2] + 289, f290: xs[3] + 290, f291: xs[4] + 291, f292: xs[5] + 292, f293: xs[6] + 293, f294: xs[0] + 294, f295: xs[1] + 295, f296: xs[2] + 296, f297: xs[3] + 297, f298: xs[4] + 298, f299: xs[5] + 299)
+    w.f0 = n
+    let r = step(w.f1, xs)
+    n = n + r + pick(w) - 1
+  }
+}
+
+fun step(k: Int, xs: Array<Int>) -> Int {
+  if k <= 0 {
+    return 0
+  }
+  return wide(k - 1, xs)
+}
+
+// The struct stays live across the recursive call and is read whole after it, so it lives in the frame.
+fun wide(k: Int, xs: Array<Int>) -> Int {
+  var w = Wide(f0: xs[0] + 0, f1: xs[1] + 1, f2: xs[2] + 2, f3: xs[3] + 3, f4: xs[4] + 4, f5: xs[5] + 5, f6: xs[6] + 6, f7: xs[0] + 7, f8: xs[1] + 8, f9: xs[2] + 9, f10: xs[3] + 10, f11: xs[4] + 11, f12: xs[5] + 12, f13: xs[6] + 13, f14: xs[0] + 14, f15: xs[1] + 15, f16: xs[2] + 16, f17: xs[3] + 17, f18: xs[4] + 18, f19: xs[5] + 19, f20: xs[6] + 20, f21: xs[0] + 21, f22: xs[1] + 22, f23: xs[2] + 23, f24: xs[3] + 24, f25: xs[4] + 25, f26: xs[5] + 26, f27: xs[6] + 27, f28: xs[0] + 28, f29: xs[1] + 29, f30: xs[2] + 30, f31: xs[3] + 31, f32: xs[4] + 32, f33: xs[5] + 33, f34: xs[6] + 34, f35: xs[0] + 35, f36: xs[1] + 36, f37: xs[2] + 37, f38: xs[3] + 38, f39: xs[4] + 39, f40: xs[5] + 40, f41: xs[6] + 41, f42: xs[0] + 42, f43: xs[1] + 43, f44: xs[2] + 44, f45: xs[3] + 45, f46: xs[4] + 46, f47: xs[5] + 47, f48: xs[6] + 48, f49: xs[0] + 49, f50: xs[1] + 50, f51: xs[2] + 51, f52: xs[3] + 52, f53: xs[4] + 53, f54: xs[5] + 54, f55: xs[6] + 55, f56: xs[0] + 56, f57: xs[1] + 57, f58: xs[2] + 58, f59: xs[3] + 59, f60: xs[4] + 60, f61: xs[5] + 61, f62: xs[6] + 62, f63: xs[0] + 63, f64: xs[1] + 64, f65: xs[2] + 65, f66: xs[3] + 66, f67: xs[4] + 67, f68: xs[5] + 68, f69: xs[6] + 69, f70: xs[0] + 70, f71: xs[1] + 71, f72: xs[2] + 72, f73: xs[3] + 73, f74: xs[4] + 74, f75: xs[5] + 75, f76: xs[6] + 76, f77: xs[0] + 77, f78: xs[1] + 78, f79: xs[2] + 79, f80: xs[3] + 80, f81: xs[4] + 81, f82: xs[5] + 82, f83: xs[6] + 83, f84: xs[0] + 84, f85: xs[1] + 85, f86: xs[2] + 86, f87: xs[3] + 87, f88: xs[4] + 88, f89: xs[5] + 89, f90: xs[6] + 90, f91: xs[0] + 91, f92: xs[1] + 92, f93: xs[2] + 93, f94: xs[3] + 94, f95: xs[4] + 95, f96: xs[5] + 96, f97: xs[6] + 97, f98: xs[0] + 98, f99: xs[1] + 99, f100: xs[2] + 100, f101: xs[3] + 101, f102: xs[4] + 102, f103: xs[5] + 103, f104: xs[6] + 104, f105: xs[0] + 105, f106: xs[1] + 106, f107: xs[2] + 107, f108: xs[3] + 108, f109: xs[4] + 109, f110: xs[5] + 110, f111: xs[6] + 111, f112: xs[0] + 112, f113: xs[1] + 113, f114: xs[2] + 114, f115: xs[3] + 115, f116: xs[4] + 116, f117: xs[5] + 117, f118: xs[6] + 118, f119: xs[0] + 119, f120: xs[1] + 120, f121: xs[2] + 121, f122: xs[3] + 122, f123: xs[4] + 123, f124: xs[5] + 124, f125: xs[6] + 125, f126: xs[0] + 126, f127: xs[1] + 127, f128: xs[2] + 128, f129: xs[3] + 129, f130: xs[4] + 130, f131: xs[5] + 131, f132: xs[6] + 132, f133: xs[0] + 133, f134: xs[1] + 134, f135: xs[2] + 135, f136: xs[3] + 136, f137: xs[4] + 137, f138: xs[5] + 138, f139: xs[6] + 139, f140: xs[0] + 140, f141: xs[1] + 141, f142: xs[2] + 142, f143: xs[3] + 143, f144: xs[4] + 144, f145: xs[5] + 145, f146: xs[6] + 146, f147: xs[0] + 147, f148: xs[1] + 148, f149: xs[2] + 149, f150: xs[3] + 150, f151: xs[4] + 151, f152: xs[5] + 152, f153: xs[6] + 153, f154: xs[0] + 154, f155: xs[1] + 155, f156: xs[2] + 156, f157: xs[3] + 157, f158: xs[4] + 158, f159: xs[5] + 159, f160: xs[6] + 160, f161: xs[0] + 161, f162: xs[1] + 162, f163: xs[2] + 163, f164: xs[3] + 164, f165: xs[4] + 165, f166: xs[5] + 166, f167: xs[6] + 167, f168: xs[0] + 168, f169: xs[1] + 169, f170: xs[2] + 170, f171: xs[3] + 171, f172: xs[4] + 172, f173: xs[5] + 173, f174: xs[6] + 174, f175: xs[0] + 175, f176: xs[1] + 176, f177: xs[2] + 177, f178: xs[3] + 178, f179: xs[4] + 179, f180: xs[5] + 180, f181: xs[6] + 181, f182: xs[0] + 182, f183: xs[1] + 183, f184: xs[2] + 184, f185: xs[3] + 185, f186: xs[4] + 186, f187: xs[5] + 187, f188: xs[6] + 188, f189: xs[0] + 189, f190: xs[1] + 190, f191: xs[2] + 191, f192: xs[3] + 192, f193: xs[4] + 193, f194: xs[5] + 194, f195: xs[6] + 195, f196: xs[0] + 196, f197: xs[1] + 197, f198: xs[2] + 198, f199: xs[3] + 199, f200: xs[4] + 200, f201: xs[5] + 201, f202: xs[6] + 202, f203: xs[0] + 203, f204: xs[1] + 204, f205: xs[2] + 205, f206: xs[3] + 206, f207: xs[4] + 207, f208: xs[5] + 208, f209: xs[6] + 209, f210: xs[0] + 210, f211: xs[1] + 211, f212: xs[2] + 212, f213: xs[3] + 213, f214: xs[4] + 214, f215: xs[5] + 215, f216: xs[6] + 216, f217: xs[0] + 217, f218: xs[1] + 218, f219: xs[2] + 219, f220: xs[3] + 220, f221: xs[4] + 221, f222: xs[5] + 222, f223: xs[6] + 223, f224: xs[0] + 224, f225: xs[1] + 225, f226: xs[2] + 226, f227: xs[3] + 227, f228: xs[4] + 228, f229: xs[5] + 229, f230: xs[6] + 230, f231: xs[0] + 231, f232: xs[1] + 232, f233: xs[2] + 233, f234: xs[3] + 234, f235: xs[4] + 235, f236: xs[5] + 236, f237: xs[6] + 237, f238: xs[0] + 238, f239: xs[1] + 239, f240: xs[2] + 240, f241: xs[3] + 241, f242: xs[4] + 242, f243: xs[5] + 243, f244: xs[6] + 244, f245: xs[0] + 245, f246: xs[1] + 246, f247: xs[2] + 247, f248: xs[3] + 248, f249: xs[4] + 249, f250: xs[5] + 250, f251: xs[6] + 251, f252: xs[0] + 252, f253: xs[1] + 253, f254: xs[2] + 254, f255: xs[3] + 255, f256: xs[4] + 256, f257: xs[5] + 257, f258: xs[6] + 258, f259: xs[0] + 259, f260: xs[1] + 260, f261: xs[2] + 261, f262: xs[3] + 262, f263: xs[4] + 263, f264: xs[5] + 264, f265: xs[6] + 265, f266: xs[0] + 266, f267: xs[1] + 267, f268: xs[2] + 268, f269: xs[3] + 269, f270: xs[4] + 270, f271: xs[5] + 271, f272: xs[6] + 272, f273: xs[0] + 273, f274: xs[1] + 274, f275: xs[2] + 275, f276: xs[3] + 276, f277: xs[4] + 277, f278: xs[5] + 278, f279: xs[6] + 279, f280: xs[0] + 280, f281: xs[1] + 281, f282: xs[2] + 282, f283: xs[3] + 283, f284: xs[4] + 284, f285: xs[5] + 285, f286: xs[6] + 286, f287: xs[0] + 287, f288: xs[1] + 288, f289: xs[2] + 289, f290: xs[3] + 290, f291: xs[4] + 291, f292: xs[5] + 292, f293: xs[6] + 293, f294: xs[0] + 294, f295: xs[1] + 295, f296: xs[2] + 296, f297: xs[3] + 297, f298: xs[4] + 298, f299: xs[5] + 299)
+  w.f0 = k
+  let r = step(k, xs)
+  return pick(w) + r
+}
+
+fun pick(w: Wide) -> Int {
+  let total = w.f0 + w.f1 + w.f2 + w.f3 + w.f4 + w.f5 + w.f6 + w.f7 + w.f8 + w.f9 + w.f10 + w.f11 + w.f12 + w.f13 + w.f14 + w.f15 + w.f16 + w.f17 + w.f18 + w.f19 + w.f20 + w.f21 + w.f22 + w.f23 + w.f24 + w.f25 + w.f26 + w.f27 + w.f28 + w.f29 + w.f30 + w.f31 + w.f32 + w.f33 + w.f34 + w.f35 + w.f36 + w.f37 + w.f38 + w.f39 + w.f40 + w.f41 + w.f42 + w.f43 + w.f44 + w.f45 + w.f46 + w.f47 + w.f48 + w.f49 + w.f50 + w.f51 + w.f52 + w.f53 + w.f54 + w.f55 + w.f56 + w.f57 + w.f58 + w.f59 + w.f60 + w.f61 + w.f62 + w.f63 + w.f64 + w.f65 + w.f66 + w.f67 + w.f68 + w.f69 + w.f70 + w.f71 + w.f72 + w.f73 + w.f74 + w.f75 + w.f76 + w.f77 + w.f78 + w.f79 + w.f80 + w.f81 + w.f82 + w.f83 + w.f84 + w.f85 + w.f86 + w.f87 + w.f88 + w.f89 + w.f90 + w.f91 + w.f92 + w.f93 + w.f94 + w.f95 + w.f96 + w.f97 + w.f98 + w.f99 + w.f100 + w.f101 + w.f102 + w.f103 + w.f104 + w.f105 + w.f106 + w.f107 + w.f108 + w.f109 + w.f110 + w.f111 + w.f112 + w.f113 + w.f114 + w.f115 + w.f116 + w.f117 + w.f118 + w.f119 + w.f120 + w.f121 + w.f122 + w.f123 + w.f124 + w.f125 + w.f126 + w.f127 + w.f128 + w.f129 + w.f130 + w.f131 + w.f132 + w.f133 + w.f134 + w.f135 + w.f136 + w.f137 + w.f138 + w.f139 + w.f140 + w.f141 + w.f142 + w.f143 + w.f144 + w.f145 + w.f146 + w.f147 + w.f148 + w.f149 + w.f150 + w.f151 + w.f152 + w.f153 + w.f154 + w.f155 + w.f156 + w.f157 + w.f158 + w.f159 + w.f160 + w.f161 + w.f162 + w.f163 + w.f164 + w.f165 + w.f166 + w.f167 + w.f168 + w.f169 + w.f170 + w.f171 + w.f172 + w.f173 + w.f174 + w.f175 + w.f176 + w.f177 + w.f178 + w.f179 + w.f180 + w.f181 + w.f182 + w.f183 + w.f184 + w.f185 + w.f186 + w.f187 + w.f188 + w.f189 + w.f190 + w.f191 + w.f192 + w.f193 + w.f194 + w.f195 + w.f196 + w.f197 + w.f198 + w.f199 + w.f200 + w.f201 + w.f202 + w.f203 + w.f204 + w.f205 + w.f206 + w.f207 + w.f208 + w.f209 + w.f210 + w.f211 + w.f212 + w.f213 + w.f214 + w.f215 + w.f216 + w.f217 + w.f218 + w.f219 + w.f220 + w.f221 + w.f222 + w.f223 + w.f224 + w.f225 + w.f226 + w.f227 + w.f228 + w.f229 + w.f230 + w.f231 + w.f232 + w.f233 + w.f234 + w.f235 + w.f236 + w.f237 + w.f238 + w.f239 + w.f240 + w.f241 + w.f242 + w.f243 + w.f244 + w.f245 + w.f246 + w.f247 + w.f248 + w.f249 + w.f250 + w.f251 + w.f252 + w.f253 + w.f254 + w.f255 + w.f256 + w.f257 + w.f258 + w.f259 + w.f260 + w.f261 + w.f262 + w.f263 + w.f264 + w.f265 + w.f266 + w.f267 + w.f268 + w.f269 + w.f270 + w.f271 + w.f272 + w.f273 + w.f274 + w.f275 + w.f276 + w.f277 + w.f278 + w.f279 + w.f280 + w.f281 + w.f282 + w.f283 + w.f284 + w.f285 + w.f286 + w.f287 + w.f288 + w.f289 + w.f290 + w.f291 + w.f292 + w.f293 + w.f294 + w.f295 + w.f296 + w.f297 + w.f298 + w.f299
+  return total - total + 1
+}
+
+fun run(depth: Int) -> Int {
+  var xs: Array<Int> = []
+  var i = 0
+  while i < 7 {
+    xs.append(i)
+    i = i + 1
+  }
+  var c = Counter(n: 0)
+  c.bump(xs)
+  return wide(depth, xs) + c.n
+}
+
+fun main() {
+  fiber let a = run(50)
+  fiber let b = run(200)
+  fiber let c = run(400)
+  print(run(10))
+  print("\n")
+  print(a)
+  print("\n")
+  print(b)
+  print("\n")
+  print(c)
+  print("\n")
+}

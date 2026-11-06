@@ -11,6 +11,11 @@
 // reads an `addrspacecast` back placed right before it. The rewrite then spills and reloads these values at
 // stops like heap references; the collector skips the ones that are not managed objects
 // (`rtKeepManagedSlots`), and the copier adjusts the ones in the moved stack.
+//
+// A raw pointer into managed memory or a frame (a string's bytes, a buffer's element) is marked where it is
+// made with `nomu.raw.interior(base, offset)`, both addresses as integers: the base an object's, a global's
+// or a frame slot's. It becomes the tracked base plus the offset, a derived pointer the rewrite records
+// with its base: a moving collection recomputes it from the base, and the copier adjusts both.
 // Design: `design/internals/frames-designs.md`, candidate 1, and the frame contract's R5 (S2 values).
 
 #include "NomuLLVMPasses.h"
@@ -36,11 +41,20 @@
 
 using namespace llvm;
 
+namespace nomu {
+bool expandStackChecks(Module &M);          // StackChecks.cpp
+bool dropInlinedStackChecks(Function &F);   // StackChecks.cpp
+void indirectLargeValues(Module &M);        // LargeValues.cpp
+bool bundleCalls(Module &M);                // CallBundles.cpp
+bool splitReferenceAggregates(Module &M);   // ReferenceAggregates.cpp
+}
+
 namespace {
 
 constexpr unsigned Tracked = 1;
 
-// `asm "", "=r,0"(ptr %p)`: the same bits, as a tracked pointer the optimizer cannot relate to %p.
+// `asm "", "=r,0"(ptr %p)` (or an `i64`): the same bits, as a tracked pointer the optimizer cannot relate
+// to %p.
 Value *track(IRBuilder<> &B, Value *P) {
   auto *Ty = FunctionType::get(PointerType::get(B.getContext(), Tracked), {P->getType()}, false);
   auto *Asm = InlineAsm::get(Ty, "", "=r,0", /*hasSideEffects=*/false);
@@ -61,13 +75,29 @@ bool derives(const User *U, unsigned Op) {
   return false;
 }
 
-void trackFunction(Function &F, Function *Marker, unsigned &Markers, unsigned &Derived) {
+// Where a marker's tracked value is made: right after its operand is defined (the entry, for an argument),
+// wherever the marker itself ended up. The marker has no memory effects, so the optimizer may sink it past
+// calls to its first use; tracking it there would leave the untracked operand live across those calls.
+Instruction *afterDefinition(Value *V, Instruction *Marker) {
+  if (auto *A = dyn_cast<Argument>(V))
+    return &*A->getParent()->getEntryBlock().getFirstInsertionPt();
+  if (auto *I = dyn_cast<Instruction>(V)) {
+    if (isa<PHINode>(I))
+      return &*I->getParent()->getFirstInsertionPt();
+    if (!I->isTerminator())
+      return I->getNextNode();
+  }
+  return Marker;
+}
+
+void trackFunction(Function &F, ArrayRef<Function *> Markers_, unsigned &Markers, unsigned &Derived) {
   // The marked values and everything derived from them, in discovery order.
   SetVector<Instruction *> Set;
-  for (Use &U : Marker->uses())
-    if (auto *CI = dyn_cast<CallInst>(U.getUser()))
-      if (CI->getFunction() == &F && CI->getCalledFunction() == Marker)
-        Set.insert(CI);
+  for (Function *Marker : Markers_)
+    for (Use &U : Marker->uses())
+      if (auto *CI = dyn_cast<CallInst>(U.getUser()))
+        if (CI->getFunction() == &F && CI->getCalledFunction() == Marker)
+          Set.insert(CI);
   if (Set.empty())
     return;
   for (size_t I = 0; I < Set.size(); ++I)
@@ -80,8 +110,12 @@ void trackFunction(Function &F, Function *Marker, unsigned &Markers, unsigned &D
   IRBuilder<> B(F.getContext());
   for (Instruction *I : Set) {
     if (auto *CI = dyn_cast<CallInst>(I)) {
+      B.SetInsertPoint(afterDefinition(CI->getArgOperand(0), CI));
+      Value *Base = track(B, CI->getArgOperand(0));
       B.SetInsertPoint(CI);
-      Counterpart[CI] = track(B, CI->getArgOperand(0));
+      if (CI->arg_size() == 2)   // `nomu.raw.interior(base, offset)`
+        Base = B.CreateGEP(B.getInt8Ty(), Base, CI->getArgOperand(1), CI->getName() + ".tracked");
+      Counterpart[CI] = Base;
       ++Markers;
     } else if (auto *P = dyn_cast<PHINode>(I)) {
       B.SetInsertPoint(P);
@@ -153,24 +187,34 @@ void trackFunction(Function &F, Function *Marker, unsigned &Markers, unsigned &D
 // The transform over a module; `Enabled` false drops the markers instead (measurement only,
 // `measure.no_frame_split`), leaving the pointers untracked. Returns false when the result fails verification.
 bool trackModule(Module &M, bool Enabled) {
-  Function *Marker = M.getFunction("nomu.frame.addr");
-  if (!Marker)
+  SmallVector<Function *, 2> Marker;
+  for (StringRef Name : {"nomu.frame.addr", "nomu.raw.interior"})
+    if (Function *F = M.getFunction(Name))
+      Marker.push_back(F);
+  if (Marker.empty())
     return true;
   if (!Enabled) {
-    for (Use &U : make_early_inc_range(Marker->uses())) {
-      auto *CI = cast<CallInst>(U.getUser());
-      CI->replaceAllUsesWith(CI->getArgOperand(0));
-      CI->eraseFromParent();
+    for (Function *Mk : Marker) {
+      for (Use &U : make_early_inc_range(Mk->uses())) {
+        auto *CI = cast<CallInst>(U.getUser());
+        IRBuilder<> B(CI);
+        Value *V = CI->getArgOperand(0);
+        if (CI->arg_size() == 2)
+          V = B.CreateIntToPtr(B.CreateAdd(V, CI->getArgOperand(1)), CI->getType());
+        CI->replaceAllUsesWith(V);
+        CI->eraseFromParent();
+      }
+      Mk->eraseFromParent();
     }
-    Marker->eraseFromParent();
     return true;
   }
   unsigned Markers = 0, Derived = 0;
   for (Function &F : M)
     if (!F.isDeclaration())
       trackFunction(F, Marker, Markers, Derived);
-  if (Marker->use_empty())
-    Marker->eraseFromParent();
+  for (Function *Mk : Marker)
+    if (Mk->use_empty())
+      Mk->eraseFromParent();
   if (std::getenv("NOMU_FRAME_SPLIT_STATS"))
     errs() << "frame-track " << M.getName() << ": " << Markers << " marked, " << Derived << " derived\n";
   return !verifyModule(M, &errs());
@@ -185,6 +229,47 @@ struct TrackFrameAddressesPass : PassInfoMixin<TrackFrameAddressesPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
     if (!trackModule(M, Enabled))
       *Failed = true;
+    return PreservedAnalyses::none();
+  }
+};
+
+// Deletes the stack-check placeholders inlining copied into a function (`StackChecks.cpp`); added at the
+// peephole extension point, which runs after each round of inlining and before the loop passes.
+struct DropInlinedStackChecksPass : PassInfoMixin<DropInlinedStackChecksPass> {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
+    return nomu::dropInlinedStackChecks(F) ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  }
+};
+
+// The new-PM pass `nomu-expand-stack-checks` (`StackChecks.cpp`).
+struct ExpandStackChecksPass : PassInfoMixin<ExpandStackChecksPass> {
+  bool *Failed;
+  explicit ExpandStackChecksPass(bool *Failed) : Failed(Failed) {}
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    if (!nomu::expandStackChecks(M))
+      *Failed = true;
+    return PreservedAnalyses::none();
+  }
+};
+
+// The new-PM pass `nomu-bundle-calls` (`CallBundles.cpp`).
+struct BundleCallsPass : PassInfoMixin<BundleCallsPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    return nomu::bundleCalls(M) ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  }
+};
+
+// The new-PM pass `nomu-split-reference-aggregates` (`ReferenceAggregates.cpp`).
+struct SplitReferenceAggregatesPass : PassInfoMixin<SplitReferenceAggregatesPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    return nomu::splitReferenceAggregates(M) ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  }
+};
+
+// The new-PM pass `nomu-indirect-large-values` (`LargeValues.cpp`).
+struct IndirectLargeValuesPass : PassInfoMixin<IndirectLargeValuesPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    nomu::indirectLargeValues(M);
     return PreservedAnalyses::none();
   }
 };
@@ -206,8 +291,27 @@ extern "C" LLVMErrorRef nomuRunPasses(LLVMModuleRef ModRef, const char *Pipeline
           MPM.addPass(TrackFrameAddressesPass(Name == "nomu-track-frame-addresses", &Failed));
           return true;
         }
+        if (Name == "nomu-split-reference-aggregates") {
+          MPM.addPass(SplitReferenceAggregatesPass());
+          return true;
+        }
+        if (Name == "nomu-bundle-calls") {
+          MPM.addPass(BundleCallsPass());
+          return true;
+        }
+        if (Name == "nomu-indirect-large-values") {
+          MPM.addPass(IndirectLargeValuesPass());
+          return true;
+        }
+        if (Name == "nomu-expand-stack-checks") {
+          MPM.addPass(ExpandStackChecksPass(&Failed));
+          return true;
+        }
         return false;
       });
+  PB.registerPeepholeEPCallback([](FunctionPassManager &FPM, OptimizationLevel) {
+    FPM.addPass(DropInlinedStackChecksPass());
+  });
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;
@@ -225,6 +329,7 @@ extern "C" LLVMErrorRef nomuRunPasses(LLVMModuleRef ModRef, const char *Pipeline
     return wrap(std::move(Err));
   MPM.run(M, MAM);
   if (Failed)
-    return wrap(make_error<StringError>("frame-address tracking produced invalid IR", inconvertibleErrorCode()));
+    return wrap(make_error<StringError>("Nomu's IR passes produced invalid IR or lost a stack check",
+                                        inconvertibleErrorCode()));
   return LLVMErrorSuccess;
 }

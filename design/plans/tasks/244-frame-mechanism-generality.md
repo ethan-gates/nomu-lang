@@ -1,7 +1,7 @@
 # Frame mechanism generality: what other LLVM languages could reuse
 
 **Avenue:** Risk · **Type/Lifecycle:** `research` · **Size:** M · **Status:** in progress, open until the
-passes are tested on another target (x86-64 at least); sixth of [194](194-gc-frame-metadata.md)'s children (with 242 and 243) · **Source:** 194
+passes are tested on another target (x86-64 at least, with [218](218-linux-support.md)); sixth of [194](194-gc-frame-metadata.md)'s children (with 242 and 243) · **Source:** 194
 
 ## Deliverable
 

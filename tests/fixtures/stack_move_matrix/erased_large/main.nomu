@@ -1,0 +1,98 @@
+// A value of about 4,000 words in compiled-once code, on a small fiber stack (`lib`). Each buffer checks for its
+// own room, since neither the entry check nor the frame's size can cover what is sized at runtime. The nested
+// structs flatten to one value, and the array makes the buffers GC roots while the stack moves.
+import pkg/lib
+
+struct L1 {
+  var f0: Int
+  var f1: Int
+  var f2: Int
+  var f3: Int
+  var f4: Int
+  var f5: Int
+  var f6: Int
+  var f7: Int
+  var f8: Int
+  var f9: Int
+}
+struct L2 {
+  var f0: L1
+  var f1: L1
+  var f2: L1
+  var f3: L1
+  var f4: L1
+  var f5: L1
+  var f6: L1
+  var f7: L1
+  var f8: L1
+  var f9: L1
+}
+struct L3 {
+  var f0: L2
+  var f1: L2
+  var f2: L2
+  var f3: L2
+  var f4: L2
+  var f5: L2
+  var f6: L2
+  var f7: L2
+  var f8: L2
+  var f9: L2
+}
+struct Huge {
+  var a: L3
+  var b: L3
+  var c: L3
+  var d: L3
+  var s: Array<Int>
+  var n: Int
+}
+fun l1(k: Int) -> L1 {
+  return L1(f0: k, f1: k, f2: k, f3: k, f4: k, f5: k, f6: k, f7: k, f8: k, f9: k)
+}
+fun l2(k: Int) -> L2 {
+  return L2(f0: l1(k), f1: l1(k), f2: l1(k), f3: l1(k), f4: l1(k), f5: l1(k), f6: l1(k), f7: l1(k), f8: l1(k), f9: l1(k))
+}
+fun l3(k: Int) -> L3 {
+  return L3(f0: l2(k), f1: l2(k), f2: l2(k), f3: l2(k), f4: l2(k), f5: l2(k), f6: l2(k), f7: l2(k), f8: l2(k), f9: l2(k))
+}
+fun boxed(k: Int) -> Box<Huge> {
+  return Box(v: Huge(a: l3(k), b: l3(k), c: l3(k), d: l3(k), s: [k], n: k))
+}
+fun churn(k: Int) -> Int {
+  var j = 0
+  while j < 200 {
+    let x = [k + j]
+    if x[0] != k + j {
+      print("unreachable")
+    }
+    j = j + 1
+  }
+  if k % 64 == 0 {
+    sleep(1)
+  }
+  return k
+}
+fun run(k: Int) -> Int {
+  let b = boxed(k)
+  var i = 0
+  var bad = 0
+  while i < 400 {
+    let t = cycle(b, i % 7)
+    if t != i % 7 + 1 || churn(i + k) != i + k {
+      bad = bad + 1
+    }
+    if b.v.s[0] != k || b.v.n != k || b.v.d.f9.f9.f9 != k {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  return bad
+}
+fun main() {
+  fiber let a = run(1)
+  fiber let b = run(2)
+  print("bad ")
+  print(a + b)
+  print("\n")
+}

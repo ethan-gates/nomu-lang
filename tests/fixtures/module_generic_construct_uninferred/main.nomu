@@ -1,0 +1,6 @@
+import pkg/util
+
+fun main() {
+    let d = Empty(count: 0, slot: .none)
+    print(d.count)
+}

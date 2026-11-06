@@ -26,6 +26,8 @@ WORKLOADS = [
     ("micro_carried", []),
     ("pingpong_fiber", ["rt_prelude"]),
     ("pingpong_actor", []),
+    ("binary_tree", []),
+    ("micro_dispatch", []),
 ]
 
 # name -> configs, each standing in for a design (see design/internals/frames-designs.md)
@@ -39,6 +41,10 @@ CONFIGS = [
     ("ceiling", ["measure_no_statepoints", "measure_no_shaped_homes", "measure_no_loop_polls"]),
     # Without what makes stacks movable (task 243, claim 5): the frame-address split and tracking.
     ("no-move-safety", ["measure_no_frame_split"]),
+    # Without the function-entry stack check (task 104.2.5).
+    ("no-stack-checks", ["measure_no_stack_checks"]),
+    # Libc called on fiber stacks, without the switch to the carrier's stack (task 104.3.3).
+    ("libc-direct", ["measure_libc_direct"]),
 ]
 
 

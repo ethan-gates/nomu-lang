@@ -1,8 +1,9 @@
 # GC frame metadata — LLVM statepoints or our own
 
 **Avenue:** Risk · **Type/Lifecycle:** `epic · evaluate` (codegen + runtime) · **Size:** XL ·
-**Status:** a tracking epic, opened; its work is in child tasks, 239–244 first (below), with
-implementation and post-implementation tasks added as it goes · **Source:** raised by [190](190-explicit-module-builds.md) 190.6 F1 (stack scanning
+**Status:** a tracking epic; decided: candidate 1, extended statepoints (below); 239–243 done, 244
+open; implementation in [247](247-frame-table.md) and [104](104-fiber-stack-strategy.md)'s steps
+104.2–104.4 · **Source:** raised by [190](190-explicit-module-builds.md) 190.6 F1 (stack scanning
 across objects), now [195](195-link-time-gc-frame-index.md); grown by [104](104-fiber-stack-strategy.md)'s
 moving stacks and interprocedural stack promotion, both blocked on statepoints
 
@@ -42,9 +43,54 @@ In order; each produces a written output, and none is done without it.
 | [242](242-frame-mechanism-designs.md) | candidate mechanisms (an IR discipline, a machine-level pass, others 239 finds), each judged against 241, with failure modes | a design comparison |
 | [243](243-frame-mechanism-feasibility.md) | experiments that could falsify the leading design: IR cases, a stack moved at every check, the old stack made inaccessible, measured costs | results |
 | [244](244-frame-mechanism-generality.md) | what depends on Nomu's frontend and what another LLVM language could reuse; its preconditions; packaging as a library or upstream | an evaluation |
+| [247](247-frame-table.md) | the frame table F2 and the link-time step that builds it from the stack maps | the table in production |
 
-The decision is recorded here once 239–243 are done; implementation tasks (the frame-table format, its
-link-time step, the producer in codegen, the runtime's readers, the stack copier) are opened from it.
+The stack-growth work the decision unblocks lives in 104, which holds its design: 104.2 (the entry check), 104.3 (the copier in production) and 104.4 (shrinking).
+
+## Decision: candidate 1, extended statepoints
+
+Nomu keeps LLVM's statepoints and stack maps and extends them
+(`internals/frames-designs.md`, "The leading candidate"):
+
+- **Recording (B):** `addrspace(1)` means "a pointer the runtime may have to change": a heap reference, an
+  interior pointer, or a possibly-stack address. RS4GC spills each one live across a stop to a recorded slot.
+- **No stray copies (K1, K2, K4):** `ni:1` on the managed space; K2 recomputes frame addresses after each
+  stop; the static check and the stress modes verify both.
+- **The table (F2):** a per-function frame table built from the stack maps by a link-time step (247).
+- **The stack (M):** copying stacks, as 104 decided.
+
+**Why.** It survived every experiment in 243. Claims 1–4 and 6 hold; claim 5 found no measurable cost
+(code and stack-map size within 0.01%, `frames_mutating` and the frames-ceiling workloads within noise).
+243.1 bounds what candidate 3 (Nomu's machine-level frames) could gain over it at 5–9% on reference- and
+`String`-heavy code, part of which candidate 1 reaches through register-resident roots (177). Candidate 1
+uses LLVM's own lowering through supported extension points: a GC strategy, one datalayout setting, two
+passes compiled into Nomu's LLVM build. Candidate 2 (Nomu's pass in place of RS4GC) stays the next step if
+RS4GC's limits get in the way; candidate 3 stays a later option; segmented stacks stay the fallback.
+
+**Built in 243, kept:**
+
+- K2, the frame-address split (`src/llvmpasses/FrameAddressSplit.cpp`), a machine pass after the peephole
+  optimizer.
+- Tracking of possibly-stack pointers (`src/llvmpasses/TrackFrameAddresses.cpp`,
+  `nomu-track-frame-addresses`): codegen marks them with `nomu.frame.addr`; the pass turns them into
+  tracked values before the statepoint rewrite.
+- The copier (`runtime/stackmove.nomu`, `rtStackMove`) and its stress mode `NOMU_STACK_MOVE=1`, with
+  `Runtime.protect`, the quarantine, and move-proof anchors and shadow-stack saves.
+- The collector's filter `rtKeepManagedSlots`: recorded words outside the heap are left for the copier.
+- The suite group `stack-move`, the harness's `--run-setting`, the `frames_mutating` workload and
+  `tools/frames-ceiling.py --configs`. The full suite passes with the stack moved at every resume.
+
+**Opened by it:**
+
+- [247](247-frame-table.md): the frame table F2 and its link-time step.
+- [104](104-fiber-stack-strategy.md).2: the function-entry stack check, and moving at it, the one stopping
+  state 243 did not cover. The check runs after the prologue against a reserve, so the stack never moves
+  with arguments in registers (R8 does not arise).
+- 104.3: the copier in production: growth from a small stack, the limit, the runtime's own code and libc
+  calls kept off growable stacks.
+- 104.4: shrinking at collections.
+- Promoted objects passed to callees: when escape analysis allows it (148 §148.1, 176.4), the collector
+  scans their managed fields from the frame, which `rtKeepManagedSlots` skips today.
 
 ## Discipline
 
@@ -187,6 +233,9 @@ Children added from the decision, in two groups. **Implementation:**
   per function, so ld64 drops an entry with its function, as for `eh_frame`; whether ld64 also drops the
   atom of a folded-away copy is untested.
 - **The producer** (in codegen) and **the runtime's readers;** then 104's stack copier.
+
+The decision settles these: the producer is LLVM's stack maps plus the two passes built in 243, and the
+format, the link-time step and the readers are 247.
 
 **After a working system:** verification beyond the stress modes (for example, checking that generated
 code keeps no untracked copy, across the suite and large programs); generalizing it for other languages

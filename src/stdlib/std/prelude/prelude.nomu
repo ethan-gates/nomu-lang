@@ -35,40 +35,23 @@ public struct String {
     var isEmpty: Bool { self.base.count == 0 }
 
     // Byte equality (task 121.1.4) — Nomu over the `StringBase` ops `count` + `bytePointer`. Equal length,
-    // then a byte-by-byte compare. (`a < b`/`a > b` stand in for `!=` on the byte.)
+    // then one `compareBytes` over both buffers. The byte addresses are used only inside that call: a loop
+    // holding them would poll at its header, where a moved buffer or stack leaves them stale (task 246).
     fun eq(other: String) -> Bool {
         let n = self.base.count
         if n != other.base.count { return false }
-        let pa = self.base.bytePointer()
-        let pb = other.base.bytePointer()
-        var i = 0
-        while i < n {
-            let a: UInt8 = pa.load(fromByteOffset: i)
-            let b: UInt8 = pb.load(fromByteOffset: i)
-            if a < b { return false }
-            if a > b { return false }
-            i = i + 1
-        }
-        return true
+        return self.base.bytePointer().compareBytes(with: other.base.bytePointer(), byteCount: n) == 0
     }
 
     // Lexicographic byte ordering (`<` as a method until operators land): compare the shared prefix; on a tie
-    // the shorter string sorts first.
+    // the shorter string sorts first. One `compareBytes`, as in `eq`.
     fun lt(other: String) -> Bool {
         let an = self.base.count
         let bn = other.base.count
         var n = an
         if bn < n { n = bn }
-        let pa = self.base.bytePointer()
-        let pb = other.base.bytePointer()
-        var i = 0
-        while i < n {
-            let a: UInt8 = pa.load(fromByteOffset: i)
-            let b: UInt8 = pb.load(fromByteOffset: i)
-            if a < b { return true }
-            if a > b { return false }
-            i = i + 1
-        }
+        let c = self.base.bytePointer().compareBytes(with: other.base.bytePointer(), byteCount: n)
+        if c != 0 { return c < 0 }
         return an < bn
     }
 

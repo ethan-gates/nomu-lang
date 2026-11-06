@@ -1,0 +1,52 @@
+// A `String` recorded on a call that gets inlined. `built` holds `s` across `pause`, whose calls have no record
+// of their own; inlined, each must still record `s`, or a moving collection there leaves it stale.
+struct Big {
+  var s: String
+  var a: Int
+  var t: String
+  var n: Int
+}
+fun fresh() -> String {
+  return "seed".concat("-heap-string-xxxxxxxxxxxxxxxx")
+}
+fun probe(s: String) -> Int {
+  return s.byte(at: 5).int + s.byte(at: 20).int
+}
+fun pause(n: Int) {
+  if n % 50 == 0 {
+    sleep(1)
+  }
+  var k = 0
+  while k < 25 {
+    let x = fresh()
+    if x.byte(at: 0).int == 0 {
+      print("unreachable")
+    }
+    k = k + 1
+  }
+}
+fun built(n: Int) -> Big {
+  let s = fresh()
+  pause(n)
+  return Big(s: s, a: 1, t: fresh(), n: n)
+}
+fun held(n: Int) -> Big {
+  let r = built(n)
+  pause(n + 1)
+  return Big(s: r.s, a: r.a, t: r.t, n: r.n + 1)
+}
+fun main() {
+  let want = probe(fresh())
+  var i = 0
+  var bad = 0
+  while i < 1000 {
+    let b = held(i)
+    if probe(b.s) != want || probe(b.t) != want || b.n != i + 1 {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

@@ -664,6 +664,7 @@ fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
   } else {
     rtImmixCollectRootsDefrag(space, slots, ns)
   }
+  rtRootsFixDerived(roots)
   rtRootsFree(roots)
   rtGcRecordExit(collectStart)
   rtCarriersResetTlabs()        // evacuation may have moved a carrier's block; refill on resume
@@ -696,6 +697,7 @@ fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
   rtGcCounter(1, ns)
   rtGcCounter(3, nrem)
   let n = rtImmixCollectMinor(space, slots, ns, rem, nrem)
+  rtRootsFixDerived(roots)
   rtGcCounter(2, n)
   rem.free()
   rtRootsFree(roots)
@@ -744,9 +746,10 @@ fun rtGcCoordinatorMain(sched: RawPtr) -> RawPtr {
         waiting = acked < ncarriers && done == 0
       }
       // Read once every carrier has acked: a request that joins this one may still raise the kind to a major
-      // until then (rtGcRaise).
+      // until then (rtGcRaise). The program may have ended first, with a fiber still running: no collection.
       let kind: Int = sched.atomicLoad(fromByteOffset: 176)
-      if kind == 1 && Runtime.gcPlan() == 0 {     // a plan without a nursery compiles the minor out
+      if acked < ncarriers {
+      } else if kind == 1 && Runtime.gcPlan() == 0 {     // a plan without a nursery compiles the minor out
         nomuSchedStwCollectMinor(sched)
       } else {
         nomuSchedStwCollectDefrag(sched)

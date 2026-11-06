@@ -77,7 +77,7 @@ Corners of the typed-root GC-trace mechanism (deferred in §100.4.3.6):
   back-edge pop unwinds it and it is re-registered only at a construction site, so a collection in a later
   iteration while it is live sees it unregistered. Full coverage wants per-iteration nodes or φ-aware
   lifetime. (No worse than before, and no cycle — a correctness-under-churn gap, not a crash.)
-- 171.3.2 — **nested composed enum field.** A nested composed **enum** field (e.g. `Wrap<Opt<T>>`): the
+- 171.3.2 — **Done** in [251](251-erased-generic-objects.md) 251.5. **Nested composed enum field.** A nested composed **enum** field (e.g. `Wrap<Opt<T>>`): the
   active case (and so which payload is managed) is a runtime property, so only the top-level `makeEnum`,
   which knows its own case, registers its payload. A nested enum's payload is not walked.
 - 171.3.3 — **non-scheduler run config.** No shadow walk runs without `NOMU_SCHED=nomu`; a non-POD erased `T`
@@ -89,6 +89,8 @@ Corners of the typed-root GC-trace mechanism (deferred in §100.4.3.6):
 `rtShadowPush`/`rtShadowPopTo`/`rtWalkShadow` (runtime).
 
 ### 171.4 — Generational write barrier for a non-POD erased field write
+
+**Done** in [251](251-erased-generic-objects.md) 251.4.
 
 The erased-`T` field *write* (§100.4.3.10) emits a VWT-sized memcpy into the field. For a **non-POD** `T`
 written into a heap (class) object, the memcpy writes the interior managed pointers but logs **no**
@@ -128,6 +130,8 @@ compile-time refinement, not a correctness gap — the extra symbols are `weak_o
 land).
 
 ### 171.7 — Erased bodies that call into other generics (surfaced by the specialization dial)
+
+**Done** in [251](251-erased-generic-objects.md) 251.5.
 
 Two cases where a generic body's own compilation fails in the **producer**, under a plain erased build —
 independent of `--mono`. The specialization dial ([100](100-modules.md) §100.5.4) can never reach them,

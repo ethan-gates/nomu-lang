@@ -101,6 +101,7 @@ private final class MutationAnalyzer {
         switch stmt.kind {
         case .letBinding(_, _, let v):   scanExpr(v, type: type, selfCalls: &selfCalls)
         case .spawnLet(_, let v, _):     scanExpr(v, type: type, selfCalls: &selfCalls)
+        case .fiberStart(let c):         scanExpr(c, type: type, selfCalls: &selfCalls)
         case .exprStmt(let v):           scanExpr(v, type: type, selfCalls: &selfCalls)
         case .ret(let v):                if let v { scanExpr(v, type: type, selfCalls: &selfCalls) }
         case .assign(let t, let v), .compoundAssign(let t, let v):

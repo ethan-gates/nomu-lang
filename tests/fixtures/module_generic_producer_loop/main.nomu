@@ -14,7 +14,7 @@ fun run() -> Int {
 }
 
 fun main() {
-    spawn let x = run()
+    fiber let x = run()
     print(x)
     print("\n")
 }

@@ -1,0 +1,13 @@
+// Recursion with no bound overflows its fiber's stack. The function-entry stack check reports it through the
+// runtime's fatal path instead of letting the recursion write past the stack (task 104).
+fun down(n: Int) -> Int {
+  if n == 0 { return 0 }
+  return down(n - 1) + 1
+}
+
+fun main() {
+  print(down(100))
+  print("\n")
+  print(down(100000000))
+  print("\n")
+}

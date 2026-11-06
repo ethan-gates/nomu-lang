@@ -671,7 +671,8 @@ public struct Parser {
         case .kwBreak:  let s = currentSpan; advance(); return .breakStmt(span: s)
         case .kwContinue: let s = currentSpan; advance(); return .continueStmt(span: s)
         case .kwSwitch: return parseSwitchStmt()
-        case .kwSpawn where peek() == .kwLet: return parseSpawnLet()
+        case .kwFiber where peek() == .kwLet: return parseSpawnLet()
+        case .kwFiber:  return parseFiberStart()
         default:        return parseExprOrAssign()
         }
     }
@@ -685,10 +686,10 @@ public struct Parser {
         return .whileStmt(WhileStmt(cond: cond, body: body, span: spanFrom(start)))
     }
 
-    // spawn let x [: T] = expr  — runs expr concurrently; reading x joins.
+    // fiber let x [: T] = expr  — runs expr concurrently; reading x joins.
     private mutating func parseSpawnLet() -> Stmt {
         let start = currentSpan
-        expect(.kwSpawn)
+        expect(.kwFiber)
         expect(.kwLet)
         let name = expectIdent()
         var type: TypeRef? = nil
@@ -696,6 +697,14 @@ public struct Parser {
         expect(.eq)
         let value = parseExpr()
         return .spawnLet(name: name, type: type, value: value, span: spanFrom(start))
+    }
+
+    // fiber f(x)  — starts a detached fiber over a call; sema requires the call.
+    private mutating func parseFiberStart() -> Stmt {
+        let start = currentSpan
+        expect(.kwFiber)
+        let call = parseExpr()
+        return .fiberStart(call: call, span: spanFrom(start))
     }
 
     // A global: `[private|internal] let name [: Type] = expr` at the top level. A top-level `var` parses

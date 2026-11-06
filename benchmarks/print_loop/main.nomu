@@ -1,0 +1,11 @@
+// Printing in a loop: three million integers, each a call into libc (`printf`) from a fiber, which the
+// platform layer runs on the carrier's stack (task 104.3.3). Measures a libc call's cost; run with stdout
+// sent to /dev/null.
+fun main() {
+  var i = 0
+  while i < 3000000 {
+    print(i)
+    print("\n")
+    i = i + 1
+  }
+}

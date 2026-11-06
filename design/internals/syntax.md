@@ -51,7 +51,8 @@ Surface decisions that belong to a subsystem live with that subsystem, so the sy
 - **Types** (`struct`/`enum`/`class`, `switch`/`case` matching) — `types.md` §2, `memory-model.md` §2.
 - **Interfaces** (`interface`, `extension`, `any`, `&`) — `interfaces.md`. Keyword spellings there are tentative.
 - **Closures** (trailing-closure syntax, `$0`/`$1` shorthand, capture lists) — `concurrency.md` §6, surface **Decided (2026-07-16)**, Swift-shaped, frontend-adjustable without semantic impact.
-- **Concurrency keywords** — the "shareable" spelling and actor/spawn surface are open (`concurrency.md`).
+- **Concurrency keywords** — the "shareable" spelling and actor surface are open (`concurrency.md`). `fiber` is the working keyword, on trial; `task` is the joinable form (`concurrency.md` §8). `fiber let` stays until `Task` exists.
+- **Attributes** — none exist yet. If added, an attribute changes compiler behavior and program characteristics (performance, diagnostics) and leaves program behavior alone: deleting one must not change what a correct program does. User-facing levers belong in the main syntax, and placement and ownership stay inferred.
 - **Modules, packages, visibility** — `../language/modules.md`. Visibility prefix modifiers
   `private`/`internal`/`package`/`public` on declarations (`internal` = unmarked default); imports
   `import foo`, `import foo/bar`, `import foo as baz`, `import pkg/…` (`pkg` = current package),

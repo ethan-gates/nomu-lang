@@ -15,9 +15,9 @@
 - **Fiber** — the lightweight, stackful execution context, many multiplexed M:N over OS threads. The scheduler-level unit: you *park*, *switch*, *schedule*, *steal* a fiber; a fiber *has its own stack*.
 - **Carrier** — the OS thread a fiber runs on (the N in M:N). "Green thread" is used only in cross-language comparison, not as our own term.
 - **Fiber handle** — the runtime-internal reference `park`/`unpark`/`current` operate on. **Not programmer-visible.**
-- **Task** — a *concept*, not a type: the structured-concurrency unit (scope, lifetime, cancellation, task-locals, the shareability boundary), 1:1 with a fiber while it runs. "Task boundary" and "task-local" name the concept. **There is no programmer-visible `Task` or `Fiber` type right now**; exposing one is deferred (discuss later) in favor of keeping the surface small.
+- **Task** — the library type `task f(x)` returns (`concurrency.md` §8), `Task<T>`, a joinable result over a fiber and a one-shot channel. "Task boundary" and "task-local" name the fiber boundary as a concept. There is no programmer-visible `Fiber` type.
 
-The doc set follows this vocabulary (pass done 2026-07-16): **fiber** for the runtime execution context (park / schedule / suspend / wait-lists / run queue), **task** only for the structured-unit concept (task boundary, task-local, the scope/cancellation tree). "Green thread" appears only in cross-language comparison. Spellings of any future user-visible type stay deferred.
+The doc set follows this vocabulary (pass done 2026-07-16): **fiber** for the runtime execution context (park / schedule / suspend / wait-lists / run queue), **task** for the joinable library type and the boundary concept (task boundary, task-local). "Green thread" appears only in cross-language comparison. Spellings of any future user-visible type stay deferred.
 
 ---
 
@@ -112,7 +112,7 @@ These were gating runtime engineering; the shipped runtime (`src/runtime/`, `src
 - **Remote-wake primitive** — eventfd vs. self-pipe vs. futex (§3).
 - **Platform syscall strategy** — how far to push no-libc; per-platform coverage (§4).
 - **FFI** — foreign-thread attach + moving-GC pinning; deferred with FFI, protected by the context-free rule (§5).
-- **Cancellation propagation through the scheduler** — how a cancelled scope unwinds parked children (interacts with the cancellation model, `concurrency.md` §7).
+- **Waking a wait for `select`** — how a poller-backed read or timer takes part in a `select` (`concurrency.md` §7). The scheduler has no cancellation of its own.
 
 ---
 

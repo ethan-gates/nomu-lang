@@ -1,0 +1,40 @@
+// The memory routines under load (task 104): concatenating and comparing strings of 16 to 140 bytes (small
+// copies and compares, done by Nomu's own `memcpy`/`memcmp`) and copying a 64 KiB buffer (a large copy,
+// through libSystem's). Prints a checksum.
+fun main() {
+  var parts: Array<String> = []
+  var k = 0
+  while k < 32 {
+    var s = "x"
+    var j = 0
+    while j < k {
+      s = s.concat("abcd")
+      j = j + 1
+    }
+    parts.append(s)
+    k = k + 1
+  }
+  var sum = 0
+  var r = 0
+  while r < 2000000 {
+    let a = parts[r % 32]
+    let b = parts[(r * 7 + 3) % 32]
+    let c = a.concat(b)
+    let d = a.concat(b)
+    if c.eq(other: d) {
+      sum = sum + c.count
+    }
+    r = r + 1
+  }
+  let n = 65536
+  let src = RawPtr.alloc(bytes: n, align: 16)
+  let dst = RawPtr.alloc(bytes: n, align: 16)
+  src.zeroBytes(n)
+  r = 0
+  while r < 100000 {
+    dst.copyBytes(from: src, byteCount: n - r % 64)
+    r = r + 1
+  }
+  print(sum)
+  print("\n")
+}

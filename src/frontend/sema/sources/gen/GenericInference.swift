@@ -128,7 +128,8 @@ enum GenericInference {
 
     // `Box(value: e)` — infer each type parameter by unifying the field's declared type
     // (a `T` resolves to `.typeParam`) against the argument, then bound-check (M5 5.2.3).
-    static func checkGenericConstruct(_ s: inout Sema, _ name: String, _ args: [Arg], explicit: [Type]? = nil, at span: Span) -> NOIRExpr {
+    static func checkGenericConstruct(_ s: inout Sema, _ name: String, _ args: [Arg], explicit: [Type]? = nil,
+                                      expected: Type? = nil, at span: Span) -> NOIRExpr {
         guard let shape = genericTypeShape(&s, name) else {
             s.diags.error("generic enum '\(name)' is constructed through one of its cases, e.g. '\(name).case(...)'", at: span)
             return NOIRExpr(type: .error, span: span, kind: .construct(typeName: name, args: []))
@@ -144,20 +145,45 @@ enum GenericInference {
                 for (p, a) in zip(shape.generics, explicit) { subst[p.name] = a }
             }
         }
-        var irArgs: [NOIRArg] = []
-        for f in shape.fields {
+        // A field's expected type is what is known so far, with `.error` for a parameter still unbound, which
+        // leaves it for the argument to bind. A leading-dot enum argument reads its type from that, so while
+        // the field has unbound parameters it waits for the other fields.
+        var irArgs: [NOIRArg?] = Array(repeating: nil, count: shape.fields.count)
+        func check(_ i: Int, _ f: VarField, deferring: Bool) {
             let fieldTy = s.resolve(f.type)
-            let expected: Type? = { if case .typeParam = fieldTy { return nil }; return fieldTy }()
+            let known = s.substitute(fieldTy, subst)
+            var holes: [String: Type] = [:]
+            for g in shape.generics where subst[g.name] == nil { holes[g.name] = .error }
+            let withHoles = s.substitute(known, holes)
+            let exp: Type? = { if case .typeParam = fieldTy, subst[fieldTy.description] == nil { return nil }; return withHoles }()
             guard let arg = args.first(where: { $0.label == f.name }) else {
-                s.diags.error("missing argument for field '\(f.name)'", at: span); continue
+                s.diags.error("missing argument for field '\(f.name)'", at: span); return
             }
-            let v = NOIRGen.checkExpr(&s, arg.value, expected: expected)
+            if deferring, withHoles != known, isLeadingDot(arg.value) { return }
+            let v = NOIRGen.checkExpr(&s, arg.value, expected: exp)
             s.unify(param: fieldTy, arg: v.type, into: &subst, at: span)
-            irArgs.append(NOIRArg(label: f.name, value: v))
+            subst = subst.filter { $0.value != .error }     // a hole binds nothing: it stays uninferred
+            irArgs[i] = NOIRArg(label: f.name, value: v)
+        }
+        for (i, f) in shape.fields.enumerated() { check(i, f, deferring: true) }
+        // Arguments decide. The contextual type binds what they left open (`let q: Q<Int> = Q(head: .none)`).
+        if let expected {
+            bindFromExpected(.generic(base: name, args: shape.generics.map { .typeParam($0.name) }), expected, into: &subst)
+        }
+        for (i, f) in shape.fields.enumerated() where irArgs[i] == nil && args.contains(where: { $0.label == f.name }) {
+            check(i, f, deferring: false)
         }
         let typeArgs = inferredTypeArgs(&s, shape.generics, subst, owner: name, at: span)
         return NOIRExpr(type: .generic(base: name, args: typeArgs), span: span,
-                      kind: .construct(typeName: name, args: irArgs))
+                      kind: .construct(typeName: name, args: irArgs.compactMap { $0 }))
+    }
+
+    private static func isLeadingDot(_ e: Expr) -> Bool {
+        switch e {
+        case .implicitMember: return true
+        case .call(let callee, _, _): if case .implicitMember = callee { return true } else { return false }
+        default: return false
+        }
     }
 
     // Finish inference for a generic decl: every parameter must be bound, and each inferred

@@ -1,0 +1,42 @@
+// Compiled-once bodies calling compiled-once code: methods on a parameter and a local, a generic calling a
+// generic, and a private generic, each forwarding the caller's witnesses.
+package class Node<T> {
+    var value: T
+    fun get() -> T {
+        return value
+    }
+    fun set(v: T) {
+        value = v
+    }
+}
+
+package struct Box<T> {
+    var value: T
+    fun get() -> T {
+        return value
+    }
+}
+
+package fun viaMethod<T>(n: Node<T>, v: T) -> T {
+    n.set(v)
+    return n.get()
+}
+
+package fun viaLocal<T>(x: T) -> T {
+    let b = Box(value: x)
+    return b.get()
+}
+
+package fun viaEcho<T>(x: T) -> Option<T> {
+    let y = viaLocal(x)
+    let o: Option<T> = .some(value: y)
+    return o
+}
+
+fun hidden<T>(x: T) -> T {
+    return x
+}
+
+package fun viaPrivate<T>(x: T) -> T {
+    return hidden(x)
+}

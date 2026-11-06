@@ -39,8 +39,8 @@ fun worker(id: Int, inLoop: RawPtr) -> Int {
 fun main() {
   let inLoop = RawPtr.alloc(bytes: 8, align: 8)
   inLoop.atomicStore(0, toByteOffset: 0)
-  spawn let x = worker(111, inLoop)
-  spawn let y = worker(222, inLoop)
+  fiber let x = worker(111, inLoop)
+  fiber let y = worker(222, inLoop)
   print(x + y)                        // 333 — joins the workers (keeps main alive while they spin)
   print("\n")
 }

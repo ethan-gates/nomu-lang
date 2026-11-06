@@ -52,6 +52,7 @@ public func collectReferencedNames(_ decl: NOIRDecl) -> Set<String> {
         switch s.kind {
         case .letBinding(_, _, let v):             visitExpr(v)
         case .spawnLet(_, let v, _):               visitExpr(v)
+        case .fiberStart(let c):                   visitExpr(c)
         case .assign(let t, let v):                visitExpr(t); visitExpr(v)
         case .compoundAssign(let t, let v):        visitExpr(t); visitExpr(v)
         case .ret(let e):                          e.map(visitExpr)
@@ -131,6 +132,8 @@ private final class Canonicalizer {
             return (here(.compoundAssign(target: expr(target, bound), value: expr(value, bound))), bound)
         case .ret(let e):
             return (here(.ret(e.map { expr($0, bound) })), bound)
+        case .fiberStart(let call):
+            return (here(.fiberStart(call: expr(call, bound))), bound)
         case .ifStmt(let cond, let then, let els):
             return (here(.ifStmt(cond: expr(cond, bound), then: stmts(then, bound), else: els.map { stmts($0, bound) })), bound)
         case .whileStmt(let cond, let body):

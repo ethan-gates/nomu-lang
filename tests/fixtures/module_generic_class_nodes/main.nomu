@@ -1,0 +1,55 @@
+import pkg/util
+
+class Box {
+    var v: Int
+}
+
+fun churn(n: Int) -> Int {
+    var total = 0
+    var i = 0
+    while i < n {
+        let b = Box(v: i)
+        total = total + b.v
+        i = i + 1
+    }
+    return total
+}
+
+fun main() {
+    let none: Option<Node<String>> = .none
+    let q = Q(head: none, seed: "seed", count: 0)
+    q.push(Node(value: "first", next: none))
+    let second = Node(value: "second", next: none)
+    q.push(second)
+    setValue(second, "replaced")
+    print(q.pop())
+    print(" ")
+    print(q.pop())
+    print(" ")
+    print(q.pop())
+    print(" ")
+    print(q.count)
+    print("\n")
+    print(q.swapSeed("new"))
+    print(" ")
+    print(q.swapSeed("newer"))
+    print("\n")
+
+    // Under minor collections: the list lives only in promoted objects and young nodes.
+    let noBox: Option<Node<Box>> = .none
+    let boxes = Q(head: noBox, seed: Box(v: -1), count: 0)
+    churn(200000)
+    var i = 0
+    while i < 2000 {
+        boxes.push(Node(value: Box(v: i), next: noBox))
+        churn(500)
+        i = i + 1
+    }
+    var sum = 0
+    while boxes.count > 0 {
+        sum = sum + boxes.pop().v
+        churn(50)
+    }
+    print(sum)
+    print("\n")
+}

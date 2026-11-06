@@ -188,6 +188,98 @@ cases:
         min: 1
     carriers: []
 
+  # Unbounded recursion: the stack grows to its maximum size (1 MiB here), then the function-entry stack
+  # check stops it with the overflow error before it writes past its fiber's stack (task 104).
+  - name: stack-overflow
+    fixture: tests/fixtures/stack_overflow
+    run_settings:
+      stack_max: 1048576
+    expect:
+      stdout: "100\n"
+      signal: SIGABRT
+    stderr_match:
+      - pattern: "nomu: stack overflow: a fiber's stack reached its maximum size"
+        min: 1
+    carriers: []
+
+  # Nomu's own memory routines (the asm floor's `memcpy`, `memmove`, `memset`, `bzero`, `memcmp`): every size
+  # to 300 at each alignment, larger sizes through libSystem's routines, overlapping copies (task 104).
+  - name: memory-routines
+    fixture: tests/fixtures/memory_routines
+    compile_settings:
+      rt_prelude: true
+    expect:
+      stdout: "bad 0\n"
+    carriers: []
+
+  - name: memory-routines-release
+    fixture: tests/fixtures/memory_routines
+    compile_settings:
+      rt_prelude: true
+      optimize: true
+    expect:
+      stdout: "bad 0\n"
+    carriers: []
+
+  # A detached fiber: arguments evaluated at the statement, the result dropped, a method call, a fiber started
+  # under an `if` in a loop (task 250).
+  - name: fiber-detached
+    fixture: tests/fixtures/fiber_detached
+    carriers:
+      - 1
+    expect:
+      stdout: "1\nevaluated\nstarted\n7\n42\n101\ndone\n"
+
+  # `main` returning ends the program with fibers spinning, allocating and sleeping.
+  - name: fiber-exit-running
+    fixture: tests/fixtures/fiber_exit_running
+    carriers:
+      - 4
+    iterations: 5
+    expect:
+      stdout: "main done\n"
+
+  # More sleepers than the timer heap's first capacity.
+  - name: fiber-many-sleepers
+    fixture: tests/fixtures/fiber_many_sleepers
+    expect:
+      stdout: "ok\n"
+
+  - name: fiber-not-call
+    fixture: tests/fixtures/fiber_not_call
+    compile:
+      expect_error: "'fiber' takes a call"
+
+  - name: fiber-not-shareable
+    fixture: tests/fixtures/fiber_not_shareable
+    compile:
+      expect_error: "type 'Box' is not shareable, so it cannot be passed to a 'fiber'"
+
+  # Frames larger than the stack reserve holds: each such function is split into a wrapper that checks for its
+  # frame and an unchecked body, and stacks grow from 2 KiB through the wrappers' checks (task 104).
+  - name: large-frame
+    fixture: tests/fixtures/large_frame
+    expect:
+      stdout: "13\n53\n203\n403\n"
+
+  # Release, with a stack move at every check: a `mutating` receiver held across a call (a frame address the
+  # tracking pass must record from the function's entry, wherever the optimizer moved its marker).
+  - name: large-frame-release-moving
+    fixture: tests/fixtures/large_frame
+    compile_settings:
+      optimize: true
+    run_settings:
+      stack_move_checks: 1
+    expect:
+      stdout: "13\n53\n203\n403\n"
+
+  # Deep recursion on several fibers at once, from the default (smallest) starting size: each stack grows by
+  # moving while its frames hold managed objects (task 104).
+  - name: stack-growth
+    fixture: tests/fixtures/stack_growth
+    expect:
+      stdout: "1250025000\n5000050000\n20000100000\n45000150000\n"
+
   # The collector's recorder reports through the handler when `gc.record` is on.
   - name: crash-gc-record
     fixture: tests/fixtures/crash_segv

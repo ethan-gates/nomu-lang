@@ -534,6 +534,9 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     optimizer.noLoopPolls = jobSettings.bool("measure.no_loop_polls")
     optimizer.gcValueRegs = Int(jobSettings.choice("measure.gc_value_regs")) ?? 0
     optimizer.noFrameSplit = jobSettings.bool("measure.no_frame_split")
+    optimizer.noStackChecks = jobSettings.bool("measure.no_stack_checks")
+    optimizer.libcDirect = jobSettings.bool("measure.libc_direct")
+    optimizer.runtimePrelude = !options.compilingPrelude && jobSettings.bool("test.runtime_prelude")
     switch jobSettings.choice("opt.escape_provider") {
     case "graph": optimizer.escapeProvider = .graph
     case "graph_precise": optimizer.escapeProvider = .graphPrecise

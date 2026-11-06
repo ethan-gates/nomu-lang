@@ -45,6 +45,11 @@ public struct OptimizerSettings {
     public var noLoopPolls = false
     public var gcValueRegs = 0
     public var noFrameSplit = false
+    public var noStackChecks = false
+    public var libcDirect = false
+    // Compiled against the runtime prelude (`test.runtime_prelude`): a white-box test that calls runtime
+    // internals by name (`FrameTable.runtimePrelude`).
+    public var runtimePrelude = false
     public init() {}
 }
 
@@ -53,6 +58,11 @@ public struct OptimizerSettings {
 /// `noirModule` is the source NOIR the egress still reads for lowering. Returns nil on success, else a
 /// `file:line:col`-prefixed error. `optimize` selects the release (`default<O2>`) pipeline over the debug
 /// default (8.5.3).
+// Emit `ssa` as an object at `path`. A checked function whose frame is larger than the stack reserve holds
+// (`LLVMGen.stackFrameLimit`) is known only once LLVM lays the frame out, so the module then compiles again
+// with each such function split into a wrapper that checks for its frame and an unchecked body
+// (`nomuSplitLargeFrame`); a body whose frame comes out larger than its wrapper asked for compiles once
+// more with the larger size.
 public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: String, optimize: Bool = false,
                        onStage: StageSink? = nil,
                        emitLLVMTo: String? = nil, stopAfterEgress: Bool = false,
@@ -63,6 +73,39 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
                        facts: FactStore = FactStore(),
                        optimizer: OptimizerSettings = OptimizerSettings(), gcRecordLevel: Int = 0,
                        gcPlan: Int = 0) -> String? {
+    var largeFrames: [String: Int] = [:]
+    for _ in 0..<3 {
+        var oversized: [String: Int] = [:]
+        let err = emitObjectAttempt(ssa, from: noirModule, to: path, optimize: optimize, onStage: onStage,
+                                    emitLLVMTo: emitLLVMTo, stopAfterEgress: stopAfterEgress,
+                                    requireMain: requireMain, externalFuncNames: externalFuncNames,
+                                    externalGenericSigs: externalGenericSigs, weakOriginFiles: weakOriginFiles,
+                                    emitTypeMaps: emitTypeMaps, homeModule: homeModule,
+                                    dependencyModules: dependencyModules, isRuntimePackage: isRuntimePackage,
+                                    facts: facts, optimizer: optimizer, gcRecordLevel: gcRecordLevel,
+                                    gcPlan: gcPlan, largeFrames: largeFrames, oversized: &oversized)
+        if oversized.isEmpty { return err }
+        let before = largeFrames
+        for (f, size) in oversized { largeFrames[f] = max(largeFrames[f] ?? 0, (size + 256 + 15) / 16 * 16) }
+        // Splitting again cannot help when no frame asks for more room: the wrapper itself is over the limit.
+        if largeFrames == before {
+            let lines = oversized.sorted { $0.key < $1.key }.map { "  '\($0.key)': \($0.value) bytes" }
+            return "stack frames still over the limit after splitting:\n" + lines.joined(separator: "\n")
+        }
+    }
+    return "stack frames still over the limit after splitting: " + largeFrames.keys.sorted().joined(separator: ", ")
+}
+
+private func emitObjectAttempt(_ ssa: SSAModule, from noirModule: NOIRModule, to path: String, optimize: Bool = false,
+                       onStage: StageSink? = nil,
+                       emitLLVMTo: String? = nil, stopAfterEgress: Bool = false,
+                       requireMain: Bool = true, externalFuncNames: Set<String> = [],
+                       externalGenericSigs: [String: ExternalGenericSig] = [:],
+                       weakOriginFiles: Set<String> = [], emitTypeMaps: Bool = true,
+                       homeModule: [String] = [], dependencyModules: [[String]] = [], isRuntimePackage: Bool = false,
+                       facts: FactStore = FactStore(),
+                       optimizer: OptimizerSettings = OptimizerSettings(), gcRecordLevel: Int = 0,
+                       gcPlan: Int = 0, largeFrames: [String: Int], oversized: inout [String: Int]) -> String? {
     // Register the host target + asm printer; both are required to emit objects. These return
     // nonzero when LLVM was configured without a native target (won't happen for our host build).
     guard LLVMInitializeNativeTarget() == 0 else { return "LLVM: no native target configured" }
@@ -118,6 +161,8 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
     egress.e.measureNoStatepoints = optimizer.noStatepoints
     egress.e.measureNoShapedHomes = optimizer.noShapedHomes
     egress.e.measureNoLoopPolls = optimizer.noLoopPolls
+    egress.e.measureNoStackChecks = optimizer.noStackChecks
+    egress.e.measureLibcDirect = optimizer.libcDirect
     egress.e.countsAllocations = gcRecordLevel > 1
     egress.e.emitsWriteBarrier = gcPlan == 0
     cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: noirModule) }
@@ -139,7 +184,11 @@ public func emitObject(_ ssa: SSAModule, from noirModule: NOIRModule, to path: S
         llpath.withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }
     }
     if stopAfterEgress { return nil }
-    return emitModuleObject(mod, to: path, optimize: optimize, optimizer: optimizer, onStage: onStage)
+    for (name, need) in largeFrames.sorted(by: { $0.key < $1.key }) {
+        if let f = LLVMGetNamedFunction(mod, name) { _ = nomuSplitLargeFrame(f, UInt64(need)) }
+    }
+    return emitModuleObject(mod, to: path, optimize: optimize, optimizer: optimizer, onStage: onStage,
+                            entries: egress.e.runtimeEntries, oversized: &oversized)
 }
 
 /// A value the runtime reads from a global in the settings object: an `int64_t`, a `uint8_t` 0 or 1, or a
@@ -206,7 +255,18 @@ private func checkHostSlotLayout(_ gen: LLVMGen) -> String? {
 
 private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: Bool,
                               optimizer: OptimizerSettings = OptimizerSettings(),
-                              onStage: StageSink? = nil) -> String? {
+                              onStage: StageSink? = nil, entries: Set<String> = []) -> String? {
+    var oversized: [String: Int] = [:]
+    return emitModuleObject(mod, to: path, optimize: optimize, optimizer: optimizer, onStage: onStage,
+                            entries: entries, oversized: &oversized)
+}
+
+// `oversized` receives each function to split: a checked one whose frame is over the limit, or the wrapper
+// of a body whose frame is over the room its check asks for, with the frame's size.
+private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: Bool,
+                              optimizer: OptimizerSettings = OptimizerSettings(),
+                              onStage: StageSink? = nil, entries: Set<String> = [],
+                              oversized: inout [String: Int]) -> String? {
     let triple = LLVMGetDefaultTargetTriple()!
     defer { LLVMDisposeMessage(triple) }
     LLVMSetTarget(mod, triple)
@@ -221,8 +281,14 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
 
     let cpu = LLVMGetHostCPUName()!
     defer { LLVMDisposeMessage(cpu) }
-    let features = LLVMGetHostCPUFeatures()!
-    defer { LLVMDisposeMessage(features) }
+    let hostFeatures = LLVMGetHostCPUFeatures()!
+    defer { LLVMDisposeMessage(hostFeatures) }
+    // x28 holds the running fiber in all Nomu code (the stack check reads its limit through it), so no
+    // function may allocate it; the context switch saves and restores it with the other callee-saved registers.
+    // The host's list can be empty (it is on Apple silicon), and an empty entry in the list leaves LLVM's
+    // target machine without subtarget info, so only non-empty parts are joined.
+    let features = ([String(cString: hostFeatures)] + (TargetPlatform.host.isArm64 ? ["+reserve-x28"] : []))
+        .filter { !$0.isEmpty }.joined(separator: ",")
 
     guard let tm = LLVMCreateTargetMachine(
         target, triple, cpu, features,
@@ -283,7 +349,12 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     // (task 243.1) drops the rewrite, so calls stay plain and references are not spilled.
     let track = optimizer.noFrameSplit ? ",nomu-drop-frame-addresses" : ",nomu-track-frame-addresses"
     let rewrite = optimizer.noStatepoints ? "" : ",rewrite-statepoints-for-gc"
-    let pipeline = (optimize ? "default<O3>" : "function(mem2reg,sroa),always-inline") + track + rewrite
+    // `nomu-bundle-calls` keeps roots recorded on a call through inlining, so it precedes any; a bundle stops
+    // tail recursion elimination, so release runs that first.
+    let pipeline = (optimize ? "function(sroa,early-cse,simplifycfg,tailcallelim),nomu-bundle-calls,default<O3>"
+                             : "function(mem2reg,sroa),nomu-bundle-calls,always-inline")
+        + ",nomu-indirect-large-values,nomu-expand-stack-checks,nomu-split-reference-aggregates"
+        + track + rewrite
     if optimizer.gcValueRegs > 0 { setGCValueRegisters(optimizer.gcValueRegs) }
     // The frame-address split (`src/llvmpasses`): no address into the frame stays in a register across a stop,
     // so a copied stack leaves no stale address behind. Registered process-wide, once.
@@ -301,6 +372,20 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     if ProcessInfo.processInfo.environment["NOMU_DUMP_LLVM"] != nil {
         (path + ".post.ll").withCString { _ = LLVMPrintModuleToFile(mod, $0, nil) }
     }
+    // Frame sizes: LLVM reports every function's frame (a `warn-stack-size` of 0 on each), which the build
+    // records in the object's frame table (`FrameTable`, written beside it as `<stem>.frames`) for the link's
+    // check of unchecked call chains; a checked function's frame over `LLVMGen.stackFrameLimit` fails the
+    // build here. `NOMU_FRAME_SIZES=1` also prints the table, for `tools/frame-depth.py`.
+    let reportFrames = ProcessInfo.processInfo.environment["NOMU_FRAME_SIZES"] != nil
+    let diagnostics = CodegenDiagnostics()
+    var table = frameTableOfModule(mod)
+    table.entries = entries
+    table.runtimePrelude = optimizer.runtimePrelude
+    diagnostics.checked = table.checked
+    let llvmCtx = LLVMGetModuleContext(mod)
+    LLVMContextSetDiagnosticHandler(llvmCtx, codegenDiagnosticHandler, Unmanaged.passUnretained(diagnostics).toOpaque())
+    defer { LLVMContextSetDiagnosticHandler(llvmCtx, nil, nil) }
+
     var emitErr: UnsafeMutablePointer<CChar>? = nil
     let rc = cgStage("llvm", "emit", onStage) { path.withCString { cpath in
         LLVMTargetMachineEmitToFile(tm, mod, cpath, LLVMObjectFile, &emitErr)
@@ -310,7 +395,150 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
         LLVMDisposeMessage(emitErr)
         return "LLVM: object emission failed: \(m)"
     }
+    if let first = diagnostics.errors.first { return "LLVM: \(first)" }
+    for (body, cover) in table.covered {
+        if let size = diagnostics.sizes[body], size > cover.need { diagnostics.oversized.append((cover.wrapper, size)) }
+    }
+    if !diagnostics.oversized.isEmpty {
+        for o in diagnostics.oversized { oversized[o.function] = max(oversized[o.function] ?? 0, o.size) }
+        let lines = diagnostics.oversized.map { "  '\($0.function)': \($0.size) bytes" }
+        return "stack frame over the limit of \(LLVMGen.stackFrameLimit) bytes the stack reserve holds:\n"
+            + lines.joined(separator: "\n")
+    }
+    var frames = table
+    frames.sizes = diagnostics.sizes
+    let text = frames.encoded()
+    if reportFrames { fputs(frames.report(), stderr) }
+    guard FileManager.default.createFile(atPath: FrameTable.path(forObject: path), contents: Data(text.utf8)) else {
+        return "cannot write '\(FrameTable.path(forObject: path))'"
+    }
     return nil
+}
+
+// Diagnostics LLVM reports while generating code for one module: every function's frame size
+// (`warn-stack-size`), the checked ones over the stack reserve's limit, and errors.
+private final class CodegenDiagnostics {
+    var checked: Set<String> = []
+    var sizes: [String: Int] = [:]
+    var oversized: [(function: String, size: Int)] = []
+    var errors: [String] = []
+}
+
+// The module's frame table before code generation: its defined functions, those that check their stack
+// (they carry `warn-stack-size`, `emitStackCheck`), each one's direct callees and whether it makes an
+// indirect call, and the functions whose address is taken (an indirect call may reach any of them). A
+// threshold of 0 then goes on every defined function, so LLVM reports each frame.
+private func frameTableOfModule(_ mod: LLVMModuleRef) -> FrameTable {
+    let key = "warn-stack-size", zero = "0"
+    let index = LLVMAttributeIndex(bitPattern: Int32(LLVMAttributeFunctionIndex))
+    var table = FrameTable()
+    var fnIter = LLVMGetFirstFunction(mod)
+    while let f = fnIter {
+        let name = String(cString: LLVMGetValueName(f))
+        if LLVMCountBasicBlocks(f) > 0 {
+            table.defined.insert(name)
+            if LLVMGetStringAttributeAtIndex(f, index, key, UInt32(key.utf8.count)) != nil {
+                table.checked.insert(name)
+            }
+            let coveredKey = "nomu-frame-covered"
+            if let attr = LLVMGetStringAttributeAtIndex(f, index, coveredKey, UInt32(coveredKey.utf8.count)) {
+                var len: UInt32 = 0
+                let text = String(cString: LLVMGetStringAttributeValue(attr, &len))
+                table.covered[name] = (need: Int(text) ?? 0, wrapper: String(name.dropLast(".frame".count)))
+            }
+            let calls = directCallees(f)
+            if !calls.direct.isEmpty { table.calls[name] = calls.direct }
+            if calls.indirect { table.indirect.insert(name) }
+            LLVMAddAttributeAtIndex(f, index, LLVMCreateStringAttribute(LLVMGetModuleContext(mod), key,
+                                                                        UInt32(key.utf8.count), zero, 1))
+        }
+        if !name.hasPrefix("llvm."), isAddressTaken(f) { table.addressTaken.insert(name) }
+        fnIter = LLVMGetNextFunction(f)
+    }
+    return table
+}
+
+// Whether `f` is used other than as the target of a direct call (a statepoint's wrapped target counts as
+// one): stored, passed, or referenced from a constant, so an indirect call may reach it.
+private func isAddressTaken(_ f: LLVMValueRef) -> Bool {
+    var use = LLVMGetFirstUse(f)
+    while let u = use {
+        let user = LLVMGetUser(u)!
+        let isCall = LLVMIsACallInst(user) != nil || LLVMIsAInvokeInst(user) != nil
+        if !isCall { return true }
+        let callee = LLVMGetCalledValue(user)
+        let isStatepoint = callee.map { LLVMIsAFunction($0) != nil
+            && String(cString: LLVMGetValueName($0)).hasPrefix("llvm.experimental.gc.statepoint") } ?? false
+        let n = LLVMGetNumArgOperands(user)
+        var asArgument = false
+        for k in 0..<n where LLVMGetOperand(user, k) == f && !(isStatepoint && k == 2) { asArgument = true }
+        if asArgument { return true }
+        use = LLVMGetNextUse(u)
+    }
+    return false
+}
+
+// The functions `f` calls by name, a statepoint's wrapped target in place of the statepoint intrinsic, and
+// whether it calls through a pointer (inline assembly is no call).
+private func directCallees(_ f: LLVMValueRef) -> (direct: Set<String>, indirect: Bool) {
+    var out: Set<String> = []
+    var indirect = false
+    var bb = LLVMGetFirstBasicBlock(f)
+    while let block = bb {
+        var inst = LLVMGetFirstInstruction(block)
+        while let i = inst {
+            if LLVMIsACallInst(i) != nil || LLVMIsAInvokeInst(i) != nil, var callee = LLVMGetCalledValue(i) {
+                if LLVMIsAFunction(callee) != nil,
+                   String(cString: LLVMGetValueName(callee)).hasPrefix("llvm.experimental.gc.statepoint"),
+                   let target = LLVMGetOperand(i, 2) {
+                    callee = target
+                }
+                if LLVMIsAFunction(callee) != nil {
+                    let name = String(cString: LLVMGetValueName(callee))
+                    if !name.hasPrefix("llvm.") { out.insert(name) }
+                } else if LLVMIsAInlineAsm(callee) == nil {
+                    indirect = true
+                }
+            }
+            inst = LLVMGetNextInstruction(i)
+        }
+        bb = LLVMGetNextBasicBlock(block)
+    }
+    return (out, indirect)
+}
+
+// The text of LLVM's stack-size warning: "<location>: stack frame size (N) exceeds limit (M) in function 'f'".
+private func parseStackSizeWarning(_ text: String) -> (function: String, size: Int)? {
+    guard let open = text.range(of: "stack frame size ("),
+          let close = text.range(of: ") exceeds limit (", range: open.upperBound..<text.endIndex),
+          let size = Int(text[open.upperBound..<close.lowerBound]),
+          let fnStart = text.range(of: "in function '", range: close.upperBound..<text.endIndex),
+          text.hasSuffix("'")
+    else { return nil }
+    return (String(text[fnStart.upperBound..<text.index(before: text.endIndex)]), size)
+}
+
+private let codegenDiagnosticHandler: LLVMDiagnosticHandler = { info, context in
+    guard let info = info, let context = context else { return }
+    let diagnostics = Unmanaged<CodegenDiagnostics>.fromOpaque(context).takeUnretainedValue()
+    let cText = LLVMGetDiagInfoDescription(info)!
+    let text = String(cString: cText)
+    LLVMDisposeMessage(cText)
+    switch LLVMGetDiagInfoSeverity(info) {
+    case LLVMDSError:
+        diagnostics.errors.append(text)
+    case LLVMDSWarning:
+        if let frame = parseStackSizeWarning(text) {
+            diagnostics.sizes[frame.function] = max(diagnostics.sizes[frame.function] ?? 0, frame.size)
+            if diagnostics.checked.contains(frame.function) && frame.size > LLVMGen.stackFrameLimit {
+                diagnostics.oversized.append(frame)
+            }
+        } else {
+            fputs("LLVM warning: \(text)\n", stderr)
+        }
+    default:
+        break
+    }
 }
 
 // `measure.gc_value_regs` (task 243.1): LLVM's statepoint lowering keeps up to `n` references in registers,

@@ -20,7 +20,7 @@ fun worker() -> Int {
 }
 
 fun main() {
-  spawn let r = worker()              // worker runs and parks at its sleep(200)
+  fiber let r = worker()              // worker runs and parks at its sleep(200)
   sleep(10)                           // let worker park
 
   let sched = rtSched

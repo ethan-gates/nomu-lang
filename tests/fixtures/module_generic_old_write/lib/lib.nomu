@@ -1,0 +1,17 @@
+// Written through an erased `T`: the field store is a sized copy, and must still remember the holder.
+package class Holder<T> {
+    var count: Int
+    var item: T
+    var next: Option<T>
+    fun put(v: T) {
+        item = v
+        next = .some(value: v)
+        count = count + 1
+    }
+    fun get() -> T {
+        return item
+    }
+    fun peek() -> Option<T> {
+        return next
+    }
+}

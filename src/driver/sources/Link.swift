@@ -19,6 +19,7 @@ func linkBinary(_ link: LinkInputs, into dir: String, timings: Timings) -> [Stri
         return nil
     }
     defer { try? fm.removeItem(atPath: work) }
+    if !checkFrameTables(link.objects) { return nil }
     let name = link.binaryName
     let binary = dir + "/" + name, dsym = binary + ".dSYM"
     let settingsObject = work + "/settings.o", recordFile = work + "/config.yaml"
@@ -119,4 +120,23 @@ func materializeLink(_ result: ActionResult, store: ArtifactStore, output: Strin
         return false
     }
     return true
+}
+
+// The linked program's frame rules (`FrameTable.check`): every chain of unchecked frames below a checked
+// function fits the stack reserve. Each object's table is beside it (`<stem>.frames`). False, with the
+// violations on stderr, when one fails. A white-box test program (`FrameTable.runtimePrelude`) is not checked.
+func checkFrameTables(_ objects: [String]) -> Bool {
+    var table = FrameTable()
+    for object in objects {
+        let path = FrameTable.path(forObject: object)
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8), let t = FrameTable.decode(text) else {
+            fputs("error: cannot read the frame table '\(path)'\n", stderr)
+            return false
+        }
+        table.merge(t)
+    }
+    if table.runtimePrelude { return true }
+    let problems = table.check(reserve: FrameTable.stackReserve, frameLimit: FrameTable.frameLimit)
+    for p in problems { fputs("error: stack: \(p)\n", stderr) }
+    return problems.isEmpty
 }

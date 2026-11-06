@@ -128,7 +128,10 @@ setting at the wrong stage, is an error. Compile settings select configs declare
 - Run: `gc_stress_bytes` (a
   collection every N bytes a carrier allocates), `nursery_blocks` (a minor collection when the nursery
   fills N 32 KiB blocks), `mature_floor` (every collection major below this mature size), `stack_move`
-  (a fiber's stack moved at every resume and the old one made inaccessible, `NOMU_STACK_MOVE`).
+  (a fiber's stack moved at every resume and the old one made inaccessible, `NOMU_STACK_MOVE`),
+  `stack_move_checks` (the same at every Nth function-entry stack check, `NOMU_STACK_MOVE_CHECKS`),
+  `stack_start` (a new fiber's stack size in bytes, `NOMU_STACK_START`), `stack_max` (the size past which
+  a fiber's stack does not grow, `NOMU_STACK_MAX`).
 
 `--run-setting name=value` adds a run setting to every run of the selection, over each case's own: for
 example `--run-setting stack_move=1` runs the whole suite moving stacks.
@@ -167,6 +170,8 @@ excluded.
 - `stack-move` — `tests/fixtures/stack_move_matrix/*` across `pipeline` × `gc`, every run moving stacks
   (`stack_move`): addresses into a moved stack held across parks — a field-writing method's `self` passed
   down three calls, an erased generic's buffers, a shadow-stack node (task 243, claim 3). Each prints `bad 0`.
+- `stack-move-checks` — the same fixtures, moving the stack at every function-entry stack check
+  (`stack_move_checks: 1`) instead of at resumes (task 104).
 - `layout` — `tests/fixtures/layout_matrix/*` across `pipeline`: value layouts a mono caller and an erased
   body must agree on.
 - `examples` — `examples/*`, the user-facing demos, each against its `expected.txt`, so they keep working.

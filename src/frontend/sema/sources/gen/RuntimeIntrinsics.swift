@@ -72,6 +72,13 @@ enum RuntimeIntrinsics {
             }
             let text = NOIRExpr(type: .stringBase, span: lspan, kind: .stringLit(v + "\n"))
             return s.ptrIntrinsic("__sysFatal", .void, [text], span)
+        // End the process with status `code`: libc's exit, which flushes stdio. Never returns.
+        case "exit":
+            guard PointerIntrinsics.checkArgLabels(&s, args, [nil], "Runtime.exit", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let code = PointerIntrinsics.intArg(&s, args[0].value, "Runtime.exit", "code")
+            return s.ptrIntrinsic("__sysExit", .void, [code], span)
         // The `__llvm_stackmaps` section (task 150 rung 2, the pcsp root walk): base address + byte size,
         // reached through the linker-provided section-bracket symbols (no libc, no new runtime C). The Nomu
         // pcsp walk parses this section (return-address → SP-relative root slots + per-function frame size).

@@ -18,8 +18,8 @@ fun node(depth: Int, seed: Int) -> Int {
     if depth == 0 {
         return spin(work: 500, seed: seed)
     }
-    spawn let a = node(depth: depth - 1, seed: seed * 2)
-    spawn let b = node(depth: depth - 1, seed: seed * 2 + 1)
+    fiber let a = node(depth: depth - 1, seed: seed * 2)
+    fiber let b = node(depth: depth - 1, seed: seed * 2 + 1)
     return a + b
 }
 

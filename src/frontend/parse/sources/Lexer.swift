@@ -223,7 +223,7 @@ public struct Lexer {
         case 5:
             if eq(lo, "class") { return .kwClass }
             if eq(lo, "actor") { return .kwActor }
-            if eq(lo, "spawn") { return .kwSpawn }
+            if eq(lo, "fiber") { return .kwFiber }
             if eq(lo, "while") { return .kwWhile }
             if eq(lo, "break") { return .kwBreak }
             if eq(lo, "false") { return .boolLit(false) }

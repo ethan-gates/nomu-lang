@@ -1,0 +1,18 @@
+import pkg/util
+
+fun main() {
+    let n = Node(value: "a")
+    print(viaMethod(n, "via method"))
+    print("\n")
+    print(viaLocal("via local"))
+    print("\n")
+    switch viaEcho("through option") {
+    case .some(let s): print(s)
+    case .none: print("none")
+    }
+    print("\n")
+    print(viaLocal(7))
+    print("\n")
+    print(viaPrivate("private"))
+    print("\n")
+}

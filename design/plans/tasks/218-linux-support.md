@@ -52,6 +52,17 @@ Until then, each Darwin-only or arm64-only choice is listed here with what repla
   `kevent` intrinsics, and only the macOS path was ported from C (its blocking-`read` fallback was dropped).
   Linux: `epoll` (`EPOLLIN | EPOLLONESHOT`) in the same place. `Runtime.poll(fd:)`, the readiness check, is
   POSIX `poll` and carries over.
+- **The frame passes.** K2 (`src/llvmpasses/FrameAddressSplit.cpp`) and the tracking of possibly-stack
+  pointers (`TrackFrameAddresses.cpp`) are tested on arm64 only. [244](244-frame-mechanism-generality.md)
+  stays open until they are tested on another target, x86-64 at least: the `stack-move` suite group and
+  `tools/frame-stackaddr-asm.py` (which reads arm64 assembly) on x86-64.
+- **libc on Linux.** The platform layer ([104](104-fiber-stack-strategy.md).3.3) is where each OS call's
+  implementation is chosen, by 104's rule (per routine, the faster on common workloads, any reproducible gain; then
+  binary size; then deployment). On Linux the system calls can be made directly, as Go does, with the clock
+  read through the vDSO; that is the expected default, and it lets binaries run in an empty (`scratch`)
+  container. Programs still link libc for what Nomu does not replicate, name resolution (DNS) first: full
+  fidelity with the system's configuration (NSS modules) needs its library. A program that links libc
+  needs it in its container, so `scratch` holds only for those that do not.
 - **Host code.** The compiler and tools import `Darwin` (`PerfReport.swift`, `ArtifactStore.swift`, the
   planner, `compiler-test`); Linux: `Glibc`.
 
@@ -59,4 +70,5 @@ Until then, each Darwin-only or arm64-only choice is listed here with what repla
 
 [216 embedded toolchain](216-embedded-toolchain.md), [128 self-hosting runtime](128-self-hosting-runtime.md),
 [159 GC observability](159-gc-observability.md), [223 retire the C floor](223-retire-the-c-floor.md),
-[225 return memory to the OS](225-return-memory-to-the-os.md).
+[225 return memory to the OS](225-return-memory-to-the-os.md),
+[244 frame mechanism generality](244-frame-mechanism-generality.md).

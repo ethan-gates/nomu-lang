@@ -120,7 +120,7 @@ private func appendStmt(_ stmt: Stmt, ind: String, into lines: inout [String]) {
         lines.append("\(ind)\(kw) \(b.name)\(annot) = \(describeExpr(b.value))")
     case .spawnLet(let name, let type, let value, _):
         let annot = type.map { ": \($0.name)" } ?? ""
-        lines.append("\(ind)spawn let \(name)\(annot) = \(describeExpr(value))")
+        lines.append("\(ind)fiber let \(name)\(annot) = \(describeExpr(value))")
     case .assign(let lhs, let rhs, _):
         lines.append("\(ind)\(describeExpr(lhs)) = \(describeExpr(rhs))")
     case .compoundAssign(let lhs, let rhs, _):
@@ -139,6 +139,8 @@ private func appendStmt(_ stmt: Stmt, ind: String, into lines: inout [String]) {
         appendBlock(s.body, ind: ind + "  ", into: &lines)
     case .breakStmt:
         lines.append("\(ind)break")
+    case .fiberStart(let call, _):
+        lines.append("\(ind)fiber \(describeExpr(call))")
     case .continueStmt:
         lines.append("\(ind)continue")
     case .switchStmt(let sw):

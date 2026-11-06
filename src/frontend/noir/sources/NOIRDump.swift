@@ -86,7 +86,7 @@ private func appendStmt(_ stmt: NOIRStmt, ind: String, into lines: inout [String
     case .letBinding(let name, let mut, let value):
         appendValued("\(mut ? "var" : "let") \(name) =", value, ind: ind, into: &lines)
     case .spawnLet(let name, let value, _):
-        appendValued("spawn let \(name) =", value, ind: ind, into: &lines)
+        appendValued("fiber let \(name) =", value, ind: ind, into: &lines)
     case .ret(let e):
         if let e { appendValued("return", e, ind: ind, into: &lines) }
         else { lines.append("\(ind)return") }
@@ -114,6 +114,8 @@ private func appendStmt(_ stmt: NOIRStmt, ind: String, into lines: inout [String
         for s in body { appendStmt(s, ind: c + "  ", into: &lines) }
     case .breakStmt:
         lines.append("\(ind)break")
+    case .fiberStart(let call):
+        appendValued("fiber", call, ind: ind, into: &lines)
     case .continueStmt:
         lines.append("\(ind)continue")
     case .switchStmt(let sw):

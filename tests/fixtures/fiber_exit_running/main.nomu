@@ -1,0 +1,36 @@
+// `main` returning ends the program while detached fibers are running, allocating and parked.
+class Node {
+    var v: Int
+}
+
+fun spin() {
+    var i = 0
+    while true {
+        i = i + 1
+    }
+}
+
+fun churn() {
+    while true {
+        let n = Node(v: 1)
+        let m = Node(v: n.v + 1)
+        if m.v != 2 {
+            print("lost\n")
+        }
+    }
+}
+
+fun nap() {
+    while true {
+        sleep(1)
+    }
+}
+
+fun main() {
+    fiber spin()
+    fiber churn()
+    fiber churn()
+    fiber nap()
+    sleep(5)
+    print("main done\n")
+}

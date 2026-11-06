@@ -85,7 +85,7 @@ Generics are real and first-class, **built through M5 and specified as-built in 
 
 ## 5. Error handling
 
-**Errors are values, not exceptions.** — **Decided (2026-07-16).** There is no `throw`/`catch` and no stack-unwinding exception mechanism; a failable operation returns its error as a value, propagated explicitly. This runs through the design: cancellation stays distinct from errors precisely because errors are values (`concurrency.md` §7), closure failability rides in the return type (`concurrency.md` §6), and the continuation hands failures back as a value (`resume(Result)`, `concurrency.md` §3). It fits the small-runtime, no-mandatory-unwinding, explicit style.
+**Errors are values, not exceptions.** — **Decided (2026-07-16).** There is no `throw`/`catch` and no stack-unwinding exception mechanism; a failable operation returns its error as a value, propagated explicitly. This runs through the design: cancellation is a signal that a function may report as an ordinary error (`concurrency.md` §7), closure failability rides in the return type (`concurrency.md` §6), and the continuation hands failures back as a value (`resume(Result)`, `concurrency.md` §3). It fits the small-runtime, no-mandatory-unwinding, explicit style.
 
 **Carrier — `Result<T, E>`. — Decided (2026-07-19); built (M5).** A generic sum type `enum Result<T, E> { case ok(value: T)  case err(error: E) }`, a **prelude citizen** in `src/stdlib/core.nomu` (usable with no import, like `Option`), handled by explicit `match`/`switch` over `.ok`/`.err`. The alternatives weighed and dropped were a Go-style tuple and other carriers; the sum type won. As-built detail: `generics.md` §9.
 

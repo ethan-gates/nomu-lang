@@ -87,10 +87,10 @@ public indirect enum SSAInstKind {
     // Concurrency (runtime-coupled composites; the egress owns the mailbox / fiber ABI).
     case mailboxInit(SSAValue)                              // install a fresh mailbox in an actor object's reserved slot
     case actorSend(receiver: SSAValue, handler: String, args: [SSAValue])   // fire-and-forget message send (void)
-    // `spawn let` — start `startFn(env)` on a fiber. Like a closure, the captured free variables ride
+    // `fiber let` — start `startFn(env)` on a fiber. Like a closure, the captured free variables ride
     // in `env`; `binding` keys the egress-owned fiber handle so `spawnJoin` can await it. Void: the
-    // handle is not an SSA value (it is a raw runtime fiber pointer).
-    case spawn(binding: Int, startFn: String, env: SSAValue?, resultType: Type)
+    // handle is not an SSA value (it is a raw runtime fiber pointer). A nil `binding` is a detached fiber.
+    case spawn(binding: Int?, startFn: String, env: SSAValue?, resultType: Type)
     // await a spawned fiber and read its boxed result (idempotent). `final` marks the structured scope-exit
     // join (joinSpawns): under the self-hosted collecting GC it is the point where the fiber's result box
     // stops being needed, so the runtime drops the fiber from the live-fiber registry. Intermediate reads

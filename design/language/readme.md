@@ -19,7 +19,7 @@ detail). Start where the extraction is cleanest — settled surfaces first:
 - **syntax** ← `../internals/syntax.md`
 - **types** (values/references, sum types + matching, error handling) ← `../internals/types.md`, `../internals/memory-model.md`
 - **generics + interfaces** ← `../internals/generics.md`, `../internals/interfaces.md`
-- **concurrency** (the shareability rule, structured scopes, actors) ← `../internals/concurrency.md`
+- **concurrency** (the shareability rule, fibers and tasks, actors) ← `../internals/concurrency.md`
 
 Keep it to guarantees a Nomu author can rely on — no implementation detail. Update the deferred
 item ("Docs reorganization: working design docs vs. a language spec", `../plans/tasks/146-language-contract-tier.md`) and

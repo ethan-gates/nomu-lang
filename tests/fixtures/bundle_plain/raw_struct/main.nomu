@@ -27,7 +27,7 @@ package fun bundleMain() {
   print(c)                                  // 456
   print("\n")
 
-  spawn let s = readAt(m, 0)                // RawPtr crosses the task boundary
+  fiber let s = readAt(m, 0)                // RawPtr crosses the task boundary
   print(s)                                  // 123
   print("\n")
 

@@ -1,0 +1,4 @@
+package class Empty<T> {
+    var count: Int
+    var slot: Option<T>
+}

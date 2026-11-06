@@ -20,12 +20,12 @@ fun host(c: Config) -> String { return c.host }
 fun main() {
     // Box<Int>: base is a value struct, T = Int is shareable → shareable.
     let bi = Box(value: 7)
-    spawn let a = unbox(bi)
+    fiber let a = unbox(bi)
     print(a)            // 7
 
     // A deeply-immutable class crosses the boundary (M3 rejected this).
     let cfg = Config(host: "localhost", port: 8080)
-    spawn let h = host(cfg)
+    fiber let h = host(cfg)
     print(h)            // localhost
 }
 
@@ -35,6 +35,6 @@ fun main() {
 // fun peek(b: Box<Counter>) -> Int { return b.value.n }
 // fun bad() {
 //     let bc = Box(value: Counter(n: 1))
-//     spawn let x = peek(bc)   // error: 'bc' has type 'Box<Counter>' which cannot cross a task boundary
+//     fiber let x = peek(bc)   // error: 'bc' has type 'Box<Counter>' which cannot cross a task boundary
 //     print(x)
 // }

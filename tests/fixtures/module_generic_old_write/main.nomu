@@ -1,0 +1,52 @@
+// A promoted holder receives young objects through a compiled-once generic method. Minor collections between
+// the writes must see them, through the holder's remembered entry, or the fields dangle.
+import pkg/lib
+
+class Box {
+    var v: Int
+}
+
+fun churn(n: Int) -> Int {
+    var total = 0
+    var i = 0
+    while i < n {
+        let b = Box(v: i)
+        total = total + b.v
+        i = i + 1
+    }
+    return total
+}
+
+fun check(h: Holder<Box>, want: Int) -> Int {
+    var bad = 0
+    if h.get().v != want {
+        bad = 1
+    }
+    switch h.peek() {
+    case .some(let b):
+        if b.v != want {
+            bad = 1
+        }
+    case .none:
+        bad = 1
+    }
+    return bad
+}
+
+fun main() {
+    let start: Option<Box> = .none
+    let h = Holder(count: 0, item: Box(v: -1), next: start)
+    churn(200000)                    // promote the holder
+    var bad = 0
+    var i = 0
+    while i < 2000 {
+        h.put(Box(v: i))
+        churn(2000)                  // collections while the holder is the only path to the Box
+        bad = bad + check(h, i)
+        i = i + 1
+    }
+    print(bad)
+    print("\n")
+    print(h.count)
+    print("\n")
+}

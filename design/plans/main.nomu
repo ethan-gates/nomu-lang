@@ -1,0 +1,28 @@
+
+
+import std
+
+
+enum Verb {
+   case GET
+   case POST
+}
+
+struct Response {
+   var body: String
+   var headers: String
+}
+
+struct controller {
+   fun request(url: String, verb: Verb) cancel -> Response? / Error {
+      select {
+         case Fiber.cancel
+      }
+      throw MyError
+      return nil
+   }
+}
+
+fun main() {
+
+}

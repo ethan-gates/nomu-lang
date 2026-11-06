@@ -1,0 +1,51 @@
+// A reference stored into a struct inside a class. The store lands in the heap object, so it takes the object's
+// barrier: an old object holding the only reference to a young array would otherwise lose it at a minor collection.
+// Two layers of struct, a store from outside and one from a method on the class.
+struct Inner {
+  var s: Array<Int>
+  var n: Int
+}
+struct Outer {
+  var i: Inner
+  var m: Int
+}
+class Box {
+  var v: Outer
+  fun put(x: Array<Int>) {
+    v.i.s = x
+  }
+}
+fun churn(k: Int) {
+  var j = 0
+  while j < 20 {
+    let y = [k + j]
+    if y[0] != k + j {
+      print("unreachable")
+    }
+    j = j + 1
+  }
+  if k % 500 == 0 {
+    sleep(1)
+  }
+}
+fun main() {
+  let b = Box(v: Outer(i: Inner(s: [0], n: 0), m: 0))
+  var bad = 0
+  var i = 0
+  while i < 4000 {
+    b.v.i.s = [i]
+    churn(i)
+    if b.v.i.s[0] != i {
+      bad = bad + 1
+    }
+    b.put([i + 1])
+    churn(i)
+    if b.v.i.s[0] != i + 1 {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

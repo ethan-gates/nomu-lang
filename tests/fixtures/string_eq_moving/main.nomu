@@ -1,6 +1,8 @@
-// String.eq holds raw byte pointers across its loop's safepoint poll. One fiber allocates to force minor
-// collections; another compares two equal, freshly built heap strings. A collection at the poll that moves a
-// buffer leaves the comparison reading the old copy.
+// String.eq once held raw byte pointers across its loop's safepoint poll (task 246). One fiber allocates to
+// force minor collections; another compares two equal, freshly built heap strings. A collection at the poll
+// that moved a buffer left the comparison reading the old copy. `loopEq` holds the byte pointers across
+// calls and allocations, as the old loop did, for a heap string (a collection may move its buffer) and a
+// short one (its bytes are in the frame, which a stack move relocates): both stay valid.
 class Box {
   var v: Int
 }
@@ -26,6 +28,30 @@ fun mk() -> String {
   return s
 }
 
+fun depth(k: Int) -> Int {
+  if k <= 0 {
+    return 0
+  }
+  return depth(k - 1) + 1
+}
+
+// Compare the first `upTo` bytes through pointers held across a call and an allocation each byte.
+fun loopEq(a: String, b: String, upTo: Int) -> Bool {
+  let pa = a.base.bytePointer()
+  let pb = b.base.bytePointer()
+  var i = 0
+  while i < upTo {
+    let x: UInt8 = pa.load(fromByteOffset: i)
+    let y: UInt8 = pb.load(fromByteOffset: i)
+    if x != y {
+      return false
+    }
+    let box = Box(v: depth(3))
+    i = i + box.v - 2
+  }
+  return true
+}
+
 fun comparer(rounds: Int) -> Int {
   var bad = 0
   var r = 0
@@ -37,14 +63,25 @@ fun comparer(rounds: Int) -> Int {
     } else {
       bad = bad + 1
     }
+    var upTo = 64
+    if r % 20 == 0 {
+      upTo = a.base.count
+    }
+    if loopEq(a, b, upTo) == false {
+      bad = bad + 1
+    }
+    let small = "abc".concat("defgh")
+    if loopEq(small, "abcdefgh", 8) == false {
+      bad = bad + 1
+    }
     r = r + 1
   }
   return bad
 }
 
 fun main() {
-  spawn let c = churner(20000000)
-  spawn let x = comparer(20000)
+  fiber let c = churner(20000000)
+  fiber let x = comparer(20000)
   print("bad ")
   print(x)
   print(" ")

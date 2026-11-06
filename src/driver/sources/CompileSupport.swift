@@ -63,14 +63,17 @@ private func parseEmbeddedPrelude(_ source: String, _ name: String) -> Program {
 
 // Prepend the `runtime` prelude for a white-box runtime test (`test.runtime_prelude`, task 174.5): the fixture
 // calls runtime internals directly, so they must be local decls. Returns the runtime function names as the
-// runtime-subset designation (its functions compile `noSafepoint`, like the package). The bare weak-ODR
-// definitions fold with the `runtime` package's, so this adds no runtime duplication to the test binary.
+// runtime-subset designation (its functions compile `noSafepoint`, like the package), with the initializers
+// of its globals (`global:<name>`), which run on the process's main thread before any fiber exists. The bare
+// weak-ODR definitions fold with the `runtime` package's, so this adds no runtime duplication to the test
+// binary.
 func prependRuntimePrelude(_ program: Program) -> (Program, Set<String>) {
     let decls = zip(EmbeddedSources.runtimeFiles, runtimePrependFileNames).flatMap { file, name in
         parseEmbeddedPrelude(file.source, name).decls
     }
     let subset = Set(decls.compactMap { decl -> String? in
         if case .funcDecl(let f) = decl { return f.name }
+        if case .globalDecl(let g) = decl { return "global:\(g.name)" }
         return nil
     })
     return (Program(decls: decls + program.decls, imports: program.imports), subset)

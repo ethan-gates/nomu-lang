@@ -6,6 +6,6 @@
 fun work(ms : Int) -> Int{return sleep(ms)}
 
 fun main() {
-    spawn let a = work(500) spawn let b = work(500) spawn let c = work(500)
+    fiber let a = work(500) fiber let b = work(500) fiber let c = work(500)
         print(a + b + c) // 1500 (sum of ms slept), but wall-clock ~500ms — they overlap
 }

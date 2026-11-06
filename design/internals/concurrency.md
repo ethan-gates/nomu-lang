@@ -2,7 +2,7 @@
 
 **Status:** working draft. The detailed home for Nomu's concurrency model and runtime. Status tags: **Locked**, **Open**, **TODO**.
 
-**API scope:** no concrete API here is committed. Any named or lowercase construct (channels, mutexes, `select`, task spawns, a self-synchronizing type) is **illustrative** until we explicitly agree to it, and each will be pinned as **language** or **standard library** at that point. What is Locked is the *model* and the *runtime primitive shape*, not surface API.
+**API scope:** no concrete API here is committed. Any named or lowercase construct (channels, mutexes, `select`, a self-synchronizing type) is **illustrative** until we explicitly agree to it, and each will be pinned as **language** or **standard library** at that point. What is Locked is the *model* and the *runtime primitive shape*, not surface API.
 
 ---
 
@@ -10,10 +10,10 @@
 
 - **Colorless.** No function coloring, no `async`/`await` split. Drives an **M:N stackful** runtime — a fiber can suspend anywhere because it has a real stack.
 - **No suspension marker (transparent, Go-style).** A blocking call looks like an ordinary call; there is no `await` or other marker showing where a fiber suspends. — **Decided (2026-07-16).**
-- **Concurrency is never implicit in your control flow.** Without an explicit spawn/scope construct, your statements run in sequence and nothing you wrote runs overlapping. A call may block — and the runtime freely schedules *other* fibers while it does (poller, work-stealing, thread handoff) — but it never makes your *own* statements run concurrently, and structured concurrency guarantees a call leaks no background work past its return (stronger than Go, where detached goroutines can). This is what carries serial-vs-concurrent legibility without a suspension marker. — **Decided (2026-07-16).**
-- **Structured concurrency + actors** as the model. Task lifetime is scoped; actors own isolated stateful concurrency.
+- **Concurrency is never implicit in your control flow.** Without an explicit `fiber` or `task`, your statements run in sequence and nothing you wrote runs overlapping. A call may block, and the runtime freely schedules *other* fibers while it does (poller, work-stealing, thread handoff), but it never makes your *own* statements run concurrently. This is what carries serial-vs-concurrent legibility without a suspension marker. A call may leave a detached fiber running past its return, as in Go (§8).
+- **Detached fibers + channels + actors** as the model. A fiber is detached by default; `task` gives a joinable result (§8); channels carry flow (§4); actors own isolated stateful concurrency (§9).
 - **Race-free by construction (the shareability rule).** Reference types are task-local by default; a value crossing a task boundary must be "shareable" (a value type, an immutable type, an actor handle, or — reserved, design deferred — a self-synchronizing type, §10). Shareability is auto-derived structurally and surfaces only as a bound on the concurrency APIs — Rust's `Send`/`Sync` without the borrow checker.
-- **Actors** are owning GC handles with reference-driven lifetime (collected when unreferenced-and-idle). You interact through **one mechanism only: fire-and-forget message-send**, written as a method call (no suspension marker). An actor is a one-way message sink — a handler never returns a value to the sender, and there is no reply/ask/request-reply. To obtain a value produced by concurrent work, use `spawn let` results (§8) or a channel (§4), not an actor. Exact actor-access syntax open (§9). No `weak`, no dangling.
+- **Actors** are owning GC handles with reference-driven lifetime (collected when unreferenced-and-idle). You interact through **one mechanism only: fire-and-forget message-send**, written as a method call (no suspension marker). An actor is a one-way message sink — a handler never returns a value to the sender, and there is no reply/ask/request-reply. To obtain a value produced by concurrent work, use a `task` (§8) or a channel (§4), not an actor. Exact actor-access syntax open (§9). No `weak`, no dangling.
 
 ---
 
@@ -83,7 +83,7 @@ The core primitive is locked runtime-internal; the exposed form for library auth
 
 **Cross-thread resume safety — Decided (2026-07-16), mechanics in `runtime.md` §3.** The token and result type cross a task boundary, so **`T: shareable`** and **`Continuation<T>` is shareable-by-construction** (its `resume` is internally synchronized). `resume` is **context-free** (no `current()`), does an **atomic resume-once** (double-resume traps at runtime), enqueues on the **MT-safe run queue**, and remote-wakes an idle scheduler; the queue provides happens-before for the value. This is locked at the in-runtime tier (the resumer is a Nomu poller/timer/offload thread); the **foreign-thread/FFI variant** (attach + GC pinning) is deferred with FFI and adds no new continuation semantics.
 
-**Cancellation — Decided (2026-07-16), against the structured cancellation model (§7).** `withContinuation` is a **cancellation point**: cancellation unparks the fiber with a cancelled outcome, the fiber unwinds, and the in-flight external operation is **abandoned**. **resume-after-cancel is a safe no-op** — the atomic resume-once CAS (`runtime.md` §3) serializes cancellation against a late callback; the loser no-ops, so a callback firing into a gone fiber neither crashes nor corrupts. An optional **`onCancel` hook** (Swift `withTaskCancellationHandler` shape) lets the author tell the external world to stop; it races with `resume` and is serialized by the same token state. A **linear resumed value is consumed even on the no-op path** (its cleanup runs). This rides on the structured cancellation model (§7).
+**Cancellation.** The runtime has no cancellation concept (§7), so `withContinuation` is an ordinary wait. A library that wants a wait to end early resumes the continuation itself. **Resume-once is checked at runtime:** the atomic resume-once CAS (`runtime.md` §3) makes a second resume a safe no-op or a trap, with no linear type, in keeping with the rule that the type system does not carry concurrency behavior.
 
 ---
 
@@ -111,13 +111,11 @@ Reference points — Go hides the primitive and makes the *channel* the public s
 
 ---
 
-## 4. Channels — deferred library type (Decided 2026-07-16)
+## 4. Channels — a library type, the base of the concurrency surface
 
-**Channels are a deferred library type: excluded from the initial language and stdlib surface, and designed so they can be added later as a plain library over the suspension core with no language change.** — **Decided.** "Trivial to include, unexposed to begin."
+**`Channel<T>` is a stdlib type over the suspension core, with no `chan` keyword and no `<-` operator.** They are the first concurrency library to build, because `Task` (§8) and stop signals (§7) are written over them.
 
-**Why deferred.** Actors (§9), the scope surface (§8), and the continuation (§3) cover the launch concurrency needs. The continuation already settled the "public suspension primitive" fork — the continuation is the blessed low-level tool, so a channel is one library consumer among many rather than *the* primitive. Channels add flow ergonomics that can arrive later without disruption.
-
-**Role when added: flow.**
+**Role: flow.**
 - **Actor** = an *addressed, stateful entity* — you send to *that* actor, it serializes messages against private state. Identity-centric (state).
 - **Channel** = an *anonymous conduit* — put a value in, whoever is reading takes it; no identity beyond the pipe. Flow-centric (pipelines, fan-out/in, worker pools, streaming, `select`).
 - Near-duals: an actor's mailbox is a channel + a loop + private state. Kept role-distinct (state → actor, flow → channel), they are two tools for two jobs — the boundary is documented, not left to taste.
@@ -126,7 +124,7 @@ Reference points — Go hides the primitive and makes the *channel* the public s
 
 **`select` rides the exposed continuation — no runtime addition needed.** Waiting on several channels means "the first ready branch wins, the losers consume nothing." The exposed one-shot continuation (§3) already supplies exactly that: its **atomic resume-once is the claim**. A channel keeps a wait-queue of continuations and does **claim-before-handoff** — a sender tries to `resume` a waiter, and on a lost claim moves to the next, so its value is never given away; a `select` is one continuation registered across several channels' queues. So `select` is a **pure library over the exposed continuation**, the runtime stays single-wait and simple, and this composition doubles as validation of the continuation design. (This supersedes an earlier worry about reserving a runtime multi-wait primitive — the continuation covers it.)
 
-**Residual (§10):** everything about channels is deferred until adopted — buffered/unbuffered API, `select` surface, and all spellings. The commitment now is only that they are a pure library over the exposed suspension primitives (park/unpark internally; the continuation for `select`), so nothing in the runtime or language must change to add them later.
+**Residual (§10):** buffered/unbuffered API, the `select` surface, and all spellings. Channels stay a library over the suspension primitives (park/unpark internally; the continuation for `select`).
 
 ---
 
@@ -175,37 +173,45 @@ First-class and central (Swift-style). The GC pivot removes Swift's two closure 
 
 ---
 
-## 7. Cancellation model (Decided 2026-07-16)
+## 7. Cancellation
 
-The spine is decided; the scope surface is settled in §8, and a few spellings remain residual (§10).
+**Cooperative, by convention, with no concept in the language or the runtime.** A signal is a request to stop, sent over a channel. The function that hears it decides what to do: stop, finish its current item, return a partial result, or ignore it.
 
-**Keystone — cancellation is not an error.** An error is a *value* describing how an operation failed (propagates via `Result`/`?`, `types.md` §4). Cancellation is a *control signal* to stop work. They are kept distinct: **cancellation is a runtime-level cooperative unwind, separate from errors-as-values** — it tears a fiber's stack down to the cancelled scope running cleanup, but it is **not** a user-catchable exception and **not** a `Result` threaded through signatures. This keeps error handling purely value-based while giving cancellation the automatic unwind it needs, and avoids the Go/Swift conflation (`ctx.Err()` / thrown `CancellationError`).
+- **Nothing is interrupted.** A function ends only by returning. There is no unwinding and no delivery at safepoints. Cancelling every function implicitly would let any function stop midway through an update (Java deprecated `Thread.stop` for this; Rust's "cancel safety" is the same problem), would need shielded cleanup, and would turn each safepoint into a function exit, which limits optimization.
+- **A signal first, perhaps an error after.** A closed channel is a signal; nothing has failed. A function that observes it may report that as an ordinary error ([115](../plans/tasks/115-error-handling.md)) or return normally. To the caller it is a normal return either way.
+- **Generic signalling.** Go's `context` bundles a stop signal, a deadline and request values for server call chains. That is one convention, so it belongs in a library. A closed channel is the generic signal, and `select` is its receive.
+- **Waits.** `select` covers channels, and is intended to cover poller-backed reads and timers too, so a blocked network read can wait on a stop channel. I/O deadlines and closing a connection also wake a blocked read. Blocking file calls and foreign calls run to completion.
+- **Compute.** A long loop stops only where its author checks.
+- **Request context.** A library class holding a stop channel, a deadline and values, passed as a parameter or held on a request struct, is an ordinary user or library choice.
+- **Reach.** Actors are unaffected: a cancelled sender has no bearing on a handler already running.
 
-- **Cooperative, not preemptive.** No forced mid-instruction kill; a fiber unwinds itself at safe points. — **Decided.**
-- **Propagation = the structured scope tree.** Cancelling a scope cancels its descendants automatically — no explicit `context` token threaded through calls. Triggers: parent cancelled, a scope deadline/timeout (timer heap, `runtime.md` §2), an explicit `.cancel()`, or a sibling error in a cancel-on-first-error scope. — **Decided.**
-- **One cleanup mechanism.** Scope exit runs cleanup whether it is a normal return, an error `?`-return, or a cancellation unwind: the same machinery runs `defer`s (reverse order) and consumes live **linear resources** (files close, locks release, a continuation resume-noop-consumes — `memory-model.md` §6.2). **Cleanup runs shielded** — it cannot itself be cancelled, so releasing a resource can't be interrupted. — **Decided.**
-- **Cancellation points = safe points, automatic by default (safepoint-based, hybrid).** Every suspension point (park) is a delivery point — anything that blocks or waits is cancellable for free. CPU-bound loops are covered by placing **safepoints at loop back-edges (plus call sites)** — the same safepoints the moving GC already needs (`noir.md`, `memory-model.md` §3) and which also serve scheduler-preemption/fairness (`runtime.md`). So a cancelled fiber checks a per-fiber flag at each back-edge and unwinds; the check is near-free (a predicted branch, or a guard-page poll). **Most code needs no explicit signal** — automatic coverage is effectively total, since any loop polls on its back-edge and straight-line code between them is finite. Two escape hatches: an explicit **`checkCancellation()` / `isCancelled`** (rare — for a partial result before unwinding, or an unusually long straight-line computation), and a **shield / non-cancellable region** to suppress automatic checks (the same shield the shielded-cleanup rule above uses). — **Decided.**
-- **Observation without catching.** No catch-and-resume; a fiber may *observe* cancellation only via `isCancelled` (voluntary, e.g. to return a partial result) and via cleanup / **`onCancel`** hooks (the continuation's `onCancel`, §3, generalizes to a scope-level "run this on cancel"). — **Decided.**
-- **Actors sit outside the cancellation tree.** Actors are independent entities with reference-driven lifetime, not nodes in the structured scope tree. Cancelling a fiber that *sent* a message does **not** abort the actor's in-flight handler (that would corrupt actor state); the fire-and-forget send already returned, so there is nothing for the cancelled fiber to unwind on the actor's behalf (§9 — no reply to wait on). — **Decided.** Actor *shutdown* (drain-then-collect) is settled in the actor surface (§9).
-
-**Residual (§10):** the exact **shield** semantics and its interaction with safepoints, scheduler-side propagation of a cancelled scope to its parked children (`runtime.md` §7), and the spellings of `checkCancellation`/`isCancelled`/`shield`/`onCancel`. (The scope surface is settled in §8, actor shutdown in §9.)
+**Possible later additions.** If programs show the need, a per-fiber flag with explicit observation points can be added without breaking code. Whether a function must declare that it listens stays open; a signature marker belongs on the input side, because a return type describes what a function produces.
 
 ---
 
-## 8. Structured concurrency — scope surface (Decided 2026-07-16)
+## 8. Fibers and tasks
 
-Two shape-specific constructs, **no programmer-visible task/fiber/future handle** (Terminology, `runtime.md`). Structure is decided; spellings and exact join points are residual (§10).
+Two forms, both taking only a call, with arguments evaluated at the call:
 
-- **Static fan-out — a binding form.** For a fixed, small set of concurrent children with *differently-typed* results: each child is bound to a name; **reading a name joins** (blocks until that child finishes) — no suspension marker (§1), no handle type. This is the common "run these two or three things and combine them" case. — **Decided (structure).**
-- **Dynamic fan-out + background workers — a scope/group.** Spawn N children (N dynamic) into a scope; collect their results by **iteration**; the scope **joins all children on exit** (the structured guarantee). Long-lived background workers are the same construct — children that run until the scope ends. — **Decided (structure).**
-- **No first-class future/handle.** Neither construct hands back a task handle or future; results are plain values you read (colorless — reading blocks). A future-based single construct was set aside as anti-colorless (a future exists mainly to avoid blocking, which Nomu makes cheap). — **Decided.**
-- **Both error modes, per-scope.** A scope chooses **cancel-on-first-error** (fail-fast: the first child error cancels its siblings via the cancellation model §7, and the construct surfaces that error) or **run-to-completion** (collect: every child runs, you get all results including errors). Errors are values (`types.md` §4) — "a child errored" means it returned an error value. — **Decided (both supported).**
+```
+fiber f(x)            // detached: a statement, nothing comes back
+let t = task f(x)     // joinable: gives a Task
+let v = t.join()
+```
 
-Why two constructs rather than one: static fan-out (fixed, heterogeneous, combined by name) and dynamic fan-out (N homogeneous, aggregated) are *different shapes*, not two ways to do the same thing — the same role-split that justifies keeping both actors (state) and channels (flow). A single construct makes the common static case awkward (improvised channels/captures).
+- **`fiber` is detached and has no left side.** It always means one thing, like Go's `go`. No join exists, so a fiber's record is freed when it exits.
+- **Types may be concurrency objects.** `Channel<T>` and `Task<T>` are real stdlib types: objects that do a job, like a file. A type may never mark how other data behaves (`Arc<T>`, `Send`, `Pin`), which keeps memory and concurrency strategy out of data modeling. Both are shareable by a stdlib-only blessing, the trusted escape hatch of §10. There is no `Fiber` type: `fiber f(x)` returns nothing, so it would have no operations.
+- **`task` is a keyword over a library type.** `Task` is an ordinary stdlib class over `fiber` and a one-shot channel, so the compiler knows one library name, as `for` knows the iterator protocol. `join()` can repeat and can come from several fibers. A dropped `task` result is rejected in favor of `fiber`.
+- **No closures are passed to `fiber` or `task`.** A multi-step body is a named function. Closures in Go mostly return results and signal completion, which `task` covers.
+- **Fan-out is an array of tasks and a loop.** A `Group` type waits until programs show which need is common: completion order, stop on first error, or a concurrency limit.
+- **`main` returning ends the program.** Detached fibers stop with it. Actor drains finish first: messages already sent are delivered.
+- **A fault in any fiber ends the process.**
+- **Captures stay checked.** Arguments crossing into a fiber must be shareable (§5).
+- **Leaks are a tooling matter.** Detached fibers can leak, so the tools need fiber dumps and leak reports.
 
-**Residual (§10):** all spellings (the binding form, the scope/group, spawn), the exact join points (implicit at block exit vs. explicit), how collected results are typed/ordered, and how the error mode is selected. Some of this rides on generics (`types.md`).
+**Why detached by default.** Mainstream languages all keep a detached form, because background work and servers need one, and concurrency gains little from novelty here. The languages that forbid it are specialized (Cilk, occam). The earlier design had implicit joins at scope exit and a `spawn let` binding; this replaces both. Task [250](../plans/tasks/250-fiber-task-surface.md) tracks the build, and `fiber let` stays until `Task` exists.
 
-**Sequencing (decided 2026-08-10).** Static fan-out (`spawn let`) ships. The **dynamic fan-out group is built after cancellation** (tasks: dynamic spawn group `plans/tasks/103-dynamic-spawn-group.md`, cancellation `plans/tasks/135-cancellation-continuations.md`) — its fail-fast mode rides the structured-cancellation model (§7), and its motivating use (benchmarking highly concurrent workloads) can wait. Confirm the surface (handle-based vs. scoped; join point; error-mode selection) before building.
+**Residual (§10):** `select` surface and how far it generalizes, and all spellings.
 
 ---
 
@@ -215,12 +221,12 @@ Actors own isolated stateful concurrency (§1); this section pins how you declar
 
 - **Declaration & isolation.** An actor is a reference type with isolated state — fields are reachable only from within the actor's own handlers (serial access). External code goes through the actor's message interface; internal helpers called from a handler run inline on the handler's fiber (a direct call, not a message-send). — **Decided (model).**
 - **Interaction = method-call syntax, fire-and-forget message-send.** `account.deposit(amount)` reads like a call; underneath it enqueues a message on the actor's mailbox and **returns immediately** — the handler runs later on the actor's turn, and the sender does not wait for it. Handlers **do not return values to the sender**. Legibility comes from the variable's actor type, consistent with the markerless model (§1). — **Decided (fire-and-forget: revised 2026-08-12, was "blocks until the handler returns").**
-- **One mechanism, no reply.** Fire-and-forget send is the *only* operation on an actor. There is no reply, no ask, no request-reply, no blocking-call form — not deferred, not a library helper, none. A handler is a one-way message sink. A value produced by concurrent work comes from `spawn let` results (§8, task parallelism) or a channel (§4, flow) — separate mechanisms with their own surfaces, never bolted onto the actor. This is the pure-actor model (Erlang's `!`; a "call"-style convenience is deliberately *not* provided). — **Decided 2026-08-12.**
+- **One mechanism, no reply.** Fire-and-forget send is the *only* operation on an actor. There is no reply, no ask, no request-reply, no blocking-call form — not deferred, not a library helper, none. A handler is a one-way message sink. A value produced by concurrent work comes from a `task` (§8) or a channel (§4, flow) — separate mechanisms with their own surfaces, never bolted onto the actor. This is the pure-actor model (Erlang's `!`; a "call"-style convenience is deliberately *not* provided). — **Decided 2026-08-12.**
 - **The send is non-blocking.** The mailbox is unbounded to start (a send always succeeds); **bounded-mailbox backpressure** (a send blocks when full, Go-buffered-channel style) is a future option (§10), not the default. — **Decided (revised 2026-08-12).**
-- **Consistency with §1 "no implicit concurrency."** A fire-and-forget send leaves the handler running past the send's return, but that is *the actor's* concurrency, not leaked background work in the sender's scope: addressing a named actor is itself the explicit concurrency act, and actors sit outside the structured scope tree (§7, §9) — their work is theirs, reference-driven, not scoped to the caller. So this holds §1 rather than bending it. — **Decided 2026-08-12.**
+- **Consistency with §1 "no implicit concurrency."** A fire-and-forget send leaves the handler running past the send's return, but that is *the actor's* concurrency, not leaked background work in the sender's scope: addressing a named actor is itself the explicit concurrency act, and their work is theirs, reference-driven, not scoped to the caller. So this holds §1 rather than bending it. — **Decided 2026-08-12.**
 - **Slow handlers spawn to keep the actor responsive.** A handler that does slow work holds up the actor's drain (the next message waits — non-reentrant), so to stay responsive it **spawns** the work and returns. Since sends never block the sender, this is about the actor's own throughput, not the caller. — **Decided.**
 - **Non-reentrant.** A handler runs to completion before the next message, so state is touched serially and invariants hold across the whole handler. A handler that blocks inline (I/O, a `sleep`) serializes the actor deliberately. — **Decided.**
-- **An actor is a structured scope** for work its handlers spawn — that work lives with the actor and is drained/cancelled on shutdown. Consistent with actors being their own tree root, outside the caller's cancellation tree (§7). — **Decided.**
+- **Work a handler starts is an ordinary fiber or task.** It runs independently of the actor's drain.
 - **Arguments are shareable** — they cross the actor boundary, so the shareability rule requires it (§1, §5). No results ever cross back (handlers don't return to the sender). — **Decided (follows from the shareability rule).**
 - **Lifetime & shutdown: pending messages root the actor; drain-then-collect.** A queued message keeps the actor reachable, so "collected when unreferenced-and-idle" means no external references *and* an empty mailbox. An actor with queued work drains it, then becomes collectable (the Swift ARC-driven drain precedent, achieved here via GC reachability). Fire-and-forget survives a sender dropping its reference; actor↔actor cycles with drained mailboxes collect together; a self-sustaining actor lives until program end (programmer-created, like an infinite loop). An explicit stop can offer drain-vs-drop. — **Decided.**
 
@@ -239,13 +245,13 @@ Actors own isolated stateful concurrency (§1); this section pins how you declar
 
 ## 10. Open questions (rollup)
 
-- **Primitive exposure** — **Decided (§3):** closure-scoped one-shot checked continuation, a runtime intrinsic (not stdlib), token is a linear type; raw park/unpark stays internal. Cross-thread resume (`runtime.md` §3) and cancellation (§7) now decided; residual is only the deferred FFI variant + spelling.
-- **Channels** — **Decided (§4):** deferred library type — unexposed at launch, a pure library over the suspension core (role = flow, distinct from actors); `select` rides the exposed continuation, so no runtime addition. Residual: the API when adopted.
-- **Actor surface** — **Decided (§9), fire-and-forget revision 2026-08-12:** one mechanism only — **fire-and-forget** message-send; handlers never return to the sender; no reply/ask/request-reply of any kind (values come from `spawn let` results or channels, not actors); non-reentrant; slow handlers spawn to stay responsive; actor is a scope for spawned work; pending messages root the actor → drain-then-collect. **Implementation model (§9):** async mailbox + pooled on-demand handler fibers (no dedicated per-actor fiber, no mutex); the M3.4 mutex actor is a superseded scaffold; teardown falls out of the moving GC (no per-actor weak handle). Residual: spellings, mailbox bound.
-- **Structured concurrency surface** — **structure Decided (§8):** a binding form for static fan-out + a scope/group for dynamic + background; no handle type; both error modes (fail-fast / collect). Residual: spellings, exact join points, result typing/ordering.
-- **Cancellation model** — **spine Decided (§7):** cancellation ≠ error, a cooperative runtime unwind; structured-tree propagation; unified shielded cleanup; safepoint-automatic cancellation points; actors outside the tree. Residual: shield semantics, actor shutdown, scheduler-side propagation (`runtime.md` §7), and spellings.
+- **Primitive exposure** — **Decided (§3):** closure-scoped one-shot checked continuation, a runtime intrinsic (not stdlib), resume-once checked at runtime; raw park/unpark stays internal. Cross-thread resume (`runtime.md` §3) now decided; residual is only the deferred FFI variant + spelling.
+- **Channels** — **Decided (§4):** a library type over the suspension core, the base of the concurrency surface (role = flow, distinct from actors); `select` rides the exposed continuation. Residual: the API.
+- **Actor surface** — **Decided (§9), fire-and-forget revision 2026-08-12:** one mechanism only — **fire-and-forget** message-send; handlers never return to the sender; no reply/ask/request-reply of any kind (values come from tasks or channels, not actors); non-reentrant; slow handlers start fibers to stay responsive; pending messages root the actor → drain-then-collect. **Implementation model (§9):** async mailbox + pooled on-demand handler fibers (no dedicated per-actor fiber, no mutex); the M3.4 mutex actor is a superseded scaffold; teardown falls out of the moving GC (no per-actor weak handle). Residual: spellings, mailbox bound.
+- **Fibers and tasks** — **Decided (§8):** detached `fiber f(x)`, joinable `task f(x)` over a library `Task`, fan-out through arrays. Residual: `select` and spellings.
+- **Cancellation** — **Decided (§7):** cooperative, by convention over channels, with no language or runtime concept. Residual: whether a per-fiber flag is ever added.
 - **Shared-mutable primitive** — **Deferred (design) 2026-07-16.** The "fourth shareable category" (a self-synchronizing type — atomics, a green `Mutex<T>`) is **reserved but unbuilt**. Adding it later is additive and low-risk: a green mutex rides the existing suspension core, atomics ride intrinsics the runtime already needs internally, and it can't precede generics anyway. The one thing kept open for it is a **trusted (`unsafe`) shareability escape hatch** — a way for a type to declare itself shareable despite mutable interior (Rust's `unsafe impl Sync`), likely exposed to library authors. Actors remain the default for shared mutable state until then. Design deferred; expected eventually.
 - **"shareable" details** — spelling decided (2026-07-20): prefix modifier `shared` (§5, `generics.md` §3a).
 - **Closures** — surface syntax locked Swift-shaped (§6, frontend-adjustable); autoclosures parked; shareable-closure spelling decided as prefix `shared` (§6).
-- **Continuations** — decided: shape (§3, §6), cross-thread resume at the in-runtime tier (`runtime.md` §3), and the cancellation contract (§3). Residual: the deferred **foreign-thread/FFI** variant (`runtime.md` §5) and **surface spelling**. The cancellation contract assumes the structured (scope-tree) cancellation model (§7).
+- **Continuations** — decided: shape (§3, §6), cross-thread resume at the in-runtime tier (`runtime.md` §3), and the cancellation contract (§3). Residual: the deferred **foreign-thread/FFI** variant (`runtime.md` §5) and **surface spelling**. Resume-once is checked at runtime.
 - **Scheduler internals** — work-stealing M:N, parallelism knob, stack growth, poller, task-locals, remote-wake primitive, platform/syscall strategy, FFI-readiness. All now homed in `runtime.md`.

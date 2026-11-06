@@ -1,0 +1,18 @@
+package class Box<T> {
+  var v: T
+}
+package fun deepen(n: Int) -> Int {
+  if n == 0 {
+    return 1
+  }
+  return deepen(n - 1) + 1
+}
+// Compiled once: the copies of `T` are buffers sized at runtime, far larger than the stack the caller's small frame
+// leaves, and the reads are from a heap object, so nothing upstream has made room for them.
+package fun cycle<T>(b: Box<T>, i: Int) -> Int {
+  let a = b.v
+  let c = a
+  let t = deepen(i)
+  b.v = c
+  return t
+}

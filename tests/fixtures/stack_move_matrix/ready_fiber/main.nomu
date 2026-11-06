@@ -1,0 +1,42 @@
+// A fiber woken from a sleep and waiting for a carrier holds its frames' references like a parked one. On one carrier
+// the other fiber runs meanwhile and collects, so the sleeper's stack must be walked while it is ready.
+class Box {
+  var a: Array<Int>
+  var n: Int
+}
+fun churn(k: Int) -> Int {
+  var j = 0
+  while j < 200 {
+    let x = [k + j]
+    if x[0] != k + j {
+      print("unreachable")
+    }
+    j = j + 1
+  }
+  if k % 16 == 0 {
+    sleep(1)
+  }
+  return k
+}
+fun run(k: Int) -> Int {
+  let b = Box(a: [k], n: k)
+  var i = 0
+  var bad = 0
+  while i < 400 {
+    if churn(i + k) != i + k {
+      bad = bad + 1
+    }
+    if b.a[0] != k || b.n != k {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  return bad
+}
+fun main() {
+  fiber let a = run(1)
+  fiber let b = run(2)
+  print("bad ")
+  print(a + b)
+  print("\n")
+}

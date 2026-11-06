@@ -218,7 +218,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 2
+        roots: 1
         min: 1
         max: 1
 
@@ -235,7 +235,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 4
+        roots: 2
         min: 1
         max: 1
 
@@ -412,7 +412,7 @@ cases:
       escape: false
       rt_prelude: true
     expect:
-      stdout: "nroots 2 total 4\nFP 156878319082112616\n30\n"
+      stdout: "nroots 1 total 4\nFP 156878319082112616\n30\n"
     carriers: []
 
   - name: walk-multiframe
@@ -421,7 +421,7 @@ cases:
       escape: false
       rt_prelude: true
     expect:
-      stdout: "NOMU-ROOT 33\nNOMU-ROOT 33\nNOMU-ROOT 44\nNOMU-ROOT 44\nNOMU-ROOT 11\nNOMU-ROOT 11\nNOMU-ROOT 22\nNOMU-ROOT 22\n110\n"
+      stdout: "NOMU-ROOT 33\nNOMU-ROOT 44\nNOMU-ROOT 11\nNOMU-ROOT 22\n110\n"
     carriers:
       - 1
       - 4
@@ -432,7 +432,7 @@ cases:
       escape: false
       rt_prelude: true
     expect:
-      stdout: "999\nnroots 4\nPARKED-ROOT 111\nPARKED-ROOT 111\nPARKED-ROOT 222\nPARKED-ROOT 222\n333\n"
+      stdout: "999\nnroots 2\nPARKED-ROOT 111\nPARKED-ROOT 222\n333\n"
     carriers:
       - 1
     iterations: 3
@@ -451,7 +451,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 4
+        roots: 2
         min: 1
         max: 1
 
@@ -718,6 +718,32 @@ cases:
     carriers: []
     iterations: 2
 
+  - name: module-generic-class-nodes
+    fixture: tests/fixtures/module_generic_class_nodes
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 4096
+    collections:
+      - kind: minor
+        min: 10
+    expect:
+      stdout: "replaced first seed 0\nseed new\n1999000\n"
+
+  # A compiled-once generic method stores young objects into a promoted holder: the sized copy of `T` must
+  # remember the holder, or a minor collection loses them.
+  - name: module-generic-old-write
+    fixture: tests/fixtures/module_generic_old_write
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 4096
+    collections:
+      - kind: minor
+        min: 10
+    expect:
+      stdout: "0\n2000\n"
+
   - name: gen-barrier
     fixture: tests/fixtures/gen_barrier
     compile_settings:
@@ -737,3 +763,18 @@ cases:
       stdout: "1\n1\n1\n199990000\n"
     carriers: []
     iterations: 2
+
+  # String.eq while another carrier's allocation moves the buffers: equal strings must compare equal
+  # (task 246; the comparison held raw byte addresses across its loop's poll).
+  - name: string-eq-moving
+    fixture: tests/fixtures/string_eq_moving
+    run_settings:
+      nursery_blocks: 1
+    expect:
+      stdout: "bad 0 1\n"
+    carriers:
+      - 4
+    iterations: 2
+    full_iterations: 6
+    collections:
+      - min: 1

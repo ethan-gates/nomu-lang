@@ -1,0 +1,15 @@
+// Fields of a concrete type beside a `T` field in an imported generic class: an erased body loads and stores
+// them as ordinary values, at offsets past a `T` whose size it reads from the witness.
+package class Q<T> {
+    var count: Int
+    var slot: T
+    var tail: Int
+    fun bump(v: T) {
+        slot = v
+        count = count + 1
+        tail = tail + 10
+    }
+    fun get() -> T {
+        return slot
+    }
+}

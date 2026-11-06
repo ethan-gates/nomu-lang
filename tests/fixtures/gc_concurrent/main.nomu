@@ -33,10 +33,10 @@ fun worker(id: Int) -> Int {
 }
 
 fun main() {
-  spawn let a = worker(1)
-  spawn let b = worker(2)
-  spawn let c = worker(3)
-  spawn let d = worker(4)
+  fiber let a = worker(1)
+  fiber let b = worker(2)
+  fiber let c = worker(3)
+  fiber let d = worker(4)
   print((a + b + c + d) % 1000000)   // deterministic — independent of collection and carrier count
   print("\n")
 }

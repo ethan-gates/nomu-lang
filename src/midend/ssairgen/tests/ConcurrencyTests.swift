@@ -8,7 +8,7 @@ import XCTest
 import ssairgen
 
 // Actors + structured concurrency (ssair.md): actor construction + mailbox, fire-and-forget
-// sends, and `spawn let` (start + join-on-read + join-at-scope-exit).
+// sends, and `fiber let` (start + join-on-read + join-at-scope-exit).
 final class ConcurrencyTests: XCTestCase {
     private func dump(_ source: String) -> String {
         var lexer = Lexer(source, file: "t.nomu")
@@ -43,13 +43,13 @@ final class ConcurrencyTests: XCTestCase {
         has(out, "writeBarrier")                   // self-field store in the handler (managed self)
     }
 
-    // `spawn let` starts a fiber over a lifted body; reading the binding joins it; the value's capture
+    // `fiber let` starts a fiber over a lifted body; reading the binding joins it; the value's capture
     // rides in a spawn env.
     func testSpawnAndJoinOnRead() {
         let out = dump("""
         fun work(n: Int) -> Int { return n * n }
         fun run(n: Int) -> Int {
-            spawn let a = work(n)
+            fiber let a = work(n)
             return a
         }
         """)
@@ -59,12 +59,12 @@ final class ConcurrencyTests: XCTestCase {
         has(out, "spawn.0.env")                    // the capture env (captures `n`)
     }
 
-    // A `spawn let` whose result is never read still joins at scope exit (structured concurrency).
+    // A `fiber let` whose result is never read still joins at scope exit (structured concurrency).
     func testSpawnJoinsAtScopeExit() {
         let out = dump("""
         fun work() -> Int { return 7 }
         fun run() {
-            spawn let a = work()
+            fiber let a = work()
         }
         """)
         has(out, "spawn #0 spawn:0")

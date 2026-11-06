@@ -50,6 +50,7 @@ private struct ExhaustivenessPass {
         switch stmt.kind {
         case .letBinding(_, _, let value):    walkExpr(value)
         case .spawnLet(_, let value, _):      walkExpr(value)
+        case .fiberStart(let call):           walkExpr(call)
         case .assign(let t, let v),
              .compoundAssign(let t, let v):   walkExpr(t); walkExpr(v)
         case .ret(let e):                     if let e { walkExpr(e) }

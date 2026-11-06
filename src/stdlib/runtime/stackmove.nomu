@@ -1,6 +1,8 @@
-// Moving a fiber's stack: the copier, and the stress mode that moves a stack at every resume.
+// Moving a fiber's stack: growth, the copier, and the stress modes that move stacks.
 // Part of the `runtime` module; see README.md.
 //
+// A fiber's stack grows by moving: its stack check fails inside the reserve, the fiber stops (state 5), and
+// its carrier copies the stack to one twice the size. Past the maximum size, the check is a fatal error.
 // A suspended fiber's stack can be copied to a new address and fixed up so it resumes there. The carrier
 // does it, on its own stack, holding the scheduler lock, just before it switches the fiber back in. What is
 // fixed is what the frame contract names (`design/internals/frames-contract.md`): the saved stack and frame
@@ -10,61 +12,234 @@
 // compiler must rule out.
 //
 // NOMU_STACK_MOVE=1 is the stress mode: every resume of a suspended fiber moves its stack, and the old stack
-// is made inaccessible, so the first use of a stale address into it faults instead of reading an intact
+// is made inaccessible (NOMU_STACK_MOVE_CHECKS=N moves at every Nth function-entry stack check instead), so the first use of a stale address into it faults instead of reading an intact
 // copy. Moved-from stacks wait in a quarantine of `rtStackQuarantine` stacks before they are made accessible
 // again and reused, which bounds the memory the mode holds. Stacks come from page-aligned reservations
 // while it is on, so they can be protected.
+//
+// NOMU_STACK_START sets a new fiber's stack size in bytes (rounded up to a power of two, at least
+// `rtStackMin`, the default); NOMU_STACK_MAX the size past which a stack does not grow.
 
 // NOMU_STACK_MOVE: 1 moves a fiber's stack at every resume; off unless set.
-let rtStackMoveOn = rtEnvStackMove() > 0
+let rtStackMoveResume = rtEnvStackMove() > 0
+// NOMU_STACK_MOVE_CHECKS=N: every Nth stack check on any fiber moves that fiber's stack; off unless set.
+let rtStackMoveChecks = rtEnvStackMoveChecks()
+let rtStackMoveOn = rtStackMoveResume || rtStackMoveChecks > 0
+// The stress mode moves only stacks using less than this: each move copies the used part and walks its
+// frames, so moving deep recursion every Nth call costs the square of its depth.
+let rtStackMoveChecksUsed = 65536
 
-let rtStackBytes = 131072
+// The stack reserve G (`design/plans/tasks/104-fiber-stack-strategy.md`, "Decided: the entry check"): a
+// checked function's entry fails its check once its SP is within this many bytes of the stack's low end.
+// Every frame, and every chain of unchecked runtime frames below a checked one, must fit within it.
+let rtStackReserve = 1024
+
+// The smallest starting size: the reserve, and as much again for the frames that run before a fiber's
+// first check, 2 KiB (Go's). A power of two; under the stress modes, which protect moved-from stacks, the
+// 16 KiB page.
+let rtStackMin = rtStackMinFor(rtStackMoveOn)
+let rtStackStart = rtStackSizeRounded(rtEnvStackStart(), rtStackMin)
+// The program's first fiber, `main`'s, starts larger: there is one, and it saves the copies a deep `main`
+// would make growing from the minimum.
+let rtStackMain = rtStackLarger(rtStackStart, 65536)
+let rtStackMax = rtStackSizeRounded(rtEnvStackMax(), 1073741824)
 let rtStackQuarantine = 256
 
-// { 0 free-list head, 8 quarantine next index, 16 quarantine ring (rtStackQuarantine words) }. Touched only
-// under the scheduler lock.
-let rtStackPool = Runtime.staticStorage(bytes: 2064, align: 8)
+// { 0 free-list head, 8 quarantine next index, 16 quarantine ring (rtStackQuarantine (stack, size) pairs) }.
+// A stack on the free list holds the next stack at word 0 and its size at word 1. Touched only under the
+// scheduler lock, and only under the stress modes.
+let rtStackPool = Runtime.staticStorage(bytes: 4112, align: 8)
 
 fun rtEnvStackMove() -> Int {
   let name = RawPtr.alloc(bytes: 32, align: 8)
   return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_STACK_MOVE")))
 }
 
-// A new fiber's stack of `rtStackBytes`: page-aligned under the stress mode, so it can be protected once
-// moved from. Called without the scheduler lock, so it does not touch the pool.
-fun rtStackNew() -> RawPtr {
+fun rtEnvStackMoveChecks() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_STACK_MOVE_CHECKS")))
+}
+
+fun rtStackMinFor(protected: Bool) -> Int {
+  if protected {
+    return 16384
+  }
+  return 2048
+}
+
+fun rtEnvStackStart() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_STACK_START")))
+}
+
+fun rtEnvStackMax() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_STACK_MAX")))
+}
+
+// A stack size: `want` bytes (`dflt` when 0, unset), rounded up to a power of two of at least `rtStackMin`.
+fun rtStackSizeRounded(want0: Int, dflt: Int) -> Int {
+  var want = want0
+  if want <= 0 {
+    want = dflt
+  }
+  var bytes = rtStackMin
+  while bytes < want {
+    bytes = bytes * 2
+  }
+  return bytes
+}
+
+fun rtStackLarger(a: Int, b: Int) -> Int {
+  if a > b {
+    return a
+  }
+  return b
+}
+
+// The size a stack of `size` bytes grows to, by doubling, to hold `used` bytes and the reserve below them.
+fun rtStackGrown(used: Int, size: Int) -> Int {
+  var bytes = size
+  while used + rtStackReserve > bytes {
+    bytes = bytes * 2
+  }
+  return bytes
+}
+
+// A fiber's stack size (offset 312).
+fun rtStackSize(fib: RawPtr) -> Int {
+  let bytes: Int = fib.load(fromByteOffset: 312)
+  return bytes
+}
+
+// Counts stack checks under NOMU_STACK_MOVE_CHECKS, across carriers.
+let rtStackCheckCount = Runtime.staticStorage(bytes: 8, align: 8)
+
+// Set fiber `fib`'s stack limit (offset 304) from its stack, at creation and after every move. Under
+// NOMU_STACK_MOVE_CHECKS the limit is all ones, so every check takes the slow path, which decides whether to
+// move.
+fun rtStackLimitSet(fib: RawPtr) {
+  if rtStackMoveChecks > 0 {
+    fib.store(-1, toByteOffset: 304)
+    return
+  }
+  let base: RawPtr = fib.load(fromByteOffset: 208)
+  fib.store(base.toInt() + rtStackReserve, toByteOffset: 304)
+}
+
+// The stack check's slow path: a checked function's SP (`anchorSp`, the forwarder's caller), less `need`,
+// compared below the limit. `need` is 0 for an ordinary check; a wrapper around a function whose frame is
+// larger than the reserve holds passes that frame's size, which must fit below its SP too. Short, the stack
+// grows (`rtStackMoveHere`) to hold `need` and the reserve below the used part, or past the maximum size the
+// program stops. Otherwise the limit was raised on purpose (the stress mode), and every Nth check moves
+// the stack at its size, when its used part is under `rtStackMoveChecksUsed`. An SP outside the running fiber's stack is on a stack the runtime does not own (a
+// white-box test's own fibers, built with `Runtime.fiberInit`), which nothing checks or moves.
+fun nomuSchedStackCheck(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int, need: Int) {
+  let self = rtCurrentFiber()
+  if self.isNull {
+    return
+  }
+  let base: RawPtr = self.load(fromByteOffset: 208)
+  let size = rtStackSize(self)
+  let sp = anchorSp.toInt()
+  if sp < base.toInt() || sp >= base.toInt() + size {
+    return
+  }
+  if sp - need < base.toInt() + rtStackReserve {
+    if rtStackGrown(base.toInt() + size - sp + need, size) > rtStackMax {
+      Runtime.fatal("nomu: stack overflow: a fiber's stack reached its maximum size")
+    }
+    self.store(need, toByteOffset: 320)
+    rtStackMoveHere(sched, self, anchorSp, anchorPc)
+    return
+  }
+  if rtStackMoveChecks > 0 && base.toInt() + size - sp < rtStackMoveChecksUsed {
+    let n: Int = rtStackCheckCount.atomicFetchAdd(1, atByteOffset: 0)
+    if n % rtStackMoveChecks == 0 {
+      rtStackMoveHere(sched, self, anchorSp, anchorPc)
+    }
+  }
+}
+
+// Stop the running fiber `self` at its stack check to have its stack moved: it switches to its carrier in
+// state 5, which moves the stack (growing it when short, `rtStackMove`) and switches straight back.
+fun rtStackMoveHere(sched: RawPtr, self: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
+  rtSchedSetAnchor(self, anchorSp, anchorPc)
+  rtSchedLock(sched)
+  self.store(5, toByteOffset: 168)             // stopped at a stack check, to be moved
+  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
+  Runtime.ctxSwitch(from: self, to: carrierCtx)
+  rtSchedUnlock(sched)
+}
+
+// A new fiber's stack of `bytes`: page-aligned under the stress modes, so it can be protected once moved
+// from. Called without the scheduler lock, so it does not touch the pool.
+fun rtStackNew(bytes: Int) -> RawPtr {
   if rtStackMoveOn {
-    return Runtime.reserveZeroed(bytes: rtStackBytes, align: 16384)
+    return Runtime.reserveZeroed(bytes: bytes, align: 16384)
   }
-  return RawPtr.alloc(bytes: rtStackBytes, align: 16)
+  return RawPtr.alloc(bytes: bytes, align: 16)
 }
 
-// A stack to move into: one back from quarantine, else a new reservation. Caller holds the scheduler lock.
-fun rtStackTake() -> RawPtr {
-  let head: RawPtr = rtStackPool.load(fromByteOffset: 0)
-  if head.isNull == false {
-    let next: RawPtr = head.load(fromByteOffset: 0)
-    rtStackPool.store(next, toByteOffset: 0)
-    return head
+// A stack of `bytes` to move into. Under the stress modes, one of that size back from quarantine, else a
+// new reservation. Caller holds the scheduler lock.
+fun rtStackTake(bytes: Int) -> RawPtr {
+  if rtStackMoveOn == false {
+    return RawPtr.alloc(bytes: bytes, align: 16)
   }
-  return Runtime.reserveZeroed(bytes: rtStackBytes, align: 16384)
+  var prev = RawPtr.null
+  var at: RawPtr = rtStackPool.load(fromByteOffset: 0)
+  while at.isNull == false {
+    let next: RawPtr = at.load(fromByteOffset: 0)
+    let size: Int = at.load(fromByteOffset: 8)
+    if size == bytes {
+      if prev.isNull {
+        rtStackPool.store(next, toByteOffset: 0)
+      } else {
+        prev.store(next, toByteOffset: 0)
+      }
+      return at
+    }
+    prev = at
+    at = next
+  }
+  return Runtime.reserveZeroed(bytes: bytes, align: 16384)
 }
 
-// Retire a moved-from stack: protect it and put it in the quarantine; the stack it displaces there becomes
-// accessible again and goes on the free list.
-fun rtStackRetire(old: RawPtr) {
+// Retire a moved-from stack of `bytes`. Freed, except under the stress modes: protected and put in the
+// quarantine, where the stack it displaces becomes accessible again and goes on the free list.
+fun rtStackRetire(old: RawPtr, bytes: Int) {
+  if rtStackMoveOn == false {
+    old.free()
+    return
+  }
   let i: Int = rtStackPool.load(fromByteOffset: 8)
-  let slot = rtStackPool.advanced(by: 16 + i * 8)
+  let slot = rtStackPool.advanced(by: 16 + i * 16)
   let evicted: RawPtr = slot.load(fromByteOffset: 0)
   if evicted.isNull == false {
-    Runtime.protect(base: evicted, bytes: rtStackBytes, access: 3)
+    let evictedBytes: Int = slot.load(fromByteOffset: 8)
+    Runtime.protect(base: evicted, bytes: evictedBytes, access: 3)
     let head: RawPtr = rtStackPool.load(fromByteOffset: 0)
     evicted.store(head, toByteOffset: 0)
+    evicted.store(evictedBytes, toByteOffset: 8)
     rtStackPool.store(evicted, toByteOffset: 0)
   }
   slot.store(old, toByteOffset: 0)
-  Runtime.protect(base: old, bytes: rtStackBytes, access: 0)
+  slot.store(bytes, toByteOffset: 8)
+  Runtime.protect(base: old, bytes: bytes, access: 0)
   rtStackPool.store((i + 1) % rtStackQuarantine, toByteOffset: 8)
+}
+
+// Free completed fiber `fib`'s stack (a retired stack under the stress modes, so a later use faults). The
+// caller holds the scheduler lock and runs on its carrier's stack.
+fun rtStackFree(fib: RawPtr) {
+  let base: RawPtr = fib.load(fromByteOffset: 208)
+  if base.isNull {
+    return
+  }
+  rtStackRetire(base, rtStackSize(fib))
+  fib.store(RawPtr.null, toByteOffset: 208)
+  fib.store(0, toByteOffset: 312)
 }
 
 // An anchor that must survive a stop: runtime code that captures its caller's anchor and may park more than
@@ -76,7 +251,7 @@ fun rtAnchorOffset(sp: RawPtr) -> Int {
     return sp.toInt()
   }
   let base: RawPtr = fib.load(fromByteOffset: 208)
-  return base.toInt() + rtStackBytes - sp.toInt()
+  return base.toInt() + rtStackSize(fib) - sp.toInt()
 }
 
 fun rtAnchorAt(fib: RawPtr, off: Int) -> RawPtr {
@@ -84,7 +259,7 @@ fun rtAnchorAt(fib: RawPtr, off: Int) -> RawPtr {
     return RawPtr.null.advanced(by: off)
   }
   let base: RawPtr = fib.load(fromByteOffset: 208)
-  return base.advanced(by: rtStackBytes - off)
+  return base.advanced(by: rtStackSize(fib) - off)
 }
 
 // `p` moved by `delta` when it points into [lo, hi), else unchanged.
@@ -103,21 +278,28 @@ fun rtStackAdjustAt(at: RawPtr, lo: Int, hi: Int, delta: Int) {
 }
 
 // Move suspended fiber `fib`'s stack to a fresh one and fix every pointer into it the contract names. The
-// caller holds the scheduler lock and runs on its carrier's stack.
+// new stack is twice the size, or more, when the used part and the room a check asked for leave less than
+// the reserve above the low end; otherwise the same size. The used part keeps its distance from the top. The caller holds the scheduler
+// lock and runs on its carrier's stack.
 fun rtStackMove(fib: RawPtr) {
   let old: RawPtr = fib.load(fromByteOffset: 208)
+  let size = rtStackSize(fib)
   let sp: RawPtr = fib.load(fromByteOffset: 96)
   let lo = old.toInt()
-  let hi = lo + rtStackBytes
+  let hi = lo + size
   let spAt = sp.toInt()
   if spAt < lo || spAt > hi {
     Runtime.fatal("nomu: stack move: the fiber's saved stack pointer is outside its stack")
   }
-  let fresh = rtStackTake()
-  let delta = fresh.toInt() - lo
-  // The used part: from the saved stack pointer to the top.
+  // The used part: from the saved stack pointer to the top; a wrapper's check also asks room for the frame
+  // it is about to call (`need`, offset 320).
   let used = hi - spAt
-  fresh.advanced(by: rtStackBytes - used).copyBytes(from: sp, byteCount: used)
+  let need: Int = fib.load(fromByteOffset: 320)
+  fib.store(0, toByteOffset: 320)
+  let bytes = rtStackGrown(used + need, size)
+  let fresh = rtStackTake(bytes)
+  let delta = fresh.toInt() + bytes - hi
+  fresh.advanced(by: bytes - used).copyBytes(from: sp, byteCount: used)
 
   // The context: sp and fp (x29 at +80). The frame-pointer chain from there: each frame record's saved fp.
   fib.store(sp.advanced(by: delta), toByteOffset: 96)
@@ -149,6 +331,15 @@ fun rtStackMove(fib: RawPtr) {
       rtStackAdjustAt(slot, lo, hi, delta)
       k = k + 1
     }
+    // Derived pointers (an interior pointer into a frame or a heap object) in their own slots.
+    let derived = rtRootsDerived(slots)
+    let nd = rtRootsDerivedWords(slots)
+    k = 0
+    while k < nd {
+      let dSlot: RawPtr = derived.load(fromByteOffset: k * 8 + 8)
+      rtStackAdjustAt(dSlot, lo, hi, delta)
+      k = k + 3
+    }
     rtRootsFree(slots)
   }
 
@@ -162,7 +353,9 @@ fun rtStackMove(fib: RawPtr) {
   }
 
   fib.store(fresh, toByteOffset: 208)
-  rtStackRetire(old)
+  fib.store(bytes, toByteOffset: 312)
+  rtStackLimitSet(fib)
+  rtStackRetire(old, size)
 }
 
 // Under the stress mode, the walk checks that a stopped fiber's anchor lies in its current stack: an anchor
@@ -171,7 +364,7 @@ fun rtStackMove(fib: RawPtr) {
 fun rtStackCheckAnchor(fib: RawPtr, anchor: RawPtr) {
   let base: RawPtr = fib.load(fromByteOffset: 208)
   let a = anchor.toInt()
-  if a >= base.toInt() && a < base.toInt() + rtStackBytes {
+  if a >= base.toInt() && a < base.toInt() + rtStackSize(fib) {
     return
   }
   let buf = RawPtr.alloc(bytes: 256, align: 8)

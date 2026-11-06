@@ -34,7 +34,7 @@ fun main() {
   let b = readLine()
   let c = readLine()
   let d = readLine()
-  spawn let n = churn()
+  fiber let n = churn()
   let e = readLine()
   let f = readLine()
   show(a)

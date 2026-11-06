@@ -26,7 +26,14 @@ bazel-bin/src/compiler-test/compiler-test tests/suite
   through the statepoint rewrite and the arm64 backend); `run.sh` prints each case's code and records.
 - `frames-ceiling.py` — builds the `frames_*` workloads (and a few others) under the `measure_*` configs,
   which remove a cost of finding roots unsoundly, and reports each one's change in time against the sound
-  build (task 243.1). Runs with a nursery large enough that nothing collects.
+  build (task 243.1), without the stack check (`--configs no-stack-checks`, task 104.2.5), or with libc
+  called directly on fiber stacks (`--configs libc-direct`, task 104.3.3). Runs with a
+  nursery large enough that nothing collects.
+- `frame-depth.py` — reads a build's frame tables (the `<stem>.frames` beside each object: every function's
+  frame size, direct calls, indirect callers and address-taken functions) and reports what the link's check
+  measures (task 104): the deepest chains of unchecked frames below checked functions, the slow path's
+  depth and the largest checked frame. `python3 tools/frame-depth.py build/<pkg>/<pkg>.frames
+  build/_external/nomu.nomu/runtime/runtime.frames …`. `NOMU_FRAME_SIZES=1` also prints each table at build.
 - `frame-stackaddr-asm.py` — scans linked arm64 binaries for stack addresses (computed from `sp`/`x29`) held
   in callee-saved registers across statepoint calls, and stores of stack addresses; a heuristic linear scan
   (task 241). `python3 tools/frame-stackaddr-asm.py <binaries…>`.

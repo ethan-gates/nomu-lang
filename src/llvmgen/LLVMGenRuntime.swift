@@ -1,6 +1,7 @@
 import mangle
 import support
 import LLVM_C
+import NomuLLVMPasses
 
 // Runtime/GC-ABI emission (moved into the shared emitter, ssair.md): the function-creation
 // seam, runtime-fn declarations, the inert mutator seams (`__nomu_poll`/`__nomu_gc_alloc`/
@@ -22,12 +23,16 @@ extension LLVMGen {
         return (fn, ty)
     }
 
+    // The largest frame a checked function may have (`FrameTable.frameLimit`).
+    static let stackFrameLimit = FrameTable.frameLimit
+
     // Runtime C functions that never allocate on the GC heap and never park the fiber — their calls
     // stay plain (no statepoint). Conservative: mislabeling a GC-triggering call as leaf is unsound.
     static let gcLeafRuntimeFns: Set<String> = [
         "printf",
         "memcpy",           // libc block copy — never allocates
         "memset",           // libc fill — never allocates
+        "memcmp",           // libc byte compare — never allocates
         "free",             // releases unmanaged memory (`RawPtr.free`)
         "write",            // libc write(2) (`Runtime.writeFd`, `Runtime.fatal`) — never allocates or parks
         "read",             // libc read(2) (`Runtime.readFd`) — never allocates or parks
@@ -72,6 +77,28 @@ extension LLVMGen {
         }
         var args: [LLVMValueRef?] = [p]
         return LLVMBuildCall2(b, ty, fn, &args, 1, "frame.addr")!
+    }
+
+    // A raw pointer into managed memory or a frame, `base + off` (both `i64`): a string's bytes, a buffer's
+    // header or element, an object's address. `base` is a heap object's address, a global's or a frame
+    // slot's. Marked `nomu.raw.interior(base, off)`, which the frame-address tracking makes a pointer derived
+    // from a tracked base: the statepoint rewrite records the pair at every stop, a moving collection
+    // recomputes it from the base, and a stack move adjusts both, so it stays valid across stops. The
+    // runtime's own code keeps the plain address: it holds raw addresses only where nothing moves.
+    func rawInterior(_ base: LLVMValueRef, _ off: LLVMValueRef, _ name: String) -> LLVMValueRef {
+        if isRuntimePackage {
+            return LLVMBuildIntToPtr(b, LLVMBuildAdd(b, base, off, name + ".int")!, i8ptr, name)!
+        }
+        let (fn, ty) = runtimeFn("nomu.raw.interior", ret: i8ptr, params: [i64, i64], varArg: false)
+        if !isGCLeafFn(fn) {
+            markGCLeaf(fn)
+            for (name, value) in [("memory", UInt64(0)), ("nounwind", 0), ("willreturn", 0)] {
+                let k = LLVMGetEnumAttributeKindForName(name, name.utf8.count)
+                LLVMAddAttributeAtIndex(fn, funcAttrIndex, LLVMCreateEnumAttribute(ctx, k, value))
+            }
+        }
+        var args: [LLVMValueRef?] = [base, off]
+        return LLVMBuildCall2(b, ty, fn, &args, 2, name)!
     }
 
     func addAlwaysInline(_ fn: LLVMValueRef) {
@@ -138,6 +165,17 @@ extension LLVMGen {
     }
 
     func buildCall(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?]) -> LLVMValueRef? {
+        if let r = libcRoute(fn, ty, args) {
+            if pendingDeoptApplies() && !r.leaf {
+                return buildCallWithDeopt(r.fn, r.ty, r.args, pendingDeopt!)
+            }
+            var a = r.args
+            let call = a.withUnsafeMutableBufferPointer {
+                LLVMBuildCall2(b, r.ty, r.fn, $0.baseAddress, UInt32(r.args.count), "")
+            }
+            if r.leaf { markCallGCLeaf(call!) }
+            return call
+        }
         // While lowering a safepoint instruction, `pendingDeopt` carries the shaped roots live across it
         // (task 176); attach them so a per-site statepoint call (a user call, concat) records them. Attaching
         // to any leaf setup call in the same instruction is harmless — RS4GC ignores a deopt bundle on a
@@ -171,6 +209,11 @@ extension LLVMGen {
     func buildCallWithDeopt(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?],
                             _ deoptOps: [LLVMValueRef?]) -> LLVMValueRef? {
         if deoptOps.isEmpty || measureNoStatepoints { return buildCall(fn, ty, args) }
+        var (fn, ty, args) = (fn, ty, args)
+        if let r = libcRoute(fn, ty, args) {
+            if r.leaf { return buildCall(fn, ty, args) }
+            (fn, ty, args) = (r.fn, r.ty, r.args)
+        }
         var ops = deoptOps
         let bundle = ops.withUnsafeMutableBufferPointer { op in
             "deopt".withCString { LLVMCreateOperandBundle($0, 5, op.baseAddress, UInt32(op.count)) }
@@ -185,6 +228,43 @@ extension LLVMGen {
         }
         LLVMDisposeOperandBundle(bundle)
         return r
+    }
+
+    // The libc functions whose calls go through the platform layer's stack switch: a call to `name` becomes
+    // a call to its stub `nomu_libc_<name>` (`runtime/embedded/rtasm_arm64.s`, which defines one per name
+    // here), which on a fiber's stack runs it on its carrier's stack, since no stack bound is assumed for
+    // code Nomu does not own (`design/plans/tasks/104-fiber-stack-strategy.md`, "Calls into libc"). The
+    // memory routines LLVM also emits on its own (`memcpy`, `memset`, `memcmp`) are not here: their calls are
+    // not all Nomu's to route.
+    static let libcViaCarrier: Set<String> = [
+        "abort", "clock_gettime_nsec_np", "close", "creat", "dprintf", "exit", "free", "getenv",
+        "getpagesize", "kevent", "kqueue", "mach_absolute_time", "mach_timebase_info", "malloc", "mmap",
+        "mprotect", "munmap", "pipe", "poll", "posix_memalign", "printf", "pthread_create",
+        "pthread_getspecific", "pthread_join", "pthread_key_create", "pthread_setspecific", "putchar",
+        "raise", "read", "sigaction", "sigaltstack", "snprintf", "strlen", "strpbrk", "strtod", "write",
+        "__ulock_wait", "__ulock_wake", "_NSGetExecutablePath",
+    ]
+
+    // A call to a libc function in `libcViaCarrier`, rewritten as a call to its stub with the same type and
+    // arguments; nil for any other callee. Every stub is gc-leaf: libc never calls back into Nomu, so no
+    // collection or stack move happens inside one. (The statepoint rewrite already treats calls to the
+    // library functions LLVM knows by name as leaves; the stubs' names it does not know, and a variadic one
+    // wrapped in a statepoint loses its stack-passed arguments.)
+    func libcRoute(_ fn: LLVMValueRef, _ ty: LLVMTypeRef, _ args: [LLVMValueRef?])
+        -> (fn: LLVMValueRef, ty: LLVMTypeRef, args: [LLVMValueRef?], leaf: Bool)?
+    {
+        guard LLVMIsAFunction(fn) != nil, let cName = LLVMGetValueName(fn) else { return nil }
+        let name = String(cString: cName)
+        guard LLVMGen.libcViaCarrier.contains(name), !measureLibcDirect else { return nil }
+        let stubName = "nomu_libc_" + name
+        let stub: LLVMValueRef
+        if let f = LLVMGetNamedFunction(mod, stubName) {
+            stub = f
+        } else {
+            stub = LLVMAddFunction(mod, stubName, ty)!
+            markGCLeaf(stub)
+        }
+        return (stub, ty, args, true)
     }
 
     func structGEP(_ structTy: LLVMTypeRef, _ addr: LLVMValueRef, _ idx: Int) -> LLVMValueRef {
@@ -497,6 +577,12 @@ extension LLVMGen {
         // reported too.
         let faultInstall = runtimePreludeFn("rtFaultInstall", ret: voidTy, params: [])
         withStubBody(fn) {
+            // No fiber runs yet on the main thread: x28, the running fiber in Nomu code, starts at 0, which
+            // the libc-call switch (`nomu_libc_call`) reads.
+            let (wr, wrTy) = runtimeFn("llvm.write_register.i64", ret: voidTy, params: [LLVMMetadataTypeInContext(ctx), i64], varArg: false)
+            var reg: [LLVMMetadataRef?] = [LLVMMDStringInContext2(ctx, "x28", 3)]
+            let regNode = LLVMMetadataAsValue(ctx, LLVMMDNodeInContext2(ctx, &reg, 1))
+            _ = buildCall(wr, wrTy, [regNode, LLVMConstInt(i64, 0, 0)])
             _ = buildCall(faultInstall.fn, faultInstall.ty, [])
             _ = buildCall(runtimeInit.0, runtimeInit.1, [])
             let sched = LLVMBuildLoad2(b, i8ptr, getOrAddGlobal(i8ptr, Mangle.global("rtSched", home: [])), "sched")!
@@ -550,6 +636,91 @@ extension LLVMGen {
             _ = self.buildCall(target.fn, target.ty, [sched, sp, pc])
             return nil
         }
+    }
+
+    // `__nomu_stack_slow()`: the stack check's slow path, called when a checked function's SP is below the
+    // carrier record's stack limit (`nomuSchedStackCheck`: an overflow, or the stress mode's move). Not
+    // gc-leaf: the call from the check is a statepoint, so it may move the stack.
+    // It uses `preserve_most`, so a caller keeps its arguments and other values in their registers across it
+    // and needs no callee-saved copies for a call that rarely runs (which would also force its prologue onto
+    // paths that make no call).
+    // Its argument is the room the check needs below the caller's SP beyond the reserve: 0, or a large
+    // frame's size for a wrapper's check (`nomuSplitLargeFrame`).
+    func nomuStackSlow() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("nomuSchedStackCheck", ret: voidTy, params: [i8ptr, i8ptr, i64, i64])
+        let slow = schedForwarder("__nomu_stack_slow", ret: voidTy, params: [i64]) { fn, sched, sp, pc in
+            _ = self.buildCall(target.fn, target.ty, [sched, sp, pc, LLVMGetParam(fn, 0)])
+            return nil
+        }
+        LLVMSetFunctionCallConv(slow.0, LLVMPreserveMostCallConv.rawValue)
+        return slow
+    }
+
+    // The function-entry stack check (`design/plans/tasks/104-fiber-stack-strategy.md`, "Decided: the entry
+    // check"), as a placeholder the pass `nomu-expand-stack-checks` (`src/llvmpasses/StackChecks.cpp`) expands
+    // after optimization: a call to `nomu.stack.check` with the slow path as its argument, `deoptOps` (the
+    // shaped values live at entry) as its bundle, and `!nomu.stack.owner` naming this function, so the copies
+    // inlining makes are told apart and deleted. The expanded check compares the SP with the running fiber's
+    // stack limit, read through x28; it needs no frame size, since the reserve holds any one frame, which
+    // `warn-stack-size` makes LLVM verify.
+    func emitStackCheck(_ deoptOps: [LLVMValueRef?]) {
+        guard let fn = currentFn else { return }
+        let limitKey = "warn-stack-size", limitValue = String(LLVMGen.stackFrameLimit)
+        LLVMAddAttributeAtIndex(fn, funcAttrIndex,
+                                LLVMCreateStringAttribute(ctx, limitKey, UInt32(limitKey.utf8.count),
+                                                          limitValue, UInt32(limitValue.utf8.count)))
+        let checkedKey = "nomu-stack-check"
+        LLVMAddAttributeAtIndex(fn, funcAttrIndex,
+                                LLVMCreateStringAttribute(ctx, checkedKey, UInt32(checkedKey.utf8.count), "", 0))
+        let slow = nomuStackSlow()
+        let placeholder = stackCheckPlaceholder()
+        let call = buildCallWithDeopt(placeholder.0, placeholder.1, [slow.0], deoptOps)!
+        var owner: [LLVMMetadataRef?] = [LLVMValueAsMetadata(fn)]
+        let node = LLVMMDNodeInContext2(ctx, &owner, 1)
+        let kind = "nomu.stack.owner"
+        LLVMSetMetadata(call, LLVMGetMDKindIDInContext(ctx, kind, UInt32(kind.utf8.count)),
+                        LLVMMetadataAsValue(ctx, node))
+    }
+
+    // A buffer of `size` bytes in this frame, sized at runtime: a compiled-once body's `T`. The entry check and the
+    // frame table cover only what LLVM lays out, so this checks for the room itself, comparing the SP less `size`
+    // with the running fiber's stack limit and asking the slow path for `size` when short. The slow path moves
+    // the stack and never collects. Its address has no frame index the frame-address split could recompute, so
+    // it is marked, and recorded at stops like a pointer into a caller's frame.
+    func runtimeSizedBuffer(_ size: LLVMValueRef, _ name: String, checked: Bool) -> LLVMValueRef {
+        if checked, let fn = currentFn {
+            let (read, readTy) = runtimeFn("llvm.read_register.i64", ret: i64, params: [LLVMMetadataTypeInContext(ctx)], varArg: false)
+            func register(_ reg: String) -> LLVMValueRef {
+                var node: [LLVMMetadataRef?] = [LLVMMDStringInContext2(ctx, reg, reg.utf8.count)]
+                return buildCall(read, readTy, [LLVMMetadataAsValue(ctx, LLVMMDNodeInContext2(ctx, &node, 1))])!
+            }
+            let fiber = LLVMBuildIntToPtr(b, register("x28"), i8ptr, "stk.fiber")!
+            var off = LLVMConstInt(i64, 304, 0)   // the fiber record's stack limit (`runtime/scheduler.nomu`)
+            let limitAddr = LLVMBuildGEP2(b, i8, fiber, &off, 1, "stk.limit.addr")!
+            let limit = LLVMBuildLoad2(b, i64, limitAddr, "stk.limit")!
+            let below = LLVMBuildSub(b, register("sp"), size, "stk.below")!
+            let short = LLVMBuildICmp(b, LLVMIntULT, below, limit, "stk.short")!
+            let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "stk.slow")
+            let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "stk.cont")
+            LLVMBuildCondBr(b, short, slowBB, contBB)
+            LLVMPositionBuilderAtEnd(b, slowBB)
+            let slow = nomuStackSlow()
+            let call = buildCall(slow.0, slow.1, [size])!
+            LLVMSetInstructionCallConv(call, LLVMPreserveMostCallConv.rawValue)
+            LLVMBuildBr(b, contBB)
+            LLVMPositionBuilderAtEnd(b, contBB)
+        }
+        return markFrameAddress(LLVMBuildArrayAlloca(b, i8, size, name)!)
+    }
+
+    // `void nomu.stack.check(ptr slow)`, marked to touch only inaccessible memory.
+    private func stackCheckPlaceholder() -> (LLVMValueRef, LLVMTypeRef) {
+        let name = "nomu.stack.check"
+        let ty = fnType(voidTy, [i8ptr])
+        if let f = LLVMGetNamedFunction(mod, name) { return (f, ty) }
+        let f = LLVMAddFunction(mod, name, ty)!
+        nomuMarkStackCheckPlaceholder(f)
+        return (f, ty)
     }
 
     // `__nomu_spawn_join(handle, final)`: await a spawned fiber, parking until it completes

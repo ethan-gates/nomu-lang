@@ -41,7 +41,7 @@ fun parker(inLoop: RawPtr) -> Int {
 fun main() {
   let inLoop = RawPtr.alloc(bytes: 8, align: 8)
   inLoop.atomicStore(0, toByteOffset: 0)
-  spawn let s = spin(Box(v: 777), inLoop)   // a carrier runs the inlined compute loop
-  spawn let q = parker(inLoop)              // another fiber requests the collection, then parks holding a root
+  fiber let s = spin(Box(v: 777), inLoop)   // a carrier runs the inlined compute loop
+  fiber let q = parker(inLoop)              // another fiber requests the collection, then parks holding a root
   print(s + q)                              // joins both
 }

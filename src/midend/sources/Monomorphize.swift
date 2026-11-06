@@ -78,10 +78,28 @@ private final class Monomorphizer {
         // 187.4.4) is also emitted **erased**, under its bare symbol, so a consumer module can call it
         // through runtime witnesses (the debug baseline; the call-site witness-argument ABI is 100.4.3.4).
         // Type parameters are retained: residual `.typeParam` survives into codegen, which lowers it to a
-        // VWT-driven opaque buffer. `internal`/`private` generics stay monomorphized-only (emitted above).
+        // VWT-driven opaque buffer. `internal`/`private` generics stay monomorphized-only (emitted above) unless an erased body calls them.
+        var erased = Set<String>()
+        var pending: [[NOIRStmt]] = []
         for decl in module.decls {
             if case .funcDecl(let f) = decl, !f.generics.isEmpty, f.visibility >= .package {
                 out.append(.funcDecl(f))
+                erased.insert(f.name)
+                pending.append(f.body)
+            }
+        }
+        // Generic types' methods are emitted erased below, so their bodies call through this ABI too.
+        for s in genericStructs.values { pending += s.methods.map(\.body) }
+        for e in genericEnums.values { pending += e.methods.map(\.body) }
+        for c in genericClasses.values { pending += c.methods.map(\.body) }
+        // A private generic that an erased body calls has no specialization to call: it is emitted erased too.
+        while let body = pending.popLast() {
+            var bound = Set<String>(), used: [String] = []
+            collectUses(body, &bound, &used)
+            for name in used {
+                guard let f = genericFuncs[name], erased.insert(name).inserted else { continue }
+                out.append(.funcDecl(f))
+                pending.append(f.body)
             }
         }
         // An erased body may hold a composed generic value (`Box<T>`) by buffer and access its fields
@@ -212,6 +230,7 @@ private final class Monomorphizer {
         case .whileStmt(let c, let body):         kind = .whileStmt(cond: rewriteExpr(c, s), body: body.map { rewriteStmt($0, s) })
         case .breakStmt:                          kind = .breakStmt
         case .continueStmt:                       kind = .continueStmt
+        case .fiberStart(let c):                  kind = .fiberStart(call: rewriteExpr(c, s))
         case .switchStmt(let sw):
             kind = .switchStmt(NOIRSwitch(subject: rewriteExpr(sw.subject, s),
                 arms: sw.arms.map { arm in NOIRCaseArm(caseName: arm.caseName,

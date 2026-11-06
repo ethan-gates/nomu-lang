@@ -202,7 +202,7 @@ private struct Scan {
 
     // The lexer's keywords. A keyword never lexes as an identifier, so it can't be a path component or alias.
     static let keywords: Set<String> = [
-        "on", "if", "in", "fun", "let", "var", "enum", "case", "else", "true", "class", "actor", "spawn",
+        "on", "if", "in", "fun", "let", "var", "enum", "case", "else", "true", "class", "actor", "fiber",
         "while", "break", "false", "struct", "switch", "return", "static", "continue", "interface", "extension",
     ]
 

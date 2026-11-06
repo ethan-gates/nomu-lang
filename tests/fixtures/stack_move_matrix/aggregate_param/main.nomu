@@ -1,0 +1,38 @@
+// A struct holding references, passed by value and read after a stop. The parameter arrives as one aggregate, and
+// reading a field later leaves the reference inside it at the stops between, where the statepoint rewrite does
+// not look.
+struct Pair {
+  var s: Array<Int>
+  var n: Int
+}
+fun churn(n: Int) -> Int {
+  var t = 0
+  var k = 0
+  while k < 25 {
+    let x = [n + k]
+    t = t + x[0]
+    k = k + 1
+  }
+  if n % 50 == 0 {
+    sleep(1)
+  }
+  return t
+}
+fun read(p: Pair) -> Int {
+  let t = churn(p.n)
+  return t - t + p.s[0]
+}
+fun main() {
+  var i = 0
+  var bad = 0
+  while i < 8000 {
+    let p = Pair(s: [i], n: i)
+    if read(p) != i {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

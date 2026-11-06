@@ -97,3 +97,20 @@ advantages in 194's comparison ([`internals/frames-designs.md`](../../internals/
 `src/stdlib/runtime/scheduler.nomu` (`nomuSchedSafepoint`, `rtSchedPick`'s slice);
 `src/llvmgen/SSAIRToLLVM.swift` (the loop-header poll); `src/llvmgen/LLVMGenRuntime.swift`
 (`emitSafepointPoll`); `runtime.md` §6 (safepoints); 234.3's results; `tools/schedbench.py`.
+
+## Open: the mechanism
+
+Preemption is likely required, and that is not decided yet. Until it is, work elsewhere must keep it within reach:
+nothing should be built that rules it out, or that makes it much harder. If it is built, the requirement is that every
+fiber reaches a stop within a bounded amount of work, at near-zero cost. Loop polls cost 29% on array loops (`horizon.md`, 245), which is enough to
+question keeping them. HotSpot is the leading model: a precise, moving collector with polls, which added loop strip
+mining for the same stalls. Go's signals rely on scanning the interrupted frame conservatively, which needs a
+non-moving heap.
+
+## Notes from 252
+
+- Large arguments pass through a frame-split wrapper by pointer, in a slot in an older frame whose references are not
+  recorded (`LargeValues.cpp`). That is sound while the stack check's slow path cannot collect. A stop added at the
+  check must skip wrappers, which the slow path can tell by a nonzero `need`, or record those slots.
+- A return hijack stops a fiber with its result in flight, which the caller's map does not describe: in registers, or
+  in the caller's slot for a large result. The stub would need the returning function's result layout.

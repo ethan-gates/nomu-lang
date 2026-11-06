@@ -1,0 +1,50 @@
+// `fiber f(x)` starts a detached fiber. On one carrier a fiber runs to completion when `main` parks, so the
+// output order is fixed. Arguments are evaluated at the statement, once, on the starting fiber.
+struct Counter {
+    var n: Int
+    fun show(extra: Int) {
+        print(n + extra)
+        print("\n")
+    }
+}
+
+fun show(n: Int) {
+    print(n)
+    print("\n")
+}
+
+fun value(n: Int) -> Int {
+    return n * 2
+}
+
+fun noted() -> Int {
+    print("evaluated\n")
+    return 7
+}
+
+fun pass() {
+    sleep(1)
+}
+
+fun main() {
+    var i = 1
+    fiber show(i)
+    i = 2                      // the fiber already has its argument
+    pass()
+    fiber show(noted())
+    print("started\n")
+    pass()
+    fiber value(3)             // the result is dropped
+    let c = Counter(n: 40)
+    fiber c.show(2)
+    pass()
+    var k = 0
+    while k < 3 {
+        if k == 1 {
+            fiber show(100 + k)
+        }
+        k = k + 1
+    }
+    pass()
+    print("done\n")
+}

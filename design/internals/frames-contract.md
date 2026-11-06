@@ -36,7 +36,7 @@ With 104 and 236, two more:
 
 | point | where | what |
 |---|---|---|
-| the stack check | function entry, before the frame is set up | grow (move) the stack; collect if growth allocates; preempt |
+| the stack check | before a function's first call on every path (104) | grow (move) the stack; collect if growth allocates; preempt |
 | the preemption request | the same check, and the loop-header poll | park, then any of the above |
 
 **R1. Every stopping point is known to the compiler,** and a call is a stopping point exactly when its
@@ -46,8 +46,9 @@ the runtime subset (149) can derive it.
 
 **The state at a stop.** The top frame is in the runtime. Every Nomu frame below it is suspended at a call,
 so its caller-saved registers are dead and its live values are in its frame or in callee-saved registers,
-which some frame above saved or the switch saved into the fiber's context buffer. The stack check is the
-exception: it runs at entry, before the frame exists, with the arguments live in argument registers.
+which some frame above saved or the switch saved into the fiber's context buffer. The stack check is no
+exception: it runs after the prologue, before the function's first call, and its slow path is an
+ordinary call (104, "Decided: the entry check").
 
 **Not stopping points.** A `gc-leaf` call; code in the runtime subset, which never polls or parks; a call
 into code Nomu does not own, which runs on the carrier's stack (104's libc rule) and returns before the
@@ -62,7 +63,7 @@ values of these kinds live across the stop:
 |---|---|---|
 | **H1** heap references | an `addrspace(1)` pointer to a managed object | the collector, when it moves the object |
 | **H2** shaped values | a value whose words are references only in some cases, decided by a tag in the value (`String`'s buffer word, an enum payload) (176) | the collector, conditionally |
-| **H3** interior heap pointers | an address inside a managed object | forbidden across a stop today (I12) |
+| **H3** interior heap pointers | an address inside a managed object | the collector, from its base: SSAIR's address operations are forbidden across a stop (I12); a raw pointer made by `nomu.raw.interior` is recorded with its base (G4) |
 | **S1** own-frame addresses | the address of something in this frame: a stack-promoted object, a value-aggregate slot, a shaped home, a struct-return or argument buffer, a shadow-stack node | the copier |
 | **S2** possibly-stack addresses | a pointer the frame received or loaded that may point into a caller's frame: a by-reference `self`, a struct-return pointer, an erased-generic buffer, a promoted object passed to a callee | the copier, when it points into the moved stack |
 | **S3** the frame chain | saved frame pointers and return addresses | the copier |
@@ -102,7 +103,9 @@ the user frames and have no records. The copier moves them with the rest; they m
 across their call into user code, or be described like any other frame.
 
 **R8. At the stack check, the arguments in registers are named** with their kinds (H1, H2, S2), since the
-check runs before the function has a frame to spill them into.
+check runs before the function has a frame to spill them into. Applies only to a check in the prologue.
+104 checks after the prologue against a reserve, where the arguments are recorded as at any call, so R8
+does not arise; it returns if the check moves into the prologue.
 
 ## What the language and runtime guarantee
 
@@ -115,13 +118,14 @@ These make the requirements sufficient. A mechanism may rely on them; each has a
   and receives fiber-stack addresses only for the duration of a call that cannot stop (104).
 - **G3. Runtime-subset code holds raw addresses only between stops,** since it never polls or parks; the
   frames that stay live across a stop are those of R7.
-- **G4. A raw pointer into managed or frame memory is never live across a stop, or is described.** This
-  does not hold today. `StringBase.bytePointer()` gives a `RawPtr` into a heap buffer or, for a small
-  string, a stack slot; `ManagedBuffer.headerPtr()` and `elementPtr(at:)` give interior pointers; all are
-  made by `ptrtoint`/`inttoptr`, so no mechanism sees them, and I12 checks only SSAIR's address operations.
-  `String.eq` holds two across its loop's poll and reads a moved buffer's old copy (reproduced: task
-  [246](../plans/tasks/246-raw-pointers-into-managed-memory.md)). Such pointers are H3 values (R4) or S1/S2
-  values (R5) under another type; whichever the mechanism chooses, the type must not hide them.
+- **G4. A raw pointer into managed or frame memory is never live across a stop, or is described.** It is
+  described: `StringBase.bytePointer()` (a heap buffer, immortal bytes, or a small string's stack slot),
+  `ManagedBuffer.headerPtr()` and `elementPtr(at:)`, and `__gcObjAddr` make their `RawPtr` with
+  `nomu.raw.interior(base, offset)`. The frame-address tracking turns it into a tracked base plus a
+  derived pointer, which the statepoint rewrite records as a (base, derived) pair; the walker roots the
+  base, a moving collection recomputes the derived pointer from it, and the copier adjusts both
+  ([246](../plans/tasks/246-raw-pointers-into-managed-memory.md).2). Runtime-subset code keeps plain
+  addresses (G3).
 
 ## What the toolchain must preserve
 

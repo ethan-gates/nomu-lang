@@ -28,8 +28,8 @@ fun tree(depth: Int, seed: Int) -> Int {
     if depth == 0 {
         return sleeper(seed: seed)
     }
-    spawn let a = tree(depth: depth - 1, seed: seed * 2)
-    spawn let b = tree(depth: depth - 1, seed: seed * 2 + 1)
+    fiber let a = tree(depth: depth - 1, seed: seed * 2)
+    fiber let b = tree(depth: depth - 1, seed: seed * 2 + 1)
     return a + b
 }
 

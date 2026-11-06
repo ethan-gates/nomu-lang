@@ -1,0 +1,24 @@
+import pkg/util
+
+fun show(o: Option<String>) {
+    switch o {
+    case .some(let v): print(v)
+    case .none: print("none")
+    }
+    print("\n")
+}
+
+fun main() {
+    let a = Q(count: 0, slot: .some(value: "literal"), seed: "s")
+    show(a.peek())
+    let b = Q(count: 0, slot: .none, seed: "s")
+    show(b.peek())
+    let c = Q<String>(count: 0, slot: .none, seed: "s")
+    show(c.peek())
+    let d: Empty<String> = Empty(count: 0, slot: .none)
+    print(d.has())
+    print("\n")
+    let e = Empty<Int>(count: 0, slot: .some(value: 5))
+    print(e.has())
+    print("\n")
+}

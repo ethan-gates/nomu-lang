@@ -44,9 +44,26 @@ enum EgressConcurrency {
     // Start `startFn(env)` on a fiber. The lifted `spawn:N(env: envClass) -> R` returns its result
     // directly, but the runtime's fiber routine ABI is `i8ptr(i8ptr)`, so wrap it in a per-spawn thunk
     // that re-manages the env pointer, calls the lifted body, boxes the result, and returns the box.
-    static func lowerSpawn(_ g: SSAIRToLLVM, binding: Int, startFn: String, env: SSAValue?, resultType: Type, span: Span) {
-        guard let start = g.e.callables["f:\(startFn)"], let resTy = g.ty(resultType, span) else {
+    // A detached fiber (nil `binding`) drops the result: its thunk returns null, and nothing boxes it.
+    static func lowerSpawn(_ g: SSAIRToLLVM, binding: Int?, startFn: String, env: SSAValue?, resultType: Type, span: Span) {
+        guard let start = g.e.callables["f:\(startFn)"] else {
             g.e.fail("7.2.3: unknown spawn body '\(startFn)'", span); return
+        }
+        guard let binding else {
+            let (thunk, _) = g.e.emitFunction("nomu_fiberthunk", ret: g.e.i8ptr, params: [g.e.i8ptr])
+            LLVMSetLinkage(thunk, LLVMInternalLinkage)
+            g.e.withStubBody(thunk) {
+                _ = g.e.buildCall(start.fn, start.ty, [LLVMGetParam(thunk, 0)!])
+                LLVMBuildRet(g.b, LLVMConstNull(g.e.i8ptr))
+            }
+            let spawn = g.e.runtimePreludeFn("nomuSchedSpawnDetached", ret: g.e.voidTy, params: [g.e.i8ptr, g.e.i8ptr, g.e.i8ptr])
+            let envArg = env != nil ? g.e.toUnmanaged(g.val(env!)) : LLVMConstNull(g.e.i8ptr)
+            let sched = g.e.loadRuntimeGlobal("rtSched", g.e.i8ptr)
+            _ = g.e.buildCall(spawn.fn, spawn.ty, [sched, thunk, envArg])
+            return
+        }
+        guard let resTy = g.ty(resultType, span) else {
+            g.e.fail("7.2.3: unknown spawn result", span); return
         }
         let (thunk, _) = g.e.emitFunction("nomu_spawnthunk_\(binding)", ret: g.e.i8ptr, params: [g.e.i8ptr])
         LLVMSetLinkage(thunk, LLVMInternalLinkage)   // referenced only from this spawn site

@@ -94,7 +94,7 @@ private func renderKind(_ kind: SSAInstKind) -> String {
     case .actorSend(let recv, let h, let args):
         return "send \(val(recv)).\(h)(\(list(args)))"
     case .spawn(let binding, let startFn, let env, _):
-        return "spawn #\(binding) \(startFn)" + (env.map { " env \(val($0))" } ?? "")
+        return "spawn \(binding.map { "#\($0)" } ?? "detached") \(startFn)" + (env.map { " env \(val($0))" } ?? "")
     case .spawnJoin(let binding, _, let fin):  return "spawnJoin #\(binding)" + (fin ? " final" : "")
 
     case .makeStruct(let t, let fields):       return "makeStruct \(t)(\(list(fields)))"

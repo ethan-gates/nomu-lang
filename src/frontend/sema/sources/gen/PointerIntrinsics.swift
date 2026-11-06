@@ -140,6 +140,17 @@ enum PointerIntrinsics {
             let src = ptrArg(&s, args[0].value, "RawPtr.copyBytes", "from")
             let cn = intArg(&s, args[1].value, "RawPtr.copyBytes", "byteCount")
             return s.ptrIntrinsic("__rawCopyBytes", .void, [recv, src, cn], span)
+        // memcmp(self, with, byteCount) — compare two raw byte ranges: negative, zero or positive as the first
+        // differing byte of `self` is lower, absent or higher. One gc-leaf call, so neither address is held
+        // across a safepoint (task 246: a byte loop polls at its header, and a pointer into a moved buffer or
+        // stack goes stale there).
+        case "compareBytes":
+            guard checkArgLabels(&s, args, ["with", "byteCount"], "RawPtr.compareBytes", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let other = ptrArg(&s, args[0].value, "RawPtr.compareBytes", "with")
+            let cn = intArg(&s, args[1].value, "RawPtr.compareBytes", "byteCount")
+            return s.ptrIntrinsic("__rawCompareBytes", .int, [recv, other, cn], span)
         case "load":
             guard checkArgLabels(&s, args, ["fromByteOffset"], "RawPtr.load", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))

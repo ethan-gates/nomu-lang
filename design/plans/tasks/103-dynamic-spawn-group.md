@@ -1,34 +1,21 @@
-# Dynamic fan-out spawn group
+# Fan-out helpers
 
-**Avenue:** Risk (high-concurrency thesis) · **Type/Lifecycle:** `language-feature · needs-design` ·
-**Size:** M · **Status:** designed (`concurrency.md` §8), sequenced after cancellation ·
-**Source:** `concurrency.md` §8 (dynamic spawn group)
+**Avenue:** Usability · **Type/Lifecycle:** `language-feature · needs-evidence` · **Size:** S ·
+**Status:** waiting on programs · **Source:** `concurrency.md` §8
 
 ## What
 
-The dynamic fan-out spawn group (`concurrency.md` §8) — runtime-sized structured concurrency (spawn
-an unbounded/data-driven number of children), beyond today's static `spawn let` fan-out.
+Dynamic fan-out is an array of tasks and a loop (`concurrency.md` §8), so nothing needs building for it. A
+library `Group` waits until programs show which need is common:
 
-## Why deferred
-
-Sequenced after [cancellation](135-cancellation-continuations.md) (decided 2026-08-10): it rides the
-structured-cancellation model for its fail-fast error mode. Its motivating use — benchmarking highly
-concurrent workloads — can wait, and static `spawn let` fan-out already ships.
+- results in completion order, today a shared channel passed to the workers;
+- stopping on first error, today a stop channel the workers check;
+- a concurrency limit, today a counted channel.
 
 ## Dependencies & triggers
 
-- **Depends on:** cancellation (fail-fast error mode).
-- **Carries:** [growable fiber stacks + syscall-free context switch](104-fiber-stack-strategy.md) ride on
-  this (decided 2026-08-14). Fixed 128 KiB stacks and `swapcontext`'s per-switch signal-mask syscall
-  only bite under massive fan-out — which this group is what creates. The GC-precision prerequisite
-  is already met (M9 statepoints + M6 parked-fiber scan). So those are perf-tail engineering gated on
-  this *workload*, measurable on this group's own benchmark the day they land.
-
-## How
-
-Per `concurrency.md` §8; fail-fast on first child error via the cancellation model.
+- **Depends on:** [250](250-fiber-task-surface.md) (`task`).
 
 ## Refs
 
-`concurrency.md` §8 (dynamic spawn group), §7 (cancellation);
-[fiber-stack-strategy](104-fiber-stack-strategy.md).
+`concurrency.md` §7, §8; [fiber-stack-strategy](104-fiber-stack-strategy.md).

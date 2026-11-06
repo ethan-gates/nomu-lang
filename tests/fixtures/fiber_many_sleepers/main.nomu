@@ -1,0 +1,14 @@
+// More fibers asleep at once than the timer heap starts with, so it grows while timers are pending.
+fun nap() {
+    sleep(50)
+}
+
+fun main() {
+    var i = 0
+    while i < 5000 {
+        fiber nap()
+        i = i + 1
+    }
+    sleep(100)
+    print("ok\n")
+}

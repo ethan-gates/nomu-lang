@@ -41,13 +41,14 @@ final class FunctionLowerer {
     private var loopStack: [LoopCtx] = []
     private var lastSpan: Span
 
-    // `spawn let` state. Each binding gets an egress-owned fiber handle keyed by `id`; reads join it,
+    // `fiber let` state. Each binding gets an egress-owned fiber handle keyed by `id`; reads join it,
     // and every scope exit (return / loop back-edge / break / continue) joins the spawns still active,
     // so a fiber never outlives its frame (structured concurrency). `spawnJoin` is idempotent.
     private var spawnBindings: [String: Int] = [:]     // spawn-let name → binding id
     private var spawnResultTypes: [Int: Type] = [:]    // binding id → result type
     private var activeSpawns: [Int] = []               // active binding ids, in spawn order
     private var nextSpawn = 0
+    private var fiberArgCounter = 0
 
     // In a method body, the receiver type + kind + its stored fields, so a bare `varRef` of a field
     // name (or `self`) resolves to a self-field access. `self` is registered as an ordinary variable
@@ -290,6 +291,9 @@ final class FunctionLowerer {
         case .spawnLet(let name, let value, let resultType):
             lowerSpawnLet(name: name, value: value, resultType: resultType, span: stmt.span)
 
+        case .fiberStart(let call):
+            lowerFiberStart(call, span: stmt.span)
+
         case .exprStmt(let e):
             _ = lowerExpr(e)
         }
@@ -304,16 +308,69 @@ final class FunctionLowerer {
         }
     }
 
-    // `spawn let name = value` — run `value` on a fiber. Its free variables are captured into an env
+    // `fiber f(x)` — a detached fiber over a call. The arguments and receiver are evaluated here, on the
+    // starting fiber, then captured; the call itself runs on the new fiber, and its result is dropped.
+    private func lowerFiberStart(_ call: NOIRExpr, span: Span) {
+        func hoist(_ e: NOIRExpr) -> NOIRExpr? {
+            switch e.kind {
+            case .intLit, .doubleLit, .boolLit, .stringLit, .funcRef, .globalRef: return e
+            default: break
+            }
+            guard let v = lowerExpr(e) else { return nil }
+            let name = "$fiber\(fiberArgCounter)"; fiberArgCounter += 1
+            bind(name, v, span)
+            return NOIRExpr(type: e.type, span: e.span, kind: .varRef(name))
+        }
+        var eager = call
+        switch call.kind {
+        case .call(let callee, let args, let typeArgs):
+            var out: [NOIRArg] = []
+            for a in args {
+                guard let v = hoist(a.value) else { return }
+                out.append(NOIRArg(label: a.label, value: v))
+            }
+            eager = NOIRExpr(type: call.type, span: call.span, kind: .call(callee: callee, args: out, typeArgs: typeArgs))
+        case .methodCall(let receiver, let method, let args):
+            guard let r = hoist(receiver) else { return }
+            var out: [NOIRExpr] = []
+            for a in args {
+                guard let v = hoist(a) else { return }
+                out.append(v)
+            }
+            eager = NOIRExpr(type: call.type, span: call.span, kind: .methodCall(receiver: r, method: method, args: out))
+        case .staticCall(let onType, let method, let args):
+            var out: [NOIRExpr] = []
+            for a in args {
+                guard let v = hoist(a) else { return }
+                out.append(v)
+            }
+            eager = NOIRExpr(type: call.type, span: call.span, kind: .staticCall(onType: onType, method: method, args: out))
+        default: break
+        }
+        startFiber(eager, resultType: call.type, binding: nil, span: span)
+    }
+
+    // `fiber let name = value` — run `value` on a fiber. Its free variables are captured into an env
     // (as for a closure); the body is lifted to `spawn:N(env) -> resultType`. The site starts the
     // fiber (`spawn`), and reads of `name` (plus scope exit) join it.
     private func lowerSpawnLet(name: String, value: NOIRExpr, resultType: Type, span: Span) {
+        let binding = nextSpawn; nextSpawn += 1
+        guard startFiber(value, resultType: resultType, binding: binding, span: span) else { return }
+        spawnResultTypes[binding] = resultType
+        activeSpawns.append(binding)
+        spawnBindings[name] = binding
+    }
+
+    // Lift `value` to `spawn:N(env)` and start it, capturing its free variables. `binding` keys the handle a
+    // joinable fiber keeps; a detached fiber has none.
+    @discardableResult
+    private func startFiber(_ value: NOIRExpr, resultType: Type, binding: Int?, span: Span) -> Bool {
         var used: [String] = []
         collectUsesExpr(value, [], &used)
         var seen = Set<String>()
         let capNames = used.filter { seen.insert($0).inserted && (slots[$0] != nil || varType[$0] != nil) }
         var caps: [(name: String, value: SSAValue)] = []
-        for n in capNames { guard let v = readVar(n, span) else { return }; caps.append((n, v)) }
+        for n in capNames { guard let v = readVar(n, span) else { return false }; caps.append((n, v)) }
 
         let id = sink.nextId; sink.nextId += 1
         let envName = "spawn.\(id).env"
@@ -342,11 +399,8 @@ final class FunctionLowerer {
             sink.lifted.append(lifted)
         }
 
-        let binding = nextSpawn; nextSpawn += 1
         emitVoid(.spawn(binding: binding, startFn: startName, env: env, resultType: resultType), span)
-        spawnResultTypes[binding] = resultType
-        activeSpawns.append(binding)
-        spawnBindings[name] = binding
+        return true
     }
 
     // `if cond { then } else { els }` → a condBr to fresh then/else blocks that both branch to a
@@ -610,6 +664,17 @@ final class FunctionLowerer {
             return nil
         }
 
+        // A residual generic in an erased body: the method's erased body, called with this frame's witnesses
+        // for the receiver's type arguments. A class receiver is the object; a value receiver its buffer.
+        if case .generic(let base, let typeArgs) = recvType {
+            guard let selfV = lowerExpr(receiver) else { return nil }
+            var argVals = [selfV]
+            for a in args { guard let v = lowerExpr(a) else { return nil }; argVals.append(v) }
+            let call = SSACall(kind: .direct(ModuleContext.methodSymbol(base, method)), args: argVals, typeArgs: typeArgs)
+            if type == .void { emitVoid(.call(call), span); return nil }
+            return emit(.call(call), type, span)
+        }
+
         guard case .named(let typeName, let kind) = recvType,
               kind == .struct_ || kind == .enum_ || kind == .class_ else {
             fail("unsupported method-call receiver", span)
@@ -682,10 +747,37 @@ final class FunctionLowerer {
         let addr = emit(.fieldAddr(base: base, fieldIndex: idx), type, span)
         // An erased `self` (a generic-type method, task 100.4.3.5.3) is a value buffer: a field access
         // yields the field's **address** — the T representation — never a loaded first-class value, the
-        // same convention `lowerFieldRead` uses for a `.generic` base (100.4.3.3.4).
-        if case .generic = base.type { return addr }
+        // same convention `lowerFieldRead` uses for a `.generic` base (100.4.3.3.4). A field of a concrete
+        // type is an ordinary value and loads.
+        if case .generic = base.type, heldByBuffer(type) { return addr }
         return emit(.load(addr), type, span)
     }
+
+    // Whether `v` is the newest instruction's result and a value that instruction built.
+    private func isFresh(_ v: SSAValue) -> Bool {
+        guard let last = bbs[curId]?.insts.last, last.result?.id == v.id else { return false }
+        switch last.kind {
+        case .makeStruct, .makeEnum, .call: return true
+        default: return false
+        }
+    }
+
+    // A generic class is a reference: in an erased body it is the managed object pointer, like `self`.
+    private func isGenericClass(_ t: Type) -> Bool {
+        if case .generic(let base, _) = t { return ctx.fields(base, .class_) != nil }
+        return false
+    }
+
+    // In an erased body a type parameter or a composed generic value is represented by a pointer to its bytes.
+    private func heldByBuffer(_ t: Type) -> Bool {
+        switch t {
+        case .typeParam: return true
+        case .generic: return !isGenericClass(t)
+        default: return false
+        }
+    }
+
+    private var addrOwner: SSAValue? = nil      // `structAddr`'s result: the heap object its address is inside
 
     private func selfFieldWrite(_ name: String, _ idx: Int, _ value: NOIRExpr, _ span: Span) {
         guard let base = selfBase() else { fail("no self for '\(name)'", span); return }
@@ -715,10 +807,12 @@ final class FunctionLowerer {
         // offset (offset 0 for the first field; a later field's VWT-derived offset is deferred). The T
         // value the field holds is itself represented by that buffer pointer.
         if case .generic(let baseName, _) = base.type {
-            guard let idx = ctx.fieldIndex(baseName, .struct_, field), let baseV = lowerExpr(base) else {
+            let kind: NamedKind = isGenericClass(base.type) ? .class_ : .struct_
+            guard let idx = ctx.fieldIndex(baseName, kind, field), let baseV = lowerExpr(base) else {
                 fail("field access '\(field)' on generic '\(baseName)'", span); return nil
             }
-            return emit(.fieldAddr(base: baseV, fieldIndex: idx), type, span)
+            let addr = emit(.fieldAddr(base: baseV, fieldIndex: idx), type, span)
+            return heldByBuffer(type) ? addr : emit(.load(addr), type, span)
         }
         guard case .named(let typeName, let kind) = base.type,
               let idx = ctx.fieldIndex(typeName, kind, field) else {
@@ -753,7 +847,7 @@ final class FunctionLowerer {
         // (task 100.4.3.3.4). Enum construction (`Opt.some(x)`) is deferred (tagged layout).
         if case .generic(let base, _) = type {
             guard let fields = ctx.fields(base, .struct_) else {
-                fail("100.4.3.3.4: constructing generic '\(base)' in an erased body is deferred (only struct-composed types are synthesized; enums pending)", span); return nil
+                fail("100.4.3.3.4: constructing generic '\(base)' in an erased body is deferred (only struct and enum types are synthesized)", span); return nil
             }
             var vals: [SSAValue] = []
             for f in fields {
@@ -887,7 +981,10 @@ final class FunctionLowerer {
 
     // Bind a name to a freshly-produced value. An aggregate goes into a new stack slot (store the
     // value in); a scalar (or reference) is tracked by SSA construction.
-    private func bind(_ name: String, _ value: SSAValue, _ span: Span) {
+    private func bind(_ name: String, _ source: SSAValue, _ span: Span) {
+        // A buffer-held value is a pointer that may be into a field: a binding owns a copy, so a later write
+        // to the field leaves it alone. A value just built has no other owner.
+        let value = heldByBuffer(source.type) && !isFresh(source) ? emit(.load(source), source.type, span) : source
         // A fresh binding replaces any earlier one of the SAME NAME by kind. Locals are name-keyed here
         // (no lexical-scope stack yet), so a name reused across sibling scopes as a different kind —
         // aggregate `let w = Wrap(...)` in one block, scalar `var w = 0` in another — would otherwise keep
@@ -913,7 +1010,17 @@ final class FunctionLowerer {
                 emitVoid(.store(addr: slot, value: v), span)   // whole-aggregate reassignment
             } else if varType[name] != nil {
                 guard let v = lowerExpr(value) else { return }
-                write(name, curId, v)                          // scalar / reference SSA rebinding
+                if heldByBuffer(v.type) {
+                    // The variable owns its buffer, so the bytes are copied in. An enum takes a new registered
+                    // copy: its roots follow the case it had when registered.
+                    if case .generic(let base, _) = v.type, ctx.enumCases[base] != nil {
+                        write(name, curId, isFresh(v) ? v : emit(.load(v), v.type, span))
+                    } else {
+                        emitVoid(.store(addr: read(name, curId), value: v), span)
+                    }
+                } else {
+                    write(name, curId, v)                      // scalar / reference SSA rebinding
+                }
             } else if let idx = selfFieldIndex(name) {
                 selfFieldWrite(name, idx, value, span)
             } else {
@@ -921,6 +1028,22 @@ final class FunctionLowerer {
             }
 
         case .fieldAccess(let base, let field):
+            // A residual generic in an erased body: the field's address comes from the backend's derived
+            // offset, past the header for a class. A class write takes the barrier.
+            if case .generic(let baseName, _) = base.type {
+                let isClass = isGenericClass(base.type)
+                addrOwner = nil
+                guard let idx = ctx.fieldIndex(baseName, isClass ? .class_ : .struct_, field),
+                      let baseV = isClass ? lowerExpr(base) : (structAddr(base) ?? lowerExpr(base)) else {
+                    fail("field assignment '\(field)' on generic '\(baseName)'", span); return
+                }
+                let owner = isClass ? baseV : addrOwner
+                let addr = emit(.fieldAddr(base: baseV, fieldIndex: idx), value.type, span)
+                guard let v = lowerExpr(value) else { return }
+                if let owner { emitVoid(.writeBarrier(object: owner, value: v), span) }
+                emitVoid(.store(addr: addr, value: v), span)
+                return
+            }
             guard case .named(let typeName, let kind) = base.type,
                   let idx = ctx.fieldIndex(typeName, kind, field) else {
                 fail("field assignment on a non-aggregate '\(field)'", span); return
@@ -929,9 +1052,12 @@ final class FunctionLowerer {
                 guard let baseAddr = structAddr(base) else {
                     fail("struct field assignment needs an addressable base", span); return
                 }
+                let owner = addrOwner
                 let addr = emit(.fieldAddr(base: baseAddr, fieldIndex: idx), value.type, span)
                 guard let v = lowerExpr(value) else { return }
-                emitVoid(.store(addr: addr, value: v), span)   // struct slot: stack, no barrier
+                // A struct in a slot takes no barrier; one inside a heap object is a store into that object.
+                if let owner { emitVoid(.writeBarrier(object: owner, value: v), span) }
+                emitVoid(.store(addr: addr, value: v), span)
             } else {
                 guard let ptr = lowerExpr(base) else { return }   // class/actor: the managed pointer
                 let addr = emit(.fieldAddr(base: ptr, fieldIndex: idx), value.type, span)
@@ -948,20 +1074,33 @@ final class FunctionLowerer {
     // The address of a struct lvalue (its slot, or a `fieldAddr` chain into one), or nil when the
     // expression is an rvalue struct with no address (a temporary, or a by-value param). Non-failing,
     // so callers can fall back to the value form; the assignment path reports the error itself.
+    // Sets `addrOwner` to the heap object the address is inside, if the chain passes through one.
     private func structAddr(_ e: NOIRExpr) -> SSAValue? {
         switch e.kind {
         case .varRef(let name):
+            addrOwner = nil
             if let slot = slots[name] { return slot }
             if let idx = selfFieldIndex(name), let base = selfBase() {
+                if isReferenceSelf { addrOwner = base }
                 return emit(.fieldAddr(base: base, fieldIndex: idx), e.type, e.span)
             }
             return nil
         case .fieldAccess(let base, let field):
-            guard case .named(let typeName, let kind) = base.type,
-                  let idx = ctx.fieldIndex(typeName, kind, field) else { return nil }
+            let idx: Int?, inClass: Bool
+            switch base.type {
+            case .named(let typeName, let kind):
+                idx = ctx.fieldIndex(typeName, kind, field); inClass = kind != .struct_
+            case .generic(let baseName, _):
+                inClass = isGenericClass(base.type)
+                idx = ctx.fieldIndex(baseName, inClass ? .class_ : .struct_, field)
+            default:
+                return nil
+            }
+            guard let idx else { return nil }
             // A struct nested in a struct GEPs into the same slot; a struct behind a class pointer
             // GEPs off the loaded pointer.
-            guard let ba = (kind == .struct_ ? structAddr(base) : lowerExpr(base)) else { return nil }
+            guard let ba = (inClass ? lowerExpr(base) : structAddr(base)) else { return nil }
+            if inClass { addrOwner = ba }
             return emit(.fieldAddr(base: ba, fieldIndex: idx), e.type, e.span)
         default:
             return nil

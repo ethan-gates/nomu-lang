@@ -7,7 +7,7 @@ on its own terms.
 
 **Decisions (2026-08-03).** One pre-tested `while` loop (no `loop`/`repeat` alternate form);
 `break` + `continue` (innermost only, no labels); `for … in` deferred until a Range/iterator
-surface exists; spawn-in-loop joins **per-iteration** for now, with an open design question below.
+surface exists; spawn-in-loop joins **per-iteration** for now, until `fiber let` is removed.
 Keywords added: **`while`, `break`, `continue`**.
 
 Guiding principle (from `syntax.md`): **one canonical way to write each thing.** Resist a second
@@ -71,45 +71,11 @@ Everything below assumes this proposal; alternatives are in **Open questions**.
   boundary. The existing mutation inference and `shareable` checks apply to the body as to any
   block.
 
-### Structured concurrency inside a loop (working decision + open question)
+### Concurrency inside a loop
 
-A `spawn let` in a loop body starts a child fiber. Structured concurrency guarantees a child
-does not outlive its scope; the child's scope here is **the iteration**, not the whole loop.
-**Working decision (2026-08-03): per-iteration join.**
-
-- **Spawns declared in the loop body join at each iteration boundary** — at the back-edge
-  (`continue` / normal fall-through to the next iteration) and at `break`, and of course at
-  normal loop exit.
-
-This differs from the current lowering, which joins active spawns at **function exit** and on
-read (`Lowering.swift` `joinActiveSpawns`). Loops require **block-scoped joins**: the set of
-spawns created within the body must be joined before the back-edge, then the active-spawn set
-restored to what it was on entry. This is the main implementation coupling between loops and
-existing runtime semantics — it extends the join model rather than fitting the current one. (The
-same block-scoped-join gap technically exists for `if`/`switch` bodies too, but is invisible
-there because control leaves the block exactly once; a loop re-enters, which forces the issue.)
-
-**Open design question — keep open; enumerate use cases before locking.** Per-iteration join is
-the sound default but has a sharp edge: it makes a *value-producing* spawn read within the
-iteration overlap correctly (spawn `f()`, do other work, read the result — join at the read),
-while making a *void, fire-and-forget* spawn pointless (joining it at the back-edge serializes
-the very work you spawned to overlap). Two consequences to settle:
-
-1. **An unread spawn binding should be a compile error** (proposed 2026-08-03). `spawn let r =
-   work()` where `r` is never read in its scope is almost certainly a mistake — today it merely
-   joins at scope exit. Requiring a read makes the language express only the case per-iteration
-   join serves well (overlap-then-consume). Scope of the rule (loops only vs. everywhere) is TBD.
-2. **Void / side-effecting fire-and-forget** (overlap a side effect across iterations) is then
-   *not* expressible as `spawn let` (no value to read) and needs its own treatment — a distinct
-   bare-`spawn` form with different (non-per-iteration) lifetime, or deferral. Likewise true
-   cross-iteration **fan-out** (N parallel children joined after the loop) is a separate future
-   construct, not a side effect of `while`.
-
-The through-line (per the performance/soundness directive): pick the lowering that makes each
-concrete use case behave the way the author expects. Land per-iteration join now to keep loops
-sound and shippable; resolve the fire-and-forget / fan-out spellings as their own design pass.
-
----
+A fiber or task started in a loop body has no join tied to the iteration (`concurrency.md` §8). `fiber f(i)`
+overlaps across iterations, and fan-out is an array of tasks joined after the loop. Until `fiber let` is
+removed, its binding joins at the back-edge, at `break`, at `continue` and at the end of its block.
 
 ## Sema / typing
 
@@ -202,12 +168,4 @@ not GC. Recommended order: **loops (this doc) → 8.4.0 spike → 8.4.1–8.4.4.
 - **`for … in` timing** — **Decided: deferred** until a Range/iterator surface exists (post-GC
   stdlib). `while`-only in the interim; `in` stays reserved.
 - **Labeled / multi-level break** — **Decided: no.** Innermost-only; additive later if needed.
-- **Loop-body spawn lifetime** — **Working decision: per-iteration join** (see "Structured
-  concurrency" above).
-
-## Still open
-
-- **Spawn-in-loop use cases** — kept open. Resolve (a) whether an *unread* spawn binding is a
-  compile error and at what scope, and (b) the spelling/lifetime for void fire-and-forget and
-  cross-iteration fan-out — as their own design pass, before those cases are locked. Per-iteration
-  join lands now so loops ship sound; these do not block loop implementation.
+- **Fibers in a loop body** — no join tied to the iteration (see "Concurrency inside a loop" above).

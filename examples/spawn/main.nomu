@@ -1,4 +1,4 @@
-// Structured concurrency (M3): `spawn let` runs a computation on its own OS thread;
+// Structured concurrency (M3): `fiber let` runs a computation on its own OS thread;
 // reading the binding joins (blocks until done). Children can't outlive the scope —
 // any unread spawn is joined at block exit.
 
@@ -6,9 +6,9 @@ fun sq(n : Int) -> Int{return n * n}
 
 fun main() {
     let base = 10
-    spawn let a = sq(3) // 9,  concurrent
-    spawn let b = sq(4)           // 16, concurrent
-    spawn let c = base + 5          // 15, captures base by value
+    fiber let a = sq(3) // 9,  concurrent
+    fiber let b = sq(4)           // 16, concurrent
+    fiber let c = base + 5          // 15, captures base by value
     print(a + b)                    // 25 (joins a and b)
     print(c)        // 15 (joins c)
 }

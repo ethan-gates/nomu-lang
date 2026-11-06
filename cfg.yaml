@@ -17,6 +17,8 @@ configs:
   measure_no_loop_polls: null
   measure_gc_regs: null
   measure_no_frame_split: null
+  measure_no_stack_checks: null
+  measure_libc_direct: null
 opt:
   mono mono_all: all
   mono mono_edge: edge
@@ -45,3 +47,7 @@ measure measure_gc_regs:
   gc_value_regs: "8"
 measure measure_no_frame_split:
   no_frame_split: true
+measure measure_no_stack_checks:
+  no_stack_checks: true
+measure measure_libc_direct:
+  libc_direct: true

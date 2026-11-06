@@ -1,0 +1,20 @@
+// Type arguments at construction: explicit, from an annotation, and from the other fields, for imported generics.
+package class Q<T> {
+    var count: Int
+    var slot: Option<T>
+    var seed: T
+    fun peek() -> Option<T> {
+        return slot
+    }
+}
+
+package class Empty<T> {
+    var count: Int
+    var slot: Option<T>
+    fun has() -> Bool {
+        switch slot {
+        case .some(let v): return true
+        case .none: return false
+        }
+    }
+}

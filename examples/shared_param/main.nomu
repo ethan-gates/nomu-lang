@@ -8,7 +8,7 @@ struct Pair {
 }
 
 fun onTask<shared T>(x: T) -> T {
-    spawn let r = x        // ok: T is `shared`, so it may cross the task boundary
+    fiber let r = x        // ok: T is `shared`, so it may cross the task boundary
     return r
 }
 
@@ -37,6 +37,6 @@ fun main() {
 // ── Without the `shared` bound, the body can't forward T across the boundary ──
 //
 // fun leaky<T>(x: T) -> T {
-//     spawn let r = x     // error: 'x' has type 'T' which cannot cross a task boundary
+//     fiber let r = x     // error: 'x' has type 'T' which cannot cross a task boundary
 //     return r
 // }

@@ -62,8 +62,8 @@ private struct RuntimeSubsetPass {
     private func walkStmt(_ s: NOIRStmt, inFn: String) {
         switch s.kind {
         case .letBinding(_, _, let v): walkExpr(v, inFn: inFn)
-        case .spawnLet(_, let v, _):
-            diags.error("runtime-subset function '\(inFn)' may not 'spawn' — it allocates a task", at: s.span)
+        case .spawnLet(_, let v, _), .fiberStart(let v):
+            diags.error("runtime-subset function '\(inFn)' may not start a 'fiber' — it allocates a task", at: s.span)
             walkExpr(v, inFn: inFn)
         case .assign(let t, let v), .compoundAssign(let t, let v):
             walkExpr(t, inFn: inFn); walkExpr(v, inFn: inFn)

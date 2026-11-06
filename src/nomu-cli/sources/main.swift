@@ -72,7 +72,31 @@ case .error(let message):
     fputs(message, stderr)
     exit(1)
 case .run(let args):
-    dispatch(args)
+    runOnLargeStack { dispatch(args) }
+}
+
+// Run `body` on a thread with a 1 GiB stack and wait for it; `body` ends the process. The compiler's passes
+// recurse over the program's trees (one level per nested expression, several KiB a level in type checking),
+// which overflows the main thread's 8 MB at about a thousand levels. The stack is reserved address space;
+// pages are committed only as they are touched.
+func runOnLargeStack(_ body: @escaping () -> Void) -> Never {
+    final class Box { let body: () -> Void; init(_ body: @escaping () -> Void) { self.body = body } }
+    var attr = pthread_attr_t()
+    pthread_attr_init(&attr)
+    pthread_attr_setstacksize(&attr, 1 << 30)
+    var thread: pthread_t? = nil
+    let arg = Unmanaged.passRetained(Box(body)).toOpaque()
+    let rc = pthread_create(&thread, &attr, { raw in
+        Unmanaged<Box>.fromOpaque(raw).takeRetainedValue().body()
+        return nil
+    }, arg)
+    pthread_attr_destroy(&attr)
+    if rc != 0 {
+        Unmanaged<Box>.fromOpaque(arg).takeRetainedValue().body()
+        exit(0)
+    }
+    pthread_join(thread!, nil)
+    exit(0)
 }
 
 func dispatch(_ args: Parsed) {

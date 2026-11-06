@@ -393,7 +393,8 @@ public typealias Block = [Stmt]
 
 public enum Stmt {
     case binding(BindingStmt)
-    case spawnLet(name: String, type: TypeRef?, value: Expr, span: Span)  // spawn let x = expr
+    case spawnLet(name: String, type: TypeRef?, value: Expr, span: Span)  // fiber let x = expr
+    case fiberStart(call: Expr, span: Span)                               // fiber f(x)
     case assign(lhs: Expr, rhs: Expr, span: Span)
     case compoundAssign(lhs: Expr, rhs: Expr, span: Span)  // +=
     case ret(Expr?, span: Span)

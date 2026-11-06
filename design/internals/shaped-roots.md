@@ -373,3 +373,16 @@ Stage 1 site 2 (object-field recursion) is in the first cut, not deferred.
   string — Stage 5 zero-scan safety), `immortal = 1`, `heap = 2`. The managed pointer (`word0`) is clean and
   untagged, so relocate needs no masking. (The descriptor is shift-only, no mask field, because the tag sits
   at the top of the word; a future shaped type with a mid-word tag would add a mask.)
+
+## Records and inlining
+
+LLVM's inliner merges a call's `deopt` bundle only into inner calls that already have one, so an inner call with none
+would stop with the outer call's roots unrecorded. `nomu-bundle-calls` (`src/llvmpasses/CallBundles.cpp`) gives every
+call that can stop an empty bundle before any inlining. A bundle stops tail recursion elimination, so release runs
+that pass first.
+
+## References in aggregates
+
+`rewrite-statepoints-for-gc` tracks pointers only, so a first-class aggregate holding a reference and live across a
+stop would go unrecorded. `nomu-split-reference-aggregates` (`src/llvmpasses/ReferenceAggregates.cpp`) reads such
+references out as pointers where the aggregate is defined. A shaped word is an `i64` and stays with its home.

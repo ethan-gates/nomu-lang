@@ -77,6 +77,15 @@ enum NOIRGen {
             s.declare(name, v.type)   // reading a spawn binding yields its result value
             return NOIRStmt(kind: .spawnLet(name: name, value: v, resultType: v.type), span: span)
 
+        case .fiberStart(let call, let span):
+            guard case .call = call else {
+                s.diags.error("'fiber' takes a call", at: span)
+                return NOIRStmt(kind: .exprStmt(checkExpr(&s, call)), span: span)
+            }
+            let c = checkExpr(&s, call)
+            checkFiberArgs(&s, c, span)
+            return NOIRStmt(kind: .fiberStart(call: c), span: span)
+
         case .assign(let lhs, let rhs, let span):
             // Array subscript write `a[i] = x` — reference semantics (mutates the shared buffer, so a
             // `let`-bound array is fine, like a class field). Lowered to a builtin call codegen handles.
@@ -233,6 +242,20 @@ enum NOIRGen {
         case .expr(let e):
             let ir = checkExpr(&s, e)
             return NOIRStmt(kind: .exprStmt(ir), span: ir.span)
+        }
+    }
+
+    // What `fiber f(x)` hands to the new fiber crosses a task boundary, so it must be shareable.
+    static func checkFiberArgs(_ s: inout Sema, _ call: NOIRExpr, _ span: Span) {
+        var crossing: [NOIRExpr] = []
+        switch call.kind {
+        case .call(_, let args, _):            crossing = args.map(\.value)
+        case .methodCall(let recv, _, let args): crossing = [recv] + args
+        case .staticCall(_, _, let args):      crossing = args
+        default: break
+        }
+        for e in crossing where e.type != .error && !s.isShareable(e.type) {
+            s.diags.error("type '\(e.type)' is not shareable, so it cannot be passed to a 'fiber'", at: span)
         }
     }
 
@@ -994,7 +1017,7 @@ enum NOIRGen {
             // Construction of a generic type — infer the type arguments from the fields (M5 5.2.3).
             if s.genericArity(name) != nil {
                 if let (vis, file) = s.typeVisibility(name) { s.checkVisible(name, vis, declaredIn: file, at: span) }
-                return GenericInference.checkGenericConstruct(&s, name, args, at: span)
+                return GenericInference.checkGenericConstruct(&s, name, args, expected: expected, at: span)
             }
             // Construction: TypeName(...) for struct/class/actor. Thread each field's declared type
             // in as the expected type of its argument (matched by label, else by position), so a
@@ -1029,10 +1052,18 @@ enum NOIRGen {
         }
 
         // Generic construction with explicit type arguments: `Box<Int>(value: 3)`.
-        if case .genericIdent(let name, let refs, _) = callee {
+        if case .genericIdent(let written, let refs, _) = callee {
             let explicit = refs.map { s.resolve($0) }
+            var name = written
+            if s.kindOf(name) == nil, s.funcs[name] == nil, s.genericArity(name) == nil {
+                switch s.externalKeyForBare(name, at: span) {
+                case .key(let k): name = k
+                case .error: return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+                case .notExternal: break
+                }
+            }
             if GenericInference.genericTypeShape(&s, name) != nil {
-                return GenericInference.checkGenericConstruct(&s, name, args, explicit: explicit, at: span)
+                return GenericInference.checkGenericConstruct(&s, name, args, explicit: explicit, expected: expected, at: span)
             }
             if s.enums[name] != nil {
                 s.diags.error("generic enum '\(name)' is constructed through a case, e.g. '\(name)<...>.case(...)'", at: span)
@@ -1521,7 +1552,7 @@ enum NOIRGen {
             let ret = s.resolve(h.returnType)
             // Actors are fire-and-forget message-send only (§9): a handler is a one-way message
             // sink and cannot return a value to the sender. There is no reply/ask mechanism; a value
-            // from concurrent work comes from a `spawn let` result or a channel, not an actor.
+            // from concurrent work comes from a `fiber let` result or a channel, not an actor.
             if ret != .void {
                 s.diags.error("an actor 'on' handler cannot return a value — actor messages are fire-and-forget (a handler is a one-way message sink). To get a value from concurrent work, use a spawned task's result or a channel, not an actor", at: h.span)
             }

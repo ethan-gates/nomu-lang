@@ -1,0 +1,21 @@
+import pkg/util
+
+fun main() {
+    let q: Q<Int> = Q(count: 0, slot: 0, tail: 5)
+    q.bump(4)
+    q.bump(9)
+    print(q.count)
+    print(" ")
+    print(q.get())
+    print(" ")
+    print(q.tail)
+    print("\n")
+    let s: Q<String> = Q(count: 0, slot: "a", tail: 1)
+    s.bump("a string longer than fifteen bytes")
+    print(s.get())
+    print(" ")
+    print(s.count)
+    print(" ")
+    print(s.tail)
+    print("\n")
+}

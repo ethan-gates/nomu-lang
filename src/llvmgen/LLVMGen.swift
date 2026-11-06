@@ -10,7 +10,7 @@ import LLVM_C
 enum AggKind { case structVal, classRef }
 
 // A captured local: its name and the (addr, ty) slot it lives in in the enclosing scope. Shared by
-// closures and `spawn let`, which both copy free variables by value into a heap env.
+// closures and `fiber let`, which both copy free variables by value into a heap env.
 typealias Capture = (name: String, local: (addr: LLVMValueRef, ty: LLVMTypeRef))
 
 // A declared LLVM function: its value ref, function type, the source IR its body lowers from, and
@@ -243,6 +243,11 @@ final class LLVMGen {
     var measureNoStatepoints = false
     var measureNoShapedHomes = false
     var measureNoLoopPolls = false
+    var measureNoStackChecks = false
+    var measureLibcDirect = false        // `measure.libc_direct`: libc calls skip the stack switch
+    // Functions whose address `Runtime.ofFunc` takes: entries a thread, a fiber or a signal starts in, which no
+    // indirect call in Nomu code reaches (`FrameTable.entries`).
+    var runtimeEntries: Set<String> = []
     // The `full` recording level (`gc.record: full`): the inline allocation hit path counts each object and
     // its bytes in the carrier record's TLAB (`allocObjects` @48, `allocBytes` @56).
     var countsAllocations = false

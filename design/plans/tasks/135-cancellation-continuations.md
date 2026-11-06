@@ -1,40 +1,21 @@
-# Cancellation + one-shot continuations
+# One-shot continuations
 
 **Avenue:** Risk (concurrency thesis) · **Type/Lifecycle:** `language-feature · needs-design` ·
-**Size:** L · **Status:** designed in `concurrency.md`, unbuilt · **Source:** `concurrency.md` §3, §6, §7
+**Size:** M · **Status:** designed in `concurrency.md`, unbuilt · **Source:** `concurrency.md` §3, §6
 
 ## What
 
-The concurrency-completion core:
-- **Safepoint-automatic cancellation** — cancellation that propagates on the M6 safepoints already
-  emitted, reaching parked children (structured-scope cancellation propagation).
-- **The checked one-shot continuation** — a resume-once suspension primitive. Resume-once is
-  enforced by linear types (see [`defer` + linear types](101-defer-linear-types.md)).
+The checked one-shot continuation: a resume-once suspension primitive, which `select` rides
+(`concurrency.md` §4). Resume-once is checked at runtime.
 
-These two are tightly coupled — the continuation's resume-once discipline and cancellation both ride
-the structured-concurrency model — so they share one task.
-
-## Why deferred
-
-The M:N runtime (M4) and the async actor runtime (M6 §9) are the substrate; cancellation and
-continuations sit on top, sequenced with the concurrency-completion work. The safepoint infrastructure they need
-(precise stack maps + parked-fiber scan) landed with M9/M6.
+Cancellation left this task: it is a convention over channels, with no language or runtime concept
+(`concurrency.md` §7).
 
 ## Dependencies & triggers
 
-- **Ready:** M6 safepoints, the async actor runtime, structured spawn/scope, M9 statepoints.
-- **Needs:** linear types (resume-once + resource cleanup) — the [`defer` + linear types](101-defer-linear-types.md)
-  task is the first hard requirement for linear types and pairs with this.
-- **Feeds:** the [dynamic spawn group](103-dynamic-spawn-group.md) rides this cancellation model for its
-  fail-fast error mode (decided 2026-08-10).
-
-## How
-
-- Cancellation checks at existing safepoints; propagate a cancel flag down the structured scope to
-  parked children; define the cancellation semantics precisely (owed to [105 hardening](105-concurrency-hardening.md)).
-- The continuation as a checked one-shot: linear typing makes double-resume a compile error.
+- **Ready:** the M:N runtime, safepoints, the async actor runtime.
+- **Feeds:** `select` in [channels](102-channels.md).
 
 ## Refs
 
-`concurrency.md` §7 (cancellation), §8 (structured scope), §9 (actor runtime); `runtime.md` §6
-(safepoints, parked-fiber scan).
+`concurrency.md` §3 (continuations), §4 (`select`), §7 (cancellation); `runtime.md` §3.

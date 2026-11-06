@@ -34,3 +34,15 @@ swift_test(
     ],
     deps = [":driver"],
 )
+
+# The link's frame check (task 104): unchecked call chains against the stack reserve, from each object's table.
+swift_test(
+    name = "frame_table_tests",
+    srcs = ["tests/FrameTableTests.swift"],
+    copts = [
+        "-cxx-interoperability-mode=default",
+        "-Xcc",
+        "-std=c++17",
+    ],
+    deps = [":driver"],
+)

@@ -32,7 +32,7 @@ fun show(s: String) {
 }
 
 fun main() {
-  spawn let t = ticker()
+  fiber let t = ticker()
   show(readLine())
   show(readLine())
   show(readLine())

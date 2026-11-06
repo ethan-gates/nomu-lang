@@ -43,8 +43,8 @@ fun main() {
     st.store(RawPtr.null, toByteOffset: 16)
     let t = Time()
     let t0 = t.now
-    spawn let a = player(st, 0, n)
-    spawn let b = player(st, 1, n)
+    fiber let a = player(st, 0, n)
+    fiber let b = player(st, 1, n)
     let hops = a + b
     print("pingpong_fiber hops ")
     print(hops)

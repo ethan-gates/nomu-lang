@@ -145,15 +145,15 @@ fun main() {
     }
     let t = Time()
     let t0 = t.now
-    spawn let c0 = consumer(st, 0)
-    spawn let c1 = consumer(st, 1)
-    spawn let c2 = consumer(st, 2)
-    spawn let c3 = consumer(st, 3)
-    spawn let c4 = consumer(st, 4)
-    spawn let c5 = consumer(st, 5)
-    spawn let c6 = consumer(st, 6)
-    spawn let c7 = consumer(st, 7)
-    spawn let p = producer(st, 20000, 25000)
+    fiber let c0 = consumer(st, 0)
+    fiber let c1 = consumer(st, 1)
+    fiber let c2 = consumer(st, 2)
+    fiber let c3 = consumer(st, 3)
+    fiber let c4 = consumer(st, 4)
+    fiber let c5 = consumer(st, 5)
+    fiber let c6 = consumer(st, 6)
+    fiber let c7 = consumer(st, 7)
+    fiber let p = producer(st, 20000, 25000)
     let x = p
     let ns = t.ns_diff(t0, t.now)
     let total = c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7

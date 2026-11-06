@@ -1,0 +1,29 @@
+// Deep recursion on several fibers at once: each stack grows by moving, many times, while its frames hold
+// managed objects and the fibers park at the bottom. Every frame's object must survive the moves for the
+// sums to come out right (task 104).
+class Box {
+  var v: Int
+}
+
+fun down(n: Int, b: Box) -> Int {
+  if n == 0 {
+    sleep(1)
+    return b.v
+  }
+  let c = Box(v: b.v + 1)
+  return b.v + down(n - 1, c)
+}
+
+fun main() {
+  fiber let a = down(100000, Box(v: 0))
+  fiber let b = down(200000, Box(v: 0))
+  fiber let c = down(300000, Box(v: 0))
+  print(down(50000, Box(v: 0)))
+  print("\n")
+  print(a)
+  print("\n")
+  print(b)
+  print("\n")
+  print(c)
+  print("\n")
+}
