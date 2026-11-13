@@ -59,7 +59,12 @@ struct Expect: Decodable {
     // The status the run must exit with, for a case that fails on purpose without a signal (a deadlock, a fiber
     // dump on SIGQUIT); absent, 0.
     var exitCode: Int32? = nil
-    enum CodingKeys: String, CodingKey { case stdout, stdoutFile = "stdout_file", signal, exitCode = "exit_code" }
+    // The most resident memory the run may reach, in MiB (its peak RSS), for a case that guards a footprint:
+    // a collector pass that strays over the heap's whole reservation shows here.
+    var maxResidentMiB: Int? = nil
+    enum CodingKeys: String, CodingKey {
+        case stdout, stdoutFile = "stdout_file", signal, exitCode = "exit_code", maxResidentMiB = "max_resident_mib"
+    }
 }
 
 // The signal named `name` (`SIGSEGV`), or nil for a name the harness does not know.

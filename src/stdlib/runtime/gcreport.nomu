@@ -253,8 +253,9 @@ fun rtGcFaultReport(buf: RawPtr, n: Int) -> Int {
 // The collector calls these hooks; each is empty unless `gc.record` is on, so with it off they fold away in
 // the release-built runtime. Ids, which the report names:
 //   cycle kinds: 1 minor, 2 major.
-//   triggers:    0 none recorded, 1 nursery full, 2 mature floor (a minor escalated to a major), 3 heap
-//                exhausted, 4 allocation stress, 5 a request from the program (rtGcRequest, white-box tests).
+//   triggers:    0 none recorded, 1 nursery full, 2 mature full (a minor escalated to a major), 3 heap
+//                exhausted, 4 allocation stress, 5 a request from the program (rtGcRequest, white-box tests),
+//                6 large objects (one would take mature space past its limit).
 //   phases:      1 time to safepoint (the request to the collector's entry, with every carrier stopped),
 //                2 root walk, 3 remembered-set drain, 4 stack roots, 5 remembered set, 6 large objects,
 //                7 scan, 8 unmark and unlog, 9 nursery reclaim, 10 source selection, 11 prepare, 12 trace,
@@ -402,10 +403,10 @@ fun rtGcRecordLargeObject(bytes: Int) {
 fun rtGcRecordSnapshot(rec: RawPtr) {
   let start = rtRecOpen(rec, 17)
   let space = rtSpace
-  let nb: Int = space.load(fromByteOffset: 8)
+  let nb = rtHeapCap(space)                     // the heap's size: L and the nursery
   let used: Int = space.load(fromByteOffset: 32)
   let tbl: RawPtr = space.load(fromByteOffset: 24)
-  var free = nb - used
+  var free = rtNeverUsedBelowCap(space)
   var recyclable = 0
   var full = 0
   var nursery = 0
@@ -594,10 +595,11 @@ fun rtGcName(at: RawPtr, table: Int, id: Int) -> Int {
   } else if table == 2 {
     if id == 0 { n = Runtime.copyLiteral(to: at, "none") }
     else if id == 1 { n = Runtime.copyLiteral(to: at, "nursery full") }
-    else if id == 2 { n = Runtime.copyLiteral(to: at, "mature floor") }
+    else if id == 2 { n = Runtime.copyLiteral(to: at, "mature full") }
     else if id == 3 { n = Runtime.copyLiteral(to: at, "heap exhausted") }
     else if id == 4 { n = Runtime.copyLiteral(to: at, "allocation stress") }
     else if id == 5 { n = Runtime.copyLiteral(to: at, "program request") }
+    else if id == 6 { n = Runtime.copyLiteral(to: at, "large objects") }
   } else if table == 3 {
     if id == 1 { n = Runtime.copyLiteral(to: at, "time to safepoint") }
     else if id == 2 { n = Runtime.copyLiteral(to: at, "root walk") }
@@ -643,7 +645,7 @@ fun rtGcPutNames(buf: RawPtr) {
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "\"names\":{\"kinds\":{"))
   rtGcPutNameList(buf, 1, 1, 2)
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"triggers\":{"))
-  rtGcPutNameList(buf, 2, 0, 5)
+  rtGcPutNameList(buf, 2, 0, 6)
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"phases\":{"))
   rtGcPutNameList(buf, 3, 1, 18)
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"counters\":{"))

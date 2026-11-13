@@ -1,0 +1,41 @@
+// Fiber stacks count toward the heap limit (heap sizing, immix.nomu): 50,000 fibers park on a channel while
+// main churns objects that survive a minor and then die, over a small live set. Counting the parked stacks
+// raises L: at most 5 majors run, where the same churn with no fibers parked runs 10.
+class Box {
+    var v: Int
+}
+
+fun waiter(c: Channel<Int>) {
+    switch c.receive() {
+    case .some(let v):
+        if v == 42 { print("") }
+    case .none:
+        return
+    }
+}
+
+fun main() {
+    let c = Channel<Int>.make(capacity: 0)
+    var i = 0
+    while i < 50000 {
+        fiber waiter(c: c)
+        i = i + 1
+    }
+    var ring: Array<Box> = []
+    i = 0
+    while i < 100000 {
+        ring.append(Box(v: i))
+        i = i + 1
+    }
+    var total = 0
+    i = 0
+    while i < 8000000 {
+        let b = Box(v: i)
+        ring[i % 100000] = b
+        total = total + b.v % 7
+        i = i + 1
+    }
+    c.close()
+    print(total)
+    print("\n")
+}

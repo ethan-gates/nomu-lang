@@ -1,0 +1,375 @@
+// The heap verifier: checks the collector's invariants at each collection, on demand (NOMU_GC_VERIFY=1).
+// Part of the `runtime` module; see README.md.
+//
+// A broken invariant in a moving, generational collector corrupts memory without a sign, and the symptom
+// comes many collections later and far away (a mailbox losing a message, a jump through a stale pointer).
+// The verifier checks the invariants where they first break and reports the rule, the object and the field.
+// It runs on the coordinator with the world stopped, three times per collection kind:
+//
+// - before a minor, the generational invariant: every reachable object outside the nursery whose field
+//   points into a nursery block is in the remembered set the minor is about to drain (large objects are
+//   exempt: the minor scans each one whole);
+// - at every check, every reachable object in a recyclable block lies on marked lines: the allocators take
+//   that block's unmarked lines as free, so a live object there would be allocated over (the clean-block
+//   rule in rtNextAllocBlock exists for this: after a major the mutator once filled holes, and after the next
+//   minor reset its scan it filled the same holes again, over the objects it had put there);
+// - after a minor or a major, every reachable object is well formed: a valid type id, no mark or forwarding
+//   bit left in its header, inside the blocks ever used, in no nursery or evacuation-source block;
+// - after a major, also: in a used block (recyclable or full, so on no free list), on marked lines, and,
+//   under the generational plan, unlogged, so its next store of a young pointer is remembered.
+//
+// The trace starts from the stopped fibers' root slots and every large object, and descends through heap
+// and large objects; a pointer to anything else (an immortal buffer, which holds no managed pointers) is
+// left alone. It leaves headers untouched, keeping the objects it has seen in a hash set of its own, so it
+// can run between the collector's own marking and can tell a stray mark bit from its own. Off, the cost is
+// one load of rtGcVerify per collection. On, every collection traces the live heap: a debugging mode.
+
+// An address set: open addressing over raw memory, linear probing, grown at half full. Handle
+// { table: RawPtr @0, cap: Int @8 (a power of two), count: Int @16 }; keys are nonzero addresses.
+fun rtVsetNew(cap: Int) -> RawPtr {
+  let set = RawPtr.alloc(bytes: 24, align: 8)
+  set.store(RawPtr.alloc(bytes: cap * 8, align: 8), toByteOffset: 0)
+  set.store(cap, toByteOffset: 8)
+  set.store(0, toByteOffset: 16)
+  return set
+}
+
+fun rtVsetFree(set: RawPtr) {
+  let table: RawPtr = set.load(fromByteOffset: 0)
+  table.free()
+  set.free()
+}
+
+fun rtVsetSlot(a: Int, cap: Int) -> Int {
+  return ((a >> 4) ^ (a >> 15) ^ (a >> 27)) & (cap - 1)
+}
+
+fun rtVsetHas(set: RawPtr, a: Int) -> Bool {
+  let table: RawPtr = set.load(fromByteOffset: 0)
+  let cap: Int = set.load(fromByteOffset: 8)
+  var i = rtVsetSlot(a, cap)
+  while true {
+    let k: Int = table.load(fromByteOffset: i * 8)
+    if k == 0 {
+      return false
+    }
+    if k == a {
+      return true
+    }
+    i = (i + 1) & (cap - 1)
+  }
+  return false
+}
+
+// Add `a`; true when it was not there.
+fun rtVsetAdd(set: RawPtr, a: Int) -> Bool {
+  let cap: Int = set.load(fromByteOffset: 8)
+  let count: Int = set.load(fromByteOffset: 16)
+  if count * 2 >= cap {
+    rtVsetGrow(set)
+  }
+  let table: RawPtr = set.load(fromByteOffset: 0)
+  let c: Int = set.load(fromByteOffset: 8)
+  var i = rtVsetSlot(a, c)
+  while true {
+    let k: Int = table.load(fromByteOffset: i * 8)
+    if k == a {
+      return false
+    }
+    if k == 0 {
+      table.store(a, toByteOffset: i * 8)
+      let n: Int = set.load(fromByteOffset: 16)
+      set.store(n + 1, toByteOffset: 16)
+      return true
+    }
+    i = (i + 1) & (c - 1)
+  }
+  return false
+}
+
+fun rtVsetGrow(set: RawPtr) {
+  let old: RawPtr = set.load(fromByteOffset: 0)
+  let cap: Int = set.load(fromByteOffset: 8)
+  let ncap = cap * 2
+  let table = RawPtr.alloc(bytes: ncap * 8, align: 8)
+  var j = 0
+  while j < cap {
+    let k: Int = old.load(fromByteOffset: j * 8)
+    if k != 0 {
+      var i = rtVsetSlot(k, ncap)
+      var placed = false
+      while !placed {
+        let e: Int = table.load(fromByteOffset: i * 8)
+        if e == 0 {
+          table.store(k, toByteOffset: i * 8)
+          placed = true
+        } else {
+          i = (i + 1) & (ncap - 1)
+        }
+      }
+    }
+    j = j + 1
+  }
+  old.free()
+  set.store(table, toByteOffset: 0)
+  set.store(ncap, toByteOffset: 8)
+}
+
+// The block index of heap address `a`, or -1 outside the heap's reservation.
+fun rtVerifyBlockOf(space: RawPtr, a: Int) -> Int {
+  let base: Int = space.load(fromByteOffset: 40)
+  let nb: Int = space.load(fromByteOffset: 8)
+  if a < base || a >= base + nb * 32768 {
+    return -1
+  }
+  return (a - base) / 32768
+}
+
+// Verify at a collection. `when` is 0 before a minor, 1 after a minor, 2 after a major; `slots` holds `ns`
+// root slot addresses; `rem` holds `nrem` remembered objects (before a minor; null otherwise).
+fun rtVerifyHeap(space: RawPtr, slots: RawPtr, ns: Int, rem: RawPtr, nrem: Int, when: Int) {
+  let gen = rtGenReserve(space) > 0
+  let fc: Int = space.load(fromByteOffset: 32)
+  let base: Int = space.load(fromByteOffset: 40)
+  let used = base + fc * 32768
+  let tcount = Runtime.gcTypeCount()
+  let remSet = rtVsetNew(1024)
+  var r = 0
+  while r < nrem {
+    let o: RawPtr = rem.load(fromByteOffset: r * 8)
+    if !o.isNull {
+      let added = rtVsetAdd(remSet, o.toInt())
+    }
+    r = r + 1
+  }
+  let losSet = rtVsetNew(256)
+  let seen = rtVsetNew(4096)
+  var wcap = 4096
+  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
+  var top = 0
+  var los: RawPtr = space.load(fromByteOffset: 64)
+  while !los.isNull {
+    let obj = los.advanced(by: 8)
+    let a1 = rtVsetAdd(losSet, obj.toInt())
+    if rtVsetAdd(seen, obj.toInt()) {
+      if top == wcap {
+        work = rtStackGrow(work, top)
+        wcap = wcap + wcap
+      }
+      work.store(obj, toByteOffset: top * 8)
+      top = top + 1
+    }
+    los = los.load(fromByteOffset: 0)
+  }
+  var s = 0
+  while s < ns {
+    let slot: RawPtr = slots.load(fromByteOffset: s * 8)
+    let obj: RawPtr = slot.load(fromByteOffset: 0)
+    if !obj.isNull && rtVerifyBlockOf(space, obj.toInt()) >= 0 {
+      if rtVsetAdd(seen, obj.toInt()) {
+        if top == wcap {
+          work = rtStackGrow(work, top)
+          wcap = wcap + wcap
+        }
+        work.store(obj, toByteOffset: top * 8)
+        top = top + 1
+      }
+    }
+    s = s + 1
+  }
+  while top > 0 {
+    top = top - 1
+    let obj: RawPtr = work.load(fromByteOffset: top * 8)
+    let a = obj.toInt()
+    let bi = rtVerifyBlockOf(space, a)
+    // The object itself.
+    let h: Int = obj.load(fromByteOffset: 0)
+    if h >> 32 != 0 {
+      rtVerifyFail(space, 3, when, obj, -1, RawPtr.null)
+    }
+    let tid = rtObjTypeId(obj)
+    if tid % rtDescSize != 0 || tid / rtDescSize >= tcount {
+      rtVerifyFail(space, 2, when, obj, -1, RawPtr.null)
+    }
+    if bi >= 0 {
+      let st = rtBlockState(space, bi)
+      if a >= used {
+        rtVerifyFail(space, 5, when, obj, -1, RawPtr.null)
+      }
+      if when > 0 && (st == 3 || st == 4) {
+        rtVerifyFail(space, 4, when, obj, -1, RawPtr.null)
+      }
+      if when == 2 && st != 1 && st != 2 {
+        rtVerifyFail(space, 6, when, obj, -1, RawPtr.null)
+      }
+      if when == 2 || st == 1 {
+        let first = rtLineIndexOf(space, obj)
+        let last = rtLineIndexOf(space, obj.advanced(by: rtObjSize(obj) - 1))
+        var li = first
+        while li <= last {
+          if rtLineMarked(space, li) == 0 {
+            rtVerifyFail(space, 7, when, obj, -1, RawPtr.null)
+          }
+          li = li + 1
+        }
+      }
+      if when == 2 {
+        if gen && rtLogBit(space, obj) == 0 {
+          rtVerifyFail(space, 8, when, obj, -1, RawPtr.null)
+        }
+      }
+    }
+    // Its managed fields: the generational check on each edge, then the referent is traced.
+    let srcMature = bi >= 0 && rtBlockState(space, bi) != 4
+    let kind = rtTypeKind(tid)
+    let nptr = rtLiveCount(tid, obj)
+    var nf = 0                                  // fields this object holds, over every element
+    var ecap = 0
+    var stride = 0
+    var elemStart = 0
+    var nhdr = 0
+    var elemShaped = false
+    if kind != 0 {
+      ecap = obj.load(fromByteOffset: 8)
+      stride = rtTypeStride(tid)
+      elemStart = rtBufElemStart(tid)
+      nhdr = rtHeaderPtrCount(tid)
+      elemShaped = rtShapedCount(tid) > 0
+    }
+    // Fields are visited in three runs: a fixed object's fields; a buffer's header pointers; each element's.
+    var phase = 0
+    var e = 0
+    var i = 0
+    var more = true
+    while more {
+      var off = -1
+      if kind == 0 {
+        if i < nptr {
+          off = rtLiveOffsetAt(tid, obj, i)
+          i = i + 1
+        } else {
+          more = false
+        }
+      } else if phase == 0 {
+        if i < nhdr {
+          off = 16 + rtHeaderOffsetAt(tid, i)
+          i = i + 1
+        } else {
+          phase = 1
+          i = 0
+        }
+      } else {
+        if e >= ecap {
+          more = false
+        } else {
+          let elemBase = elemStart + e * stride
+          let elemPtr = obj.advanced(by: elemBase)
+          var en = nptr
+          if elemShaped {
+            en = rtLiveCount(tid, elemPtr)
+          }
+          if i < en {
+            off = elemBase + rtLiveOffsetAt(tid, elemPtr, i)
+            i = i + 1
+          } else {
+            e = e + 1
+            i = 0
+          }
+        }
+      }
+      if off >= 0 {
+        let child: RawPtr = obj.load(fromByteOffset: off)
+        if !child.isNull {
+          let ca = child.toInt()
+          let cb = rtVerifyBlockOf(space, ca)
+          if when == 0 && srcMature && cb >= 0 && rtBlockState(space, cb) == 4 && !rtVsetHas(remSet, a) {
+            rtVerifyFail(space, 1, when, obj, off, child)
+          }
+          if (cb >= 0 || rtVsetHas(losSet, ca)) && rtVsetAdd(seen, ca) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
+            work.store(child, toByteOffset: top * 8)
+            top = top + 1
+          }
+        }
+      }
+    }
+  }
+  work.free()
+  rtVsetFree(seen)
+  rtVsetFree(losSet)
+  rtVsetFree(remSet)
+}
+
+// A broken invariant: report it in the crash format and exit with status 2. `rule` is the check (rtVerifyHeap's
+// numbering), `when` the point in the collection; `off` and `child` the field and its referent, or -1 and
+// null for a check on the object alone. The carrier that claims the exit (sched+232) reports.
+fun rtVerifyFail(space: RawPtr, rule: Int, when: Int, obj: RawPtr, off: Int, child: RawPtr) {
+  let sched = rtSched
+  if !sched.isNull {
+    let was: Int = sched.atomicCas(0, 1, atByteOffset: 232)
+    if was != 0 {
+      let parked = sched.advanced(by: 232)
+      while true {
+        Runtime.futexWait(at: parked, expected: 1, timeoutMicros: 1000000)
+      }
+    }
+  }
+  var buf = rtFaultScratch
+  let alt = Runtime.currentAltStack()
+  if !alt.isNull {
+    buf = alt.advanced(by: 16)
+  }
+  var n = Runtime.copyLiteral(to: buf, "fatal error: gc verify: ")
+  let at = buf.advanced(by: n)
+  if rule == 1 { n = n + Runtime.copyLiteral(to: at, "an object outside the nursery points into it and is not remembered") }
+  if rule == 2 { n = n + Runtime.copyLiteral(to: at, "a reachable object has a bad type id") }
+  if rule == 3 { n = n + Runtime.copyLiteral(to: at, "a reachable object's header has its mark or forwarding bit set") }
+  if rule == 4 { n = n + Runtime.copyLiteral(to: at, "a reachable object is in a nursery or evacuation-source block after a collection") }
+  if rule == 5 { n = n + Runtime.copyLiteral(to: at, "a reachable object lies past the blocks ever used") }
+  if rule == 6 { n = n + Runtime.copyLiteral(to: at, "a reachable object is in a free block after a major") }
+  if rule == 7 { n = n + Runtime.copyLiteral(to: at, "a reachable object is on an unmarked line, which an allocator may hand out") }
+  if rule == 8 { n = n + Runtime.copyLiteral(to: at, "a reachable object is logged after a major") }
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\nnomu-crash: format 1\nnomu-crash: gc verify: ")
+  if when == 0 { n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "before a minor") }
+  if when == 1 { n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "after a minor") }
+  if when == 2 { n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "after a major") }
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), ", stop-the-world ")
+  if !sched.isNull {
+    let gen: Int = sched.atomicLoad(fromByteOffset: 152)
+    n = rtFaultPutDec(buf, n, gen)
+  }
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\nnomu-crash: object ")
+  n = rtVerifyPutObject(space, buf, n, obj)
+  if off >= 0 {
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\nnomu-crash: field +")
+    n = rtFaultPutDec(buf, n, off)
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " -> ")
+    n = rtVerifyPutObject(space, buf, n, child)
+  }
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\n")
+  Runtime.writeFd(fd: 2, buf: buf, count: n)
+  Runtime.writeFd(fd: 2, buf: buf, count: rtFaultPutImage(buf, 0))
+  Runtime.writeFd(fd: 2, buf: buf, count: Runtime.copyLiteral(to: buf, "nomu-crash: end\n"))
+  Runtime.exit(2)
+}
+
+// `0x… type T block B (state S)`, or `(off-heap)` for an address outside the reservation; returns the new
+// length.
+fun rtVerifyPutObject(space: RawPtr, buf: RawPtr, n: Int, obj: RawPtr) -> Int {
+  var m = rtFaultPutHex(buf, n, obj.toInt())
+  let h: Int = obj.load(fromByteOffset: 0)
+  m = m + Runtime.copyLiteral(to: buf.advanced(by: m), " type ")
+  m = rtFaultPutDec(buf, m, h & 4294967295)
+  let bi = rtVerifyBlockOf(space, obj.toInt())
+  if bi < 0 {
+    return m + Runtime.copyLiteral(to: buf.advanced(by: m), " (off-heap)")
+  }
+  m = m + Runtime.copyLiteral(to: buf.advanced(by: m), " block ")
+  m = rtFaultPutDec(buf, m, bi)
+  m = m + Runtime.copyLiteral(to: buf.advanced(by: m), " (state ")
+  m = rtFaultPutDec(buf, m, rtBlockState(space, bi))
+  return m + Runtime.copyLiteral(to: buf.advanced(by: m), ")")
+}

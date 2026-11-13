@@ -696,6 +696,11 @@ fun rtWalkShadow(fib: RawPtr, roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
   return n
 }
 
+// The used stack bytes of the fibers the last root walk visited (nomuSchedWalkRoots). Heap sizing counts them
+// toward the heap limit after a major (rtHeapResize), as Go counts goroutine stacks toward its heap goal: the
+// stacks are scanned at every collection, so a program with many fibers collects less often.
+let rtStackScanBytes = Runtime.staticStorage(bytes: 8, align: 8)
+
 // Walk the roots of every fiber not running, from its stored user-frame anchor (rtWalkFrom, the self-hosted
 // pcsp walk): parked, stopped, and ready after a park. A ready fiber that never ran has no anchor. Appends roots into the growable buffer `roots`; returns the count. Skips running fibers (their roots are the caller's
 // live stack, reached differently) and fibers with no anchor. Caller has stopped the world (all target
@@ -704,6 +709,7 @@ fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
   let cache = rtFrameCacheTake()
   var n = 0
   let now = Runtime.monotonicNanos()
+  var stackBytes = 0
   var cur: RawPtr = sched.load(fromByteOffset: 128)
   while cur.isNull == false {
     let stByte: UInt8 = cur.load(fromByteOffset: 8)
@@ -720,6 +726,10 @@ fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
     if st == 2 { stopped = true }        // parked at sleep/join
     if st == 4 { stopped = true }        // stopped at a safepoint poll (STW)
     if stopped {
+      let stackBase: RawPtr = cur.load(fromByteOffset: 48)
+      if stackBase.isNull == false {
+        stackBytes = stackBytes + rtStackUsed(cur)
+      }
       let sp: RawPtr = cur.load(fromByteOffset: 104)
       if sp.isNull == false {
         let pc: Int = cur.load(fromByteOffset: 112)
@@ -770,6 +780,7 @@ fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
     }
   }
   rtFrameCacheDone(cache)
+  rtStackScanBytes.store(stackBytes, toByteOffset: 0)
   return rtWalkRunQueues(roots, n, emitSlots)
 }
 

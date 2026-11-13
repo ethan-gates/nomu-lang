@@ -204,7 +204,8 @@ enum RuntimeIntrinsics {
         // A zeroed reservation: `bytes` of memory guaranteed to read as zero, aligned to `align`, whose pages
         // become resident only as they are first touched; never freed. For long-lived regions sized up front
         // (the collector's heap and side tables), where `RawPtr.alloc`'s zero-fill would make every page
-        // resident at once. Subset-legal (`__sys`).
+        // resident at once. Null when the system refuses it, so the caller can ask for less or report out of
+        // memory. Subset-legal (`__sys`).
         case "reserveZeroed":
             guard PointerIntrinsics.checkArgLabels(&s, args, ["bytes", "align"], "Runtime.reserveZeroed", span) else {
                 return err(span)
@@ -212,6 +213,13 @@ enum RuntimeIntrinsics {
             let bytes = PointerIntrinsics.intArg(&s, args[0].value, "Runtime.reserveZeroed", "bytes")
             let align = PointerIntrinsics.intArg(&s, args[1].value, "Runtime.reserveZeroed", "align")
             return s.ptrIntrinsic("__sysReserveZeroed", .rawPtr, [bytes, align], span)
+        // The machine's physical memory in bytes, 0 when the system does not say: the heap's default
+        // reservation is sized from it (`runtime/startup.nomu`). Subset-legal (`__sys`).
+        case "physicalMemory":
+            guard PointerIntrinsics.checkArgLabels(&s, args, [], "Runtime.physicalMemory", span) else {
+                return err(span)
+            }
+            return s.ptrIntrinsic("__sysPhysicalMemory", .int, [], span)
         // `RawPtr.alloc` without the zero-fill: `bytes` aligned to `align`, contents undefined, freed with
         // `free()`. For runtime memory written before it is read (a stack a move copies into), where the fill
         // is wasted work. Subset-legal (`__sys`).

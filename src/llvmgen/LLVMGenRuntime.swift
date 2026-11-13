@@ -241,7 +241,8 @@ extension LLVMGen {
         "getpagesize", "kevent", "kqueue", "mach_absolute_time", "mach_timebase_info", "malloc", "mmap",
         "mprotect", "munmap", "pipe", "poll", "posix_memalign", "printf", "pthread_create",
         "pthread_getspecific", "pthread_join", "pthread_key_create", "pthread_setspecific", "pthread_sigmask", "putchar",
-        "raise", "read", "sigaction", "sigaltstack", "snprintf", "strlen", "strpbrk", "strtod", "write",
+        "raise", "read", "sigaction", "sigaltstack", "snprintf", "strlen", "strpbrk", "strtod", "sysconf",
+        "sysctlbyname", "write",
         "__ulock_wait", "__ulock_wake", "_NSGetExecutablePath",
     ]
 
@@ -910,7 +911,9 @@ extension LLVMGen {
     // Unmanaged memory (`RawPtr.alloc`, `Ptr<T>.alloc`; `unsafe-memory.md`): `__nomu_raw_alloc(bytes, align)`,
     // straight to libSystem. `bytes` at or below zero gives null; the alignment is raised to a pointer's, as
     // `posix_memalign` requires; the memory is zero-filled, which the runtime's allocator relies on; failure
-    // prints "out of memory" and exits 1. It never touches the managed heap or parks, so it is gc-leaf and
+    // calls the runtime's out-of-memory report (`rtOutOfMemory`) on the carrier's stack through the asm
+    // floor's `nomu_oom_on_carrier`, which exits with status 2. It never touches the managed heap or parks (the
+    // report never polls), so it is gc-leaf and
     // its calls are never statepoints. Never inlined: `posix_memalign` dominates its cost, and inlining it at
     // every site only grows the code. With `zeroed` false it is `__nomu_raw_alloc_uninitialized`, the same
     // without the fill (`Runtime.allocUninitialized`), for runtime memory written before it is read.
@@ -941,7 +944,10 @@ extension LLVMGen {
             let rc = buildCall(memalign.0, memalign.1, [slot, a, bytes])!
             LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, rc, LLVMConstInt(i32, 0, 0), "raw.failed"), oomBB, okBB)
             LLVMPositionBuilderAtEnd(b, oomBB)
-            emitOutOfMemoryExit()
+            let report = runtimeFn("nomu_oom_on_carrier", ret: voidTy, params: [i64, i64], varArg: false)
+            let call = buildCall(report.0, report.1, [LLVMConstInt(i64, 1, 0), bytes])!
+            markCallGCLeaf(call)
+            LLVMBuildUnreachable(b)
             LLVMPositionBuilderAtEnd(b, okBB)
             let p = LLVMBuildLoad2(b, i8ptr, slot, "raw.mem")!
             if zeroed {
@@ -957,23 +963,15 @@ extension LLVMGen {
         return (fn, ty)
     }
 
-    // Print "out of memory" to stderr and exit 1, ending the current block.
-    func emitOutOfMemoryExit() {
-        let dprintf = runtimeFn("dprintf", ret: i32, params: [i32, i8ptr], varArg: true)
-        let exit = runtimeFn("exit", ret: voidTy, params: [i32], varArg: false)
-        let message = LLVMBuildGlobalStringPtr(b, "out of memory\n", "oom.msg")!
-        _ = buildCall(dprintf.0, dprintf.1, [LLVMConstInt(i32, 2, 0), message])
-        _ = buildCall(exit.0, exit.1, [LLVMConstInt(i32, 1, 0)])
-        LLVMBuildUnreachable(b)
-    }
-
     // A zeroed reservation (`Runtime.reserveZeroed`): `__nomu_reserve_zeroed(bytes, align)` maps private
     // anonymous memory, which the kernel guarantees reads as zero and backs with physical pages only as they
     // are first touched, so reserving costs no resident memory. The size is rounded up to whole pages and
     // the alignment raised to at least a page (the page size is read with `getpagesize`, since it differs
     // by platform); `bytes + align` is mapped and the unaligned head and the tail beyond `bytes` are
-    // unmapped. Never freed. `bytes` at or below zero gives null; a failed map prints "out of memory" and
-    // exits 1. gc-leaf and never inlined, like `__nomu_raw_alloc`.
+    // unmapped. Never freed. `bytes` at or below zero, or a map the system refuses, gives null: the heap's
+    // reservation then asks for less, and other callers report out of memory. On Linux the map is
+    // `MAP_NORESERVE`, so a reservation larger than RAM and swap passes the default overcommit check.
+    // gc-leaf and never inlined, like `__nomu_raw_alloc`.
     func nomuReserveZeroed() -> (LLVMValueRef, LLVMTypeRef) {
         if let f = reserveZeroedFn { return f }
         let platform = TargetPlatform.host
@@ -989,7 +987,7 @@ extension LLVMGen {
             let bytes = LLVMGetParam(fn, 0)!, align = LLVMGetParam(fn, 1)!
             let mapBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.map")!
             let emptyBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.empty")!
-            let oomBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.oom")!
+            let failedBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.failed")!
             let trimBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.trim")!
             let headBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.head")!
             let tailCheckBB = LLVMAppendBasicBlockInContext(ctx, fn, "reserve.tailcheck")!
@@ -1008,13 +1006,13 @@ extension LLVMGen {
             let span = LLVMBuildAdd(b, n, a, "reserve.span")!
             let base = buildCall(mmap.0, mmap.1, [LLVMConstPointerNull(i8ptr), span,
                                                  LLVMConstInt(i32, UInt64(platform.protReadWrite), 0),
-                                                 LLVMConstInt(i32, UInt64(platform.mapPrivateAnonymous), 0),
+                                                 LLVMConstInt(i32, UInt64(platform.mapPrivateAnonymous | platform.mapNoReserve), 0),
                                                  LLVMConstInt(i32, UInt64(bitPattern: -1), 1), zero])!
             let baseInt = LLVMBuildPtrToInt(b, base, i64, "reserve.base")!
             let failed = LLVMBuildICmp(b, LLVMIntEQ, baseInt, LLVMConstInt(i64, UInt64(bitPattern: -1), 1), "reserve.failed")
-            LLVMBuildCondBr(b, failed, oomBB, trimBB)
-            LLVMPositionBuilderAtEnd(b, oomBB)
-            emitOutOfMemoryExit()
+            LLVMBuildCondBr(b, failed, failedBB, trimBB)
+            LLVMPositionBuilderAtEnd(b, failedBB)
+            LLVMBuildRet(b, LLVMConstPointerNull(i8ptr))
 
             LLVMPositionBuilderAtEnd(b, trimBB)
             let alignMask = LLVMBuildSub(b, a, one, "reserve.alignmask")!

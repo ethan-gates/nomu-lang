@@ -155,8 +155,8 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
   if rootNull {
     return root
   }
-  var wcap = 4096                   // grows on demand (rtStackGrow)
-  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
+  var work = rtGcWorkTake()         // grows on demand (rtStackGrow)
+  var wcap = rtGcWorkCap()
   var top = 0
   let newRoot = rtEvacuate(space, root)
   if rtTryMarkBare(newRoot) {
@@ -168,7 +168,12 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
     let obj: RawPtr = work.load(fromByteOffset: top * 8)
     let tid = rtObjTypeId(obj)
     let kind = rtTypeKind(tid)
-    let nptr = rtLiveCount(tid, obj)
+    var nptr = 0
+    if kind == 0 {
+      nptr = rtOffsetsList(tid, obj)            // each enum field decoded once
+    } else {
+      nptr = rtLiveCount(tid, obj)
+    }
     var size = 0
     if kind == 0 {
       size = rtTypeSize(tid)
@@ -182,7 +187,7 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = rtLiveOffsetAt(tid, obj, i)
+        let off = rtOffsetListed(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         let childNull = child.eq(RawPtr.null)
         if !childNull {
@@ -255,7 +260,7 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
       }
     }
   }
-  work.free()
+  rtGcWorkKeep(work, wcap)
   return newRoot
 }
 
@@ -301,6 +306,7 @@ fun rtImmixEvacCollect(space: RawPtr, root: RawPtr) -> RawPtr {
   rtImmixSweepLos(space)
   rtImmixUnmark(newRoot)
   rtResetAllocator(space)
+  rtGcWorkRelease()
   return newRoot
 }
 
@@ -350,6 +356,7 @@ fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> In
   }
   rtGcPhaseClose(16, tp)
   rtResetAllocator(space)
+  rtGcWorkRelease()
   return nSources
 }
 
@@ -409,6 +416,7 @@ fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) ->
   }
   rtGcPhaseClose(16, tp)
   rtResetAllocator(space)
+  rtGcWorkRelease()
   return nSources
 }
 
@@ -454,6 +462,47 @@ fun rtStackGrow(stack: RawPtr, count: Int) -> RawPtr {
   return fresh
 }
 
+// The collector's work stack, shared by the mark, evacuate and unmark walks: {base @0, capacity @8 in
+// entries}, empty (null) between collections. A collection walks once per root slot, and a stack allocated
+// and zeroed per walk cost a major 1.6 µs a parked fiber; taken from here, it is allocated once per
+// collection and keeps any growth from earlier walks. Walks run one at a time under stop-the-world (or in
+// a single-threaded test), so one stack serves the whole runtime.
+let rtGcWork = Runtime.staticStorage(bytes: 16, align: 8)
+
+// The work stack's base, allocated at 4096 entries if none is held; its capacity is rtGcWorkCap().
+fun rtGcWorkTake() -> RawPtr {
+  let base: RawPtr = rtGcWork.load(fromByteOffset: 0)
+  if base.eq(RawPtr.null) {
+    let fresh = RawPtr.alloc(bytes: 4096 * 8, align: 8)
+    rtGcWork.store(fresh, toByteOffset: 0)
+    rtGcWork.store(4096, toByteOffset: 8)
+    return fresh
+  }
+  return base
+}
+
+fun rtGcWorkCap() -> Int {
+  let cap: Int = rtGcWork.load(fromByteOffset: 8)
+  return cap
+}
+
+// Hand the work stack back after a walk, with the base and capacity any growth left it.
+fun rtGcWorkKeep(base: RawPtr, cap: Int) {
+  rtGcWork.store(base, toByteOffset: 0)
+  rtGcWork.store(cap, toByteOffset: 8)
+}
+
+// Free the work stack at the end of a collection, so a stack grown by a deep trace is not held between
+// collections.
+fun rtGcWorkRelease() {
+  let base: RawPtr = rtGcWork.load(fromByteOffset: 0)
+  if !base.eq(RawPtr.null) {
+    base.free()
+  }
+  rtGcWork.store(RawPtr.null, toByteOffset: 0)
+  rtGcWork.store(0, toByteOffset: 8)
+}
+
 // The promotion queue is a growable dynamic array behind a stable 2-word handle {base @0, cap @8}: a minor's
 // promotion count is bounded only by the nursery's live objects, which grows with the nursery reserve, so a
 // fixed array can overflow (a large nursery promoting many survivors). Region/block collectors (Immix, G1,
@@ -483,11 +532,16 @@ fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
   var count = count0
   let tid = rtObjTypeId(obj)
   let kind = rtTypeKind(tid)
-  let nptr = rtLiveCount(tid, obj)
+  var nptr = 0
+  if kind == 0 {
+    nptr = rtOffsetsList(tid, obj)            // each enum field decoded once
+  } else {
+    nptr = rtLiveCount(tid, obj)
+  }
   if kind == 0 {
     var i = 0
     while i < nptr {
-      let off = rtLiveOffsetAt(tid, obj, i)
+      let off = rtOffsetListed(tid, obj, i)
       count = rtMinorForward(space, obj.advanced(by: off), q, count)
       i = i + 1
     }
@@ -527,6 +581,11 @@ fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
 // live nursery object into mature Immix, rewrite each slot to its survivor, reclaim the emptied nursery blocks,
 // and re-establish the log bits (promoted + remembered objects are unlogged so their next mutation is caught).
 // The mature space is neither scanned nor swept. Returns the number of objects promoted.
+// Promotions fill the holes of the recyclable blocks the last major left, then clean blocks. The copy
+// allocator keeps its place from one minor to the next and only a major resets it (rtResetAllocator), so each
+// hole and the tail of each partly filled block is taken once per major cycle, as Immix's allocator does.
+// Each promoted object's lines are marked, so the rule the heap verifier checks holds between majors: a
+// reachable object in a recyclable block lies on marked lines, which no allocator hands out.
 fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: RawPtr, nrem: Int) -> Int {
   // From-space = the NURSERY blocks; turn each into a DEFRAG_SOURCE so rtEvacuate copies its objects.
   let fc: Int = space.load(fromByteOffset: 32)
@@ -537,7 +596,6 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
     }
     bi = bi + 1
   }
-  rtSetupCopyAllocator(space)                    // to-space = fresh mature (non-nursery) blocks only
   // Promotion queue: a growable dynamic array behind a stable 2-word handle {base @0, cap @8}. rtQueuePush
   // doubles the buffer when full, so a minor promoting more than the initial capacity grows instead of
   // overflowing. Starts small (64Ki entries = 512 KiB) — most minors promote little; a large-survivor minor
@@ -599,17 +657,16 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
   }
   rtGcPhaseClose(7, tp)
   // Clear each promoted object's transient mark bit and set its unlog bit — it is mature now, so a future
-  // store of a young object into it must be remembered.
+  // store of a young object into it must be remembered — and mark its lines.
   tp = rtGcPhaseOpen(8)
   var p = 0
   var promotedBytes = 0
-  let recording = Runtime.gcRecordLevel() > 0
   let qbaseFix: RawPtr = q.load(fromByteOffset: 0)   // growth is done; the buffer no longer moves
   while p < count {
     let obj: RawPtr = qbaseFix.load(fromByteOffset: p * 8)
-    if recording {
-      promotedBytes = promotedBytes + rtObjSize(obj)
-    }
+    let size = rtObjSize(obj)
+    promotedBytes = promotedBytes + size
+    rtMarkObjLines(space, obj, size)             // its lines are taken until the next major
     let un = rtUnmarkIfMarked(obj)
     rtSetUnlogged(space, obj)
     p = p + 1
@@ -631,7 +688,6 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
     bj = bj + 1
   }
   space.store(0, toByteOffset: 136)              // the nursery is empty again
-  rtResetAllocator(space)
   rtGcPhaseClose(9, tp)
   let qbaseFree: RawPtr = q.load(fromByteOffset: 0)   // free the (possibly grown) buffer, then the handle
   qbaseFree.free()
@@ -663,6 +719,10 @@ fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
     rtImmixCollectRootsDefragGen(space, slots, ns)
   } else {
     rtImmixCollectRootsDefrag(space, slots, ns)
+  }
+  rtHeapResize(space)           // L from what survived (heap sizing, immix.nomu)
+  if rtGcVerify {
+    rtVerifyHeap(space, slots, ns, RawPtr.null, 0, 2)   // before the run queues' entries are tagged again
   }
   rtRootsFixDerived(roots)
   rtRootsFree(roots)
@@ -696,7 +756,13 @@ fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
   rtGcPhaseClose(3, td)
   rtGcCounter(1, ns)
   rtGcCounter(3, nrem)
+  if rtGcVerify {
+    rtVerifyHeap(space, slots, ns, rem, nrem, 0)
+  }
   let n = rtImmixCollectMinor(space, slots, ns, rem, nrem)
+  if rtGcVerify {
+    rtVerifyHeap(space, slots, ns, RawPtr.null, 0, 1)   // before the run queues' entries are tagged again
+  }
   rtRootsFixDerived(roots)
   rtGcCounter(2, n)
   rem.free()
@@ -779,28 +845,35 @@ fun rtGcCoordinatorMain(sched: RawPtr) -> RawPtr {
   return sched
 }
 
-// Available empty blocks in the self-hosted Immix space (never-used + reclaimed-free) — the heap-pressure
-// gauge the GC-trigger thread polls. Returns -1 before the space exists (no managed allocation yet).
+// Available empty blocks for the mutator (never-used below its cap + reclaimed-free) — the heap-pressure
+// gauge. Returns -1 before the space exists (no managed allocation yet).
 fun nomuGcSpaceAvail() -> Int {
   let space = rtSpace
   let spaceNull = space.eq(RawPtr.null)
   if spaceNull {
     return -1
   }
-  let nb: Int = space.load(fromByteOffset: 8)
-  let fc: Int = space.load(fromByteOffset: 32)
-  let flTop: Int = space.load(fromByteOffset: 96)
-  return nb - fc + flTop
+  return rtNeverUsedBelowCap(space) + space.load(fromByteOffset: 96)
 }
 
-// Total blocks in the self-hosted Immix space (for the trigger threshold). 0 when it does not exist.
+// Never-used blocks below the mutator's cap: none once the collector's copies have passed it.
+fun rtNeverUsedBelowCap(space: RawPtr) -> Int {
+  let fc: Int = space.load(fromByteOffset: 32)
+  let left = rtHeapCap(space) - fc
+  if left < 0 {
+    return 0
+  }
+  return left
+}
+
+// The heap's size in blocks: L and the nursery. 0 when it does not exist.
 fun nomuGcSpaceBlocks() -> Int {
   let space = rtSpace
   let spaceNull = space.eq(RawPtr.null)
   if spaceNull {
     return 0
   }
-  return space.load(fromByteOffset: 8)
+  return rtHeapCap(space)
 }
 
 // ---- Copy reserve + defrag trigger — the general collector (task 150 · rung 3, 150.3.8) ----
@@ -828,9 +901,8 @@ fun rtDefragThreshold() -> Int {
 // are never sources; the first collection therefore never evacuates and only seeds defragTable.
 fun rtSelectDefragSources(space: RawPtr) -> Int {
   let fc: Int = space.load(fromByteOffset: 32)
-  let nb: Int = space.load(fromByteOffset: 8)
   let flTop: Int = space.load(fromByteOffset: 96)
-  let neverUsed = nb - fc
+  let neverUsed = rtNeverUsedBelowCap(space)
   let available = flTop + neverUsed
   var reserve = available / 16
   if reserve < 1 {
@@ -879,5 +951,6 @@ fun rtImmixCollectDefrag(space: RawPtr, root: RawPtr) -> RawPtr {
   rtImmixSweepLos(space)
   rtImmixUnmark(newRoot)
   rtResetAllocator(space)
+  rtGcWorkRelease()
   return newRoot
 }

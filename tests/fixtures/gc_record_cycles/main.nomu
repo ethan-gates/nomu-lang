@@ -3,8 +3,11 @@
 // every cycle of that kind recorded the phases and counters its collector records, and that every interval
 // lies inside its cycle. Prints one line per (kind, trigger) seen, `kind trigger ok`, sorted; 1 for ok.
 //
-// With a one-block nursery every collection is a minor raised by a full nursery: `1 1 1`. With a mature floor
-// above the heap every collection escalates to a major: `2 2 1`.
+// With a one-block nursery and a mature floor of 120 blocks the collections are minors raised by a full
+// nursery, `1 1 1`, until the promoted garbage brings mature space within the floor of its 4 MiB starting
+// limit and one escalates to a major, `2 2 1`. (Promotions are packed, so without the floor the garbage would
+// not reach the limit.) With a mature floor above the heap every collection escalates to a major: `2 2 1`
+// alone.
 class Box {
   var v: Int
 }

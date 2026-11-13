@@ -447,7 +447,7 @@ fun rtPoolDrainAll() {
 // from; otherwise from this carrier's pool, or a new one left unfilled.
 fun rtStackNew(bytes: Int) -> RawPtr {
   if rtStackMoveOn {
-    return Runtime.reserveZeroed(bytes: bytes, align: 16384)
+    return rtReserve(bytes, 16384)
   }
   let pooled = rtStackPooled(bytes)
   if pooled.isNull == false {
@@ -484,7 +484,7 @@ fun rtStackTake(bytes: Int) -> RawPtr {
     prev = at
     at = next
   }
-  return Runtime.reserveZeroed(bytes: bytes, align: 16384)
+  return rtReserve(bytes, 16384)
 }
 
 // Retire a moved-from or finished stack of `bytes`: into this carrier's pool or freed, except under the stress

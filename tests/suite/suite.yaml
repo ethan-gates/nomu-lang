@@ -48,12 +48,33 @@ dimensions:
         - kind: minor
           max: 0
       tier: full
+    - name: stress-minor-verify
+      run_settings:
+        gc_stress_bytes: 4096
+        gc_verify: 1
+      collections:
+        - min: 100
+      tier: full
     - name: stress-major
       run_settings:
         gc_stress_bytes: 4096
         mature_floor: 8192
       collections:
         - min: 100
+      tier: full
+    # Minors and majors alternating: stress collections, every fourth a major, so minors run after majors
+    # whatever the program's live data. Minors that follow a major were otherwise untested (task 159.7). The
+    # heap verifier checks every collection (task 159.8).
+    - name: stress-mixed
+      run_settings:
+        gc_stress_bytes: 4096
+        stress_major_every: 4
+        gc_verify: 1
+      collections:
+        - kind: minor
+          min: 10
+        - kind: major
+          min: 2
       tier: full
 
 groups:

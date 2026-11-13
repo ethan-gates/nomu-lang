@@ -29,6 +29,15 @@ struct TargetPlatform {
         }
     }
 
+    // `MAP_NORESERVE` for a reservation (`Runtime.reserveZeroed`): Linux's default overcommit check refuses a
+    // writable map plainly larger than RAM and swap without it. Darwin has no such check, so nothing is added.
+    var mapNoReserve: Int32 {
+        switch os {
+        case .darwin: return 0
+        case .linux:  return 0x4000
+        }
+    }
+
     // Whether the carrier-local slot is read and written in place. On darwin-arm64 it is the thread's TSD
     // array (`TPIDRRO_EL0`) indexed by the key, as libpthread reads it. Elsewhere it goes through
     // `pthread_getspecific` / `pthread_setspecific` until a direct form is written (glibc keeps keys in a

@@ -35,8 +35,17 @@ or the first real Nomu programs. The collector should be the one being benchmark
   a major keeps the burst's records and stacks. Tune the caps, the largest pooled class, and whether the shared
   pool should also shrink on a timer.
 
-Other runtime policies join this task when their owners reach the point of tuning on workloads, for example
-the heap's growth factor once [230](230-heap-sizing.md) has a heap that grows.
+- **258.5 Heap growth.** [230](230-heap-sizing.md) sets the heap's soft limit to live + (live + stacks) × r
+  after each major, r = 1 (`NOMU_GC_PERCENT`). Tune r's default, and try timing-based rules (a collection-time target,
+  MemBalancer's square-root rule) against it.
+- **258.6 Behaviour near the heap maximum.** In 230 a program near `NOMU_HEAP_MAX` collects ever more often
+  until a major frees nothing, then fails. Candidates:
+  - fail early when collection overhead stays high, as the JVM's overhead limit does (98% of time collecting,
+    under 2% recovered);
+  - a soft limit below the maximum that the policy collects harder to stay under, with a cap on collection
+    CPU past which the heap exceeds it, as Go's `GOMEMLIMIT` does.
+
+Other runtime policies join this task when their owners reach the point of tuning on workloads.
 
 ## Relations
 

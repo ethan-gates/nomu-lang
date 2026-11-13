@@ -794,12 +794,18 @@ the nursery blocks.
 - **Placement:** nursery blocks are carved from the existing shared block pool and tagged with a new
   `NURSERY` block state in the block-state table (§10.2), so no second heap or mmap region is added. Mature
   blocks are the pool's non-nursery blocks. This reuses the pool, the per-carrier TLAB, and the line tables.
-- **Size:** **bounded** — a fixed fraction of the 256 MiB pool (a tunable reserve, MMTk's default shape),
-  giving a predictable minor-GC pause and guaranteed mature headroom for promotions. The flexible/Appel
-  "nursery = all free blocks" sizing is a later throughput knob, not the first cut.
+- **Size:** **bounded** — a quarter of the heap's limit, clamped to 4–64 MiB, on top of the limit mature
+  space grows to (heap sizing, `plans/tasks/230-heap-sizing.md`), giving a predictable minor-GC pause. The
+  flexible/Appel "nursery = all free blocks" sizing is a later throughput knob, not the first cut.
 - **Allocation:** the per-carrier TLAB (150.3.10) bumps into a nursery block; refill draws a fresh nursery
   block from the pool under the space lock and, when the nursery reserve is exhausted, triggers a minor GC
-  rather than a mature refill.
+  rather than a mature refill. Refill takes clean blocks only, never a recyclable mature block's holes:
+  nothing marks the lines a fill uses, so after the next minor resets the scan the same holes are handed out
+  again over live objects; and an object placed there reads as logged, so the barrier would miss its nursery
+  pointers. The minor's promotions fill those holes instead: its copy allocator takes recyclable blocks
+  before clean ones, keeps its place from one minor to the next (a major resets it), and marks each promoted
+  object's lines, so each hole is used once per major cycle and live objects in recyclable blocks always lie
+  on marked lines. Promoted objects are unlogged, so the barrier sees their stores.
 
 ### 11.2 Write barrier — reuse the inline fast path, self-host the slow path (Decided)
 

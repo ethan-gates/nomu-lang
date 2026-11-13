@@ -2154,6 +2154,32 @@ final class SSAIRToLLVM {
         case "__sysReserveZeroed":
             let (fn, fty) = e.nomuReserveZeroed()
             return e.buildCall(fn, fty, [val(args[0]), val(args[1])])
+        // The machine's physical memory: `hw.memsize` through `sysctlbyname` on darwin, pages times page size
+        // through `sysconf` on Linux; 0 when the call fails.
+        case "__sysPhysicalMemory":
+            let i32 = e.i32
+            switch TargetPlatform.host.os {
+            case .darwin:
+                let value = e.entryAlloca(e.i64, "memsize")
+                let len = e.entryAlloca(e.i64, "memsize.len")
+                LLVMBuildStore(b, LLVMConstInt(e.i64, 0, 0), value)
+                LLVMBuildStore(b, LLVMConstInt(e.i64, 8, 0), len)
+                let name = LLVMBuildGlobalStringPtr(b, "hw.memsize", "memsize.name")!
+                let (fn, fty) = e.runtimeFn("sysctlbyname", ret: i32,
+                                            params: [e.i8ptr, e.i8ptr, e.i8ptr, e.i8ptr, e.i64], varArg: false)
+                let rc = e.buildCall(fn, fty, [name, value, len, LLVMConstNull(e.i8ptr), LLVMConstInt(e.i64, 0, 0)])!
+                let ok = LLVMBuildICmp(b, LLVMIntEQ, rc, LLVMConstInt(i32, 0, 0), "memsize.ok")
+                let v = LLVMBuildLoad2(b, e.i64, value, "memsize.v")!
+                return LLVMBuildSelect(b, ok, v, LLVMConstInt(e.i64, 0, 0), "physmem")
+            case .linux:
+                // _SC_PHYS_PAGES 85, _SC_PAGESIZE 30; -1 on failure.
+                let (fn, fty) = e.runtimeFn("sysconf", ret: e.i64, params: [i32], varArg: false)
+                let pages = e.buildCall(fn, fty, [LLVMConstInt(i32, 85, 0)])!
+                let size = e.buildCall(fn, fty, [LLVMConstInt(i32, 30, 0)])!
+                let ok = LLVMBuildAnd(b, LLVMBuildICmp(b, LLVMIntSGT, pages, LLVMConstInt(e.i64, 0, 0), "pages.ok"),
+                                      LLVMBuildICmp(b, LLVMIntSGT, size, LLVMConstInt(e.i64, 0, 0), "size.ok"), "physmem.ok")
+                return LLVMBuildSelect(b, ok, LLVMBuildMul(b, pages, size, "physmem.v"), LLVMConstInt(e.i64, 0, 0), "physmem")
+            }
         // Unmanaged memory without the zero-fill (a fiber stack a move copies into).
         case "__sysAllocUninitialized":
             let (fn, fty) = e.nomuRawAlloc(zeroed: false)

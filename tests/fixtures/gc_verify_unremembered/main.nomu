@@ -1,0 +1,30 @@
+// The heap verifier catches a store the write barrier never saw (built with `test.runtime_prelude`, run with
+// NOMU_GC_VERIFY=1). A major makes `h` mature; a raw store then points it at a young Box without the barrier,
+// so `h` is not remembered. The verifier fails before the minor that would move the Box and leave `h`'s field
+// stale, naming `h` and the field.
+class Box {
+  var v: Int
+}
+
+class Holder {
+  var item: Box
+}
+
+fun collect(kind: Int) {
+  let ticket = rtGcRequest(kind)
+  var spins = 0
+  while !rtGcCollected(ticket) {
+    spins = spins + 1
+  }
+}
+
+fun main() {
+  let h = Holder(item: Box(v: 1))
+  collect(0)
+  let young = Box(v: 2)
+  addrOf(h).store(addrOf(young), toByteOffset: 8)
+  print("stored\n")
+  collect(1)
+  print(h.item.v)
+  print(young.v)
+}

@@ -1,7 +1,7 @@
 # GC observability — one model for every collector: intervals, cycles, counters, heap snapshots
 
 **Avenue:** Risk · **Type/Lifecycle:** `runtime · observability · needs-design` · **Size:** M ·
-**Status:** built (159.1–159.6) ·
+**Status:** built (159.1–159.8) ·
 **Source:** grounded during 150.4.5.3 — debugging a minor-collector segfault and an STW deadlock, the only
 signal was a single per-collection line and a native backtrace that could not unwind the collector's carrier
 stack (frame #0 only). Ad-hoc `RawPtr.gcDbg` breadcrumbs localized both bugs, then were stripped.
@@ -257,6 +257,65 @@ The model below is LXR's shape. GenImmix is its special case: every interval in 
     instruction sequence is identical to `limited`'s, and `rtTlabAlloc` never touches the counters. The rule
     is written in `src/stdlib/runtime/README.md`.
     The full tier (758 passed), `--check-reproducible` (1741 identical), the 18 Bazel test targets.
+
+- **159.7** A stress leg where minors and majors alternate.
+
+  **Why.** The `gc` dimension's legs run almost all minors (`stress-minor`, `nursery`) or all majors
+  (`stress-major`, `immix-stress`). Minors that follow a major went untested, and a bug lived there from
+  GenImmix's start: after a major the mutator refilled from recyclable holes, and after the next minor reset
+  its scan it handed the same holes out again over the objects it had placed there. 230.4's small starting
+  heap made majors frequent enough to show it, as a mailbox hang and a jump through a stale actor pointer,
+  thousands of collections after the cause.
+
+  **What.** A `gc` dimension value, `stress-mixed`: stress collections (`gc_stress_bytes: 4096`) with every
+  fourth one a major, asserting at least 10 minors and 2 majors, over every group the `gc` axis spans
+  (`shape`, `stack-move`, `stack-move-checks`), in the full tier.
+
+  **Done.** A mature floor cannot make the alternation: the matrix fixtures' live data is small, so minors
+  promote almost nothing and mature space never nears a floor below the starting limit, while a floor above
+  it makes every collection a major. So a test-only run setting decides it directly:
+  `NOMU_GC_STRESS_MAJOR_EVERY` (suite `stress_major_every`), under `NOMU_GC_STRESS`, makes every Nth stress
+  collection process-wide a major (`rtStressTick`, an atomic count in `rtGcStressCount`). The leg passes all
+  189 runs; with the clean-block rule reverted (the mutator's refill allowed recyclable blocks,
+  `rtNextAllocBlock`) it fails `actor_msg_queued` on all three pipelines (two failures and a hang), the
+  bug's own symptoms. Full tier 1629 passed. Documented in `tests/README.md`.
+- **159.8** A heap verifier: checks the collector's invariants at each collection, on demand.
+
+  **Why.** A broken invariant in a moving, generational collector corrupts memory without a sign, and the
+  symptom comes many collections later and far away. A check at the collection where the invariant first
+  breaks turns hours of bisecting into one report. The coming collector work changes these invariants:
+  230.6 (promotions into recyclable holes, with their lines marked), 236 (preemption's new stop points)
+  and [127](127-lxr-collector.md) (LXR's field-logging barrier, deferred counts, concurrent decrements).
+
+  **Done.** `runtime/gcverify.nomu`; run setting `NOMU_GC_VERIFY=1` (suite `gc_verify`), read at startup; off,
+  one load per collection.
+  - *When.* On the coordinator with the world stopped: before a minor (after the remembered set is drained),
+    after a minor, after a major. The post-collection checks run before `rtRootsFixDerived`, which tags the
+    run queues' mailbox entries again.
+  - *The trace.* From the root slots and every large object, through heap and large objects; pointers to
+    anything else (immortal buffers) are left alone. Headers are untouched: visited objects go into an
+    address hash set of the verifier's own, so a stray mark bit is detected, never confused with the
+    verifier's.
+  - *The rules,* numbered in the report: (1) before a minor, an object outside the nursery whose field
+    points into a nursery block is in the remembered set (large objects exempt, the minor scans them
+    whole); (2) a valid type id; (3) no mark or forwarding bit in the header; (4) after a collection, in no
+    nursery or evacuation-source block; (5) inside the blocks ever used; (6) after a major, in a recyclable
+    or full block; (7) on marked lines, after a major and at every check for a recyclable block, whose
+    unmarked lines the allocators hand out; (8) after a major under the generational plan, unlogged.
+  - *A failure* is `fatal error: gc verify: <rule>`, then the crash format's lines: the check point and the
+    stop-the-world number, the object (address, type, block and state), the field and its referent for an
+    edge rule, the image; exit 2.
+  - *What it found first.* With 230.4's clean-block rule reverted it fails, the same on every run, at the
+    first minor after the first major: rule 7, an object in a recyclable block on unmarked lines. That
+    corrected 230.4's account of the bug, which had blamed the barrier: the corruption was the allocator
+    handing out filled holes again. Rule 7 at every check was added for it; the first design checked lines
+    only after a major.
+  - *Tests.* `gc-verify-unremembered` stores a young pointer into a mature object with a raw store, past the
+    barrier, and expects rule 1 before the next minor, naming field +8. The `stress-mixed` leg runs with
+    the verifier on, and a new `stress-minor-verify` leg runs `stress-minor` with it; both full tier. Full
+    tier 1819 passed (about 20 s more than without the two verified legs).
+  - *Cost.* `actor_msg_queued` under `NOMU_GC_STRESS=4096` (a collection every 4 KiB): 0.02 s off, 6.7 s on.
+    Every collection traces the live heap, so it is a debugging mode.
 
 Deterministic GC tests (suite cases that pass or fail by thread timing) moved to
 [158](158-gc-packaging.md), whose trigger protocol their fixes go through. 159 comes first, so 158's

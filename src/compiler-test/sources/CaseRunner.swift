@@ -147,6 +147,12 @@ struct CaseRunner {
                                   ["  run exited \(r.exitCode ?? -1) (\(at)\(expected))"] + partial(r) + ["  repro: \(runRepro)"],
                                   runTime: totalRun)
                 }
+                if let cap = c.expect?.maxResidentMiB, r.maxResident > cap << 20 {
+                    return result(.fail,
+                                  ["  resident memory \(r.maxResident >> 20) MiB (\(at)), expected at most \(cap) MiB"]
+                                      + ["  repro: \(runRepro)"],
+                                  runTime: totalRun)
+                }
                 if let want = want, r.stdout != want {
                     var d = ["  stdout mismatch (\(at))"] + diffBlock(want: want, got: r.stdout)
                     if !r.stderr.isEmpty { d += ["  stderr:"] + indented(r.stderr) }

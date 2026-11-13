@@ -1,0 +1,24 @@
+// Garbage over a small live set, collected many times under the default reservation (64 GiB or more): the
+// collector's passes stop at the blocks ever used, so resident memory stays near the live set and the
+// nursery, far below the reservation's side tables (over a gigabyte).
+class Box {
+  var v: Int
+}
+
+fun main() {
+  var keep: Array<Box> = []
+  var total = 0
+  var i = 0
+  while i < 2000000 {
+    let junk = Box(v: i)
+    total = total + junk.v % 7
+    if i % 1000 == 0 {
+      keep.append(Box(v: i))
+    }
+    i = i + 1
+  }
+  print(keep.count)
+  print("\n")
+  print(total)
+  print("\n")
+}

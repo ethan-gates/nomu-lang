@@ -9,13 +9,24 @@
 // (§10.2, Decided), one byte per entry, over the reserved heap range. Entry value 0 is the initial state
 // (block FREE / line unmarked), and `RawPtr.alloc` zero-fills, so the fresh tables start correct.
 //
-// Space descriptor (160 bytes):
+// Space descriptor (184 bytes):
 //   { heapBase: RawPtr @0, numBlocks: Int @8, lineTable: RawPtr @16, blockTable: RawPtr @24,
 //     freeCursor: Int @32, heapBaseInt: Int @40, allocCursor: Int @48, allocLimit: Int @56,
 //     losHead: RawPtr @64, allocBlock: Int @72, allocLine: Int @80, freeList: RawPtr @88,
 //     freeListTop: Int @96, scanBlock: Int @104, defragTable: RawPtr @112, poolLock: Int @120,
-//     nurseryReserve: Int @128, nurseryUsed: Int @136, logbitTable: RawPtr @144, recorder: RawPtr @152 }.
-// recorder is the collector's recorder (rtRecNew), null unless `gc.record` is on.
+//     nurseryReserve: Int @128, nurseryUsed: Int @136, logbitTable: RawPtr @144, recorder: RawPtr @152,
+//     heapLimit: Int @160, losBytes: Int @168, liveBlocks: Int @176 }.
+// recorder is the collector's recorder (rtRecNew), null unless `gc.record` is on. numBlocks is the
+// reservation: the address range and the side tables cover it, and it bounds every address test.
+// heapLimit (L) is mature space's soft limit in blocks, set after each major (rtHeapResize); the nursery
+// reserve sits on top of it, and the mutator's block pool hands out blocks below the two together
+// (rtHeapCap). The collector's own copies may pass it, up to the reservation. losBytes counts the large
+// objects' bytes: the live ones after the last major plus those allocated since. liveBlocks is what the last
+// major left live, large objects included, in blocks (0 before the first). Only
+// blocks below freeCursor have ever been used, so every pass over the blocks or the side tables stops there:
+// a pass that read the tables to numBlocks would make the whole reservation's tables resident (on darwin a
+// read alone does), and the suite's `heap-reservation-untouched` case bounds a run's resident memory to
+// catch one.
 // allocCursor/allocLimit are heap-relative byte offsets bounding the current hole (0/0 → refill). freeCursor
 // bumps never-used blocks. allocBlock/allocLine track the block being filled + its next line to scan for
 // holes (allocBlock −1 = none). freeList is a stack of reclaimed empty block indices (freeListTop entries).
@@ -26,12 +37,12 @@
 // collection, overwritten by the sweep), 4 NURSERY (a clean block handed to a mutator TLAB — young objects
 // only; the minor collection's from-space, 150.4). Line mark byte: 0 unmarked, 1 marked.
 //
-// Generational layer (task 150 · rung 4, GenImmix, §11). nurseryReserve bounds the nursery to a fixed
-// fraction of the pool (a bounded copying nursery — the minor GC promotes all survivors to mature and
-// recycles the nursery blocks). nurseryUsed counts NURSERY blocks acquired since the last collection; a
-// collection empties the nursery, so the sweep resets it to 0. A mutator TLAB refill tags each *clean* block
-// it pulls (free/never-used, block-state 0) NURSERY — a reused RECYCLABLE block holds mature survivors and
-// stays mature. 150.4.1 lands this substrate non-collecting (no minor GC yet, so the reserve bound is not
+// Generational layer (task 150 · rung 4, GenImmix, §11). nurseryReserve bounds the nursery (a bounded copying
+// nursery — the minor GC promotes all survivors to mature and recycles the nursery blocks), sized with the
+// heap limit (heap sizing, below). nurseryUsed counts NURSERY blocks acquired since the last collection; a
+// collection empties the nursery, so the sweep resets it to 0. A mutator TLAB refill takes only *clean*
+// blocks (free/never-used, block-state 0) and tags each NURSERY; it never reuses a RECYCLABLE block's holes
+// under this plan (rtNextAllocBlock). 150.4.1 lands this substrate non-collecting (no minor GC yet, so the reserve bound is not
 // enforced); the minor-collection driver keying off the NURSERY tag is 150.4.3.
 //
 // logbitTable @144 (task 150 · 150.4.2) is the self-hosted log-bit side table for the object-remembering
@@ -51,22 +62,30 @@
 // scanBlock) and the large-object list (losHead) are pulled under poolLock @120 — a 3-state futex mutex
 // (rtSchedMutexLockAt). The per-carrier bump fast path takes no lock.
 
-// Reserve a heap of `numBlocks` 32 KiB blocks + its side tables; return the space descriptor. The heap and
-// tables are zeroed reservations: they read as zero, and their pages become resident only as the allocator
-// and collector first touch them, so an unused heap costs no memory.
-fun rtImmixNew(numBlocks: Int) -> RawPtr {
-  let block = 32768
-  let heapBytes = numBlocks * block
-  let heap = Runtime.reserveZeroed(bytes: heapBytes, align: block)
+// A zeroed reservation the runtime cannot do without (a side table, a fiber stack): out of memory when the
+// system refuses it.
+fun rtReserve(bytes: Int, align: Int) -> RawPtr {
+  let p = Runtime.reserveZeroed(bytes: bytes, align: align)
+  if p.isNull {
+    rtOutOfMemoryIn(1, bytes, RawPtr.null)
+  }
+  return p
+}
+
+// The space descriptor over `heap`, a reservation of `numBlocks` 32 KiB blocks (rtHeapNew), with its side
+// tables reserved here and a heap limit of `limitBlocks`. The heap and tables are zeroed reservations: they
+// read as zero, and their pages become resident only as the allocator and collector first touch them, so an
+// unused heap costs no memory.
+fun rtImmixNew(heap: RawPtr, numBlocks: Int, limitBlocks: Int) -> RawPtr {
   let lineBytes = numBlocks * 128
-  let lineTable = Runtime.reserveZeroed(bytes: lineBytes, align: 8)
-  let blockTable = Runtime.reserveZeroed(bytes: numBlocks, align: 8)
-  let freeList = Runtime.reserveZeroed(bytes: numBlocks * 8, align: 8)
-  let defragTable = Runtime.reserveZeroed(bytes: numBlocks, align: 8)
+  let lineTable = rtReserve(lineBytes, 8)
+  let blockTable = rtReserve(numBlocks, 8)
+  let freeList = rtReserve(numBlocks * 8, 8)
+  let defragTable = rtReserve(numBlocks, 8)
   // Log-bit side table (150.4.2): one bit per 8-byte region = one byte per 64 heap bytes = 512 bytes per
   // 32 KiB block, plus a word of slack for the top-of-heap boundary index. Zero → all objects logged.
-  let logbitTable = Runtime.reserveZeroed(bytes: numBlocks * 512 + 64, align: 8)
-  let ctl = RawPtr.alloc(bytes: 160, align: 8)
+  let logbitTable = rtReserve(numBlocks * 512 + 64, 8)
+  let ctl = RawPtr.alloc(bytes: 184, align: 8)
   ctl.store(heap, toByteOffset: 0)
   ctl.store(numBlocks, toByteOffset: 8)
   ctl.store(lineTable, toByteOffset: 16)
@@ -84,10 +103,13 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
   ctl.store(0, toByteOffset: 104)    // scanBlock
   ctl.store(defragTable, toByteOffset: 112)  // per-block last-sweep live-line count (defrag histogram)
   ctl.store(0, toByteOffset: 120)            // poolLock (150.3.10.1): shared-pool + LOS futex mutex, unlocked
-  ctl.store(numBlocks / 4, toByteOffset: 128) // nurseryReserve (150.4): bounded copying nursery, 1/4 of the pool
+  ctl.store(0, toByteOffset: 128)            // nurseryReserve (150.4), set with the limit below
   ctl.store(0, toByteOffset: 136)            // nurseryUsed: NURSERY blocks acquired since the last collection
   ctl.store(logbitTable, toByteOffset: 144)  // logbitTable (150.4.2): write-barrier log-bit side table
   ctl.store(RawPtr.null, toByteOffset: 152)  // recorder: null unless `gc.record` is on
+  ctl.store(0, toByteOffset: 168)            // losBytes
+  ctl.store(0, toByteOffset: 176)            // liveBlocks
+  rtHeapSetLimit(ctl, limitBlocks)           // heapLimit and the nursery reserve
   if Runtime.gcRecordLevel() > 0 {
     ctl.store(rtRecNew(0), toByteOffset: 152)
   }
@@ -96,7 +118,7 @@ fun rtImmixNew(numBlocks: Int) -> RawPtr {
 
 // The active nursery reserve (150.4.5.3): the generational minor trigger in blocks, and the predicate for
 // "generational active" (> 0). Under the `genimmix` plan the reserve is the descriptor's default
-// (numBlocks/4, stored at ctl+128 by rtImmixNew) unless the NOMU_NURSERY_RESERVE dev/test override sets a
+// (heapLimit/4, stored at ctl+128 by rtImmixNew) unless the NOMU_NURSERY_RESERVE dev/test override sets a
 // positive value. Under the `immix` plan (`gc.plan`) it is 0, a constant, so the generational paths fold
 // away. Both the nursery-full trigger in rtImmixRefill and the gen-defrag gate in nomuSchedStwCollectDefrag
 // resolve through here so they share one predicate.
@@ -109,6 +131,84 @@ fun rtGenReserve(space: RawPtr) -> Int {
     return env
   }
   return space.load(fromByteOffset: 128)
+}
+
+// ---- Heap sizing: the soft limit and the nursery ----
+// Mature space may hold L blocks (heapLimit @160), large objects counted in blocks; the nursery reserve sits
+// on top. After each major L becomes live + (live + stacks) × r, r = NOMU_GC_PERCENT / 100 (Go's GOGC shape;
+// stacks are the fibers' used stack bytes in blocks, rtStackScanBytes), at least the 4 MiB minimum and,
+// with the nursery, at most the reservation. A major runs when mature space
+// reaches L (rtGenCollect, and the large-object path in rtTlabAlloc) or the mutator's blocks run out
+// (rtImmixRefill). The nursery is a quarter of L, clamped to 4–64 MiB: a plain fraction would give a small
+// heap a tiny nursery and a large heap a huge one.
+
+// The nursery reserve for a heap limit of `limit` blocks: a quarter, within 128–2048 blocks.
+fun rtNurseryFor(limit: Int) -> Int {
+  var n = limit / 4
+  if n < 128 {
+    n = 128
+  }
+  if n > 2048 {
+    n = 2048
+  }
+  return n
+}
+
+// Set L to `limit` blocks, at least the minimum heap, and the nursery reserve to match, with the two inside the
+// reservation: past it, the nursery is cut to a quarter of the reservation and L takes the rest.
+fun rtHeapSetLimit(space: RawPtr, limit: Int) {
+  let reserved: Int = space.load(fromByteOffset: 8)
+  var l = limit
+  let minimum = rtHeapMinimum / 32768
+  if l < minimum {
+    l = minimum
+  }
+  var n = rtNurseryFor(l)
+  if l + n > reserved {
+    if n > reserved / 4 {
+      n = reserved / 4
+    }
+    l = reserved - n
+  }
+  space.store(l, toByteOffset: 160)
+  space.store(n, toByteOffset: 128)
+}
+
+// The mutator's block cap: L plus the active nursery reserve (none under the `immix` plan).
+fun rtHeapCap(space: RawPtr) -> Int {
+  let limit: Int = space.load(fromByteOffset: 160)
+  return limit + rtGenReserve(space)
+}
+
+// Whether the heap is as large as it can grow: L and the nursery fill the reservation.
+fun rtHeapAtMax(space: RawPtr) -> Bool {
+  let limit: Int = space.load(fromByteOffset: 160)
+  let nursery: Int = space.load(fromByteOffset: 128)
+  let reserved: Int = space.load(fromByteOffset: 8)
+  return limit + nursery >= reserved
+}
+
+// The large objects' bytes in blocks, rounded up.
+fun rtLosBlocks(space: RawPtr) -> Int {
+  let bytes: Int = space.load(fromByteOffset: 168)
+  return (bytes + 32767) / 32768
+}
+
+// Mature space in blocks: the blocks in use less the nursery's, plus the large objects.
+fun rtMatureBlocks(space: RawPtr) -> Int {
+  let fc: Int = space.load(fromByteOffset: 32)
+  let flTop: Int = space.load(fromByteOffset: 96)
+  let nursery: Int = space.load(fromByteOffset: 136)
+  return fc - flTop - nursery + rtLosBlocks(space)
+}
+
+// After a major, which empties the nursery: record the live blocks and set L from them and the fibers' stacks.
+fun rtHeapResize(space: RawPtr) {
+  let live = rtMatureBlocks(space)
+  space.store(live, toByteOffset: 176)
+  let stackBytes: Int = rtStackScanBytes.load(fromByteOffset: 0)
+  let stacks = (stackBytes + 32767) / 32768
+  rtHeapSetLimit(space, live + (live + stacks) * rtGcPercent / 100)
 }
 
 // The base address of block `bi`.
@@ -164,8 +264,7 @@ fun rtClearLine(space: RawPtr, li: Int) {
 // the fresh-block source the hole-aware allocator (150.3.2) draws from.
 fun rtAcquireBlock(space: RawPtr) -> RawPtr {
   let fc: Int = space.load(fromByteOffset: 32)
-  let nb: Int = space.load(fromByteOffset: 8)
-  if fc >= nb {
+  if fc >= rtHeapCap(space) {
     return RawPtr.null
   }
   let addr = rtBlockAddr(space, fc)
@@ -182,6 +281,8 @@ fun rtAcquireBlock(space: RawPtr) -> RawPtr {
 // the seam turns into the managed `p1` — codegen never sees the link word.
 fun rtLosAlloc(space: RawPtr, need: Int) -> RawPtr {
   rtGcRecordLargeObject(need)
+  let counted: Int = space.load(fromByteOffset: 168)
+  space.store(counted + need, toByteOffset: 168)      // under poolLock, as the list is
   let raw = RawPtr.alloc(bytes: need + 8, align: 8)
   let head: RawPtr = space.load(fromByteOffset: 64)
   raw.store(head, toByteOffset: 0)              // link → previous LOS head
@@ -189,12 +290,12 @@ fun rtLosAlloc(space: RawPtr, need: Int) -> RawPtr {
   return raw.advanced(by: 8)                    // object starts after the link word
 }
 
-// Hand out the next never-used block index (bump freeCursor), or −1 when the heap is exhausted. Unlike
-// rtAcquireBlock this sets no state and returns an index — the hole-aware allocator manages state.
-fun rtAcquireNeverUsed(space: RawPtr) -> Int {
+// Hand out the next never-used block index (bump freeCursor), or −1 at `cap` blocks: the mutator's cap
+// (rtHeapCap) or, for the collector's copies, the reservation. Unlike rtAcquireBlock this sets no state and
+// returns an index — the hole-aware allocator manages state.
+fun rtAcquireNeverUsed(space: RawPtr, cap: Int) -> Int {
   let fc: Int = space.load(fromByteOffset: 32)
-  let nb: Int = space.load(fromByteOffset: 8)
-  if fc >= nb {
+  if fc >= cap {
     return -1
   }
   space.store(fc + 1, toByteOffset: 32)
@@ -204,8 +305,14 @@ fun rtAcquireNeverUsed(space: RawPtr) -> Int {
 // Choose the next block for the allocator to fill (task 150 · rung 3): a reclaimed empty block off the free
 // list first, then a recyclable block (has holes) scanned from scanBlock, then a never-used block. Returns
 // the block index, or −1 when the heap is exhausted. Reclaimed + recyclable blocks are why the heap does not
-// grow when garbage was collected (150.3.5).
-fun rtNextAllocBlock(space: RawPtr) -> Int {
+// grow when garbage was collected (150.3.5). Never-used blocks stop at `cap` (rtAcquireNeverUsed). With
+// `recyclable` false the scan is skipped: the generational plan's mutator takes clean blocks only, so every
+// young object is in a NURSERY block. A young object in a mature block's hole would read as logged, so the
+// barrier would miss a nursery pointer stored into it, and nothing would mark its lines, so a later scan
+// would hand the hole out again over it (seen as lost mailbox messages once a small heap made majors
+// frequent; the heap verifier's unmarked-line check catches it). Under that plan the minor's promotions fill
+// the holes instead (rtNextHole, rtImmixCollectMinor): promoted objects are unlogged and line-marked.
+fun rtNextAllocBlock(space: RawPtr, cap: Int, recyclable: Bool) -> Int {
   let top: Int = space.load(fromByteOffset: 96)
   if top > 0 {
     let fl: RawPtr = space.load(fromByteOffset: 88)
@@ -217,7 +324,7 @@ fun rtNextAllocBlock(space: RawPtr) -> Int {
   var sb: Int = space.load(fromByteOffset: 104)
   let fc: Int = space.load(fromByteOffset: 32)
   var found = -1
-  var scanning = true
+  var scanning = recyclable
   while scanning {
     if sb >= fc {
       scanning = false
@@ -236,7 +343,25 @@ fun rtNextAllocBlock(space: RawPtr) -> Int {
   if found >= 0 {
     return found
   }
-  return rtAcquireNeverUsed(space)
+  return rtAcquireNeverUsed(space, cap)
+}
+
+// The next recyclable block from scanBlock on, advancing scanBlock past it, or −1 when none remains. The
+// collector's copy allocator fills holes before it takes a clean block, as Immix's does. A major's evacuation
+// finds none (rtSetupCopyAllocator moves scanBlock past every used block), since its line marks are being
+// rebuilt; a minor's promotions take each recyclable block once per major cycle.
+fun rtNextRecyclable(space: RawPtr) -> Int {
+  var sb: Int = space.load(fromByteOffset: 104)
+  let fc: Int = space.load(fromByteOffset: 32)
+  var found = -1
+  while found < 0 && sb < fc {
+    if rtBlockState(space, sb) == 1 {
+      found = sb
+    }
+    sb = sb + 1
+  }
+  space.store(sb, toByteOffset: 104)
+  return found
 }
 
 // Advance the allocator to the next hole (a run of free/unmarked lines) big enough for `need` bytes, setting
@@ -251,7 +376,11 @@ fun rtNextHole(space: RawPtr, need: Int) -> Bool {
   while !done {
     let ab: Int = space.load(fromByteOffset: 72)
     if ab < 0 {
-      let nb = rtNextAllocBlock(space)
+      let reserved: Int = space.load(fromByteOffset: 8)
+      var nb = rtNextRecyclable(space)
+      if nb < 0 {
+        nb = rtNextAllocBlock(space, reserved, false)    // the collector's copies may pass the heap limit
+      }
       if nb < 0 {
         done = true
       } else {
@@ -473,11 +602,11 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
   return total
 }
 
-// Count the marked lines in the space's line table.
+// Count the marked lines in the space's line table, over the blocks ever used.
 fun rtCountMarkedLines(space: RawPtr) -> Int {
-  let nb: Int = space.load(fromByteOffset: 8)
+  let fc: Int = space.load(fromByteOffset: 32)
   let tbl: RawPtr = space.load(fromByteOffset: 16)
-  let n = nb * 128
+  let n = fc * 128
   var count = 0
   var li = 0
   while li < n {
@@ -517,7 +646,8 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
   let nb: Int = space.load(fromByteOffset: 8)
   let base: Int = space.load(fromByteOffset: 40)
   let heapEnd = base + nb * 32768
-  let ntot = nb * 128
+  let fc: Int = space.load(fromByteOffset: 32)
+  let ntot = fc * 128               // lines of the blocks ever used; no object lies past them
   let scratch = RawPtr.alloc(bytes: ntot, align: 8)
   var wcap = 4096                   // grows on demand (rtStackGrow)
   var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
@@ -671,8 +801,8 @@ fun rtTryMarkBare(obj: RawPtr) -> Bool {
 // Mark the transitive live set from `root`: header bit 32 on each object, plus line marks for in-heap
 // objects (rtMarkObjLines; LOS objects get the header bit only, reclaimed by whole chunk).
 fun rtImmixMark(space: RawPtr, root: RawPtr) {
-  var wcap = 4096                   // grows on demand (rtStackGrow)
-  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
+  var work = rtGcWorkTake()         // grows on demand (rtStackGrow)
+  var wcap = rtGcWorkCap()
   var top = 0
   let rootNull = root.eq(RawPtr.null)
   if !rootNull {
@@ -767,14 +897,15 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
       }
     }
   }
-  work.free()
+  rtGcWorkKeep(work, wcap)
 }
 
-// Clear every line mark — the start of a collection, before liveness is re-derived.
+// Clear every line mark — the start of a collection, before liveness is re-derived. Lines past the blocks
+// ever used were never marked.
 fun rtClearAllLines(space: RawPtr) {
-  let nb: Int = space.load(fromByteOffset: 8)
+  let fc: Int = space.load(fromByteOffset: 32)
   let tbl: RawPtr = space.load(fromByteOffset: 16)
-  let n = nb * 128
+  let n = fc * 128
   var i = 0
   while i < n {
     tbl.store(0.uint8, toByteOffset: i)
@@ -822,10 +953,12 @@ fun rtImmixSweepBlocks(space: RawPtr) {
 }
 
 // Reclaim the large-object space: walk the LOS list, free every unmarked (dead) chunk, and relink the marked
-// (live) ones (their marks are cleared later by rtImmixUnmark). Reforms losHead over the survivors.
+// (live) ones (their marks are cleared later by rtImmixUnmark). Reforms losHead over the survivors, and
+// losBytes to their sizes.
 fun rtImmixSweepLos(space: RawPtr) {
   var cur: RawPtr = space.load(fromByteOffset: 64)
   var newHead = RawPtr.null
+  var live = 0
   var curNull = cur.eq(RawPtr.null)
   while !curNull {
     let next: RawPtr = cur.load(fromByteOffset: 0)
@@ -835,6 +968,7 @@ fun rtImmixSweepLos(space: RawPtr) {
     if hi > 0 {
       cur.store(newHead, toByteOffset: 0)
       newHead = cur
+      live = live + rtObjSize(obj)
     } else {
       cur.free()
     }
@@ -842,13 +976,14 @@ fun rtImmixSweepLos(space: RawPtr) {
     curNull = cur.eq(RawPtr.null)
   }
   space.store(newHead, toByteOffset: 64)
+  space.store(live, toByteOffset: 168)
 }
 
 // Clear the header mark bit across the live set (re-walk from root). Runs after the sweeps have read the
 // marks, so the next collection starts clean. Reaches LOS survivors through the graph too.
 fun rtImmixUnmark(root: RawPtr) {
-  var wcap = 4096                   // grows on demand (rtStackGrow)
-  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
+  var work = rtGcWorkTake()         // grows on demand (rtStackGrow)
+  var wcap = rtGcWorkCap()
   var top = 0
   if rtUnmarkIfMarked(root) {
     work.store(root, toByteOffset: 0)
@@ -859,11 +994,16 @@ fun rtImmixUnmark(root: RawPtr) {
     let obj: RawPtr = work.load(fromByteOffset: top * 8)
     let tid = rtObjTypeId(obj)
     let kind = rtTypeKind(tid)
-    let nptr = rtLiveCount(tid, obj)
+    var nptr = 0
+    if kind == 0 {
+      nptr = rtOffsetsList(tid, obj)            // each enum field decoded once
+    } else {
+      nptr = rtLiveCount(tid, obj)
+    }
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = rtLiveOffsetAt(tid, obj, i)
+        let off = rtOffsetListed(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         if rtUnmarkIfMarked(child) {
           if top == wcap {
@@ -922,7 +1062,7 @@ fun rtImmixUnmark(root: RawPtr) {
       }
     }
   }
-  work.free()
+  rtGcWorkKeep(work, wcap)
 }
 
 // Clear the header mark bit across the live set from `root` and, in the same walk, set every in-heap survivor
@@ -936,8 +1076,8 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
   let base: Int = space.load(fromByteOffset: 40)
   let nb: Int = space.load(fromByteOffset: 8)
   let heapEnd = base + nb * 32768
-  var wcap = 4096                   // grows on demand (rtStackGrow)
-  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
+  var work = rtGcWorkTake()         // grows on demand (rtStackGrow)
+  var wcap = rtGcWorkCap()
   var top = 0
   if rtUnmarkIfMarked(root) {
     work.store(root, toByteOffset: 0)
@@ -954,11 +1094,16 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
     }
     let tid = rtObjTypeId(obj)
     let kind = rtTypeKind(tid)
-    let nptr = rtLiveCount(tid, obj)
+    var nptr = 0
+    if kind == 0 {
+      nptr = rtOffsetsList(tid, obj)            // each enum field decoded once
+    } else {
+      nptr = rtLiveCount(tid, obj)
+    }
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let off = rtLiveOffsetAt(tid, obj, i)
+        let off = rtOffsetListed(tid, obj, i)
         let child: RawPtr = obj.load(fromByteOffset: off)
         if rtUnmarkIfMarked(child) {
           if top == wcap {
@@ -1017,7 +1162,7 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
       }
     }
   }
-  work.free()
+  rtGcWorkKeep(work, wcap)
 }
 
 // One non-moving collection from `root`: clear line marks, mark the live set, reclaim by block and by LOS
@@ -1034,6 +1179,7 @@ fun rtImmixCollect(space: RawPtr, root: RawPtr) {
   space.store(0, toByteOffset: 48)    // allocCursor
   space.store(0, toByteOffset: 56)    // allocLimit
   space.store(0, toByteOffset: 104)   // scanBlock (rescan recyclable from the start)
+  rtGcWorkRelease()
 }
 
 // Blocks handed out from the never-used pool (freeCursor) — the heap's high-water mark in blocks.

@@ -1,0 +1,22 @@
+// Live data that outgrows the heap: every array stays reachable, so a collection frees nothing and the
+// allocator reports out of memory and exits with status 2, as Go's fatal errors do.
+fun chunk(seed: Int) -> Array<Int> {
+  var xs: Array<Int> = []
+  var i = 0
+  while i < 1024 {
+    xs.append(seed + i)
+    i = i + 1
+  }
+  return xs
+}
+
+fun main() {
+  var keep: Array<Array<Int>> = []
+  print("filling\n")
+  var n = 0
+  while true {
+    keep.append(chunk(n))
+    n = n + 1
+  }
+  print(keep.count)
+}

@@ -20,9 +20,25 @@ One module over these files; a name declared in any file is visible in all of th
 | `scheduler.nomu` | the M:N scheduler, timers, actor mailboxes, the stop-the-world handshake, entry points |
 | `io.nomu` | stdin line input and its poller, the array bounds trap |
 | `channel.nomu` | the channel core under the prelude's `Channel<T>`: the buffer, the waiter queues, park and wake; the one-shot pair (fulfill, await) under `Task<T>`; and `select` (rtSelectWait, rtSelectDone) |
-| `fault.nomu` | the fault handler: the crash report, each runtime thread's alternate signal stack; fiber dumps (SIGQUIT, `NOMU_TRACEBACK=all`) |
+| `fault.nomu` | the fault handler: the crash report, each runtime thread's alternate signal stack; fiber dumps (SIGQUIT, `NOMU_TRACEBACK=all`); the out-of-memory report |
+| `gcverify.nomu` | the heap verifier: the collector's invariants checked at every collection (`NOMU_GC_VERIFY=1`) |
 | `leak.nomu` | the leak report: fibers that can never wake, found by a mark from the roots that can run (`NOMU_LEAK_REPORT=1`) |
 | `verify.nomu` | the bump allocator and mark-verify tracer (early collector rungs) |
+
+**The heap is one large reservation.** `rtHeapNew` (`startup.nomu`) reserves the heap and its side tables
+once, sized by `NOMU_HEAP_MAX` or from physical RAM (64 GiB at least), and the heap's size is a soft limit
+inside it (descriptor +160) that follows the live data, Go's `GOGC` rule (heap sizing, `immix.nomu`).
+Untouched pages cost nothing, which holds only while two rules do:
+- No pass reads or writes the blocks or side tables past the blocks ever used (`freeCursor`); on darwin a
+  read alone makes a page resident. The suite's `heap-reservation-untouched` case bounds resident memory to
+  catch a pass that strays.
+- Anything the write barrier must see lives inside the reservation: its range test (`rtHeapLo`,
+  `rtHeapHi`) and the log-bit table cover that range only. Large objects sit outside it and never move.
+
+Under the generational plan the mutator allocates into clean (nursery) blocks only, never a mature block's
+holes: nothing marks the lines it fills, so after the next minor the same holes would be handed out again
+over live objects, and a new object there reads as logged, so the barrier would miss its nursery pointers.
+`NOMU_GC_VERIFY=1` (`gcverify.nomu`) checks these rules and the collector's others at every collection.
 
 **Recording costs nothing when off.** Every recording path is guarded by `Runtime.gcRecordLevel()` (0 off,
 1 `limited`, 2 `full`), which folds to a constant when the runtime compiles, so a lower level's build has

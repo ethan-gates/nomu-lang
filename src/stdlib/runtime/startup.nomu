@@ -17,6 +17,13 @@ let rtMatureFloor = rtPositive(rtEnvMatureFloor())
 // NOMU_GC_STRESS, in bytes: every allocation takes the slow path and each carrier requests a collection
 // after this many allocated bytes.
 let rtGcStress = rtPositive(rtEnvGcStress())
+// NOMU_GC_STRESS_MAJOR_EVERY, under NOMU_GC_STRESS: every this many stress collections, process-wide, one is a
+// major, so minors and majors alternate whatever the program's live data; 0 leaves the choice to the policy.
+let rtGcStressMajorEvery = rtPositive(rtEnvGcStressMajorEvery())
+// The stress collections requested so far, for NOMU_GC_STRESS_MAJOR_EVERY (counted atomically by carriers).
+let rtGcStressCount = Runtime.staticStorage(bytes: 8, align: 8)
+// NOMU_GC_VERIFY: 1 checks the collector's invariants at every collection (gcverify.nomu); off unless set.
+let rtGcVerify = rtPositive(rtEnvGcVerify()) > 0
 // NOMU_CARRIERS: the number of carrier threads the scheduler boots with; 4 unless set to 1 or more.
 let rtCarrierCount = rtEnvCarrierCount()
 // NOMU_SLOT: 0 turns off the run-queue slot (rtSchedReadyNext readies onto the run queue instead); on unless set.
@@ -35,17 +42,138 @@ let rtSearchNanos = rtEnvSearchNanos()
 // The scheduler.
 let rtSched = nomuSchedNew()
 
-// The heap: one Immix space of `rtHeapBlocks` 32 KiB blocks, created here so its descriptor and the write
-// barrier's values are constants. Its memory is reserved, not committed (rtImmixNew).
-let rtHeapBlocks = 8192
-let rtSpace = rtImmixNew(rtHeapBlocks)
-// The heap's address range [rtHeapLo, rtHeapHi): the write barrier skips stores into objects outside it
-// (large and immortal objects), which the log-bit table does not cover.
+// The heap: one Immix space over a reservation made once, here, so its descriptor and the write barrier's
+// values are constants. The reservation is NOMU_HEAP_MAX, in bytes with an optional suffix (B, KiB, MiB,
+// GiB, TiB), or by default the larger of 64 GiB (rtHeapDefaultFloor) and 4× physical RAM, halved until the
+// system grants it. Only touched pages cost memory (rtImmixNew). The heap's size is a soft limit inside the
+// reservation that follows the live data (heap sizing, immix.nomu): it starts at rtHeapMinimum, 4 MiB, Go's
+// starting heap, which is also the smallest reservation. NOMU_GC_PERCENT is r × 100 in that policy, 100
+// unless set, as Go's GOGC.
+let rtHeapDefaultFloor = 68719476736
+let rtHeapMinimum = 4194304
+let rtGcPercent = rtEnvGcPercent()
+let rtHeapMaxSetting = rtEnvHeapMax()
+let rtSpace = rtHeapNew(rtHeapMaxSetting)
+let rtHeapReservedBlocks: Int = rtSpace.load(fromByteOffset: 8)
+// The heap's address range [rtHeapLo, rtHeapHi), the whole reservation: the write barrier skips stores into
+// objects outside it (large and immortal objects), which the log-bit table does not cover.
 let rtHeapLo: Int = rtSpace.load(fromByteOffset: 40)
-let rtHeapHi = rtHeapLo + rtHeapBlocks * 32768
+let rtHeapHi = rtHeapLo + rtHeapReservedBlocks * 32768
 // The log-bit table's base, biased so the barrier indexes it by absolute address: the byte for address `a`
 // is at `rtLogbitBase + (a >> 3 >> 3)` (one bit per 8-byte region).
 let rtLogbitBase = rtLogbitBaseOf(rtSpace)
+
+// The heap's space: a reservation of `setting` bytes when NOMU_HEAP_MAX gives one, which out of memory ends
+// the program when the system refuses; else the default size, halved on each refusal down to the minimum. The
+// heap starts at the minimum.
+fun rtHeapNew(setting: Int) -> RawPtr {
+  var blocks = setting / 32768
+  var heap = RawPtr.null
+  if setting > 0 {
+    heap = Runtime.reserveZeroed(bytes: blocks * 32768, align: 32768)
+    if heap.isNull {
+      rtOutOfMemoryIn(2, blocks * 32768, RawPtr.null)
+    }
+  } else {
+    var bytes = rtHeapDefaultFloor
+    let ram = Runtime.physicalMemory()
+    if ram * 4 > bytes {
+      bytes = ram * 4
+    }
+    blocks = bytes / 32768
+    heap = Runtime.reserveZeroed(bytes: blocks * 32768, align: 32768)
+    while heap.isNull && blocks / 2 * 32768 >= rtHeapMinimum {
+      blocks = blocks / 2
+      heap = Runtime.reserveZeroed(bytes: blocks * 32768, align: 32768)
+    }
+    if heap.isNull {
+      rtOutOfMemoryIn(1, blocks * 32768, RawPtr.null)
+    }
+  }
+  return rtImmixNew(heap, blocks, rtHeapMinimum / 32768)
+}
+
+// NOMU_GC_PERCENT: a positive whole number, 100 when unset. A value it cannot read ends the program.
+fun rtEnvGcPercent() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  let s = rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_GC_PERCENT"))
+  if s.isNull {
+    return 100
+  }
+  var n = 0
+  var i = 0
+  var more = true
+  while more {
+    let c: UInt8 = s.load(fromByteOffset: i)
+    let d = c.int - 48
+    if d < 0 || d > 9 || i >= 9 {
+      more = false
+    } else {
+      n = n * 10 + d
+      i = i + 1
+    }
+  }
+  let end: UInt8 = s.load(fromByteOffset: i)
+  if i == 0 || end.int != 0 || n == 0 {
+    let msg = RawPtr.alloc(bytes: 128, align: 8)
+    let len = Runtime.copyLiteral(to: msg, "fatal error: NOMU_GC_PERCENT: expected a whole number above 0, such as 100\n")
+    Runtime.writeFd(fd: 2, buf: msg, count: len)
+    Runtime.exit(2)
+  }
+  return n
+}
+
+// NOMU_HEAP_MAX in bytes: decimal digits and an optional suffix, B, KiB, MiB, GiB or TiB, as Go's GOMEMLIMIT
+// reads them; 0 when unset. A value it cannot read, or one below the minimum heap, ends the program.
+fun rtEnvHeapMax() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  let s = rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_HEAP_MAX"))
+  if s.isNull {
+    return 0
+  }
+  var n = 0
+  var i = 0
+  var more = true
+  while more {
+    let c: UInt8 = s.load(fromByteOffset: i)
+    let d = c.int - 48
+    if d < 0 || d > 9 || i >= 15 {
+      more = false
+    } else {
+      n = n * 10 + d
+      i = i + 1
+    }
+  }
+  let c0: UInt8 = s.load(fromByteOffset: i)
+  var unit = 0
+  if i > 0 {
+    if c0.int == 0 {
+      unit = 1
+    } else {
+      let c1: UInt8 = s.load(fromByteOffset: i + 1)
+      if c0.int == 66 && c1.int == 0 {                               // B
+        unit = 1
+      } else if c1.int == 105 {                                      // ?i…
+        let c2: UInt8 = s.load(fromByteOffset: i + 2)
+        let c3: UInt8 = s.load(fromByteOffset: i + 3)
+        if c2.int == 66 && c3.int == 0 {                             // ?iB
+          if c0.int == 75 { unit = 1024 }                            // KiB
+          if c0.int == 77 { unit = 1048576 }                         // MiB
+          if c0.int == 71 { unit = 1073741824 }                      // GiB
+          if c0.int == 84 { unit = 1099511627776 }                   // TiB
+        }
+      }
+    }
+  }
+  // At most 2^62 bytes, so the product cannot overflow and the reservation's size stays positive.
+  if unit == 0 || n > 4611686018427387904 / unit || n * unit < rtHeapMinimum {
+    let msg = RawPtr.alloc(bytes: 256, align: 8)
+    let len = Runtime.copyLiteral(to: msg, "fatal error: NOMU_HEAP_MAX: expected a size of at least 4MiB, such as 512MiB or 64GiB (suffixes B, KiB, MiB, GiB, TiB)\n")
+    Runtime.writeFd(fd: 2, buf: msg, count: len)
+    Runtime.exit(2)
+  }
+  return n * unit
+}
 
 fun rtLogbitBaseOf(space: RawPtr) -> Int {
   let table: RawPtr = space.load(fromByteOffset: 144)
@@ -110,6 +238,16 @@ fun rtEnvMatureFloor() -> Int {
 fun rtEnvGcStress() -> Int {
   let name = RawPtr.alloc(bytes: 32, align: 8)
   return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_GC_STRESS")))
+}
+
+fun rtEnvGcVerify() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_GC_VERIFY")))
+}
+
+fun rtEnvGcStressMajorEvery() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_GC_STRESS_MAJOR_EVERY")))
 }
 
 fun rtEnvCarrierCount() -> Int {

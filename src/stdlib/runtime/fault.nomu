@@ -36,6 +36,8 @@
 // The fibers are read from the registry without its lock, as Go reads goroutines when it dumps them: the
 // dump is best effort, and a fiber running on another carrier shows as `[running]`, with no frames.
 //
+// Out of memory (rtOutOfMemory) reports in the same format, without a signal, and exits with status 2.
+//
 // `nomu tool symbolize <binary> <report>` names the frames, as `nomu run` does; underneath it is
 // `atos -o <binary> -l <load address> <frame addresses…>`. Frames after 0 are return
 // addresses, the instruction after the call, so a symbolizer looks up each less one: a call that never returns
@@ -172,6 +174,122 @@ fun rtFaultHandler(sig: Int, info: RawPtr, uctx: RawPtr) {
     Runtime.closeFd(fd: fd)
   }
   Runtime.raise(signal: signo)
+}
+
+// Out of memory: say so, report the heap and the allocating fiber's frames, and exit with status
+// 2, as Go's fatal errors do. `what` is why: 0, the heap is full after a collection (rtTlabAlloc); 1, the
+// system refused `bytes` (`__nomu_raw_alloc` under every large object and the runtime's own memory, or a
+// reservation, rtReserve); 2, the system refused the heap's reservation that NOMU_HEAP_MAX asked for
+// (rtHeapNew). The report is the crash format's: a `fatal error:` line, as the deadlock writes, then
+// `nomu-crash:` lines, the backtrace from this frame, every fiber under `NOMU_TRACEBACK=all`, and `end`.
+//
+//   fatal error: out of memory
+//   nomu-crash: format 1
+//   nomu-crash: out of memory: heap full after a collection     or: the system refused the request
+//   nomu-crash: request: 48 bytes
+//   nomu-crash: heap: 268435456 bytes, 268402688 in use, 134201344 live after the last major, maximum
+//               68719476736 (default)                          (one line)
+//   nomu-crash: a larger NOMU_HEAP_MAX raises the maximum       when the heap has reached it
+//
+// It allocates nothing (the text goes through the thread's alternate stack, as the fault handler's does) and
+// never returns. Callers reach it from gc-leaf code, which it may be, since runtime code never polls. The
+// carrier that claims the exit (sched+232, as rtSchedFinish does) reports; any other waits for the exit.
+fun rtOutOfMemory(what: Int, bytes: Int) {
+  rtOutOfMemoryIn(what, bytes, rtSpace)
+}
+
+// The report with the heap's figures from `space`, or none when it is null: the heap's own creation
+// (rtHeapNew, rtReserve) reports through here, before `rtSpace` exists.
+fun rtOutOfMemoryIn(what: Int, bytes: Int, space: RawPtr) {
+  let sched = rtSched
+  if !sched.isNull {
+    let was: Int = sched.atomicCas(0, 1, atByteOffset: 232)
+    if was != 0 {
+      let parked = sched.advanced(by: 232)
+      while true {
+        Runtime.futexWait(at: parked, expected: 1, timeoutMicros: 1000000)
+      }
+    }
+  }
+  let alt = Runtime.currentAltStack()
+  var buf = rtFaultScratch
+  if !alt.isNull {
+    buf = alt.advanced(by: 16)
+  }
+  var fd = -1
+  let first: UInt8 = rtFaultReportPath.load(fromByteOffset: 0)
+  if first.int != 0 {
+    fd = Runtime.createFile(path: rtFaultReportPath, mode: 420)
+  }
+  Runtime.writeFd(fd: 2, buf: buf, count: Runtime.copyLiteral(to: buf, "fatal error: out of memory\n"))
+  var n = Runtime.copyLiteral(to: buf, "nomu-crash: format 1\nnomu-crash: out of memory: ")
+  if what == 0 {
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "heap full after a collection\n")
+  } else if what == 1 {
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "the system refused the request\n")
+  } else {
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "the system refused the heap's reservation (NOMU_HEAP_MAX)\n")
+  }
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: request: ")
+  n = rtFaultPutDec(buf, n, bytes)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " bytes\n")
+  if !space.isNull {
+    let reserved: Int = space.load(fromByteOffset: 8)
+    let live: Int = space.load(fromByteOffset: 176)
+    let fc: Int = space.load(fromByteOffset: 32)
+    let flTop: Int = space.load(fromByteOffset: 96)
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: heap: ")
+    n = rtFaultPutDec(buf, n, rtHeapCap(space) * 32768)
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " bytes, ")
+    // In use: the blocks ever used less the free list, and the large objects.
+    n = rtFaultPutDec(buf, n, (fc - flTop + rtLosBlocks(space)) * 32768)
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " in use, ")
+    n = rtFaultPutDec(buf, n, live * 32768)
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " live after the last major, maximum ")
+    n = rtFaultPutDec(buf, n, reserved * 32768)
+    if rtHeapMaxSetting > 0 {
+      n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " (NOMU_HEAP_MAX)\n")
+    } else {
+      n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " (default)\n")
+    }
+    if what == 0 && rtHeapAtMax(space) {
+      n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: a larger NOMU_HEAP_MAX raises the maximum\n")
+    }
+  }
+  rtFaultEmit(fd, buf, n)
+  rtFaultEmit(fd, buf, rtFaultPutImage(buf, 0))
+  // This frame's record, then each caller's: { the caller's fp, the return address }, walked as the fault
+  // handler walks a faulting thread's.
+  var fp = Runtime.gcFrameAddr()
+  var i = 0
+  var go = true
+  while go && i < 64 {
+    if fp.isNull || fp.toInt() % 8 != 0 {
+      go = false
+    } else {
+      let next: RawPtr = fp.load(fromByteOffset: 0)
+      let ret: Int = fp.load(fromByteOffset: 8)
+      if ret == 0 {
+        go = false
+      } else {
+        rtFaultEmit(fd, buf, rtFaultPutFrame(buf, 0, i, ret))
+        if next.toInt() <= fp.toInt() {
+          go = false
+        }
+        fp = next
+        i = i + 1
+      }
+    }
+  }
+  let all: Int = rtFaultTracebackAll.load(fromByteOffset: 0)
+  if all != 0 {
+    rtFiberDump(fd, buf)
+  }
+  rtFaultEmit(fd, buf, Runtime.copyLiteral(to: buf, "nomu-crash: end\n"))
+  if fd >= 0 {
+    Runtime.closeFd(fd: fd)
+  }
+  Runtime.exit(2)
 }
 
 // Every fiber in the registry, a header and its frames each (the format above). Mailbox fibers waiting for

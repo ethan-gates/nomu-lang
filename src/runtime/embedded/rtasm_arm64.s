@@ -187,10 +187,20 @@ NOMU_LIBC snprintf, 1
 NOMU_LIBC strlen, 0
 NOMU_LIBC strpbrk, 0
 NOMU_LIBC strtod, 0
+NOMU_LIBC sysconf, 0
+NOMU_LIBC sysctlbyname, 0
 NOMU_LIBC write, 0
 NOMU_LIBC __ulock_wait, 0
 NOMU_LIBC __ulock_wake, 0
 NOMU_LIBC _NSGetExecutablePath, 0
+
+// The out-of-memory report (`rtOutOfMemory`, runtime/fault.nomu) for `__nomu_raw_alloc`, which runtime code
+// calls on a fiber's stack below its checked frames: the report walks frames and dumps fibers, deeper than
+// the stack reserve covers, so it runs on the carrier's stack like a libc call. It never returns.
+.global _nomu_oom_on_carrier
+.p2align 2
+_nomu_oom_on_carrier:
+    NOMU_SWITCH _nomu_fn_rtOutOfMemory, 0
 
 // The memory routines: `memcpy`, `memmove`, `memset`, `bzero` and `memcmp`, defined here so that every
 // call in a Nomu binary binds to them, the ones LLVM emits on its own included (a local definition wins

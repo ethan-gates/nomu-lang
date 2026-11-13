@@ -1,0 +1,23 @@
+// Only large objects (64 KiB arrays, past a block), almost all garbage: they count toward mature space, so
+// majors run and free them, and resident memory stays near one heap's worth instead of the 250 MiB allocated.
+fun big(seed: Int) -> Array<Int> {
+  var xs: Array<Int> = []
+  var i = 0
+  while i < 8000 {
+    xs.append(seed)
+    i = i + 1
+  }
+  return xs
+}
+
+fun main() {
+  var kept = 0
+  var i = 0
+  while i < 4000 {
+    let xs = big(i)
+    kept = kept + xs.count / 8000
+    i = i + 1
+  }
+  print(kept)
+  print("\n")
+}

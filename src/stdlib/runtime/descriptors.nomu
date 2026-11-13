@@ -97,6 +97,81 @@ fun rtLiveOffsetAt(tid: Int, base: RawPtr, i: Int) -> Int {
   return rtPairsOffsetAt(flat.advanced(by: nptr * 4), rtShapedCount(tid), base, i - nptr)
 }
 
+// The collector's offset list: a fixed-size object's live managed offsets, listed once per visit
+// (rtOffsetsList) and read back by index (rtOffsetListed). rtLiveCount and rtLiveOffsetAt decode the
+// object's enum fields again for every index, so a walk over an object with k such fields decodes O(k²)
+// cases; the list decodes each once. Word 0 is 1 when the list holds the object, 0 when it overflowed
+// (more than 256 offsets) and the readers fall back to rtLiveOffsetAt. One list for the runtime: the walks
+// that use it run on the collector, under stop-the-world, and read it before visiting the next object.
+let rtOffsList = Runtime.staticStorage(bytes: 2056, align: 8)        // 8 + 256 offsets × 8
+
+// List `base`'s live offsets (type `tid`, kind 0) and return their count.
+fun rtOffsetsList(tid: Int, base: RawPtr) -> Int {
+  let n = rtOffsetsInto(tid, base, 0, 0)
+  if n < 0 {
+    rtOffsList.store(0, toByteOffset: 0)
+    return rtLiveCount(tid, base)
+  }
+  rtOffsList.store(1, toByteOffset: 0)
+  return n
+}
+
+// The i-th offset rtOffsetsList listed for `base`.
+fun rtOffsetListed(tid: Int, base: RawPtr, i: Int) -> Int {
+  let listed: Int = rtOffsList.load(fromByteOffset: 0)
+  if listed == 1 {
+    let off: Int = rtOffsList.load(fromByteOffset: 8 + i * 8)
+    return off
+  }
+  return rtLiveOffsetAt(tid, base, i)
+}
+
+// Append the live offsets of the value of type `tid` at `base`, each plus `rel`, to the list after entry
+// `n`; the new count, or -1 past 256. Mirrors rtLiveCount and rtLiveOffsetAt.
+fun rtOffsetsInto(tid: Int, base: RawPtr, n0: Int, rel: Int) -> Int {
+  var n = n0
+  let map = rtTypeMap(tid)
+  var flat = map
+  var nflat = 0
+  var pairs = map
+  var nshaped = 0
+  if rtTypeKind(tid) == 2 {
+    let c = rtShapedCase(map, base)
+    if c < 0 {
+      return n
+    }
+    nflat = Runtime.loadInt32(map, at: c + 4)
+    flat = map.advanced(by: c + 8)
+    nshaped = Runtime.loadInt32(map, at: c + 8 + nflat * 4)
+    pairs = map.advanced(by: c + 12 + nflat * 4)
+  } else {
+    nflat = rtDescField(tid, 12)
+    flat = map.advanced(by: rtHeaderPtrCount(tid) * 4)
+    nshaped = rtShapedCount(tid)
+    pairs = flat.advanced(by: nflat * 4)
+  }
+  if n + nflat > 256 {
+    return -1
+  }
+  var i = 0
+  while i < nflat {
+    rtOffsList.store(rel + Runtime.loadInt32(flat, at: i * 4), toByteOffset: 8 + n * 8)
+    n = n + 1
+    i = i + 1
+  }
+  var k = 0
+  while k < nshaped {
+    let off = Runtime.loadInt32(pairs, at: k * 8)
+    let sub = Runtime.loadInt32(pairs, at: k * 8 + 4)
+    n = rtOffsetsInto(sub, base.advanced(by: off), n, rel + off)
+    if n < 0 {
+      return -1
+    }
+    k = k + 1
+  }
+  return n
+}
+
 // `n` (field offset, sub-shape type-id) pairs at `pairs`: the live sub-offsets they hold in all.
 fun rtPairsCount(pairs: RawPtr, n: Int, base: RawPtr) -> Int {
   var total = 0

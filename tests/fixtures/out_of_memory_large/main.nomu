@@ -1,0 +1,7 @@
+// A large object the system allocator refuses (64 TiB, built with `test.runtime_prelude` to ask for it
+// directly): the runtime reports out of memory and exits with status 2.
+fun main() {
+  print("asking\n")
+  let p = rtLosAlloc(rtSpace, 70368744177664)
+  print("unreachable\n")
+}

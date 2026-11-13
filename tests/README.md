@@ -72,7 +72,9 @@ since no package may sit at a workspace root. Fields:
   correct output legitimately changes. Omit `expect` to
   only require a clean exit. `signal: SIGSEGV` (or `SIGABRT`, `SIGBUS`, `SIGILL`, `SIGTRAP`, `SIGKILL`) is
   for a case that crashes on purpose: each run must die from that signal, and `stdout` and `stderr_match`
-  are still checked (the `crash-*` cases, the fault handler's report).
+  are still checked (the `crash-*` cases, the fault handler's report). `exit_code: 2` is for a case that
+  fails on purpose without a signal (a deadlock, out of memory). `max_resident_mib: 64` bounds each run's
+  peak resident memory (`wait4`'s `ru_maxrss`), for a case that guards a footprint.
 - `iterations` (repeat; all must pass), `carriers` (one run per count, sets `NOMU_CARRIERS`). Set
   `carriers: []` to run once without setting `NOMU_CARRIERS` — for fixtures that manage their own
   threads (the self-hosted scheduler/actor cases).
@@ -161,7 +163,9 @@ A matrix is declared once. `dimensions` names axes; each value carries `compile_
 - `pipeline` — `debug`; `release` (`optimize`) and `noinline` (`inline: false`), both `full`.
 - `gc` — `default`; `nursery` (64 blocks); `nursery-tight` (1 block: collections land at points the larger
   nursery never reaches); `stress-minor` (a collection every 4 KiB); `stress-major` (the same, every
-  collection major), `full`.
+  collection major), `full`; `stress-mixed` (the same, every fourth collection major, so minors run after
+  majors: `stress_major_every`; the heap verifier on: `gc_verify`), `full`; `stress-minor-verify`
+  (`stress-minor` with the heap verifier on), `full`.
 
 A `group` names fixtures by a directory glob (`dir/*`, every subdirectory), the axes it spans (`across`),
 shared settings and a default `expect`. It expands to one run per fixture and combination of values, named
@@ -198,7 +202,7 @@ fixture of their own, as does a fixture another case also uses with other settin
 
 `fast` is the default run: every flat case, plus group runs on the debug pipeline with the `default`,
 `nursery` and `stress-minor` legs. Budget about 60 s wall. `full` (`--tier full`) adds the `release` and
-`noinline` pipelines and `stress-major`; budget about 5 minutes. A whole-tier run reports when it exceeds
+`noinline` pipelines, `stress-major`, `stress-mixed` and `stress-minor-verify`; budget about 5 minutes. A whole-tier run reports when it exceeds
 its budget, and every run lists its five slowest cases.
 
 ## Scheduling order

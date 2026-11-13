@@ -1,0 +1,22 @@
+// Live data past 256 MiB, the heap's old fixed size: the heap grows with it (to twice the live data after
+// each major), so the program finishes where it once ran out of memory.
+fun chunk(seed: Int) -> Array<Int> {
+  var xs: Array<Int> = []
+  var i = 0
+  while i < 1024 {
+    xs.append(seed + i)
+    i = i + 1
+  }
+  return xs
+}
+
+fun main() {
+  var keep: Array<Array<Int>> = []
+  var n = 0
+  while n < 40960 {
+    keep.append(chunk(n))
+    n = n + 1
+  }
+  print(keep.count)
+  print("\n")
+}

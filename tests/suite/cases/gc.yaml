@@ -179,7 +179,7 @@ cases:
     fixture: tests/fixtures/gen_major
     run_settings:
       nursery_blocks: 8
-      mature_floor: 8176
+      mature_floor: 125
     expect:
       stdout: "77\n4242\n94950\n"
     iterations: 5
@@ -601,8 +601,9 @@ cases:
       rt_prelude: true
     run_settings:
       nursery_blocks: 1
+      mature_floor: 120
     expect:
-      stdout: "1 1 1\n"
+      stdout: "1 1 1\n2 2 1\n"
     collections:
       - min: 1
     carriers: []
@@ -709,11 +710,34 @@ cases:
     carriers: []
     iterations: 2
 
+  - name: gc-verify-unremembered
+    fixture: tests/fixtures/gc_verify_unremembered
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    run_settings:
+      gc_verify: 1
+    expect:
+      stdout: "stored\n"
+      exit_code: 2
+    stderr_match:
+      - pattern: "fatal error: gc verify: an object outside the nursery points into it and is not remembered"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: gc verify: before a minor"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: field +8 -> "
+        min: 1
+        max: 1
+    carriers: []
+
   - name: immix-sweep
     fixture: tests/fixtures/immix_sweep
     compile_settings:
       escape: false
       rt_prelude: true
+      gc_immix: true
     expect:
       stdout: "1\n1\n111\n222\n2\n"
     carriers: []

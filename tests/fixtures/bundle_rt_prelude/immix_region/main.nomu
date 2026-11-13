@@ -10,7 +10,7 @@
 // Expected output: 1 / 1 / 2 / 261 / 5 / 2 / 1 / 0 / 1 / 0 / 0 / 1.
 
 package fun bundleMain() {
-  let space = rtImmixNew(8)
+  let space = rtImmixNew(rtReserve(8 * 32768, 32768), 8, 8)   // 8 blocks reserved, a heap limit of 8
 
   // Block pool hands out block-adjacent bases: b1 = b0 + 32768, b2 = b1 + 32768.
   let b0 = rtAcquireBlock(space)

@@ -15,6 +15,7 @@ struct RunOutcome {
     var stdout: String
     var stderr: String
     var duration: Double   // wall-clock seconds
+    var maxResident: Int = 0   // peak resident memory in bytes (`wait4`'s `ru_maxrss`); 0 when unknown
 
     var succeeded: Bool { !timedOut && exitCode == 0 }
 }
@@ -184,11 +185,19 @@ func runProcess(path: String, args: [String], env: [String: String], timeout: Do
     }
 
     let statusBox = Box<Int32>(0)
+    let residentBox = Box<Int>(0)
     let done = DispatchSemaphore(value: 0)
     DispatchQueue.global().async {
         var st: Int32 = 0
-        while waitpid(pid, &st, 0) < 0 && errno == EINTR {}
+        var usage = rusage()
+        while wait4(pid, &st, 0, &usage) < 0 && errno == EINTR {}
         statusBox.value = st
+        // Bytes on darwin, kilobytes on Linux.
+        #if canImport(Darwin)
+        residentBox.value = Int(usage.ru_maxrss)
+        #else
+        residentBox.value = Int(usage.ru_maxrss) * 1024
+        #endif
         done.signal()
     }
 
@@ -217,5 +226,6 @@ func runProcess(path: String, args: [String], env: [String: String], timeout: Do
                       signal: timedOut ? nil : signal,
                       stdout: String(decoding: outBox.value, as: UTF8.self),
                       stderr: String(decoding: errBox.value, as: UTF8.self),
-                      duration: Date().timeIntervalSince(start))
+                      duration: Date().timeIntervalSince(start),
+                      maxResident: residentBox.value)
 }

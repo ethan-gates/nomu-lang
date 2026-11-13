@@ -2139,6 +2139,15 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(errors(outside).contains("undefined name 'Runtime'"), errors(outside))
     }
 
+    func testPhysicalMemory() {
+        let ok = sema("fun f() -> Int { return Runtime.physicalMemory() }", runtimeTier: true)
+        XCTAssertTrue(ok.diagnostics.isEmpty, errors(ok))
+        let args = sema("fun f() -> Int { return Runtime.physicalMemory(1) }", runtimeTier: true)
+        XCTAssertFalse(args.diagnostics.isEmpty)
+        let outside = sema("fun f() -> Int { return Runtime.physicalMemory() }")
+        XCTAssertTrue(errors(outside).contains("undefined name 'Runtime'"), errors(outside))
+    }
+
     func testStaticStorageArguments() {
         let literal = sema("let n = 8\nlet p = Runtime.staticStorage(bytes: n, align: 8)", runtimeTier: true)
         XCTAssertTrue(errors(literal).contains("takes integer literals for 'bytes' and 'align'"), errors(literal))

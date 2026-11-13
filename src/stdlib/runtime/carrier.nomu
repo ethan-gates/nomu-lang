@@ -293,28 +293,28 @@ fun rtGcCollected(ticket: Int) -> Bool {
   return rtSched.atomicLoad(fromByteOffset: 152) != ticket
 }
 
-// Run a generational collection at the alloc-site anchor: a minor, or a major when mature headroom is short
-// (150.4.4, §11.4). `minorTrigger` is the active nursery reserve in blocks (rtGenReserve, > 0). A minor
-// promotes the whole nursery into mature; when mature lacks headroom the copy allocator would return null
-// mid-promotion (a null stored into a slot — corruption), and a minor never reclaims dead mature objects, so
-// mature fills over time. When the free mature blocks fall below a floor, run a full defrag major instead — it
-// reclaims mature garbage and collects the nursery, so it handles both failed promotion and mature pressure.
-// The floor is the worst-case promotion (the whole nursery, minorTrigger blocks) plus a fragmentation margin,
-// raised by NOMU_MATURE_FLOOR (the mature-pressure knob) when set higher. The defrag major is
-// heap-pressure-safe (it selects sources within the copy reserve), so it runs even when the minor could not
-// place its promotions. Called without the pool lock held. `trigger` is why the collection was raised (the
-// recorder's trigger id: nursery full or allocation stress). Returns whether a collection ran.
+// Run a generational collection at the alloc-site anchor: a minor, or a major when mature space has reached
+// its limit (150.4.4, §11.4). A minor promotes the whole nursery into mature and never reclaims dead mature
+// objects, so mature fills over time; once it holds L blocks (rtHeapResize) the next collection is a major,
+// which reclaims mature garbage, collects the nursery and sets L again. A minor's promotions may pass L: the
+// collector's copies draw blocks up to the reservation, so a minor runs out of room only when the
+// reservation does, and it runs a major in its place when the reservation's free blocks could not hold the
+// whole nursery. NOMU_MATURE_FLOOR (the mature-pressure knob) runs a major while fewer than that many blocks
+// remain below L. Called without the pool lock held. `minorTrigger` is the active nursery reserve
+// (rtGenReserve, > 0); `trigger` is why the collection was raised (the recorder's trigger id: nursery full or
+// allocation stress). Returns whether a collection ran.
 fun rtGenCollect(minorTrigger: Int, trigger: Int, anchorOff: Int, anchorPc: Int) -> Bool {
-  let avail = nomuGcSpaceAvail()
-  var floor = minorTrigger + minorTrigger        // 2× the reserve: promotion headroom + fragmentation margin
-  let matureFloor = rtMatureFloor
-  if matureFloor > floor {
-    floor = matureFloor
-  }
-  if avail < floor {
+  let space = rtSpace
+  let limit: Int = space.load(fromByteOffset: 160)
+  let room = limit - rtMatureBlocks(space)
+  let reserved: Int = space.load(fromByteOffset: 8)
+  let fc: Int = space.load(fromByteOffset: 32)
+  let flTop: Int = space.load(fromByteOffset: 96)
+  let nursery: Int = space.load(fromByteOffset: 136)
+  if room <= rtMatureFloor || reserved - fc + flTop < nursery {
     var why = trigger
     if trigger == 1 {
-      why = 2                                    // a nursery-full minor escalated by the mature floor
+      why = 2                                    // a nursery-full minor escalated: mature space is full
     }
     return rtSelfhostOom(why, anchorOff, anchorPc)     // escalate → major (collection kind 0)
   }
@@ -333,7 +333,13 @@ fun rtStressTick(space: RawPtr, tlab: RawPtr, need: Int, stress: Int, anchorOff:
   }
   tlab.store(0, toByteOffset: 40)
   let minorTrigger = rtGenReserve(space)
-  if minorTrigger > 0 {
+  var forceMajor = false
+  let every = rtGcStressMajorEvery
+  if every > 0 {
+    let k: Int = rtGcStressCount.atomicFetchAdd(1, atByteOffset: 0)
+    forceMajor = (k + 1) % every == 0
+  }
+  if minorTrigger > 0 && !forceMajor {
     let ran = rtGenCollect(minorTrigger, 4, anchorOff, anchorPc)
   } else {
     let ran = rtSelfhostOom(4, anchorOff, anchorPc)
@@ -371,7 +377,7 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorOff: Int, anchor
       if didGc {
         done = false                       // retry: nursery emptied, TLAB reset — get a fresh block next pass
       } else {
-        let nb = rtNextAllocBlock(space)
+        let nb = rtNextAllocBlock(space, rtHeapCap(space), rtGenReserve(space) == 0)   // recyclable: `immix` only
       if nb < 0 {
         // Pool exhausted → synchronous collection at true OOM (150.3.11). Release the pool lock (the collector
         // runs under STW; parking while holding it would be wrong), trigger + wait, then re-acquire and retry
@@ -386,8 +392,10 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorOff: Int, anchor
       } else {
         rtGcRecordRefill()
         // 150.4: a clean block (FREE/never-used, state 0) handed to a mutator holds only young objects, so
-        // tag it NURSERY (the minor GC's from-space) and count it against the nursery. A reused RECYCLABLE
-        // block (state 1) holds mature survivors from a prior sweep, so it stays mature (untagged).
+        // tag it NURSERY (the minor GC's from-space) and count it against the nursery. Under the `immix` plan
+        // the mutator also reuses RECYCLABLE blocks (state 1), which stay untagged; under the generational
+        // plan it takes clean blocks only (rtNextAllocBlock's `recyclable`): a mature block's holes, once
+        // filled, would be handed out again after the next minor, and the objects there would read as logged.
         if rtBlockState(space, nb) == 0 {
           rtSetBlockState(space, nb, 4)
           let nu: Int = space.load(fromByteOffset: 136)
@@ -449,10 +457,10 @@ fun rtImmixRefill(space: RawPtr, tlab: RawPtr, need: Int, anchorOff: Int, anchor
 
 // Allocate `n` bytes for a carrier via its TLAB (150.3.10.1). Private bump within the TLAB's current hole (no
 // lock); on overflow refill from the shared pool under poolLock. Objects larger than a block route to the
-// shared large-object space, also under the lock. Returns a RawPtr into the heap (or a LOS chunk), or
-// RawPtr.null on heap exhaustion. This is the mutator alloc target the codegen self-hosted-alloc seam routes
-// to; the collector's own copy allocator keeps using rtImmixAlloc on the descriptor bump state (single-thread,
-// under STW).
+// shared large-object space, also under the lock. Returns a RawPtr into the heap (or a LOS chunk); when a
+// collection leaves no room it reports out of memory and exits (rtOutOfMemory). This is the mutator alloc
+// target the codegen self-hosted-alloc seam routes to; the collector's own copy allocator keeps using
+// rtImmixAlloc on the descriptor bump state (single-thread, under STW).
 fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
   // The anchor as an offset from the stack's top: a collection here can move the stack, and the retry may
   // park again, so the address is recomputed at each park (rtAnchorAt).
@@ -466,12 +474,22 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
     rtStressTick(space, tlab, need, stress, anchorOff, anchorPc)
   }
   if need > 32768 {
+    // Large objects count toward mature space: a major runs first when this one would take it past L, so a
+    // program allocating mostly large objects still collects them. At the heap's maximum, one that still
+    // does not fit is out of memory.
+    let blocks = (need + 32767) / 32768
+    let limit: Int = space.load(fromByteOffset: 160)
+    if limit - rtMatureBlocks(space) < blocks {
+      let ran = rtSelfhostOom(6, anchorOff, anchorPc)
+      let after: Int = space.load(fromByteOffset: 160)
+      if rtHeapAtMax(space) && after - rtMatureBlocks(space) < blocks {
+        rtOutOfMemory(0, need)
+      }
+    }
     rtSchedMutexLockAt(space.advanced(by: 120))
     let los = rtLosAlloc(space, need)          // larger than a block → shared large-object space (off-heap malloc)
     rtSchedMutexUnlockAt(space.advanced(by: 120))
-    if !los.isNull {
-      rtCountAllocation(tlab, need)
-    }
+    rtCountAllocation(tlab, need)              // a refused malloc never returns (__nomu_raw_alloc → rtOutOfMemory)
     return los
   }
   var done = false
@@ -491,11 +509,11 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
       done = true
     } else {
       // On overflow refill from the pool; a true-OOM refill triggers a synchronous collection at the alloc-site
-      // anchor and retries (150.3.11), returning false only on genuine OOM.
+      // anchor and retries (150.3.11), returning false only on genuine OOM, which ends the program here, before
+      // generated code could store through a null object.
       let ok = rtImmixRefill(space, tlab, need, anchorOff, anchorPc)
       if !ok {
-        result = RawPtr.null
-        done = true
+        rtOutOfMemory(0, need)
       } else if stress > 0 {
         let holeEnd: Int = tlab.load(fromByteOffset: 8)
         tlab.store(holeEnd, toByteOffset: 32)    // move the hole end out of the inline fast path's reach
@@ -503,9 +521,7 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
       }
     }
   }
-  if !result.isNull {
-    rtCountAllocation(tlab, need)
-  }
+  rtCountAllocation(tlab, need)
   return result
 }
 
@@ -577,12 +593,13 @@ fun rtClearLogged(space: RawPtr, obj: RawPtr) {
 // Reset the whole log-bit table to logged (0) — every 8-byte region unmarked (150.4.4). Used post-major to
 // wipe stale unlogged bits before re-establishing them per surviving object: after a full collection every
 // live object is mature and the nursery is empty, so freed regions (future young objects) must read logged so
-// they never trip the barrier, and only the survivors are then set unlogged. The table is numBlocks*512 bytes
-// (one bit per 8-byte region); zero it a machine word at a time.
+// they never trip the barrier, and only the survivors are then set unlogged. The table holds 512 bytes per
+// block (one bit per 8-byte region); only the blocks ever used (below freeCursor) can hold a set bit, so
+// zero their part a machine word at a time and leave the rest of the reservation's table untouched.
 fun rtClearLogTable(space: RawPtr) {
-  let nb: Int = space.load(fromByteOffset: 8)
+  let fc: Int = space.load(fromByteOffset: 32)
   let tbl: RawPtr = space.load(fromByteOffset: 144)
-  let words = nb * 64                        // numBlocks*512 bytes / 8
+  let words = fc * 64                        // freeCursor*512 bytes / 8
   var i = 0
   while i < words {
     tbl.store(0, toByteOffset: i * 8)

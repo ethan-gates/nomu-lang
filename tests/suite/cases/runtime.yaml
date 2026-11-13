@@ -746,6 +746,176 @@ cases:
       - 4
     iterations: 2
 
+  - name: out-of-memory-heap
+    fixture: tests/fixtures/out_of_memory_heap
+    run_settings:
+      heap_max: 64MiB
+    expect:
+      stdout: "filling\n"
+      exit_code: 2
+    stderr_match:
+      - pattern: "fatal error: out of memory"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: out of memory: heap full after a collection"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: frame 0: "
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: end"
+        min: 1
+        max: 1
+    carriers:
+      - 1
+      - 4
+
+  - name: out-of-memory-heap-max
+    fixture: tests/fixtures/out_of_memory_heap
+    run_settings:
+      heap_max: 16MiB
+    expect:
+      stdout: "filling\n"
+      exit_code: 2
+    stderr_match:
+      - pattern: "nomu-crash: out of memory: heap full after a collection"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: heap: 16777216 bytes, "
+        min: 1
+        max: 1
+      - pattern: " live after the last major, maximum 16777216 (NOMU_HEAP_MAX)"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: a larger NOMU_HEAP_MAX raises the maximum"
+        min: 1
+        max: 1
+    carriers:
+      - 1
+      - 4
+
+  - name: heap-grows-past-256mib
+    fixture: tests/fixtures/heap_grows
+    expect:
+      stdout: "40960\n"
+    carriers:
+      - 1
+      - 4
+    tier: full
+    weight: 4
+
+  - name: heap-large-objects-collected
+    fixture: tests/fixtures/heap_large_objects
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "4000\n"
+      max_resident_mib: 96
+    collections:
+      - kind: major
+        trigger: "large objects"
+        min: 1
+    carriers:
+      - 1
+      - 4
+
+  - name: gc-percent-unreadable
+    fixture: tests/fixtures/heap_reservation
+    run_settings:
+      gc_percent: "0"
+    expect:
+      stdout: ""
+      exit_code: 2
+    stderr_match:
+      - pattern: "fatal error: NOMU_GC_PERCENT: expected a whole number above 0"
+        min: 1
+        max: 1
+
+  - name: heap-max-unreadable
+    fixture: tests/fixtures/heap_reservation
+    run_settings:
+      heap_max: 12abc
+    expect:
+      stdout: ""
+      exit_code: 2
+    stderr_match:
+      - pattern: "fatal error: NOMU_HEAP_MAX: expected a size of at least 4MiB"
+        min: 1
+        max: 1
+
+  - name: heap-max-too-small
+    fixture: tests/fixtures/heap_reservation
+    run_settings:
+      heap_max: 1MiB
+    expect:
+      stdout: ""
+      exit_code: 2
+    stderr_match:
+      - pattern: "fatal error: NOMU_HEAP_MAX: expected a size of at least 4MiB"
+        min: 1
+        max: 1
+
+  - name: heap-max-refused
+    fixture: tests/fixtures/heap_reservation
+    run_settings:
+      heap_max: 1000000TiB
+    expect:
+      stdout: ""
+      exit_code: 2
+    stderr_match:
+      - pattern: "nomu-crash: out of memory: the system refused the heap's reservation (NOMU_HEAP_MAX)"
+        min: 1
+        max: 1
+
+  - name: heap-reservation-untouched
+    fixture: tests/fixtures/heap_reservation
+    compile_settings:
+      escape: false
+    run_settings:
+      nursery_blocks: 8
+      mature_floor: 1000000
+    expect:
+      stdout: "2000\n5999995\n"
+      max_resident_mib: 128
+    carriers:
+      - 1
+      - 4
+    collections:
+      - kind: major
+        min: 20
+
+  - name: heap-counts-fiber-stacks
+    fixture: tests/fixtures/heap_counts_stacks
+    expect:
+      stdout: "23999997\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - kind: major
+        max: 5
+
+  - name: out-of-memory-large
+    fixture: tests/fixtures/out_of_memory_large
+    compile_settings:
+      rt_prelude: true
+    expect:
+      stdout: "asking\n"
+      exit_code: 2
+    stderr_match:
+      - pattern: "fatal error: out of memory"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: out of memory: the system refused the request"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: request: 70368744177672 bytes"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: end"
+        min: 1
+        max: 1
+
   - name: fiber-no-deadlock
     fixture: tests/fixtures/fiber_no_deadlock
     expect:
