@@ -11,6 +11,13 @@ class Box {
 
 // Spin `n` iterations. The requester also keeps spinning until both workers are inside their loops, requests
 // the collection once, and keeps spinning until it has run.
+// Whether `main` has parked in its join, so the collection's roots include its join's wait object every run.
+fun mainParked() -> Bool {
+  let mf: RawPtr = rtSched.load(fromByteOffset: 216)
+  let st: UInt8 = mf.load(fromByteOffset: 8)
+  return st.int == 2
+}
+
 fun spin(n: Int, inLoop: RawPtr, requester: Bool) -> Int {
   var i = 0
   var acc = 0
@@ -18,7 +25,7 @@ fun spin(n: Int, inLoop: RawPtr, requester: Bool) -> Int {
   var ticket = 0
   while i < n || !asked || (requester && !rtGcCollected(ticket)) {
     if !asked {
-      if inLoop.atomicLoad(fromByteOffset: 0) == 2 {
+      if inLoop.atomicLoad(fromByteOffset: 0) == 2 && mainParked() {
         ticket = rtGcRequest(1)       // both workers are mid-loop; they stop at their next poll
         asked = true
       }
@@ -39,8 +46,8 @@ fun worker(id: Int, inLoop: RawPtr) -> Int {
 fun main() {
   let inLoop = RawPtr.alloc(bytes: 8, align: 8)
   inLoop.atomicStore(0, toByteOffset: 0)
-  fiber let x = worker(111, inLoop)
-  fiber let y = worker(222, inLoop)
-  print(x + y)                        // 333 — joins the workers (keeps main alive while they spin)
+  let x = task worker(111, inLoop)
+  let y = task worker(222, inLoop)
+  print(x.join() + y.join())          // 333 — joins the workers (keeps main alive while they spin)
   print("\n")
 }

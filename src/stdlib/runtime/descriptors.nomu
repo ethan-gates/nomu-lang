@@ -7,7 +7,7 @@
 // type-id is a descriptor's byte offset from the section start (`Runtime.gcDescBase()`), stamped into object
 // headers and value-witness tables. A descriptor is eight `int32` fields (codegen's `gcDescType`, backend.md
 // §4): size @0 (0 for an array buffer), stride @4 (0 for a fixed object), kind @8 (0 fixed, 1 array buffer,
-// 2 shaped), nptr @12, ptrmapOff @16, nshaped @20, headerSize @24 (a buffer's user-header bytes), nheader @28.
+// 2 shaped, 3 a value layout: a fixed map with no object header, read only through a value witness), nptr @12, ptrmapOff @16, nshaped @20, headerSize @24 (a buffer's user-header bytes), nheader @28.
 // A type's map, at the pointer-map base + ptrmapOff, holds the nheader header offsets, then the nptr field or
 // element offsets, then nshaped (field offset, sub-shape type-id) pairs; kind 2 has the discriminant-keyed
 // form rtLiveCount describes. Type-ids come from codegen and are always valid, so nothing range-checks them.

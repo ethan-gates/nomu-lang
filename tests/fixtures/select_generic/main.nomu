@@ -1,0 +1,92 @@
+// `select` in generic code: specialized in this module, and compiled once in `lib`.
+import pkg/lib
+
+class Msg {
+  let n: Int
+  let text: String
+}
+
+// Specialized per use.
+fun either<shared T>(a: Channel<T>, b: Channel<T>) -> Option<T> {
+  select {
+  case let v = a.receive():
+    return v
+  case let v = b.receive():
+    return v
+  }
+  return .none
+}
+
+fun later(ch: Channel<Msg>, n: Int) {
+  churn(5000)
+  ch.send(Msg(n: n, text: "late"))
+}
+
+// Allocate enough to collect while a select waits.
+fun churn(count: Int) {
+  var keep: Array<Msg> = []
+  var i = 0
+  while i < count {
+    keep.append(Msg(n: i, text: "churn-".concat("abcdefghijklmnopqrstuvwxyz")))
+    if keep.count > 64 {
+      keep = []
+    }
+    i = i + 1
+  }
+}
+
+fun show(label: String, v: Option<Int>) {
+  print(label)
+  print(" ")
+  switch v {
+  case .some(let x): print(x)
+  case .none: print("none")
+  }
+  print("\n")
+}
+
+fun showMsg(label: String, v: Option<Msg>) {
+  print(label)
+  print(" ")
+  switch v {
+  case .some(let m):
+    print(m.n)
+    print(" ")
+    print(m.text)
+  case .none: print("none")
+  }
+  print("\n")
+}
+
+fun main() {
+  let a = Channel<Int>.make(capacity: 1)
+  let b = Channel<Int>.make(capacity: 1)
+  b.send(3)
+  show("specialized", either(a, b))
+  a.send(4)
+  show("erased", take(a))
+  a.close()
+  show("closed", take(a))
+
+  let c = Channel<Msg>.make(capacity: 0)
+  let d = Channel<Msg>.make(capacity: 0)
+  fiber later(d, 9)
+  showMsg("erased managed", take(d))
+  fiber later(c, 10)
+  showMsg("erased two cases", firstOf(c, d))
+  fiber later(c, 8)
+  showMsg("specialized managed", either(c, d))
+
+  let e = Channel<Msg>.make(capacity: 1)
+  print("offer ")
+  print(offer(e, Msg(n: 5, text: "offered")))
+  print(" ")
+  print(offer(e, Msg(n: 6, text: "full")))
+  print("\n")
+  switch e.receive() {
+  case .some(let m):
+    print(m.text)
+    print("\n")
+  case .none:
+  }
+}

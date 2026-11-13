@@ -18,9 +18,9 @@ fun node(depth: Int, seed: Int) -> Int {
     if depth == 0 {
         return spin(work: 500, seed: seed)
     }
-    fiber let a = node(depth: depth - 1, seed: seed * 2)
-    fiber let b = node(depth: depth - 1, seed: seed * 2 + 1)
-    return a + b
+    let a = task node(depth: depth - 1, seed: seed * 2)
+    let b = task node(depth: depth - 1, seed: seed * 2 + 1)
+    return a.join() + b.join()
 }
 
 fun main() {

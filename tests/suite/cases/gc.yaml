@@ -218,7 +218,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 1
+        roots: 4
         min: 1
         max: 1
 
@@ -235,7 +235,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 2
+        roots: 7
         min: 1
         max: 1
 
@@ -388,13 +388,14 @@ cases:
       - kind: minor
         min: 1
 
+  # Each lists every descriptor in the image, so the prelude's value layouts add rows that count nothing.
   - name: mark-verify
     fixture: tests/fixtures/mark_verify
     compile_settings:
       escape: false
       rt_prelude: true
     expect:
-      stdout: "99\nTOTAL 2\nLIVE 0 1\nLIVE 1 1\nLIVE 2 0\nLIVE 3 0\nFP 32523553956047741\n"
+      stdout: "99\nTOTAL 2\nLIVE 0 1\nLIVE 1 1\nLIVE 2 0\nLIVE 3 0\nLIVE 4 0\nLIVE 5 0\nFP 32523553956047741\n"
     carriers: []
 
   - name: mark-verify-arr
@@ -403,7 +404,7 @@ cases:
       escape: false
       rt_prelude: true
     expect:
-      stdout: "TOTAL 5\nLIVE 0 1\nLIVE 1 1\nLIVE 2 3\nLIVE 3 0\nLIVE 4 0\nFP 219055701645145072\n"
+      stdout: "TOTAL 5\nLIVE 0 1\nLIVE 1 1\nLIVE 2 3\nLIVE 3 0\nLIVE 4 0\nLIVE 5 0\nLIVE 6 0\nFP 219055701645145072\n"
     carriers: []
 
   - name: walk-mark
@@ -432,7 +433,7 @@ cases:
       escape: false
       rt_prelude: true
     expect:
-      stdout: "999\nnroots 2\nPARKED-ROOT 111\nPARKED-ROOT 222\n333\n"
+      stdout: "999\nnroots 3\nPARKED-ROOT 111\nPARKED-ROOT 222\nPARKED-ROOT 1\n333\n"
     carriers:
       - 1
     iterations: 3
@@ -451,7 +452,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 2
+        roots: 7
         min: 1
         max: 1
 
@@ -778,3 +779,40 @@ cases:
     full_iterations: 6
     collections:
       - min: 1
+
+  - name: base-pointer-frame
+    fixture: tests/fixtures/base_pointer_frame
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "15\n"
+    carriers:
+      - 1
+      - 4
+    iterations: 2
+    full_iterations: 10
+    collections:
+      - min: 1
+
+  - name: base-pointer-frame-stack-move
+    fixture: tests/fixtures/base_pointer_frame
+    run_settings:
+      gc_stress_bytes: 65536
+      stack_move: 1
+    expect:
+      stdout: "15\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - min: 1
+
+  - name: base-pointer-frame-stack-checks
+    fixture: tests/fixtures/base_pointer_frame
+    run_settings:
+      stack_move_checks: 1
+    expect:
+      stdout: "15\n"
+    carriers:
+      - 1
+      - 4

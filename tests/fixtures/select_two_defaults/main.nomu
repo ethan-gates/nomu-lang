@@ -1,0 +1,12 @@
+// A `select` has at most one `default`.
+fun main() {
+  let ch = Channel<Int>.make(capacity: 1)
+  select {
+  case let v = ch.receive():
+    print(1)
+  default:
+    print(2)
+  default:
+    print(3)
+  }
+}

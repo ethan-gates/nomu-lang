@@ -38,6 +38,15 @@ A check asks whether there is room *from where the stack pointer is now*, whatev
   no further check, so a fiber in it is preempted only at the covering check or at a loop-header poll.
   Folding only small trees keeps that delay short.
 
+## Also here: the leaf path's prologue
+
+From 104.2.6, accepted at parity with Go: in some functions the register allocator copies an argument into
+a callee-saved register before the check's branch, so the leaf path keeps the prologue (`frames_mutating`,
+512 ms against 317 ms without the check). Two candidates:
+- pass the argument registers through the slow path, as Go's `morestack` keeps them; tracked pointers
+  cannot, since a collection there would leave the returned copy stale;
+- duplicate the entry so the leaf path's code has no check region.
+
 ## Refs
 
 [104](104-fiber-stack-strategy.md) (the entry check, its measured cost); [236](236-fiber-preemption.md).

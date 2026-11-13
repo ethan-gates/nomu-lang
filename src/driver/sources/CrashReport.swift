@@ -1,8 +1,9 @@
 import Foundation
 
-// `nomu run`'s view of its program's crash (task 219): the fault handler's report (`runtime/fault.nomu`),
-// which the program also writes to the file `NOMU_CRASH_REPORT` names, symbolized against the binary just
-// built. The report carries raw addresses only; the names and lines come from the binary's debug info:
+// A program's crash report or fiber dump (task 219, `runtime/fault.nomu`), symbolized against its binary: by
+// `nomu run`, from the file `NOMU_CRASH_REPORT` names, and by `nomu tool symbolize`, from a report saved anywhere.
+// The report carries raw addresses only, so binaries need no symbol names; the names and lines come from the
+// binary's debug info:
 // its `.dSYM` when the build gathered one (`link.debug_info_storage: dsym`), else one `dsymutil` makes now
 // from the objects the binary names, workspace-relative, so it runs in the workspace. `atos` maps the
 // addresses and `c++filt` demangles the v0 names. Every step is best-effort: a missing tool or file leaves
@@ -18,31 +19,79 @@ enum CrashReport {
     static func symbolize(reportPath: String, binary: String) -> String? {
         defer { try? FileManager.default.removeItem(atPath: reportPath) }
         guard let text = try? String(contentsOfFile: reportPath, encoding: .utf8) else { return nil }
+        return symbolize(text: text, binary: binary)
+    }
+
+    // The build ID a report names (its `image:` line), canonical upper-case with dashes, or nil when it has none.
+    static func reportBuildID(_ text: String) -> String? {
+        for line in text.split(separator: "\n") where line.hasPrefix("nomu-crash: image: ") {
+            let fields = line.split(separator: " ")
+            if fields.count >= 3 { return String(fields[2]) }
+        }
+        return nil
+    }
+
+    // A binary's build ID (its LC_UUID), in the form a report prints it, or nil when it has none.
+    static func binaryBuildID(_ binary: String) -> String? {
+        guard let d = FileManager.default.contents(atPath: binary), d.count >= 32 else { return nil }
+        func u32(_ o: Int) -> UInt32 { d.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt32.self) } }
+        guard u32(0) == 0xFEED_FACF else { return nil }
+        var off = 32
+        for _ in 0..<Int(u32(16)) {
+            let cmd = u32(off), size = Int(u32(off + 4))
+            if cmd == 0x1B {
+                let hex = d[(off + 8)..<(off + 24)].map { String(format: "%02X", $0) }.joined()
+                var out = ""
+                for (i, c) in hex.enumerated() {
+                    if [8, 12, 16, 20].contains(i) { out.append("-") }
+                    out.append(c)
+                }
+                return out
+            }
+            off += size
+        }
+        return nil
+    }
+
+    // The symbolized text of a report from the program at `binary`, or nil when nothing could be symbolized.
+    static func symbolize(text: String, binary: String) -> String? {
+        // The faulting thread's frames, then each fiber's under its header (a fiber dump).
         var base: String? = nil
-        var frames: [UInt64] = []
+        var groups: [(header: String, frames: [UInt64])] = [("nomu: crash backtrace", [])]
         for line in text.split(separator: "\n") {
             let fields = line.split(separator: " ")
             if line.hasPrefix("nomu-crash: image: "), fields.count >= 4 { base = String(fields[3]) }
+            if line.hasPrefix("nomu-crash: fiber ") { groups.append((String(line.dropFirst("nomu-crash: ".count)), [])) }
             if line.hasPrefix("nomu-crash: frame "), fields.count >= 4, let a = UInt64(fields[3].dropFirst(2), radix: 16) {
-                frames.append(a)
+                groups[groups.count - 1].frames.append(a)
             }
         }
+        let frames = groups.flatMap(\.frames)
         guard let base, !frames.isEmpty else { return nil }
 
         guard let (dwarf, made) = debugInfo(for: binary) else { return nil }
         defer { if let made { try? FileManager.default.removeItem(atPath: made) } }
         guard let atos = Toolchain.resolveTool("atos") else { return nil }
-        // Frames after the first are return addresses, the instruction after the call: look up each less one, so
-        // a call that ends its function names that function.
-        let lookups = frames.enumerated().map { "0x" + String($0.offset == 0 ? $0.element : $0.element - 1, radix: 16) }
+        // Every frame but the faulting thread's first is a return address, the instruction after the call: look
+        // up each less one, so a call that ends its function names that function.
+        var lookups: [String] = []
+        for (g, group) in groups.enumerated() {
+            for (i, a) in group.frames.enumerated() { lookups.append("0x" + String(g == 0 && i == 0 ? a : a - 1, radix: 16)) }
+        }
         guard let out = Toolchain.output(atos, ["-o", dwarf, "-l", base] + lookups) else { return nil }
         let names = out.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         guard names.count >= frames.count else { return nil }
         let demangled = demangle(Array(names.prefix(frames.count)))
 
-        var lines = ["nomu: crash backtrace"]
-        for (i, a) in frames.enumerated() {
-            lines.append("  " + pad(String(i), 3) + " " + "0x" + String(a, radix: 16) + "  " + describe(demangled[i], binary: binary))
+        var lines: [String] = []
+        var k = 0
+        for group in groups where !group.frames.isEmpty || group.header != groups[0].header {
+            if !lines.isEmpty { lines.append("") }
+            lines.append(group.header)
+            for (i, a) in group.frames.enumerated() {
+                lines.append("  " + pad(String(i), 3) + " " + "0x" + String(a, radix: 16) + "  " + describe(demangled[k], binary: binary))
+                k += 1
+            }
         }
         return lines.joined(separator: "\n") + "\n"
     }

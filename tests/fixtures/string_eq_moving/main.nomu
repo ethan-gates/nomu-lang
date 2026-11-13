@@ -80,11 +80,11 @@ fun comparer(rounds: Int) -> Int {
 }
 
 fun main() {
-  fiber let c = churner(20000000)
-  fiber let x = comparer(20000)
+  let c = task churner(20000000)
+  let x = task comparer(20000)
   print("bad ")
-  print(x)
+  print(x.join())
   print(" ")
-  print(c)
+  print(c.join())
   print("\n")
 }

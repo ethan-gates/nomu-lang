@@ -1,0 +1,71 @@
+// The leak report (suite case `fiber-leak`, run with NOMU_LEAK_REPORT=1): when `main` returns, the fibers that
+// can never wake are reported, as Go's goroutine-leak profile reports goroutines. A fiber waiting on a channel
+// that only it, or only other such fibers, can reach is leaked; one waiting on a channel a sleeping fiber holds
+// is not, since the sleeper may still send.
+
+fun wait(ch: Channel<Int>) {
+  switch ch.receive() {
+  case .some(let v):
+  case .none:
+  }
+}
+
+fun relay(from: Channel<Int>, to: Channel<Int>) {
+  switch from.receive() {
+  case .some(let v): to.send(v)
+  case .none:
+  }
+}
+
+fun holder(c: Channel<Int>) {
+  sleep(600000)
+  c.send(1)
+}
+
+fun selector(a: Channel<Int>, b: Channel<Int>) {
+  select {
+  case let v = a.receive():
+  case let v = b.receive():
+  }
+}
+
+fun blockForever() -> Int {
+  let own = Channel<Int>.make(capacity: 0)
+  switch own.receive() {
+  case .some(let v): return v
+  case .none: return 0
+  }
+}
+
+fun joinIt(t: Task<Int>) {
+  print(t.join())
+}
+
+fun leakChain() {
+  let x = Channel<Int>.make(capacity: 0)
+  let y = Channel<Int>.make(capacity: 0)
+  fiber relay(x, y)
+  fiber wait(y)
+}
+
+fun leakSelect() {
+  let a = Channel<Int>.make(capacity: 0)
+  let b = Channel<Int>.make(capacity: 0)
+  fiber selector(a, b)
+}
+
+fun leakJoin() {
+  let t = task blockForever()
+  fiber joinIt(t)
+}
+
+fun main() {
+  let c = Channel<Int>.make(capacity: 0)
+  fiber holder(c)
+  fiber wait(c)
+  leakChain()
+  leakSelect()
+  leakJoin()
+  sleep(30)
+  print("done\n")
+}

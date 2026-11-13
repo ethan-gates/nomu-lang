@@ -25,6 +25,11 @@ At the cache root (199.1): `NOMU_CACHE_DIR`, else the entry workspace's `cache.r
 
 ## Design
 
+From [256](256-host-cache-store-only.md): `ac/` and `cas/` are sharded by two hex digits, `checked/`, `costs/`
+and `source/` leave the host cache, and lookups no longer hash blobs, so a blob's modification time is free for
+recency. Bazel's disk cache touches an entry's mtime on every store and hit and collects by it; whether Nomu
+can track recency better than that is this task's question.
+
 The store already treats a result whose blob is missing as a miss (the result is discarded and the job
 rebuilt), so eviction deletes blobs on their own, with no reference counts. Materialized outputs under
 `build/` are clones and survive eviction.

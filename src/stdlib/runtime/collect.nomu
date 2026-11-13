@@ -751,8 +751,18 @@ fun rtGcCoordinatorMain(sched: RawPtr) -> RawPtr {
       if acked < ncarriers {
       } else if kind == 1 && Runtime.gcPlan() == 0 {     // a plan without a nursery compiles the minor out
         nomuSchedStwCollectMinor(sched)
+        if rtStackShrinkStress {
+          rtStackShrinkAll(sched)
+        }
       } else {
         nomuSchedStwCollectDefrag(sched)
+        rtStackShrinkAll(sched)                           // stacks shrink at a major, the world still stopped
+        rtPoolDrainAll()                                  // and the carriers' pools of records and stacks empty
+      }
+      // A leak pass to follow, with the world still stopped and the wait objects current (`runtime/leak.nomu`).
+      if acked >= ncarriers && sched.atomicLoad(fromByteOffset: 200) != 0 {
+        sched.atomicStore(0, toByteOffset: 200)
+        rtLeakCheck(sched)
       }
       sched.atomicStore(0, toByteOffset: 176)             // the kind, for the next request
       // Reset the count under the next generation's tag before clearing the request, so a late ack for

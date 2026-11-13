@@ -128,7 +128,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 1
+        roots: 4
         min: 1
         max: 1
 
@@ -203,7 +203,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 1
+        roots: 4
         min: 1
         max: 1
 
@@ -223,7 +223,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 2
+        roots: 5
         min: 1
         max: 1
 
@@ -243,7 +243,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 3             # the object, the box's `T`, and `r`'s own copy
+        roots: 6             # the object, the box's `T`, `r`'s own copy, the `Task` in each fiber, and the joined one as a wait object
         min: 60
         max: 60
 
@@ -262,7 +262,7 @@ cases:
     collections:
       - kind: minor
         trigger: "program request"
-        roots: 1
+        roots: 4
         min: 1
         max: 1
 
@@ -279,3 +279,44 @@ cases:
     expect:
       stdout: "40\n"
     carriers: []
+  - name: module-generic-composed-args
+    fixture: tests/fixtures/module_generic_composed_args
+    expect:
+      stdout: "5 heap-string 2 7 3 5 4\n"
+  - name: module-generic-two-bounds
+    fixture: tests/fixtures/module_generic_two_bounds
+    expect:
+      stdout: "10\n"
+  - name: module-generic-two-bounds-specialized
+    fixture: tests/fixtures/module_generic_two_bounds
+    compile_args:
+      - "--config=mono_all"
+    expect:
+      stdout: "10\n"
+
+  # `<shared T>` on a type: every instantiation's argument must be shareable, whether written, inferred or a
+  # type parameter passed on (concurrency.md §5); a `shared` parameter counts, bare or nested.
+  - name: shared-type-arg
+    fixture: tests/fixtures/shared_type_arg
+    expect:
+      stdout: "1545"
+
+  - name: shared-type-arg-written
+    fixture: tests/fixtures/shared_type_arg_written
+    compile:
+      expect_error: "type 'Mut' is not shareable, but type parameter 'T' of 'Box' is declared 'shared'"
+
+  - name: shared-type-arg-inferred
+    fixture: tests/fixtures/shared_type_arg_inferred
+    compile:
+      expect_error: "type 'Mut' is not shareable, but type parameter 'T' of 'Box' is declared 'shared'"
+
+  - name: shared-type-arg-param
+    fixture: tests/fixtures/shared_type_arg_param
+    compile:
+      expect_error: "type 'U' is not shareable, but type parameter 'T' of 'Box' is declared 'shared'"
+
+  - name: shared-type-arg-static
+    fixture: tests/fixtures/shared_type_arg_static
+    compile:
+      expect_error: "type 'Mut' is not shareable, but type parameter 'T' of 'Box' is declared 'shared'"

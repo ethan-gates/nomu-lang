@@ -49,7 +49,6 @@ private struct ExhaustivenessPass {
     private func walkStmt(_ stmt: NOIRStmt) {
         switch stmt.kind {
         case .letBinding(_, _, let value):    walkExpr(value)
-        case .spawnLet(_, let value, _):      walkExpr(value)
         case .fiberStart(let call):           walkExpr(call)
         case .assign(let t, let v),
              .compoundAssign(let t, let v):   walkExpr(t); walkExpr(v)
@@ -94,6 +93,8 @@ private struct ExhaustivenessPass {
             walkExpr(base); walkExpr(idx)
         case .staticCall(_, _, let args):
             for a in args { walkExpr(a) }
+        case .taskStart(_, let make, let call, let fulfill):
+            walkExpr(make); walkExpr(call); walkExpr(fulfill)
         }
     }
 

@@ -31,10 +31,8 @@ public func remapOperands(_ kind: SSAInstKind, _ f: (SSAValue) -> SSAValue) -> S
         return .mailboxInit(f(a))
     case .actorSend(let recv, let h, let args):
         return .actorSend(receiver: f(recv), handler: h, args: args.map(f))
-    case .spawn(let binding, let startFn, let env, let t):
-        return .spawn(binding: binding, startFn: startFn, env: env.map(f), resultType: t)
-    case .spawnJoin:
-        return kind
+    case .fiber(let startFn, let env, let t):
+        return .fiber(startFn: startFn, env: env.map(f), resultType: t)
     case .makeStruct(let t, let fields):
         return .makeStruct(t, fields: fields.map(f))
     case .makeEnum(let t, let ci, let fields):

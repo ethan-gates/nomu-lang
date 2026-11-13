@@ -73,6 +73,8 @@ public struct Sema {
     var allConformsTo: [String: Set<String>] = [:]
     var opaqueUnderlyings: [String: Type] = [:]
     var opaqueBindingCounter = 0
+    var taskCounter = 0              // names each `task` site's `Task` binding (`$taskN`)
+    var selectCounter = 0            // names each `select` site's temporaries (`$selN`)
 
     // M5 5.2.1: the generic type parameters (`T`, `U`) in scope while resolving a generic
     // decl's signatures — a bare name here resolves to `.typeParam`, not an unknown type.
@@ -133,6 +135,11 @@ public struct Sema {
     // used inside the body counts as shareable when passed to another `shared` bound.
     var sharedParams: Set<String> = []
 
+    // Whether a written generic type's `shared` parameters are checked as it resolves. On while a
+    // declaration lowers, where `sharedParams` is that declaration's; off while another decl's shape is
+    // briefly in scope (construction inference), and during signature collection, which lowering repeats.
+    var checksSharedArgs = false
+
     // M5 5.3.2: the structural share-analysis predicate over the program's types,
     // built once after global collection; discharges `<shared T>` bounds at call sites.
     private var shareChecker = Shareability(lookup: { _ in nil })
@@ -179,6 +186,8 @@ public struct Sema {
             // Generic *types* lower to one uniform C shape — a `T` field is held boxed
             // (`void*`), sized/copied at construction where the concrete `T` is known; no
             // value witness (M5 5.2.3). Generic *functions* are witness-passed (5.2.2).
+            checksSharedArgs = true
+            defer { checksSharedArgs = false }
             if isGenericType(decl) { decls.append(NOIRGen.lowerGenericDecl(&self, decl)); continue }
             decls.append(NOIRGen.lowerDecl(&self, decl))
         }
@@ -442,7 +451,8 @@ public struct Sema {
     // shareable only when its parameter is declared `<shared T>` and thus in scope here.
     func isShareable(_ t: Type) -> Bool {
         if case .typeParam(let p) = t { return sharedParams.contains(p) }
-        return shareChecker.isShareable(t)
+        // A shared parameter nested in the type (`Option<T>`) counts as shareable, as a bare one does.
+        return shareChecker.isShareable(sharedParams.isEmpty ? t : substitute(t, Dictionary(uniqueKeysWithValues: sharedParams.map { ($0, Type.int) })))
     }
 
     // MARK: - Type resolution (syntax → semantics)
@@ -931,8 +941,32 @@ public struct Sema {
     func typeNameAndArgs(_ e: Expr) -> (name: String, explicit: [Type]?)? {
         switch e {
         case .ident(let n, _):                   return (n, nil)
-        case .genericIdent(let n, let refs, _):  return (n, refs.map { resolve($0) })
+        case .genericIdent(let n, let refs, let span):
+            let args = refs.map { resolve($0) }
+            // `Box<Mut>(…)` and `Box<Mut>.make(…)` name the type here rather than through `resolve`.
+            var base = n
+            if genericArity(base) == nil, case .key(let k) = resolveExternal(base, qualifier: nil, kind: .type, at: span) {
+                base = k
+            }
+            checkSharedTypeArgs(base, args, at: span)
+            return (n, args)
         default:                                 return nil
+        }
+    }
+
+    // A `shared` parameter's argument must be shareable (concurrency.md §5): `Channel<Mut>` with a mutable
+    // class `Mut` is an error, as passing one to a `<shared T>` function is. Checked only while a
+    // declaration lowers (`checksSharedArgs`), where `sharedParams` are that declaration's. A written type
+    // resolves again wherever its declaration is read, so each is reported once.
+    func checkSharedTypeArgs(_ base: String, _ args: [Type], at span: Span) {
+        guard checksSharedArgs else { return }
+        let params = structs[base]?.generics ?? enums[base]?.generics ?? classes[base]?.generics ?? []
+        for (g, a) in zip(params, args) where g.isShared && a != .error && !isShareable(a) {
+            let owner = ExternalName.decode(base)?.name ?? base
+            let message = "type '\(a)' is not shareable, but type parameter '\(g.name)' of '\(owner)' is declared 'shared'"
+            if !diags.diagnostics.contains(where: { $0.message == message && $0.span == span }) {
+                diags.error(message, at: span)
+            }
         }
     }
     // Build a NOIR call to a codegen intrinsic (`__rawAlloc` etc.); the result type is carried on the

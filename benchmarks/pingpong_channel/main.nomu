@@ -1,0 +1,38 @@
+import std/time
+
+// Two fibers pass a counter back and forth over two unbuffered channels, as `go chan` does in
+// `tools/pingpong.py`: each hop is one rendezvous, a receiver parked and woken by the sender's handoff.
+fun bounce(from: Channel<Int>, to: Channel<Int>, done: Channel<Int>) {
+    var open = true
+    while open {
+        switch from.receive() {
+        case .some(let v):
+            if v == 0 {
+                done.send(0)
+                open = false
+            } else {
+                to.send(v - 1)
+            }
+        case .none:
+            open = false
+        }
+    }
+}
+
+fun main() {
+    let n = 1000000
+    let a = Channel<Int>.make(capacity: 0)
+    let b = Channel<Int>.make(capacity: 0)
+    let done = Channel<Int>.make(capacity: 0)
+    let t = Time()
+    let t0 = t.now
+    fiber bounce(a, b, done)
+    fiber bounce(b, a, done)
+    a.send(n)
+    done.receive()
+    print("pingpong_channel hops ")
+    print(n)
+    print(" ns ")
+    print(t.ns_diff(t0, t.now))
+    print("\n")
+}

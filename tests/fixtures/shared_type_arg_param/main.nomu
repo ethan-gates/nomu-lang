@@ -1,0 +1,12 @@
+// A type parameter passed on to a `shared` one must be declared `shared` itself.
+class Box<shared T> {
+    let v: T
+}
+
+fun wrap<U>(v: U) -> Box<U> {
+    return Box(v: v)
+}
+
+fun main() {
+    print(wrap(1).v)
+}

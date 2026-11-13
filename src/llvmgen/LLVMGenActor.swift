@@ -134,8 +134,9 @@ extension LLVMGen {
     // Give the scheduler the drain loop: store its address in the scheduler's drain slot (`rtSched`+120,
     // which the mailbox fibers call). Emitted at each actor's creation, so only a program that creates an
     // actor references the drain and the scheduler's actor code; every creation stores the same address.
-    // The first send of any message follows a creation and goes through the scheduler lock, which orders
-    // this store before a mailbox fiber reads the slot.
+    // The first send of any message follows a creation, and the send publishes the mailbox to a carrier with
+    // sequentially consistent atomics (its scheduled flag, the run queue), which order this store before the
+    // mailbox fiber that drains it reads the slot.
     func registerActorDrain() {
         let drain = actorDrain()
         let slot = gepByte(loadRuntimeGlobal("rtSched", i8ptr), LLVMConstInt(i64, 120, 0))

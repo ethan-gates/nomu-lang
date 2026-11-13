@@ -671,7 +671,12 @@ public struct Parser {
         case .kwBreak:  let s = currentSpan; advance(); return .breakStmt(span: s)
         case .kwContinue: let s = currentSpan; advance(); return .continueStmt(span: s)
         case .kwSwitch: return parseSwitchStmt()
-        case .kwFiber where peek() == .kwLet: return parseSpawnLet()
+        case .kwSelect: return parseSelectStmt()
+        case .kwFiber where peek() == .kwLet:
+            // The joinable `fiber let` became `task`; parse the binding so the rest of the block still checks.
+            error("'fiber let' is replaced by 'task': write 'let x = task f(...)' and read the result with 'x.join()'")
+            advance()
+            return parseBinding(isMutable: false)
         case .kwFiber:  return parseFiberStart()
         default:        return parseExprOrAssign()
         }
@@ -686,20 +691,7 @@ public struct Parser {
         return .whileStmt(WhileStmt(cond: cond, body: body, span: spanFrom(start)))
     }
 
-    // fiber let x [: T] = expr  — runs expr concurrently; reading x joins.
-    private mutating func parseSpawnLet() -> Stmt {
-        let start = currentSpan
-        expect(.kwFiber)
-        expect(.kwLet)
-        let name = expectIdent()
-        var type: TypeRef? = nil
-        if eat(.colon) { type = parseTypeRef() }
-        expect(.eq)
-        let value = parseExpr()
-        return .spawnLet(name: name, type: type, value: value, span: spanFrom(start))
-    }
-
-    // fiber f(x)  — starts a detached fiber over a call; sema requires the call.
+    // fiber f(x)  — starts a fiber over a call; sema requires the call.
     private mutating func parseFiberStart() -> Stmt {
         let start = currentSpan
         expect(.kwFiber)
@@ -773,6 +765,57 @@ public struct Parser {
         }
         expect(.rBrace)
         return .switchStmt(SwitchStmt(subject: subject, cases: cases, span: spanFrom(start)))
+    }
+
+    // select { case [let v =] op: body … [default: body] }  — `default` is recognized only here, before a `:`.
+    private mutating func parseSelectStmt() -> Stmt {
+        let start = currentSpan
+        expect(.kwSelect)
+        expect(.lBrace)
+        var arms: [SelectArm] = []
+        var defaultBody: Block? = nil
+        while true {
+            if check(.kwCase) {
+                let cstart = currentSpan
+                advance()
+                var binding: String? = nil
+                if eat(.kwLet) {
+                    binding = expectIdent()
+                    expect(.eq)
+                }
+                let op = parseExpr()
+                expect(.colon)
+                let body = parseSelectArmBody()
+                arms.append(SelectArm(binding: binding, op: op, body: body, span: spanFrom(cstart)))
+            } else if atSelectDefault() {
+                let dspan = currentSpan
+                advance()
+                expect(.colon)
+                let body = parseSelectArmBody()
+                if defaultBody != nil { error("a 'select' has one 'default'", at: dspan) }
+                defaultBody = body
+            } else {
+                break
+            }
+        }
+        expect(.rBrace)
+        return .selectStmt(SelectStmt(arms: arms, defaultBody: defaultBody, span: spanFrom(start)))
+    }
+
+    private func atSelectDefault() -> Bool {
+        if case .ident("default") = currentKind, peek() == .colon { return true }
+        return false
+    }
+
+    private mutating func parseSelectArmBody() -> Block {
+        var stmts: [Stmt] = []
+        while !check(.kwCase) && !check(.rBrace) && !check(.eof) && !atSelectDefault() {
+            panicking = false
+            let before = pos
+            stmts.append(parseStmt())
+            if pos == before { advance() }
+        }
+        return stmts
     }
 
     private mutating func parsePattern() -> Pattern {
@@ -950,6 +993,11 @@ public struct Parser {
         case .bang:  op = .not
         case .tilde: op = .bitNot
         default:     op = nil
+        }
+        // task f(x) — runs the call on a new fiber and gives its `Task`; sema requires the call.
+        if currentKind == .kwTask {
+            advance()
+            return .taskStart(call: parsePostfix(), span: spanFrom(start))
         }
         guard let op else { return parsePostfix() }
         advance()

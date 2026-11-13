@@ -240,7 +240,7 @@ extension LLVMGen {
         "abort", "clock_gettime_nsec_np", "close", "creat", "dprintf", "exit", "free", "getenv",
         "getpagesize", "kevent", "kqueue", "mach_absolute_time", "mach_timebase_info", "malloc", "mmap",
         "mprotect", "munmap", "pipe", "poll", "posix_memalign", "printf", "pthread_create",
-        "pthread_getspecific", "pthread_join", "pthread_key_create", "pthread_setspecific", "putchar",
+        "pthread_getspecific", "pthread_join", "pthread_key_create", "pthread_setspecific", "pthread_sigmask", "putchar",
         "raise", "read", "sigaction", "sigaltstack", "snprintf", "strlen", "strpbrk", "strtod", "write",
         "__ulock_wait", "__ulock_wake", "_NSGetExecutablePath",
     ]
@@ -295,7 +295,7 @@ extension LLVMGen {
         LLVMGetPointerAddressSpace(LLVMTypeOf(v)) == 1 ? pinnedAddress(v) : LLVMBuildPtrToInt(b, v, i64, "addr")!
     }
     // The reverse boundary cast: a runtime-held `void*` (addrspace 0) back to a managed `p1` — used
-    // where a fiber's `env` re-enters managed code (the SSAIR spawn thunk, D1/D4).
+    // where a fiber's `env` re-enters managed code (the SSAIR fiber thunk, D1/D4).
     func toManaged(_ v: LLVMValueRef) -> LLVMValueRef { LLVMBuildAddrSpaceCast(b, v, p1, "to1")! }
 
     // Allocate a managed (GC-heap) object of `bytes` bytes through the `__nomu_gc_alloc` seam.
@@ -695,7 +695,7 @@ extension LLVMGen {
                 return buildCall(read, readTy, [LLVMMetadataAsValue(ctx, LLVMMDNodeInContext2(ctx, &node, 1))])!
             }
             let fiber = LLVMBuildIntToPtr(b, register("x28"), i8ptr, "stk.fiber")!
-            var off = LLVMConstInt(i64, 304, 0)   // the fiber record's stack limit (`runtime/scheduler.nomu`)
+            var off = LLVMConstInt(i64, 40, 0)   // the fiber record's stack limit (`runtime/scheduler.nomu`)
             let limitAddr = LLVMBuildGEP2(b, i8, fiber, &off, 1, "stk.limit.addr")!
             let limit = LLVMBuildLoad2(b, i64, limitAddr, "stk.limit")!
             let below = LLVMBuildSub(b, register("sp"), size, "stk.below")!
@@ -723,14 +723,68 @@ extension LLVMGen {
         return (f, ty)
     }
 
-    // `__nomu_spawn_join(handle, final)`: await a spawned fiber, parking until it completes
-    // (`nomuSchedJoin`), and return its result box. `handle` is the spawn site's `{ fiber }` slot; `final`
-    // (the structured scope-exit join) drops the fiber from the live-fiber registry after the read.
-    func nomuSpawnJoin() -> (LLVMValueRef, LLVMTypeRef) {
-        let target = runtimePreludeFn("nomuSchedJoin", ret: i8ptr, params: [i8ptr, i8ptr, i8ptr, i64, i64])
-        return schedForwarder("__nomu_spawn_join", ret: i8ptr, params: [i8ptr, i64]) { fn, sched, sp, pc in
-            let fiber = LLVMBuildLoad2(self.b, self.i8ptr, LLVMGetParam(fn, 0), "fiber")!
-            return self.buildCall(target.fn, target.ty, [sched, fiber, sp, pc, LLVMGetParam(fn, 1)])
+    // A channel's operations (`runtime/channel.nomu`): `send(buf, src, vwt, waiter)` and
+    // `receive(buf, dst, vwt, waiter) -> 1 | 0` may park the fiber, so they run through a forwarder that
+    // anchors the caller's frame; `close(buf)` wakes waiters and never parks.
+    func nomuChanSend() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("rtChanSend", ret: voidTy, params: [i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i64])
+        return schedForwarder("__nomu_chan_send", ret: voidTy, params: [i8ptr, i8ptr, i8ptr, i8ptr]) { fn, sched, sp, pc in
+            let a = (0..<4).map { LLVMGetParam(fn, UInt32($0))! }
+            _ = self.buildCall(target.fn, target.ty, [sched] + a + [sp, pc])
+            return nil
+        }
+    }
+
+    func nomuChanReceive() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("rtChanReceive", ret: i64, params: [i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i64])
+        return schedForwarder("__nomu_chan_receive", ret: i64, params: [i8ptr, i8ptr, i8ptr, i8ptr]) { fn, sched, sp, pc in
+            let a = (0..<4).map { LLVMGetParam(fn, UInt32($0))! }
+            return self.buildCall(target.fn, target.ty, [sched] + a + [sp, pc])
+        }
+    }
+
+    // The one-shot pair under `Task<T>`: `fulfill(buf, src, vwt)` stores the value and closes, never parking;
+    // `await(buf, dst, vwt, waiter) -> 1 | 0` waits for the close and copies the value out.
+    func nomuChanFulfill() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("rtChanFulfill", ret: voidTy, params: [i8ptr, i8ptr, i8ptr, i8ptr])
+        return schedForwarder("__nomu_chan_fulfill", ret: voidTy, params: [i8ptr, i8ptr, i8ptr]) { fn, sched, _, _ in
+            let a = (0..<3).map { LLVMGetParam(fn, UInt32($0))! }
+            _ = self.buildCall(target.fn, target.ty, [sched] + a)
+            return nil
+        }
+    }
+
+    func nomuChanAwait() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("rtChanAwait", ret: i64, params: [i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i64])
+        return schedForwarder("__nomu_chan_await", ret: i64, params: [i8ptr, i8ptr, i8ptr, i8ptr]) { fn, sched, sp, pc in
+            let a = (0..<4).map { LLVMGetParam(fn, UInt32($0))! }
+            return self.buildCall(target.fn, target.ty, [sched] + a + [sp, pc])
+        }
+    }
+
+    func nomuChanClose() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("rtChanClose", ret: voidTy, params: [i8ptr, i8ptr])
+        return schedForwarder("__nomu_chan_close", ret: voidTy, params: [i8ptr]) { fn, sched, _, _ in
+            _ = self.buildCall(target.fn, target.ty, [sched, LLVMGetParam(fn, 0)!])
+            return nil
+        }
+    }
+
+    // `select` (`runtime/channel.nomu`): `wait(area, hasDefault) -> case | -1` may park, so it anchors the caller's
+    // frame; `done(area)` takes the losing waiters out of their queues and never parks.
+    func nomuSelectWait() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("rtSelectWait", ret: i64, params: [i8ptr, i8ptr, i64, i8ptr, i64])
+        return schedForwarder("__nomu_select_wait", ret: i64, params: [i8ptr, i64]) { fn, sched, sp, pc in
+            let a = (0..<2).map { LLVMGetParam(fn, UInt32($0))! }
+            return self.buildCall(target.fn, target.ty, [sched] + a + [sp, pc])
+        }
+    }
+
+    func nomuSelectDone() -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("rtSelectDone", ret: voidTy, params: [i8ptr, i8ptr])
+        return schedForwarder("__nomu_select_done", ret: voidTy, params: [i8ptr]) { fn, sched, _, _ in
+            _ = self.buildCall(target.fn, target.ty, [sched, LLVMGetParam(fn, 0)!])
+            return nil
         }
     }
 
@@ -858,11 +912,13 @@ extension LLVMGen {
     // `posix_memalign` requires; the memory is zero-filled, which the runtime's allocator relies on; failure
     // prints "out of memory" and exits 1. It never touches the managed heap or parks, so it is gc-leaf and
     // its calls are never statepoints. Never inlined: `posix_memalign` dominates its cost, and inlining it at
-    // every site only grows the code.
-    func nomuRawAlloc() -> (LLVMValueRef, LLVMTypeRef) {
-        if let f = rawAllocFn { return f }
+    // every site only grows the code. With `zeroed` false it is `__nomu_raw_alloc_uninitialized`, the same
+    // without the fill (`Runtime.allocUninitialized`), for runtime memory written before it is read.
+    func nomuRawAlloc(zeroed: Bool = true) -> (LLVMValueRef, LLVMTypeRef) {
+        if zeroed, let f = rawAllocFn { return f }
+        if !zeroed, let f = rawAllocUninitializedFn { return f }
         let ty = fnType(i8ptr, [i64, i64])
-        let fn = LLVMAddFunction(mod, "__nomu_raw_alloc", ty)!
+        let fn = LLVMAddFunction(mod, zeroed ? "__nomu_raw_alloc" : "__nomu_raw_alloc_uninitialized", ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         markGCLeaf(fn)
         addNoInline(fn)
@@ -888,11 +944,17 @@ extension LLVMGen {
             emitOutOfMemoryExit()
             LLVMPositionBuilderAtEnd(b, okBB)
             let p = LLVMBuildLoad2(b, i8ptr, slot, "raw.mem")!
-            _ = buildCall(memset.0, memset.1, [p, LLVMConstInt(i32, 0, 0), bytes])
+            if zeroed {
+                _ = buildCall(memset.0, memset.1, [p, LLVMConstInt(i32, 0, 0), bytes])
+            }
             LLVMBuildRet(b, p)
         }
-        rawAllocFn = (fn, ty)
-        return rawAllocFn!
+        if zeroed {
+            rawAllocFn = (fn, ty)
+        } else {
+            rawAllocUninitializedFn = (fn, ty)
+        }
+        return (fn, ty)
     }
 
     // Print "out of memory" to stderr and exit 1, ending the current block.

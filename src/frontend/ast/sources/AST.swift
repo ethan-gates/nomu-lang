@@ -393,8 +393,8 @@ public typealias Block = [Stmt]
 
 public enum Stmt {
     case binding(BindingStmt)
-    case spawnLet(name: String, type: TypeRef?, value: Expr, span: Span)  // fiber let x = expr
     case fiberStart(call: Expr, span: Span)                               // fiber f(x)
+    case selectStmt(SelectStmt)
     case assign(lhs: Expr, rhs: Expr, span: Span)
     case compoundAssign(lhs: Expr, rhs: Expr, span: Span)  // +=
     case ret(Expr?, span: Span)
@@ -451,6 +451,29 @@ public struct SwitchStmt {
     }
 }
 
+// `select { case let v = ch.receive(): … case ch.send(x): … case after(ms): … default: … }`. Each arm's `op` is
+// the case's operation, which sema classifies; `binding` names its value (`case let v = …`).
+public struct SelectArm {
+    public let binding: String?
+    public let op: Expr
+    public let body: Block
+    public let span: Span
+
+    public init(binding: String?, op: Expr, body: Block, span: Span) {
+        self.binding = binding; self.op = op; self.body = body; self.span = span
+    }
+}
+
+public struct SelectStmt {
+    public let arms: [SelectArm]
+    public let defaultBody: Block?
+    public let span: Span
+
+    public init(arms: [SelectArm], defaultBody: Block?, span: Span) {
+        self.arms = arms; self.defaultBody = defaultBody; self.span = span
+    }
+}
+
 public struct CaseArm {
     public let pattern: Pattern
     public let body: Block
@@ -484,6 +507,7 @@ public indirect enum Expr {
     case closure(params: [Param], ret: TypeRef?, body: Block, span: Span)
     case arrayLit([Expr], span: Span)          // [a, b, c] — an Array<T> literal
     case index(Expr, Expr, span: Span)         // a[i] — array subscript
+    case taskStart(call: Expr, span: Span)     // task f(x) — runs the call on a new fiber, giving a Task
 
     // A placeholder for an expression the parser could not build from broken input.
     // Only produced during error recovery — a diagnostic is always reported alongside

@@ -46,6 +46,11 @@ inlining budget. The loss is bounded: the wake (case 2 handled as case 3) and on
 report should list readying sites and why each did or did not get the fast path, as `-gcflags=-m` does for
 Go's escape and inlining decisions.
 
+## Dependents
+
+- **[254](254-scheduler-performance.md)** (scheduler performance) waits on this task: a direct switch skips the
+  run queue, the pick and the wake that 254 tunes.
+
 ## Refs
 
 234's step two and 234.3 (the cases, the measurements, the cliff discussion);

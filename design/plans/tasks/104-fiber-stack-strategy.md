@@ -1,9 +1,7 @@
 # Fiber stack strategy: growth, overflow, high-fiber-count throughput
 
 **Avenue:** Risk (the "better than Go" concurrency thesis) · **Type/Lifecycle:** `perf · needs-design`
-(runtime + compiler architecture) · **Size:** L · **Status:** direction decided (Go-style copying stacks);
-104.1 (baseline) done; the entry check decided; unblocked by [194](194-gc-frame-metadata.md)'s decision
-(extended statepoints; the copier and its stress mode are built); 104.2.1–104.2.5 done (the entry check, through x28, before the first call; overflow is now a fatal error; frames verified against the reserve; its cost measured); 104.2.6 accepted at parity with Go; 104.3.1–104.3.8 done (growth; raw pointers tracked; the platform layer, libc on the carrier's stack; Nomu's own memory routines; the link checks unchecked chains against the reserve; nothing outside a fiber points into its stack; every fiber starts at the minimum, completed stacks freed; 2 KiB stacks, large frames behind wrappers); next 250 (104.3.9 completes at 250.4), then 104.4, then performance (104.5); built before any collector is measured · **Source:** deferred.md
+(runtime + compiler architecture) · **Size:** L · **Status:** done — Go-style copying stacks: an entry check through x28 against a 1,152-byte reserve, 2 KiB starting stacks that grow by copying and shrink at major collections, libc on the carrier's stack (104.1–104.4); 104.5 made growth 2.5 to 3 times faster than Go's, a spawn as cheap as Go's on one carrier, and memory routines up to 42% faster. Policies left at their defaults went to [258](258-runtime-policy-tuning.md), libc-or-own choices to [259](259-libc-or-own-per-routine.md), the scheduler gaps 104.5 found to [254](254-scheduler-performance.md) · **Source:** deferred.md
 
 **Scheduled before any collector is measured** (the benchmark against Go and Swift on GenImmix, then the
 GenImmix–LXR comparison), so the benchmarks run on large, fiber-heavy programs. Today's three stack
@@ -146,7 +144,8 @@ the stack's low end, and calls into the runtime to grow when it is inside it.
     (`/etc/nsswitch.conf`: LDAP, mDNS, `systemd-resolved`), and on macOS the system resolver with its
     per-interface and VPN scopes (Go uses libSystem's there). Such calls block, so they run on a thread
     of their own, as Go's cgo lookups do. Which lookups use which belongs to the networking work.
-- **Shrinking.** At collections, a stack using under a quarter of its size is copied to one half the size.
+- **Shrinking.** At major collections, a stack using under a quarter of its size is copied to one half the
+  size (104.4).
 - **The limit.** A maximum stack size per fiber; past it, a fatal error through the runtime's fatal path,
   which [219](219-runtime-fault-handling.md)'s handler reports.
 
@@ -215,7 +214,7 @@ the stack's low end, and calls into the runtime to grow when it is inside it.
     `morestack` keeps them; tracked pointers cannot, since a collection there would leave the returned copy
     stale); duplicate the entry so the leaf path's code has no check region; or accept parity with Go.
     **Accepted** at parity with Go, whose check at entry pays the same on such leaves; the two other
-    candidates stay open for a later pass on the check's cost.
+    candidates moved to [238](238-stack-check-elision.md), with the rest of the check's cost.
 - **104.3** The copier in production: fibers start small and grow by copying (`rtStackMove` from 243,
   today a stress mode), the limit, the runtime's own code and libc calls kept off growable stacks (above).
   Small stacks are the default since 104.3.7; `NOMU_STACK_START` still sets the starting size.
@@ -265,7 +264,7 @@ the stack's low end, and calls into the runtime to grow when it is inside it.
       cost 1.4% (about 0.7 ns a call). Against direct calls: `pingpong_fiber`, `forkjoin_fiber`,
       `sleepers_fiber`, `fanout_actor`, `pipeline_actor`, `mixed_fiber`, `producer_fiber`, `alloc_live`,
       `micro_alloc` and `frames_strings` within noise. What remains on printing goes with owning number
-      formatting (104.5).
+      formatting ([227](227-double-formatting-in-nomu.md)).
     - **Tests.** The suite passes plain, at `stack_move=1`, `stack_move_checks=3` and with 32 KiB stacks
       (995/995 each). A fatal error on a fiber now aborts on its carrier's stack.
   - **104.3.4** The memory routines LLVM emits (`memcpy`, `memmove`, `memset`, `memcmp`): LLVM calls them
@@ -362,8 +361,9 @@ the stack's low end, and calls into the runtime to grow when it is inside it.
     reserve and a 32 KiB minimum (rejected: 16 times Go's footprint). Stacks stay page-sized under the
     stress modes, which protect them.
     **Done:**
-    - **The reserve** is 1 KiB (`rtStackReserve`, `FrameTable.stackReserve`), a checked frame at most
-      768 bytes (`FrameTable.frameLimit`), leaving the slow path 256; every fiber starts at 2 KiB
+    - **The reserve** is 1152 bytes (`rtStackReserve`, `FrameTable.stackReserve`), a checked frame at most
+      768 bytes (`FrameTable.frameLimit`), leaving the slow path 384, which holds the 224 bytes the context
+      switch pushes ([250](250-fiber-task-surface.md) 250.8.2; 1 KiB and 256 before); every fiber starts at 2 KiB
       (`rtStackMin`; 16 KiB under the stress modes), `main`'s at 64 KiB.
     - **Large frames.** `emitObject` compiles a module; when a checked function's frame comes out over
       the limit, it compiles it again with each such function split (`nomuSplitLargeFrame`,
@@ -396,16 +396,341 @@ the stack's low end, and calls into the runtime to grow when it is inside it.
     the detached model, which [250](250-fiber-task-surface.md) 250.1–250.4 builds; removing `fiber let` there
     also fixes the crash on a `fiber let` in an untaken branch, which joins an uninitialized handle at
     function exit. The carrier clears its current-fiber word when a fiber returns, since another carrier may
-    free the record.
-- **104.4** Shrinking at collections (above). Counted in functional completeness: without it a fiber that
-  once ran deep keeps that memory, against the fiber-density goal.
-- **104.5** Performance, after 104.4: growth by doubling and starting sizes learned per spawn site; stacks
-  pooled per carrier with no guard pages; a smaller reserve once libc is off fiber stacks; the check
-  elision of [238](238-stack-check-elision.md) and 104.2.6's other candidates; 247's frame table for the
-  copier's walk. Each measured with counters for growths, bytes copied and time, and against Go on a
-  spawn-heavy and a deep-recursion benchmark. And the per-routine choices of the libc rule (above): each
-  candidate (short and bulk memory operations, integer and float formatting, float parsing, the clock)
-  benchmarked against libc on workloads with the stack switch in place, the result deciding it.
+    free the record. **Done** with 250.4: every fiber's record is freed when it ends, except `main`'s.
+  - **104.3.10** The fastbuild compiler (LLVM with assertions) aborts compiling the runtime in `-c release`:
+    "Odd number of callee-saved regs to spill!" in `rtImmixRefill`. With `+reserve-x28`, LLVM pairs x27 with
+    x28 for Mach-O's compact unwind, then drops x28 as user-reserved, leaving x27 alone; any function using
+    x19–x27 trips it. Release LLVM saves x27 singly and the compact unwind falls back to DWARF, so `-c opt`
+    builds work. The runtime is compiled optimized in every configuration, so any fastbuild-compiler build that compiles it afresh aborts; `build_tests` fail whenever they compile the runtime afresh (`testVerifyCache`, `testVerifyCacheCoversLinks`, `testConcurrentWorkspacesShareOneCache`) and pass when a cached runtime serves them.
+    Options: patch LLVM's pairing to skip a user-reserved partner, keep x27 out of allocation as well, or
+    take x28's role in a register outside the callee-saved pairs.
+    **Decision: generated code stays as it is**, x28 reserved and x27 allocatable, because it is the fastest.
+    Release LLVM saves x27 with a single `str` (`rtImmixRefill`: `str x27, [sp, #0x30]`), at most one store
+    per prologue. Keeping x27 out of allocation costs a register in every function; moving the fiber pointer
+    to a thread-local adds a TLS load to every stack check, and to a caller-saved register adds a restore
+    after every libc call and at every entry from C. **Done:** `.bazelrc` builds `AArch64FrameLowering.cpp`
+    and `AArch64PrologueEpilogue.cpp` with `-DNDEBUG`, so the fastbuild compiler takes the release path for
+    this spill; the rest of LLVM keeps its assertions. Both files, because they share
+    `AArch64PrologueEpilogueCommon`, whose members depend on NDEBUG; LLVM's other layout switches follow
+    `LLVM_ENABLE_ABI_BREAKING_CHECKS`, which is global. A fastbuild compiler now compiles the runtime afresh
+    under `-c release`, and `build_tests` pass. `testConcurrentWorkspacesShareOneCache` then failed
+    intermittently on a non-deterministic `std/prelude` object, fixed in
+    [207](207-build-determinism.md) 207.7.
+  - **104.3.11** A frame addressed through a base pointer breaks when its stack moves. With run-time-sized
+    buffers (compiled-once code's values of unknown size) and 256 bytes or more of fixed locals, LLVM addresses
+    the locals through x19, set from SP in the prologue. The mover fixes frame pointers and recorded slots but
+    not x19, so after a move the function reads its old stack. Found with a two-case `select` in a
+    compiled-once generic (`firstOf(a, b)`, two receive cases, under `stack_move=1`; `select_generic` keeps its compiled-once selects to one case until this is fixed); any compiled-once
+    function that large that stops while holding such a buffer is exposed, and stack growth moves stacks
+    outside the stress mode too. The collector has the same gap: a stack map records such a frame's root
+    slots relative to x19, and the walk reads every register other than x29 as SP, so it reads the wrong
+    words (a collection while `firstOf` is parked loses the channels its `select` holds). Options: an LLVM patch so these functions address locals from the frame
+    pointer, or the mover fixing x19 in the context and in each callee's save slot, which sits at a fixed
+    place below the frame record under Darwin's compact unwind layout.
+    Decided: the runtime handles these frames, with the facts it needs found after the link. An LLVM patch
+    (address the locals from x29) would cost an instruction or two on many accesses in these frames, and a
+    per-fiber side stack for run-time-sized values would cost a bump and a reset per use and a second region
+    per fiber; this costs nothing outside collections and stack moves.
+    - **104.3.11.1** After the link, the driver reads the binary's unwind info and adds a table to the frame
+      index: for each function, where it saves x19 (its offset from the frame pointer), and whether it uses a
+      base pointer. **Done** (`driver/sources/UnwindFacts.swift`, frame index version 3). The save comes from
+      `__unwind_info` (frame mode: x19 at fp−8 with the x19/x20 pair) or, for a function in DWARF mode, from
+      its `__eh_frame` FDE (the first save rule, relative to the CFA, the frame record at CFA−16). A base
+      pointer is LLVM's `mov x19, sp` in the prologue. The step checks every stack-map slot location: based on
+      x19 only in a base-pointer function, and on no register but x19, x29 and SP. The section's size is
+      reserved from the objects' compact-unwind entry counts.
+    - **104.3.11.2** The collector's walk carries each frame's x19 outward. **Done.** `rtX19AtAnchor` follows
+      the frame-pointer chain from the fiber's context to the anchor; `rtWalkFrom` continues frame by frame;
+      `rtSlotBase` reads a slot's base, fatal for any register it cannot read.
+    - **104.3.11.3** The mover adjusts the saved x19 of each base-pointer frame. **Done**, after the
+      frame-pointer chain and before the root slots, which a base-pointer frame records relative to it. The
+      frames contract names it (S4, R2a).
+    - **104.3.11.4** Tests. **Done.** `select_generic` has its two-case compiled-once `firstOf` back, under
+      collections and stack moves; `base-pointer-frame` (`-stack-move`, `-stack-checks`) holds two channels in
+      x19-based slots across a park 40 frames down while another fiber churns the heap. With the mover's x19
+      fix removed, it faults under `stack_move=1`.
+    - **104.3.11.5** Verification. **Done.** Full tier 1420/1420; fast tier 534/534 under `stack_move=1`,
+      `stack_move_checks=1` and `=3`; the base-pointer, select, task, channel, scheduler, fiber, actor, stdin,
+      STW and module-generic cases 20× each plain and 10× with stacks moving, all passing.
+- **104.4** Shrinking at collections (above). **Done** (104.4.1–104.4.5). Counted in functional completeness: without it a fiber that
+  once ran deep keeps that memory, against the fiber-density goal. A fiber parked on a channel is held by raw
+  addresses into its stack: the channel's queue points at its waiter (in the caller's frame), and the waiter's
+  slot, or a `select` waiter's slot, points at its value ([102](102-channels.md) 102.3). The resume move is
+  safe, since the waker has finished with them by then; a shrink is not. Decided: fix those addresses. Go
+  does the same: it shrinks goroutines parked on channels and adjusts the pointers into the stack under the
+  channels' locks (`activeStackChans`, `syncadjustsudogs`), skipping only a goroutine in the middle of parking.
+  Skipping would leave the most common parked fiber unshrunk. Nomu shrinks while the world is stopped, so no
+  waker runs during the fix.
+  - **104.4.1** List every address into a parked fiber's stack held outside it, by wait reason (channel,
+    `select`, sleep, `readLine`, `Task` join, actor mailbox, safepoint stop), and confirm no channel lock is
+    held while the world is stopped.
+    **Done.** 104.3.6's audit predates channels in the runtime; this extends it. By wait reason:
+    - **Channel receive, send and `Task` join** (`rtChanPark`): the waiter is in the caller's frame. Its slot
+      and shadow link are a node of the fiber's shadow list, which `rtStackMove` already walks and fixes. The
+      channel's queue points at it: the queue's head or the previous waiter's `next` (offset 24), and the
+      tail. Those are the only addresses 104.4.3 has to fix. The fiber record's wait object (offset 120) is the
+      channel's buffer, whose state at +16 holds both queues.
+    - **`select`**: its waiters are in a heap record; each is a shadow node whose slot points into the stack,
+      fixed by the same walk. Nothing else points in.
+    - **Sleep**: the timer holds the fiber record. **`readLine`**: its waiter is on the heap and holds the
+      fiber record. **Mailbox fibers** (idle, state 6): the carrier holds the record. **Safepoint and stack-check
+      stops** (states 4 and 5): only the runtime's own records, which the mover already fixes (the resume
+      and check stress modes move these states today).
+    - **Locks**: runtime code compiles with no safepoint polls (`noSafepoint`, the runtime subset), so a fiber
+      stops only in user code, and every channel lock is taken and released inside runtime code. The one
+      release outside it is the carrier's, right after the switch back (`rtSchedSwitchedBack`), before the
+      carrier can take part in a stop. So no channel lock is held while the world is stopped, and the fix-up
+      needs none.
+  - **104.4.2** Shrinking at collections for fibers with no such addresses: a stack using under a quarter of
+    its size moves to one half, through the existing mover. **Done** (`rtStackShrinkAll`, `stackmove.nomu`).
+    The GC coordinator runs it after each major collection, with the world stopped, over the fibers the
+    collector walks as stopped: ready, parked and stopped at a safepoint. A stack never goes below the
+    starting size, and always keeps the reserve below its used part. Majors only: minors are frequent, and
+    the pass visits every fiber. The move is `rtStackMoveTo(fib, bytes)`, which the growth path
+    (`rtStackMove`) now calls with its doubled size. Suite case `stack-shrink`: three fibers grow, then sleep
+    shallow, and come back smaller with their objects intact; `main`, stopped at a safepoint, shrinks too. It
+    fails with the pass removed.
+  - **104.4.3** The fix-up for channel and `select` waits: after the copy, every address into the old range in
+    the channel's queues and the waiters' slots moves by the same delta. The fiber record's wait object (the
+    channel's buffer or the `select`'s record) says where to look. **Done.** Slots needed nothing new: every
+    waiter, `select`'s included, is a node of the shadow list the mover already fixes. Only the queue links
+    to a plain waiter on the stack were left. A fiber parked in a channel operation has that waiter as its
+    shadow list's newest node, so the pass knows its old and new address. A first version walked the
+    channel's queues once per moved fiber: 10,000 receivers on one channel made each major take 5.6 s. The
+    pass now lists every moved waiter first, then walks each listed channel's queues once through a table
+    from old to new waiter addresses. Suite case `stack-shrink-chan`: three receivers on one channel (one in
+    the middle of the queue), two senders, and a `Task` join. It crashes with the fix-up removed (SIGSEGV;
+    SIGBUS with the old stack protected).
+  - **104.4.4** A stress mode that shrinks every eligible fiber at every collection; the suite under it.
+    **Done.** `NOMU_STACK_SHRINK=1`, run setting `stack_shrink`: every collection, minor or major, moves every
+    stopped fiber's stack, halving it where the rules allow and at its size otherwise, with the old stack
+    protected as in the other stack-move modes. The fast tier passes 543/543 under it; the two shrink cases
+    pass under it combined with `gc_stress_bytes=65536` and with `stack_move=1`. Combined with
+    `gc_stress_bytes` across the whole suite, the failures and timeouts are the same set as under
+    `gc_stress_bytes` alone (cases that require more collections than the run-wide value gives).
+  - **104.4.5** Measures: peak and settled memory on a workload that runs deep and then parks, and the added
+    pause. **Done** (`benchmarks/stack_shrink`, `--config=rt_prelude`): 10,000 fibers recurse 1,000 frames,
+    then park on one channel's receive. Six majors in a row:
+
+    | Major | Pause | Total stack |
+    |---|---|---|
+    | before | | 655 MB (64 KiB each) |
+    | 1 | 62 ms | 328 MB |
+    | 2 | 58 ms | 164 MB |
+    | 3 | 45 ms | 82 MB |
+    | 4 | 40 ms | 41 MB (4 KiB each) |
+    | 5, 6 | 26 ms | 41 MB, nothing left to shrink |
+
+    The same at 1 and 4 carriers. Shrinking adds 14–36 ms to a pause for 10,000 fibers, about 3.6 µs a fiber
+    at the largest size: a stack's allocation and free, and the walk of its frames for root slots. Stacks
+    pooled per carrier (104.5) cut the first part. The stacks end at 4 KiB, since 2 KiB would leave less than
+    the reserve below the used part.
+- **104.5** Performance of the stack mechanisms, after 104.4: what a spawn, a growth, a shrink and the
+  calls that switch stacks cost, measured on synthetic benchmarks, since a mechanism's cost does not depend on
+  the workload. The policies (the growth factor, starting sizes, the shrink threshold) need real programs and
+  moved to [258](258-runtime-policy-tuning.md); they keep their current defaults here. Moved elsewhere: check
+  elision and 104.2.6's other candidates to [238](238-stack-check-elision.md); the copier reading the frame
+  table is part of [247](247-frame-table.md)'s deliverable; number formatting and parsing to
+  [227](227-double-formatting-in-nomu.md). The smaller reserve was 104.3.8.
+  - **104.5.1** Baseline and counters. Runtime counters for stack growths, bytes copied, and time in moves and
+    in the shrink pass, printed at exit under a setting. Two benchmarks with Go counterparts in
+    `practice/go`: spawn-heavy (many short fibers, each a little deeper than the starting size) and
+    deep-recursion (a few fibers recursing far, growing through every size). With `forkjoin_fiber`,
+    `sleepers_fiber` and `stack_shrink`, these are the set the later steps measure against.
+    **Done:**
+    - **Counters.** `NOMU_STACK_STATS=1` (suite setting `stack_stats`) prints one line to stderr at exit:
+      `nomu-stacks: moves= grown= move-bytes= move-ns= shrink-passes= shrunk= shrink-bytes= shrink-ns=`.
+      Kept in `rtStackStats`, added to atomically; off, a move pays one branch. Test:
+      `stack-stats`.
+    - **Benchmarks.** `benchmarks/spawn_grow`: 100,000 fibers per round in waves of 1,000, each recursing
+      to a depth (0, 16, 64, 256, 1024) and returning. `benchmarks/deep_recursion`: 4 fibers recursing to
+      10,000, 100,000 and 1,000,000. Both recurse through the same non-tail function. Go counterparts:
+      `practice/go/stacks` (`spawn`, `deep`).
+    - **Results.** Median of 3, M3 Max; `spawn_grow` in ns a fiber, `deep_recursion` in ms; columns are
+      carriers, or `GOMAXPROCS`:
+
+      | benchmark | Nomu 1 | Go 1 | Nomu 4 | Go 4 |
+      |---|---|---|---|---|
+      | spawn_grow, depth 0 | 203 | 130 | 453 | 155 |
+      | spawn_grow, depth 16 | 201 | 148 | 460 | 147 |
+      | spawn_grow, depth 64 | 1,748 | 1,323 | 3,067 | 388 |
+      | spawn_grow, depth 256 | 15,328 | 10,285 | 20,647 | 2,780 |
+      | spawn_grow, depth 1024 | 68,857 | 48,060 | 88,638 | 13,302 |
+      | deep_recursion, 10,000 | 2.4 | 1.8 | 2.4 | 0.6 |
+      | deep_recursion, 100,000 | 18.3 | 14.4 | 17.2 | 4.4 |
+      | deep_recursion, 1,000,000 | 144 | 122 | 134 | 35 |
+
+      Counters: `spawn_grow` makes 900,000 moves copying 7.3 GB, 8.0 s of its 8.8 s at one carrier;
+      `deep_recursion` 132 moves copying 153 MB, 143 ms of its 145. `stack_shrink`: 50,000 growth moves
+      (887 ms), and 40,005 stacks shrunk over six passes copying 38 MB in 87 ms, about 2.2 µs a stack for
+      under 1 KiB copied each. `forkjoin_fiber` and `sleepers_fiber` never grow.
+    - **Findings.**
+      - Growth does not scale with carriers: a move holds the scheduler lock, so moves on different
+        carriers run one at a time. Go's growth scales about 3.7 times from 1 to 4. (104.5.2)
+      - A move costs about 9 µs for 8 KiB copied, about 40 ns a frame; the copy itself is a small part.
+        Go's copier costs about the same per frame (its time at depth 1024 is also mostly copying), so
+        this is where beating Go is open. (104.5.3)
+      - A spawn with no growth costs 203 ns against Go's 130 at one carrier, 453 against 155 at four.
+        Part of it is the stack's `malloc` and `free` (104.5.4); the scheduler's part belongs to
+        [254](254-scheduler-performance.md).
+  - **104.5.2** Growth off the scheduler lock. A fiber stopped at its check (state 5) is on no channel queue
+    and runs on no other carrier, so its move touches only its own stack and record. Find what the lock
+    guards in a growth move today (the stress modes' stack pool; anything reading a running fiber's stack:
+    the fiber dump, the leak pass, the stop-the-world), and move growth outside it where it is safe. Measure
+    `deep_recursion` and `spawn_grow` at 4 carriers.
+    **Done:**
+    - **What the lock guarded.** Only the stress modes' stack pool (`rtStackTake`, `rtStackRetire`), which
+      the lock still guards; outside them a move's stacks come from `malloc`. The stop-the-world cannot start
+      during a move: the coordinator waits for every carrier's ack, and a carrier gives it only once its fiber
+      runs again and stops at a poll. The shrink pass and the leak pass run inside it; the deadlock check
+      counts a state-5 fiber as running either way.
+    - **The change.** `nomuSchedStackCheck` takes the lock only under the stress modes, and the carrier moves
+      the stack without it otherwise (`rtStackGrowLocked`; `rtSchedSwitchedBack` reports state 5 as not
+      holding it). The counters became atomic.
+    - **Results.** Paired against the same build with the lock, 30 pairs: `deep_recursion` (depth
+      1,000,000) at 4 carriers 140 → 81 ms (−59.7 ms, 95% interval [−60.2, −58.6]); at 1 carrier equal
+      (−0.06 ms, [−0.63, +0.31]). Median of 3 at 4 carriers, ns a fiber, against 104.5.1:
+
+      | spawn_grow depth | before | after | Go 4 |
+      |---|---|---|---|
+      | 0 | 453 | 446 | 155 |
+      | 64 | 3,067 | 633 | 388 |
+      | 256 | 20,647 | 4,535 | 2,780 |
+      | 1024 | 88,638 | 19,148 | 13,302 |
+
+      `deep_recursion` at 4 carriers stays at 81 ms against Go's 35 because the four fibers run on about
+      two carriers. The same happens with no growth (four compute-only tasks: 158 ms on 4 carriers against
+      300 on 1): a searcher that finds work wakes another only when its own queues hold more, and the rest
+      wait on a busy carrier. Go's rule (wake another whenever a searcher finds work) brought it to 44 ms in
+      an experiment; that is scheduler policy and went to [254](254-scheduler-performance.md) 254.5.
+    - **Tests.** The full tier three times (1430/1430 each); the fast tier at `stack_move=1`,
+      `stack_move_checks=3` and `stack_shrink=1` (544/544 each); `stack-growth`, `large-frame*` and
+      `stack-shrink*` five times each under `gc_stress_bytes=65536`.
+  - **104.5.3** The move itself. Profile a growth and a shrink: the walk of frames for root slots and base
+    pointers (a frame-index lookup per frame), the copy, the pointer fixes. Cut what shows, without the
+    frame table (247 replaces the lookup later).
+    **Done:**
+    - **Where the time went.** The copy was about 1% of a move. Most of it was two binary searches per
+      frame, each a chain of dependent loads: the stack-map record (`rtFrameLookup`) and the x19 fact
+      (`rtFrameFact`), the second made twice, once in the mover's x19 pass and once in the root walk. Then
+      zero-filling: `RawPtr.alloc` zeroes what it returns, so each growth zeroed its whole new stack before
+      copying over its top, and each move zeroed a 32 KiB root buffer.
+    - **The changes.**
+      - A lookup cache (`rtFrameCached`): 64 direct-mapped entries from a return address to its record and
+        fact. An address's lookups never change, so each thread keeps one in its carrier record (offset 176)
+        for the whole run; a thread without a record makes one per walk or pass. The mover, the collector's
+        walk of stopped fibers and the leak pass use it. Go keeps a pcvalue cache per thread the same way.
+      - One pass over the frame-pointer chain fixes both the saved frame pointers and each base-pointer
+        frame's x19, where there were two.
+      - The move's root buffer starts at 64 roots (`rtRootsNewSized`) and grows as before.
+      - The stack a move copies into is left unfilled: `Runtime.allocUninitialized(bytes:align:)`, a new
+        runtime-only intrinsic, `RawPtr.alloc` without the fill. A new fiber's stack keeps it.
+    - **Results.** Time in moves at one carrier (`move-ns`, median of 7):
+
+      | step | `deep_recursion` | `spawn_grow` |
+      |---|---|---|
+      | before | 158 ms | 8.65 s |
+      | lookup cache | 27 ms | 2.27 s |
+      | kept per thread | 27 ms | 2.19 s |
+      | one chain pass | 23 ms | 1.92 s |
+      | small root buffer | 24 ms | 1.68 s |
+      | unfilled stacks | 20 ms | 1.49 s |
+
+      Finding the frame index once per run instead of per lookup changed nothing and was dropped. Wall time,
+      median of 3 (`spawn_grow` in ns a fiber, `deep_recursion` in ms):
+
+      | benchmark | Nomu 1 | Go 1 | Nomu 4 | Go 4 |
+      |---|---|---|---|---|
+      | spawn_grow, depth 0 | 215 | 147 | 481 | 160 |
+      | spawn_grow, depth 64 | 870 | 1,427 | 427 | 414 |
+      | spawn_grow, depth 256 | 4,766 | 10,930 | 1,435 | 2,892 |
+      | spawn_grow, depth 1024 | 18,182 | 51,083 | 4,950 | 13,739 |
+      | deep_recursion, 1,000,000 | 41 | 124 | 22 | 37 |
+
+      Growth now beats Go by 2.5 to 3 times at depth 256 and beyond. A spawn with no growth is still slower
+      (104.5.4, and the scheduler's part in 254). The shrink pass is unchanged at about 87 ms for 40,005
+      stacks: its stacks are shallow, so lookups were never its cost; a profile splits it between `malloc`
+      and `free` of the stacks (104.5.4), the copy, and touching 10,000 cold records and stacks.
+    - **Tests.** The full tier twice (1430/1430); the fast tier at `stack_move=1`, `stack_move_checks=3`,
+      `stack_move_checks=1` and `stack_shrink=1` (544/544 each); the growth, shrink and large-frame cases
+      five times each under `gc_stress_bytes=65536`; a sema test for the intrinsic.
+  - **104.5.4** Stacks pooled per carrier. Stacks come from `malloc` today and return to it at each fiber's
+    end, growth and shrink. A free list per size class on each carrier, filled and drained without the
+    scheduler lock, with a cap, and the surplus returned at major collections. Measure spawn cost
+    (`spawn_grow` at depth 0), growth and the shrink pause against `malloc`, whose own per-thread caches
+    may already take most of the gain; kept only if it wins.
+    **Done:**
+    - **What a spawn paid.** A profile of a spawn-only loop (2 million fibers, none growing, 191 ns a fiber
+      on one carrier) put about a quarter of it in `malloc`, `free` and zero-fill, nearly all for the fiber
+      record (128 bytes) and its stack, allocated at the spawn and freed when the fiber ends.
+    - **The pools** (`runtime/stackmove.nomu`, "Pools per carrier"), shaped as Go keeps dead goroutines:
+      each carrier keeps lists of records and of stacks by size class (2 to 64 KiB), behind its record at
+      offset 184. A list holds up to 64; past that a batch of 32 moves to a shared pool under its own lock,
+      and an empty list takes up to 32 back, so a fiber that starts on one carrier and ends on another is
+      still reused. The shared pool has no cap; a major collection empties it and every carrier's
+      (`rtPoolDrainAll`). Spawns, growth moves and finished fibers use them; a pooled record comes back
+      zeroed, a stack as it was left. A thread with no carrier record and the stress modes use `malloc`.
+      A first version with only per-carrier caps (256 records, 256 KiB a class) missed: `spawn_grow`'s
+      waves keep 1,000 fibers alive, and most went back to `malloc`.
+    - **Results.** Against the same build with pools off, median of 5 interleaved runs:
+
+      | benchmark | 1 carrier | 4 carriers |
+      |---|---|---|
+      | spawn-only loop, ns a fiber | 171 → 147 (−14%) | 407 → 339 (−17%) |
+      | spawn_grow, depth 0 | 180 → 152 (−16%) | 426 → 349 (−18%) |
+      | spawn_grow, depth 64 | 696 → 652 (−6%) | 409 → 361 (−12%) |
+      | spawn_grow, depth 1024 | 16,285 → 15,766 (−3%) | 4,571 → 4,338 (−5%) |
+      | forkjoin_fiber, work 0 / 100 / 1,000 | −15% / −21% / −4% | −21% / −29% / −31% |
+      | stack_shrink, six majors | −3% | −3% |
+
+      `sleepers_fiber` and `forkjoin_fiber` at work 10,000 within 1–3%. `deep_recursion`'s 100,000-deep
+      round read 1.8% slower between the two builds (paired, [+0.04, +0.11] ms); the same binary with pools
+      switched off at run time measured equal ([−0.05, +0.07] ms), so the difference is code layout. Peak
+      memory equal or lower on every benchmark (`stack_shrink` 970 → 881 MiB). A spawn now costs about what
+      Go's does on one carrier (147 against 147 ns); on four carriers it is 339 against 160, the
+      scheduler's part ([254](254-scheduler-performance.md)).
+    - **Tests.** The full tier twice (1430/1430); the fast tier at `stack_move=1`, `stack_move_checks=3`
+      and `stack_shrink=1`; the growth, shrink and large-frame cases five times each under
+      `gc_stress_bytes=65536`, which runs majors that drain pools in use.
+  - **104.5.5** Bulk memory past 128 bytes. Today it switches to the carrier's stack and calls libSystem's
+    tuned routines. Against embedded tuned routines (Arm's optimized-routines) run on the fiber's stack, on
+    `mem_routines`, `frames_strings` and `binary_tree`, by the libc rule above.
+    **Done:**
+    - **The ceiling.** A variant calling libSystem directly, with no stack switch (against the libc rule, for
+      measuring only), showed what the switch costs: 0.3–0.5 ns a call, 12% of a 160-byte copy, under 5%
+      from 1 KiB up; `mem_routines` 1.2% faster, `binary_tree` and `frames_strings` equal.
+    - **Our own loops**, in place of embedding Arm's routines: copies and fills from 129 bytes to
+      `NOMU_MEM_OWN_MAX` (4096) run 64 bytes a step on the caller's stack (the copy picks its direction by
+      overlap and loads what a store could overwrite first, so it stays a correct `memmove`); past 4096 they
+      switch to libSystem, which zeroes about twice as fast at 64 KiB and up (likely `DC ZVA`) and where the
+      switch costs under 1%. Compares run here at every size, 32 bytes a step with vector registers, faster
+      than libSystem's `memcmp` at every size measured; `memcmp` no longer calls libSystem.
+    - **Results.** Against the build before, median of 11 interleaved runs, ns a call (`practice/memsize`):
+
+      | bytes | copy | fill | compare |
+      |---|---|---|---|
+      | 160 | 3.4 → 2.5 | 3.2 → 2.1 | 5.0 → 3.2 |
+      | 256 | 5.2 → 3.6 | 3.4 → 3.3 | 6.9 → 4.0 |
+      | 1024 | 12.2 → 11.9 | 9.9 → 9.2 | 19.7 → 13.4 |
+      | 4096 | 51.8 → 45.5 | 36.3 → 35.7 | 94.0 → 58.0 |
+      | 65536 | 617 → 650 | 331 → 395 | 1,307 → 821 |
+      | 1 MiB | equal | equal | 19,126 → 18,068 |
+
+      Workloads: `mem_routines` 2.2% faster ([−3.3, −0.4] ms), `binary_tree` 0.6% faster ([−4.6, −1.8]
+      ms), `frames_strings` equal. The 64 KiB copy and fill run the same libSystem path in both builds.
+      Most of their gap comes from the sweep's order: without its compare phase it falls to +2.2% and +3.2%
+      (an A/A control moves them 2% and 0.3%), so the new compare loop leaves cache state the next phases
+      see. The +3% fill residue on unchanged code is unexplained, probably layout; with the loops switched
+      off the new build measures the same.
+    - **Tests.** `memory-routines` extended: sizes around the 64-byte steps and 4096 at two alignments;
+      overlapping copies of 1000 and 4096 bytes, shifts 1 to 500, both ways; a compare with one byte changed
+      at every position of 17 to 4097 bytes, and with a later byte changed the other way. It fails with the
+      compare made to skip half of each 32-byte step, and with copies always run forward. The full tier
+      (1430/1430), and the fast tier at `stack_move=1` and `stack_move_checks=3`.
+    - **Left for later.** Arm's optimized-routines against these loops, and `DC ZVA` zeroing for large fills:
+      [259](259-libc-or-own-per-routine.md).
+  - **104.5.6** The clock: moved to [259](259-libc-or-own-per-routine.md) 259.4, where the other per-routine
+    libc choices are and where [254](254-scheduler-performance.md)'s need for a cheap clock is in view.
 
 ## Baseline (104.1)
 
@@ -472,6 +797,11 @@ register swap and the one-carrier hop without the wake are the figures 104's lat
 - **Couples with:** [TCO](129-tail-call-optimization.md) (lowers stack depth), GC statepoints and the
   parked-fiber scan (the stack maps a move reuses), escape analysis (pointers into frames), the dynamic
   spawn group.
+
+## Dependents
+
+- **[254](254-scheduler-performance.md)** (scheduler performance) waited on this task through 104.5: stack
+  shrinking and stack pools changed what a spawn and a stack move cost. Done.
 
 ## Refs
 

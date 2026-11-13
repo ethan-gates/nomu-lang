@@ -100,7 +100,6 @@ private final class MutationAnalyzer {
     private func scanStmt(_ stmt: NOIRStmt, type: String, direct: inout Bool, selfCalls: inout Set<String>) {
         switch stmt.kind {
         case .letBinding(_, _, let v):   scanExpr(v, type: type, selfCalls: &selfCalls)
-        case .spawnLet(_, let v, _):     scanExpr(v, type: type, selfCalls: &selfCalls)
         case .fiberStart(let c):         scanExpr(c, type: type, selfCalls: &selfCalls)
         case .exprStmt(let v):           scanExpr(v, type: type, selfCalls: &selfCalls)
         case .ret(let v):                if let v { scanExpr(v, type: type, selfCalls: &selfCalls) }
@@ -170,6 +169,8 @@ private final class MutationAnalyzer {
             scanExpr(idx, type: type, selfCalls: &selfCalls)
         case .staticCall(_, _, let args):
             for a in args { scanExpr(a, type: type, selfCalls: &selfCalls) }
+        case .taskStart(_, _, let call, _):
+            scanExpr(call, type: type, selfCalls: &selfCalls)
         case .intLit, .doubleLit, .boolLit, .stringLit, .varRef, .globalRef, .closure, .funcRef:
             break
         }

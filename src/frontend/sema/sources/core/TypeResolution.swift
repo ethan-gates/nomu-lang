@@ -89,6 +89,8 @@ enum TypeResolution {
             s.diags.error("generic type '\(base)' expects \(arity) type argument(s), got \(args.count)", at: span)
             return .error
         }
-        return .generic(base: base, args: args.map { s.resolve($0, selfAs: selfAs) })
+        let resolved = args.map { s.resolve($0, selfAs: selfAs) }
+        s.checkSharedTypeArgs(base, resolved, at: span)
+        return .generic(base: base, args: resolved)
     }
 }

@@ -57,7 +57,8 @@ enum EnumConstruction {
     static func buildGenericEnumInit(_ s: inout Sema, _ enumName: String, _ generics: [GenericParam],
                                      _ caseDecl: EnumCaseDecl, _ args: [Arg],
                                      explicit: [Type]? = nil, expected: Type?, at span: Span) -> NOIRExpr {
-        let saved = s.genericScope; s.genericScope = Set(generics.map(\.name)); defer { s.genericScope = saved }
+        let saved = s.genericScope, savedCheck = s.checksSharedArgs; s.genericScope = Set(generics.map(\.name)); s.checksSharedArgs = false
+        defer { s.genericScope = saved; s.checksSharedArgs = savedCheck }
         var subst: [String: Type] = [:]
         // Explicit type arguments (`Option<Int>.some(...)`) seed inference; the payload is then
         // unified against them, so a mismatch (`Option<Int>.some("hi")`) is a conflict error.

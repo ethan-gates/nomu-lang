@@ -286,6 +286,18 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         }
         return out
     }
+    // The dictionary recipes the visible dependencies publish, named as this module names them.
+    func dependencyRecipes() -> DictionaryRecipes? {
+        var recipes: [String: DictionaryRecipe] = [:], layouts: [String: DictionaryLayout] = [:]
+        for k in visible {
+            guard let own = deps.interfaces[k]?.dictionaries?.qualified(origin: k) else { continue }
+            for r in own.recipes { recipes[r.symbol] = r }
+            for l in own.layouts { layouts[l.name] = l }
+        }
+        if recipes.isEmpty { return nil }
+        return DictionaryRecipes(recipes: recipes.values.sorted { $0.symbol < $1.symbol },
+                                 layouts: layouts.values.sorted { $0.name < $1.name })
+    }
     // The dependency results module inference reads: each visible dependency's published results, keyed by
     // the call names this module uses for them.
     func dependencyResults() -> [String: EscapeSummary] {
@@ -471,7 +483,9 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         localizedGenerics = injection.localizedNames
     }
     let monoDiags = DiagnosticSink()
-    let monoModule = timings.measure("noir", "mono") { monomorphize(moduleForMono, into: monoDiags) }
+    let monoModule = timings.measure("noir", "mono") {
+        monomorphize(moduleForMono, recipes: dependencyRecipes(), into: monoDiags)
+    }
     if !monoDiags.isEmpty { fputs(monoDiags.render() + "\n", stderr); return false }
 
     if let stem = debugStem, options.ssair || options.stopAt == .ssair {
@@ -482,6 +496,8 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
             return true
         }
     }
+
+    iface.dictionaries = monoModule.recipes
 
     let extFuncs = semaResult.externalFuncNames.subtracting(localizedGenerics)
     let extGenerics = semaResult.externalGenericSigs.filter { !localizedGenerics.contains($0.key) }

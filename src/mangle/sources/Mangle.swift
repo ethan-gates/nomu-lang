@@ -12,7 +12,7 @@ import support
 //             initializer `Nv<global>4init`, a static-storage global's block `Nv<global>7storage`
 //   type      `Nt<module><name>`, nested types `Nt<outer><inner>`
 //   method    `Nv<type><method>`; an accessor `count.get` nests, `Nv(Nv<type>5count)3get`
-//   closure   `NC<module>[s<index>]0`, a spawn routine `NC<module>[s<index>]5spawn`
+//   closure   `NC<module>[s<index>]0`, a fiber routine `NC<module>[s<index>]5fiber`
 //   init      `Ni<module>4init`, the module's startup-global initializer
 //   GC data   `I Nd C4nomu <kind> <types> E` (or `Nd C4nomu <kind>` with no type), its pointer map
 //             `Nd <descriptor> 6ptrmap`
@@ -38,7 +38,7 @@ public enum Mangle {
         if rest.hasPrefix("global:") {
             return "_RNv" + "Nv" + modulePath(module) + ident(String(rest.dropFirst(7))) + ident("init")
         }
-        for (prefix, label) in [("clo:", ""), ("spawn:", "spawn")] where rest.hasPrefix(prefix) {
+        for (prefix, label) in [("clo:", ""), ("fiber:", "fiber")] where rest.hasPrefix(prefix) {
             if let index = Int(rest.dropFirst(prefix.count)) {
                 return "_RNC" + modulePath(module) + disambiguator(index) + ident(label)
             }

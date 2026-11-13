@@ -80,7 +80,7 @@ cases:
     compile_settings:
       runtime_tier: true
     compile_args:
-      - "--runtime-subset=enqueue,dequeue,schedRun,fiberMain,fiberSpawn,park,unpark,joinFiber"
+      - "--runtime-subset=enqueue,dequeue,schedRun,fiberMain,fiberStart,park,unpark,joinFiber"
     expect:
       stdout: "6\n111\n42\n"
     carriers: []
@@ -90,7 +90,7 @@ cases:
     compile_settings:
       runtime_tier: true
     compile_args:
-      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,schedRun,fiberMain,fiberNew,fiberSpawn,fiberSpawnParked,park,parkLocked,unpark,unparkLocked,joinFiber"
+      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,schedRun,fiberMain,fiberNew,fiberStart,fiberStartParked,park,parkLocked,unpark,unparkLocked,joinFiber"
     expect:
       stdout: "6\n111\n42\n2000\n"
     carriers: []
@@ -100,7 +100,7 @@ cases:
     compile_settings:
       runtime_tier: true
     compile_args:
-      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,fiberNew,fiberSpawn,fiberMain,schedLoop,carrierMain"
+      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,fiberNew,fiberStart,fiberMain,schedLoop,carrierMain"
     expect:
       stdout: "600\n"
     carriers: []
@@ -112,7 +112,7 @@ cases:
     compile_settings:
       runtime_tier: true
     compile_args:
-      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,signalStop,fiberNew,fiberSpawn,unpark,waitReadable,fiberMain,schedLoop,carrierMain,pollerMain"
+      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,signalStop,fiberNew,fiberStart,unpark,waitReadable,fiberMain,schedLoop,carrierMain,pollerMain"
     expect:
       stdout: "36\n"
     carriers: []
@@ -124,7 +124,7 @@ cases:
     compile_settings:
       runtime_tier: true
     compile_args:
-      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,wakeTimer,signalStop,heapSwap,timerPush,timerPopMin,fiberNew,fiberSpawn,unpark,fiberSleep,fiberMain,schedLoop,carrierMain,timerMain"
+      - "--runtime-subset=mutexLock,mutexUnlock,enqueue,dequeue,wakeCarrier,wakeTimer,signalStop,heapSwap,timerPush,timerPopMin,fiberNew,fiberStart,unpark,fiberSleep,fiberMain,schedLoop,carrierMain,timerMain"
     expect:
       stdout: "1\n2\n3\n4\n"
     carriers: []

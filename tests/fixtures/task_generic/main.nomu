@@ -1,0 +1,45 @@
+// `task` inside generic functions, specialized per use: scalar and managed type arguments, a task returned
+// from the generic function, and two tasks joined in one body.
+
+class Msg {
+    let n: Int
+    let text: String
+}
+
+fun identity<shared T>(x: T) -> T {
+    return x
+}
+
+fun echo<shared T>(x: T) -> T {
+    let t = task identity(x)
+    return t.join()
+}
+
+fun start<shared T>(x: T) -> Task<T> {
+    return task identity(x)
+}
+
+fun both<shared T>(a: T, b: T) -> Array<T> {
+    let x = task identity(a)
+    let y = task identity(b)
+    var out: Array<T> = []
+    out.append(x.join())
+    out.append(y.join())
+    return out
+}
+
+fun main() {
+    print(echo(41) + 1)
+    print("\n")
+    let m = echo(Msg(n: 7, text: "seven"))
+    print(m.n)
+    print(" ")
+    print(m.text)
+    print("\n")
+    let t = start(Msg(n: 8, text: "eight"))
+    print(t.join().text)
+    print("\n")
+    let xs = both(1, 2)
+    print(xs[0] + xs[1])
+    print("\n")
+}

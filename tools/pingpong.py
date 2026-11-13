@@ -7,9 +7,18 @@ and GOMAXPROCS for Go), and prints the best ns per hop of `--iters` runs.
   ctx_swap        the register swap alone (ns per switch; a hop is two)
   pingpong_fiber  two fibers through the scheduler's park and unpark
   pingpong_actor  two actors sending a counter back and forth
+  pingpong_channel two fibers over unbuffered channels (`go chan`'s shape)
+  stream_channel  one fiber streaming to another over a buffered channel of 64 (ns per value)
+  fanin_channel   four senders to one receiver over a buffered channel of 64 (ns per value)
+  fanout_actor    one actor sending jobs to 16 actors that reply (ns per job; its no-work round)
+  pipeline_actor  items through a chain of 8 actors (ns per item; its no-work round)
   go chan         two goroutines over unbuffered channels
   go mailbox      two goroutines, each with a buffered channel as its mailbox
   go gosched      two goroutines yielding in turn
+  go stream       stream_channel's counterpart
+  go fanin        fanin_channel's counterpart
+  go fanout       fanout_actor's counterpart: a goroutine per actor, a buffered channel as its mailbox
+  go pipeline     pipeline_actor's counterpart, the same way
 
 The Go program is kept outside the repository, in the gitignored `practice/go/pingpong`; the Go rows run
 only when it is there.
@@ -35,9 +44,15 @@ NOMU_BENCHES = [
     ("ctx_swap", ["--config=runtime_tier", "--runtime-subset=swapPeer,swapRounds"]),
     ("pingpong_fiber", ["--config=rt_prelude"]),
     ("pingpong_actor", []),
+    ("pingpong_channel", []),
+    ("stream_channel", []),
+    ("fanin_channel", []),
+    ("fanout_actor", []),
+    ("pipeline_actor", []),
 ]
-GO_MODES = ["chan", "mailbox", "gosched"]
-GO_HOPS = 2000000
+# Go mode -> its count of hops, values, jobs or items (the actor shapes match their Nomu counterparts')
+GO_MODES = [("chan", 2000000), ("mailbox", 2000000), ("gosched", 2000000), ("stream", 2000000),
+            ("fanin", 2000000), ("fanout", 50000), ("pipeline", 20000)]
 
 
 def build_nomu(name, flags):
@@ -55,12 +70,13 @@ def build_go():
 
 
 def per_hop(cmd, env, iters):
-    """Best ns per hop over `iters` runs. Every program prints `... <count> ... ns <total>`; the actor one
-    prints its total only, for its fixed 1,000,000 hops."""
+    """Best ns per hop over `iters` runs. Every program prints `... <count> ... ns <total>` (the actor fan-out
+    and pipeline a line per round, of which the first, with no work, counts); the actor ping-pong prints its
+    total only, for its fixed 1,000,000 hops."""
     best = None
     for _ in range(iters):
         out = subprocess.run(cmd, env=env, capture_output=True, text=True).stdout
-        m = re.search(r"(?:hops|rounds) (\d+) ns (\d+)", out)
+        m = re.search(r"(?:hops|rounds|msgs|items) (\d+) ns (\d+)", out)
         if m:
             count, ns = int(m.group(1)), int(m.group(2))
         else:
@@ -94,8 +110,8 @@ def main():
         rows.append((name, [per_hop([binary], dict(os.environ, NOMU_CARRIERS=str(c)), iters) for c in carriers]))
     if os.path.isdir(GO_SRC):
         build_go()
-        for mode in GO_MODES:
-            rows.append((f"go {mode}", [per_hop([GO_BIN, mode, str(GO_HOPS)], dict(os.environ, GOMAXPROCS=str(c)), iters)
+        for mode, count in GO_MODES:
+            rows.append((f"go {mode}", [per_hop([GO_BIN, mode, str(count)], dict(os.environ, GOMAXPROCS=str(c)), iters)
                                         for c in carriers]))
 
     print(f"ns per hop (ctx_swap: per round trip), best of {iters}; columns are carriers / GOMAXPROCS\n")

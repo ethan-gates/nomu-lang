@@ -23,9 +23,9 @@ fun tree(depth: Int, seed: Int) -> Int {
     if depth == 0 {
         return spin(work: 260000, seed: seed)
     }
-    fiber let a = tree(depth: depth - 1, seed: seed * 2)
-    fiber let b = tree(depth: depth - 1, seed: seed * 2 + 1)
-    return a + b
+    let a = task tree(depth: depth - 1, seed: seed * 2)
+    let b = task tree(depth: depth - 1, seed: seed * 2 + 1)
+    return a.join() + b.join()
 }
 
 fun background() -> Int {
@@ -70,14 +70,14 @@ fun main() {
     st.store(RawPtr.null, toByteOffset: 8)
     st.store(RawPtr.null, toByteOffset: 16)
     let t0 = Time().now
-    fiber let bg = background()
-    fiber let a = player(st, 0, 200000)
-    fiber let b = player(st, 1, 200000)
-    var pairEnd = a
-    if b > pairEnd {
-        pairEnd = b
+    let bg = task background()
+    let a = task player(st, 0, 200000)
+    let b = task player(st, 1, 200000)
+    var pairEnd = a.join()
+    if b.join() > pairEnd {
+        pairEnd = b.join()
     }
-    let bgEnd = bg
+    let bgEnd = bg.join()
     print("mixed_fiber pair_ns ")
     print(pairEnd - t0)
     print(" bg_ns ")

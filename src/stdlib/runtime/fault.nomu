@@ -28,7 +28,16 @@
 // When `NOMU_CRASH_REPORT` names a file at startup, the report is written there too (created or truncated):
 // `nomu run` sets it and symbolizes the frames from the file once its program has died.
 //
-// `atos -o <binary> -l <load address> <frame addresses…>` names the frames. Frames after 0 are return
+// Fiber dumps, as Go's goroutine dumps. SIGQUIT dumps every fiber and exits with status 2, as Go does; a fault
+// dumps every fiber after its backtrace when `NOMU_TRACEBACK=all` (Go's `GOTRACEBACK`), and a deadlock
+// (`runtime/scheduler.nomu`) dumps them before it fails. A fiber's lines follow its header:
+//   nomu-crash: fiber 7 [chan receive, 2 minutes]:
+//   nomu-crash: frame 0: 0x…                            the frame it parked from, then its callers
+// The fibers are read from the registry without its lock, as Go reads goroutines when it dumps them: the
+// dump is best effort, and a fiber running on another carrier shows as `[running]`, with no frames.
+//
+// `nomu tool symbolize <binary> <report>` names the frames, as `nomu run` does; underneath it is
+// `atos -o <binary> -l <load address> <frame addresses…>`. Frames after 0 are return
 // addresses, the instruction after the call, so a symbolizer looks up each less one: a call that never returns
 // (`abort`) can end its function, and its return address is then the next function's first. A leaf function
 // sets no frame record, so when the fault is in one its caller is missing from the walk; `lr` holds it.
@@ -47,6 +56,9 @@ let rtFaultScratch = Runtime.staticStorage(bytes: 1024, align: 8)
 // `NOMU_CRASH_REPORT` as it was at startup, NUL-terminated; empty when unset. Read once at install, so the
 // handler never reads the environment.
 let rtFaultReportPath = Runtime.staticStorage(bytes: 1024, align: 8)
+
+// 1 when `NOMU_TRACEBACK` was `all` at startup: a fault dumps every fiber.
+let rtFaultTracebackAll = Runtime.staticStorage(bytes: 8, align: 8)
 
 // Install the handler and give the main thread its alternate stack. The process entry calls it first, before
 // the runtime's startup globals, so it reads none of them.
@@ -69,7 +81,24 @@ fun rtFaultInstall() {
     }
   }
   rtFaultReportPath.store(0.uint8, toByteOffset: i)
+  let tbLen = Runtime.copyLiteral(to: rtFaultScratch, "NOMU_TRACEBACK")
+  rtFaultScratch.store(0.uint8, toByteOffset: tbLen)
+  let tb = Runtime.getenv(name: rtFaultScratch)
+  rtFaultTracebackAll.store(0, toByteOffset: 0)
+  if !tb.isNull {
+    let c0: UInt8 = tb.load(fromByteOffset: 0)
+    let c1: UInt8 = tb.load(fromByteOffset: 1)
+    let c2: UInt8 = tb.load(fromByteOffset: 2)
+    let c3: UInt8 = tb.load(fromByteOffset: 3)
+    if c0.int == 97 && c1.int == 108 && c2.int == 108 && c3.int == 0 {      // "all"
+      rtFaultTracebackAll.store(1, toByteOffset: 0)
+    }
+  }
   let h = Runtime.ofFunc(rtFaultHandler)
+  // A process started with SIGQUIT blocked (a parent's mask is inherited) would never see it; the runtime's
+  // threads are created from this one and inherit the unblocked mask.
+  Runtime.unblockSignal(signal: 3)
+  Runtime.sigaction(signal: 3, handler: h, flags: 69)
   Runtime.sigaction(signal: 11, handler: h, flags: 69)
   Runtime.sigaction(signal: 10, handler: h, flags: 69)
   Runtime.sigaction(signal: 4, handler: h, flags: 69)
@@ -110,7 +139,7 @@ fun rtFaultHandler(sig: Int, info: RawPtr, uctx: RawPtr) {
   n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " (")
   n = rtFaultPutDec(buf, n, signo)
   n = n + Runtime.copyLiteral(to: buf.advanced(by: n), ")\n")
-  if signo != 6 {
+  if signo != 6 && signo != 3 {
     let addr: Int = info.load(fromByteOffset: 24)
     n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: address: ")
     n = rtFaultPutHex(buf, n, addr)
@@ -119,14 +148,138 @@ fun rtFaultHandler(sig: Int, info: RawPtr, uctx: RawPtr) {
   n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: thread: ")
   n = rtFaultPutThread(buf, n, kind, index)
   n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\n")
+  // SIGQUIT: every fiber, then exit with status 2, as Go does.
+  if signo == 3 {
+    n = rtFaultPutImage(buf, n)
+    rtFaultEmit(fd, buf, n)
+    rtFiberDump(fd, buf)
+    rtFaultEmit(fd, buf, Runtime.copyLiteral(to: buf, "nomu-crash: end\n"))
+    if fd >= 0 {
+      Runtime.closeFd(fd: fd)
+    }
+    Runtime.exit(2)
+  }
   // The reporters, each a line or none: the collector's recorder.
   n = rtGcFaultReport(buf, n)
   rtFaultEmit(fd, buf, n)
   rtFaultBacktrace(fd, buf, uctx)
+  let all: Int = rtFaultTracebackAll.load(fromByteOffset: 0)
+  if all != 0 {
+    rtFiberDump(fd, buf)
+  }
+  rtFaultEmit(fd, buf, Runtime.copyLiteral(to: buf, "nomu-crash: end\n"))
   if fd >= 0 {
     Runtime.closeFd(fd: fd)
   }
   Runtime.raise(signal: signo)
+}
+
+// Every fiber in the registry, a header and its frames each (the format above). Mailbox fibers waiting for
+// work are the runtime's own and are left out, as Go leaves out its system goroutines.
+fun rtFiberDump(fd: Int, buf: RawPtr) {
+  let sched = rtSched
+  if sched.isNull {
+    return
+  }
+  let now = Runtime.monotonicNanos()
+  var cur: RawPtr = sched.load(fromByteOffset: 128)
+  var count = 0
+  while cur.isNull == false && count < 100000 {
+    let stByte: UInt8 = cur.load(fromByteOffset: 8)
+    let st = stByte.int
+    if st != 3 && st != 6 {
+      rtFiberDumpFiber(fd, buf, cur, st, now, false)
+    }
+    cur = cur.load(fromByteOffset: 80)
+    count = count + 1
+  }
+}
+
+// One fiber: `fiber <id> [<state>]:`, then the frames from where it stopped, starting at its anchor when it
+// has one, the frame it parked from, so the runtime's own park frames are left out. A leak report marks the
+// state `(leaked)`, as Go's leak profile does.
+fun rtFiberDumpFiber(fd: Int, buf: RawPtr, fib: RawPtr, st: Int, now: Int, leaked: Bool) {
+  let id: Int = fib.load(fromByteOffset: 56)
+  var n = Runtime.copyLiteral(to: buf, "\nnomu-crash: fiber ")
+  n = rtFaultPutDec(buf, n, id)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " [")
+  n = rtFiberPutState(buf, n, fib, st)
+  if st == 2 {
+    let since: Int = fib.load(fromByteOffset: 96)
+    if since > 0 {
+      let minutes = (now - since) / 60000000000
+      if minutes >= 1 {
+        n = n + Runtime.copyLiteral(to: buf.advanced(by: n), ", ")
+        n = rtFaultPutDec(buf, n, minutes)
+        n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " minutes")
+      }
+    }
+  }
+  if leaked {
+    n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " (leaked)")
+  }
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "]:\n")
+  rtFaultEmit(fd, buf, n)
+  if st == 1 {
+    return
+  }
+  // A fiber that never ran has no frames yet.
+  let anchorPc: Int = fib.load(fromByteOffset: 112)
+  let regs: RawPtr = fib.load(fromByteOffset: 0)   // the registers its last switch saved
+  var fp: RawPtr = regs.load(fromByteOffset: 80)
+  var i = 0
+  if anchorPc != 0 {
+    // Up the frame-pointer chain to the record returning into the anchor's frame.
+    var steps = 0
+    var found = false
+    while !found && steps < 256 && fp.isNull == false && fp.toInt() % 8 == 0 {
+      let ret: Int = fp.load(fromByteOffset: 8)
+      if ret == anchorPc {
+        found = true
+      } else {
+        fp = fp.load(fromByteOffset: 0)
+        steps = steps + 1
+      }
+    }
+    if !found {
+      fp = regs.load(fromByteOffset: 80)
+    }
+  }
+  var go = true
+  while go && i < 64 {
+    if fp.isNull || fp.toInt() % 8 != 0 {
+      go = false
+    } else {
+      let next: RawPtr = fp.load(fromByteOffset: 0)
+      let ret: Int = fp.load(fromByteOffset: 8)
+      if ret == 0 {
+        go = false
+      } else {
+        rtFaultEmit(fd, buf, rtFaultPutFrame(buf, 0, i, ret))
+        if next.toInt() <= fp.toInt() {
+          go = false
+        }
+        fp = next
+        i = i + 1
+      }
+    }
+  }
+}
+
+// A fiber's state as Go names a goroutine's: what a parked fiber waits on, else running or runnable.
+fun rtFiberPutState(buf: RawPtr, n: Int, fib: RawPtr, st: Int) -> Int {
+  let at = buf.advanced(by: n)
+  if st == 1 { return n + Runtime.copyLiteral(to: at, "running") }
+  if st != 2 { return n + Runtime.copyLiteral(to: at, "runnable") }
+  let whyByte: UInt8 = fib.load(fromByteOffset: 10)
+  let why = whyByte.int
+  if why == 1 { return n + Runtime.copyLiteral(to: at, "chan receive") }
+  if why == 2 { return n + Runtime.copyLiteral(to: at, "chan send") }
+  if why == 3 { return n + Runtime.copyLiteral(to: at, "select") }
+  if why == 4 { return n + Runtime.copyLiteral(to: at, "task join") }
+  if why == 5 { return n + Runtime.copyLiteral(to: at, "sleep") }
+  if why == 6 { return n + Runtime.copyLiteral(to: at, "IO wait") }
+  return n + Runtime.copyLiteral(to: at, "waiting")
 }
 
 // Write `n` bytes of the report at `buf` to stderr, and to the report file when `fd` is one.
@@ -137,20 +290,16 @@ fun rtFaultEmit(fd: Int, buf: RawPtr, n: Int) {
   }
 }
 
-// The backtrace part of the report, written a piece at a time through `buf`: the image, the registers, the
-// frames, then `end`.
+// The backtrace part of the report, written a piece at a time through `buf`: the image, the registers, then
+// the frames. The caller writes `end`.
 fun rtFaultBacktrace(fd: Int, buf: RawPtr, uctx: RawPtr) {
   let mc: RawPtr = uctx.load(fromByteOffset: 48)
   let pc: Int = mc.load(fromByteOffset: 272)
   let lr: Int = mc.load(fromByteOffset: 256)
   let sp: Int = mc.load(fromByteOffset: 264)
   let fp0: RawPtr = mc.load(fromByteOffset: 248)
-  var n = Runtime.copyLiteral(to: buf, "nomu-crash: image: ")
-  let header = Runtime.imageHeader()
-  n = rtFaultPutUUID(buf, n, header)
-  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " ")
-  n = rtFaultPutHex(buf, n, header.toInt())
-  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "\nnomu-crash: registers: pc ")
+  var n = rtFaultPutImage(buf, 0)
+  n = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: registers: pc ")
   n = rtFaultPutHex(buf, n, pc)
   n = n + Runtime.copyLiteral(to: buf.advanced(by: n), " lr ")
   n = rtFaultPutHex(buf, n, lr)
@@ -184,7 +333,17 @@ fun rtFaultBacktrace(fd: Int, buf: RawPtr, uctx: RawPtr) {
       }
     }
   }
-  rtFaultEmit(fd, buf, Runtime.copyLiteral(to: buf, "nomu-crash: end\n"))
+}
+
+// The `image:` line, the build ID and load address frames are symbolized against, at `buf + n`; returns the
+// new length.
+fun rtFaultPutImage(buf: RawPtr, n: Int) -> Int {
+  var m = n + Runtime.copyLiteral(to: buf.advanced(by: n), "nomu-crash: image: ")
+  let header = Runtime.imageHeader()
+  m = rtFaultPutUUID(buf, m, header)
+  m = m + Runtime.copyLiteral(to: buf.advanced(by: m), " ")
+  m = rtFaultPutHex(buf, m, header.toInt())
+  return m + Runtime.copyLiteral(to: buf.advanced(by: m), "\n")
 }
 
 // One `frame i: 0x…` line at `buf + n`; returns the new length.
@@ -244,6 +403,7 @@ fun rtFaultPutSignal(buf: RawPtr, n: Int, signo: Int) -> Int {
   if signo == 4 { return n + Runtime.copyLiteral(to: at, "SIGILL") }
   if signo == 5 { return n + Runtime.copyLiteral(to: at, "SIGTRAP") }
   if signo == 6 { return n + Runtime.copyLiteral(to: at, "SIGABRT") }
+  if signo == 3 { return n + Runtime.copyLiteral(to: at, "SIGQUIT") }
   return n + Runtime.copyLiteral(to: at, "signal")
 }
 

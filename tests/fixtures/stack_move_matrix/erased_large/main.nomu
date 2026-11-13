@@ -90,9 +90,9 @@ fun run(k: Int) -> Int {
   return bad
 }
 fun main() {
-  fiber let a = run(1)
-  fiber let b = run(2)
+  let a = task run(1)
+  let b = task run(2)
   print("bad ")
-  print(a + b)
+  print(a.join() + b.join())
   print("\n")
 }

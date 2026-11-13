@@ -93,7 +93,7 @@ final class EscapeQueryTests: XCTestCase {
         assertFaithful(fn([bb]), "call args")
     }
 
-    // Aggregate / closure / box / actorSend / spawn publishing operands all escape identically.
+    // Aggregate / closure / box / actorSend / fiber publishing operands all escape identically.
     func testCompositePublishingSites() {
         let env = v(0, objTy), clo = v(1, cloTy), s = v(2, objTy), b = v(3, objTy)
         let recv = v(4, objTy), msg = v(5, objTy), senv = v(6, objTy)
@@ -106,7 +106,7 @@ final class EscapeQueryTests: XCTestCase {
             SSAInst(result: msg, kind: .alloc(objTy), span: sp),
             SSAInst(result: nil, kind: .actorSend(receiver: recv, handler: "h", args: [msg]), span: sp),
             SSAInst(result: senv, kind: .alloc(objTy), span: sp),
-            SSAInst(result: nil, kind: .spawn(binding: 0, startFn: "s:0", env: senv, resultType: .void), span: sp),
+            SSAInst(result: nil, kind: .fiber(startFn: "s:0", env: senv, resultType: .void), span: sp),
         ], terminator: SSATerm(kind: .ret(nil), span: sp))
         assertFaithful(fn([bb]), "composite publishing sites")
     }

@@ -1,0 +1,22 @@
+// A `T` field passed straight to a compiled-once call, from a method and from a free function. The callee holds it
+// across parks and collections, while the object it came from moves.
+import pkg/lib
+
+fun fresh(i: Int) -> Array<Int> {
+  return [i]
+}
+fun main() {
+  let c = Cell(value: fresh(7))
+  var i = 0
+  var bad = 0
+  while i < 4000 {
+    c.value = fresh(i)
+    if c.fetch(i)[0] != i || fetchField(c, i)[0] != i {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

@@ -1,0 +1,13 @@
+// A `task`'s result crosses back between fibers, so it must be shareable: a class with a `var` field is not.
+class Box {
+  var v: Int
+}
+
+fun make(n: Int) -> Box {
+  return Box(v: n)
+}
+
+fun main() {
+  let t = task make(1)
+  print(t.join().v)
+}

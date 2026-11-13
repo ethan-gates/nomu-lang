@@ -1,0 +1,5 @@
+// `task` takes a call.
+fun main() {
+  let x = 3
+  let t = task x
+}

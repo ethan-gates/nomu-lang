@@ -1,0 +1,9 @@
+// Sending on a closed channel is a fault.
+fun main() {
+    let ch = Channel<Int>.make(capacity: 4)
+    ch.send(1)
+    ch.close()
+    print("closed\n")
+    ch.send(2)
+    print("unreachable\n")
+}

@@ -1,0 +1,199 @@
+// `select` under load: managed values crossing while collections run, many fibers selecting on shared
+// channels, selects meeting selects on unbuffered channels, and the random pick among ready cases.
+
+class Msg {
+  let n: Int
+  let text: String
+}
+
+// Allocate enough to collect while values wait in channels and parked selects.
+fun churn(count: Int) {
+  var keep: Array<Msg> = []
+  var i = 0
+  while i < count {
+    keep.append(Msg(n: i, text: "churn-".concat("abcdefghijklmnopqrstuvwxyz")))
+    if keep.count > 64 {
+      keep = []
+    }
+    i = i + 1
+  }
+}
+
+fun producer(out: Channel<Msg>, from: Int, count: Int) {
+  var i = 0
+  while i < count {
+    out.send(Msg(n: from + i, text: "msg-".concat("0123456789")))
+    if i % 50 == 0 {
+      churn(200)
+    }
+    i = i + 1
+  }
+}
+
+// Take from either channel until both are closed; check each text survived the moves.
+fun consumer(a: Channel<Msg>, b: Channel<Msg>, result: Channel<Int>) {
+  var sum = 0
+  var bad = 0
+  var aOpen = true
+  var bOpen = true
+  while aOpen || bOpen {
+    if aOpen && bOpen {
+      select {
+      case let m = a.receive():
+        switch m {
+        case .some(let x):
+          sum = sum + x.n
+          if x.text.count != 14 { bad = bad + 1 }
+        case .none: aOpen = false
+        }
+      case let m = b.receive():
+        switch m {
+        case .some(let x):
+          sum = sum + x.n
+          if x.text.count != 14 { bad = bad + 1 }
+        case .none: bOpen = false
+        }
+      }
+    } else if aOpen {
+      switch a.receive() {
+      case .some(let x): sum = sum + x.n
+      case .none: aOpen = false
+      }
+    } else {
+      switch b.receive() {
+      case .some(let x): sum = sum + x.n
+      case .none: bOpen = false
+      }
+    }
+  }
+  result.send(sum * 1000 + bad)
+}
+
+// Pass a token back and forth: each side selects a send on one channel against a receive on a quiet one.
+fun pinger(to: Channel<Int>, from: Channel<Int>, quiet: Channel<Int>, rounds: Int, done: Channel<Int>) {
+  var i = 0
+  var total = 0
+  while i < rounds {
+    select {
+    case to.send(i):
+    case let q = quiet.receive():
+      total = total - 1000000
+    }
+    select {
+    case let v = from.receive():
+      switch v {
+      case .some(let x): total = total + x
+      case .none:
+      }
+    case let q = quiet.receive():
+      total = total - 1000000
+    }
+    i = i + 1
+  }
+  done.send(total)
+}
+
+fun ponger(from: Channel<Int>, to: Channel<Int>, quiet: Channel<Int>, rounds: Int) {
+  var i = 0
+  while i < rounds {
+    select {
+    case let v = from.receive():
+      switch v {
+      case .some(let x):
+        select {
+        case to.send(x * 2):
+        case let q = quiet.receive():
+        }
+      case .none:
+      }
+    case let q = quiet.receive():
+    }
+    i = i + 1
+  }
+}
+
+fun report(label: String, a: Int, b: Int) {
+  print(label)
+  print(" ")
+  print(a)
+  print(" ")
+  print(b)
+  print("\n")
+}
+
+fun main() {
+  // Four producers on two channels, three consumers selecting over both.
+  let a = Channel<Msg>.make(capacity: 4)
+  let b = Channel<Msg>.make(capacity: 0)
+  let result = Channel<Int>.make(capacity: 3)
+  let doneA = Channel<Int>.make(capacity: 0)
+  var p = 0
+  while p < 3 {
+    fiber consumer(a, b, result)
+    p = p + 1
+  }
+  let pa = task producer(a, 0, 1000)
+  let pb = task producer(a, 1000, 1000)
+  let pc = task producer(b, 2000, 1000)
+  let pd = task producer(b, 3000, 1000)
+  pa.join()
+  pb.join()
+  a.close()
+  pc.join()
+  pd.join()
+  b.close()
+  var total = 0
+  var bad = 0
+  p = 0
+  while p < 3 {
+    switch result.receive() {
+    case .some(let r):
+      total = total + r / 1000
+      bad = bad + r % 1000
+    case .none:
+    }
+    p = p + 1
+  }
+  report("fan-in", total, bad)
+
+  // Selects meeting selects on unbuffered channels.
+  let ping = Channel<Int>.make(capacity: 0)
+  let pong = Channel<Int>.make(capacity: 0)
+  let quiet = Channel<Int>.make(capacity: 0)
+  let done = Channel<Int>.make(capacity: 0)
+  fiber ponger(ping, pong, quiet, 2000)
+  fiber pinger(ping, pong, quiet, 2000, done)
+  switch done.receive() {
+  case .some(let t): report("ping-pong", t, 0)
+  case .none: report("ping-pong", -1, 0)
+  }
+
+  // Both cases ready every time: each must be picked often.
+  let x = Channel<Int>.make(capacity: 1)
+  let y = Channel<Int>.make(capacity: 1)
+  var fromX = 0
+  var fromY = 0
+  var i = 0
+  while i < 2000 {
+    x.send(1)
+    y.send(2)
+    select {
+    case let v = x.receive():
+      fromX = fromX + 1
+      switch y.receive() {
+      case .some(let n):
+      case .none:
+      }
+    case let v = y.receive():
+      fromY = fromY + 1
+      switch x.receive() {
+      case .some(let n):
+      case .none:
+      }
+    }
+    i = i + 1
+  }
+  var fair = 0
+  if fromX > 600 && fromY > 600 { fair = 1 }
+  report("fair", fair, fromX + fromY)
+}

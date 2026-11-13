@@ -130,7 +130,7 @@ private func promote(_ f: inout SSAFunction) {
     }
 
     // 3 · Escaping members. A member escapes if it is a `ret` value or appears in a publishing operand
-    // position of any instruction (store/barrier value, call/send/spawn argument, boxed/captured/…).
+    // position of any instruction (store/barrier value, call/send/fiber argument, boxed/captured/…).
     // Edge arguments are intra-web by construction (the union above), so they never escape here.
     var escaping = Set<Int>()
     for blk in f.blocks {
@@ -294,7 +294,7 @@ private func escapingOperandIds(_ kind: SSAInstKind) -> [Int] {
     case .makeStruct(_, let fields):        return fields.map(\.id)
     case .makeEnum(_, _, let fields):       return fields.map(\.id)
     case .actorSend(let recv, _, let args): return [recv.id] + args.map(\.id)
-    case .spawn(_, _, let env, _):          return env.map { [$0.id] } ?? []
+    case .fiber(_, let env, _):          return env.map { [$0.id] } ?? []
     case .call(let c):                      return c.args.map(\.id)
     default:                                return []
     }

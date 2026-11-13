@@ -348,15 +348,15 @@ fun run(depth: Int) -> Int {
 }
 
 fun main() {
-  fiber let a = run(50)
-  fiber let b = run(200)
-  fiber let c = run(400)
+  let a = task run(50)
+  let b = task run(200)
+  let c = task run(400)
   print(run(10))
   print("\n")
-  print(a)
+  print(a.join())
   print("\n")
-  print(b)
+  print(b.join())
   print("\n")
-  print(c)
+  print(c.join())
   print("\n")
 }

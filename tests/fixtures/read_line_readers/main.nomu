@@ -26,10 +26,10 @@ fun watcher() -> Int {
 }
 
 fun main() {
-  fiber let a = reader()
-  fiber let b = reader()
-  fiber let c = reader()
-  fiber let w = watcher()
-  print(a + b + c + w)
+  let a = task reader()
+  let b = task reader()
+  let c = task reader()
+  let w = task watcher()
+  print(a.join() + b.join() + c.join() + w.join())
   print("\n")
 }

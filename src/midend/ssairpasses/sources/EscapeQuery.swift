@@ -42,7 +42,7 @@ extension PointsToGraph {
 extension PTGSink {
     fileprivate var isTerminalEscape: Bool {
         switch self {
-        case .ret, .globalStore, .spawnCapture, .actorSend, .callArg,
+        case .ret, .globalStore, .fiberCapture, .actorSend, .callArg,
              .box, .closureCapture, .aggregate:
             return true
         case .store, .edgeArg:

@@ -7,8 +7,7 @@ import support
 import XCTest
 import ssairgen
 
-// Actors + structured concurrency (ssair.md): actor construction + mailbox, fire-and-forget
-// sends, and `fiber let` (start + join-on-read + join-at-scope-exit).
+// Actors + fibers (ssair.md): actor construction + mailbox, fire-and-forget sends, and `fiber f(x)`.
 final class ConcurrencyTests: XCTestCase {
     private func dump(_ source: String) -> String {
         var lexer = Lexer(source, file: "t.nomu")
@@ -43,31 +42,17 @@ final class ConcurrencyTests: XCTestCase {
         has(out, "writeBarrier")                   // self-field store in the handler (managed self)
     }
 
-    // `fiber let` starts a fiber over a lifted body; reading the binding joins it; the value's capture
-    // rides in a spawn env.
-    func testSpawnAndJoinOnRead() {
+    // `fiber f(x)` evaluates the argument on the starting fiber, captures it in a fiber env, and starts a
+    // fiber over a lifted body that makes the call.
+    func testFiberStart() {
         let out = dump("""
         fun work(n: Int) -> Int { return n * n }
-        fun run(n: Int) -> Int {
-            fiber let a = work(n)
-            return a
+        fun run(n: Int) {
+            fiber work(n + 1)
         }
         """)
-        has(out, "spawn #0 spawn:0")               // start the fiber over the lifted body
-        has(out, "spawnJoin #0")                   // reading `a` joins
-        has(out, "fun spawn:0(")                   // the lifted spawn body
-        has(out, "spawn.0.env")                    // the capture env (captures `n`)
-    }
-
-    // A `fiber let` whose result is never read still joins at scope exit (structured concurrency).
-    func testSpawnJoinsAtScopeExit() {
-        let out = dump("""
-        fun work() -> Int { return 7 }
-        fun run() {
-            fiber let a = work()
-        }
-        """)
-        has(out, "spawn #0 spawn:0")
-        has(out, "spawnJoin #0")                   // joined at the implicit fall-off return, though never read
+        has(out, "fiber fiber:0")                  // start the fiber over the lifted body
+        has(out, "fun fiber:0(")                   // the lifted fiber body
+        has(out, "fiber.0.env")                    // the capture env (the evaluated argument)
     }
 }

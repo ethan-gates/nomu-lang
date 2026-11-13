@@ -45,7 +45,7 @@ public enum PTGCallee: Hashable {
 
 // A publishing use — a sink. The cases mirror `EscapeAnalysis.escapingUses`/`escapingTermUses` operand by
 // operand, so the faithful escape query (166.2) is exactly "a value carrying any sink tag escapes" plus
-// the interior→base fixpoint. The cross-fiber subset (`spawnCapture`, `actorSend`, and `callArg` to a
+// the interior→base fixpoint. The cross-fiber subset (`fiberCapture`, `actorSend`, and `callArg` to a
 // channel-send once that library type exists) is the taxonomy that later drives fiber-locality and
 // transfer in 164.
 public enum PTGSink: Hashable {
@@ -55,7 +55,7 @@ public enum PTGSink: Hashable {
     case box                                           // published into a box object
     case aggregate                                     // captured into a struct/enum/array-literal field
     case closureCapture                                // captured into a closure env
-    case spawnCapture                                  // captured into a spawned fiber's env (cross-fiber)
+    case fiberCapture                                  // captured into a started fiber's env (cross-fiber)
     case actorSend                                     // actor message receiver/args (cross-fiber)
     case callArg(callee: PTGCallee, paramIndex: Int)   // argument to a callee's parameter i
     case globalStore                                   // stored into a module global — reserved; not structurally taggable today
@@ -167,7 +167,7 @@ private func record(_ inst: SSAInst, into g: inout PointsToGraph, layout: [Strin
     case .makeStruct(_, let fields):        for e in fields { g.addSink(e.id, .aggregate) }
     case .makeEnum(_, _, let fields):       for e in fields { g.addSink(e.id, .aggregate) }
     case .actorSend(let recv, _, let args): g.addSink(recv.id, .actorSend); for a in args { g.addSink(a.id, .actorSend) }
-    case .spawn(_, _, let env, _):          if let e = env { g.addSink(e.id, .spawnCapture) }
+    case .fiber(_, let env, _):          if let e = env { g.addSink(e.id, .fiberCapture) }
     case .call(let c):                      recordCallArgSinks(c, into: &g)
     default:                                break
     }

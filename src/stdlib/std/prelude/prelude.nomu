@@ -4,6 +4,8 @@
 // began with an invisible `import std`. It holds the pervasive surface (`Option`, `Result`, `String` and its
 // methods); the rest of `std` is reached by an explicit `import std/<module>`.
 
+import core
+
 // A value that is present (`some`) or absent (`none`). Payloads are labelled, so the
 // spelling is `Option.some(value: x)` / `.some(value: x)` and `case .some(let v)`.
 public enum Option<T> {
@@ -83,5 +85,59 @@ public struct String {
         dp.copyBytes(from: self.base.bytePointer(), byteCount: an)
         dp.advanced(by: an).copyBytes(from: other.base.bytePointer(), byteCount: bn)
         return String(base: dst)
+    }
+}
+
+// A channel carries values between fibers (`design/internals/concurrency.md` §4). `make(capacity:)` buffers up to
+// `capacity` values; 0 makes a rendezvous, where each send waits for a receiver. `send` blocks while the buffer is
+// full; `receive` blocks while it is empty, and returns `.none` once the channel is closed and drained.
+// Sending on a closed channel, or closing one twice, is a fault. The values cross between fibers, so `T` must
+// be shareable. The channel is one buffer object the runtime's core works on (`runtime/channel.nomu`).
+public struct Channel<shared T> {
+    let buf: ManagedBuffer<ChannelState, ChannelSlot<T>>
+
+    static fun make(capacity: Int) -> Channel<T> {
+        return Channel(buf: ManagedBuffer<ChannelState, ChannelSlot<T>>.create(capacity: capacity))
+    }
+
+    fun send(value: T) {
+        self.buf.channelSend(value)
+    }
+
+    fun receive() -> Option<T> {
+        return self.buf.channelReceive()
+    }
+
+    fun close() {
+        self.buf.channelClose()
+    }
+}
+
+// The value with no content: the result of a `task` whose call returns nothing.
+public struct Void {
+}
+
+// The result of `task f(x)`, which runs `f(x)` on a new fiber (`design/internals/concurrency.md` §8). `join()`
+// waits for the result and returns it; it can repeat, and can come from several fibers, each getting a copy.
+// The task is a one-shot channel: the fiber running `f(x)` stores its result and closes it in one step
+// (`fulfill`), which wakes every waiting `join()`. The result crosses between fibers, so `T` must be shareable.
+public struct Task<shared T> {
+    let buf: ManagedBuffer<ChannelState, ChannelSlot<T>>
+
+    static fun make() -> Task<T> {
+        return Task(buf: ManagedBuffer<ChannelState, ChannelSlot<T>>.create(capacity: 1))
+    }
+
+    fun fulfill(value: T) {
+        self.buf.channelFulfill(value)
+    }
+
+    fun join() -> T {
+        while true {
+            switch self.buf.channelAwait() {
+            case .some(let v): return v
+            case .none:
+            }
+        }
     }
 }

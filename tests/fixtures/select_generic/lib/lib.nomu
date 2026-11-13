@@ -1,0 +1,34 @@
+// A `select` in a generic function compiled once: the channels' element is a type parameter, so each case's
+// value moves through its witness. A two-case select here gives a frame LLVM addresses through a base pointer
+// (x19): its roots are found and its stack moved through the frame index's x19 facts.
+
+// The first value from either channel, or `.none` once one of them is closed and drained.
+package fun firstOf<shared T>(a: Channel<T>, b: Channel<T>) -> Option<T> {
+    select {
+    case let v = a.receive():
+        return v
+    case let v = b.receive():
+        return v
+    }
+    return .none
+}
+
+// The next value, or `.none` once the channel is closed and drained.
+package fun take<shared T>(a: Channel<T>) -> Option<T> {
+    select {
+    case let v = a.receive():
+        return v
+    }
+    return .none
+}
+
+// Send `x` if there is room or a receiver at once: 1 when sent, 0 when not.
+package fun offer<shared T>(a: Channel<T>, x: T) -> Int {
+    select {
+    case a.send(x):
+        return 1
+    default:
+        return 0
+    }
+    return -1
+}

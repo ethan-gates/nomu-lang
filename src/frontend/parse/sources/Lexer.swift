@@ -220,6 +220,7 @@ public struct Lexer {
             if eq(lo, "case") { return .kwCase }
             if eq(lo, "else") { return .kwElse }
             if eq(lo, "true") { return .boolLit(true) }
+            if eq(lo, "task") { return .kwTask }
         case 5:
             if eq(lo, "class") { return .kwClass }
             if eq(lo, "actor") { return .kwActor }
@@ -232,6 +233,7 @@ public struct Lexer {
             if eq(lo, "switch") { return .kwSwitch }
             if eq(lo, "return") { return .kwReturn }
             if eq(lo, "static") { return .kwStatic }
+            if eq(lo, "select") { return .kwSelect }
         case 8:
             if eq(lo, "continue") { return .kwContinue }
         case 9:

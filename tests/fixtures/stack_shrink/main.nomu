@@ -1,0 +1,51 @@
+// Stacks shrink at a major collection (task 104). Three fibers recurse deep, so their stacks grow, then return
+// and sleep with a few frames in use. Once all three have measured their stacks, `main` requests a major
+// collection; each fiber's stack
+// must come back smaller, with its frames' objects intact. `main`, stopped at a safepoint in its
+// loop, shrinks too. Built with `test.runtime_prelude` (for `rtGcRequest` and the stack size).
+class Box {
+  var v: Int
+}
+
+fun down(n: Int, b: Box) -> Int {
+  if n == 0 {
+    return b.v
+  }
+  let c = Box(v: b.v + 1)
+  return b.v + down(n - 1, c)
+}
+
+fun grow(ready: Channel<Int>, n: Int) -> Int {
+  let keep = Box(v: down(n, Box(v: 0)))
+  let before = rtStackSize(rtCurrentFiber())
+  ready.send(1)
+  sleep(300)
+  let after = rtStackSize(rtCurrentFiber())
+  if after < before {
+    return keep.v
+  }
+  return 0 - after
+}
+
+fun main() {
+  let ready = Channel<Int>.make(capacity: 3)
+  let a = task grow(ready, 20000)
+  let b = task grow(ready, 40000)
+  let c = task grow(ready, 80000)
+  var k = 0
+  while k < 3 {
+    ready.receive()
+    k = k + 1
+  }
+  let ticket = rtGcRequest(0)
+  var spins = 0
+  while !rtGcCollected(ticket) {
+    spins = spins + 1
+  }
+  print(a.join())
+  print("\n")
+  print(b.join())
+  print("\n")
+  print(c.join())
+  print("\n")
+}

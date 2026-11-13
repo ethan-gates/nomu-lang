@@ -30,7 +30,7 @@ fun run() -> Int {
 }
 
 fun main() {
-    fiber let x = run()
-    print(x)
+    let x = task run()
+    print(x.join())
     print("\n")
 }

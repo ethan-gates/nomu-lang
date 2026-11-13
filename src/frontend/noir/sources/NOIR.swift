@@ -24,6 +24,10 @@ public struct NOIRModule {
     // `util@Box<Int>` whose type args are otherwise only in the mangled name; the erased-method call
     // lowering reads them here to thread the type-argument VWTs through the witness ABI.
     public let monoTypeArgs: [String: [Type]]
+    // Compiled-once dictionaries (task 251.2), set by `Monomorphize`: this module's recipes, for the `.nmi` and for
+    // its erased bodies to find their words, and the instances its concrete calls need, by `dictionaryKey`.
+    public var recipes: DictionaryRecipes? = nil
+    public var dictionaries: [String: DictionaryInstance] = [:]
 
     public init(decls: [NOIRDecl], interfaces: [NOIRInterface] = [], conformances: [NOIRConformance] = [],
                 composites: [NOIRComposite] = [], opaqueUnderlyings: [String: Type] = [:],
@@ -225,7 +229,7 @@ public struct NOIRParam {
 public struct NOIRGenericParam {
     public let name: String
     public let bounds: [String]
-    public let isShared: Bool   // `<shared T>` — codegen's spawn check treats such a T as shareable (M5 5.3.2)
+    public let isShared: Bool   // `<shared T>` — codegen's fiber-capture check treats such a T as shareable (M5 5.3.2)
     public init(name: String, bounds: [String], isShared: Bool = false) {
         self.name = name; self.bounds = bounds; self.isShared = isShared
     }
@@ -267,7 +271,6 @@ public struct NOIRStmt {
 
 public indirect enum StmtKind {
     case letBinding(name: String, isMutable: Bool, value: NOIRExpr)
-    case spawnLet(name: String, value: NOIRExpr, resultType: Type)
     case fiberStart(call: NOIRExpr)
     case assign(target: NOIRExpr, value: NOIRExpr)
     case compoundAssign(target: NOIRExpr, value: NOIRExpr)
@@ -339,6 +342,10 @@ public indirect enum ExprKind {
     case box(value: NOIRExpr, interfaces: [String])       // M5 A1.4/A1.5b: wrap a conformer as `any I` / `any A & B`
     case arrayLit(elements: [NOIRExpr])                   // [a, b, c] — build an Array<T>; `type` is `.array(T)` (M6)
     case index(base: NOIRExpr, idx: NOIRExpr)               // a[i] — array subscript read; `type` is the element T (M6)
+    // `task f(x)`: `make` builds the `Task`, bound to `binder`. A new fiber runs `call`, binds its result to
+    // `binder.v` (unless it is void), then runs `fulfill`, which stores it. The call's arguments and receiver are
+    // evaluated at the site. The expression's value is the `Task`.
+    case taskStart(binder: String, make: NOIRExpr, call: NOIRExpr, fulfill: NOIRExpr)
     case funcRef(name: String)                              // the C-ABI code address of a top-level non-capturing `fun` as a `RawPtr` (task 128.2, Runtime.ofFunc). A runtime-tier primitive for handing an entry point to the asm floor / pthread_create; not first-class functions (task 128 note).
 }
 

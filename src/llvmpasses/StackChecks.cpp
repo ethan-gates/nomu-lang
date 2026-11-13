@@ -34,8 +34,8 @@ namespace nomu {
 
 namespace {
 
-// The running fiber's stack limit: the fiber record's offset 304 (`runtime/scheduler.nomu`), the fiber in x28.
-constexpr uint64_t LimitOffset = 304;
+// The running fiber's stack limit: the fiber record's offset 40 (`runtime/scheduler.nomu`), the fiber in x28.
+constexpr uint64_t LimitOffset = 40;
 
 Value *readRegister(IRBuilder<> &B, StringRef Name) {
   LLVMContext &C = B.getContext();

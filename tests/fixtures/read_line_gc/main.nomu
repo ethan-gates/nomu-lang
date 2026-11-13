@@ -35,7 +35,7 @@ fun churn() -> Int {
 fun main() {
   let keep = Box(v: 4242)
   let name = "held".concat(" string")
-  fiber let c = churn()
+  let c = task churn()
   let line = readLine()
   print(keep.v)
   print(" ")
@@ -43,6 +43,6 @@ fun main() {
   print(" ")
   print(line)
   print(" ")
-  print(c)
+  print(c.join())
   print("\n")
 }

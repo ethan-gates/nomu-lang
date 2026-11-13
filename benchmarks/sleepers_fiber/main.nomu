@@ -28,9 +28,9 @@ fun tree(depth: Int, seed: Int) -> Int {
     if depth == 0 {
         return sleeper(seed: seed)
     }
-    fiber let a = tree(depth: depth - 1, seed: seed * 2)
-    fiber let b = tree(depth: depth - 1, seed: seed * 2 + 1)
-    return a + b
+    let a = task tree(depth: depth - 1, seed: seed * 2)
+    let b = task tree(depth: depth - 1, seed: seed * 2 + 1)
+    return a.join() + b.join()
 }
 
 fun main() {

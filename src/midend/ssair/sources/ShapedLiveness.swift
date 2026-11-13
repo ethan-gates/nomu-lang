@@ -77,7 +77,7 @@ public func computeSlotLiveness(_ f: SSAFunction, tracked: Set<Int>) -> ShapedLi
 // allocation can trigger a collection; the rest lower to non-leaf runtime calls.
 public func isSafepointInst(_ k: SSAInstKind) -> Bool {
     switch k {
-    case .call, .alloc, .arrayLit, .box, .actorSend, .spawn, .spawnJoin, .mailboxInit:
+    case .call, .alloc, .arrayLit, .box, .actorSend, .fiber, .mailboxInit:
         return true
     default:
         return false

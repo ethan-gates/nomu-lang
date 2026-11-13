@@ -1,0 +1,24 @@
+// Dictionaries through three modules: `main` calls `mid`, whose bodies call `base`. The sub-dictionaries come from
+// recipes, so `main` builds them for types and generics it never names.
+import pkg/mid
+
+struct Point {
+  var x: Int
+  var y: Int
+}
+fun main() {
+  print(viaOption(5, 0))
+  print(" ")
+  print(viaOption("heap".concat("-string"), "none"))
+  print(" ")
+  print(viaOption(Point(x: 1, y: 2), Point(x: 0, y: 0)).y)
+  print(" ")
+  print(viaSwap(7, "q"))
+  print(" ")
+  print(viaSwap(Point(x: 3, y: 4), 9).x)
+  print(" ")
+  print(viaConcrete(1))
+  print(" ")
+  print(viaHidden("s"))
+  print("\n")
+}

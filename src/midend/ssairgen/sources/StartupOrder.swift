@@ -9,7 +9,7 @@ import support
 // The fact is the set of this module's startup globals a function may read, directly or through its
 // callees, solved on the interprocedural fixpoint engine. Edges: direct calls; a witness call to every
 // method of that name in the module; a closure call to every closure and function address the module
-// creates; a spawn to its routine and an actor send to every handler of that name, since either may run
+// creates; a fiber start to its routine and an actor send to every handler of that name, since either may run
 // before startup ends; and a call into another module that passes a closure, an interface value or residual
 // type arguments, to every closure and method in the module. Each initializer's summary names the globals it
 // needs first; a depth-first walk over those in declaration order gives the order, and a cycle is an error.
@@ -69,7 +69,7 @@ func orderStartupGlobals(_ globals: [SSAGlobal], functions: [SSAFunction], diags
                     case .witness(_, _, let method): targets += methodsByName[method] ?? []
                     case .indirect: targets += addressTaken
                     }
-                case .spawn(_, let startFn, _, _): targets.append(startFn)
+                case .fiber(let startFn, _, _): targets.append(startFn)
                 case .actorSend(_, let handler, _): targets += methodsByName[handler] ?? []
                 default: break
                 }

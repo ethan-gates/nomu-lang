@@ -1,0 +1,21 @@
+// Type arguments written on a static call, inside another construction's arguments.
+class Box<shared T> {
+    let v: T
+
+    static fun make(v: T) -> Box<T> {
+        return Box(v: v)
+    }
+}
+
+class Outer<X> {
+    let x: X
+}
+
+class Mut {
+    var n: Int
+}
+
+fun main() {
+    let o = Outer(x: Box<Mut>.make(Mut(n: 1)))
+    print(o.x.v.n)
+}

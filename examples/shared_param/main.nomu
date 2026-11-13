@@ -7,9 +7,13 @@ struct Pair {
     let b: Int
 }
 
+fun identity<T>(x: T) -> T {
+    return x
+}
+
 fun onTask<shared T>(x: T) -> T {
-    fiber let r = x        // ok: T is `shared`, so it may cross the task boundary
-    return r
+    let r = task identity(x)   // ok: T is `shared`, so it may cross the task boundary
+    return r.join()
 }
 
 fun main() {
@@ -37,6 +41,6 @@ fun main() {
 // ── Without the `shared` bound, the body can't forward T across the boundary ──
 //
 // fun leaky<T>(x: T) -> T {
-//     fiber let r = x     // error: 'x' has type 'T' which cannot cross a task boundary
-//     return r
+//     let r = task identity(x)   // error: type 'T' is not shareable, so it cannot be passed to a 'task'
+//     return r.join()
 // }

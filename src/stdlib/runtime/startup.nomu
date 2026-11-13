@@ -19,9 +19,6 @@ let rtMatureFloor = rtPositive(rtEnvMatureFloor())
 let rtGcStress = rtPositive(rtEnvGcStress())
 // NOMU_CARRIERS: the number of carrier threads the scheduler boots with; 4 unless set to 1 or more.
 let rtCarrierCount = rtEnvCarrierCount()
-// NOMU_MBOX_AGE_NS: how long the scheduled-mailbox queue must go unpopped before a searching carrier readies
-// a mailbox fiber for it; 3000 unless set.
-let rtMboxAgeNanos = rtEnvMboxAgeNanos()
 // NOMU_SLOT: 0 turns off the run-queue slot (rtSchedReadyNext readies onto the run queue instead); on unless set.
 let rtSlotOn = rtEnvSlot()
 // NOMU_SLOT_STEAL_NS: how long a carrier's current fiber must have run before a searcher may take the fiber
@@ -180,11 +177,3 @@ fun rtNanosToTicks(ns: Int) -> Int {
   return ns * denom / numer
 }
 
-fun rtEnvMboxAgeNanos() -> Int {
-  let name = RawPtr.alloc(bytes: 32, align: 8)
-  let n = rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_MBOX_AGE_NS")))
-  if n >= 1 {
-    return n
-  }
-  return 3000
-}

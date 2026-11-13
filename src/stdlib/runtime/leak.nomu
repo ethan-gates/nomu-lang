@@ -1,0 +1,370 @@
+// The leak report: fibers that can never wake, found as Go 1.26's goroutine-leak profile finds goroutines.
+// Part of the `runtime` module; see README.md.
+//
+// A fiber parked on a channel, a `Task` join or a `select` of channel cases can be woken only through those
+// objects. When nothing that can still run reaches them, it never will. The pass marks from every root but
+// the stacks of such blocked fibers; a blocked fiber whose wait object got marked can be woken, so its stack is
+// marked in turn, until nothing changes. The blocked fibers left are leaked. A fiber asleep, waiting on stdin
+// or with a timer case in its `select` is woken from outside and counts as able to run.
+//
+// What a parked fiber waits on is in its record (fib+120, `runtime/scheduler.nomu`): a channel's buffer, or a
+// select's off-stack record, whose case channels follow its waiters (`runtime/channel.nomu`). Collections
+// keep those words current as roots (nomuSchedWalkRoots).
+//
+// `NOMU_LEAK_REPORT=1` runs the pass when `main` returns, in a stop-the-world after a collection, and prints
+// each leaked fiber as a dump does, its state marked `(leaked)`. The marks are a set of their own, off the heap:
+// the pass moves and marks nothing the collector reads.
+
+// NOMU_LEAK_REPORT: 1 runs the leak pass when `main` returns.
+let rtLeakReport = rtEnvLeakReport() > 0
+
+fun rtEnvLeakReport() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvParseInt(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_LEAK_REPORT")))
+}
+
+// ---- A set of addresses: open addressing over a power-of-two table, kept at most half full. ----
+// Set: 0 capacity · 8 count · 16 the table (0: an empty slot).
+
+fun rtLeakSetNew() -> RawPtr {
+  let set = RawPtr.alloc(bytes: 24, align: 8)
+  let cap = 1024
+  let table = RawPtr.alloc(bytes: cap * 8, align: 8)
+  table.zeroBytes(cap * 8)
+  set.store(cap, toByteOffset: 0)
+  set.store(0, toByteOffset: 8)
+  set.store(table, toByteOffset: 16)
+  return set
+}
+
+fun rtLeakSetFree(set: RawPtr) {
+  let table: RawPtr = set.load(fromByteOffset: 16)
+  table.free()
+  set.free()
+}
+
+fun rtLeakSlot(a: Int, cap: Int) -> Int {
+  return ((a >> 4) * 7046029254386353131) & (cap - 1)
+}
+
+fun rtLeakSetHas(set: RawPtr, p: RawPtr) -> Bool {
+  let cap: Int = set.load(fromByteOffset: 0)
+  let table: RawPtr = set.load(fromByteOffset: 16)
+  let a = p.toInt()
+  var i = rtLeakSlot(a, cap)
+  while true {
+    let w: Int = table.load(fromByteOffset: i * 8)
+    if w == 0 {
+      return false
+    }
+    if w == a {
+      return true
+    }
+    i = (i + 1) & (cap - 1)
+  }
+  return false
+}
+
+// Add `p`; true when it was not there.
+fun rtLeakSetAdd(set: RawPtr, p: RawPtr) -> Bool {
+  var cap: Int = set.load(fromByteOffset: 0)
+  let count: Int = set.load(fromByteOffset: 8)
+  if (count + 1) * 2 > cap {
+    rtLeakSetGrow(set)
+    cap = set.load(fromByteOffset: 0)
+  }
+  let table: RawPtr = set.load(fromByteOffset: 16)
+  let a = p.toInt()
+  var i = rtLeakSlot(a, cap)
+  while true {
+    let w: Int = table.load(fromByteOffset: i * 8)
+    if w == a {
+      return false
+    }
+    if w == 0 {
+      table.store(a, toByteOffset: i * 8)
+      set.store(count + 1, toByteOffset: 8)
+      return true
+    }
+    i = (i + 1) & (cap - 1)
+  }
+  return false
+}
+
+fun rtLeakSetGrow(set: RawPtr) {
+  let cap: Int = set.load(fromByteOffset: 0)
+  let old: RawPtr = set.load(fromByteOffset: 16)
+  let ncap = cap + cap
+  let table = RawPtr.alloc(bytes: ncap * 8, align: 8)
+  table.zeroBytes(ncap * 8)
+  var k = 0
+  while k < cap {
+    let w: Int = old.load(fromByteOffset: k * 8)
+    if w != 0 {
+      var i = rtLeakSlot(w, ncap)
+      var placed = false
+      while !placed {
+        let t: Int = table.load(fromByteOffset: i * 8)
+        if t == 0 {
+          table.store(w, toByteOffset: i * 8)
+          placed = true
+        } else {
+          i = (i + 1) & (ncap - 1)
+        }
+      }
+    }
+    k += 1
+  }
+  old.free()
+  set.store(ncap, toByteOffset: 0)
+  set.store(table, toByteOffset: 16)
+}
+
+// ---- Marking ----
+
+// Mark the `n` root values in `roots` and everything they reach, reading each object's pointer map as the
+// mark-verify tracer does (`runtime/verify.nomu`). A root that is not a managed object is skipped, as the
+// collector skips it (`rtKeepManagedSlots`): a recorded slot may hold an address into a stack, such as an
+// erased generic's buffer, whose fields the walk records in their own slots.
+fun rtLeakMarkFrom(set: RawPtr, roots: RawPtr, n: Int) {
+  var wcap = 4096
+  var work = RawPtr.alloc(bytes: wcap * 8, align: 8)
+  var top = 0
+  let base: RawPtr = roots.load(fromByteOffset: 0)
+  var r = 0
+  while r < n {
+    let obj: RawPtr = base.load(fromByteOffset: r * 8)
+    if obj.isNull == false && rtIsManaged(obj) && rtLeakSetAdd(set, obj) {
+      if top == wcap {
+        work = rtStackGrow(work, top)
+        wcap = wcap + wcap
+      }
+      work.store(obj, toByteOffset: top * 8)
+      top = top + 1
+    }
+    r += 1
+  }
+  while top > 0 {
+    top = top - 1
+    let obj: RawPtr = work.load(fromByteOffset: top * 8)
+    let tid = rtObjTypeId(obj)
+    let kind = rtTypeKind(tid)
+    let nptr = rtLiveCount(tid, obj)
+    if kind == 0 {
+      var i = 0
+      while i < nptr {
+        let child: RawPtr = obj.load(fromByteOffset: rtLiveOffsetAt(tid, obj, i))
+        if child.isNull == false && rtLeakSetAdd(set, child) {
+          if top == wcap {
+            work = rtStackGrow(work, top)
+            wcap = wcap + wcap
+          }
+          work.store(child, toByteOffset: top * 8)
+          top = top + 1
+        }
+        i += 1
+      }
+    } else {
+      let ecap: Int = obj.load(fromByteOffset: 8)       // a buffer: { header, cap, header fields, elements }
+      let stride = rtTypeStride(tid)
+      let elemStart = rtBufElemStart(tid)
+      var hk = 0
+      let nhdr = rtHeaderPtrCount(tid)
+      while hk < nhdr {
+        let hchild: RawPtr = obj.load(fromByteOffset: 16 + rtHeaderOffsetAt(tid, hk))
+        if hchild.isNull == false && rtLeakSetAdd(set, hchild) {
+          if top == wcap {
+            work = rtStackGrow(work, top)
+            wcap = wcap + wcap
+          }
+          work.store(hchild, toByteOffset: top * 8)
+          top = top + 1
+        }
+        hk += 1
+      }
+      let elemShaped = rtShapedCount(tid) > 0
+      var e = 0
+      while e < ecap {
+        let elemBase = elemStart + e * stride
+        let elemPtr = obj.advanced(by: elemBase)
+        var en = nptr
+        if elemShaped {
+          en = rtLiveCount(tid, elemPtr)
+        }
+        var i = 0
+        while i < en {
+          let child: RawPtr = obj.load(fromByteOffset: elemBase + rtLiveOffsetAt(tid, elemPtr, i))
+          if child.isNull == false && rtLeakSetAdd(set, child) {
+            if top == wcap {
+              work = rtStackGrow(work, top)
+              wcap = wcap + wcap
+            }
+            work.store(child, toByteOffset: top * 8)
+            top = top + 1
+          }
+          i += 1
+        }
+        e += 1
+      }
+    }
+  }
+  work.free()
+}
+
+// Mark everything a fiber's stack, typed roots and unstarted argument reach.
+fun rtLeakMarkFiber(set: RawPtr, fib: RawPtr) {
+  let roots = rtRootsNew()
+  var n = 0
+  let sp: RawPtr = fib.load(fromByteOffset: 104)
+  if sp.isNull == false {
+    let pc: Int = fib.load(fromByteOffset: 112)
+    let cache = rtFrameCacheTake()
+    n = rtWalkFrom(sp, pc, rtX19AtAnchor(fib, pc), roots, n, 0, cache)
+    rtFrameCacheDone(cache)
+  }
+  n = rtWalkShadow(fib, roots, n, 0)
+  let arg: RawPtr = fib.load(fromByteOffset: 32)
+  if arg.isNull == false {
+    rtQueuePush(roots, n, arg)
+    n = n + 1
+  }
+  rtLeakMarkFrom(set, roots, n)
+  rtRootsFree(roots)
+}
+
+// Whether a fiber is blocked on objects alone: parked on a channel, a join, or a select of channel cases only.
+fun rtLeakBlocked(fib: RawPtr) -> Bool {
+  let stByte: UInt8 = fib.load(fromByteOffset: 8)
+  let st = stByte.int
+  if st != 2 {
+    return false
+  }
+  let whyByte: UInt8 = fib.load(fromByteOffset: 10)
+  let why = whyByte.int
+  let waitOn: RawPtr = fib.load(fromByteOffset: 120)
+  if waitOn.isNull {
+    return false
+  }
+  if why == rtWaitChanReceive || why == rtWaitChanSend || why == rtWaitTaskJoin {
+    return true
+  }
+  if why == rtWaitSelect {
+    let n: Int = waitOn.load(fromByteOffset: 32)
+    var i = 0
+    while i < n {
+      let buf: RawPtr = waitOn.load(fromByteOffset: 48 + n * 64 + i * 8)
+      if buf.isNull {
+        return false                       // a timer or stdin case: woken from outside
+      }
+      i += 1
+    }
+    return true
+  }
+  return false
+}
+
+// Whether any object a blocked fiber waits on is marked.
+fun rtLeakReached(set: RawPtr, fib: RawPtr) -> Bool {
+  let whyByte: UInt8 = fib.load(fromByteOffset: 10)
+  let why = whyByte.int
+  let waitOn: RawPtr = fib.load(fromByteOffset: 120)
+  if why != rtWaitSelect {
+    return rtLeakSetHas(set, waitOn)
+  }
+  let n: Int = waitOn.load(fromByteOffset: 32)
+  var i = 0
+  while i < n {
+    let buf: RawPtr = waitOn.load(fromByteOffset: 48 + n * 64 + i * 8)
+    if rtLeakSetHas(set, buf) {
+      return true
+    }
+    i += 1
+  }
+  return false
+}
+
+// The pass, with the world stopped: mark from the roots that can run, then from each blocked fiber whose wait
+// was reached, until nothing changes; report the blocked fibers left. Returns their count.
+fun rtLeakCheck(sched: RawPtr) -> Int {
+  let set = rtLeakSetNew()
+  let live = rtLeakSetNew()
+  // Roots outside fibers: the queued mailboxes and their messages.
+  let roots = rtRootsNew()
+  var n = 0
+  let mboxHead: RawPtr = sched.load(fromByteOffset: 80)
+  if mboxHead.isNull == false {
+    rtQueuePush(roots, n, mboxHead)
+    n = n + 1
+  }
+  n = rtWalkRunQueues(roots, n, 0)
+  rtLeakMarkFrom(set, roots, n)
+  rtRootsFree(roots)
+  var cur: RawPtr = sched.load(fromByteOffset: 128)
+  while cur.isNull == false {
+    let stByte: UInt8 = cur.load(fromByteOffset: 8)
+    let st = stByte.int
+    if st != 3 && !rtLeakBlocked(cur) {
+      rtLeakSetAdd(live, cur)
+      rtLeakMarkFiber(set, cur)
+    }
+    cur = cur.load(fromByteOffset: 80)
+  }
+  var progress = true
+  while progress {
+    progress = false
+    cur = sched.load(fromByteOffset: 128)
+    while cur.isNull == false {
+      if rtLeakBlocked(cur) && !rtLeakSetHas(live, cur) && rtLeakReached(set, cur) {
+        rtLeakSetAdd(live, cur)
+        rtLeakMarkFiber(set, cur)
+        progress = true
+      }
+      cur = cur.load(fromByteOffset: 80)
+    }
+  }
+  // Report what is left.
+  var leaked = 0
+  let buf = RawPtr.alloc(bytes: 1024, align: 8)
+  var fd = -1
+  let first: UInt8 = rtFaultReportPath.load(fromByteOffset: 0)
+  if first.int != 0 {
+    fd = Runtime.createFile(path: rtFaultReportPath, mode: 420)
+  }
+  let now = Runtime.monotonicNanos()
+  cur = sched.load(fromByteOffset: 128)
+  while cur.isNull == false {
+    if rtLeakBlocked(cur) && !rtLeakSetHas(live, cur) {
+      if leaked == 0 {
+        Runtime.writeFd(fd: 2, buf: buf, count: Runtime.copyLiteral(to: buf, "nomu: leaked fibers\n"))
+        rtFaultEmit(fd, buf, rtFaultPutImage(buf, 0))
+      }
+      rtFiberDumpFiber(fd, buf, cur, 2, now, true)
+      leaked = leaked + 1
+    }
+    cur = cur.load(fromByteOffset: 80)
+  }
+  if leaked > 0 {
+    rtFaultEmit(fd, buf, Runtime.copyLiteral(to: buf, "nomu-crash: end\n"))
+  }
+  if fd >= 0 {
+    Runtime.closeFd(fd: fd)
+  }
+  buf.free()
+  rtLeakSetFree(set)
+  rtLeakSetFree(live)
+  return leaked
+}
+
+// Request the pass from `main`'s fiber once `main` has returned: raise a collection with the pass to follow it
+// (sched+200), and stop at it as an out-of-memory collection's requester does (rtSelfhostOom), so the
+// coordinator runs both before this fiber goes on to end the program.
+fun rtLeakAtExit(sched: RawPtr) {
+  let self = rtCurrentFiber()
+  self.store(RawPtr.null, toByteOffset: 104)       // `main` has returned: no frames to walk
+  self.store(0, toByteOffset: 112)
+  rtSchedLock(sched)
+  sched.atomicStore(1, toByteOffset: 200)
+  rtGcRaise(sched, 1, 5)
+  self.store(4.uint8, toByteOffset: 8)
+  Runtime.ctxSwitch(from: self, to: self.advanced(by: 72))    // resumes without the scheduler lock
+}

@@ -1,0 +1,104 @@
+// `select` over channels: the ready case wins, a closed channel's receive binds `.none`, `default` runs when
+// nothing is ready, and a blocked select wakes for whichever channel a value reaches first.
+
+fun produce(ch: Channel<Int>, v: Int) {
+  sleep(2)
+  ch.send(v)
+}
+
+fun drain(ch: Channel<Int>, out: Channel<Int>) {
+  var total = 0
+  var done = false
+  while done == false {
+    switch ch.receive() {
+    case .some(let v): total = total + v
+    case .none: done = true
+    }
+  }
+  out.send(total)
+}
+
+fun report(label: String, a: Int) {
+  print(label)
+  print(" ")
+  print(a)
+  print("\n")
+}
+
+fun main() {
+  // One ready channel among two.
+  let a = Channel<Int>.make(capacity: 1)
+  let b = Channel<Int>.make(capacity: 1)
+  b.send(7)
+  select {
+  case let v = a.receive():
+    report("a", -1)
+  case let v = b.receive():
+    switch v {
+    case .some(let x): report("ready", x)
+    case .none: report("ready", -1)
+    }
+  }
+
+  // Nothing ready: default.
+  select {
+  case let v = a.receive():
+    report("default", -1)
+  default:
+    report("default", 1)
+  }
+
+  // A send case into room.
+  select {
+  case a.send(5):
+    report("sent", 5)
+  }
+  switch a.receive() {
+  case .some(let x): report("got", x)
+  case .none: report("got", -1)
+  }
+
+  // Closed: the receive binds .none.
+  let c = Channel<Int>.make(capacity: 0)
+  c.close()
+  select {
+  case let v = c.receive():
+    switch v {
+    case .some(let x): report("closed", x)
+    case .none: report("closed", 0)
+    }
+  }
+
+  // Blocked until another fiber sends on one of them.
+  let d = Channel<Int>.make(capacity: 0)
+  let e = Channel<Int>.make(capacity: 0)
+  fiber produce(e, 42)
+  select {
+  case let v = d.receive():
+    report("woke d", -1)
+  case let v = e.receive():
+    switch v {
+    case .some(let x): report("woke", x)
+    case .none: report("woke", -1)
+    }
+  }
+
+  // A blocked send, taken by a receiver.
+  let f = Channel<Int>.make(capacity: 0)
+  let out = Channel<Int>.make(capacity: 1)
+  fiber drain(f, out)
+  var i = 0
+  while i < 100 {
+    select {
+    case f.send(i):
+    case let v = d.receive():
+      report("d", -1)
+    }
+    i = i + 1
+  }
+  f.close()
+  switch out.receive() {
+  case .some(let x): report("drained", x)
+  case .none: report("drained", -1)
+  }
+}

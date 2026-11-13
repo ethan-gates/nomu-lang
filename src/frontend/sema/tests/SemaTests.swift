@@ -2130,6 +2130,15 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(errors(outside).contains("undefined name 'Runtime'"), errors(outside))
     }
 
+    func testAllocUninitialized() {
+        let ok = sema("fun f(n: Int) -> RawPtr { return Runtime.allocUninitialized(bytes: n, align: 16) }", runtimeTier: true)
+        XCTAssertTrue(ok.diagnostics.isEmpty, errors(ok))
+        let labels = sema("fun f() -> RawPtr { return Runtime.allocUninitialized(8, 16) }", runtimeTier: true)
+        XCTAssertFalse(labels.diagnostics.isEmpty)
+        let outside = sema("fun f() -> RawPtr { return Runtime.allocUninitialized(bytes: 8, align: 8) }")
+        XCTAssertTrue(errors(outside).contains("undefined name 'Runtime'"), errors(outside))
+    }
+
     func testStaticStorageArguments() {
         let literal = sema("let n = 8\nlet p = Runtime.staticStorage(bytes: n, align: 8)", runtimeTier: true)
         XCTAssertTrue(errors(literal).contains("takes integer literals for 'bytes' and 'align'"), errors(literal))

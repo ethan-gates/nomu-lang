@@ -1,0 +1,115 @@
+// `after(ms)` in a `select`: it wins when nothing else is ready in time, loses to a channel that is, and a
+// timer that lost is taken out of the timer heap, so many selects leave nothing behind. Built with
+// `test.runtime_prelude` to read the heap's entry count (sched+64).
+
+fun sendLater(ch: Channel<Int>, ms: Int, v: Int) {
+  sleep(ms)
+  ch.send(v)
+}
+
+fun report(label: String, a: Int) {
+  print(label)
+  print(" ")
+  print(a)
+  print("\n")
+}
+
+// A worker that gives up waiting for work after a while.
+fun worker(jobs: Channel<Int>, out: Channel<Int>) {
+  var total = 0
+  var idle = false
+  while idle == false {
+    select {
+    case let j = jobs.receive():
+      switch j {
+      case .some(let n): total = total + n
+      case .none: idle = true
+      }
+    case after(50):
+      idle = true
+    }
+  }
+  out.send(total)
+}
+
+fun main() {
+  // Nothing comes: the timer wins.
+  let quiet = Channel<Int>.make(capacity: 0)
+  select {
+  case let v = quiet.receive():
+    report("quiet", -1)
+  case after(5):
+    report("timeout", 5)
+  }
+
+  // A value comes first: the channel wins and the timer is removed.
+  let soon = Channel<Int>.make(capacity: 0)
+  fiber sendLater(soon, 1, 7)
+  select {
+  case let v = soon.receive():
+    switch v {
+    case .some(let x): report("value", x)
+    case .none: report("value", -1)
+    }
+  case after(2000):
+    report("value", -2)
+  }
+
+  // after(0) is ready at once, as default would be.
+  select {
+  case let v = quiet.receive():
+    report("zero", -1)
+  case after(0):
+    report("zero", 0)
+  }
+
+  // Two timers: the shorter wins.
+  select {
+  case after(500):
+    report("shorter", 500)
+  case after(3):
+    report("shorter", 3)
+  }
+
+  // Many selects whose timers lose: each is taken out of the heap.
+  let busy = Channel<Int>.make(capacity: 1)
+  var i = 0
+  var got = 0
+  while i < 2000 {
+    busy.send(i)
+    select {
+    case let v = busy.receive():
+      got = got + 1
+    case after(100000):
+      got = -100000
+    }
+    i = i + 1
+  }
+  report("lost timers", got)
+  let pending: Int = rtSched.load(fromByteOffset: 64)
+  report("pending", pending)
+
+  // Workers that stop when work stops coming.
+  let jobs = Channel<Int>.make(capacity: 0)
+  let out = Channel<Int>.make(capacity: 4)
+  var w = 0
+  while w < 4 {
+    fiber worker(jobs, out)
+    w = w + 1
+  }
+  i = 1
+  while i <= 100 {
+    jobs.send(i)
+    i = i + 1
+  }
+  var total = 0
+  w = 0
+  while w < 4 {
+    switch out.receive() {
+    case .some(let t): total = total + t
+    case .none:
+    }
+    w = w + 1
+  }
+  report("workers", total)
+}

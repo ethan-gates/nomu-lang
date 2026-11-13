@@ -33,10 +33,10 @@ fun worker(id: Int) -> Int {
 }
 
 fun main() {
-  fiber let a = worker(1)
-  fiber let b = worker(2)
-  fiber let c = worker(3)
-  fiber let d = worker(4)
-  print((a + b + c + d) % 1000000)   // deterministic — independent of collection and carrier count
+  let a = task worker(1)
+  let b = task worker(2)
+  let c = task worker(3)
+  let d = task worker(4)
+  print((a.join() + b.join() + c.join() + d.join()) % 1000000)  // deterministic — independent of collection and carrier count
   print("\n")
 }

@@ -12,12 +12,18 @@ import Foundation
 // index is written into it and the linker's signature is redone over the patched pages (CodeSignature.swift).
 //
 // Layout, at the first 8-aligned address in the section (`-sectcreate` gives the section byte alignment):
-//   header    { u32 magic 'NFIX', u32 version, u64 count }
+//   header    { u32 magic 'NFIX', u32 version, u64 count, u64 facts position (bytes from the header), u64 facts
+//               count }
 //   entries   { i64 function address − stackmaps section start, u32 record offset into the stackmaps section,
 //               u32 record count, u32 stack size (UINT32_MAX: dynamic), u32 blob ordinal }, sorted by
 //               function address
 //   directory { u64 blob count, then per blob i64 its object's `__nomu_shape_table` − stackmaps section
 //               start (0: none) }
+//   facts     { i64 function address − stackmaps section start, u32 length, i32 x19 save offset from the
+//               frame pointer (0: not saved), u32 flags (1: base pointer, 2: saves x19 with no frame record),
+//               u32 0 }, sorted by address: every function that saves x19 or uses a base pointer
+//               (UnwindFacts.swift). The step also checks each record's root locations: based on SP, x29, or x19
+//               in a base-pointer function, and no other register.
 // A record's shape ordinals are numbered per object, so they resolve in the shape table of the object its
 // blob came from (`{ count, then a descriptor type-id per ordinal }`); the step checks every ordinal against
 // it. Positions are relative to the stackmaps section, so the index holds no pointers to relocate (the image
@@ -26,8 +32,9 @@ enum FrameIndex {
     static let segment = "__DATA_CONST"
     static let section = "__nomu_frameidx"
     static let magic: UInt32 = 0x5849_464E   // "NFIX"
-    static let version: UInt32 = 2
-    static let headerSize = 16
+    static let version: UInt32 = 3
+    static let headerSize = 32
+    static let factSize = 24
     static let entrySize = 24
 
     struct Failure: Error, CustomStringConvertible {
@@ -36,8 +43,8 @@ enum FrameIndex {
     }
 
     // Bytes to reserve for the index over these objects: the alignment slack, the header, one entry per
-    // stackmap function record in their blobs (an upper bound: folded copies leave slack), and the blob
-    // directory.
+    // stackmap function record in their blobs (an upper bound: folded copies leave slack), the blob
+    // directory, and one fact per compact-unwind entry (an upper bound on functions).
     static func reserveSize(objects: [String]) throws -> Int {
         var functions = 0, blobs = 0
         for path in objects {
@@ -53,7 +60,7 @@ enum FrameIndex {
                 blobs += 1
             }
         }
-        return 8 + headerSize + functions * entrySize + 8 + blobs * 8
+        return 8 + headerSize + functions * entrySize + 8 + blobs * 8 + (try UnwindFacts.entryCount(objects: objects)) * factSize
     }
 
     // Build the index for a linked binary from its stackmaps and link map, and write it into the reserved
@@ -73,6 +80,14 @@ enum FrameIndex {
             return (0, 0)
         }
         let fixups = try ChainedFixups(file: file, data: data)
+        let facts = try UnwindFacts.facts(file: file, data: data)
+        // The function a fact covers, by address.
+        func fact(at address: UInt64) -> UnwindFacts.Fact? {
+            var lo = 0, hi = facts.count
+            while lo < hi { let m = (lo + hi) / 2; if facts[m].start <= address { lo = m + 1 } else { hi = m } }
+            guard lo > 0, address < facts[lo - 1].start + UInt64(facts[lo - 1].length) else { return nil }
+            return facts[lo - 1]
+        }
 
         // Every blob's function entries, with the function each one's address field targets.
         struct Function { let blob: Int; let target: ChainedFixups.Target; let stack: UInt64; let nrec: UInt64; let recOff: Int }
@@ -148,10 +163,21 @@ enum FrameIndex {
             guard let stack, stack != UInt32.max || f.stack == UInt64.max, f.nrec <= UInt64(UInt32.max) else {
                 throw Failure("stackmap function at 0x\(String(address, radix: 16)): stack size or record count out of range")
             }
-            // Every shape ordinal in the records must name an entry of the blob's object's table.
+            // Every shape ordinal in the records must name an entry of the blob's object's table, and every
+            // stack-slot location must be based on a register the walk reads.
+            let basePointer = fact(at: address)?.basePointer ?? false
             var r = start + f.recOff
             for _ in 0..<f.nrec {
                 let nloc = Int(data.u16(r + 14))
+                for li in 0..<nloc {
+                    let c = r + 16 + li * 12
+                    guard data[c] == 2 || data[c] == 3 else { continue }   // Direct, Indirect
+                    let reg = data.u16(c + 4)
+                    if reg == 29 || reg == 31 { continue }
+                    guard reg == 19, basePointer else {
+                        throw Failure("stackmap function at 0x\(String(address, radix: 16)): a root slot based on register \(reg)" + (reg == 19 ? ", in a function with no base pointer" : ""))
+                    }
+                }
                 let numDeopt = nloc > 2 ? Int(data.u32(r + 16 + 2 * 12 + 8)) : 0
                 var li = 3
                 while li + 1 < 3 + numDeopt {
@@ -175,13 +201,20 @@ enum FrameIndex {
             throw Failure("two kept stackmap entries for the function at 0x\(String(UInt64(bitPattern: entries[i].func) &+ sm.address, radix: 16))")
         }
         var bytes = Data(capacity: headerSize + entries.count * entrySize)
+        let factsAt = headerSize + entries.count * entrySize + 8 + tables.count * 8
         bytes.appendLE(magic); bytes.appendLE(version); bytes.appendLE(UInt64(entries.count))
+        bytes.appendLE(UInt64(factsAt)); bytes.appendLE(UInt64(facts.count))
         for e in entries {
             bytes.appendLE(UInt64(bitPattern: e.func)); bytes.appendLE(e.recOff); bytes.appendLE(e.nrec)
             bytes.appendLE(e.stack); bytes.appendLE(e.blob)
         }
         bytes.appendLE(UInt64(tables.count))
         for t in tables { bytes.appendLE(UInt64(bitPattern: t)) }
+        for f in facts {
+            bytes.appendLE(UInt64(bitPattern: Int64(bitPattern: f.start &- sm.address))); bytes.appendLE(f.length)
+            bytes.appendLE(f.x19); bytes.appendLE(UInt32((f.basePointer ? 1 : 0) | (f.framelessSave ? 2 : 0)))
+            bytes.appendLE(UInt32(0))
+        }
         try writeIndex(bytes, into: reserved, binary: binary)
         return (entries.count, dropped)
     }
@@ -191,7 +224,8 @@ enum FrameIndex {
         let pad = Int((8 - s.address % 8) % 8)
         var index = bytes
         if index.isEmpty {   // no entries, no blobs
-            index.appendLE(magic); index.appendLE(version); index.appendLE(UInt64(0)); index.appendLE(UInt64(0))
+            index.appendLE(magic); index.appendLE(version); index.appendLE(UInt64(0))
+            index.appendLE(UInt64(headerSize + 8)); index.appendLE(UInt64(0)); index.appendLE(UInt64(0))
         }
         guard pad + index.count <= Int(s.size) else {
             throw Failure("frame index needs \(pad + index.count) bytes, \(s.size) reserved")
@@ -414,7 +448,7 @@ struct LinkMap {
     func filesDefining(address: UInt64) -> Set<Int> { byAddress[address] ?? [] }
 }
 
-private extension Data {
+extension Data {
     func u16(_ o: Int) -> UInt16 { UInt16(self[startIndex + o]) | UInt16(self[startIndex + o + 1]) << 8 }
     func u32(_ o: Int) -> UInt32 { UInt32(u16(o)) | UInt32(u16(o + 2)) << 16 }
     func u64(_ o: Int) -> UInt64 { UInt64(u32(o)) | UInt64(u32(o + 4)) << 32 }

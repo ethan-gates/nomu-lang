@@ -78,10 +78,18 @@ let settingTable: [String: SettingDef] = [
                                      help: "move a fiber's stack at every resume and protect the old one"),
     "stack_move_checks":  SettingDef(stage: .run, carrier: .envValue("NOMU_STACK_MOVE_CHECKS"),
                                      help: "move a fiber's stack at every Nth function-entry stack check"),
+    "stack_shrink":       SettingDef(stage: .run, carrier: .envValue("NOMU_STACK_SHRINK"),
+                                     help: "move every stopped fiber's stack at every collection, halving where it can"),
+    "stack_stats":        SettingDef(stage: .run, carrier: .envValue("NOMU_STACK_STATS"),
+                                     help: "print stack moves and shrink passes, their bytes and time, at exit"),
     "stack_start":        SettingDef(stage: .run, carrier: .envValue("NOMU_STACK_START"),
                                      help: "a new fiber's stack size in bytes (a power of two, at least 32 KiB)"),
     "stack_max":          SettingDef(stage: .run, carrier: .envValue("NOMU_STACK_MAX"),
                                      help: "the size in bytes past which a fiber's stack does not grow"),
+    "traceback":          SettingDef(stage: .run, carrier: .envValue("NOMU_TRACEBACK"),
+                                     help: "`all`: a fault dumps every fiber after its backtrace (Go's GOTRACEBACK)"),
+    "leak_report":        SettingDef(stage: .run, carrier: .envValue("NOMU_LEAK_REPORT"),
+                                     help: "1: when `main` returns, report the fibers that can never wake"),
 ]
 
 // The manifest decoder's snake_case conversion also rewrites dictionary keys (`gc_record` arrives as `gcRecord`),

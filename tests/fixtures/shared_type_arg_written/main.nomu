@@ -1,0 +1,13 @@
+// A written type argument that is not shareable: `Mut` has a mutable field.
+class Box<shared T> {
+    let v: T
+}
+
+class Mut {
+    var n: Int
+}
+
+fun main() {
+    let c: Box<Mut> = Box(v: Mut(n: 1))
+    print(c.v.n)
+}

@@ -25,14 +25,23 @@ fun loopSum(x: Box) -> Int {
   return acc
 }
 // The carrier body. After inlining, `spin`'s CFG *contains* loopSum's loop — an inlined loop whose
-// only safepoint is the loop-header poll.
-fun spin(x: Box, inLoop: RawPtr) -> Int {
+// only safepoint is the loop-header poll. The Box is made here: a mutable class cannot be passed to a task.
+fun spin(v: Int, inLoop: RawPtr) -> Int {
+  let x = Box(v: v)
   inLoop.atomicStore(1, toByteOffset: 0)   // the next poll is the inlined loop's
   return loopSum(x)
+}
+// Whether `main` has parked in its join, so the collection's roots include its join's wait object every run.
+fun mainParked() -> Bool {
+  let mf: RawPtr = rtSched.load(fromByteOffset: 216)
+  let st: UInt8 = mf.load(fromByteOffset: 8)
+  return st.int == 2
 }
 fun parker(inLoop: RawPtr) -> Int {
   let p = Box(v: 888)
   while inLoop.atomicLoad(fromByteOffset: 0) == 0 {
+  }
+  while !mainParked() {
   }
   rtGcRequest(1)                // the spinner is in the inlined loop
   sleep(20)                     // park holding p live across the safepoint
@@ -41,7 +50,7 @@ fun parker(inLoop: RawPtr) -> Int {
 fun main() {
   let inLoop = RawPtr.alloc(bytes: 8, align: 8)
   inLoop.atomicStore(0, toByteOffset: 0)
-  fiber let s = spin(Box(v: 777), inLoop)   // a carrier runs the inlined compute loop
-  fiber let q = parker(inLoop)              // another fiber requests the collection, then parks holding a root
-  print(s + q)                              // joins both
+  let s = task spin(777, inLoop)             // a carrier runs the inlined compute loop
+  let q = task parker(inLoop)              // another fiber requests the collection, then parks holding a root
+  print(s.join() + q.join())                // joins both
 }

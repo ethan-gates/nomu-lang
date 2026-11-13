@@ -11,8 +11,6 @@ public func collectUsesStmt(_ stmt: NOIRStmt, _ bound: inout Set<String>, _ used
     switch stmt.kind {
     case .letBinding(let name, _, let value):
         collectUsesExpr(value, bound, &used); bound.insert(name)
-    case .spawnLet(let name, let value, _):
-        collectUsesExpr(value, bound, &used); bound.insert(name)
     case .fiberStart(let call):
         collectUsesExpr(call, bound, &used)
     case .assign(let t, let v), .compoundAssign(let t, let v):
@@ -70,6 +68,9 @@ public func collectUsesExpr(_ e: NOIRExpr, _ bound: Set<String>, _ used: inout [
         collectUsesExpr(base, bound, &used); collectUsesExpr(idx, bound, &used)
     case .staticCall(_, _, let args):
         for a in args { collectUsesExpr(a, bound, &used) }   // monomorphization lowers these to `call`
+    case .taskStart(let binder, let make, let call, let fulfill):
+        collectUsesExpr(make, bound, &used); collectUsesExpr(call, bound, &used)
+        collectUsesExpr(fulfill, bound.union([binder, "\(binder).v"]), &used)
     }
 }
 

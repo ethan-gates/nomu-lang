@@ -212,6 +212,16 @@ enum RuntimeIntrinsics {
             let bytes = PointerIntrinsics.intArg(&s, args[0].value, "Runtime.reserveZeroed", "bytes")
             let align = PointerIntrinsics.intArg(&s, args[1].value, "Runtime.reserveZeroed", "align")
             return s.ptrIntrinsic("__sysReserveZeroed", .rawPtr, [bytes, align], span)
+        // `RawPtr.alloc` without the zero-fill: `bytes` aligned to `align`, contents undefined, freed with
+        // `free()`. For runtime memory written before it is read (a stack a move copies into), where the fill
+        // is wasted work. Subset-legal (`__sys`).
+        case "allocUninitialized":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["bytes", "align"], "Runtime.allocUninitialized", span) else {
+                return err(span)
+            }
+            let bytes = PointerIntrinsics.intArg(&s, args[0].value, "Runtime.allocUninitialized", "bytes")
+            let align = PointerIntrinsics.intArg(&s, args[1].value, "Runtime.allocUninitialized", "align")
+            return s.ptrIntrinsic("__sysAllocUninitialized", .rawPtr, [bytes, align], span)
         case "carrierLocal":
             guard PointerIntrinsics.checkArgLabels(&s, args, [], "Runtime.carrierLocal", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
@@ -277,7 +287,8 @@ enum RuntimeIntrinsics {
         // runtime-tier primitive for handing an entry point to the asm floor (rtFiberInit) or
         // pthread_create — deliberately not first-class functions (task 128 note: full first-class
         // functions/closures for user code are a later, separate language step). The argument must name a
-        // top-level `fun (_: RawPtr) -> RawPtr` — the carrier/fiber-entry ABI (a bare pointer, no env) — or a
+        // top-level `fun (_: RawPtr) -> RawPtr` — the carrier/fiber-entry ABI (bare pointers, no env), which
+        // takes up to two more `RawPtr`s for a fiber entry the trampoline passes its seeded x21 and x22 — or a
         // `fun (_: Int, _: RawPtr, _: RawPtr)`, the `SA_SIGINFO` signal handler's (`Runtime.sigaction`).
         case "ofFunc":
             guard args.count == 1, args[0].label == nil else {
@@ -292,11 +303,12 @@ enum RuntimeIntrinsics {
                 s.diags.error("no top-level function named '\(fname)'", at: span)
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
-            let entryShape = sig.params == [.rawPtr] && sig.ret == .rawPtr
+            let entryShape = (1...3).contains(sig.params.count) && sig.params.allSatisfy { $0 == .rawPtr }
+                && sig.ret == .rawPtr
             let handlerShape = sig.params == [.int, .rawPtr, .rawPtr] && sig.ret == .void
             guard sig.generics.isEmpty, entryShape || handlerShape else {
-                s.diags.error("Runtime.ofFunc requires a non-generic 'fun \(fname)(_: RawPtr) -> RawPtr' or "
-                              + "'fun \(fname)(_: Int, _: RawPtr, _: RawPtr)'", at: span)
+                s.diags.error("Runtime.ofFunc requires a non-generic 'fun \(fname)(_: RawPtr) -> RawPtr' (with up to "
+                              + "two more RawPtr parameters) or 'fun \(fname)(_: Int, _: RawPtr, _: RawPtr)'", at: span)
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
             return NOIRExpr(type: .rawPtr, span: span, kind: .funcRef(name: fname))
@@ -320,6 +332,12 @@ enum RuntimeIntrinsics {
             let base = PointerIntrinsics.ptrArg(&s, args[0].value, "Runtime.sigaltstack", "base")
             let size = PointerIntrinsics.intArg(&s, args[1].value, "Runtime.sigaltstack", "size")
             return s.ptrIntrinsic("__sysSigaltstack", .int, [base, size], span)
+        // Unblock `signal` for the calling thread (`pthread_sigmask(SIG_UNBLOCK, …)`), so a handler installed
+        // for it runs though the process started with it blocked. Returns 0 on success.
+        case "unblockSignal":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["signal"], "Runtime.unblockSignal", span) else { return err(span) }
+            let sg = PointerIntrinsics.intArg(&s, args[0].value, "Runtime.unblockSignal", "signal")
+            return s.ptrIntrinsic("__sysUnblockSignal", .int, [sg], span)
         case "currentAltStack":
             guard PointerIntrinsics.checkArgLabels(&s, args, [], "Runtime.currentAltStack", span) else { return err(span) }
             return s.ptrIntrinsic("__sysCurrentAltStack", .rawPtr, [], span)
@@ -338,15 +356,19 @@ enum RuntimeIntrinsics {
             guard PointerIntrinsics.checkArgLabels(&s, args, ["signal"], "Runtime.raise", span) else { return err(span) }
             let sg = PointerIntrinsics.intArg(&s, args[0].value, "Runtime.raise", "signal")
             return s.ptrIntrinsic("__sysRaise", .int, [sg], span)
-        // Asm-floor context switch (task 128.2). `from` is the context buffer to save into (≥168 bytes, the
-        // callee-saved set); `to` is the context to resume. Saves the current registers into `from` and jumps
-        // into `to` (rtSwitch). Subset-legal (`__sys`).
+        // Asm-floor context switch (task 128.2). `from` and `to` are contexts, one word each: the SP below which
+        // a switch pushed the callee-saved set. Pushes the current registers, saves SP into `from`, and resumes
+        // `to` (rtSwitch), handing it `message` (null when omitted): `to`'s own switch returns it. Returns the
+        // message the switch that resumes this context passes. Subset-legal (`__sys`).
         case "ctxSwitch":
-            guard PointerIntrinsics.checkArgLabels(&s, args, ["from", "to"], "Runtime.ctxSwitch", span) else { return err(span) }
+            let labels: [String?] = args.count == 3 ? ["from", "to", "message"] : ["from", "to"]
+            guard PointerIntrinsics.checkArgLabels(&s, args, labels, "Runtime.ctxSwitch", span) else { return err(span) }
             let from = PointerIntrinsics.ptrArg(&s, args[0].value, "Runtime.ctxSwitch", "from")
             let to = PointerIntrinsics.ptrArg(&s, args[1].value, "Runtime.ctxSwitch", "to")
-            return s.ptrIntrinsic("__sysCtxSwitch", .void, [from, to], span)
-        // Seed a fresh fiber's context buffer so the first switch into it lands in the trampoline running
+            let message = args.count == 3 ? PointerIntrinsics.ptrArg(&s, args[2].value, "Runtime.ctxSwitch", "message")
+                : s.ptrIntrinsic("__ptrNull", .rawPtr, [], span)
+            return s.ptrIntrinsic("__sysCtxSwitch", .rawPtr, [from, to, message], span)
+        // Seed a fresh fiber's context so the first switch into it lands in the trampoline running
         // `entry(arg)` on `stackTop` (rtFiberInit). `entry` is a code address from Runtime.ofFunc.
         case "fiberInit":
             guard PointerIntrinsics.checkArgLabels(&s, args, ["context", "stackTop", "entry", "arg"], "Runtime.fiberInit", span) else { return err(span) }

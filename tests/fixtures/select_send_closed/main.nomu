@@ -1,0 +1,20 @@
+// A send case on a closed channel is a fault, as `send` is, whether the channel was closed before the select
+// or while it waited.
+fun closeLater(ch: Channel<Int>) {
+  sleep(2)
+  ch.close()
+}
+
+fun main() {
+  let quiet = Channel<Int>.make(capacity: 0)
+  let ch = Channel<Int>.make(capacity: 0)
+  fiber closeLater(ch)
+  print("waiting\n")
+  select {
+  case ch.send(1):
+    print("sent\n")
+  case let v = quiet.receive():
+    print("quiet\n")
+  }
+  print("unreachable\n")
+}

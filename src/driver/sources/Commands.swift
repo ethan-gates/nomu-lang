@@ -98,9 +98,9 @@ public func buildResolved(_ m: ResolvedModule, options: EmitOptions = EmitOption
 // `nomu run <path> [-- args]` (task 173.5.3): build the target module, then exec the produced binary,
 // forwarding `args` and propagating its exit status. A module without a `main` is not executable — its
 // build fails, which surfaces here as a non-zero exit. Returns the process exit code: the program's, or
-// 128 plus the signal that ended it, as a shell reports it. When the program dies from a signal, its crash
-// report (task 219), written also to the file `NOMU_CRASH_REPORT` names, is printed again symbolized
-// (`CrashReport`).
+// 128 plus the signal that ended it, as a shell reports it. When the program writes a crash report or a fiber
+// dump (task 219, `runtime/fault.nomu`), also to the file `NOMU_CRASH_REPORT` names, it is printed again
+// symbolized (`CrashReport`).
 public func runTarget(path: String, args: [String], options: EmitOptions = EmitOptions(),
                       selection: ConfigSelection = ConfigSelection()) -> Int32 {
     guard let binary = buildTarget(path: path, options: options, selection: selection) else { return 1 }
@@ -114,14 +114,45 @@ public func runTarget(path: String, args: [String], options: EmitOptions = EmitO
         return 1
     }
     proc.waitUntilExit()
-    guard proc.terminationReason == .uncaughtSignal else {
-        try? FileManager.default.removeItem(atPath: report)
-        return proc.terminationStatus
-    }
     if let text = CrashReport.symbolize(reportPath: report, binary: binary) {
         FileHandle.standardError.write(Data(text.utf8))
     }
+    guard proc.terminationReason == .uncaughtSignal else { return proc.terminationStatus }
     return 128 + proc.terminationStatus
+}
+
+// `nomu tool symbolize <binary> [report]` (task 219, scenario 2 for a binary at hand): a crash report or fiber dump the program at `binary` wrote, read from
+// `report` or standard input, printed with each frame named (`CrashReport`). The report's build ID must be the
+// binary's: names from another build would mislead. Returns whether it printed a symbolized report.
+public func symbolize(binary: String, report: String?) -> Bool {
+    let text: String
+    if let report {
+        guard let t = try? String(contentsOfFile: report, encoding: .utf8) else {
+            fputs("error: cannot read '\(report)'\n", stderr)
+            return false
+        }
+        text = t
+    } else {
+        text = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
+    }
+    guard let wanted = CrashReport.reportBuildID(text) else {
+        fputs("error: the report has no `nomu-crash: image:` line\n", stderr)
+        return false
+    }
+    guard let have = CrashReport.binaryBuildID(binary) else {
+        fputs("error: cannot read a build ID from '\(binary)'\n", stderr)
+        return false
+    }
+    guard wanted == have else {
+        fputs("error: the report is from build \(wanted), but '\(binary)' is build \(have)\n", stderr)
+        return false
+    }
+    guard let out = CrashReport.symbolize(text: text, binary: binary) else {
+        fputs("error: nothing in the report could be symbolized (no frames, or no debug info for '\(binary)')\n", stderr)
+        return false
+    }
+    print(out, terminator: "")
+    return true
 }
 
 // `nomu test [target]` (task 173.5.4): build and run a test module. Resolution is the shared single-module

@@ -1,0 +1,19 @@
+// Waits that something will end are no deadlock: a sleep, a select with a timer, and a fiber the main fiber
+// waits for that is itself only sleeping.
+fun later(ms: Int) -> Int {
+  sleep(ms)
+  return ms
+}
+
+fun main() {
+  let quiet = Channel<Int>.make(capacity: 0)
+  let t = task later(150)
+  select {
+  case let v = quiet.receive():
+    print("quiet\n")
+  case after(150):
+    print("timer\n")
+  }
+  print(t.join())
+  print("\n")
+}

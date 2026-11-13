@@ -27,8 +27,8 @@ import support
 // land it is rescoped to within-module (cross-module specialization opt-in), preserving
 // the stable-ABI default at module edges (generics.md §6).
 
-public func monomorphize(_ module: NOIRModule, into diags: DiagnosticSink) -> NOIRModule {
-    Monomorphizer(module: module, diags: diags).run()
+public func monomorphize(_ module: NOIRModule, recipes: DictionaryRecipes? = nil, into diags: DiagnosticSink) -> NOIRModule {
+    Monomorphizer(module: module, recipes: recipes, diags: diags).run()
 }
 
 private final class Monomorphizer {
@@ -55,7 +55,16 @@ private final class Monomorphizer {
     // this we assume polymorphic recursion (`f<Box<T>>` → `f<Box<Box<T>>>` → …) and error.
     let depthCap = 64
 
-    init(module: NOIRModule, diags: DiagnosticSink) { self.module = module; self.diags = diags }
+    // The dependencies' dictionary recipes, by symbol, and the instances this module's concrete calls need.
+    let imported: DictionaryRecipes?
+    var importedRecipes: [String: DictionaryRecipe] = [:]
+    var dictionaries: [String: DictionaryInstance] = [:]
+    var requestedDictionaries = Set<String>()
+
+    init(module: NOIRModule, recipes: DictionaryRecipes?, diags: DiagnosticSink) {
+        self.module = module; self.diags = diags; self.imported = recipes
+        for r in recipes?.recipes ?? [] { importedRecipes[r.symbol] = r }
+    }
 
     func run() -> NOIRModule {
         // Register every generic template first (a root may reference one declared later).
@@ -69,6 +78,7 @@ private final class Monomorphizer {
             default: roots.append(decl)
             }
         }
+        roots += layoutDecls()
         for r in roots { out.append(rewriteDecl(r, [:])) }
         while !funcWork.isEmpty || !typeWork.isEmpty {
             while let w = funcWork.popLast() { specializeFunc(w.base, w.args) }
@@ -89,9 +99,11 @@ private final class Monomorphizer {
             }
         }
         // Generic types' methods are emitted erased below, so their bodies call through this ABI too.
-        for s in genericStructs.values { pending += s.methods.map(\.body) }
-        for e in genericEnums.values { pending += e.methods.map(\.body) }
-        for c in genericClasses.values { pending += c.methods.map(\.body) }
+        // In name order, as everything this function emits: dictionary order varies from run to run, and the
+        // object must be the same bytes from every compile.
+        for (_, s) in genericStructs.sorted(by: { $0.key < $1.key }) { pending += s.methods.map(\.body) }
+        for (_, e) in genericEnums.sorted(by: { $0.key < $1.key }) { pending += e.methods.map(\.body) }
+        for (_, c) in genericClasses.sorted(by: { $0.key < $1.key }) { pending += c.methods.map(\.body) }
         // A private generic that an erased body calls has no specialization to call: it is emitted erased too.
         while let body = pending.popLast() {
             var bound = Set<String>(), used: [String] = []
@@ -113,24 +125,91 @@ private final class Monomorphizer {
         // concrete path. (Gating to the *type's* `public` visibility — to drop internal generic types'
         // dead erased methods — awaits type visibility on `NOIRStruct`/`NOIREnum`; members are not
         // individually marked public here, so the type is the unit, 100.4.3.5.3.)
-        for (name, s) in genericStructs {
+        for (name, s) in genericStructs.sorted(by: { $0.key < $1.key }) {
             out.append(.structDecl(NOIRStruct(name: name, generics: s.generics, fields: s.fields,
                                               methods: s.methods, span: s.span)))
         }
-        for (name, e) in genericEnums {
+        for (name, e) in genericEnums.sorted(by: { $0.key < $1.key }) {
             out.append(.enumDecl(NOIREnum(name: name, generics: e.generics, cases: e.cases,
                                           methods: e.methods, span: e.span)))
         }
         // A generic **class** template, for the erased method path on a reference receiver (task 100.4.3.9):
         // like structs/enums, retain the template so codegen has the field layout; its methods lower erased
         // with `self` a managed object pointer and fields indexed by VWT-derived offset past the header.
-        for (name, c) in genericClasses {
+        for (name, c) in genericClasses.sorted(by: { $0.key < $1.key }) {
             out.append(.classDecl(NOIRClass(name: name, generics: c.generics, fields: c.fields,
                                             methods: c.methods, span: c.span)))
         }
-        return NOIRModule(decls: out, interfaces: module.interfaces, conformances: module.conformances,
+        var result = NOIRModule(decls: out, interfaces: module.interfaces, conformances: module.conformances,
                         composites: module.composites, opaqueUnderlyings: module.opaqueUnderlyings,
                         externalMutatingMethods: module.externalMutatingMethods, monoTypeArgs: monoTypeArgs)
+        result.recipes = dictionaryRecipes(out, imported: imported)
+        result.dictionaries = dictionaries
+        return result
+    }
+
+    // The types recipes name that this module has no decl for, private ones of a dependency: a generic one becomes a
+    // template, specialized like any other, and the rest are returned as decls.
+    private func layoutDecls() -> [NOIRDecl] {
+        let zero = Span(startOffset: -1, endOffset: -1, map: nil)
+        var known = Set<String>()
+        for d in module.decls {
+            switch d {
+            case .structDecl(let s): known.insert(s.name)
+            case .enumDecl(let e): known.insert(e.name)
+            case .classDecl(let c): known.insert(c.name)
+            case .actorDecl(let a): known.insert(a.name)
+            default: break
+            }
+        }
+        var decls: [NOIRDecl] = []
+        for l in imported?.layouts ?? [] where !known.contains(l.name) {
+            let params = l.generics.map { NOIRGenericParam(name: $0, bounds: []) }
+            func fields(_ group: Int) -> [NOIRField] {
+                guard group < l.fields.count else { return [] }
+                return zip(l.fieldNames[group], l.fields[group]).map {
+                    NOIRField(name: $0, type: $1, isMutable: true, span: zero)
+                }
+            }
+            let decl: NOIRDecl
+            switch l.kind {
+            case .enum_:
+                let cases = l.caseNames.enumerated().map { NOIREnumCase(name: $0.element, fields: fields($0.offset), span: zero) }
+                let e = NOIREnum(name: l.name, generics: params, cases: cases, methods: [], span: zero)
+                decl = .enumDecl(e)
+                if !params.isEmpty { genericEnums[l.name] = e }
+            case .class_:
+                let c = NOIRClass(name: l.name, generics: params, fields: fields(0), methods: [], span: zero)
+                decl = .classDecl(c)
+                if !params.isEmpty { genericClasses[l.name] = c }
+            default:
+                let st = NOIRStruct(name: l.name, generics: params, fields: fields(0), methods: [], span: zero)
+                decl = .structDecl(st)
+                if !params.isEmpty { genericStructs[l.name] = st }
+            }
+            if params.isEmpty { decls.append(decl) } else { baseKind[l.name] = l.kind }
+        }
+        return decls
+    }
+
+    // The dictionary of `symbol` at concrete `typeArgs`, and the dictionaries, types and descriptors it reaches. The
+    // types go through `resolveType`, so a type this module never named gets specialized like one it did.
+    private func requestDictionary(_ symbol: String, _ typeArgs: [Type]) {
+        let key = dictionaryKey(symbol, typeArgs)
+        guard requestedDictionaries.insert(key).inserted, let recipe = importedRecipes[symbol] else { return }
+        let subst = Dictionary(uniqueKeysWithValues: zip(recipe.generics, typeArgs))
+        let needs: [DictionaryInstance.Need] = recipe.needs.map { need in
+            switch need {
+            case .object(let t): return .object(resolveType(t, subst))
+            case .arrayBuffer(let e): return .arrayBuffer(element: resolveType(e, subst))
+            case .box(let t): return .box(resolveType(t, subst))
+            case .callee(let callee, let args):
+                let resolved = args.map { resolveType($0, subst) }
+                requestDictionary(callee, resolved)
+                return .dictionary(key: dictionaryKey(callee, resolved))
+            }
+        }
+        dictionaries[key] = DictionaryInstance(typeArgs: typeArgs, bounds: recipe.bounds, needs: needs)
     }
 
     // MARK: - Specialization
@@ -222,7 +301,6 @@ private final class Monomorphizer {
         let kind: StmtKind
         switch st.kind {
         case .letBinding(let n, let m, let v):    kind = .letBinding(name: n, isMutable: m, value: rewriteExpr(v, s))
-        case .spawnLet(let n, let v, let rt):     kind = .spawnLet(name: n, value: rewriteExpr(v, s), resultType: resolveType(rt, s))
         case .assign(let t, let v):               kind = .assign(target: rewriteExpr(t, s), value: rewriteExpr(v, s))
         case .compoundAssign(let t, let v):       kind = .compoundAssign(target: rewriteExpr(t, s), value: rewriteExpr(v, s))
         case .ret(let e):                         kind = .ret(e.map { rewriteExpr($0, s) })
@@ -254,6 +332,9 @@ private final class Monomorphizer {
         case .enumInit(let typeName, let caseName, let args):
             kind = .enumInit(typeName: namedName(newType) ?? typeName, caseName: caseName, args: rewriteArgs(args, s))
         case .methodCall(let recv, let method, let args):
+            if case .generic(let base, let typeArgs) = recv.type, importedRecipes["m:\(base):\(method)"] != nil {
+                requestDictionary("m:\(base):\(method)", typeArgs.map { resolveType($0, s) })
+            }
             kind = .methodCall(receiver: rewriteExpr(recv, s), method: method, args: args.map { rewriteExpr($0, s) })
         case .call(let callee, let args, let typeArgs):
             let rArgs = typeArgs.map { resolveType($0, s) }
@@ -266,6 +347,7 @@ private final class Monomorphizer {
                 let newCallee = NOIRExpr(type: .void, span: callee.span, kind: .varRef(sn))
                 kind = .call(callee: newCallee, args: rewriteArgs(args, s), typeArgs: [])
             } else {
+                if case .varRef(let fname) = callee.kind, importedRecipes[fname] != nil { requestDictionary(fname, rArgs) }
                 kind = .call(callee: rewriteExpr(callee, s), args: rewriteArgs(args, s), typeArgs: rArgs)
             }
         case .binary(let op, let l, let r):
@@ -286,6 +368,9 @@ private final class Monomorphizer {
             let tn = namedName(rty) ?? "<unresolved>"
             let callee = NOIRExpr(type: .void, span: e.span, kind: .varRef("\(tn).\(method)"))
             kind = .call(callee: callee, args: args.map { NOIRArg(label: nil, value: rewriteExpr($0, s)) }, typeArgs: [])
+        case .taskStart(let binder, let make, let call, let fulfill):
+            kind = .taskStart(binder: binder, make: rewriteExpr(make, s), call: rewriteExpr(call, s),
+                              fulfill: rewriteExpr(fulfill, s))
         }
         return NOIRExpr(type: newType, span: e.span, kind: kind)
     }

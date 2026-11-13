@@ -7,7 +7,7 @@ on its own terms.
 
 **Decisions (2026-08-03).** One pre-tested `while` loop (no `loop`/`repeat` alternate form);
 `break` + `continue` (innermost only, no labels); `for … in` deferred until a Range/iterator
-surface exists; spawn-in-loop joins **per-iteration** for now, until `fiber let` is removed.
+surface exists; a fiber or task started in a loop has no per-iteration join (below).
 Keywords added: **`while`, `break`, `continue`**.
 
 Guiding principle (from `syntax.md`): **one canonical way to write each thing.** Resist a second
@@ -74,8 +74,7 @@ Everything below assumes this proposal; alternatives are in **Open questions**.
 ### Concurrency inside a loop
 
 A fiber or task started in a loop body has no join tied to the iteration (`concurrency.md` §8). `fiber f(i)`
-overlaps across iterations, and fan-out is an array of tasks joined after the loop. Until `fiber let` is
-removed, its binding joins at the back-edge, at `break`, at `continue` and at the end of its block.
+overlaps across iterations, and fan-out is an array of tasks joined after the loop.
 
 ## Sema / typing
 

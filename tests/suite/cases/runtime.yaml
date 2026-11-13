@@ -280,6 +280,46 @@ cases:
     expect:
       stdout: "1250025000\n5000050000\n20000100000\n45000150000\n"
 
+  # The stack counters (task 104): the same growth, with its moves counted and printed at exit.
+  - name: stack-stats
+    fixture: tests/fixtures/stack_growth
+    run_settings:
+      stack_stats: 1
+    expect:
+      stdout: "1250025000\n5000050000\n20000100000\n45000150000\n"
+    stderr_match:
+      - pattern: "nomu-stacks: moves="
+        min: 1
+        max: 1
+      - pattern: " grown=0 "
+        max: 0
+
+  # Stacks shrink at a major collection: fibers that grew and then sleep shallow come back smaller,
+  # their frames' objects intact (task 104).
+  - name: stack-shrink
+    fixture: tests/fixtures/stack_shrink
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "200010000\n800020000\n3200040000\n"
+    carriers:
+      - 1
+      - 4
+
+  # The same with fibers parked in channel operations, whose waiters the channel's queues point at: three
+  # receivers on one channel, two senders on another, and a task join (task 104).
+  - name: stack-shrink-chan
+    fixture: tests/fixtures/stack_shrink_chan
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "1450045006\n200010000\n800020000\n16\n450015005\n"
+    carriers:
+      - 1
+      - 4
+
   # The collector's recorder reports through the handler when `gc.record` is on.
   - name: crash-gc-record
     fixture: tests/fixtures/crash_segv
@@ -293,3 +333,549 @@ cases:
       - pattern: "nomu-crash: end"
         min: 1
     carriers: []
+
+  # Channels (task 102): the runtime core under the prelude's `Channel<T>`. The stack-move matrix runs
+  # `channel_values` compiled once across the collectors; `channel_local` declares its own channel type, so its
+  # methods are specialized. These run both on several carriers and check the faults.
+  - name: channel-values-carriers
+    fixture: tests/fixtures/stack_move_matrix/channel_values
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 4
+
+  # Stop-the-world under a mixed load (task 235.6): fibers, channels and actors moving managed values on every
+  # carrier count while collections run, every 4 KiB a carrier allocates, at each minor collection, and with
+  # stacks moved at every resume.
+  - name: sched-mixed-load
+    fixture: tests/fixtures/sched_mixed_load
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+      - 8
+    iterations: 2
+    full_iterations: 10
+    collections:
+      - min: 1
+
+  - name: sched-mixed-load-nursery
+    fixture: tests/fixtures/sched_mixed_load
+    run_settings:
+      nursery_blocks: 16
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+      - 8
+    iterations: 2
+    full_iterations: 10
+    collections:
+      - kind: minor
+        min: 1
+
+  - name: sched-mixed-load-stack-move
+    fixture: tests/fixtures/sched_mixed_load
+    run_settings:
+      gc_stress_bytes: 65536
+      stack_move: 1
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+      - 8
+    iterations: 2
+    full_iterations: 10
+    collections:
+      - min: 1
+
+  - name: channel-local
+    fixture: tests/fixtures/channel_local
+    compile_args:
+      - "--allow-core-import"
+    run_settings:
+      gc_stress_bytes: 4096
+      stack_move: 1
+    expect:
+      stdout: "bad 0\n"
+    collections:
+      - min: 100
+
+  - name: channel-local-release
+    fixture: tests/fixtures/channel_local
+    compile_args:
+      - "--allow-core-import"
+    compile_settings:
+      optimize: true
+    run_settings:
+      gc_stress_bytes: 4096
+      stack_move_checks: 1
+    expect:
+      stdout: "bad 0\n"
+    collections:
+      - min: 100
+
+  - name: channel-local-carriers
+    fixture: tests/fixtures/channel_local
+    compile_args:
+      - "--allow-core-import"
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 4
+
+  # A mailbox fiber parked on a channel inside a handler: its carrier keeps the old lock order.
+  - name: channel-actor
+    fixture: tests/fixtures/channel_actor
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+      - 4
+
+  # `Task<T>` from the stdlib, before the `task` keyword: one result stored once and read by repeated joins,
+  # by joins parked before it is stored, and by joins after; a managed result across collections; fan-out.
+  - name: task-library
+    fixture: tests/fixtures/task_library
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "repeat 49 49\nwaiters 648 0\nlate 25 0\nmanaged 4 42\nfanout 328350 0\n"
+    carriers:
+      - 1
+      - 4
+    iterations: 2
+    full_iterations: 10
+    collections:
+      - min: 1
+
+  - name: task-library-nursery
+    fixture: tests/fixtures/task_library
+    run_settings:
+      nursery_blocks: 16
+    expect:
+      stdout: "repeat 49 49\nwaiters 648 0\nlate 25 0\nmanaged 4 42\nfanout 328350 0\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - kind: minor
+        min: 1
+
+  - name: task-library-stack-move
+    fixture: tests/fixtures/task_library
+    run_settings:
+      gc_stress_bytes: 65536
+      stack_move: 1
+    expect:
+      stdout: "repeat 49 49\nwaiters 648 0\nlate 25 0\nmanaged 4 42\nfanout 328350 0\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - min: 1
+
+  # `task f(x)`: arguments evaluated at the site, repeated joins, joins from several fibers, a void task, a managed
+  # result across collections, a task returned from its starter, fan-out over an array, and tasks inside tasks.
+  - name: task-keyword
+    fixture: tests/fixtures/task_keyword
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "repeat 49 49\neager 9 100\nmethod 42 0\nvoid 11 0\njoiners 648 81\nmanaged 42 48\nreturned 42 0\nfanout 328350 0\ntree 127 0\n"
+    carriers:
+      - 1
+      - 4
+    iterations: 2
+    full_iterations: 10
+    collections:
+      - min: 1
+
+  - name: task-keyword-nursery
+    fixture: tests/fixtures/task_keyword
+    run_settings:
+      nursery_blocks: 16
+    expect:
+      stdout: "repeat 49 49\neager 9 100\nmethod 42 0\nvoid 11 0\njoiners 648 81\nmanaged 42 48\nreturned 42 0\nfanout 328350 0\ntree 127 0\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - kind: minor
+        min: 1
+
+  - name: task-keyword-stack-move
+    fixture: tests/fixtures/task_keyword
+    run_settings:
+      gc_stress_bytes: 65536
+      stack_move: 1
+    expect:
+      stdout: "repeat 49 49\neager 9 100\nmethod 42 0\nvoid 11 0\njoiners 648 81\nmanaged 42 48\nreturned 42 0\nfanout 328350 0\ntree 127 0\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - min: 1
+
+  # `task` inside generic functions specialized per use. A compiled-once generic body cannot start a fiber yet.
+  - name: task-generic
+    fixture: tests/fixtures/task_generic
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "42\n7 seven\neight\n3\n"
+    carriers:
+      - 1
+      - 4
+
+  - name: task-not-call
+    fixture: tests/fixtures/task_not_call
+    compile:
+      expect_error: "'task' takes a call"
+
+  - name: task-not-shareable
+    fixture: tests/fixtures/task_not_shareable
+    compile:
+      expect_error: "type 'Box' is not shareable, so it cannot be passed to a 'task'"
+
+  - name: task-result-not-shareable
+    fixture: tests/fixtures/task_result_not_shareable
+    compile:
+      expect_error: "type 'Box' is not shareable, so a 'task' cannot return it"
+
+  - name: task-unused
+    fixture: tests/fixtures/task_unused
+    compile:
+      expect_error: "the result of 'task' is unused; use 'fiber' to start a fiber with no result"
+
+  - name: select-basic
+    fixture: tests/fixtures/select_basic
+    expect:
+      stdout: "ready 7\ndefault 1\nsent 5\ngot 5\nclosed 0\nwoke 42\ndrained 4950\n"
+    carriers:
+      - 1
+      - 4
+    iterations: 2
+    full_iterations: 10
+
+  - name: select-basic-stack-move
+    fixture: tests/fixtures/select_basic
+    run_settings:
+      stack_move: 1
+    expect:
+      stdout: "ready 7\ndefault 1\nsent 5\ngot 5\nclosed 0\nwoke 42\ndrained 4950\n"
+    carriers:
+      - 1
+      - 4
+
+  - name: select-stress
+    fixture: tests/fixtures/select_stress
+    run_settings:
+      gc_stress_bytes: 65536
+    expect:
+      stdout: "fan-in 7998000 0\nping-pong 3998000 0\nfair 1 2000\n"
+    carriers:
+      - 1
+      - 4
+    iterations: 2
+    full_iterations: 10
+    collections:
+      - min: 1
+
+  - name: select-stress-nursery
+    fixture: tests/fixtures/select_stress
+    run_settings:
+      nursery_blocks: 16
+    expect:
+      stdout: "fan-in 7998000 0\nping-pong 3998000 0\nfair 1 2000\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - kind: minor
+        min: 1
+
+  - name: select-stress-stack-move
+    fixture: tests/fixtures/select_stress
+    run_settings:
+      gc_stress_bytes: 65536
+      stack_move: 1
+    expect:
+      stdout: "fan-in 7998000 0\nping-pong 3998000 0\nfair 1 2000\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - min: 1
+
+  - name: select-generic
+    fixture: tests/fixtures/select_generic
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "specialized 3\nerased 4\nclosed none\nerased managed 9 late\nerased two cases 10 late\nspecialized managed 8 late\noffer 1 0\noffered\n"
+    carriers:
+      - 1
+      - 4
+    collections:
+      - min: 1
+
+  - name: select-generic-stack-move
+    fixture: tests/fixtures/select_generic
+    run_settings:
+      gc_stress_bytes: 65536
+      stack_move: 1
+    expect:
+      stdout: "specialized 3\nerased 4\nclosed none\nerased managed 9 late\nerased two cases 10 late\nspecialized managed 8 late\noffer 1 0\noffered\n"
+    carriers:
+      - 1
+      - 4
+
+  - name: select-after
+    fixture: tests/fixtures/select_after
+    compile_settings:
+      rt_prelude: true
+    expect:
+      stdout: "timeout 5\nvalue 7\nzero 0\nshorter 3\nlost timers 2000\npending 0\nworkers 5050\n"
+    carriers:
+      - 1
+      - 4
+    iterations: 2
+    full_iterations: 5
+
+  - name: select-after-stack-move
+    fixture: tests/fixtures/select_after
+    compile_settings:
+      rt_prelude: true
+    run_settings:
+      stack_move: 1
+    expect:
+      stdout: "timeout 5\nvalue 7\nzero 0\nshorter 3\nlost timers 2000\npending 0\nworkers 5050\n"
+    carriers:
+      - 1
+      - 4
+
+  - name: select-read-line
+    fixture: tests/fixtures/select_read_line
+    compile_settings:
+      rt_prelude: true
+    stdin_file: tests/input/select_read_line.txt
+    stdin_after: "ready\n"
+    expect:
+      stdout: "timeout\nwaiters 0\nwoke 'first'\nbuffered 'second'\n"
+    carriers:
+      - 1
+      - 4
+    iterations: 3
+
+  - name: select-read-line-stack-move
+    fixture: tests/fixtures/select_read_line
+    compile_settings:
+      rt_prelude: true
+    run_settings:
+      stack_move: 1
+    stdin_file: tests/input/select_read_line.txt
+    stdin_after: "ready\n"
+    expect:
+      stdout: "timeout\nwaiters 0\nwoke 'first'\nbuffered 'second'\n"
+    carriers:
+      - 1
+      - 4
+
+  - name: select-send-closed
+    fixture: tests/fixtures/select_send_closed
+    expect:
+      stdout: "waiting\n"
+      signal: SIGABRT
+    stderr_match:
+      - pattern: "nomu: send on a closed channel"
+        min: 1
+
+  - name: select-empty
+    fixture: tests/fixtures/select_empty
+    compile:
+      expect_error: "a 'select' needs at least one case"
+
+  - name: select-not-channel
+    fixture: tests/fixtures/select_not_channel
+    compile:
+      expect_error: "a 'select' case is a channel's 'receive()' or 'send(_)', 'after(ms)' or 'readLine()'"
+
+  - name: select-send-binding
+    fixture: tests/fixtures/select_send_binding
+    compile:
+      expect_error: "a 'send' case has no value to bind"
+
+  - name: select-two-defaults
+    fixture: tests/fixtures/select_two_defaults
+    compile:
+      expect_error: "a 'select' has one 'default'"
+
+  - name: fiber-deadlock
+    fixture: tests/fixtures/fiber_deadlock
+    expect:
+      stdout: "waiting\n"
+      exit_code: 2
+    stderr_match:
+      - pattern: "fatal error: all fibers are asleep - deadlock!"
+        min: 1
+        max: 1
+      - pattern: "fiber 1 [task join]:"
+        min: 1
+        max: 1
+      - pattern: " [chan receive]:"
+        min: 2
+        max: 2
+      - pattern: " [select]:"
+        min: 1
+        max: 1
+    carriers:
+      - 1
+      - 4
+    iterations: 2
+
+  - name: fiber-no-deadlock
+    fixture: tests/fixtures/fiber_no_deadlock
+    expect:
+      stdout: "timer\n150\n"
+    carriers:
+      - 1
+      - 4
+
+  - name: fiber-sigquit
+    fixture: tests/fixtures/fiber_sigquit
+    compile_settings:
+      rt_prelude: true
+    expect:
+      stdout: "dumping\n"
+      exit_code: 2
+    stderr_match:
+      - pattern: "nomu-crash: signal: SIGQUIT (3)"
+        min: 1
+        max: 1
+      - pattern: "fiber 1 [running]:"
+        min: 1
+        max: 1
+      - pattern: " [chan receive]:"
+        min: 1
+        max: 1
+      - pattern: " [sleep]:"
+        min: 1
+        max: 1
+    carriers:
+      - 1
+      - 4
+
+  - name: fiber-traceback-all
+    fixture: tests/fixtures/fiber_traceback_all
+    run_settings:
+      traceback: all
+    expect:
+      stdout: "faulting\n"
+      signal: SIGABRT
+    stderr_match:
+      - pattern: "nomu: send on a closed channel"
+        min: 1
+      - pattern: " [chan receive]:"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: end"
+        min: 1
+        max: 1
+
+  - name: fiber-leak
+    fixture: tests/fixtures/fiber_leak
+    run_settings:
+      leak_report: 1
+    expect:
+      stdout: "done\n"
+    stderr_match:
+      - pattern: "nomu: leaked fibers"
+        min: 1
+        max: 1
+      - pattern: "(leaked)]:"
+        min: 5
+        max: 5
+      - pattern: " [chan receive (leaked)]:"
+        min: 3
+        max: 3
+      - pattern: " [select (leaked)]:"
+        min: 1
+        max: 1
+      - pattern: " [task join (leaked)]:"
+        min: 1
+        max: 1
+    carriers:
+      - 1
+      - 4
+    iterations: 3
+
+  - name: fiber-leak-stack-move
+    fixture: tests/fixtures/fiber_leak
+    run_settings:
+      leak_report: 1
+      stack_move: 1
+      gc_stress_bytes: 65536
+    expect:
+      stdout: "done\n"
+    stderr_match:
+      - pattern: "(leaked)]:"
+        min: 5
+        max: 5
+    carriers:
+      - 1
+      - 4
+
+  - name: fiber-no-leak-report
+    fixture: tests/fixtures/fiber_leak
+    expect:
+      stdout: "done\n"
+    stderr_match:
+      - pattern: "leaked"
+        max: 0
+    carriers:
+      - 1
+
+  - name: fiber-let-removed
+    fixture: tests/fixtures/fiber_let_removed
+    compile:
+      expect_error: "'fiber let' is replaced by 'task': write 'let x = task f(...)' and read the result with 'x.join()'"
+
+  - name: channel-send-closed
+    fixture: tests/fixtures/channel_send_closed
+    expect:
+      stdout: "closed\n"
+      signal: SIGABRT
+    stderr_match:
+      - pattern: "nomu: send on a closed channel"
+        min: 1
+
+  - name: channel-send-closed-parked
+    fixture: tests/fixtures/channel_send_closed_parked
+    expect:
+      stdout: "closing\n"
+      signal: SIGABRT
+    stderr_match:
+      - pattern: "nomu: send on a closed channel"
+        min: 1
+
+  - name: channel-close-twice
+    fixture: tests/fixtures/channel_close_twice
+    expect:
+      stdout: "closed\n"
+      signal: SIGABRT
+    stderr_match:
+      - pattern: "nomu: close of a closed channel"
+        min: 1

@@ -1,5 +1,5 @@
 // More roots in one collection than the collector's old fixed root buffer held (8,192). Three fibers each
-// recurse 60 frames deep holding 48 Boxes per frame across the recursive call; at its bottom each fiber spawns
+// recurse 60 frames deep holding 48 Boxes per frame across the recursive call; at its bottom each fiber starts
 // the next and parks at the join with every frame live, and the last allocates enough garbage to force
 // several collections. One walk then covers 8,640 live Boxes across three stacks (each about a third of a
 // 128 KB fiber stack). Every root must be found and fixed up, so each frame reads back exactly the values it
@@ -72,8 +72,8 @@ fun deep(level: Int, d: Int) -> Int {
   if d > 0 {
     r = deep(level, d - 1)
   } else if level > 0 {
-    fiber let x = deep(level - 1, 59)    // park at the join with this fiber's 60 frames live
-    r = x
+    let x = task deep(level - 1, 59)    // park at the join with this fiber's 60 frames live
+    r = x.join()
   } else {
     r = churn(30000000)                  // 480 MB of garbage: several collections with all three stacks live
   }

@@ -109,6 +109,11 @@ and matrix runs exist ad hoc. This task folds them into one harness.
 
 ### Remaining open axes (later phases)
 
+- **A case that outlived its timeout.** Under a heap-corrupting runtime bug (found in 104.4), four GC fixtures
+  faulted inside `malloc` and stayed alive past their per-case cap; samples showed the fault handler in
+  `write(2)` to stderr. The suite stopped only at its 300 s deadline ("a case cap failed to fire"). Find why
+  the cap's kill did not end them, and whether the harness stops draining a case's stderr before the kill.
+
 - **Suite migration to 1 dir == 1 module** _(folded in from the old [100](100-modules.md) §100.3.8)._
   **Pass 1 done; pass 2 reopened by the leaf-module invariant.** Pass 1: every flat fixture became its own
   module directory with a `main.nomu`, and both `examples/` and `tests/fixtures/` gained package manifests

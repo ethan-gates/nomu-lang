@@ -139,8 +139,10 @@ What the report and the handler hold to, so none of these is locked out:
   fiber trampoline (`rtFiberTrampoline`) are global symbols, since the link strips local ones and those frames
   took a neighbour's name. Tested in `build_tests` (`testRunSymbolizesCrash`). Keeping debug info by build ID
   is not needed while `nomu run` holds the binary; it moves to scenario 2 below.
-- Later: `nomu tool symbolize` for scenario 2, with debug info kept by build ID (the host cache) and remote
-  symbol stores; handler chaining.
+- `nomu tool symbolize <binary> [report]` is built for a binary at hand ([250](250-fiber-task-surface.md)
+  250.6.5): it checks the report's build ID and names frames from the binary's dSYM or objects.
+- Later: the rest of scenario 2, debug info kept by build ID (the host cache) and remote symbol stores, so the
+  binary argument becomes optional; handler chaining.
 
 ## Refs
 

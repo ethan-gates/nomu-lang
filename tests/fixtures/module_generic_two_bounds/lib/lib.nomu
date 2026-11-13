@@ -1,0 +1,12 @@
+package interface A {
+  fun a() -> Int
+}
+package interface B {
+  fun b() -> Int
+}
+fun inner<T: A & B>(x: T) -> Int {
+  return x.a() + x.b()
+}
+package fun outer<T: A & B, U: A>(x: T, y: U) -> Int {
+  return inner(x) + y.a()
+}

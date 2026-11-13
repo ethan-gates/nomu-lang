@@ -162,8 +162,9 @@ join the link line beside the emitted object. The alternative (codegen-emitted i
 build step) is recorded as the rejected option.
 
 **Built (arm64 floor + integration).** `src/runtime/embedded/rtasm_arm64.s` carries `rtSwitch(from, to)`
-and `rtFiberInit(ctx, stackTop, entry, arg)` + the fresh-fiber trampoline (saved set: x19–x28, fp, lr, sp,
-d8–d15 — a 168-byte context buffer, the layout the GC parked-fiber walk will read). The `.s` is embedded
+and `rtFiberInit(ctx, stackTop, entry, arg)` + the fresh-fiber trampoline (saved set: x19–x28, fp, lr and
+d8–d15, pushed in a 224-byte block on the switched-out stack; the context is one word, the saved SP, and the layout is
+what the GC's parked-fiber walk and the stack mover read). The `.s` is embedded
 in `nomuc` (`EmbeddedSources.rtAsmArm64`), assembled by `cc` and archived into `libnomuruntime.a` beside
 the C floor, so its symbols resolve in every emitted binary. Isolation-tested first, as §6 requires: the
 C harness `rt_asm_selftest` seeds a fiber, switches in, the fiber records its argument and switches back,
@@ -310,7 +311,7 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
      reads its byte → sum 36. **New substrate (128.1.7):** `Runtime.kqueue` / `kevent` / `pipe` / `readFd` /
      `writeFd` — libSystem externs (§3.3), subset-legal (`__sys`). Blocking-syscall offload stays deferred
      (as on the C side). Both fixtures are NoGC-only (raw carriers + feeder threads) and watchdogged.
-8. **128.1.8 — actor mailbox + mailbox-fiber pool. Built.** The fire-and-forget message-send model
+8. **128.1.8 — actor mailbox + mailbox-fiber pool. Built.** (Superseded in part by task 235.5: scheduled mailboxes now wait in the run queues and a mailbox's messages need no lock; `concurrency.md` §9 has the current design.) The fire-and-forget message-send model
    (`concurrency.md` §9), self-hosted over the 128.1.6/128.1.7 machinery in
    `tests/fixtures/scheduler_actor.nomu` (`tools/scheduler-actor.sh`), mirroring the C `rt_actor_send` /
    `rt_mailbox_pool` oracle:

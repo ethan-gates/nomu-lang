@@ -150,7 +150,11 @@ enum GenericInference {
         // the field has unbound parameters it waits for the other fields.
         var irArgs: [NOIRArg?] = Array(repeating: nil, count: shape.fields.count)
         func check(_ i: Int, _ f: VarField, deferring: Bool) {
+            // The field's type is in the constructed type's parameters, whose `shared` flags were checked
+            // where it was declared; the arguments below are this body's and are checked.
+            let savedCheck = s.checksSharedArgs; s.checksSharedArgs = false
             let fieldTy = s.resolve(f.type)
+            s.checksSharedArgs = savedCheck
             let known = s.substitute(fieldTy, subst)
             var holes: [String: Type] = [:]
             for g in shape.generics where subst[g.name] == nil { holes[g.name] = .error }
@@ -201,6 +205,10 @@ enum GenericInference {
             for b in g.bounds where inferred != .error && !typeConforms(&s, inferred, to: b.name) {
                 s.diags.error("type '\(inferred)' does not conform to '\(b.name)', required by type parameter '\(g.name)' of '\(owner)'", at: span)
             }
+            if g.isShared && inferred != .error && !s.isShareable(inferred) {
+                let name = ExternalName.decode(owner)?.name ?? owner
+                s.diags.error("type '\(inferred)' is not shareable, but type parameter '\(g.name)' of '\(name)' is declared 'shared'", at: span)
+            }
         }
         return generics.map { subst[$0.name] ?? .error }
     }
@@ -223,7 +231,8 @@ enum GenericInference {
     // substituted to the concrete arguments. Mirrors `genericMemberType` for fields (task 151).
     static func genericMethodSig(_ s: inout Sema, _ base: String, _ args: [Type], _ m: FuncDecl) -> (params: [Type], ret: Type) {
         let gens = genericParamsOf(&s, base)
-        let saved = s.genericScope; s.genericScope = Set(gens.map(\.name)); defer { s.genericScope = saved }
+        let saved = s.genericScope, savedCheck = s.checksSharedArgs; s.genericScope = Set(gens.map(\.name)); s.checksSharedArgs = false
+        defer { s.genericScope = saved; s.checksSharedArgs = savedCheck }
         let subst = genericSubst(&s, base, args)
         return (m.params.map { s.substitute(s.resolve($0.type), subst) }, s.substitute(s.resolve(m.returnType), subst))
     }
@@ -235,7 +244,8 @@ enum GenericInference {
             s.diags.error("type '\(base)' has no field '\(field)'", at: span)
             return .error
         }
-        let saved = s.genericScope; s.genericScope = Set(shape.generics.map(\.name)); defer { s.genericScope = saved }
+        let saved = s.genericScope, savedCheck = s.checksSharedArgs; s.genericScope = Set(shape.generics.map(\.name)); s.checksSharedArgs = false
+        defer { s.genericScope = saved; s.checksSharedArgs = savedCheck }
         var subst: [String: Type] = [:]
         for (p, a) in zip(shape.generics, args) { subst[p.name] = a }
         return s.substitute(s.resolve(f.type), subst)

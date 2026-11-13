@@ -1,0 +1,33 @@
+package class Blob {
+  var n: Int
+}
+fun churn(i: Int) -> Int {
+  var t = 0
+  var k = 0
+  while k < 25 {
+    let b = Blob(n: i + k)
+    t = t + b.n % 3
+    k = k + 1
+  }
+  if i % 50 == 0 {
+    sleep(1)
+  }
+  return t
+}
+// Holds its argument across stops: a heap address here would go stale when the object moves.
+fun held<T>(x: T, i: Int) -> T {
+  let t = churn(i)
+  if t < 0 {
+    churn(t)
+  }
+  return x
+}
+package class Cell<T> {
+  var value: T
+  fun fetch(i: Int) -> T {
+    return held(value, i)
+  }
+}
+package fun fetchField<T>(c: Cell<T>, i: Int) -> T {
+  return held(c.value, i)
+}

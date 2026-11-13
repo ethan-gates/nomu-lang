@@ -383,10 +383,41 @@ enum ManagedBufferIntrinsics {
             guard let hdr = requireRefArg(&s, header, kind: "Header", "headerRef", span) else { return err(span) }
             guard PointerIntrinsics.checkArgLabels(&s, args, [], "ManagedBuffer.headerRef", span) else { return err(span) }
             return s.ptrIntrinsic("__managedBufferHeaderRef", hdr, [recv], span)
+        // A channel's operations, on its `ManagedBuffer<ChannelState, ChannelSlot<T>>` (`runtime/channel.nomu`).
+        // `core` is importable only from `std`, so these are the stdlib's: `Channel<T>` wraps them.
+        // `channelFulfill` and `channelAwait` are the one-shot pair under `Task<T>`: store once and close, and wait
+        // for the close and copy the value out without taking it.
+        case "channelSend", "channelReceive", "channelClose", "channelFulfill", "channelAwait":
+            guard let value = channelElement(header, element) else {
+                s.diags.error("'ManagedBuffer.\(method)' needs a 'ManagedBuffer<ChannelState, ChannelSlot<T>>'", at: span)
+                return err(span)
+            }
+            switch method {
+            case "channelSend", "channelFulfill":
+                guard PointerIntrinsics.checkArgLabels(&s, args, [nil], "ManagedBuffer.\(method)", span) else { return err(span) }
+                let v = NOIRGen.coerce(&s, NOIRGen.checkExpr(&s, args[0].value, expected: value), to: value)
+                NOIRGen.checkAssignable(&s, v.type, to: value, role: "argument", at: span)
+                return s.ptrIntrinsic("__\(method)", .void, [recv, v], span)
+            case "channelReceive", "channelAwait":
+                guard PointerIntrinsics.checkArgLabels(&s, args, [], "ManagedBuffer.\(method)", span) else { return err(span) }
+                let option = s.enums["Option"] != nil ? "Option" : (s.externalTypeKey("Option", at: span) ?? "Option")
+                return s.ptrIntrinsic("__\(method)", .generic(base: option, args: [value]), [recv], span)
+            default:
+                guard PointerIntrinsics.checkArgLabels(&s, args, [], "ManagedBuffer.channelClose", span) else { return err(span) }
+                return s.ptrIntrinsic("__channelClose", .void, [recv], span)
+            }
         default:
             s.diags.error("value of type 'ManagedBuffer' has no method '\(method)'", at: span)
             return err(span)
         }
+    }
+
+    // The value type `T` of a channel's buffer, `ManagedBuffer<ChannelState, ChannelSlot<T>>`, or nil.
+    private static func channelElement(_ header: Type?, _ element: Type?) -> Type? {
+        guard case .named(let h, _)? = header, (ExternalName.decode(h)?.name ?? h) == "ChannelState",
+              case .generic(let e, let args)? = element, (ExternalName.decode(e)?.name ?? e) == "ChannelSlot",
+              args.count == 1 else { return nil }
+        return args[0]
     }
 
     // A reference accessor is well-formed only when the relevant type argument is a reference type (class /

@@ -1,0 +1,741 @@
+// Channels: the untyped core under the stdlib's `Channel<T>` (`design/internals/concurrency.md` §4).
+// Part of the `runtime` module; see README.md.
+//
+// A channel is a `ManagedBuffer<ChannelState, ChannelSlot<T>>`: the collector scans and moves it as any
+// buffer. The core never learns `T`: each call gets the value's address and its value witness, whose size is
+// the element stride (`ChannelSlot<T>` keeps every element a whole number of 8-byte slots) and whose POD flag
+// says whether a slot holds references.
+//
+// Layouts (byte offsets):
+//   Buffer: 0 type-id · 8 capacity · 16 state · 80 elements (capacity × size)
+//   State (ChannelState, at +16): 0 lock (a futex mutex word) · 8 head (oldest buffered element) · 16 count
+//         · 24 closed · 32 receivers head · 40 receivers tail · 48 senders head · 56 senders tail
+//   Waiter (56B, in the caller's frame, so no channel operation allocates): 0 shadow-prev · 8 slot · 16 vwt
+//         (0..23 is the shadow node that roots the slot while parked) · 24 next · 32 fiber · 40 result
+//         (1 the value moved, 0 the channel closed) · 48 select record, or null
+//   A `select`'s waiters (64B) are off the stack, one per channel case, with the case's index at 56 (select
+//   below). Waiters of one `select` share its record, and a waker takes a select waiter only by claiming the
+//   record; one that loses the claim drops the waiter and looks at the next.
+//
+// The waker does all the work: it copies the value to or from a parked waiter's slot, sets the result, and
+// readies it. A waiter touches only its own waiter after it wakes, so the channel may move while it is
+// parked. Its stack may move too, at the resume, so it finds its waiter again by its offset from the
+// stack's top. Each slot is rooted through the fiber's shadow list while parked, since the stack maps record
+// neither a destination not yet written nor a source already passed.
+//
+// Locks: a parker holds only the channel's lock, and its carrier releases it once the fiber's context is saved
+// (nomuSchedParkReleasing), so a waker, which must take that lock to find the fiber, cannot resume it early. A
+// waker readies the fiber under the scheduler lock after releasing the channel's, so the two are never nested.
+
+// Take the channel's lock. Its holder never blocks while holding it, so a contended lock is usually free within
+// a few hundred nanoseconds: spin on the word before sleeping in the futex mutex, as Go's runtime lock does. A
+// sleep costs a system call on each side, which made four senders on one channel twice as slow as Go's.
+let rtChanSpins = 128
+
+fun rtChanLock(st: RawPtr) {
+  let c: Int = st.atomicCas(0, 1, atByteOffset: 0)
+  if c == 0 {
+    return
+  }
+  var i = 0
+  while i < rtChanSpins {
+    let w: Int = st.atomicLoad(fromByteOffset: 0)
+    if w == 0 {
+      let got: Int = st.atomicCas(0, 1, atByteOffset: 0)
+      if got == 0 {
+        return
+      }
+    }
+    i += 1
+  }
+  rtSchedMutexLockAt(st)
+}
+
+fun rtChanState(buf: RawPtr) -> RawPtr {
+  return buf.advanced(by: 16)
+}
+
+fun rtChanSlotAt(buf: RawPtr, index: Int, size: Int) -> RawPtr {
+  return buf.advanced(by: 80 + index * size)
+}
+
+fun rtChanSize(vwt: RawPtr) -> Int {
+  let w: Int = vwt.load(fromByteOffset: 0)
+  return w % 4294967296
+}
+
+fun rtChanIsPod(vwt: RawPtr) -> Bool {
+  let w: Int = vwt.load(fromByteOffset: 8)
+  let flags = w / 4294967296
+  return flags % 2 == 1
+}
+
+// Append `w` to the queue whose head is at `st + at` (and tail at `st + at + 8`).
+fun rtChanEnqueue(st: RawPtr, at: Int, w: RawPtr) {
+  w.store(RawPtr.null, toByteOffset: 24)
+  let tail: RawPtr = st.load(fromByteOffset: at + 8)
+  if tail.isNull {
+    st.store(w, toByteOffset: at)
+  } else {
+    tail.store(w, toByteOffset: 24)
+  }
+  st.store(w, toByteOffset: at + 8)
+}
+
+// Take the first waiter of the queue at `st + at`, or null.
+fun rtChanDequeue(st: RawPtr, at: Int) -> RawPtr {
+  let w: RawPtr = st.load(fromByteOffset: at)
+  if w.isNull {
+    return w
+  }
+  let next: RawPtr = w.load(fromByteOffset: 24)
+  st.store(next, toByteOffset: at)
+  if next.isNull {
+    st.store(RawPtr.null, toByteOffset: at + 8)
+  }
+  return w
+}
+
+// Ready a parked waiter after its result is set, onto this carrier's run queue with no lock. Called without
+// the channel's lock; the waiter's carrier released it after the switch, so its context is saved.
+fun rtChanWake(sched: RawPtr, fib: RawPtr) {
+  rtSchedReadyOn(sched, fib, false)
+  rtSchedWake(sched, false)
+}
+
+// Take the first waiter of the queue at `st + at` that can still be woken, or null. A select waiter is taken
+// by claiming its record, which names the waiter's case as the winner; one already claimed through another
+// channel is dropped. Called holding the channel's lock, which keeps the record alive: its fiber frees it only
+// after taking its waiters out of their queues, under each queue's lock.
+fun rtChanDequeueLive(st: RawPtr, at: Int) -> RawPtr {
+  while true {
+    let w = rtChanDequeue(st, at)
+    if w.isNull {
+      return w
+    }
+    let sel: RawPtr = w.load(fromByteOffset: 48)
+    if sel.isNull {
+      return w
+    }
+    let was: Int = sel.atomicCas(0, 1, atByteOffset: 8)
+    if was == 0 {
+      let index: Int = w.load(fromByteOffset: 56)
+      sel.store(index, toByteOffset: 16)
+      return w
+    }
+  }
+  return RawPtr.null
+}
+
+// Wake a waiter taken by rtChanDequeueLive, given its fiber and select record (read under the channel's lock).
+// A select's fiber parks holding its record's lock, which its carrier releases once the context is saved, so
+// taking that lock first means the fiber is parked.
+fun rtChanWakeTaken(sched: RawPtr, fib: RawPtr, sel: RawPtr) {
+  if sel.isNull == false {
+    rtSchedMutexLockAt(sel)
+    rtSchedMutexUnlockAt(sel)
+  }
+  rtChanWake(sched, fib)
+}
+
+// Park on the channel whose state is `st`, with `w` queued and its slot `slot` holding a value of `vwt`.
+// Called holding the channel's lock; returns the waiter's result, with no lock held.
+fun rtChanPark(sched: RawPtr, st: RawPtr, w: RawPtr, slot: RawPtr, vwt: RawPtr, why: Int, anchorSp: RawPtr,
+               anchorPc: Int) -> Int {
+  let self = rtCurrentFiber()
+  if self.isNull {
+    Runtime.fatal("nomu: a channel operation would block outside a fiber")
+  }
+  rtSchedWaiting(self, why)
+  self.store(st.advanced(by: -16), toByteOffset: 120)     // the channel's buffer
+  w.store(self, toByteOffset: 32)
+  w.store(0, toByteOffset: 40)
+  rtShadowPush(w, slot, vwt)
+  let waiterOff = rtAnchorOffset(w)
+  nomuSchedParkReleasing(sched, st, anchorSp, anchorPc)   // the carrier releases the lock
+  // The stack may have moved at the resume: find the waiter again, and pop its shadow node.
+  let me = rtCurrentFiber()
+  let wn = rtAnchorAt(me, waiterOff)
+  let prev: RawPtr = wn.load(fromByteOffset: 0)
+  me.store(prev, toByteOffset: 24)
+  let result: Int = wn.load(fromByteOffset: 40)
+  return result
+}
+
+// Send the value at `src` (a `vwt` value) on the channel `buf`. `w` is the caller's waiter, used if it blocks.
+fun rtChanSend(sched: RawPtr, buf: RawPtr, src: RawPtr, vwt: RawPtr, w: RawPtr, anchorSp: RawPtr,
+               anchorPc: Int) {
+  let st = rtChanState(buf)
+  let size = rtChanSize(vwt)
+  rtChanLock(st)
+  let closed: Int = st.load(fromByteOffset: 24)
+  if closed != 0 {
+    rtSchedMutexUnlockAt(st)
+    Runtime.fatal("nomu: send on a closed channel")
+  }
+  // A parked receiver takes the value directly.
+  let r = rtChanDequeueLive(st, 32)
+  if r.isNull == false {
+    let dst: RawPtr = r.load(fromByteOffset: 8)
+    dst.copyBytes(from: src, byteCount: size)
+    r.store(1, toByteOffset: 40)
+    let fib: RawPtr = r.load(fromByteOffset: 32)
+    let sel: RawPtr = r.load(fromByteOffset: 48)
+    rtSchedMutexUnlockAt(st)
+    rtChanWakeTaken(sched, fib, sel)
+    return
+  }
+  let cap: Int = buf.load(fromByteOffset: 8)
+  let count: Int = st.load(fromByteOffset: 16)
+  if count < cap {
+    let head: Int = st.load(fromByteOffset: 8)
+    let slot = rtChanSlotAt(buf, (head + count) % cap, size)
+    slot.copyBytes(from: src, byteCount: size)
+    if rtChanIsPod(vwt) == false {
+      rtRememberStore(buf)
+    }
+    st.store(count + 1, toByteOffset: 16)
+    rtSchedMutexUnlockAt(st)
+    return
+  }
+  // Full, or unbuffered with no receiver: wait for a receiver to take the value from `src`.
+  w.store(src, toByteOffset: 8)
+  w.store(RawPtr.null, toByteOffset: 48)
+  rtChanEnqueue(st, 48, w)
+  let result = rtChanPark(sched, st, w, src, vwt, rtWaitChanSend, anchorSp, anchorPc)
+  if result == 0 {
+    Runtime.fatal("nomu: send on a closed channel")
+  }
+}
+
+// Receive into `dst` (zeroed by the caller, a `vwt` value). Returns 1 with a value, or 0 once the channel is
+// closed and drained, leaving `dst` zeroed.
+fun rtChanReceive(sched: RawPtr, buf: RawPtr, dst: RawPtr, vwt: RawPtr, w: RawPtr, anchorSp: RawPtr,
+                  anchorPc: Int) -> Int {
+  let st = rtChanState(buf)
+  let size = rtChanSize(vwt)
+  rtChanLock(st)
+  let count: Int = st.load(fromByteOffset: 16)
+  if count > 0 {
+    let cap: Int = buf.load(fromByteOffset: 8)
+    let head: Int = st.load(fromByteOffset: 8)
+    let slot = rtChanSlotAt(buf, head, size)
+    dst.copyBytes(from: slot, byteCount: size)
+    let pod = rtChanIsPod(vwt)
+    if pod == false {
+      slot.zeroBytes(size)     // the collector must not keep a received value alive
+    }
+    let next = (head + 1) % cap
+    st.store(next, toByteOffset: 8)
+    // The buffer had been full: a parked sender's value takes the freed place at the tail.
+    let s = rtChanDequeueLive(st, 48)
+    if s.isNull {
+      st.store(count - 1, toByteOffset: 16)
+      rtSchedMutexUnlockAt(st)
+      return 1
+    }
+    let ssrc: RawPtr = s.load(fromByteOffset: 8)
+    rtChanSlotAt(buf, (next + count - 1) % cap, size).copyBytes(from: ssrc, byteCount: size)
+    if pod == false {
+      rtRememberStore(buf)
+    }
+    s.store(1, toByteOffset: 40)
+    let sfib: RawPtr = s.load(fromByteOffset: 32)
+    let ssel: RawPtr = s.load(fromByteOffset: 48)
+    rtSchedMutexUnlockAt(st)
+    rtChanWakeTaken(sched, sfib, ssel)
+    return 1
+  }
+  // Empty. On an unbuffered channel a parked sender hands its value over directly.
+  let s = rtChanDequeueLive(st, 48)
+  if s.isNull == false {
+    let ssrc: RawPtr = s.load(fromByteOffset: 8)
+    dst.copyBytes(from: ssrc, byteCount: size)
+    s.store(1, toByteOffset: 40)
+    let sfib: RawPtr = s.load(fromByteOffset: 32)
+    let ssel: RawPtr = s.load(fromByteOffset: 48)
+    rtSchedMutexUnlockAt(st)
+    rtChanWakeTaken(sched, sfib, ssel)
+    return 1
+  }
+  let closed: Int = st.load(fromByteOffset: 24)
+  if closed != 0 {
+    rtSchedMutexUnlockAt(st)
+    return 0
+  }
+  w.store(dst, toByteOffset: 8)
+  w.store(RawPtr.null, toByteOffset: 48)
+  rtChanEnqueue(st, 32, w)
+  return rtChanPark(sched, st, w, dst, vwt, rtWaitChanReceive, anchorSp, anchorPc)
+}
+
+// Close the channel: every parked receiver wakes with no value, and every parked sender faults. Buffered
+// values stay for receivers to drain.
+fun rtChanClose(sched: RawPtr, buf: RawPtr) {
+  let st = rtChanState(buf)
+  rtChanLock(st)
+  let closed: Int = st.load(fromByteOffset: 24)
+  if closed != 0 {
+    rtSchedMutexUnlockAt(st)
+    Runtime.fatal("nomu: close of a closed channel")
+  }
+  st.store(1, toByteOffset: 24)
+  // Take every waiter that can still be woken under the lock, then wake them outside it: a woken waiter
+  // reads only its own waiter.
+  let receivers = rtChanTakeAll(st, 32)
+  let senders = rtChanTakeAll(st, 48)
+  rtSchedMutexUnlockAt(st)
+  rtChanWakeAll(sched, receivers)
+  rtChanWakeAll(sched, senders)
+}
+
+// Empty the queue at `st + at`, returning the waiters that can still be woken as a list through their next
+// links, each with result 0. Called holding the channel's lock.
+fun rtChanTakeAll(st: RawPtr, at: Int) -> RawPtr {
+  var first = RawPtr.null
+  var last = RawPtr.null
+  var w = rtChanDequeueLive(st, at)
+  while w.isNull == false {
+    w.store(0, toByteOffset: 40)
+    w.store(RawPtr.null, toByteOffset: 24)
+    if last.isNull {
+      first = w
+    } else {
+      last.store(w, toByteOffset: 24)
+    }
+    last = w
+    w = rtChanDequeueLive(st, at)
+  }
+  return first
+}
+
+// Wake each waiter of a list rtChanTakeAll made. Its links and record are read before the wake: once ready,
+// the waiter's frame may be reused.
+fun rtChanWakeAll(sched: RawPtr, first: RawPtr) {
+  var w = first
+  while w.isNull == false {
+    let next: RawPtr = w.load(fromByteOffset: 24)
+    let fib: RawPtr = w.load(fromByteOffset: 32)
+    let sel: RawPtr = w.load(fromByteOffset: 48)
+    rtChanWakeTaken(sched, fib, sel)
+    w = next
+  }
+}
+
+// A one-shot channel, the core under the stdlib's `Task<T>` (`design/internals/concurrency.md` §8): one value,
+// stored once, then read by any number of waiters, each getting a copy.
+
+// Store the value at `src` (a `vwt` value) and close the channel, in one step under the lock. Every parked
+// waiter gets its copy and wakes; later waiters read the stored value. Never parks.
+fun rtChanFulfill(sched: RawPtr, buf: RawPtr, src: RawPtr, vwt: RawPtr) {
+  let st = rtChanState(buf)
+  let size = rtChanSize(vwt)
+  rtChanLock(st)
+  let closed: Int = st.load(fromByteOffset: 24)
+  let count: Int = st.load(fromByteOffset: 16)
+  let cap: Int = buf.load(fromByteOffset: 8)
+  if closed != 0 {
+    rtSchedMutexUnlockAt(st)
+    Runtime.fatal("nomu: a task's result stored twice")
+  }
+  if count >= cap {
+    rtSchedMutexUnlockAt(st)
+    Runtime.fatal("nomu: a one-shot channel with no room for its value")
+  }
+  let head: Int = st.load(fromByteOffset: 8)
+  rtChanSlotAt(buf, (head + count) % cap, size).copyBytes(from: src, byteCount: size)
+  if rtChanIsPod(vwt) == false {
+    rtRememberStore(buf)
+  }
+  st.store(count + 1, toByteOffset: 16)
+  st.store(1, toByteOffset: 24)
+  var w: RawPtr = st.load(fromByteOffset: 32)
+  st.store(RawPtr.null, toByteOffset: 32)
+  st.store(RawPtr.null, toByteOffset: 40)
+  // Fill each waiter's slot under the lock, as a send does, so the value cannot move while it is copied.
+  var r = w
+  while r.isNull == false {
+    let dst: RawPtr = r.load(fromByteOffset: 8)
+    dst.copyBytes(from: src, byteCount: size)
+    r.store(1, toByteOffset: 40)
+    r = r.load(fromByteOffset: 24)
+  }
+  rtSchedMutexUnlockAt(st)
+  // Wake outside the lock. The next link is read before the wake: once ready, the waiter's frame may be reused.
+  while w.isNull == false {
+    let next: RawPtr = w.load(fromByteOffset: 24)
+    let fib: RawPtr = w.load(fromByteOffset: 32)
+    rtChanWake(sched, fib)
+    w = next
+  }
+}
+
+// Wait until the channel is closed, then copy its oldest value into `dst` (zeroed by the caller, a `vwt`
+// value) without taking it. Returns 1 with a value, or 0 if the channel closed empty.
+fun rtChanAwait(sched: RawPtr, buf: RawPtr, dst: RawPtr, vwt: RawPtr, w: RawPtr, anchorSp: RawPtr,
+                anchorPc: Int) -> Int {
+  let st = rtChanState(buf)
+  let size = rtChanSize(vwt)
+  rtChanLock(st)
+  let closed: Int = st.load(fromByteOffset: 24)
+  if closed != 0 {
+    let count: Int = st.load(fromByteOffset: 16)
+    if count == 0 {
+      rtSchedMutexUnlockAt(st)
+      return 0
+    }
+    let head: Int = st.load(fromByteOffset: 8)
+    dst.copyBytes(from: rtChanSlotAt(buf, head, size), byteCount: size)
+    rtSchedMutexUnlockAt(st)
+    return 1
+  }
+  w.store(dst, toByteOffset: 8)
+  w.store(RawPtr.null, toByteOffset: 48)
+  rtChanEnqueue(st, 32, w)
+  return rtChanPark(sched, st, w, dst, vwt, rtWaitTaskJoin, anchorSp, anchorPc)
+}
+
+// ---- select ----
+// `select` (`design/internals/concurrency.md` §4) over channel cases. Generated code builds the select's area
+// in its frame and calls rtSelectWait, then rtSelectDone with each case's channel at its current address.
+//
+//   Area (in the frame): 0 case count · 8 the off-stack record while waiters are queued, else null · 16 the
+//         partner a ready case took, to wake after the locks are released · 24 the cases, 48 bytes each:
+//         0 kind (0 receive, 1 send, 2 after, 3 readLine) · 8 the channel's buffer, or null · 16 slot (the
+//         receive's destination, zeroed, or the send's value), an `after`'s milliseconds, or the line read (a
+//         block as rtReadLine returns) · 24 vwt · 32 result (1 a value moved, the time came or a line was read,
+//         0 the channel closed) · 40 unused
+//   Record (off the stack, so its waiters stay valid while the fiber's stack moves): 0 lock (held by the
+//         fiber until its carrier saves its context) · 8 claim (0 open, 1 taken) · 16 the winning case
+//         · 24 fiber · 32 case count · 40 the first case whose waiter roots a slot, or -1 · 48 the waiters,
+//         64 bytes each, one per case · then each case's channel buffer, null for a timer or stdin case, which
+//         the leak pass reads and collections keep current (`runtime/leak.nomu`)
+//   A `readLine()` case's waiter sits on the stdin waiter list (`runtime/io.nomu`); once the poller wakes it,
+//   the fiber reads its line as `readLine` does, which can wait again if another reader takes the line first.
+//   An `after` case's waiter sits in the timer heap (`runtime/scheduler.nomu`) with its low bit set; the timer
+//   thread claims the record under the timer lock, which rtSelectDone takes to remove an entry that has not
+//   fired before it frees the record.
+
+fun rtSelectCase(area: RawPtr, i: Int) -> RawPtr {
+  return area.advanced(by: 24 + i * 48)
+}
+
+// The state of the case channel with the lowest address above `above`, or null: locks are taken in address
+// order, each channel once.
+fun rtSelectStateAbove(area: RawPtr, n: Int, above: Int) -> RawPtr {
+  var best = RawPtr.null
+  var i = 0
+  while i < n {
+    let c = rtSelectCase(area, i)
+    let buf: RawPtr = c.load(fromByteOffset: 8)
+    var a = 0
+    var st = RawPtr.null
+    if buf.isNull == false {
+      st = rtChanState(buf)
+      a = st.toInt()
+    }
+    if a > above {
+      if best.isNull || a < best.toInt() {
+        best = st
+      }
+    }
+    i += 1
+  }
+  return best
+}
+
+fun rtSelectLockAll(area: RawPtr, n: Int) {
+  var st = rtSelectStateAbove(area, n, 0)
+  while st.isNull == false {
+    rtChanLock(st)
+    st = rtSelectStateAbove(area, n, st.toInt())
+  }
+}
+
+fun rtSelectUnlockAll(area: RawPtr, n: Int) {
+  var st = rtSelectStateAbove(area, n, 0)
+  while st.isNull == false {
+    rtSchedMutexUnlockAt(st)
+    st = rtSelectStateAbove(area, n, st.toInt())
+  }
+}
+
+// Try case `c` with its channel locked: -1 when it is not ready, else its result. A parked partner whose value
+// moved is left at area+16 to wake once the locks are released.
+fun rtSelectTry(area: RawPtr, c: RawPtr) -> Int {
+  let kind: Int = c.load(fromByteOffset: 0)
+  if kind == 3 {
+    let sin = rtStdin
+    rtSchedMutexLockAt(sin)
+    let line = rtStdinTryLine(sin)
+    rtSchedMutexUnlockAt(sin)
+    if line.isNull {
+      return -1
+    }
+    c.store(line, toByteOffset: 16)
+    return 1
+  }
+  if kind == 2 {
+    let ms: Int = c.load(fromByteOffset: 16)
+    if ms <= 0 {
+      return 1
+    }
+    return -1
+  }
+  let buf: RawPtr = c.load(fromByteOffset: 8)
+  let slot: RawPtr = c.load(fromByteOffset: 16)
+  let vwt: RawPtr = c.load(fromByteOffset: 24)
+  let st = rtChanState(buf)
+  let size = rtChanSize(vwt)
+  let cap: Int = buf.load(fromByteOffset: 8)
+  let count: Int = st.load(fromByteOffset: 16)
+  if kind == 1 {
+    let closed: Int = st.load(fromByteOffset: 24)
+    if closed != 0 {
+      return 0
+    }
+    let r = rtChanDequeueLive(st, 32)
+    if r.isNull == false {
+      let dst: RawPtr = r.load(fromByteOffset: 8)
+      dst.copyBytes(from: slot, byteCount: size)
+      r.store(1, toByteOffset: 40)
+      area.store(r, toByteOffset: 16)
+      return 1
+    }
+    if count < cap {
+      let head: Int = st.load(fromByteOffset: 8)
+      rtChanSlotAt(buf, (head + count) % cap, size).copyBytes(from: slot, byteCount: size)
+      if rtChanIsPod(vwt) == false {
+        rtRememberStore(buf)
+      }
+      st.store(count + 1, toByteOffset: 16)
+      return 1
+    }
+    return -1
+  }
+  if count > 0 {
+    let head: Int = st.load(fromByteOffset: 8)
+    let taken = rtChanSlotAt(buf, head, size)
+    slot.copyBytes(from: taken, byteCount: size)
+    let pod = rtChanIsPod(vwt)
+    if pod == false {
+      taken.zeroBytes(size)
+    }
+    let next = (head + 1) % cap
+    st.store(next, toByteOffset: 8)
+    let s = rtChanDequeueLive(st, 48)
+    if s.isNull {
+      st.store(count - 1, toByteOffset: 16)
+      return 1
+    }
+    let ssrc: RawPtr = s.load(fromByteOffset: 8)
+    rtChanSlotAt(buf, (next + count - 1) % cap, size).copyBytes(from: ssrc, byteCount: size)
+    if pod == false {
+      rtRememberStore(buf)
+    }
+    s.store(1, toByteOffset: 40)
+    area.store(s, toByteOffset: 16)
+    return 1
+  }
+  let s = rtChanDequeueLive(st, 48)
+  if s.isNull == false {
+    let ssrc: RawPtr = s.load(fromByteOffset: 8)
+    slot.copyBytes(from: ssrc, byteCount: size)
+    s.store(1, toByteOffset: 40)
+    area.store(s, toByteOffset: 16)
+    return 1
+  }
+  let closed: Int = st.load(fromByteOffset: 24)
+  if closed != 0 {
+    return 0
+  }
+  return -1
+}
+
+// Wait until one of the area's cases is ready and complete it, returning its index, or -1 at once when none is
+// ready and the select has a `default`. Cases are polled from a random one onward, so none starves. With none
+// ready, a waiter is queued on each channel, all under the locks, and the fiber parks until a waker claims the
+// record; rtSelectDone then takes the other waiters out.
+fun rtSelectWait(sched: RawPtr, area: RawPtr, hasDefault: Int, anchorSp: RawPtr, anchorPc: Int) -> Int {
+  let n: Int = area.load(fromByteOffset: 0)
+  area.store(RawPtr.null, toByteOffset: 8)
+  area.store(RawPtr.null, toByteOffset: 16)
+  rtSelectLockAll(area, n)
+  let start = rtCarrierRandom() % n
+  var k = 0
+  while k < n {
+    let i = (start + k) % n
+    let c = rtSelectCase(area, i)
+    let result = rtSelectTry(area, c)
+    if result >= 0 {
+      c.store(result, toByteOffset: 32)
+      rtSelectUnlockAll(area, n)
+      let kind: Int = c.load(fromByteOffset: 0)
+      if kind == 1 && result == 0 {
+        Runtime.fatal("nomu: send on a closed channel")
+      }
+      let p: RawPtr = area.load(fromByteOffset: 16)
+      if p.isNull == false {
+        let pfib: RawPtr = p.load(fromByteOffset: 32)
+        let psel: RawPtr = p.load(fromByteOffset: 48)
+        rtChanWakeTaken(sched, pfib, psel)
+      }
+      return i
+    }
+    k += 1
+  }
+  if hasDefault != 0 {
+    rtSelectUnlockAll(area, n)
+    return -1
+  }
+  let self = rtCurrentFiber()
+  if self.isNull {
+    rtSelectUnlockAll(area, n)
+    Runtime.fatal("nomu: a select would block outside a fiber")
+  }
+  // Queue a waiter on every channel, the record locked until this fiber's context is saved.
+  let rec = RawPtr.alloc(bytes: 48 + n * 72, align: 16)
+  rec.store(1, toByteOffset: 0)
+  rec.store(0, toByteOffset: 8)
+  rec.store(-1, toByteOffset: 16)
+  rec.store(self, toByteOffset: 24)
+  rec.store(n, toByteOffset: 32)
+  rec.store(-1, toByteOffset: 40)
+  var timers = false
+  var i = 0
+  while i < n {
+    let c = rtSelectCase(area, i)
+    let kind: Int = c.load(fromByteOffset: 0)
+    let buf: RawPtr = c.load(fromByteOffset: 8)
+    let slot: RawPtr = c.load(fromByteOffset: 16)
+    let vwt: RawPtr = c.load(fromByteOffset: 24)
+    let w = rec.advanced(by: 48 + i * 64)
+    rec.store(buf, toByteOffset: 48 + n * 64 + i * 8)
+    w.store(self, toByteOffset: 32)
+    w.store(0, toByteOffset: 40)
+    w.store(rec, toByteOffset: 48)
+    w.store(i, toByteOffset: 56)
+    if kind == 3 {
+      w.store(rec.toInt() + 1, toByteOffset: 0)
+      let sin = rtStdin
+      rtSchedMutexLockAt(sin)
+      rtStdinWait(sin, w)
+      rtSchedMutexUnlockAt(sin)
+    } else if kind == 2 {
+      let ms: Int = c.load(fromByteOffset: 16)
+      let expiry: Int = Runtime.monotonicNanos() + ms * 1000000
+      rtSchedMutexLockAt(sched.advanced(by: 48))
+      rtSchedTimerPush(sched, expiry, RawPtr.null.advanced(by: w.toInt() + 1))
+      rtSchedMutexUnlockAt(sched.advanced(by: 48))
+      timers = true
+    } else {
+      w.store(slot, toByteOffset: 8)
+      let first: Int = rec.load(fromByteOffset: 40)
+      if first < 0 {
+        rec.store(i, toByteOffset: 40)
+      }
+      rtShadowPush(w, slot, vwt)
+      if kind == 1 {
+        rtChanEnqueue(rtChanState(buf), 48, w)
+      } else {
+        rtChanEnqueue(rtChanState(buf), 32, w)
+      }
+    }
+    i += 1
+  }
+  area.store(rec, toByteOffset: 8)
+  rtSelectUnlockAll(area, n)
+  if timers {
+    rtSchedWakeTimer(sched)
+  }
+  let areaOff = rtAnchorOffset(area)
+  let anchorOff = rtAnchorOffset(anchorSp)
+  rtSchedWaiting(self, rtWaitSelect)
+  self.store(rec, toByteOffset: 120)
+  nomuSchedParkReleasing(sched, rec, anchorSp, anchorPc)   // the carrier releases the record's lock
+  // The stack may have moved at the resume: find the area again, and pop the waiters' shadow nodes (the first
+  // one's prev is the list as it was, moved with the stack).
+  let me = rtCurrentFiber()
+  let at = rtAnchorAt(me, areaOff)
+  let firstRooted: Int = rec.load(fromByteOffset: 40)
+  if firstRooted >= 0 {
+    let prev: RawPtr = rec.advanced(by: 48 + firstRooted * 64).load(fromByteOffset: 0)
+    me.store(prev, toByteOffset: 24)
+  }
+  let won: Int = rec.load(fromByteOffset: 16)
+  let result: Int = rec.advanced(by: 48 + won * 64).load(fromByteOffset: 40)
+  var c = rtSelectCase(at, won)
+  c.store(result, toByteOffset: 32)
+  let kind: Int = c.load(fromByteOffset: 0)
+  if kind == 3 {
+    // Stdin became readable: read the line, which may wait again, and find the area afresh after.
+    let line = rtReadLine(sched, rtAnchorAt(me, anchorOff), anchorPc)
+    c = rtSelectCase(rtAnchorAt(rtCurrentFiber(), areaOff), won)
+    c.store(line, toByteOffset: 16)
+  }
+  if kind == 1 && result == 0 {
+    Runtime.fatal("nomu: send on a closed channel")
+  }
+  return won
+}
+
+// After rtSelectWait, with each case's channel stored again at its current address: take the waiters a waker
+// did not take out of their queues, and free the record. Nothing to do when the select did not park.
+fun rtSelectDone(sched: RawPtr, area: RawPtr) {
+  let rec: RawPtr = area.load(fromByteOffset: 8)
+  if rec.isNull {
+    return
+  }
+  let n: Int = area.load(fromByteOffset: 0)
+  var i = 0
+  while i < n {
+    let c = rtSelectCase(area, i)
+    let kind: Int = c.load(fromByteOffset: 0)
+    let w = rec.advanced(by: 48 + i * 64)
+    if kind == 3 {
+      let sin = rtStdin
+      rtSchedMutexLockAt(sin)
+      rtStdinUnwait(sin, w)
+      rtSchedMutexUnlockAt(sin)
+    } else if kind == 2 {
+      rtSchedMutexLockAt(sched.advanced(by: 48))
+      rtSchedTimerRemove(sched, RawPtr.null.advanced(by: w.toInt() + 1))
+      rtSchedMutexUnlockAt(sched.advanced(by: 48))
+    } else {
+      let buf: RawPtr = c.load(fromByteOffset: 8)
+      let st = rtChanState(buf)
+      rtChanLock(st)
+      if kind == 1 {
+        rtChanUnlink(st, 48, w)
+      } else {
+        rtChanUnlink(st, 32, w)
+      }
+      rtSchedMutexUnlockAt(st)
+    }
+    i += 1
+  }
+  rec.free()
+  area.store(RawPtr.null, toByteOffset: 8)
+}
+
+// Take `w` out of the queue at `st + at` if it is there. Called holding the channel's lock.
+fun rtChanUnlink(st: RawPtr, at: Int, w: RawPtr) {
+  var prev = RawPtr.null
+  var cur: RawPtr = st.load(fromByteOffset: at)
+  while cur.isNull == false {
+    let next: RawPtr = cur.load(fromByteOffset: 24)
+    if cur.eq(w) {
+      if prev.isNull {
+        st.store(next, toByteOffset: at)
+      } else {
+        prev.store(next, toByteOffset: 24)
+      }
+      if next.isNull {
+        st.store(prev, toByteOffset: at + 8)
+      }
+      return
+    }
+    prev = cur
+    cur = next
+  }
+}

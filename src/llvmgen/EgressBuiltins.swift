@@ -149,14 +149,27 @@ enum EgressBuiltins {
     // managed is live across its calls, and after the heap allocation only gc-leaf calls follow (memcpy,
     // free), so the fresh buffer stays put until it is returned.
     static func readLineFn(_ g: SSAIRToLLVM) -> (LLVMValueRef, LLVMTypeRef) {
-        let e = g.e, b = g.b
-        let ty = e.fnType(e.strTy, [])
-        if let f = LLVMGetNamedFunction(e.mod, "__nomu_read_line") { return (f, ty) }
+        let e = g.e
         let target = e.runtimePreludeFn("rtReadLine", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64])
         let park = e.schedForwarder("__nomu_read_line_park", ret: e.i8ptr, params: []) { _, sched, sp, pc in
             e.buildCall(target.fn, target.ty, [sched, sp, pc])
         }
-        let fn = LLVMAddFunction(e.mod, "__nomu_read_line", ty)!
+        return lineStringFn(g, "__nomu_read_line", params: []) { _ in e.buildCall(park.0, park.1, [])! }
+    }
+
+    // `__nomu_line_string(block) -> StringBase`: a line block a `select`'s `readLine()` case read, made a string
+    // the same way.
+    static func lineFromBlockFn(_ g: SSAIRToLLVM) -> (LLVMValueRef, LLVMTypeRef) {
+        lineStringFn(g, "__nomu_line_string", params: [g.e.i8ptr]) { fn in LLVMGetParam(fn, 0)! }
+    }
+
+    // A function `name(params) -> StringBase` that gets a line block from `block` and makes it a string.
+    private static func lineStringFn(_ g: SSAIRToLLVM, _ name: String, params: [LLVMTypeRef],
+                                     block makeBlock: (LLVMValueRef) -> LLVMValueRef) -> (LLVMValueRef, LLVMTypeRef) {
+        let e = g.e, b = g.b
+        let ty = e.fnType(e.strTy, params)
+        if let f = LLVMGetNamedFunction(e.mod, name) { return (f, ty) }
+        let fn = LLVMAddFunction(e.mod, name, ty)!
         LLVMSetLinkage(fn, LLVMInternalLinkage)
         LLVMSetGC(fn, "statepoint-example")
         e.addNoInline(fn)
@@ -165,7 +178,7 @@ enum EgressBuiltins {
         e.pendingDeopt = nil
         e.withStubBody(fn) {
             let slot = LLVMBuildAlloca(b, e.strTy, "small.build")!
-            let block = e.buildCall(park.0, park.1, [])!
+            let block = makeBlock(fn)
             let n = LLVMBuildLoad2(b, e.i64, block, "line.n")!
             let src = e.gepByte(block, LLVMConstInt(e.i64, 8, 0))
             let (memcpy, mty) = e.runtimeFn("memcpy", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i64], varArg: false)

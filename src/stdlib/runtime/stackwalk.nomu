@@ -77,9 +77,11 @@ fun rtI32(base: RawPtr, off: Int) -> Int {
 // ---- The GC frame index (task 195) ----
 // The driver writes a sorted index of every function with stackmap records into the binary after the link
 // (`__DATA_CONST,__nomu_frameidx`; layout in the driver's FrameIndex.swift), at the section's first 8-aligned
-// address: header { u32 magic, u32 version, u64 count }, then entries { i64 function address − stackmaps
-// start, u32 record offset, u32 record count, u32 stack size, u32 blob }, then a blob directory { u64 count,
-// then per blob the position of its object's shape-ordinal table − stackmaps start }. A stack size of
+// address: header { u32 magic, u32 version, u64 count, u64 facts position, u64 facts count }, then entries
+// { i64 function address − stackmaps start, u32 record offset, u32 record count, u32 stack size, u32 blob },
+// then a blob directory { u64 count, then per blob the position of its object's shape-ordinal table −
+// stackmaps start }, then the x19 facts { i64 function address − stackmaps start, u32 length, i32 x19 save
+// offset from FP (0: none), u32 flags (1: base pointer, 2: saves x19 with no frame record), u32 0 }. A stack size of
 // 2^32 − 1 marks a frame of dynamic size (a runtime-sized alloca); the pcsp walk finds its FP from its
 // callee's frame record instead. A
 // shape table (`__nomu_shape_table`, one per object) is { count, then a descriptor type-id per ordinal }.
@@ -96,7 +98,7 @@ fun rtFrameIndex() -> RawPtr {
   if rtU32(idx, 0) != 1481197134 {                 // "NFIX"
     return RawPtr.null
   }
-  if rtU32(idx, 4) != 2 {
+  if rtU32(idx, 4) != 3 {
     return RawPtr.null
   }
   return idx
@@ -117,7 +119,7 @@ fun rtFrameLookup(pc: Int) -> Int {
   var hi = count
   while lo < hi {
     let mid = lo + (hi - lo) / 2
-    let f: Int = idx.load(fromByteOffset: 16 + mid * 24)
+    let f: Int = idx.load(fromByteOffset: 32 + mid * 24)
     if f <= key {
       lo = mid + 1
     } else {
@@ -127,7 +129,7 @@ fun rtFrameLookup(pc: Int) -> Int {
   if lo == 0 {
     return -1
   }
-  let e = 16 + (lo - 1) * 24
+  let e = 32 + (lo - 1) * 24
   let fdelta: Int = idx.load(fromByteOffset: e)
   var recCur = rtU32(idx, e + 8)
   let nrec = rtU32(idx, e + 12)
@@ -147,7 +149,7 @@ fun rtFrameLookup(pc: Int) -> Int {
 
 // An index entry's function frame size.
 fun rtFrameStack(entry: Int) -> Int {
-  return rtU32(rtFrameIndex(), 16 + entry * 24 + 16)
+  return rtU32(rtFrameIndex(), 32 + entry * 24 + 16)
 }
 
 // An index entry's shape-ordinal table: the table of the object its records came from. A shape ordinal `o`
@@ -155,9 +157,168 @@ fun rtFrameStack(entry: Int) -> Int {
 fun rtFrameShapes(entry: Int) -> RawPtr {
   let idx = rtFrameIndex()
   let count: Int = idx.load(fromByteOffset: 8)
-  let blob = rtU32(idx, 16 + entry * 24 + 20)
-  let delta: Int = idx.load(fromByteOffset: 16 + count * 24 + 8 + blob * 8)
+  let blob = rtU32(idx, 32 + entry * 24 + 20)
+  let delta: Int = idx.load(fromByteOffset: 32 + count * 24 + 8 + blob * 8)
   return Runtime.gcStackmapBase().advanced(by: delta)
+}
+
+// ---- x19: the base pointer (`design/internals/frames-contract.md`) ----
+// A frame with run-time-sized buffers and enough fixed locals addresses them through a base pointer in x19,
+// set from SP in its prologue, and its stack-map root slots are based on it. At a stop, a frame's x19 is in
+// the fiber's context (offset 0) when no deeper frame saved it, else in the save slot of the nearest deeper
+// frame that did. The index's facts say where each function saves x19, so the walk carries the location
+// outward frame by frame.
+
+// The fact for the function holding `pc`: its position in the index, or -1 when the function neither saves
+// x19 nor uses a base pointer.
+fun rtFrameFact(pc: Int) -> Int {
+  let idx = rtFrameIndex()
+  if idx.isNull {
+    return -1
+  }
+  let at: Int = idx.load(fromByteOffset: 16)
+  let count: Int = idx.load(fromByteOffset: 24)
+  let key = pc - Runtime.gcStackmapBase().toInt()
+  var lo = 0
+  var hi = count
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    let f: Int = idx.load(fromByteOffset: at + mid * 24)
+    if f <= key {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  if lo == 0 {
+    return -1
+  }
+  let e = at + (lo - 1) * 24
+  let start: Int = idx.load(fromByteOffset: e)
+  if key >= start + rtU32(idx, e + 8) {
+    return -1
+  }
+  return e
+}
+
+// The fact's x19 save offset from the frame pointer, 0 when it saves none; fatal for a save with no frame
+// record, which no walk can find.
+fun rtFactX19(e: Int) -> Int {
+  let idx = rtFrameIndex()
+  let flags = rtU32(idx, e + 16)
+  if (flags & 2) != 0 {
+    Runtime.fatal("nomu: a frame on a stopped stack saves x19 with no frame record")
+  }
+  return rtI32(idx, e + 12)
+}
+
+// A walk's lookup cache: a return address's stack-map record (rtFrameLookup) and x19 fact (rtFrameFact),
+// direct-mapped by address, `rtFrameCacheSlots` entries of { pc, record, fact } (pc 0: empty). A stack repeats
+// return addresses (recursion, a loop calling the same function), and each lookup is a binary search whose
+// loads depend on each other. An address's record and fact never change, so a cache stays valid for the whole
+// run: each thread keeps one in its carrier record (rtFrameCacheTake), warm from one walk to the next, and no
+// two threads share one. Go keeps a pcvalue cache per thread for its stack walks the same way.
+fun rtFrameCacheSlots() -> Int {
+  return 64
+}
+
+fun rtFrameCacheNew() -> RawPtr {
+  let bytes = rtFrameCacheSlots() * 24
+  let cache = RawPtr.alloc(bytes: bytes, align: 8)
+  cache.zeroBytes(bytes)
+  return cache
+}
+
+// This thread's cache, made on first use; a thread with no carrier record gets one for this walk alone.
+// Hand it back with rtFrameCacheDone.
+fun rtFrameCacheTake() -> RawPtr {
+  let rec = Runtime.carrierLocal()
+  if rec.isNull {
+    return rtFrameCacheNew()
+  }
+  var cache: RawPtr = rec.load(fromByteOffset: 176)
+  if cache.isNull {
+    cache = rtFrameCacheNew()
+    rec.store(cache, toByteOffset: 176)
+  }
+  return cache
+}
+
+fun rtFrameCacheDone(cache: RawPtr) {
+  let rec = Runtime.carrierLocal()
+  if rec.isNull {
+    cache.free()
+    return
+  }
+  let mine: RawPtr = rec.load(fromByteOffset: 176)
+  if mine.eq(cache) == false {
+    cache.free()
+  }
+}
+
+// The cache entry for `pc`, filled on a miss: its record at +8, its fact at +16.
+fun rtFrameCached(cache: RawPtr, pc: Int) -> RawPtr {
+  let at = cache.advanced(by: ((pc >> 2) & (rtFrameCacheSlots() - 1)) * 24)
+  let key: Int = at.load(fromByteOffset: 0)
+  if key != pc {
+    at.store(pc, toByteOffset: 0)
+    at.store(rtFrameLookup(pc), toByteOffset: 8)
+    at.store(rtFrameFact(pc), toByteOffset: 16)
+  }
+  return at
+}
+
+fun rtFactBasePointer(e: Int) -> Bool {
+  return (rtU32(rtFrameIndex(), e + 16) & 1) != 0
+}
+
+// Where the anchor frame's x19 is kept, for a fiber stopped at a park or a safepoint: walk the frame-pointer
+// chain from the saved registers (the frame that switched, at their fp and lr) out to the anchor, which is the
+// frame `anchorPc` returns into, taking each saved x19 as the next frame's.
+fun rtX19AtAnchor(fib: RawPtr, anchorPc: Int) -> RawPtr {
+  let regs: RawPtr = fib.load(fromByteOffset: 0)
+  var loc = regs
+  var fp: RawPtr = regs.load(fromByteOffset: 80)
+  var pc: Int = regs.load(fromByteOffset: 88)
+  var steps = 0
+  while steps < 4096 {
+    if fp.isNull {
+      Runtime.fatal("nomu: the frame-pointer chain ends before the anchor")
+    }
+    let e = rtFrameFact(pc)
+    if e >= 0 {
+      let off = rtFactX19(e)
+      if off != 0 {
+        loc = fp.advanced(by: off)
+      }
+    }
+    let next: Int = fp.load(fromByteOffset: 8)
+    if next == anchorPc {
+      return loc
+    }
+    fp = fp.load(fromByteOffset: 0)
+    pc = next
+    steps += 1
+  }
+  Runtime.fatal("nomu: the anchor is not on the frame-pointer chain")
+  return loc
+}
+
+// The base of a stack-map slot location: SP, the frame pointer (x29), or the frame's x19, read from where the
+// walk found it. Any other register is fatal; the frame index's build checked none occurs.
+fun rtSlotBase(reg: Int, sp: RawPtr, fp: RawPtr, x19At: RawPtr) -> RawPtr {
+  if reg == 29 {
+    return fp
+  }
+  if reg == 31 {
+    return sp
+  }
+  if reg == 19 && x19At.isNull == false {
+    let v: RawPtr = x19At.load(fromByteOffset: 0)
+    return v
+  }
+  Runtime.fatal("nomu: a stack-map slot based waitOn a register the walk cannot read")
+  return sp
 }
 
 // ---- The pcsp stack walk (task 150 · rung 2) — recover the live roots from a stack ----
@@ -183,6 +344,7 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
   let fp0 = Runtime.gcFrameAddr()
   var sp = fp0.advanced(by: 16)
   var pc = Runtime.gcReturnAddr()
+  let x19At = RawPtr.null                    // a running stack's x19 is not tracked: no base-pointer frames here
   var walking = true
   while walking {
     var found = false
@@ -228,10 +390,7 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
           let ordinal = rtU32(base, cLoc + 8)
           let dReg = rtU16(base, dLoc + 4)
           let dOff = rtI32(base, dLoc + 8)
-          var vbBase = sp
-          if dReg == 29 {
-            vbBase = frameFp
-          }
+          let vbBase = rtSlotBase(dReg, sp, frameFp, x19At)
           let valbase = vbBase.advanced(by: dOff)
           let descId: Int = shapes.load(fromByteOffset: 8 + ordinal * 8)
           let cnt = rtLiveCount(descId, valbase)
@@ -259,10 +418,7 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
         if kind == 3 {                          // Indirect [reg + offset] — a stack slot
           let reg = rtU16(base, locOff + 4)
           let slotOff = rtI32(base, locOff + 8)
-          var slotBase = sp
-          if reg == 29 {                        // DWARF x29 = frame pointer
-            slotBase = frameFp
-          }
+          let slotBase = rtSlotBase(reg, sp, frameFp, x19At)
           let slotPtr = slotBase.advanced(by: slotOff)
           let root: RawPtr = slotPtr.load(fromByteOffset: 0)
           let rootNull = root.eq(RawPtr.null)
@@ -302,8 +458,9 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
 // function's own body to make its live caller spill its roots at the call statepoint (selfhosted-gc.md §9).
 // A saved-context anchor carries no such dependency — its frame's roots were already spilled at the fiber's
 // park/safepoint — so factoring the loop here is sound; only rtCollectRoots must keep it inline.
-fun rtWalkFrom(spIn: RawPtr, pcIn: Int, roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
+fun rtWalkFrom(spIn: RawPtr, pcIn: Int, x19In: RawPtr, roots: RawPtr, n0: Int, emitSlots: Int, cache: RawPtr) -> Int {
   let base = Runtime.gcStackmapBase()
+  var x19At = x19In
   var n = n0
   var sp = spIn
   var pc = pcIn
@@ -312,8 +469,9 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, roots: RawPtr, n0: Int, emitSlots: Int) 
     var found = false
     var frameFp = sp
     // The record of the statepoint returning to `pc`, through the GC frame index; none at the first frame
-    // that is not a statepoint's return address (the Nomu→C boundary).
-    let hit = rtFrameLookup(pc)
+    // that is not a statepoint's return address (the Nomu→C boundary). Both lookups go through the walk's cache.
+    let cached = rtFrameCached(cache, pc)
+    let hit: Int = cached.load(fromByteOffset: 8)
     if hit >= 0 {
       found = true
       let entry = hit / 4294967296
@@ -353,10 +511,7 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, roots: RawPtr, n0: Int, emitSlots: Int) 
           let ordinal = rtU32(base, cLoc + 8)
           let dReg = rtU16(base, dLoc + 4)
           let dOff = rtI32(base, dLoc + 8)
-          var vbBase = sp
-          if dReg == 29 {
-            vbBase = frameFp
-          }
+          let vbBase = rtSlotBase(dReg, sp, frameFp, x19At)
           let valbase = vbBase.advanced(by: dOff)
           let descId: Int = shapes.load(fromByteOffset: 8 + ordinal * 8)
           let cnt = rtLiveCount(descId, valbase)
@@ -390,10 +545,7 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, roots: RawPtr, n0: Int, emitSlots: Int) 
         if kind == 3 {
           let reg = rtU16(base, locOff + 4)
           let slotOff = rtI32(base, locOff + 8)
-          var slotBase = sp
-          if reg == 29 {
-            slotBase = frameFp
-          }
+          let slotBase = rtSlotBase(reg, sp, frameFp, x19At)
           let slotPtr = slotBase.advanced(by: slotOff)
           let root: RawPtr = slotPtr.load(fromByteOffset: 0)
           let rootNull = root.eq(RawPtr.null)
@@ -408,10 +560,7 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, roots: RawPtr, n0: Int, emitSlots: Int) 
             n = n + 1
             let dw: Int = base.load(fromByteOffset: locOff + 12)
             if emitSlots != 0 && dw - dw / 256 * 256 == 3 {
-              var dBase = sp
-              if rtU16(base, locOff + 16) == 29 {
-                dBase = frameFp
-              }
+              let dBase = rtSlotBase(rtU16(base, locOff + 16), sp, frameFp, x19At)
               let dSlot = dBase.advanced(by: rtI32(base, locOff + 20))
               if dSlot.toInt() != slotPtr.toInt() {
                 rtRootsAddDerived(roots, slotPtr, dSlot)
@@ -425,6 +574,14 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, roots: RawPtr, n0: Int, emitSlots: Int) 
     if !found {
       walking = false
     } else {
+      // The caller's x19: this frame's save slot when it saved x19, else where this frame's was.
+      let fe: Int = cached.load(fromByteOffset: 16)
+      if fe >= 0 {
+        let off = rtFactX19(fe)
+        if off != 0 {
+          x19At = frameFp.advanced(by: off)
+        }
+      }
       let cfa = frameFp.advanced(by: 16)
       let nextPc: Int = cfa.load(fromByteOffset: -8)
       pc = nextPc
@@ -437,14 +594,14 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, roots: RawPtr, n0: Int, emitSlots: Int) 
 // The GC frame index (`__DATA_CONST,__nomu_frameidx`, layout in the driver's FrameIndex.swift) maps a return
 // address to its stack-map record; `nomu build` writes it after the link. A binary with stack maps but no
 // index was linked another way, and its roots could not be found, so startup stops. The index starts at the
-// section's first 8-aligned address with the magic "NFIX" and version 2.
+// section's first 8-aligned address with the magic "NFIX" and version 3.
 let rtFrameIndexChecked = rtCheckFrameIndex()
 
 fun rtCheckFrameIndex() -> Int {
   if Runtime.gcStackmapSize() > 0 {
     let fx = Runtime.gcFrameIndexBase()
     let at = fx.advanced(by: (8 - fx.toInt() % 8) % 8)
-    if Runtime.loadInt32(at, at: 0) != 1481197134 || Runtime.loadInt32(at, at: 4) != 2 {
+    if Runtime.loadInt32(at, at: 0) != 1481197134 || Runtime.loadInt32(at, at: 4) != 3 {
       Runtime.fatal("nomu: this binary has no GC frame index (it was linked without `nomu build`)")
     }
   }
@@ -457,7 +614,7 @@ fun rtCheckFrameIndex() -> Int {
 // non-POD `T` buffer with the current fiber as a `{ prev, buffer, vwt }` node on its own native stack;
 // the STW walk expands each node via the VWT's GC descriptor into the buffer's interior pointer slots,
 // which then ride the ordinary evacuation + in-place fixup. The node's lifetime is the frame that
-// declared it; the fiber holds the list head at offset 288.
+// declared it; the fiber holds the list head at offset 24.
 
 // Link a caller-allocated node `{ prev(0), buffer(8), vwt(16) }` at the current fiber's shadow-top.
 fun rtShadowPush(node: RawPtr, buffer: RawPtr, vwt: RawPtr) {
@@ -465,11 +622,11 @@ fun rtShadowPush(node: RawPtr, buffer: RawPtr, vwt: RawPtr) {
   if self.isNull {
     return
   }
-  let prev: RawPtr = self.load(fromByteOffset: 288)
+  let prev: RawPtr = self.load(fromByteOffset: 24)
   node.store(prev, toByteOffset: 0)
   node.store(buffer, toByteOffset: 8)
   node.store(vwt, toByteOffset: 16)
-  self.store(node, toByteOffset: 288)
+  self.store(node, toByteOffset: 24)
 }
 
 // Restore the shadow-top to a value saved on entry (LIFO pop of every node a frame pushed, on any exit).
@@ -481,10 +638,10 @@ fun rtShadowPopTo(savedTop: RawPtr) {
     return
   }
   if savedTop.isNull {
-    self.store(RawPtr.null, toByteOffset: 288)
+    self.store(RawPtr.null, toByteOffset: 24)
     return
   }
-  self.store(rtAnchorAt(self, savedTop.toInt()), toByteOffset: 288)
+  self.store(rtAnchorAt(self, savedTop.toInt()), toByteOffset: 24)
 }
 
 // The current fiber's shadow-top (saved on entry to an erased frame, restored on exit), as an offset from
@@ -494,7 +651,7 @@ fun rtShadowSave() -> RawPtr {
   if self.isNull {
     return RawPtr.null
   }
-  let top: RawPtr = self.load(fromByteOffset: 288)
+  let top: RawPtr = self.load(fromByteOffset: 24)
   if top.isNull {
     return top
   }
@@ -507,7 +664,7 @@ fun rtShadowSave() -> RawPtr {
 // map the object walk uses. Called with the world stopped, so the buffers on the fiber's stack are stable.
 fun rtWalkShadow(fib: RawPtr, roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
   var n = n0
-  var node: RawPtr = fib.load(fromByteOffset: 288)
+  var node: RawPtr = fib.load(fromByteOffset: 24)
   while node.isNull == false {
     let buf: RawPtr = node.load(fromByteOffset: 8)
     let vwt: RawPtr = node.load(fromByteOffset: 16)
@@ -544,63 +701,58 @@ fun rtWalkShadow(fib: RawPtr, roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
 // live stack, reached differently) and fibers with no anchor. Caller has stopped the world (all target
 // fibers parked at a safepoint), so the registry + anchors are stable.
 fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
+  let cache = rtFrameCacheTake()
   var n = 0
+  let now = Runtime.monotonicNanos()
   var cur: RawPtr = sched.load(fromByteOffset: 128)
   while cur.isNull == false {
-    let st: Int = cur.load(fromByteOffset: 168)
+    let stByte: UInt8 = cur.load(fromByteOffset: 8)
+    let st = stByte.int
+    // A parked fiber's wait is dated by the first collection that finds it, as Go dates `waitsince`.
+    if st == 2 {
+      let since: Int = cur.load(fromByteOffset: 96)
+      if since == 0 {
+        cur.store(now, toByteOffset: 96)
+      }
+    }
     var stopped = false
     if st == 0 { stopped = true }        // ready: parked and since woken, its frames as it left them
     if st == 2 { stopped = true }        // parked at sleep/join
     if st == 4 { stopped = true }        // stopped at a safepoint poll (STW)
     if stopped {
-      let sp: RawPtr = cur.load(fromByteOffset: 264)
+      let sp: RawPtr = cur.load(fromByteOffset: 104)
       if sp.isNull == false {
-        let pc: Int = cur.load(fromByteOffset: 272)
+        let pc: Int = cur.load(fromByteOffset: 112)
         if rtStackMoveOn {
           rtStackCheckAnchor(cur, sp)
         }
-        n = rtWalkFrom(sp, pc, roots, n, emitSlots)
+        n = rtWalkFrom(sp, pc, rtX19AtAnchor(cur, pc), roots, n, emitSlots, cache)
       }
       // Typed roots: the interior managed pointers of this fiber's live erased non-POD `T` buffers,
       // invisible to the stackmap walk above (task 100.4.3.6).
       n = rtWalkShadow(cur, roots, n, emitSlots)
     }
-    // A spawned fiber that has not started yet: its argument, the spawn's managed closure environment, is
-    // reachable only through fib+192 (rtSchedFiberMain clears it on the first switch-in). Without this root a
+    // What a parked fiber waits on (`runtime/leak.nomu`): kept current, so a leak pass reads it as it is.
+    if st == 2 {
+      n = rtWalkWaitObjects(cur, roots, n, emitSlots)
+    }
+    // A fiber that has not started yet: its argument, the fiber's managed closure environment, is
+    // reachable only through fib+32 (rtSchedFiberMain clears it on the first switch-in). Without this root a
     // collection before the fiber runs frees the environment, and the fiber reads its captures from garbage.
-    let arg: RawPtr = cur.load(fromByteOffset: 192)
+    let arg: RawPtr = cur.load(fromByteOffset: 32)
     if arg.isNull == false {
       if emitSlots != 0 {
-        rtQueuePush(roots, n, cur.advanced(by: 192))
+        rtQueuePush(roots, n, cur.advanced(by: 32))
       } else {
         rtQueuePush(roots, n, arg)
       }
       n = n + 1
     }
-    if st == 3 {
-      // Completed spawn fiber awaiting join (150.3.13): its result is a managed box at fib+216, reachable
-      // only through this slot until the joiner reads it. Root it — slot mode emits the slot address (a
-      // moving collection rewrites it in place with the box's forwarded pointer), value mode emits the box.
-      let box: RawPtr = cur.load(fromByteOffset: 216)
-      if box.isNull == false {
-        if emitSlots != 0 {
-          rtQueuePush(roots, n, cur.advanced(by: 216))
-        } else {
-          rtQueuePush(roots, n, box)
-        }
-        n = n + 1
-      }
-    }
-    cur = cur.load(fromByteOffset: 240)
+    cur = cur.load(fromByteOffset: 80)
   }
-  // The scheduled-mailbox queue root. The queue head/tail live in this Sched (sched+80 / sched+88), so the
-  // STW walk must root them here or a collection mid-drain reclaims/moves every queued mailbox (and each
-  // message's `self` receiver + args). Mailbox and message objects carry real type-id pointer maps
-  // (mailboxTypeIdValue: mb_head/mb_tail/sched_next; the message type-id: next/self/args), so rooting the
-  // head propagates through the whole chain — the tracer follows sched_next between scheduled mailboxes and
-  // mb_head→next through each message, evacuating and fixing every managed slot. Slot mode also fixes the
-  // off-heap tail pointer (sched+88): it is Sched state reached through no object's pointer map, so a move
-  // would leave it dangling into reclaimed from-space (nomuSchedActorSend reads it on the next enqueue).
+  // The global mailbox queue (sched+80 / sched+88), off the run queues' rings. Rooting the head reaches every
+  // queued mailbox through sched_next, and each one's messages through mb_head and next. Slot mode also fixes
+  // the off-heap tail pointer (sched+88), which no object's pointer map reaches.
   let mboxHead: RawPtr = sched.load(fromByteOffset: 80)
   if mboxHead.isNull == false {
     if emitSlots != 0 {
@@ -617,13 +769,96 @@ fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
       }
     }
   }
+  rtFrameCacheDone(cache)
+  return rtWalkRunQueues(roots, n, emitSlots)
+}
+
+// A parked fiber's wait objects: a channel's buffer at fib+120, or each case channel of the select record
+// there.
+fun rtWalkWaitObjects(fib: RawPtr, roots: RawPtr, start: Int, emitSlots: Int) -> Int {
+  var n = start
+  let waitOn: RawPtr = fib.load(fromByteOffset: 120)
+  if waitOn.isNull {
+    return n
+  }
+  let whyByte: UInt8 = fib.load(fromByteOffset: 10)
+  let why = whyByte.int
+  if why == rtWaitSelect {
+    let cases: Int = waitOn.load(fromByteOffset: 32)
+    var i = 0
+    while i < cases {
+      let at = 48 + cases * 64 + i * 8
+      let buf: RawPtr = waitOn.load(fromByteOffset: at)
+      if buf.isNull == false {
+        if emitSlots != 0 {
+          rtQueuePush(roots, n, waitOn.advanced(by: at))
+        } else {
+          rtQueuePush(roots, n, buf)
+        }
+        n = n + 1
+      }
+      i += 1
+    }
+    return n
+  }
+  if emitSlots != 0 {
+    rtQueuePush(roots, n, fib.advanced(by: 120))
+  } else {
+    rtQueuePush(roots, n, waitOn)
+  }
+  return n + 1
+}
+
+// The scheduled mailboxes waiting in the run queues, as entries tagged in their low bit (scheduler.nomu): each
+// carrier's slot and the live part of its ring. A mailbox roots its queued messages and their receivers
+// through its pointer map. Slot mode stores the mailbox untagged in place, roots that word, and records it
+// with the derived pointers so rtRootsFixDerived tags the moved address again after the collection; the world
+// is stopped, so no carrier reads the queues meanwhile. Value mode roots the mailbox and leaves the entry.
+fun rtWalkRunQueues(roots: RawPtr, start: Int, emitSlots: Int) -> Int {
+  var n = start
+  var r: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while !r.isNull {
+    let ring = rtRunqRing(r)
+    if ring.isNull == false {
+      n = rtWalkRunqEntry(roots, n, emitSlots, r.advanced(by: 104))
+      let h: Int = r.load(fromByteOffset: 128)
+      let t: Int = r.load(fromByteOffset: 136)
+      var i = h
+      while i < t {
+        n = rtWalkRunqEntry(roots, n, emitSlots, ring.advanced(by: (i % rtRunqSize) * 8))
+        i += 1
+      }
+    }
+    r = r.load(fromByteOffset: 96)
+  }
   return n
+}
+
+fun rtWalkRunqEntry(roots: RawPtr, start: Int, emitSlots: Int, slot: RawPtr) -> Int {
+  let e: Int = slot.load(fromByteOffset: 0)
+  if e % 2 == 0 {
+    return start
+  }
+  let mb = RawPtr.null.advanced(by: e - 1)
+  if emitSlots == 0 {
+    rtQueuePush(roots, start, mb)
+    return start + 1
+  }
+  slot.store(mb, toByteOffset: 0)
+  rtQueuePush(roots, start, slot)
+  rtRootsAddFixup(roots, slot, slot, 1)
+  return start + 1
 }
 
 // A growable root buffer: the handle `{base @0, cap @8}` rtQueuePush grows, and at 16 the derived
 // pointers' list (`rtRootsAddDerived`) with its word count at 24. Free it with rtRootsFree.
 fun rtRootsNew() -> RawPtr {
-  let cap = 4096
+  return rtRootsNewSized(4096)
+}
+
+// The same with room for `cap` roots to start. A stack move starts small: it runs often, holds one fiber's
+// roots, and the allocation is zero-filled.
+fun rtRootsNewSized(cap: Int) -> RawPtr {
   let roots = RawPtr.alloc(bytes: 32, align: 8)
   roots.store(RawPtr.alloc(bytes: cap * 8, align: 8), toByteOffset: 0)
   roots.store(cap, toByteOffset: 8)
@@ -646,6 +881,13 @@ fun rtRootsFree(roots: RawPtr) {
 
 // Record a derived pointer at `dSlot` whose base is at `bSlot`, as (base slot, derived slot, offset) words.
 fun rtRootsAddDerived(roots: RawPtr, bSlot: RawPtr, dSlot: RawPtr) {
+  let b: RawPtr = bSlot.load(fromByteOffset: 0)
+  let d: RawPtr = dSlot.load(fromByteOffset: 0)
+  rtRootsAddFixup(roots, bSlot, dSlot, d.toInt() - b.toInt())
+}
+
+// Record that after the collection `dSlot` is to hold the address at `bSlot` plus `off` (rtRootsFixDerived).
+fun rtRootsAddFixup(roots: RawPtr, bSlot: RawPtr, dSlot: RawPtr, off: Int) {
   var derived: RawPtr = roots.load(fromByteOffset: 16)
   if derived.isNull {
     derived = RawPtr.alloc(bytes: 16, align: 8)
@@ -653,12 +895,10 @@ fun rtRootsAddDerived(roots: RawPtr, bSlot: RawPtr, dSlot: RawPtr) {
     derived.store(64, toByteOffset: 8)
     roots.store(derived, toByteOffset: 16)
   }
-  let b: RawPtr = bSlot.load(fromByteOffset: 0)
-  let d: RawPtr = dSlot.load(fromByteOffset: 0)
   let k: Int = roots.load(fromByteOffset: 24)
   rtQueuePush(derived, k, bSlot)
   rtQueuePush(derived, k + 1, dSlot)
-  rtQueuePush(derived, k + 2, RawPtr.null.advanced(by: d.toInt() - b.toInt()))
+  rtQueuePush(derived, k + 2, RawPtr.null.advanced(by: off))
   roots.store(k + 3, toByteOffset: 24)
 }
 
@@ -720,27 +960,35 @@ fun nomuSchedWalkSlots(sched: RawPtr, roots: RawPtr) -> Int {
 // buffer), recorded so the stack copier can adjust it; the collector must not treat it as an object. Compacts
 // the slot list in place and returns the count kept.
 fun rtKeepManagedSlots(roots: RawPtr, n: Int) -> Int {
-  let space = rtSpace
-  if space.isNull {
+  if rtSpace.isNull {
     return n
   }
   let base: RawPtr = roots.load(fromByteOffset: 0)
-  let lo: Int = space.load(fromByteOffset: 40)
-  let nb: Int = space.load(fromByteOffset: 8)
-  let hi = lo + nb * 32768
   var kept = 0
   var i = 0
   while i < n {
     let slot: RawPtr = base.load(fromByteOffset: i * 8)
     let w: RawPtr = slot.load(fromByteOffset: 0)
-    let a = w.toInt()
-    if (a >= lo && a < hi) || rtLosHolds(space, a) {
+    if rtIsManaged(w) {
       base.store(slot, toByteOffset: kept * 8)
       kept = kept + 1
     }
     i = i + 1
   }
   return kept
+}
+
+// Whether `w` is a managed object: in the Immix heap or a large-object chunk. True for every address before the
+// heap exists.
+fun rtIsManaged(w: RawPtr) -> Bool {
+  let space = rtSpace
+  if space.isNull {
+    return true
+  }
+  let lo: Int = space.load(fromByteOffset: 40)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let a = w.toInt()
+  return (a >= lo && a < lo + nb * 32768) || rtLosHolds(space, a)
 }
 
 // Whether `a` is the object of a chunk in the large-object list.

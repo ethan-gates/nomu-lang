@@ -18,7 +18,7 @@ public enum TokenKind: Hashable {
     case kwExtension
     case kwFunc, kwLet, kwVar
     case kwStatic
-    case kwOn, kwFiber
+    case kwOn, kwFiber, kwTask, kwSelect
     case kwSwitch, kwCase, kwReturn
     case kwIf, kwElse
     case kwIn
@@ -78,6 +78,8 @@ extension TokenKind {
         case .kwStatic: return "static"
         case .kwOn: return "on"
         case .kwFiber: return "fiber"
+        case .kwTask: return "task"
+        case .kwSelect: return "select"
         case .kwSwitch: return "switch"
         case .kwCase: return "case"
         case .kwReturn: return "return"

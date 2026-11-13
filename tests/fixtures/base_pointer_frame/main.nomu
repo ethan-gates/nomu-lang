@@ -1,0 +1,45 @@
+// A base-pointer frame across collections and stack moves (suite case `base-pointer-frame`): `deep` holds two
+// channels in x19-based slots while a fiber churns the heap, then takes the value sent on one of them.
+import pkg/lib
+
+class Msg {
+  let n: Int
+  let text: String
+}
+
+fun churn(count: Int) {
+  var keep: Array<Msg> = []
+  var i = 0
+  while i < count {
+    keep.append(Msg(n: i, text: "churn-".concat("abcdefghijklmnopqrstuvwxyz")))
+    if keep.count > 64 {
+      keep = []
+    }
+    i = i + 1
+  }
+}
+
+fun feed(ch: Channel<Msg>, n: Int) {
+  churn(20000)
+  ch.send(Msg(n: n, text: "fed-".concat("0123456789")))
+}
+
+fun main() {
+  var total = 0
+  var i = 0
+  while i < 5 {
+    let a = Channel<Msg>.make(capacity: 0)
+    let b = Channel<Msg>.make(capacity: 0)
+    fiber feed(b, i)
+    switch deep(a, b, 40) {
+    case .some(let m):
+      if m.text.count == 14 {
+        total = total + m.n + 1
+      }
+    case .none:
+    }
+    i = i + 1
+  }
+  print(total)
+  print("\n")
+}

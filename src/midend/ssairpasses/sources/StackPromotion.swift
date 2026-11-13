@@ -60,7 +60,7 @@ public struct StackPromotion: SSAPass {
     // shared-heap semantics; struct/enum values are already `stackAlloc`. A non-escaping closure
     // *object* promotes separately (the `makeClosure` `onStack` flag), but its `env` object still
     // allocates here as a heap class — env stack-promotion is a scoped follow-up (the `p1` env-param
-    // addrspace wall); a spawn env is likewise never promoted (it crosses the fiber boundary).
+    // addrspace wall); a fiber env is likewise never promoted (it crosses the fiber boundary).
     private func isPromotable(_ t: Type) -> Bool {
         if case .named(_, .class_) = t { return true }
         return false

@@ -140,9 +140,11 @@ struct CaseRunner {
                                       + partial(r) + ["  repro: \(runRepro)"],
                                   runTime: totalRun)
                 }
-                if r.signal == nil, r.exitCode != 0 {
+                let wantExit = c.expect?.exitCode ?? 0
+                if r.signal == nil, r.exitCode != wantExit {
+                    let expected = wantExit == 0 ? "" : ", expected \(wantExit)"
                     return result(.fail,
-                                  ["  run exited \(r.exitCode ?? -1) (\(at))"] + partial(r) + ["  repro: \(runRepro)"],
+                                  ["  run exited \(r.exitCode ?? -1) (\(at)\(expected))"] + partial(r) + ["  repro: \(runRepro)"],
                                   runTime: totalRun)
                 }
                 if let want = want, r.stdout != want {

@@ -1,0 +1,40 @@
+// Actor handlers that wait on channels: each handler runs on a mailbox fiber, which parks on the channel in the
+// middle of its drain, and its carrier takes the scheduler lock before releasing the channel's (the drainer
+// count must change while the fiber is still parked).
+actor Relay {
+    var moved: Int = 0
+    on pass(from: Channel<Int>, to: Channel<Int>) {
+        switch from.receive() {
+        case .some(let v):
+            moved += 1
+            to.send(v + 1)
+        case .none:
+            to.send(-1)
+        }
+    }
+}
+
+fun main() {
+    let a = Relay()
+    let b = Relay()
+    let input = Channel<Int>.make(capacity: 0)
+    let middle = Channel<Int>.make(capacity: 0)
+    let output = Channel<Int>.make(capacity: 0)
+    var bad = 0
+    var i = 0
+    while i < 2000 {
+        a.pass(from: input, to: middle)
+        b.pass(from: middle, to: output)
+        input.send(i)
+        switch output.receive() {
+        case .some(let v):
+            if v != i + 2 { bad = bad + 1 }
+        case .none:
+            bad = bad + 1
+        }
+        i = i + 1
+    }
+    print("bad ")
+    print(bad)
+    print("\n")
+}

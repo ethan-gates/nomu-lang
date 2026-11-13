@@ -43,7 +43,7 @@ fun worker() -> Int {
 }
 
 fun main() {
-  fiber let x = worker()
-  print(x)                     // 111 — keep survived the move and its slot was fixed up
+  let x = task worker()
+  print(x.join())              // 111 — keep survived the move and its slot was fixed up
   print("\n")
 }

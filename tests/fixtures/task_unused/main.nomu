@@ -1,0 +1,8 @@
+// A `task` whose result is never used should be a `fiber`.
+fun square(n: Int) -> Int {
+  return n * n
+}
+
+fun main() {
+  task square(3)
+}

@@ -65,6 +65,13 @@ and share only the descriptor. Re-expressing removes the duplicated barrier/offs
 path for every collection); keeping it inline avoids threading `monoTypeArgs` through the array handle's
 element type at codegen. Decide at 181.1 — it sets how much of `EgressArrays` collapses.
 
+## Shareability
+
+`ManagedBuffer` has no fields, so the share rule counts it, and any struct holding one, as shareable. That is
+sound for `String` (immutable bytes) and `Channel` (contents the runtime synchronizes,
+[102](102-channels.md)), but an `Array` on a `ManagedBuffer` is mutable: it must not become shareable this way.
+Give the buffer's shareability to its element type and its user, rather than to the class.
+
 ## Refs
 
 Split from [180 managed buffer](180-managed-buffer.md) 180.4 (the Array half); the ad-hoc kind-1 array buffer

@@ -1,0 +1,99 @@
+import std/time
+
+// Stack shrinking at a major collection (task 104.4.5). 10,000 fibers each recurse about 1,000 frames, so their
+// stacks grow, then park on a channel receive with a few frames in use: the case shrinking exists for, and the
+// one that needs the channel's queue fixed. `main` then requests six major collections, printing the fibers'
+// total stack size (through the live-fiber registry) and each collection's wait. Each major halves the stacks
+// until they reach the starting size; the last finds nothing to shrink, so the others' extra time over it is
+// the shrink's cost. Built with the runtime prelude (`--config=rt_prelude`) for `rtGcRequest` and the
+// registry.
+class Box {
+    var v: Int
+}
+
+fun down(n: Int, b: Box) -> Int {
+    if n == 0 {
+        return b.v
+    }
+    let c = Box(v: b.v + 1)
+    return b.v + down(n - 1, c)
+}
+
+fun parked(ready: Channel<Int>, ch: Channel<Int>, n: Int) -> Int {
+    let keep = Box(v: down(n, Box(v: 0)))
+    ready.send(1)
+    switch ch.receive() {
+    case .some(let v):
+        return keep.v + v
+    case .none:
+        return keep.v
+    }
+}
+
+// The total size of every live fiber's stack, in bytes.
+fun stackBytes() -> Int {
+    var total = 0
+    var fib: RawPtr = rtSched.load(fromByteOffset: 128)
+    while fib.isNull == false {
+        total = total + rtStackSize(fib)
+        fib = fib.load(fromByteOffset: 80)
+    }
+    return total
+}
+
+// Request a major collection and wait for it; returns the wait in ns.
+fun major(t: Time) -> Int {
+    let t0 = t.now
+    let ticket = rtGcRequest(0)
+    var spins = 0
+    while !rtGcCollected(ticket) {
+        spins = spins + 1
+    }
+    return t.ns_diff(t0, t.now)
+}
+
+fun main() {
+    let n = 10000
+    let depth = 1000
+    let ready = Channel<Int>.make(capacity: n)
+    let ch = Channel<Int>.make(capacity: 0)
+    var tasks: Array<Task<Int>> = []
+    var i = 0
+    while i < n {
+        tasks.append(task parked(ready, ch, depth))
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        ready.receive()
+        i = i + 1
+    }
+    let t = Time()
+    print("stack_shrink fibers ")
+    print(n)
+    print(" stack-bytes ")
+    print(stackBytes())
+    var m = 0
+    while m < 6 {
+        let ns = major(t)
+        print(" | major-ns ")
+        print(ns)
+        print(" stack-bytes ")
+        print(stackBytes())
+        m = m + 1
+    }
+    i = 0
+    while i < n {
+        ch.send(1)
+        i = i + 1
+    }
+    var sum = 0
+    i = 0
+    while i < n {
+        sum = sum + tasks[i].join()
+        i = i + 1
+    }
+    print(" sum ")
+    print(sum)
+    print("\n")
+}

@@ -130,6 +130,10 @@ setting at the wrong stage, is an error. Compile settings select configs declare
   fills N 32 KiB blocks), `mature_floor` (every collection major below this mature size), `stack_move`
   (a fiber's stack moved at every resume and the old one made inaccessible, `NOMU_STACK_MOVE`),
   `stack_move_checks` (the same at every Nth function-entry stack check, `NOMU_STACK_MOVE_CHECKS`),
+  `stack_shrink` (every stopped fiber's stack moved at every collection, halved where shrinking allows,
+  `NOMU_STACK_SHRINK`),
+  `stack_stats` (stack moves and shrink passes, with their bytes and time, printed to stderr at exit,
+  `NOMU_STACK_STATS`),
   `stack_start` (a new fiber's stack size in bytes, `NOMU_STACK_START`), `stack_max` (the size past which
   a fiber's stack does not grow, `NOMU_STACK_MAX`).
 

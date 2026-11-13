@@ -118,9 +118,6 @@ private func appendStmt(_ stmt: Stmt, ind: String, into lines: inout [String]) {
         let kw    = b.isMutable ? "var" : "let"
         let annot = b.type.map { ": \($0.name)" } ?? ""
         lines.append("\(ind)\(kw) \(b.name)\(annot) = \(describeExpr(b.value))")
-    case .spawnLet(let name, let type, let value, _):
-        let annot = type.map { ": \($0.name)" } ?? ""
-        lines.append("\(ind)fiber let \(name)\(annot) = \(describeExpr(value))")
     case .assign(let lhs, let rhs, _):
         lines.append("\(ind)\(describeExpr(lhs)) = \(describeExpr(rhs))")
     case .compoundAssign(let lhs, let rhs, _):
@@ -148,6 +145,17 @@ private func appendStmt(_ stmt: Stmt, ind: String, into lines: inout [String]) {
         for arm in sw.cases {
             lines.append("\(ind)  \(describePattern(arm.pattern))")
             appendBlock(arm.body, ind: ind + "    ", into: &lines)
+        }
+    case .selectStmt(let sel):
+        lines.append("\(ind)select")
+        for arm in sel.arms {
+            let bind = arm.binding.map { "let \($0) = " } ?? ""
+            lines.append("\(ind)  case \(bind)\(describeExpr(arm.op))")
+            appendBlock(arm.body, ind: ind + "    ", into: &lines)
+        }
+        if let d = sel.defaultBody {
+            lines.append("\(ind)  default")
+            appendBlock(d, ind: ind + "    ", into: &lines)
         }
     case .expr(let e):
         lines.append("\(ind)\(describeExpr(e))")
@@ -180,6 +188,8 @@ private func describeExpr(_ e: Expr) -> String {
         return "[\(elems.map(describeExpr).joined(separator: ", "))]"
     case .index(let base, let idx, _):
         return "\(describeExpr(base))[\(describeExpr(idx))]"
+    case .taskStart(let call, _):
+        return "task \(describeExpr(call))"
     case .error:
         return "<error>"
     }

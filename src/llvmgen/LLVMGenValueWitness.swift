@@ -17,6 +17,58 @@ extension LLVMGen {
     // VWT flag bits.
     static let vwtFlagPOD: UInt64 = 1   // trivial: memcpy copy/move, no-op destroy, no GC scan needed
 
+    // A dictionary's word `i`. A dictionary is a constant.
+    func loadDictionaryWord(_ dict: LLVMValueRef, _ i: Int) -> LLVMValueRef {
+        var off = LLVMConstInt(i64, UInt64(i * 8), 0)
+        let addr = LLVMBuildGEP2(b, i8, dict, &off, 1, "dict.word")!
+        let word = LLVMBuildLoad2(b, i8ptr, addr, "dict.value")!
+        markInvariantLoad(word)
+        return word
+    }
+
+    // The constant dictionary `key` names. It may reach itself, through a recursive generic, so the global exists
+    // before its words are built. Each type argument's words come first, then the bounds' tables, then the needs.
+    func dictionary(_ key: String) -> LLVMValueRef? {
+        if let g = dictionaryGlobals[key] { return g }
+        guard let d = dictionaries[key] else { return nil }
+        let count = d.typeArgs.count * 2 + d.bounds.reduce(0) { $0 + $1.count } + d.needs.count
+        let ty = LLVMArrayType2(i8ptr, UInt64(count))!
+        let g = LLVMAddGlobal(mod, ty, "dict.\(dictionaryGlobals.count)")!
+        LLVMSetLinkage(g, LLVMInternalLinkage)
+        LLVMSetGlobalConstant(g, 1)
+        dictionaryGlobals[key] = g
+
+        var words: [LLVMValueRef?] = []
+        for t in d.typeArgs {
+            words.append(valueWitness(t))
+            words.append(LLVMConstIntToPtr(LLVMConstInt(i64, UInt64(slotCount(t) * 8), 0), i8ptr))
+        }
+        for (i, bounds) in d.bounds.enumerated() {
+            for iface in bounds {
+                guard case .named(let name, _) = d.typeArgs[i], let w = witnessInstanceErased(name, iface) else { return nil }
+                words.append(w)
+            }
+        }
+        for need in d.needs {
+            switch need {
+            case .dictionary(let callee):
+                guard let w = dictionary(callee) else { return nil }
+                words.append(w)
+            case .object(let t):
+                guard case .named(let name, _) = t else { return nil }
+                if let (header, element) = managedBufferArgs(t) {   // a channel's buffer: a buffer descriptor
+                    words.append(LLVMConstIntToPtr(descOffsetHeader(managedBufferTypeId(header: header, element: element)), i8ptr))
+                } else {
+                    words.append(LLVMConstIntToPtr(descOffsetHeader(typeId(forHeapType: name)), i8ptr))
+                }
+            case .arrayBuffer, .box:
+                words.append(LLVMConstNull(i8ptr))   // arrays and boxes of `T` are task 253
+            }
+        }
+        LLVMSetInitializer(g, LLVMConstArray2(i8ptr, &words, UInt64(count)))
+        return g
+    }
+
     // The shared VWT struct type.
     func valueWitnessType() -> LLVMTypeRef {
         if let t = valueWitnessTy { return t }

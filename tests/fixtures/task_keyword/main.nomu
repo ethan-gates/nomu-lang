@@ -1,0 +1,151 @@
+// `task f(x)`: the call runs on a new fiber and the expression gives its `Task`. Arguments are evaluated where
+// the task starts; joins repeat and can come from several fibers; a call returning nothing gives a `Task<Void>`.
+
+class Msg {
+  let n: Int
+  let text: String
+}
+
+struct Counter {
+  let base: Int
+
+  fun plus(n: Int) -> Int {
+    return self.base + n
+  }
+}
+
+fun square(n: Int) -> Int {
+  return n * n
+}
+
+fun slowSquare(n: Int) -> Int {
+  sleep(2)
+  return n * n
+}
+
+fun message(n: Int) -> Msg {
+  churn(20000)
+  return Msg(n: n, text: "message-".concat("0123456789012345678901234567890123456789"))
+}
+
+// Allocate enough to collect while results wait.
+fun churn(count: Int) {
+  var keep: Array<Msg> = []
+  var i = 0
+  while i < count {
+    keep.append(Msg(n: i, text: "churn-".concat("abcdefghijklmnopqrstuvwxyz")))
+    if keep.count > 64 {
+      keep = []
+    }
+    i = i + 1
+  }
+}
+
+fun record(out: Channel<Int>, v: Int) {
+  out.send(v)
+}
+
+fun joinInto(t: Task<Int>, out: Channel<Int>) {
+  out.send(t.join())
+}
+
+// A task started in one function and joined in another.
+fun startSum(a: Int, b: Int) -> Task<Int> {
+  return task sum(a, b)
+}
+
+fun sum(a: Int, b: Int) -> Int {
+  return a + b
+}
+
+// A task whose body starts tasks of its own.
+fun tree(depth: Int) -> Int {
+  if depth == 0 {
+    return 1
+  }
+  let l = task tree(depth - 1)
+  let r = task tree(depth - 1)
+  return l.join() + r.join() + 1
+}
+
+fun report(label: String, a: Int, b: Int) {
+  print(label)
+  print(" ")
+  print(a)
+  print(" ")
+  print(b)
+  print("\n")
+}
+
+fun main() {
+  // A join, then the same result again.
+  let a = task square(7)
+  report("repeat", a.join(), a.join())
+
+  // Arguments are evaluated where the task starts.
+  var x = 3
+  let b = task slowSquare(x)
+  x = 100
+  report("eager", b.join(), x)
+
+  // A method call: the receiver is evaluated where the task starts too.
+  let c = Counter(base: 40)
+  let m = task c.plus(2)
+  report("method", m.join(), 0)
+
+  // A call returning nothing gives a `Task<Void>`; joining waits for it.
+  let out = Channel<Int>.make(capacity: 1)
+  let v = task record(out, 11)
+  v.join()
+  switch out.receive() {
+  case .some(let got): report("void", got, 0)
+  case .none: report("void", -1, 0)
+  }
+
+  // Several fibers join one task.
+  let s = task slowSquare(9)
+  let joined = Channel<Int>.make(capacity: 0)
+  var i = 0
+  while i < 8 {
+    fiber joinInto(s, joined)
+    i = i + 1
+  }
+  var total = 0
+  i = 0
+  while i < 8 {
+    switch joined.receive() {
+    case .some(let got): total = total + got
+    case .none: total = -1
+    }
+    i = i + 1
+  }
+  report("joiners", total, s.join())
+
+  // A managed result across collections.
+  let msg = task message(42)
+  churn(5000)
+  let got = msg.join()
+  report("managed", got.n, got.text.count)
+
+  // Returned from the function that started it.
+  report("returned", startSum(20, 22).join(), 0)
+
+  // Fan out over an array of tasks, then reduce.
+  var ts: Array<Task<Int>> = []
+  i = 0
+  while i < 100 {
+    ts.append(task square(i))
+    i = i + 1
+  }
+  var fan = 0
+  i = 0
+  while i < ts.count {
+    fan = fan + ts[i].join()
+    i = i + 1
+  }
+  report("fanout", fan, 0)
+
+  // Tasks inside tasks.
+  let t = task tree(6)
+  report("tree", t.join(), 0)
+}

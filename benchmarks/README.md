@@ -8,6 +8,15 @@ reads the collector report. `speed_nomu` and `speed-py.py` are a recursive Fibon
 memory routines' load (task 104.3.4). `print_loop` prints three million integers, each a libc call from a fiber, which runs on the carrier's
 stack (task 104.3.3); it measures a libc call's cost, with stdout sent to /dev/null.
 
+`stack_shrink` parks 10,000 fibers on a channel after deep recursion and runs six major collections,
+printing each pause and the fibers' total stack size: the cost and the effect of shrinking stacks (task
+104.4.5; `--config=rt_prelude`).
+
+`spawn_grow` starts 100,000 short fibers a round, each recursing to a depth from 0 to 1,024, and
+`deep_recursion` runs 4 fibers recursing to 10,000, 100,000 and 1,000,000: what growing a stack costs (task
+104.5.1). Run them with `NOMU_STACK_STATS=1` for the moves' count, bytes and time. Their Go counterparts are
+in the gitignored `practice/go/stacks`.
+
 `ctx_swap`, `pingpong_fiber` and `pingpong_actor` measure a fiber switch; `tools/pingpong.py` builds and
 runs them, with a local Go counterpart when one is present (task 104). The scheduler workloads
 (`fanout_actor`, `forkjoin_fiber`, `pipeline_actor`, `producer_fiber`, `sleepers_fiber`, `mixed_fiber`,

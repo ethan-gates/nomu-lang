@@ -1,0 +1,8 @@
+// Closing a channel twice is a fault.
+fun main() {
+    let ch = Channel<Int>.make(capacity: 0)
+    ch.close()
+    print("closed\n")
+    ch.close()
+    print("unreachable\n")
+}

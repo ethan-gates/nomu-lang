@@ -102,7 +102,7 @@ func summarize(_ f: SSAFunction, _ g: PointsToGraph,
         for (v, sinkSet) in g.sinks {
             for sink in sinkSet {
                 switch sink {
-                case .globalStore, .spawnCapture, .actorSend,
+                case .globalStore, .fiberCapture, .actorSend,
                      .store, .box, .aggregate, .closureCapture, .edgeArg:
                     esc.insert(v)                                   // conservative / cross-fiber — terminal
                 case .ret:

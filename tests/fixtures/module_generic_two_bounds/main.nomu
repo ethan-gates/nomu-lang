@@ -1,0 +1,17 @@
+// Several bounds on a parameter, forwarded to a private generic: the sub-dictionary carries both tables. Specialized,
+// the bodies come from the `.bir`, with no source positions.
+import pkg/lib
+
+struct W: A, B {
+  var n: Int
+  fun a() -> Int {
+    return n
+  }
+  fun b() -> Int {
+    return n + 1
+  }
+}
+fun main() {
+  print(outer(W(n: 4), W(n: 1)))
+  print("\n")
+}

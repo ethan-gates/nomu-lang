@@ -93,9 +93,8 @@ private func renderKind(_ kind: SSAInstKind) -> String {
     case .mailboxInit(let a):                  return "mailboxInit \(val(a))"
     case .actorSend(let recv, let h, let args):
         return "send \(val(recv)).\(h)(\(list(args)))"
-    case .spawn(let binding, let startFn, let env, _):
-        return "spawn \(binding.map { "#\($0)" } ?? "detached") \(startFn)" + (env.map { " env \(val($0))" } ?? "")
-    case .spawnJoin(let binding, _, let fin):  return "spawnJoin #\(binding)" + (fin ? " final" : "")
+    case .fiber(let startFn, let env, _):
+        return "fiber \(startFn)" + (env.map { " env \(val($0))" } ?? "")
 
     case .makeStruct(let t, let fields):       return "makeStruct \(t)(\(list(fields)))"
     case .makeEnum(let t, let ci, let fields): return "makeEnum \(t)#\(ci)(\(list(fields)))"

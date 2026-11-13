@@ -4,7 +4,7 @@ import support
 //
 // A designated function (named via --runtime-subset) may not touch the managed heap
 // or call back into the runtime: no class/actor construction, no closures, no `any`
-// boxing, no array literals, no `spawn`, and it may call only other designated
+// boxing, no array literals, no `fiber` or `task`, and it may call only other designated
 // functions or the low-level primitives (__raw*/__ptr*/__gc*/__atomic*/__sys*, and
 // pure C leaves). The rules are opt-in — with no designated names the pass is inert.
 // It emits diagnostics only; the module is not rewritten.
@@ -62,7 +62,7 @@ private struct RuntimeSubsetPass {
     private func walkStmt(_ s: NOIRStmt, inFn: String) {
         switch s.kind {
         case .letBinding(_, _, let v): walkExpr(v, inFn: inFn)
-        case .spawnLet(_, let v, _), .fiberStart(let v):
+        case .fiberStart(let v):
             diags.error("runtime-subset function '\(inFn)' may not start a 'fiber' — it allocates a task", at: s.span)
             walkExpr(v, inFn: inFn)
         case .assign(let t, let v), .compoundAssign(let t, let v):
@@ -109,6 +109,9 @@ private struct RuntimeSubsetPass {
         case .fieldAccess(let base, _): walkExpr(base, inFn: inFn)
         case .index(let base, let idx): walkExpr(base, inFn: inFn); walkExpr(idx, inFn: inFn)
         case .enumInit(_, _, let args): args.forEach { walkExpr($0.value, inFn: inFn) }
+        case .taskStart(_, _, let call, _):
+            diags.error("runtime-subset function '\(inFn)' may not start a 'task' — it allocates a task", at: e.span)
+            walkExpr(call, inFn: inFn)
         default: break   // literals, varRef, and other leaves carry no allocation or call
         }
     }

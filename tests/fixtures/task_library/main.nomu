@@ -1,0 +1,133 @@
+// The stdlib's `Task<T>`, used directly: a fiber stores its result once, and any number of joins read it, before
+// or after it is stored, from one fiber or several. Managed results stay intact while the collector moves them.
+
+class Msg {
+  let n: Int
+  let text: String
+}
+
+fun square(n: Int) -> Int {
+  return n * n
+}
+
+fun runSquare(t: Task<Int>, n: Int) {
+  t.fulfill(square(n))
+}
+
+fun runSquareLate(t: Task<Int>, n: Int) {
+  sleep(2)
+  t.fulfill(square(n))
+}
+
+fun runMsg(t: Task<Msg>, n: Int) {
+  churn(20000)
+  t.fulfill(Msg(n: n, text: "message-".concat("0123456789012345678901234567890123456789")))
+}
+
+// Allocate enough to collect while results wait.
+fun churn(count: Int) {
+  var keep: Array<Msg> = []
+  var i = 0
+  while i < count {
+    keep.append(Msg(n: i, text: "churn-".concat("abcdefghijklmnopqrstuvwxyz")))
+    if keep.count > 64 {
+      keep = []
+    }
+    i = i + 1
+  }
+}
+
+fun joinInto(t: Task<Int>, out: Channel<Int>) {
+  out.send(t.join())
+}
+
+fun joinMsgInto(t: Task<Msg>, out: Channel<Int>) {
+  let m = t.join()
+  churn(5000)
+  if m.text.count == 48 {
+    out.send(m.n)
+  } else {
+    out.send(-1)
+  }
+}
+
+fun report(label: String, a: Int, b: Int) {
+  print(label)
+  print(" ")
+  print(a)
+  print(" ")
+  print(b)
+  print("\n")
+}
+
+fun main() {
+  // One join, then the same result again.
+  let a = Task<Int>.make()
+  fiber runSquare(a, 7)
+  let a1 = a.join()
+  let a2 = a.join()
+  report("repeat", a1, a2)
+
+  // Several fibers parked in `join` before the result is stored.
+  let b = Task<Int>.make()
+  let out = Channel<Int>.make(capacity: 0)
+  var i = 0
+  while i < 8 {
+    fiber joinInto(b, out)
+    i = i + 1
+  }
+  fiber runSquareLate(b, 9)
+  var sum = 0
+  i = 0
+  while i < 8 {
+    switch out.receive() {
+    case .some(let v): sum = sum + v
+    case .none: sum = -1
+    }
+    i = i + 1
+  }
+  report("waiters", sum, 0)
+
+  // Joined after the result is stored.
+  let c = Task<Int>.make()
+  fiber runSquare(c, 5)
+  sleep(2)
+  report("late", c.join(), 0)
+
+  // A managed result, read by several fibers across collections.
+  let d = Task<Msg>.make()
+  fiber runMsg(d, 42)
+  i = 0
+  while i < 4 {
+    fiber joinMsgInto(d, out)
+    i = i + 1
+  }
+  var ok = 0
+  i = 0
+  while i < 4 {
+    switch out.receive() {
+    case .some(let v):
+      if v == 42 { ok = ok + 1 }
+    case .none:
+    }
+    i = i + 1
+  }
+  report("managed", ok, d.join().n)
+
+  // Fan out over an array of tasks, then reduce.
+  var ts: Array<Task<Int>> = []
+  i = 0
+  while i < 100 {
+    let t = Task<Int>.make()
+    fiber runSquare(t, i)
+    ts.append(t)
+    i = i + 1
+  }
+  var total = 0
+  i = 0
+  while i < ts.count {
+    total = total + ts[i].join()
+    i = i + 1
+  }
+  report("fanout", total, 0)
+}

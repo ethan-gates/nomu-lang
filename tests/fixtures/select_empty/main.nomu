@@ -1,0 +1,5 @@
+// A `select` with no cases would wait forever.
+fun main() {
+  select {
+  }
+}

@@ -31,7 +31,9 @@ fun rtBoundsTrap(idx: Int, len: Int) {
 // rtStdin: 0 lock (futex mutex word) · 8 buffer · 16 head (first unread byte) · 24 end (bytes buffered)
 //          · 32 capacity · 40 end of input seen · 48 waiter list · 56 read event armed · 64 kqueue fd
 //          · 72 poller started · 80 poller thread handle
-// A waiter (16 bytes): 0 fiber · 8 next.
+// A waiter (16 bytes): 0 fiber · 8 next. A `select`'s `readLine()` case links its own select waiter instead
+// (`runtime/channel.nomu`), with its record and the low bit set at 0; the poller claims the record under the
+// stdin lock, which rtSelectDone takes to unlink a waiter that was not woken before it frees the record.
 let rtStdin = Runtime.staticStorage(bytes: 96, align: 8)
 
 // Read one line from stdin. Returns a raw block the caller frees: the line's byte count at 0, then its bytes
@@ -42,6 +44,61 @@ fun rtReadLine(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
   let anchorOff = rtAnchorOffset(anchorSp)
   let st = rtStdin
   rtSchedMutexLockAt(st)
+  while true {
+    let line = rtStdinTryLine(st)
+    if line.isNull == false {
+      rtSchedMutexUnlockAt(st)
+      return line
+    }
+    // Nothing to read: wait for the poller, then re-check from the top.
+    let w = RawPtr.alloc(bytes: 16, align: 8)
+    w.store(rtCurrentFiber(), toByteOffset: 0)
+    rtStdinWait(st, w)
+    rtSchedWaiting(rtCurrentFiber(), rtWaitStdin)
+    rtSchedLock(sched)
+    rtSchedMutexUnlockAt(st)
+    nomuSchedParkLocked(sched, rtAnchorAt(rtCurrentFiber(), anchorOff), anchorPc)   // returns with the scheduler lock released
+    rtSchedMutexLockAt(st)
+  }
+  return RawPtr.null
+}
+
+// Put `w` on the waiter list, starting the poller and arming the read event as needed. Called holding the
+// stdin lock.
+fun rtStdinWait(st: RawPtr, w: RawPtr) {
+  rtStdinPollerStart(st)
+  let first: RawPtr = st.load(fromByteOffset: 48)
+  w.store(first, toByteOffset: 8)
+  st.store(w, toByteOffset: 48)
+  let armed: Int = st.load(fromByteOffset: 56)
+  if armed == 0 {
+    rtStdinArm(st)
+    st.store(1, toByteOffset: 56)
+  }
+}
+
+// Take `w` off the waiter list if it is there. Called holding the stdin lock.
+fun rtStdinUnwait(st: RawPtr, w: RawPtr) {
+  var prev = RawPtr.null
+  var cur: RawPtr = st.load(fromByteOffset: 48)
+  while cur.isNull == false {
+    let next: RawPtr = cur.load(fromByteOffset: 8)
+    if cur.eq(w) {
+      if prev.isNull {
+        st.store(next, toByteOffset: 48)
+      } else {
+        prev.store(next, toByteOffset: 8)
+      }
+      return
+    }
+    prev = cur
+    cur = next
+  }
+}
+
+// The next line if one can be had without waiting, reading stdin when it is readable, else null. Called
+// holding the stdin lock.
+fun rtStdinTryLine(st: RawPtr) -> RawPtr {
   while true {
     let buf: RawPtr = st.load(fromByteOffset: 8)
     let head: Int = st.load(fromByteOffset: 16)
@@ -70,26 +127,10 @@ fun rtReadLine(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) -> RawPtr {
       } else {
         st.store(next, toByteOffset: 16)
       }
-      rtSchedMutexUnlockAt(st)
       return line
     }
     if Runtime.poll(fd: 0) == 0 {
-      // Nothing to read: wait for the poller, then re-check from the top.
-      rtStdinPollerStart(st)
-      let w = RawPtr.alloc(bytes: 16, align: 8)
-      w.store(rtCurrentFiber(), toByteOffset: 0)
-      let first: RawPtr = st.load(fromByteOffset: 48)
-      w.store(first, toByteOffset: 8)
-      st.store(w, toByteOffset: 48)
-      let armed: Int = st.load(fromByteOffset: 56)
-      if armed == 0 {
-        rtStdinArm(st)
-        st.store(1, toByteOffset: 56)
-      }
-      rtSchedLock(sched)
-      rtSchedMutexUnlockAt(st)
-      nomuSchedParkLocked(sched, rtAnchorAt(rtCurrentFiber(), anchorOff), anchorPc)   // returns with the scheduler lock released
-      rtSchedMutexLockAt(st)
+      return RawPtr.null
     } else {
       // Readable: read what is there. Holding the stdin lock serializes readers; a readable fd does not
       // block.
@@ -197,15 +238,52 @@ fun rtStdinPollerMain(st: RawPtr) -> RawPtr {
     let n = Runtime.kevent(kq: kq, changes: RawPtr.null, nchanges: 0, events: evs, nevents: 8)
     if n > 0 {
       rtSchedMutexLockAt(st)
-      var w: RawPtr = st.load(fromByteOffset: 48)
+      var first: RawPtr = st.load(fromByteOffset: 48)
       st.store(RawPtr.null, toByteOffset: 48)
       st.store(0, toByteOffset: 56)
+      // Claim each select waiter under the lock, dropping those another case already won: a dropped one's
+      // record may be freed once the lock is released.
+      var prev = RawPtr.null
+      var c = first
+      while !c.isNull {
+        let nx: RawPtr = c.load(fromByteOffset: 8)
+        let tag: Int = c.load(fromByteOffset: 0)
+        var keep = true
+        if (tag & 1) == 1 {
+          let sel = RawPtr.null.advanced(by: tag - 1)
+          let was: Int = sel.atomicCas(0, 1, atByteOffset: 8)
+          if was == 0 {
+            let index: Int = c.load(fromByteOffset: 56)
+            sel.store(index, toByteOffset: 16)
+            c.store(1, toByteOffset: 40)
+          } else {
+            keep = false
+          }
+        }
+        if keep {
+          prev = c
+        } else if prev.isNull {
+          first = nx
+        } else {
+          prev.store(nx, toByteOffset: 8)
+        }
+        c = nx
+      }
       rtSchedMutexUnlockAt(st)
+      var w = first
       while !w.isNull {
         let nx: RawPtr = w.load(fromByteOffset: 8)
-        let fib: RawPtr = w.load(fromByteOffset: 0)
-        rtSchedUnpark(rtSched, fib)
-        w.free()
+        let tag: Int = w.load(fromByteOffset: 0)
+        if (tag & 1) == 1 {
+          let sel = RawPtr.null.advanced(by: tag - 1)
+          rtSchedMutexLockAt(sel)
+          rtSchedMutexUnlockAt(sel)
+          let fib: RawPtr = sel.load(fromByteOffset: 24)
+          rtSchedUnpark(rtSched, fib)
+        } else {
+          rtSchedUnpark(rtSched, w.load(fromByteOffset: 0))
+          w.free()
+        }
         w = nx
       }
     }

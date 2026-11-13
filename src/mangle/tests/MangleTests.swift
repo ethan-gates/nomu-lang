@@ -35,7 +35,7 @@ final class MangleTests: XCTestCase {
              "_RINvNmNmC4acme4shop3lib3maxNtNmNmC4acme4shop3app4NodeE",
              "acme::shop::lib::max::<acme::shop::app::Node>"),
             (Mangle.function("clo:3", home: app), "_RNCNmNmC4acme4shop3apps1_0", "acme::shop::app::{closure#3}"),
-            (Mangle.function("spawn:0", home: app), "_RNCNmNmC4acme4shop3app5spawn", "acme::shop::app::{closure:spawn#0}"),
+            (Mangle.function("fiber:0", home: app), "_RNCNmNmC4acme4shop3app5fiber", "acme::shop::app::{closure:fiber#0}"),
         ])
     }
 

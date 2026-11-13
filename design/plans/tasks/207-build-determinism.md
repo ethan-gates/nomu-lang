@@ -37,6 +37,9 @@ correctness. Differential stage-diffing (156) and Bazel's caching (192) need the
   debug map (`N_OSO`) named each object by absolute path, so binaries were path-dependent, and a cached link
   must not be. The split follows Xcode and Bazel: development links keep a debug map, with relative paths;
   `release` writes a dSYM, since `dsymutil` costs O(all debug info) per link.
+- **207.7** A regression: `std/prelude`'s object came out in one of two forms, chosen by Swift's per-process
+  hash seed. Found by `testConcurrentWorkspacesShareOneCache`, whose `--verify-cache` build compared a third
+  compile of the prelude with the cached one.
 
 ## Progress
 
@@ -89,6 +92,13 @@ correctness. Differential stage-diffing (156) and Bazel's caching (192) need the
   Corrected in [214](214-link-caching.md): `dsymutil` resolved the relative debug map against the current
   directory, so a `dsym` build run from outside the workspace root wrote an empty dSYM; it now reads objects from
   the workspace root.
+
+- **207.7 done.** `Monomorphize` emitted generic type templates, and queued their methods' bodies for the
+  erased pass, in `Dictionary` order, so the order of the prelude's `Task` and `Channel` methods (and of a
+  fixture's generic `Q` and `Empty`) varied, and with it the function order, frames and lazily added globals of
+  the object. Both loops now go in name order. The sweep found nothing earlier because each compile picks one
+  of the two forms at random, so two rounds agree half the time. Checked: the prelude compiled ten times gives one object, the sweep (3241 outputs) is identical,
+  and `testConcurrentWorkspacesShareOneCache` passes eight runs of eight.
 
 ## Refs
 

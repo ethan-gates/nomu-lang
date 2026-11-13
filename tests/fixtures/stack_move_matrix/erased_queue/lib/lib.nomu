@@ -1,0 +1,49 @@
+// A queue compiled once, in the shape of a channel: its methods allocate nodes of a generic class, so each
+// allocation takes its descriptor from the dictionary of the queue's instantiation.
+package class Node<T> {
+  var value: T
+  var next: Option<Node<T>>
+}
+package class Queue<T> {
+  var head: Option<Node<T>>
+  var tail: Option<Node<T>>
+  var count: Int
+  fun push(v: T) {
+    let n = Node(value: v, next: .none)
+    switch tail {
+    case .some(let t):
+      t.next = .some(value: n)
+    case .none:
+      head = .some(value: n)
+    }
+    tail = .some(value: n)
+    count = count + 1
+  }
+  fun pop(fallback: T) -> T {
+    switch head {
+    case .some(let h):
+      head = h.next
+      count = count - 1
+      switch head {
+      case .some:
+        count = count + 0
+      case .none:
+        tail = .none
+      }
+      return h.value
+    case .none:
+      return fallback
+    }
+  }
+}
+// A free generic allocating the queue itself, then filling it through its methods.
+package fun filled<T>(x: T, n: Int) -> Queue<T> {
+  let none: Option<Node<T>> = .none
+  let q = Queue(head: none, tail: none, count: 0)
+  var i = 0
+  while i < n {
+    q.push(x)
+    i = i + 1
+  }
+  return q
+}

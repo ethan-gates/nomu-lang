@@ -6,9 +6,8 @@ import support
 import Foundation
 import LLVM_C
 
-// SSAIR→LLVM egress — actor / closure / spawn emission: actor mailbox init, the managed closure
-// `{header, fn, env}` object (stack-allocated when non-escaping), and `spawn`/`spawn`-join (the
-// per-spawn fiber thunk that boxes the result, and the join that reads it back). A capability
+// SSAIR→LLVM egress — actor / closure / fiber emission: actor mailbox init, the managed closure
+// `{header, fn, env}` object (stack-allocated when non-escaping), and `fiber` (the per-fiber thunk). A capability
 // namespace over the `SSAIRToLLVM` reference; the GC/fiber ABI primitives are reached through `g.e`.
 enum EgressConcurrency {
 
@@ -41,82 +40,21 @@ enum EgressConcurrency {
         return obj
     }
 
-    // Start `startFn(env)` on a fiber. The lifted `spawn:N(env: envClass) -> R` returns its result
-    // directly, but the runtime's fiber routine ABI is `i8ptr(i8ptr)`, so wrap it in a per-spawn thunk
-    // that re-manages the env pointer, calls the lifted body, boxes the result, and returns the box.
-    // A detached fiber (nil `binding`) drops the result: its thunk returns null, and nothing boxes it.
-    static func lowerSpawn(_ g: SSAIRToLLVM, binding: Int?, startFn: String, env: SSAValue?, resultType: Type, span: Span) {
+    // Start `startFn(env)` on a fiber. The runtime's fiber routine ABI is `i8ptr(i8ptr)`, so a thunk calls the
+    // lifted `fiber:N(env)` and returns null; the body's result is dropped.
+    static func lowerFiber(_ g: SSAIRToLLVM, startFn: String, env: SSAValue?, span: Span) {
         guard let start = g.e.callables["f:\(startFn)"] else {
-            g.e.fail("7.2.3: unknown spawn body '\(startFn)'", span); return
+            g.e.fail("7.2.3: unknown fiber body '\(startFn)'", span); return
         }
-        guard let binding else {
-            let (thunk, _) = g.e.emitFunction("nomu_fiberthunk", ret: g.e.i8ptr, params: [g.e.i8ptr])
-            LLVMSetLinkage(thunk, LLVMInternalLinkage)
-            g.e.withStubBody(thunk) {
-                _ = g.e.buildCall(start.fn, start.ty, [LLVMGetParam(thunk, 0)!])
-                LLVMBuildRet(g.b, LLVMConstNull(g.e.i8ptr))
-            }
-            let spawn = g.e.runtimePreludeFn("nomuSchedSpawnDetached", ret: g.e.voidTy, params: [g.e.i8ptr, g.e.i8ptr, g.e.i8ptr])
-            let envArg = env != nil ? g.e.toUnmanaged(g.val(env!)) : LLVMConstNull(g.e.i8ptr)
-            let sched = g.e.loadRuntimeGlobal("rtSched", g.e.i8ptr)
-            _ = g.e.buildCall(spawn.fn, spawn.ty, [sched, thunk, envArg])
-            return
-        }
-        guard let resTy = g.ty(resultType, span) else {
-            g.e.fail("7.2.3: unknown spawn result", span); return
-        }
-        let (thunk, _) = g.e.emitFunction("nomu_spawnthunk_\(binding)", ret: g.e.i8ptr, params: [g.e.i8ptr])
-        LLVMSetLinkage(thunk, LLVMInternalLinkage)   // referenced only from this spawn site
+        let (thunk, _) = g.e.emitFunction("nomu_fiberthunk", ret: g.e.i8ptr, params: [g.e.i8ptr])
+        LLVMSetLinkage(thunk, LLVMInternalLinkage)
         g.e.withStubBody(thunk) {
-            let envArg = LLVMGetParam(thunk, 0)!   // addr0 void* — matches `spawn:N`'s addr0 env param
-            let r = g.e.buildCall(start.fn, start.ty, [envArg])!
-            // A proper typed box { header, result } (150.3.13): the header lets a moving collection relocate
-            // the box, which the self-hosted STW walk roots at fib+216 until the join; its pointer map scans a
-            // managed result so that survives + is fixed up too. Result lives after the 8-byte header.
-            let slots = 1 + g.e.slotCount(resultType)
-            let bytes = LLVMConstInt(g.e.i64, UInt64(slots * 8), 0)!
-            let box: LLVMValueRef
-            var result = r
-            if g.e.shapes.hasConditional(resultType), let lt = g.ty(resultType, span) {
-                // A shaped result crosses the box's allocation in a recorded frame slot, as a home does: stored
-                // before, recorded in the allocation's deopt bundle, reloaded after. The thunk is built while
-                // `currentFn` is the spawning function, so it is this function's for the allocation.
-                let savedFn = g.e.currentFn, savedDeopt = g.e.pendingDeopt
-                g.e.currentFn = thunk
-                let home = g.e.entryAlloca(lt, "spawn.res.home")
-                LLVMBuildStore(g.b, r, home)
-                g.e.pendingDeopt = [LLVMConstInt(g.e.i32, UInt64(bitPattern: Int64(g.e.shapeOrdinal(resultType))), 0), home]
-                box = g.e.rtAllocManaged(bytes)
-                g.e.pendingDeopt = savedDeopt
-                g.e.currentFn = savedFn
-                result = g.loadReloading(home, resultType, lt)
-            } else {
-                box = g.e.rtAllocManaged(bytes)
-            }
-            g.e.writeTypeIdHeaderRaw(box, g.e.spawnBoxTypeId(resultType))
-            g.e.storeField(box, g.e.gepByte(box, LLVMConstInt(g.e.i64, 8, 0)), result, type: resultType)
-            LLVMBuildRet(g.b, g.e.toUnmanaged(box))
+            _ = g.e.buildCall(start.fn, start.ty, [LLVMGetParam(thunk, 0)!])
+            LLVMBuildRet(g.b, LLVMConstNull(g.e.i8ptr))
         }
-        // The scheduler's spawn, called directly with the scheduler handle; returns the fiber handle.
-        let spawn = g.e.runtimePreludeFn("nomuSchedSpawn", ret: g.e.i8ptr, params: [g.e.i8ptr, g.e.i8ptr, g.e.i8ptr])
+        let startFiber = g.e.runtimePreludeFn("nomuSchedStartFiber", ret: g.e.voidTy, params: [g.e.i8ptr, g.e.i8ptr, g.e.i8ptr])
         let envArg = env != nil ? g.e.toUnmanaged(g.val(env!)) : LLVMConstNull(g.e.i8ptr)
         let sched = g.e.loadRuntimeGlobal("rtSched", g.e.i8ptr)
-        let fiber = g.e.buildCall(spawn.fn, spawn.ty, [sched, thunk, envArg])!
-        _ = resTy
-        let handleSlot = g.e.entryAlloca(g.e.spawnHandleTy, "spawn.h")
-        LLVMBuildStore(g.b, fiber, g.e.structGEP(g.e.spawnHandleTy, handleSlot, 0))
-        g.spawnHandles[binding] = handleSlot
-    }
-
-    static func lowerSpawnJoin(_ g: SSAIRToLLVM, _ inst: SSAInst, binding: Int, resultType: Type, final: Bool, span: Span) {
-        guard let handleSlot = g.spawnHandles[binding] else { return }
-        // `final` (the structured scope-exit join) tells the runtime to drop the fiber from the live-fiber
-        // registry after reading the result — the point its result box stops being rooted (150.3.13).
-        let (sj, sty) = g.e.nomuSpawnJoin()
-        let box = g.e.buildCall(sj, sty, [handleSlot, LLVMConstInt(g.e.i64, final ? 1 : 0, 0)])!
-        if let result = inst.result, let rt = g.ty(resultType, span) {
-            let payload = g.e.gepByte(box, LLVMConstInt(g.e.i64, 8, 0))   // result after the 8-byte header (150.3.13)
-            g.define(inst, LLVMBuildLoad2(g.b, rt, payload, "spawn.res"))
-        }
+        _ = g.e.buildCall(startFiber.fn, startFiber.ty, [sched, thunk, envArg])
     }
 }

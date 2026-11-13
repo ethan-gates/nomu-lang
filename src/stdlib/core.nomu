@@ -18,3 +18,24 @@ public class ManagedBuffer<Header, Element> {
 // `cap` — heap `String` storage is a `ManagedBuffer<EmptyHeader, UInt8>`) is a compiler builtin (task
 // 174.5.1): codegen names it, it carries no symbols, and it is never written in source, so the egress seeds
 // its zero-field layout directly rather than a prepended decl.
+
+// A channel's state, the header of its `ManagedBuffer` (`runtime/channel.nomu` reads it by offset): the lock
+// word, the oldest buffered element and the count, the closed flag, and the queues of parked receivers and
+// senders. Plain words: the queues link waiters in parked fibers' frames, which the collector never follows.
+// A fresh buffer is zeroed, which is an open, empty channel.
+public struct ChannelState {
+    let lock: Int
+    let head: Int
+    let count: Int
+    let closed: Int
+    let receiversHead: Int
+    let receiversTail: Int
+    let sendersHead: Int
+    let sendersTail: Int
+}
+
+// One element of a channel's buffer. A struct is a whole number of 8-byte slots, so the element stride is the
+// value witness's size for every `T`, `UInt8` included, which is the stride the runtime steps by.
+public struct ChannelSlot<T> {
+    let value: T
+}

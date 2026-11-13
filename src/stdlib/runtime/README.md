@@ -19,7 +19,9 @@ One module over these files; a name declared in any file is visible in all of th
 | `gcreport.nomu` | the collector's recorder and report |
 | `scheduler.nomu` | the M:N scheduler, timers, actor mailboxes, the stop-the-world handshake, entry points |
 | `io.nomu` | stdin line input and its poller, the array bounds trap |
-| `fault.nomu` | the fault handler: the crash report, each runtime thread's alternate signal stack |
+| `channel.nomu` | the channel core under the prelude's `Channel<T>`: the buffer, the waiter queues, park and wake; the one-shot pair (fulfill, await) under `Task<T>`; and `select` (rtSelectWait, rtSelectDone) |
+| `fault.nomu` | the fault handler: the crash report, each runtime thread's alternate signal stack; fiber dumps (SIGQUIT, `NOMU_TRACEBACK=all`) |
+| `leak.nomu` | the leak report: fibers that can never wake, found by a mark from the roots that can run (`NOMU_LEAK_REPORT=1`) |
 | `verify.nomu` | the bump allocator and mark-verify tracer (early collector rungs) |
 
 **Recording costs nothing when off.** Every recording path is guarded by `Runtime.gcRecordLevel()` (0 off,

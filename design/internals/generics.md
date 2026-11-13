@@ -110,6 +110,13 @@ Intentionally out; none of these locks anything that contradicts adding them lat
 
 ---
 
+## Inlining compiled-once code — Decided
+
+Unspecialized generic code is never inlined, and no flag turns it on. Specialization is the lever for a hot generic
+path: it removes the witnesses, the runtime sizes and the call together, where inlining code that stays generic
+removes only the call. A compiled-once body's witnesses also live in its own dictionary, which a caller does not have.
+Specialized code inlines as any other code does.
+
 ## 11. Coherence (global orphan rule)
 
 A conformance (`extension T: I`, `interfaces.md`) may be declared only in the module that owns `T` or the module that owns `I`; it is then global and unique across the program — **no invisible behavior on import**, and **one witness program-wide**. A third module needing `T`-as-`I` wraps `T` in a distinct nominal type it owns (the newtype mechanism, §10) and conforms the wrapper. — Decided (2026-07-20); **enforcement blocked on modules** (`modules.md`). Under M5's single compilation unit uniqueness is trivial; this is the target model, not scaffolding.

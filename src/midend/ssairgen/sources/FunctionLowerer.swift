@@ -37,17 +37,10 @@ final class FunctionLowerer {
     private var slots: [String: SSAValue] = [:]
     private var entryId = 0
 
-    private struct LoopCtx { let header: Int; let exit: Int; let spawnBase: Int }
+    private struct LoopCtx { let header: Int; let exit: Int }
     private var loopStack: [LoopCtx] = []
     private var lastSpan: Span
 
-    // `fiber let` state. Each binding gets an egress-owned fiber handle keyed by `id`; reads join it,
-    // and every scope exit (return / loop back-edge / break / continue) joins the spawns still active,
-    // so a fiber never outlives its frame (structured concurrency). `spawnJoin` is idempotent.
-    private var spawnBindings: [String: Int] = [:]     // spawn-let name → binding id
-    private var spawnResultTypes: [Int: Type] = [:]    // binding id → result type
-    private var activeSpawns: [Int] = []               // active binding ids, in spawn order
-    private var nextSpawn = 0
     private var fiberArgCounter = 0
 
     // In a method body, the receiver type + kind + its stored fields, so a bare `varRef` of a field
@@ -148,7 +141,6 @@ final class FunctionLowerer {
                                 generics: [NOIRGenericParam]? = nil) -> SSAFunction? {
         lowerBlock(f.body)
         if bbs[curId]?.term == nil {       // fell off the end
-            joinSpawns(from: 0)
             terminate(f.returnType == .void ? .ret(nil) : .unreachable, f.span)
         }
         let blocks = finalize(returnType: f.returnType)
@@ -258,13 +250,11 @@ final class FunctionLowerer {
             }
 
         case .ret(let e):
-            // Compute the value first (its own spawn reads join), then join the rest before returning.
             var rv: SSAValue?
             if let e = e {
                 guard let v = lowerExpr(e) else { return }
                 rv = v
             }
-            joinSpawns(from: 0)
             terminate(.ret(rv), stmt.span)
 
         case .ifStmt(let cond, let then, let els):
@@ -275,21 +265,16 @@ final class FunctionLowerer {
 
         case .breakStmt:
             guard let loop = loopStack.last else { fail("break outside a loop", stmt.span); return }
-            joinSpawns(from: loop.spawnBase)
             terminate(.br(target: loop.exit, args: []), stmt.span)
             addPred(loop.exit, curId)
 
         case .continueStmt:
             guard let loop = loopStack.last else { fail("continue outside a loop", stmt.span); return }
-            joinSpawns(from: loop.spawnBase)
             terminate(.br(target: loop.header, args: []), stmt.span)
             addPred(loop.header, curId)
 
         case .switchStmt(let sw):
             lowerSwitch(sw, stmt.span)
-
-        case .spawnLet(let name, let value, let resultType):
-            lowerSpawnLet(name: name, value: value, resultType: resultType, span: stmt.span)
 
         case .fiberStart(let call):
             lowerFiberStart(call, span: stmt.span)
@@ -299,18 +284,30 @@ final class FunctionLowerer {
         }
     }
 
-    // Emit an (idempotent) join for every spawn still active from `base` onward, newest first — a scope
-    // exit must not leave a fiber running past its frame.
-    private func joinSpawns(from base: Int) {
-        guard base < activeSpawns.count else { return }
-        for id in activeSpawns[base...].reversed() {
-            if let rt = spawnResultTypes[id] { _ = emit(.spawnJoin(binding: id, resultType: rt, final: true), rt, lastSpan) }
-        }
-    }
-
-    // `fiber f(x)` — a detached fiber over a call. The arguments and receiver are evaluated here, on the
+    // `fiber f(x)` — a fiber over a call. The arguments and receiver are evaluated here, on the
     // starting fiber, then captured; the call itself runs on the new fiber, and its result is dropped.
     private func lowerFiberStart(_ call: NOIRExpr, span: Span) {
+        guard let eager = hoistCallOperands(call) else { return }
+        startFiber([NOIRStmt(kind: .ret(eager), span: span)], resultType: call.type, span: span)
+    }
+
+    // `task f(x)` — build the `Task` and bind it to `binder`, then start a fiber that runs the call and
+    // stores its result through `fulfill`. The arguments and receiver are evaluated here, as for `fiber`. The
+    // expression's value is the `Task`.
+    private func lowerTaskStart(binder: String, make: NOIRExpr, call: NOIRExpr, fulfill: NOIRExpr, span: Span) -> SSAValue? {
+        guard let task = lowerExpr(make) else { return nil }
+        bind(binder, task, span)
+        guard let eager = hoistCallOperands(call) else { return nil }
+        let run = call.type == .void
+            ? NOIRStmt(kind: .exprStmt(eager), span: span)
+            : NOIRStmt(kind: .letBinding(name: "\(binder).v", isMutable: false, value: eager), span: span)
+        startFiber([run, NOIRStmt(kind: .exprStmt(fulfill), span: span)], resultType: .void, span: span)
+        return readVar(binder, span)
+    }
+
+    // Evaluate a call's arguments and receiver here, binding each to a fresh local, and return the call over
+    // those locals, for a fiber to make. Literals and top-level names stay as they are.
+    private func hoistCallOperands(_ call: NOIRExpr) -> NOIRExpr? {
         func hoist(_ e: NOIRExpr) -> NOIRExpr? {
             switch e.kind {
             case .intLit, .doubleLit, .boolLit, .stringLit, .funcRef, .globalRef: return e
@@ -318,7 +315,7 @@ final class FunctionLowerer {
             }
             guard let v = lowerExpr(e) else { return nil }
             let name = "$fiber\(fiberArgCounter)"; fiberArgCounter += 1
-            bind(name, v, span)
+            bind(name, v, e.span)
             return NOIRExpr(type: e.type, span: e.span, kind: .varRef(name))
         }
         var eager = call
@@ -326,54 +323,42 @@ final class FunctionLowerer {
         case .call(let callee, let args, let typeArgs):
             var out: [NOIRArg] = []
             for a in args {
-                guard let v = hoist(a.value) else { return }
+                guard let v = hoist(a.value) else { return nil }
                 out.append(NOIRArg(label: a.label, value: v))
             }
             eager = NOIRExpr(type: call.type, span: call.span, kind: .call(callee: callee, args: out, typeArgs: typeArgs))
         case .methodCall(let receiver, let method, let args):
-            guard let r = hoist(receiver) else { return }
+            guard let r = hoist(receiver) else { return nil }
             var out: [NOIRExpr] = []
             for a in args {
-                guard let v = hoist(a) else { return }
+                guard let v = hoist(a) else { return nil }
                 out.append(v)
             }
             eager = NOIRExpr(type: call.type, span: call.span, kind: .methodCall(receiver: r, method: method, args: out))
         case .staticCall(let onType, let method, let args):
             var out: [NOIRExpr] = []
             for a in args {
-                guard let v = hoist(a) else { return }
+                guard let v = hoist(a) else { return nil }
                 out.append(v)
             }
             eager = NOIRExpr(type: call.type, span: call.span, kind: .staticCall(onType: onType, method: method, args: out))
         default: break
         }
-        startFiber(eager, resultType: call.type, binding: nil, span: span)
+        return eager
     }
 
-    // `fiber let name = value` — run `value` on a fiber. Its free variables are captured into an env
-    // (as for a closure); the body is lifted to `spawn:N(env) -> resultType`. The site starts the
-    // fiber (`spawn`), and reads of `name` (plus scope exit) join it.
-    private func lowerSpawnLet(name: String, value: NOIRExpr, resultType: Type, span: Span) {
-        let binding = nextSpawn; nextSpawn += 1
-        guard startFiber(value, resultType: resultType, binding: binding, span: span) else { return }
-        spawnResultTypes[binding] = resultType
-        activeSpawns.append(binding)
-        spawnBindings[name] = binding
-    }
-
-    // Lift `value` to `spawn:N(env)` and start it, capturing its free variables. `binding` keys the handle a
-    // joinable fiber keeps; a detached fiber has none.
-    @discardableResult
-    private func startFiber(_ value: NOIRExpr, resultType: Type, binding: Int?, span: Span) -> Bool {
+    // Lift `body` to `fiber:N(env) -> resultType` and start it, capturing its free variables.
+    private func startFiber(_ body: [NOIRStmt], resultType: Type, span: Span) {
         var used: [String] = []
-        collectUsesExpr(value, [], &used)
+        var bound = Set<String>()
+        collectUses(body, &bound, &used)
         var seen = Set<String>()
         let capNames = used.filter { seen.insert($0).inserted && (slots[$0] != nil || varType[$0] != nil) }
         var caps: [(name: String, value: SSAValue)] = []
-        for n in capNames { guard let v = readVar(n, span) else { return false }; caps.append((n, v)) }
+        for n in capNames { guard let v = readVar(n, span) else { return }; caps.append((n, v)) }
 
         let id = sink.nextId; sink.nextId += 1
-        let envName = "spawn.\(id).env"
+        let envName = "fiber.\(id).env"
         let envType = Type.named(envName, .class_)
         sink.envAggregates.append(SSAAggregate(
             name: envName, kind: .class_,
@@ -389,18 +374,16 @@ final class FunctionLowerer {
             env = e
         }
 
-        // Lift `spawn:N(env) -> resultType { return value }`.
-        let startName = "spawn:\(id)"
+        // Lift `fiber:N(env) -> resultType { body }`.
+        let startName = "fiber:\(id)"
         let child = FunctionLowerer(diags: diags, ctx: ctx, sink: sink, subsetFuncs: subsetFuncs)
-        let body = [NOIRStmt(kind: .ret(value), span: span)]
         if let lifted = child.lowerClosureBody(name: startName, envType: envType,
                                                captures: caps.map { ($0.name, $0.value.type) },
                                                params: [], body: body, ret: resultType, span: span) {
             sink.lifted.append(lifted)
         }
 
-        emitVoid(.spawn(binding: binding, startFn: startName, env: env, resultType: resultType), span)
-        return true
+        emitVoid(.fiber(startFn: startName, env: env, resultType: resultType), span)
     }
 
     // `if cond { then } else { els }` → a condBr to fresh then/else blocks that both branch to a
@@ -472,15 +455,12 @@ final class FunctionLowerer {
         addPred(bodyB, headerB); addPred(exitB, headerB)
 
         seal(bodyB); curId = bodyB
-        let spawnBase = activeSpawns.count                // spawns made in the body don't outlive the loop
-        loopStack.append(LoopCtx(header: headerB, exit: exitB, spawnBase: spawnBase))
+        loopStack.append(LoopCtx(header: headerB, exit: exitB))
         lowerBlock(body)
         if !terminated {
-            joinSpawns(from: spawnBase)                   // the iteration's spawns join on the back-edge
             terminate(.br(target: headerB, args: []), span); addPred(headerB, curId)
         }
         loopStack.removeLast()
-        activeSpawns.removeLast(activeSpawns.count - spawnBase)
 
         seal(headerB)                                     // both preds (entry + back-edge) now known
         seal(exitB)                                       // preds: header + any `break` edges
@@ -492,6 +472,8 @@ final class FunctionLowerer {
     private func lowerExpr(_ e: NOIRExpr) -> SSAValue? {
         lastSpan = e.span
         switch e.kind {
+        case .taskStart(let binder, let make, let call, let fulfill):
+            return lowerTaskStart(binder: binder, make: make, call: call, fulfill: fulfill, span: e.span)
         case .intLit(let n):    return emit(.constInt(n), e.type, e.span)   // .int, or .uint8 in a byte context
         case .doubleLit(let x): return emit(.constDouble(x), .double, e.span)
         case .boolLit(let b):   return emit(.constBool(b), .bool, e.span)
@@ -623,7 +605,7 @@ final class FunctionLowerer {
         }
 
         lowerBlock(body)
-        if bbs[curId]?.term == nil { joinSpawns(from: 0); terminate(ret == .void ? .ret(nil) : .unreachable, span) }
+        if bbs[curId]?.term == nil { terminate(ret == .void ? .ret(nil) : .unreachable, span) }
         let blocks = finalize(returnType: ret)
         if diags.hasErrors { return nil }
         return SSAFunction(name: name, params: fnParams, returnType: ret, blocks: blocks, isMutating: false, span: span)
@@ -659,7 +641,7 @@ final class FunctionLowerer {
         if case .named(_, .actor_) = recvType {
             guard let recv = lowerExpr(receiver) else { return nil }
             var argVals: [SSAValue] = []
-            for a in args { guard let v = lowerExpr(a) else { return nil }; argVals.append(v) }
+            for a in args { guard let v = lowerArg(a) else { return nil }; argVals.append(v) }
             emitVoid(.actorSend(receiver: recv, handler: method, args: argVals), span)
             return nil
         }
@@ -669,7 +651,7 @@ final class FunctionLowerer {
         if case .generic(let base, let typeArgs) = recvType {
             guard let selfV = lowerExpr(receiver) else { return nil }
             var argVals = [selfV]
-            for a in args { guard let v = lowerExpr(a) else { return nil }; argVals.append(v) }
+            for a in args { guard let v = lowerArg(a) else { return nil }; argVals.append(v) }
             let call = SSACall(kind: .direct(ModuleContext.methodSymbol(base, method)), args: argVals, typeArgs: typeArgs)
             if type == .void { emitVoid(.call(call), span); return nil }
             return emit(.call(call), type, span)
@@ -694,7 +676,7 @@ final class FunctionLowerer {
         guard let selfV = selfArg else { return nil }
 
         var argVals = [selfV]
-        for a in args { guard let v = lowerExpr(a) else { return nil }; argVals.append(v) }
+        for a in args { guard let v = lowerArg(a) else { return nil }; argVals.append(v) }
         let call = SSACall(kind: .direct(ModuleContext.methodSymbol(typeName, method)), args: argVals)
         if type == .void { emitVoid(.call(call), span); return nil }
         return emit(.call(call), type, span)
@@ -715,9 +697,6 @@ final class FunctionLowerer {
     // current value, a bare self-field name resolves through `currentSelf`. `fieldType` is the read's
     // result type (needed for a self-field read).
     private func readVar(_ name: String, _ span: Span, fieldType: Type = .void) -> SSAValue? {
-        if let binding = spawnBindings[name], let rt = spawnResultTypes[binding] {
-            return emit(.spawnJoin(binding: binding, resultType: rt, final: false), rt, span)   // reading a spawn joins it (intermediate; leaves it registered)
-        }
         if let slot = slots[name] {
             // An erased `.generic` value (a generic-type method's `self`, task 100.4.3.5.3) is held by a
             // value buffer: the slot already IS the buffer pointer that represents the value, so reading it
@@ -763,6 +742,19 @@ final class FunctionLowerer {
     }
 
     // A generic class is a reference: in an erased body it is the managed object pointer, like `self`.
+    // An argument. A buffer-held value read out of a field or an element is an address into that object, which a
+    // callee cannot hold across a stop: it passes a copy, a buffer of its own.
+    private func lowerArg(_ e: NOIRExpr) -> SSAValue? {
+        guard let v = lowerExpr(e) else { return nil }
+        var inObject = false
+        switch e.kind {
+        case .fieldAccess, .index: inObject = true
+        case .varRef(let name): inObject = selfFieldIndex(name) != nil
+        default: break
+        }
+        return inObject && heldByBuffer(v.type) ? emit(.load(v), v.type, e.span) : v
+    }
+
     private func isGenericClass(_ t: Type) -> Bool {
         if case .generic(let base, _) = t { return ctx.fields(base, .class_) != nil }
         return false
@@ -845,6 +837,20 @@ final class FunctionLowerer {
         // in declared order (from the type template's layout) and emit `makeStruct` over the `.generic`
         // type — the backend allocates a derived-VWT-sized buffer and copies each field to its offset
         // (task 100.4.3.3.4). Enum construction (`Opt.some(x)`) is deferred (tagged layout).
+        // A generic class in an erased body: allocated with the descriptor its dictionary holds for it, then each
+        // field stored at its derived offset (task 251.3).
+        if case .generic(let base, _) = type, let fields = ctx.fields(base, .class_) {
+            let obj = emit(.alloc(type), type, span)
+            for (idx, f) in fields.enumerated() {
+                guard let arg = args.first(where: { $0.label == f.name }), let v = lowerExpr(arg.value) else {
+                    fail("missing field '\(f.name)' constructing '\(base)'", span); return nil
+                }
+                let addr = emit(.fieldAddr(base: obj, fieldIndex: idx), f.type, span)
+                emitVoid(.writeBarrier(object: obj, value: v), span)
+                emitVoid(.store(addr: addr, value: v), span)
+            }
+            return obj
+        }
         if case .generic(let base, _) = type {
             guard let fields = ctx.fields(base, .struct_) else {
                 fail("100.4.3.3.4: constructing generic '\(base)' in an erased body is deferred (only struct and enum types are synthesized)", span); return nil
@@ -929,7 +935,7 @@ final class FunctionLowerer {
         }
         var argVals: [SSAValue] = []
         for a in args {
-            guard let v = lowerExpr(a.value) else { return nil }
+            guard let v = lowerArg(a.value) else { return nil }
             argVals.append(v)
         }
         let call = SSACall(kind: kind, args: argVals, typeArgs: typeArgs)
@@ -947,7 +953,7 @@ final class FunctionLowerer {
                                   args: [NOIRExpr], type: Type, span: Span) -> SSAValue? {
         guard let box = lowerExpr(receiver) else { return nil }
         var argVals: [SSAValue] = []            // `self` is the box (carried in the `.witness` kind), not an arg
-        for a in args { guard let v = lowerExpr(a) else { return nil }; argVals.append(v) }
+        for a in args { guard let v = lowerArg(a) else { return nil }; argVals.append(v) }
         let call = SSACall(kind: .witness(receiver: box, interface: interface, method: method), args: argVals)
         if type == .void { emitVoid(.call(call), span); return nil }
         return emit(.call(call), type, span)

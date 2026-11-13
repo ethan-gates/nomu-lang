@@ -14,16 +14,21 @@ fun down(n: Int, b: Box) -> Int {
   return b.v + down(n - 1, c)
 }
 
+// The Box is made on the task's own fiber: a mutable class is not shareable, so it cannot be passed in.
+fun start(n: Int) -> Int {
+  return down(n, Box(v: 0))
+}
+
 fun main() {
-  fiber let a = down(100000, Box(v: 0))
-  fiber let b = down(200000, Box(v: 0))
-  fiber let c = down(300000, Box(v: 0))
+  let a = task start(100000)
+  let b = task start(200000)
+  let c = task start(300000)
   print(down(50000, Box(v: 0)))
   print("\n")
-  print(a)
+  print(a.join())
   print("\n")
-  print(b)
+  print(b.join())
   print("\n")
-  print(c)
+  print(c.join())
   print("\n")
 }

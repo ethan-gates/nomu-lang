@@ -1,0 +1,38 @@
+import std/time
+
+// One fiber streams values to another over a buffered channel of 64: most sends and receives find room or
+// a value and never park, so this measures the channel's fast path and how often the two sides meet empty
+// or full.
+fun produce(ch: Channel<Int>, n: Int) {
+    var i = 0
+    while i < n {
+        ch.send(i)
+        i = i + 1
+    }
+    ch.close()
+}
+
+fun main() {
+    let n = 4000000
+    let ch = Channel<Int>.make(capacity: 64)
+    let t = Time()
+    let t0 = t.now
+    fiber produce(ch, n)
+    var sum = 0
+    var open = true
+    while open {
+        switch ch.receive() {
+        case .some(let v): sum = sum + v
+        case .none: open = false
+        }
+    }
+    let ns = t.ns_diff(t0, t.now)
+    if sum != (n - 1) * n / 2 {
+        print("wrong sum\n")
+    }
+    print("stream_channel hops ")
+    print(n)
+    print(" ns ")
+    print(ns)
+    print("\n")
+}

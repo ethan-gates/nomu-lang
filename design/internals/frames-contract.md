@@ -46,7 +46,7 @@ the runtime subset (149) can derive it.
 
 **The state at a stop.** The top frame is in the runtime. Every Nomu frame below it is suspended at a call,
 so its caller-saved registers are dead and its live values are in its frame or in callee-saved registers,
-which some frame above saved or the switch saved into the fiber's context buffer. The stack check is no
+which some frame above saved or the switch pushed on the fiber's stack (its context is the SP below them). The stack check is no
 exception: it runs after the prologue, before the function's first call, and its slow path is an
 ordinary call (104, "Decided: the entry check").
 
@@ -68,6 +68,7 @@ values of these kinds live across the stop:
 | **S2** possibly-stack addresses | a pointer the frame received or loaded that may point into a caller's frame: a by-reference `self`, a struct-return pointer, an erased-generic buffer, a promoted object passed to a callee | the copier, when it points into the moved stack |
 | **S3** the frame chain | saved frame pointers and return addresses | the copier |
 | **R** runtime records into the stack | the fiber's saved context (stack pointer, frame pointer, callee-saved registers), its anchor (`anchor-sp`), its stack base, its shadow-stack top, and the shadow stack's `prev` links | the copier |
+| **S4** the base pointer | x19 in a frame LLVM addresses through a base pointer (run-time-sized buffers and 256 bytes or more of fixed locals): set from SP in the prologue, kept across every stop, and the base of the frame's stack-map slots. Held in the fiber's context or in a deeper frame's x19 save slot | the copier, and the collector reads slots through it; both find it from the frame index's x19 facts |
 
 **R2. Every H1 and H2 value live across a stop is in a named location** (a frame slot, or a callee-saved
 register whose save location is known) **and the code reads it from there after the stop.** A copy of the
@@ -76,6 +77,12 @@ used after the stop. The two silent bugs in 240 (problems 5 and 10) were copies 
 
 **R3. For each H2 value, the shape is named with the location,** resolvable across separately compiled
 objects (240, problem 8).
+
+**R2a. The base pointer is the one callee-saved register the runtime reads and fixes.** After the link, the
+driver records in the frame index where each function saves x19 (from `__unwind_info`, or the function's
+`__eh_frame` FDE) and whether its prologue sets a base pointer, and checks that every stack-map slot is based
+on SP, x29, or x19 in a base-pointer function. The walk carries each frame's x19 location outward from the
+context; the copier adjusts the saved x19 of each base-pointer frame (`runtime/stackmove.nomu`).
 
 **R4. No H3 value is live across a stop,** or each one is named with its base, and the collector rewrites it
 by the base's displacement. Either is acceptable; the choice belongs to 242.

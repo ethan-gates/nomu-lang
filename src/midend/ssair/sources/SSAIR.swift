@@ -87,15 +87,9 @@ public indirect enum SSAInstKind {
     // Concurrency (runtime-coupled composites; the egress owns the mailbox / fiber ABI).
     case mailboxInit(SSAValue)                              // install a fresh mailbox in an actor object's reserved slot
     case actorSend(receiver: SSAValue, handler: String, args: [SSAValue])   // fire-and-forget message send (void)
-    // `fiber let` — start `startFn(env)` on a fiber. Like a closure, the captured free variables ride
-    // in `env`; `binding` keys the egress-owned fiber handle so `spawnJoin` can await it. Void: the
-    // handle is not an SSA value (it is a raw runtime fiber pointer). A nil `binding` is a detached fiber.
-    case spawn(binding: Int?, startFn: String, env: SSAValue?, resultType: Type)
-    // await a spawned fiber and read its boxed result (idempotent). `final` marks the structured scope-exit
-    // join (joinSpawns): under the self-hosted collecting GC it is the point where the fiber's result box
-    // stops being needed, so the runtime drops the fiber from the live-fiber registry. Intermediate reads
-    // (`final == false`) leave it registered so the box stays rooted until the last read (150.3.13).
-    case spawnJoin(binding: Int, resultType: Type, final: Bool)
+    // `fiber` / `task` — start `startFn(env)` on a fiber. Like a closure, the captured free variables ride
+    // in `env`. Void: nothing waits on the fiber itself, and its body's result is dropped.
+    case fiber(startFn: String, env: SSAValue?, resultType: Type)
 
     // By-value aggregates (struct / enum). These never heap-allocate, so escape analysis ignores
     // them; a value flows as a first-class SSA aggregate and its members are read by projection.
@@ -121,7 +115,7 @@ public indirect enum SSAInstKind {
     // the capture set into `env`). `env` is nil for a bare function reference. `onStack` is an EA
     // output (7.3): a non-escaping closure *object* is stack-allocated by the egress (the `env` object
     // itself stays heap this slice — a stack-promoted env hits the `p1` env-param addrspace wall, a
-    // scoped follow-up like `spawn:N`). Set only by `StackPromotion`; ssairgen always emits `false`.
+    // scoped follow-up like `fiber:N`). Set only by `StackPromotion`; ssairgen always emits `false`.
     case makeClosure(funcName: String, env: SSAValue?, onStack: Bool)
 
     // The C-ABI code address of a top-level non-capturing function, as an addrspace(0) raw pointer (task

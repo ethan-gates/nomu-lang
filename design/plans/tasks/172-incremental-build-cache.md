@@ -126,6 +126,8 @@ Explicitly out of 172's scope; each is picked up after it lands. Added to as the
    collision odds like 64-bit FNV-1a or better (about N²/2⁶⁵ for N entries). Candidates: FNV-1a at 128 bits,
    an in-tree XXH3. The YAML parser ([204](204-yaml-parser-upgrades.md) 204.2) shares it and adds needs:
    latency on 8–16-byte keys, a full final mix, a per-parse seed.
+   **Settled for the cache in [256](256-host-cache-store-only.md):** SHA-256 for keys and blob digests, after a
+   throughput measurement; the YAML parser's hash stays a separate question.
 
 ## Dependencies & triggers
 

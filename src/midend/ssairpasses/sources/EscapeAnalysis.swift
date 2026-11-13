@@ -8,7 +8,7 @@ import support
 //
 // Soundness (I4): when unsure, an allocation escapes — a false "non-escaping" is the one unsound
 // direction. So the escaping set is an over-approximation: every use that could publish the pointer
-// (return, any call/send/spawn argument, a store *of* the value into memory, boxing, capture into an
+// (return, any call/send/fiber argument, a store *of* the value into memory, boxing, capture into an
 // aggregate/closure, a block argument) marks it escaping, and an interior pointer escaping
 // (`fieldAddr`/`elementAddr`) marks its base escaping (I5 — never leave a stack object's managed field
 // unscannable behind an address-taken use).
@@ -56,12 +56,12 @@ private func escapingUses(_ kind: SSAInstKind) -> [SSAValue] {
     case .arrayLit(let elems, _):         return elems
     // The env is published into the closure object (the captures become reachable through it). The env
     // *object* still escapes here — only the closure *object* is promoted this slice; a stack-promoted
-    // env hits the `p1` env-param addrspace wall (a scoped follow-up, like `spawn:N`).
+    // env hits the `p1` env-param addrspace wall (a scoped follow-up, like `fiber:N`).
     case .makeClosure(_, let env, _):     return env.map { [$0] } ?? []
     case .makeStruct(_, let fields):      return fields
     case .makeEnum(_, _, let fields):     return fields
     case .actorSend(let recv, _, let args): return [recv] + args
-    case .spawn(_, _, let env, _):        return env.map { [$0] } ?? []
+    case .fiber(_, let env, _):        return env.map { [$0] } ?? []
     case .call(let c):
         // Only the call arguments escape. Calling *through* a value reads it — a witness receiver has
         // its witness+payload extracted, a closure/fn value has its fn+env loaded — none of which

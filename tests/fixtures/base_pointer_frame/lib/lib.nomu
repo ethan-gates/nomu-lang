@@ -1,0 +1,24 @@
+// A compiled-once frame LLVM addresses through a base pointer (x19): its select's run-time-sized buffers and
+// its fixed locals put it over the size where LLVM uses one. It holds its channels across a call that parks
+// many frames further down, so its x19 is saved by the frames below it, and the collector and the stack mover
+// must find it there to read and fix its root slots.
+
+package fun deep<shared T>(a: Channel<T>, b: Channel<T>, n: Int) -> Option<T> {
+    let depth = down(n)
+    select {
+    case let v = a.receive():
+        return v
+    case let v = b.receive():
+        return v
+    }
+    return .none
+}
+
+// Recurse `n` frames, then park.
+package fun down(n: Int) -> Int {
+    if n == 0 {
+        sleep(3)
+        return 0
+    }
+    return down(n - 1) + 1
+}

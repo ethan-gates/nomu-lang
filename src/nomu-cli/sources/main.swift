@@ -3,7 +3,7 @@ import cli
 import driver
 import settings
 
-// The `nomu` driver (task 173.5.1). Every entry is a subcommand: `build`/`run`/`test`/`query` for people,
+// The `nomu` driver (task 173.5.1). Every entry is a subcommand: `build`/`run`/`test`/`query` for people, `tool` for infrequent tools,
 // and `compile`, the per-module job for tools that divide a build into processes (task 190, D9). The command
 // tree is declared here and parsed by `src/cli`.
 
@@ -59,6 +59,13 @@ let tool = Command("nomu", summary: "The Nomu compiler and build driver.",
         Command("query", summary: "print package metadata as JSON",
             positionals: [Positional("target", help: "module or package directory (default: .)",
                                      required: false)]),
+        Command("tool", summary: "infrequent tools",
+            subcommands: [
+                Command("symbolize", summary: "name the frames of a crash report or fiber dump a program wrote",
+                    positionals: [Positional("binary", help: "the program that wrote the report"),
+                                  Positional("report", help: "the report file (default: standard input)",
+                                             required: false)]),
+            ]),
     ])
 
 switch parse(tool, Array(CommandLine.arguments.dropFirst()), version: nomuVersion) {
@@ -111,6 +118,8 @@ func dispatch(_ args: Parsed) {
         exit(runTest(args) ? 0 : 1)
     case "query":
         exit(runQuery(args) ? 0 : 1)
+    case "symbolize":
+        exit(symbolize(binary: args.positional("binary") ?? "", report: args.positional("report")) ? 0 : 1)
     case let sub:
         fputs("nomu \(sub ?? "?"): not yet implemented\n", stderr)
         exit(1)

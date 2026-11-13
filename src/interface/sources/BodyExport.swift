@@ -46,12 +46,12 @@ public func collectReferencedNames(_ decl: NOIRDecl) -> Set<String> {
         case .box(let v, _):                       visitExpr(v)
         case .arrayLit(let els):                   els.forEach(visitExpr)
         case .index(let b, let i):                 visitExpr(b); visitExpr(i)
+        case .taskStart(_, let m, let c, let f):   visitExpr(m); visitExpr(c); visitExpr(f)
         }
     }
     func visitStmt(_ s: NOIRStmt) {
         switch s.kind {
         case .letBinding(_, _, let v):             visitExpr(v)
-        case .spawnLet(_, let v, _):               visitExpr(v)
         case .fiberStart(let c):                   visitExpr(c)
         case .assign(let t, let v):                visitExpr(t); visitExpr(v)
         case .compoundAssign(let t, let v):        visitExpr(t); visitExpr(v)
@@ -123,9 +123,6 @@ private final class Canonicalizer {
         case .letBinding(let name, let isMutable, let value):
             let v = expr(value, bound)
             return (here(.letBinding(name: name, isMutable: isMutable, value: v)), bound.union([name]))
-        case .spawnLet(let name, let value, let resultType):
-            let v = expr(value, bound)
-            return (here(.spawnLet(name: name, value: v, resultType: type(resultType))), bound.union([name]))
         case .assign(let target, let value):
             return (here(.assign(target: expr(target, bound), value: expr(value, bound))), bound)
         case .compoundAssign(let target, let value):
@@ -192,6 +189,9 @@ private final class Canonicalizer {
             return here(.index(base: expr(base, bound), idx: expr(idx, bound)))
         case .funcRef(let name):
             return here(.funcRef(name: keyed(name)))
+        case .taskStart(let binder, let make, let call, let fulfill):
+            return here(.taskStart(binder: binder, make: expr(make, bound), call: expr(call, bound),
+                                   fulfill: expr(fulfill, bound.union([binder, "\(binder).v"]))))
         }
     }
 }

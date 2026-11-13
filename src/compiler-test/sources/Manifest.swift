@@ -56,7 +56,10 @@ struct Expect: Decodable {
     // The signal the run must die from (`SIGSEGV`, `SIGABRT`, …), for a case that crashes on purpose; absent, a
     // run must exit 0.
     var signal: String? = nil
-    enum CodingKeys: String, CodingKey { case stdout, stdoutFile = "stdout_file", signal }
+    // The status the run must exit with, for a case that fails on purpose without a signal (a deadlock, a fiber
+    // dump on SIGQUIT); absent, 0.
+    var exitCode: Int32? = nil
+    enum CodingKeys: String, CodingKey { case stdout, stdoutFile = "stdout_file", signal, exitCode = "exit_code" }
 }
 
 // The signal named `name` (`SIGSEGV`), or nil for a name the harness does not know.

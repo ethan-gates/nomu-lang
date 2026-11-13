@@ -1,0 +1,34 @@
+// Many fibers alive at once: 200,000 fibers each park on one channel until `main` closes it, then report in.
+// Peak memory over the fiber count is the cost of a parked fiber: its record and its starting stack. Run under
+// `/usr/bin/time -l` and read the maximum resident set size.
+
+fun waitFor(gate: Channel<Int>, done: Channel<Int>) {
+    switch gate.receive() {
+    case .some(let v): done.send(v)
+    case .none: done.send(1)
+    }
+}
+
+fun main() {
+    let n = 200000
+    let gate = Channel<Int>.make(capacity: 0)
+    let done = Channel<Int>.make(capacity: n)
+    var i = 0
+    while i < n {
+        fiber waitFor(gate, done)
+        i += 1
+    }
+    sleep(200)
+    gate.close()
+    var total = 0
+    i = 0
+    while i < n {
+        switch done.receive() {
+        case .some(let v): total += v
+        case .none: total += 0
+        }
+        i += 1
+    }
+    print(total)
+    print("\n")
+}

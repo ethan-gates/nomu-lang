@@ -16,7 +16,7 @@ import support
 // `fieldAddr`/`load`/`store`; scalars and reference types stay pure SSA), class construction, field
 // access/assignment, enum init + `switch`/match, and array literals (7.2.2b-i). Still ahead:
 // type-method/actor-handler bodies + `self`, concrete method calls, closures + closure conversion,
-// `box`/witness/indirect dispatch, actors + `actorSend`, and `spawn`.
+// `box`/witness/indirect dispatch, actors + `actorSend`, and `fiber`.
 
 public struct SSAGenResult {
     public let module: SSAModule

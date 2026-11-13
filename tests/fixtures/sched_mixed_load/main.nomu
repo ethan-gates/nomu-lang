@@ -1,0 +1,93 @@
+// Stop-the-world under a mixed load: fibers, channels and actors all moving managed values at once while
+// collections run. Producer fibers send messages over a buffered channel to relay fibers, which hand each one
+// to one of its four sink actors (eight in all); each sink checks it and reports to a tally actor, which answers on a channel once every message has arrived. A collection can find a message in a channel's buffer, in a parked sender's frame,
+// in a mailbox queued in a carrier's slot or ring or the global mailbox queue, or in a handler's frame, on any
+// carrier. A message that is lost, moved without its referrers being fixed, or reclaimed early shows as a wrong
+// count, a wrong text length or a wrong sum.
+
+class Msg {
+  let n: Int
+  let text: String
+}
+
+actor Tally {
+  var got: Int = 0
+  var bad: Int = 0
+  var sum: Int = 0
+  on add(n: Int, ok: Bool, total: Int, done: Channel<Int>) {
+    if ok == false {
+      bad = bad + 1
+    }
+    sum = sum + n
+    got = got + 1
+    if got == total {
+      let m = total - 1
+      if sum != m * (m + 1) / 2 {
+        bad = bad + 1
+      }
+      done.send(bad)
+    }
+  }
+}
+
+actor Sink {
+  on take(m: Msg, total: Int, tally: Tally, done: Channel<Int>) {
+    let copy = m.text.concat("!")
+    tally.add(n: m.n, ok: copy.count == 109, total: total, done: done)
+  }
+}
+
+fun produce(ch: Channel<Msg>, start: Int, n: Int) {
+  var i = 0
+  while i < n {
+    ch.send(Msg(n: start + i, text: "payload-".concat("0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789")))
+    i = i + 1
+  }
+}
+
+fun relay(ch: Channel<Msg>, count: Int, a: Sink, b: Sink, c: Sink, d: Sink, total: Int, tally: Tally,
+          done: Channel<Int>) {
+  var i = 0
+  while i < count {
+    switch ch.receive() {
+    case .some(let m):
+      let k = m.n % 4
+      if k == 0 {
+        a.take(m: m, total: total, tally: tally, done: done)
+      } else if k == 1 {
+        b.take(m: m, total: total, tally: tally, done: done)
+      } else if k == 2 {
+        c.take(m: m, total: total, tally: tally, done: done)
+      } else {
+        d.take(m: m, total: total, tally: tally, done: done)
+      }
+    case .none:
+      i = count
+    }
+    i = i + 1
+  }
+}
+
+fun main() {
+  let producers = 4
+  let each = 2000
+  let total = producers * each
+  let ch = Channel<Msg>.make(capacity: 16)
+  let done = Channel<Int>.make(capacity: 1)
+  let tally = Tally()
+  var p = 0
+  while p < producers {
+    fiber produce(ch, p * each, each)
+    p = p + 1
+  }
+  fiber relay(ch, total / 2, Sink(), Sink(), Sink(), Sink(), total, tally, done)
+  fiber relay(ch, total / 2, Sink(), Sink(), Sink(), Sink(), total, tally, done)
+  switch done.receive() {
+  case .some(let bad):
+    print("bad ")
+    print(bad)
+    print("\n")
+  case .none:
+    print("closed\n")
+  }
+}

@@ -1,0 +1,15 @@
+// A sender parked on a full channel faults when the channel closes under it.
+fun fill(ch: Channel<Int>) {
+    ch.send(1)
+    ch.send(2)          // parks: the buffer holds one
+    print("unreachable\n")
+}
+
+fun main() {
+    let ch = Channel<Int>.make(capacity: 1)
+    fiber fill(ch)
+    sleep(5)
+    print("closing\n")
+    ch.close()
+    sleep(5)
+}

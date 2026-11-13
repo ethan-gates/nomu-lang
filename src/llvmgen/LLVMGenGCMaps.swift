@@ -12,11 +12,11 @@ extension LLVMGen {
     // Register a fixed-size object's pointer map (managed-field byte offsets) + total byte size; the
     // returned type-id indexes `typeMaps`/`typeSizes`/`typeKinds`/`typeStrides`.
     func registerMap(_ offsets: [Int32], sizeBytes: Int32, symbol: String, foldable: Bool,
-                     shaped: [(offset: Int32, shapeId: UInt64)] = []) -> UInt64 {
+                     shaped: [(offset: Int32, shapeId: UInt64)] = [], valueLayout: Bool = false) -> UInt64 {
         let id = UInt64(typeMaps.count)
         typeMaps.append(offsets)
         typeSizes.append(sizeBytes)
-        typeKinds.append(0)      // fixed
+        typeKinds.append(valueLayout ? 3 : 0)      // fixed, or a value layout (no object header, never a heap object)
         typeStrides.append(0)
         typeSymbols.append((symbol, foldable))
         typeShaped.append(shaped)
@@ -143,16 +143,15 @@ extension LLVMGen {
         return id
     }
 
-    // Type-id for a spawn-result box `{ header, result… }` (150.3.13). A completed fiber's result rides in a
-    // heap box at fib+216 until the joiner reads it; the self-hosted STW walk roots that slot, so the box must
-    // be a proper GC object the moving collector can relocate — a header plus the result's managed-pointer map
-    // (shifted past slot 0). A managed result is scanned so it survives + is fixed up too. One shape per result
-    // type; the set is small, so a fresh map per call is fine.
-    func spawnBoxTypeId(_ t: Type) -> UInt64 {
+    // Type-id for a value box `{ header, value… }`, the payload of a boxed value (`boxPayload`). The box is a
+    // proper GC object the moving collector can relocate: a header plus the value's managed-pointer map
+    // (shifted past slot 0), so a managed value is scanned and fixed up too. One shape per value type; the set
+    // is small, so a fresh map per call is fine.
+    func valueBoxTypeId(_ t: Type) -> UInt64 {
         let d = descriptorEntries(shapes.shape(t).shifted(by: 8))   // result at slot 1 (header is slot 0)
         let slots = 1 + slotCount(t)
         return registerMap(d.offsets, sizeBytes: Int32(slots * 8),
-                           symbol: Mangle.descriptor("spawnbox", [t], home: homeModule), foldable: true, shaped: d.shaped)
+                           symbol: Mangle.descriptor("valuebox", [t], home: homeModule), foldable: true, shaped: d.shaped)
     }
 
     // The shared type-id for every mailbox object `{ header, mb_head, mb_tail, scheduled, sched_next }`:
@@ -238,7 +237,8 @@ extension LLVMGen {
         // shaped typed-root gap — `internals/gc-model-upgrade.md`).
         let d = descriptorEntries(shapes.shape(t))
         let id = registerMap(d.offsets, sizeBytes: Int32(slotCount(t) * 8),
-                             symbol: Mangle.descriptor("val", [t], home: homeModule), foldable: true, shaped: d.shaped)
+                             symbol: Mangle.descriptor("val", [t], home: homeModule), foldable: true, shaped: d.shaped,
+                             valueLayout: true)
         valueDescIds[key] = id
         return id
     }
@@ -302,7 +302,7 @@ extension LLVMGen {
         switch t {
         case .uint8, .bool:                 return 1
         case .int, .uint64, .double, .rawPtr, .ptr:  return 8
-        default:                            return 8
+        default:                            return slotCount(t) * 8   // a struct, enum or `String`: its whole slots
         }
     }
 

@@ -1,0 +1,124 @@
+// Channels carrying managed values between fibers, across moving collections and stack moves: buffered and
+// rendezvous channels with several senders, struct values, and receivers parked when the channel closes. A
+// value waits in the buffer, or in a parked fiber's frame, while the collector moves what it holds.
+
+class Msg {
+  let n: Int
+  let text: String
+}
+
+struct Pair {
+  let a: Int
+  let s: String
+}
+
+fun produce(ch: Channel<Msg>, start: Int, n: Int, done: Channel<Int>) {
+  var i = 0
+  while i < n {
+    ch.send(Msg(n: start + i, text: "payload-".concat("0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789")))
+    if i % 500 == 0 {
+      sleep(1)
+    }
+    i = i + 1
+  }
+  done.send(1)
+}
+
+fun pairs(ch: Channel<Pair>, n: Int) {
+  var i = 0
+  while i < n {
+    ch.send(Pair(a: i, s: "pair-value-".concat("abcdefgh")))
+    i = i + 1
+  }
+  ch.close()
+}
+
+fun waitClosed(ch: Channel<Msg>, out: Channel<Int>) {
+  switch ch.receive() {
+  case .some(let m): out.send(m.n)
+  case .none: out.send(-1)
+  }
+}
+
+// Drain `ch` for `count` messages and check each, returning the number of bad ones and the sum of `n`.
+fun drain(ch: Channel<Msg>, count: Int) -> Int {
+  var bad = 0
+  var sum = 0
+  var i = 0
+  while i < count {
+    switch ch.receive() {
+    case .some(let m):
+      if m.text.count != 108 { bad = bad + 1 }
+      sum = sum + m.n
+    case .none:
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  let n = count - 1
+  if sum != n * (n + 1) / 2 { bad = bad + 1 }
+  return bad
+}
+
+fun main() {
+  var bad = 0
+  let done = Channel<Int>.make(capacity: 2)
+
+  // Buffered, two senders.
+  let buffered = Channel<Msg>.make(capacity: 8)
+  fiber produce(buffered, 0, 6000, done)
+  fiber produce(buffered, 6000, 6000, done)
+  bad = bad + drain(buffered, 12000)
+
+  // Rendezvous, two senders.
+  let direct = Channel<Msg>.make(capacity: 0)
+  fiber produce(direct, 0, 4000, done)
+  fiber produce(direct, 4000, 4000, done)
+  bad = bad + drain(direct, 8000)
+  var finished = 0
+  while finished < 4 {
+    switch done.receive() {
+    case .some(let one): finished = finished + one
+    case .none: bad = bad + 1
+    }
+  }
+
+  // Struct values, drained after close.
+  let pc = Channel<Pair>.make(capacity: 3)
+  fiber pairs(pc, 1000)
+  var expect = 0
+  var open = true
+  while open {
+    switch pc.receive() {
+    case .some(let p):
+      if p.a != expect || p.s.count != 19 { bad = bad + 1 }
+      expect = expect + 1
+    case .none:
+      open = false
+    }
+  }
+  if expect != 1000 { bad = bad + 1 }
+
+  // Receivers parked when the channel closes wake with `.none`.
+  let quiet = Channel<Msg>.make(capacity: 0)
+  let out = Channel<Int>.make(capacity: 3)
+  fiber waitClosed(quiet, out)
+  fiber waitClosed(quiet, out)
+  fiber waitClosed(quiet, out)
+  sleep(5)
+  quiet.close()
+  var woke = 0
+  while woke < 3 {
+    switch out.receive() {
+    case .some(let v):
+      if v != -1 { bad = bad + 1 }
+    case .none:
+      bad = bad + 1
+    }
+    woke = woke + 1
+  }
+
+  print("bad ")
+  print(bad)
+  print("\n")
+}

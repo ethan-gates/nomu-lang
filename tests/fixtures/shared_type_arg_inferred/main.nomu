@@ -1,0 +1,13 @@
+// An inferred type argument that is not shareable.
+class Box<shared T> {
+    let v: T
+}
+
+class Mut {
+    var n: Int
+}
+
+fun main() {
+    let b = Box(v: Mut(n: 1))
+    print(b.v.n)
+}

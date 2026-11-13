@@ -32,7 +32,7 @@ fun park()             // suspend current fiber until it holds a permit
 fun unpark(f Fiber)    // give f a permit and make it runnable
 ```
 
-(This handle is runtime-internal; there is no programmer-visible `Fiber` or `Task` type — see `runtime.md` → Terminology.)
+(This handle is runtime-internal; there is no programmer-visible `Fiber` type — see `runtime.md` → Terminology. `Task<T>` (§8) is the result of `task f(x)`, which carries a value.)
 
 The correctness hazard is the **lost-wakeup race**: a fiber checks a condition, decides to park, but a producer calls `unpark` before the park commits, and the wakeup is lost. Two standard fixes:
 
@@ -40,6 +40,8 @@ The correctness hazard is the **lost-wakeup race**: a fiber checks a condition, 
 - **Lock-coupled park** (Go's `gopark`): hold the lock guarding the condition; `park` atomically releases it and suspends, so a producer holding the same lock can't fire `unpark` until the park has committed. More efficient for hot built-ins (channels, mutexes) that already hold a lock.
 
 Direction: permit-based pair as the primitive, with a lock-release-on-park variant for performance-critical stdlib types.
+
+**As built:** every park is lock-coupled. A fiber parks holding the lock that guards its condition, and its carrier releases that lock once the fiber's context is saved; a waker must take the same lock to find the fiber, so it cannot ready it early. Channels hold their own lock (`nomuSchedParkReleasing`); sleep, join, stdin and the collector's stops hold the scheduler lock. Fibers run and resume without the scheduler lock, so readying needs it only where the condition is guarded by it ([235](../plans/tasks/235-scheduler-run-queues.md)).
 
 **Layer 2 — wakeup feeders** (what calls `unpark`):
 
@@ -111,20 +113,51 @@ Reference points — Go hides the primitive and makes the *channel* the public s
 
 ---
 
-## 4. Channels — a library type, the base of the concurrency surface
+## 4. Channels — a runtime core under a stdlib type
 
-**`Channel<T>` is a stdlib type over the suspension core, with no `chan` keyword and no `<-` operator.** They are the first concurrency library to build, because `Task` (§8) and stop signals (§7) are written over them.
+**`Channel<T>` is a stdlib type over a runtime core, with no `chan` keyword and no `<-` operator.** They are the first concurrency library to build, because `Task` (§8) and stop signals (§7) are written over them.
 
 **Role: flow.**
 - **Actor** = an *addressed, stateful entity* — you send to *that* actor, it serializes messages against private state. Identity-centric (state).
 - **Channel** = an *anonymous conduit* — put a value in, whoever is reading takes it; no identity beyond the pipe. Flow-centric (pipelines, fan-out/in, worker pools, streaming, `select`).
 - Near-duals: an actor's mailbox is a channel + a loop + private state. Kept role-distinct (state → actor, flow → channel), they are two tools for two jobs — the boundary is documented, not left to taste.
 
-**Addability — basic channels are a pure library.** Send/receive with buffered or unbuffered (rendezvous) capacity is ~30 lines over park/unpark + a wait-list (Rust `mpsc`, Kotlin, C# precedent). Plain methods, no `chan` keyword and no `<-` operator; the colorless model makes them read cleanly — a receive is a plain blocking call, no marker.
+**Where it lives.** Blocking needs park, unpark and a lock, which only the runtime tier has (§3), so ordinary Nomu cannot write a channel. The split follows Go's `hchan`:
+- **The runtime core** (`runtime/channel.nomu`) is untyped: the lock, the queues of waiting senders and receivers, a ring of elements, park and wake, and the close state. It is given the element's address and value witness, and moves values as bytes, stepping the ring by the witness's size. Buffering allocates nothing per value, and a waiter lives in the caller's frame.
+- **`Channel<T>`** is a struct in the prelude whose one field is the channel object, a `ManagedBuffer<ChannelState, ChannelSlot<T>>`: one object and one indirection, scanned and moved by the collector as any buffer. Its methods call three builtins on that buffer, which only the stdlib can name (`core` is importable only from `std`). It works compiled once or specialized through the dictionaries of [251](../plans/tasks/251-erased-generic-objects.md).
+- **The waker does the work.** It copies the value to or from a parked waiter's slot and sets the result before readying it, so a parked fiber never touches the channel again. Rendezvous and full-buffer handoffs copy once, straight between the two fibers.
 
-**`select` rides the exposed continuation — no runtime addition needed.** Waiting on several channels means "the first ready branch wins, the losers consume nothing." The exposed one-shot continuation (§3) already supplies exactly that: its **atomic resume-once is the claim**. A channel keeps a wait-queue of continuations and does **claim-before-handoff** — a sender tries to `resume` a waiter, and on a lost claim moves to the next, so its value is never given away; a `select` is one continuation registered across several channels' queues. So `select` is a **pure library over the exposed continuation**, the runtime stays single-wait and simple, and this composition doubles as validation of the continuation design. (This supersedes an earlier worry about reserving a runtime multi-wait primitive — the continuation covers it.)
+**API.**
+- `Channel<T>.make(capacity: n)`; capacity 0 is a rendezvous.
+- `send(v)` blocks while the buffer is full or, unbuffered, until a receiver takes the value.
+- `receive() -> Option<T>` blocks while empty; `.none` means closed and drained. Close is the sender saying the stream has ended, so it is an ordinary result. If cancellation can later interrupt a parked receive, this becomes a `Result` with an error enum covering closed and cancelled.
+- `close()`. Sending on a closed channel and closing twice fault, as in Go.
+- Iteration (`for v in ch`, ending at close) comes with [117](../plans/tasks/117-for-in-iteration.md).
 
-**Residual (§10):** buffered/unbuffered API, the `select` surface, and all spellings. Channels stay a library over the suspension primitives (park/unpark internally; the continuation for `select`).
+**Shareability.** Declared `Channel<shared T>`, the first type to use the `shared` bound. `Channel` itself is shareable with no blessing: its one field is a `ManagedBuffer`, which has no fields, and the core synchronizes the buffer's contents.
+
+**`select`** ([250](../plans/tasks/250-fiber-task-surface.md) 250.5) waits on several channels; the first ready branch wins and the losers consume nothing. It follows Go's statement:
+
+```
+select {
+case let job = jobs.receive():   // job: Option<Job>; .none once closed and drained
+    handle(job)
+case results.send(r):
+    sent = sent + 1
+case after(100):                 // a timer, in milliseconds
+    print("idle")
+default:                         // optional: go on at once when no case is ready
+}
+```
+
+- A case is a channel `receive()` (bound with `let`, or not), a channel `send(v)`, `after(ms)`, or `readLine()`. `after` and `readLine` take part only as cases; `select` is the one new keyword.
+- The channel and value expressions are evaluated once, in source order, before any waiting.
+- A receive on a closed channel is ready and binds `.none`, as `receive()` returns. A send on a closed channel faults, as `send` does.
+- When several cases are ready, one is chosen at random, so none starves. With `default`, a `select` never blocks.
+- Arms are as in `switch`: a body may be empty, and `break` and `continue` act on the enclosing loop.
+- It is built in the runtime, as Go's `selectgo` is. All the channels' locks are held, in address order, while the cases are polled and, if none is ready, a waiter is queued on each. The waiters are off the fiber's stack, since the stack may move while it is parked, and share one record whose claim exactly one waker wins; a waker that loses the claim skips the waiter. After the wake, the fiber takes its other waiters out of their queues.
+
+**Residual (§10):** none for the channel cases; I/O deadlines and connections wait on networking ([255](../plans/tasks/255-networking.md)).
 
 ---
 
@@ -200,16 +233,16 @@ let v = t.join()
 ```
 
 - **`fiber` is detached and has no left side.** It always means one thing, like Go's `go`. No join exists, so a fiber's record is freed when it exits.
-- **Types may be concurrency objects.** `Channel<T>` and `Task<T>` are real stdlib types: objects that do a job, like a file. A type may never mark how other data behaves (`Arc<T>`, `Send`, `Pin`), which keeps memory and concurrency strategy out of data modeling. Both are shareable by a stdlib-only blessing, the trusted escape hatch of §10. There is no `Fiber` type: `fiber f(x)` returns nothing, so it would have no operations.
-- **`task` is a keyword over a library type.** `Task` is an ordinary stdlib class over `fiber` and a one-shot channel, so the compiler knows one library name, as `for` knows the iterator protocol. `join()` can repeat and can come from several fibers. A dropped `task` result is rejected in favor of `fiber`.
+- **Types may be concurrency objects.** `Channel<T>` and `Task<T>` are real stdlib types: objects that do a job, like a file. A type may never mark how other data behaves (`Arc<T>`, `Send`, `Pin`), which keeps memory and concurrency strategy out of data modeling. `Channel` and `Task` are shareable because each one's one field is a buffer the runtime synchronizes (§4). There is no `Fiber` type: `fiber f(x)` returns nothing, so it would have no operations.
+- **`task` is a keyword over a library type.** `Task<T>` is an ordinary stdlib struct over `fiber` and a one-shot channel, so the compiler knows one library name, as `for` knows the iterator protocol. It is a struct over the channel's buffer, as `Channel` is, so the structural share rule covers it without the trusted escape hatch. `join()` can repeat and can come from several fibers, each getting a copy. A call returning nothing gives a `Task<Void>`. A dropped `task` result is rejected in favor of `fiber`. `task` is a prefix expression and binds like the other prefix operators: `task f(x).join()` starts `f(x).join()`.
 - **No closures are passed to `fiber` or `task`.** A multi-step body is a named function. Closures in Go mostly return results and signal completion, which `task` covers.
 - **Fan-out is an array of tasks and a loop.** A `Group` type waits until programs show which need is common: completion order, stop on first error, or a concurrency limit.
 - **`main` returning ends the program.** Detached fibers stop with it. Actor drains finish first: messages already sent are delivered.
 - **A fault in any fiber ends the process.**
 - **Captures stay checked.** Arguments crossing into a fiber must be shareable (§5).
-- **Leaks are a tooling matter.** Detached fibers can leak, so the tools need fiber dumps and leak reports.
+- **Leaks are a tooling matter.** Detached fibers can leak, so the tools match Go's: fiber dumps with wait reasons (SIGQUIT, `NOMU_TRACEBACK=all`), the deadlock error, and a leak report (`NOMU_LEAK_REPORT=1`) that finds fibers waiting on objects nothing that can run still reaches, as Go 1.26's goroutine-leak profile does.
 
-**Why detached by default.** Mainstream languages all keep a detached form, because background work and servers need one, and concurrency gains little from novelty here. The languages that forbid it are specialized (Cilk, occam). The earlier design had implicit joins at scope exit and a `spawn let` binding; this replaces both. Task [250](../plans/tasks/250-fiber-task-surface.md) tracks the build, and `fiber let` stays until `Task` exists.
+**Why detached by default.** Mainstream languages all keep a detached form, because background work and servers need one, and concurrency gains little from novelty here. The languages that forbid it are specialized (Cilk, occam). The earlier design had implicit joins at scope exit and a `fiber let` binding; this replaces both, and both are removed. Task [250](../plans/tasks/250-fiber-task-surface.md) tracks the build.
 
 **Residual (§10):** `select` surface and how far it generalizes, and all spellings.
 
@@ -233,9 +266,9 @@ Actors own isolated stateful concurrency (§1); this section pins how you declar
 **Implementation model — async mailbox + pooled handler fibers (Decided 2026-08-12).** The runtime that backs this surface is the async, fire-and-forget message-send model above, not a shared lock. Pinned:
 
 - **Message-send, not a mutex.** An actor owns a **mailbox** — an MT-safe FIFO of messages. A send enqueues a message and returns (fire-and-forget); the actor's drain runs the handler later — the sender is never parked. This is what makes fire-and-forget, offload, and non-reentrant run-to-completion expressible. A mutex gives none of them: it runs the handler on the caller's own fiber and deadlocks on re-entry. The M3.4 `{ header, fields…, mu }` mutex actor was a belief-milestone scaffold — now superseded.
-- **A capped pool of mailbox fibers, no dedicated per-actor fiber.** An idle actor is just its state + mailbox; it holds no fiber and no OS stack. When a message arrives at an unscheduled actor, its mailbox is marked *scheduled* and appended to a **global scheduled-mailbox queue**. A **program-global pool of mailbox fibers** — reusable, capped in number — pulls mailboxes off that queue and drains each to completion (one mailbox at a time per fiber). A mailbox fiber loops: pull a mailbox, drain it, pull the next; when the queue is empty it parks on a free-list, and it is woken (or a new one is created, up to the cap) when work arrives. The **cap is the point** — a churn of many concurrently-busy actors can't spawn a 128 KiB-stack fiber each; excess mailboxes wait in the queue and a busy fiber picks them up as it frees. Over its life a mailbox is drained by whatever fiber happens to pull it; stacks are warm-reused, never owned by any actor. Serialization and non-reentrancy come from the **single-drain invariant** (a mailbox is *scheduled* — queued or draining — at most once at a time), not a lock; the pool parallelizes *across* actors, never within one. **The scheduled queue is a GC root** (its head is scanned, the `sched_next` links traced), so a scheduled mailbox whose actor is otherwise unreferenced — fire-and-forget outstanding work — stays live until drained rather than being collected mid-flight. Actors don't each own a thread-sized stack; the pool is sized (and bounded) to simultaneously-*busy* actors, not to how many exist. (Erlang/Akka dispatcher precedent.)
-- **Ordering: per-sender FIFO.** A single sender's messages to an actor are handled in send order (they enter the one FIFO mailbox in the sender's program order). Cross-sender order — two fibers sending concurrently — is arbitrary, as in every actor system (concurrent sends have no defined order). Ordering and serialization come from the single FIFO mailbox + the single-drain invariant, not from which mailbox fiber does the draining. The drain's empty-check races a concurrent send under the scheduler lock: on seeing the mailbox empty the drainer clears *scheduled*; a send that arrives after that re-appends the mailbox to the scheduled queue, one that arrives before is seen by the in-flight drain — preserving both order and single-drain.
-- **An inline-blocking handler holds its mailbox fiber parked** — on whatever it awaits (a timer, I/O); its roots are scanned via the live-fiber registry (6.2.2), like any parked fiber. That fiber is unavailable to drain other mailboxes until the handler completes; other mailboxes wait in the scheduled queue (bounded by the pool cap), so a handler that blocks long throttles actor throughput deliberately.
+- **Scheduled mailboxes wait in the run queues, drained by pooled mailbox fibers; no dedicated per-actor fiber.** An idle actor is just its state + mailbox; it holds no fiber and no OS stack. The send that finds an actor unscheduled marks its mailbox *scheduled* and readies it as a run-queue entry, the mailbox tagged in its low bit, into the sending carrier's slot like a readied fiber; the entry it displaces goes to the carrier's ring, where idle carriers steal it, so actors spread across carriers as fibers do. A ring that overflows sends mailboxes to a global mailbox queue beside the global fiber queue. The carrier that picks a mailbox runs it on its idle mailbox fiber (one per carrier, the rest pooled), which drains it and then the next mailbox in the carrier's slot without a switch, up to 64 in a row: actors handing messages back and forth stay on one fiber and one carrier (about 19 ns a hop). A send from a mailbox fiber that leaves the new mailbox alone in the slot wakes no carrier, since the sender's fiber takes it once its own mailbox empties; if that drain goes on, its next message pop wakes a carrier to steal the waiting mailbox. Fibers exist only for mailboxes being drained, so a backlog of scheduled actors costs queue entries, not stacks. Serialization and non-reentrancy come from the **single-drain invariant** (a mailbox is *scheduled*, queued or draining, at most once at a time), not a lock; the pool parallelizes *across* actors, never within one. **Queued mailboxes are GC roots**: the collector's walk roots the tagged entries in every carrier's slot and ring and the global mailbox queue's head, so a scheduled mailbox whose actor is otherwise unreferenced (fire-and-forget outstanding work) stays live until drained. (Erlang/Akka dispatcher precedent.)
+- **Ordering: per-sender FIFO.** A single sender's messages to an actor are handled in send order (they enter the one FIFO mailbox in the sender's program order). Cross-sender order (two fibers sending concurrently) is arbitrary, as in every actor system, and so is the order in which different actors run. A mailbox's messages are a lock-free queue for many senders and one drainer (Vyukov's intrusive queue), and its *scheduled* flag is set by compare-and-swap: a sender that swaps it from 0 to 1 schedules the mailbox; a drainer that finds the queue empty clears it, then looks again and takes it back if a message arrived meanwhile, so no message is left unscheduled and the single-drain invariant holds.
+- **An inline-blocking handler holds its mailbox fiber parked** on whatever it awaits (a timer, I/O); its roots are scanned via the live-fiber registry (6.2.2), like any parked fiber. The carrier takes another mailbox fiber from the pool for the next mailbox, so a blocked handler holds up only its own actor.
 - **Park protocol: lock-handoff (M6 · 6.4, built).** A parking-heavy concurrency workload surfaced a latent M:N race: a fiber that unlocked the scheduler lock before `swapcontext` finished saving its context could be re-queued by a waker mid-save → SIGBUS / lost-wakeup deadlock. Fixed by holding the single scheduler lock (`rt_queue_mu`) across every fiber↔scheduler switch — the scheduler switches in with the lock held, a fiber releases it only after switch-in and re-acquires it to park, so a fiber becomes wakeable only once its context is fully saved. Applied uniformly to spawn/join, the timer sleep, the I/O poller, and mailbox-fiber parking — hardening the pre-existing park sites too.
 - **Teardown falls out of the moving GC.** Actor state and mailbox are ordinary GC objects; pending messages root the actor (drain-then-collect, above). An unreferenced idle actor has no fiber and no mutex — nothing non-GC to release — so it is reclaimed structurally like any object, and actor↔actor cycles collect together. The pool's fiber stacks are runtime-lifetime, not per-actor. This **removes the per-actor weak-handle / `ReferenceGlue` teardown** an earlier design assumed (it rested on a dedicated per-actor fiber stack held through a weak handle; there is none). Built as the M6 actor runtime (2026-08-12).
 
@@ -246,9 +279,9 @@ Actors own isolated stateful concurrency (§1); this section pins how you declar
 ## 10. Open questions (rollup)
 
 - **Primitive exposure** — **Decided (§3):** closure-scoped one-shot checked continuation, a runtime intrinsic (not stdlib), resume-once checked at runtime; raw park/unpark stays internal. Cross-thread resume (`runtime.md` §3) now decided; residual is only the deferred FFI variant + spelling.
-- **Channels** — **Decided (§4):** a library type over the suspension core, the base of the concurrency surface (role = flow, distinct from actors); `select` rides the exposed continuation. Residual: the API.
+- **Channels** — **Decided (§4):** a stdlib `Channel<T>` struct over an untyped runtime core with a ring buffer, the base of the concurrency surface (role = flow, distinct from actors); `receive` returns `Option<T>`; `select` is built in the runtime, Go's statement (§4).
 - **Actor surface** — **Decided (§9), fire-and-forget revision 2026-08-12:** one mechanism only — **fire-and-forget** message-send; handlers never return to the sender; no reply/ask/request-reply of any kind (values come from tasks or channels, not actors); non-reentrant; slow handlers start fibers to stay responsive; pending messages root the actor → drain-then-collect. **Implementation model (§9):** async mailbox + pooled on-demand handler fibers (no dedicated per-actor fiber, no mutex); the M3.4 mutex actor is a superseded scaffold; teardown falls out of the moving GC (no per-actor weak handle). Residual: spellings, mailbox bound.
-- **Fibers and tasks** — **Decided (§8):** detached `fiber f(x)`, joinable `task f(x)` over a library `Task`, fan-out through arrays. Residual: `select` and spellings.
+- **Fibers and tasks** — **Decided (§8):** detached `fiber f(x)`, joinable `task f(x)` over a library `Task`, fan-out through arrays; `select` (§4). `fiber` stays as the keyword after its trial, since it pairs with `task`.
 - **Cancellation** — **Decided (§7):** cooperative, by convention over channels, with no language or runtime concept. Residual: whether a per-fiber flag is ever added.
 - **Shared-mutable primitive** — **Deferred (design) 2026-07-16.** The "fourth shareable category" (a self-synchronizing type — atomics, a green `Mutex<T>`) is **reserved but unbuilt**. Adding it later is additive and low-risk: a green mutex rides the existing suspension core, atomics ride intrinsics the runtime already needs internally, and it can't precede generics anyway. The one thing kept open for it is a **trusted (`unsafe`) shareability escape hatch** — a way for a type to declare itself shareable despite mutable interior (Rust's `unsafe impl Sync`), likely exposed to library authors. Actors remain the default for shared mutable state until then. Design deferred; expected eventually.
 - **"shareable" details** — spelling decided (2026-07-20): prefix modifier `shared` (§5, `generics.md` §3a).

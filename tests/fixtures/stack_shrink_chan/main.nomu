@@ -1,0 +1,114 @@
+// Stacks shrink at a major collection with fibers parked in channel operations (task 104): the channel's queue
+// points at each waiter in its fiber's frame, so the shrink fixes those links. Three receivers queue on one
+// channel (a waiter in the middle of a queue), two senders on another, and one fiber joins a task that is
+// itself parked on a receive. Each grew its stack deep first and reports when it has measured it; once all have, `main` requests a major
+// collection, which finds each parked or about to park with a few frames in use. After the collection `main` completes every
+// operation; each fiber checks its stack came back smaller and its frames' objects are intact.
+// Built with `test.runtime_prelude` (for `rtGcRequest` and the stack size).
+class Box {
+  var v: Int
+}
+
+fun down(n: Int, b: Box) -> Int {
+  if n == 0 {
+    return b.v
+  }
+  let c = Box(v: b.v + 1)
+  return b.v + down(n - 1, c)
+}
+
+fun halved(before: Int, v: Int) -> Int {
+  let after = rtStackSize(rtCurrentFiber())
+  if after < before {
+    return v
+  }
+  return 0 - after
+}
+
+fun receiver(ready: Channel<Int>, ch: Channel<Int>, n: Int) -> Int {
+  let keep = Box(v: down(n, Box(v: 0)))
+  let before = rtStackSize(rtCurrentFiber())
+  ready.send(1)
+  var got = -1000
+  switch ch.receive() {
+  case .some(let v):
+    got = v
+  case .none:
+    got = -1
+  }
+  return halved(before, keep.v + got)
+}
+
+fun sender(ready: Channel<Int>, ch: Channel<Int>, n: Int, v: Int) -> Int {
+  let keep = Box(v: down(n, Box(v: 0)))
+  let before = rtStackSize(rtCurrentFiber())
+  ready.send(1)
+  ch.send(v)
+  return halved(before, keep.v)
+}
+
+fun take(ch: Channel<Int>) -> Int {
+  switch ch.receive() {
+  case .some(let v):
+    return v
+  case .none:
+    return -1
+  }
+}
+
+fun joiner(ready: Channel<Int>, ch: Channel<Int>, n: Int) -> Int {
+  let inner = task take(ch)
+  let keep = Box(v: down(n, Box(v: 0)))
+  let before = rtStackSize(rtCurrentFiber())
+  ready.send(1)
+  let got = inner.join()
+  return halved(before, keep.v + got)
+}
+
+fun main() {
+  let rc = Channel<Int>.make(capacity: 0)
+  let sc = Channel<Int>.make(capacity: 0)
+  let jc = Channel<Int>.make(capacity: 0)
+  let ready = Channel<Int>.make(capacity: 6)
+  let r1 = task receiver(ready, rc, 20000)
+  let r2 = task receiver(ready, rc, 40000)
+  let r3 = task receiver(ready, rc, 30000)
+  let s1 = task sender(ready, sc, 20000, 7)
+  let s2 = task sender(ready, sc, 40000, 9)
+  let j = task joiner(ready, jc, 30000)
+  var r = 0
+  while r < 6 {
+    ready.receive()
+    r = r + 1
+  }
+  let ticket = rtGcRequest(0)
+  var spins = 0
+  while !rtGcCollected(ticket) {
+    spins = spins + 1
+  }
+  rc.send(1)
+  rc.send(2)
+  rc.send(3)
+  var sent = 0
+  var k = 0
+  while k < 2 {
+    switch sc.receive() {
+    case .some(let v):
+      sent = sent + v
+    case .none:
+      sent = -1
+    }
+    k = k + 1
+  }
+  jc.send(5)
+  print(r1.join() + r2.join() + r3.join())
+  print("\n")
+  print(s1.join())
+  print("\n")
+  print(s2.join())
+  print("\n")
+  print(sent)
+  print("\n")
+  print(j.join())
+  print("\n")
+}

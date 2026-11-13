@@ -32,11 +32,11 @@ fun show(s: String) {
 }
 
 fun main() {
-  fiber let t = ticker()
+  let t = task ticker()
   show(readLine())
   show(readLine())
   show(readLine())
   show(readLine())
-  print(t)
+  print(t.join())
   print("\n")
 }

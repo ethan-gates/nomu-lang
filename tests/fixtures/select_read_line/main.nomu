@@ -1,0 +1,54 @@
+// `readLine()` as a `select` case (suite case `select-read-line`, built with `test.runtime_prelude`). Before
+// stdin has anything, a timer wins and the line waiter leaves the stdin list. Then a select waits on stdin and
+// a quiet channel; a watcher tells the harness to write stdin once the select is on the list. The second line
+// is buffered by then, so the next select takes it at once.
+
+// Tell the harness to write stdin (the suite case's `stdin_after`): stderr is unbuffered.
+fun signalReady() {
+  let buf = RawPtr.alloc(bytes: 16, align: 8)
+  let n = Runtime.copyLiteral(to: buf, "ready\n")
+  let w = Runtime.writeFd(fd: 2, buf: buf, count: n)
+  buf.free()
+}
+
+fun watcher() {
+  while rtStdinWaiters() < 1 {
+    sleep(1)
+  }
+  signalReady()
+}
+
+fun show(label: String, line: String) {
+  print(label)
+  print(" '")
+  print(line)
+  print("'\n")
+}
+
+fun main() {
+  let quiet = Channel<Int>.make(capacity: 0)
+  select {
+  case let line = readLine():
+    show("early", line)
+  case after(5):
+    print("timeout\n")
+  }
+  print("waiters ")
+  print(rtStdinWaiters())
+  print("\n")
+
+  fiber watcher()
+  select {
+  case let line = readLine():
+    show("woke", line)
+  case let v = quiet.receive():
+    print("quiet\n")
+  }
+
+  select {
+  case let line = readLine():
+    show("buffered", line)
+  case after(1000):
+    print("late\n")
+  }
+}

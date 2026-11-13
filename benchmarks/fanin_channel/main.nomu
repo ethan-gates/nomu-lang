@@ -1,0 +1,39 @@
+import std/time
+
+// Four fibers send to one receiver over a buffered channel of 64: the senders contend for the channel's lock,
+// which measures whether a lock-free ring or padding the state's words apart would pay (task 102.5).
+fun produce(ch: Channel<Int>, n: Int, done: Channel<Int>) {
+    var i = 0
+    while i < n {
+        ch.send(1)
+        i = i + 1
+    }
+    done.send(1)
+}
+
+fun main() {
+    let senders = 4
+    let each = 1000000
+    let ch = Channel<Int>.make(capacity: 64)
+    let done = Channel<Int>.make(capacity: 4)
+    let t = Time()
+    let t0 = t.now
+    var s = 0
+    while s < senders {
+        fiber produce(ch, each, done)
+        s = s + 1
+    }
+    var got = 0
+    while got < senders * each {
+        switch ch.receive() {
+        case .some(let v): got = got + v
+        case .none: got = senders * each
+        }
+    }
+    let ns = t.ns_diff(t0, t.now)
+    print("fanin_channel hops ")
+    print(senders * each)
+    print(" ns ")
+    print(ns)
+    print("\n")
+}

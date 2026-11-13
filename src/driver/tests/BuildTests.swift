@@ -946,7 +946,29 @@ final class BuildTests: XCTestCase {
         try text.write(toFile: path, atomically: true, encoding: .utf8)
     }
 
-    // The GC frame index (task 195): a built binary carries it, version 2 with entries, and collects
+    // `nomu tool symbolize` names a saved fiber dump's frames from the binary's dSYM (a release build keeps one),
+    // and refuses a report from another build of the program.
+    func testSymbolizeFiberDump() throws {
+        let fixture = "tests/fixtures/fiber_deadlock"
+        let binary = try XCTUnwrap(try build(fixture, ["-c", "release"]).binary)
+        let dump = try run(binary)
+        XCTAssertEqual(dump.status, 2)
+        XCTAssertTrue(dump.stderr.contains("all fibers are asleep"), dump.stderr)
+        let report = NSTemporaryDirectory() + "nomu-symbolize-\(UUID().uuidString).txt"
+        try write(report, dump.stderr)
+        defer { try? FileManager.default.removeItem(atPath: report) }
+        let named = try run(nomu, ["tool", "symbolize", binary, report])
+        XCTAssertEqual(named.status, 0, named.stderr)
+        XCTAssertTrue(named.stdout.contains("fiber 1 [task join]:"), named.stdout)
+        XCTAssertTrue(named.stdout.contains("main.nomu:"), named.stdout)
+
+        try write(report, dump.stderr.replacingOccurrences(of: "nomu-crash: image: ", with: "nomu-crash: image: 0"))
+        let refused = try run(nomu, ["tool", "symbolize", binary, report])
+        XCTAssertNotEqual(refused.status, 0)
+        XCTAssertTrue(refused.stderr.contains("is build"), refused.stderr)
+    }
+
+    // The GC frame index (task 195): a built binary carries it, version 3 with entries, and collects
     // correctly across modules; with the index erased, the program aborts at startup with a message instead
     // of missing roots, whether or not it would collect.
     func testBinaryWithoutFrameIndexAborts() throws {
@@ -960,7 +982,7 @@ final class BuildTests: XCTestCase {
         let at = fileOffset + Int((8 - address % 8) % 8)
         XCTAssertLessThanOrEqual(at + 16, fileOffset + size)
         XCTAssertEqual(data.subdata(in: at..<(at + 4)), Data("NFIX".utf8), "index magic")
-        XCTAssertEqual(data[at + 4], 2, "index version")
+        XCTAssertEqual(data[at + 4], 3, "index version")
         XCTAssertGreaterThan(data[at + 8], 0, "index entries")
 
         data.replaceSubrange(at..<(at + 16), with: Data(count: 16))

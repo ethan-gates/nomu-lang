@@ -192,7 +192,7 @@ fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   return fib
 }
 
-fun fiberSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+fun fiberStart(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   let fib = fiberNew(sched, entry, arg)
   mutexLock(sched.advanced(by: 16))
   fib.store(0, toByteOffset: 168)
@@ -365,7 +365,7 @@ fun main() {
     a.store(i + 1, toByteOffset: 16)
     a.store(seqBuf, toByteOffset: 24)
     a.store(seqIdx, toByteOffset: 32)
-    fiberSpawn(sched, body, a)
+    fiberStart(sched, body, a)
     i = i + 1
   }
 

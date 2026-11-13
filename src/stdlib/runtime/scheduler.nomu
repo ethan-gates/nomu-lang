@@ -15,17 +15,16 @@
 // saved before any waker (which must hold the same lock to enqueue) can re-queue it.
 //
 // Off-heap layouts (byte offsets):
-//   Sched: 0 runq-head · 8 runq-tail · 16 unused (the mutex word moved to 256) · 24 wake-gen · 32 unused · 40 stopping
+//   Sched: 0 runq-head · 8 runq-tail · 16 unused (the mutex word moved to 256) · 24 wake-gen · 32 the last fiber ID · 40 stopping
 //                 · 48 timer-mutex · 56 timer-gen · 64 timer-count · 72 timer-entries (ptr)
-//                 · 80 mbox-sched-head · 88 mbox-sched-tail · 96 active-drains · 104 mbfiber-free
+//                 · 80 global mailbox-queue head · 88 its tail (scheduled mailboxes off the run queues, linked
+//                   through sched_next; under the lock) · 96 active-drains · 104 mbfiber-free (pooled mailbox fibers)
 //                 · 112 mbfiber-count · 120 drain-fn-ptr (nomu_actor_drain) · 128 registry-head
 //                 · 136 stw-request · 144 stw-ack · 152 stw-gen · 160 ncarriers   (STW handshake, 128.3.2)
 //                 · 168 gc-request   (OOM initiator → GC coordinator signal, 150.3.11)
 //                 · 176 gc-kind      (collection kind for the coordinator: 1 minor, 0 major/defrag, 150.4.3;
 //                                     bit 8 reserved for a concurrent request — rtGcRaise)
-//                 · 200 drainers   (mailbox fibers able to pop the scheduled-mailbox queue: readied or
-//                                   running in their loop, and not parked in a handler or on the free list)
-//                 · 208 mbox-pops  (pops of the scheduled-mailbox queue; a searcher reads it to age the queue)
+//                 · 200 1 when a leak pass is to follow the next collection (`runtime/leak.nomu`) · 208 unused
 //                 · 216 main-fiber · 224 main-done · 232 exit-claim (rtSchedFinish)
 //                 · 240 GC coordinator's thread handle · 248 timer capacity
 //   (384B, 64-aligned) Words written on every handoff sit on cache lines of their own, apart from the words
@@ -38,19 +37,35 @@
 //     Both are GC objects codegen allocates (it supplies their pointer maps). An actor object is class-shaped
 //     with its mailbox in its last slot, which codegen loads at the send, so the runtime never parses an
 //     actor. mb_head, mb_tail, next, self and sched_next are GC-scanned (they chain live queued messages and
-//     the scheduled-mailbox queue, kept live with the receiver); thunk, a code pointer, is not.
-//   Fiber (336B): 0..167 ctx buffer · 168 state · 176 next-link · 184 entry · 192 arg · 200 sched
-//                 · 208 stackBase · 216 result · 224 joiner · 232 carrierCtx · 240 reg-next · 248 reg-prev
-//                 · 256 pool-next · 264 anchor-sp · 272 anchor-pc · 280 registered · 288 shadow-top (typed roots, 100.4.3.6)
-//                 · 296 drainer (0 a user fiber; a mailbox fiber: 1 counted in sched drainers, 2 not counted)
-//                 · 304 stack limit (the stack check's: stack low end plus the reserve; `rtStackLimitSet`)
-//                 · 312 stack size (bytes from stackBase to the stack's top; grows when the stack moves)
-//                 · 320 stack need (room a wrapper's check asked for below its SP, read by the move; else 0)
-//                 · 328 detached (1: no join exists, so the carrier frees the record when the fiber ends)
-//   The context's x28 slot (72) holds the fiber itself: generated code keeps the running fiber in x28,
-//   which the stack check reads the limit through.
+//     global mailbox queue, kept live with the receiver); thunk, a code pointer, is not.
+//   Fiber (128B): 0 the context: the SP its last switch saved, where its callee-saved registers sit on its
+//                   own stack (`rtasm_arm64.s`) · 8 three bytes, each read and written alone: 8 state,
+//                   9 drainer (0 a user fiber, 1 a mailbox fiber; a mailbox fiber's mailbox to drain waits at
+//                   32, rooted as a started fiber's argument is), 10 wait reason (rtWait*, read while parked)
+//                 · 16 next-link: the global run queue's, or the mailbox-fiber pool's (rtSchedDrainerPut). A
+//                   fiber is in at most one: only an idle mailbox fiber is pooled, and every readying targets
+//                   a fiber parked on that event
+//                 · 24 shadow-top (typed roots, 100.4.3.6) · 32 arg
+//                 · 40 stack limit (the stack check's: stack low end plus the reserve; `rtStackLimitSet`)
+//                 · 48 stackBase · 56 ID (from 1, in start order)
+//                 · 64 stack size (bytes from stackBase to the stack's top; grows when the stack moves)
+//                 · 72 carrier SP: the SP its carrier saved switching it in, which it switches back through
+//                 · 80 reg-next · 88 reg-prev
+//                 · 96 when the current wait began, in ns, or 0 until the first collection that finds the fiber
+//                   parked sets it (Go's `waitsince`); a park clears it
+//                 · 104 anchor-sp · 112 anchor-pc · 120 what a parked fiber waits on: a channel's buffer, a
+//                   select's record, or null (`runtime/leak.nomu`)
+//   The saved registers' x28 slot holds the fiber itself: generated code keeps the running fiber in x28,
+//   which the stack check reads the limit through. Before a fiber first runs, its x21 slot holds the
+//   scheduler and its x22 slot the body; the trampoline passes them to rtSchedFiberMain as arguments.
+//   The libc stubs (`rtasm_arm64.s`) read 48, 64 and 72; the stack check (`StackChecks.cpp`,
+//   `runtimeSizedBuffer`) reads 40.
+//   A fiber's switch back to its carrier passes a message: the mutex the carrier releases once the fiber's
+//   context is saved (nomuSchedParkReleasing), or at a stack check the room it needs, as -(need + 1)
+//   (nomuSchedStackCheck).
 //   state: 0 ready · 1 running · 2 parked · 3 done · 4 stopped at a safepoint for STW · 5 stopped at a stack
-//          check to be moved (stackmove.nomu)
+//          check to be moved (stackmove.nomu) · 6 a mailbox fiber with nothing to drain, back at its carrier
+//          without the scheduler lock (rtSchedDrainerIdle)
 //   mutex-word: 0 unlocked · 1 locked · 2 contended
 //   anchor-sp/anchor-pc (task 128.3.2): the user-frame (sp, pc) captured by the C dispatch shim at the
 //   point the fiber stopped (a park at join/sleep, or a safepoint poll) — a statepoint return address the
@@ -91,21 +106,21 @@ fun rtSchedUnlock(sched: RawPtr) {
 // timer thread to fire a sleeper it has already removed from the heap).
 fun rtSchedUnpark(sched: RawPtr, fib: RawPtr) {
   rtSchedLock(sched)
-  fib.store(0, toByteOffset: 168)
+  fib.store(0.uint8, toByteOffset: 8)
   rtSchedEnqueue(sched, fib)
   rtSchedUnlock(sched)
   rtSchedWake(sched, false)
 }
 
-// Intrusive run queue (head at sched+0, tail at sched+8, link at fib+176). Touched only under the lock.
+// Intrusive run queue (head at sched+0, tail at sched+8, link at fib+16). Touched only under the lock.
 fun rtSchedEnqueue(sched: RawPtr, fib: RawPtr) {
-  fib.store(RawPtr.null, toByteOffset: 176)
+  fib.store(RawPtr.null, toByteOffset: 16)
   let tail: RawPtr = sched.load(fromByteOffset: 8)
   if tail.isNull {
-    sched.store(fib, toByteOffset: 0)
+    sched.atomicStore(fib.toInt(), toByteOffset: 0)   // read without the lock by idle carriers (rtSchedIdle)
     sched.store(fib, toByteOffset: 8)
   } else {
-    tail.store(fib, toByteOffset: 176)
+    tail.store(fib, toByteOffset: 16)
     sched.store(fib, toByteOffset: 8)
   }
 }
@@ -115,77 +130,270 @@ fun rtSchedDequeue(sched: RawPtr) -> RawPtr {
   if h.isNull {
     return h
   }
-  let nx: RawPtr = h.load(fromByteOffset: 176)
+  let nx: RawPtr = h.load(fromByteOffset: 16)
   sched.store(nx, toByteOffset: 0)
   if nx.isNull {
     sched.store(RawPtr.null, toByteOffset: 8)
   }
-  h.store(RawPtr.null, toByteOffset: 176)
+  h.store(RawPtr.null, toByteOffset: 16)
   return h
 }
 
-// Make `fib` runnable from the fiber running on this carrier: it goes in this carrier's run-queue slot
-// (carrier record +104) to run next here, and a fiber already there moves to the run queue. The readier
-// usually parks moments later, so the pair continues on this carrier; a searcher takes the slot's fiber if
-// the readier keeps running (rtSchedSlotSteal). With NOMU_SLOT=0, or off a carrier, it goes on the run
-// queue. The caller then wakes a carrier (rtSchedWake), as after rtSchedEnqueue, so a searcher is up to take
-// the fiber if the readier keeps running (Go's `wakep`; task 234.3 chose this over a monitor). Caller holds
-// the scheduler lock.
-fun rtSchedReadyNext(sched: RawPtr, fib: RawPtr) {
-  fib.store(0, toByteOffset: 168)
-  let rec = Runtime.carrierLocal()
-  if rtSlotOn == 0 || rec.isNull {
+// ---- Local run queues (task 235; Go's per-P queues) ----
+// Each carrier owns a run queue in its record: a ring of 256 fibers between a head (taken by the owner and by
+// stealers, with a compare-and-swap) and a tail (written only by the owner), plus the run-queue slot
+// (`runnext`, rec+104), which the owner swaps a readied fiber into and pick and steal take with a
+// compare-and-swap. A carrier readies, picks and steals with no lock; the global queue (sched+0/8, under the
+// scheduler lock) takes readyings from off a carrier (timers, the poller, boot), overflow, and mailbox fibers.
+// Every atomic here is sequentially consistent, which the sleep handshake relies on (rtSchedLoop).
+//
+// An entry is a fiber, or a scheduled mailbox tagged in its low bit (rtSchedEntryMailbox): an actor's mailbox
+// waits in the queues as a fiber does, and the carrier that picks it runs it on a mailbox fiber
+// (rtSchedRunMailbox). The global queue links fibers through their records, so a mailbox bound for it goes on a
+// global mailbox queue beside it, linked through the mailbox's sched_next, and a global take tries the fibers
+// first. A tagged entry refers to a managed object: the collector's walk roots it (rtWalkRunQueues), and the
+// global mailbox queue through its head.
+let rtRunqSize = 256
+
+// The run-queue entry for a scheduled mailbox.
+fun rtSchedEntryMailbox(mb: RawPtr) -> RawPtr {
+  return mb.advanced(by: 1)
+}
+
+// Whether a run-queue entry is a mailbox.
+fun rtSchedEntryIsMailbox(e: RawPtr) -> Bool {
+  return e.toInt() % 2 == 1
+}
+
+// Give this carrier its run queue. Only a carrier running the scheduler loop has one, so a record bound by
+// another thread (the timer's, the poller's) readies onto the global queue.
+fun rtRunqInit(rec: RawPtr) {
+  rec.store(0, toByteOffset: 128)
+  rec.store(0, toByteOffset: 136)
+  rec.atomicStore(RawPtr.alloc(bytes: rtRunqSize * 8, align: 64).toInt(), toByteOffset: 144)
+}
+
+fun rtRunqRing(rec: RawPtr) -> RawPtr {
+  let ring: Int = rec.atomicLoad(fromByteOffset: 144)
+  return RawPtr.null.advanced(by: ring)
+}
+
+// Append `fib` at the tail of the owner's queue; false when it is full.
+fun rtRunqPush(rec: RawPtr, fib: RawPtr) -> Bool {
+  let ring = rtRunqRing(rec)
+  let h: Int = rec.atomicLoad(fromByteOffset: 128)
+  let t: Int = rec.load(fromByteOffset: 136)
+  if t - h >= rtRunqSize {
+    return false
+  }
+  ring.atomicStore(fib.toInt(), toByteOffset: (t % rtRunqSize) * 8)
+  rec.atomicStore(t + 1, toByteOffset: 136)
+  return true
+}
+
+// Take the head of the owner's queue, or null.
+fun rtRunqPop(rec: RawPtr) -> RawPtr {
+  let ring = rtRunqRing(rec)
+  while true {
+    let h: Int = rec.atomicLoad(fromByteOffset: 128)
+    let t: Int = rec.load(fromByteOffset: 136)
+    if t == h {
+      return RawPtr.null
+    }
+    let fib: Int = ring.atomicLoad(fromByteOffset: (h % rtRunqSize) * 8)
+    let got: Int = rec.atomicCas(h, h + 1, atByteOffset: 128)
+    if got == h {
+      return RawPtr.null.advanced(by: fib)
+    }
+  }
+  return RawPtr.null
+}
+
+// Move half of `victim`'s queue to the empty queue of `mine` and return one of them to run, or null. The
+// entries are copied before the compare-and-swap that claims them, and published by the tail store after it,
+// so a failed claim leaves nothing behind (Go's runqgrab).
+fun rtRunqSteal(mine: RawPtr, victim: RawPtr) -> RawPtr {
+  let vring = rtRunqRing(victim)
+  let ring = rtRunqRing(mine)
+  while true {
+    let h: Int = victim.atomicLoad(fromByteOffset: 128)
+    let t: Int = victim.atomicLoad(fromByteOffset: 136)
+    let avail = t - h
+    if avail <= 0 {
+      return RawPtr.null
+    }
+    if avail <= rtRunqSize {
+      let n = avail - avail / 2
+      let mt: Int = mine.load(fromByteOffset: 136)
+      var i = 0
+      while i < n {
+        let f: Int = vring.atomicLoad(fromByteOffset: ((h + i) % rtRunqSize) * 8)
+        ring.atomicStore(f, toByteOffset: ((mt + i) % rtRunqSize) * 8)
+        i += 1
+      }
+      let got: Int = victim.atomicCas(h, h + n, atByteOffset: 128)
+      if got == h {
+        let fib: Int = ring.atomicLoad(fromByteOffset: ((mt + n - 1) % rtRunqSize) * 8)
+        if n > 1 {
+          mine.atomicStore(mt + n - 1, toByteOffset: 136)
+        }
+        return RawPtr.null.advanced(by: fib)
+      }
+    }
+  }
+  return RawPtr.null
+}
+
+// Whether `rec`'s queue holds a fiber, read without its owner.
+fun rtRunqNonEmpty(rec: RawPtr) -> Bool {
+  let h: Int = rec.atomicLoad(fromByteOffset: 128)
+  let t: Int = rec.atomicLoad(fromByteOffset: 136)
+  return t - h > 0
+}
+
+// Append `fib` to the global queue. `locked`: the caller holds the scheduler lock.
+fun rtSchedGlobalPut(sched: RawPtr, fib: RawPtr, locked: Bool) {
+  if locked {
     rtSchedEnqueue(sched, fib)
     return
   }
-  let old: RawPtr = rec.load(fromByteOffset: 104)
-  rec.store(fib, toByteOffset: 104)
-  if old.isNull {
+  rtSchedLock(sched)
+  rtSchedEnqueue(sched, fib)
+  rtSchedUnlock(sched)
+}
+
+// Append a run-queue entry to the global queue: a mailbox to the global mailbox queue.
+fun rtSchedGlobalPutEntry(sched: RawPtr, e: RawPtr, locked: Bool) {
+  if rtSchedEntryIsMailbox(e) == false {
+    rtSchedGlobalPut(sched, e, locked)
+    return
+  }
+  if locked == false {
+    rtSchedLock(sched)
+  }
+  let mb = e.advanced(by: -1)
+  mb.store(RawPtr.null, toByteOffset: 32)                       // sched_next = null
+  let tail: RawPtr = sched.load(fromByteOffset: 88)
+  if tail.isNull {
+    sched.atomicStore(mb.toInt(), toByteOffset: 80)             // read without the lock by idle carriers
   } else {
-    rtSchedEnqueue(sched, old)
+    tail.store(mb, toByteOffset: 32)
+    rtRememberStore(tail)                                       // a maybe-young mailbox linked into a maybe-mature one
+  }
+  sched.store(mb, toByteOffset: 88)
+  if locked == false {
+    rtSchedUnlock(sched)
   }
 }
 
-// Choose this carrier's next fiber. Every NOMU_GLOBAL_CHECK picks the run queue's head comes first;
-// otherwise the slot, then the run queue's head, then a fiber stolen from another carrier's slot. A fiber
-// from the slot inherits the current slice; once the slice has run past NOMU_SLICE_NS it goes to the back of
-// the run queue instead. Records when the chosen fiber starts (rec+112) and when a new slice begins
-// (rec+120). Caller holds the scheduler lock.
-fun rtSchedPick(sched: RawPtr, rec: RawPtr, picks: Int) -> RawPtr {
-  if rtSlotOn == 0 {
-    return rtSchedDequeue(sched)
+// Whether the global queue holds a fiber or a mailbox, read without the lock.
+fun rtSchedGlobalNonEmpty(sched: RawPtr) -> Bool {
+  let h: Int = sched.atomicLoad(fromByteOffset: 0)
+  let m: Int = sched.atomicLoad(fromByteOffset: 80)
+  return h != 0 || m != 0
+}
+
+// Take the head of the global queue, a fiber before a mailbox, or null, taking the scheduler lock only when the
+// queue looks non-empty.
+fun rtSchedGlobalTake(sched: RawPtr) -> RawPtr {
+  if rtSchedGlobalNonEmpty(sched) == false {
+    return RawPtr.null
   }
-  var fib = RawPtr.null
-  if picks % rtGlobalCheck == 0 {
-    fib = rtSchedDequeue(sched)
+  rtSchedLock(sched)
+  var e = rtSchedDequeue(sched)
+  if e.isNull {
+    let mb: RawPtr = sched.load(fromByteOffset: 80)
+    if mb.isNull == false {
+      let nx: RawPtr = mb.load(fromByteOffset: 32)
+      sched.atomicStore(nx.toInt(), toByteOffset: 80)
+      if nx.isNull {
+        sched.store(RawPtr.null, toByteOffset: 88)
+      }
+      mb.store(RawPtr.null, toByteOffset: 32)
+      e = rtSchedEntryMailbox(mb)
+    }
   }
+  rtSchedUnlock(sched)
+  return e
+}
+
+// Make `fib` runnable from the fiber running on this carrier: it goes in this carrier's run-queue slot to run
+// next here, and a fiber already there moves to the local queue. The readier usually parks moments later, so
+// the pair continues on this carrier; a searcher steals the slot's fiber if the readier keeps running past
+// NOMU_SLOT_STEAL_NS. With NOMU_SLOT=0 it goes on the local queue. Off a carrier it goes on the global queue.
+// The caller then wakes a carrier (rtSchedWake), so a searcher is up to take the fiber if the readier keeps
+// running (Go's `wakep`; task 234.3 chose this over a monitor). `locked`: the caller holds the scheduler lock,
+// which only the global queue needs. Returns whether the entry went into this carrier's empty slot.
+fun rtSchedReadyOn(sched: RawPtr, fib: RawPtr, locked: Bool) -> Bool {
+  if rtSchedEntryIsMailbox(fib) == false {
+    fib.store(0.uint8, toByteOffset: 8)
+  }
+  let rec = Runtime.carrierLocal()
+  if rec.isNull {
+    rtSchedGlobalPutEntry(sched, fib, locked)
+    return false
+  }
+  if rtRunqRing(rec).isNull {
+    rtSchedGlobalPutEntry(sched, fib, locked)
+    return false
+  }
+  var put = fib
+  if rtSlotOn != 0 {
+    let old: Int = rec.atomicExchange(fib.toInt(), atByteOffset: 104)
+    if old == 0 {
+      return true
+    }
+    put = RawPtr.null.advanced(by: old)
+  }
+  if rtRunqPush(rec, put) == false {
+    rtSchedGlobalPutEntry(sched, put, locked)
+  }
+  return false
+}
+
+// The same, for a caller holding the scheduler lock.
+fun rtSchedReadyNext(sched: RawPtr, fib: RawPtr) {
+  rtSchedReadyOn(sched, fib, true)
+}
+
+// Choose this carrier's next fiber, with no lock held. Every NOMU_GLOBAL_CHECK picks the global queue's head
+// comes first; otherwise the slot, then the local queue, then the global queue, then a steal. A fiber from the
+// slot inherits the current slice; once the slice has run past NOMU_SLICE_NS it goes to the back of the local
+// queue instead. Records when the chosen fiber starts (rec+112) and when a new slice begins (rec+120).
+fun rtSchedFind(sched: RawPtr, rec: RawPtr, picks: Int) -> RawPtr {
   let now = Runtime.ticks()
+  var fib = RawPtr.null
   var inherit = false
+  if picks % rtGlobalCheck == 0 {
+    fib = rtSchedGlobalTake(sched)
+  }
   if fib.isNull {
-    let sl: RawPtr = rec.load(fromByteOffset: 104)
-    if sl.isNull {
-    } else {
-      rec.store(RawPtr.null, toByteOffset: 104)
-      let start: Int = rec.load(fromByteOffset: 120)
-      if now - start > rtSliceTicks {
-        rtSchedEnqueue(sched, sl)
-        fib = rtSchedDequeue(sched)
-        let more: RawPtr = sched.load(fromByteOffset: 0)
-        if more.isNull {
+    let sl: Int = rec.atomicLoad(fromByteOffset: 104)
+    if sl != 0 {
+      let got: Int = rec.atomicCas(sl, 0, atByteOffset: 104)
+      if got == sl {
+        let slf = RawPtr.null.advanced(by: sl)
+        let start: Int = rec.load(fromByteOffset: 120)
+        if now - start > rtSliceTicks {
+          if rtRunqPush(rec, slf) == false {
+            rtSchedGlobalPutEntry(sched, slf, false)
+          }
+          fib = rtRunqPop(rec)
         } else {
-          rtSchedWake(sched, false)
+          fib = slf
+          inherit = true
         }
-      } else {
-        fib = sl
-        inherit = true
       }
     }
   }
   if fib.isNull {
-    fib = rtSchedDequeue(sched)
+    fib = rtRunqPop(rec)
   }
   if fib.isNull {
-    fib = rtSchedSlotSteal(rec, now)
+    fib = rtSchedGlobalTake(sched)
+  }
+  if fib.isNull {
+    fib = rtSchedSteal(rec, now)
   }
   if fib.isNull {
   } else {
@@ -198,19 +406,37 @@ fun rtSchedPick(sched: RawPtr, rec: RawPtr, picks: Int) -> RawPtr {
   return fib
 }
 
-// Take a fiber from another carrier's slot whose current fiber has run past NOMU_SLOT_STEAL_NS (`now` in
-// ticks), or null. Caller holds the scheduler lock.
-fun rtSchedSlotSteal(mine: RawPtr, now: Int) -> RawPtr {
+// Steal for the empty carrier `mine`: half of another carrier's queue, else a fiber from another carrier's
+// slot whose current fiber has run past NOMU_SLOT_STEAL_NS (`now` in ticks), else null.
+fun rtSchedSteal(mine: RawPtr, now: Int) -> RawPtr {
   var r: RawPtr = rtCarriers.load(fromByteOffset: 0)
   while !r.isNull {
     if r.toInt() != mine.toInt() {
-      let sl: RawPtr = r.load(fromByteOffset: 104)
-      if sl.isNull {
+      if rtRunqRing(r).isNull {
       } else {
+        let f = rtRunqSteal(mine, r)
+        if f.isNull {
+        } else {
+          return f
+        }
+      }
+    }
+    r = r.load(fromByteOffset: 96)
+  }
+  if rtSlotOn == 0 {
+    return RawPtr.null
+  }
+  r = rtCarriers.load(fromByteOffset: 0)
+  while !r.isNull {
+    if r.toInt() != mine.toInt() {
+      let sl: Int = r.atomicLoad(fromByteOffset: 104)
+      if sl != 0 {
         let st: Int = r.atomicLoad(fromByteOffset: 112)
         if now - st > rtSlotStealTicks {
-          r.store(RawPtr.null, toByteOffset: 104)
-          return sl
+          let got: Int = r.atomicCas(sl, 0, atByteOffset: 104)
+          if got == sl {
+            return RawPtr.null.advanced(by: sl)
+          }
         }
       }
     }
@@ -219,14 +445,18 @@ fun rtSchedSlotSteal(mine: RawPtr, now: Int) -> RawPtr {
   return RawPtr.null
 }
 
-// Whether another carrier's slot holds a fiber a searcher may take (rtSchedSlotSteal's test, read
-// without the lock).
-fun rtSchedSlotStealable(mine: RawPtr, now: Int) -> Bool {
+// Whether another carrier has work this one may take: a non-empty local queue, or a slot past the steal age.
+// Read without any lock, by a searcher and by a carrier about to sleep.
+fun rtSchedWorkVisible(mine: RawPtr, now: Int) -> Bool {
   var r: RawPtr = rtCarriers.load(fromByteOffset: 0)
   while !r.isNull {
     if r.toInt() != mine.toInt() {
+      if rtRunqRing(r).isNull {
+      } else if rtRunqNonEmpty(r) {
+        return true
+      }
       let sl: Int = r.atomicLoad(fromByteOffset: 104)
-      if sl != 0 {
+      if sl != 0 && rtSlotOn != 0 {
         let st: Int = r.atomicLoad(fromByteOffset: 112)
         if now - st > rtSlotStealTicks {
           return true
@@ -264,6 +494,15 @@ fun rtSchedWake(sched: RawPtr, all: Bool) {
   if was != 0 {
     return
   }
+  // The search flag goes to a carrier that leaves its sleep after this point and reads it. One that left
+  // between the read above and the swap read the flag clear and runs as no searcher, and the flag would stay
+  // raised with none searching, which turns away every later wake. If none is counted sleeping now, none will
+  // take the flag: drop it. The carrier that left looks for work after this readying was queued, so finds it.
+  let still: Int = sched.atomicLoad(fromByteOffset: 320)
+  if still == 0 {
+    sched.atomicStore(0, toByteOffset: 328)
+    return
+  }
   gw.atomicFetchAdd(1, atByteOffset: 0)
   Runtime.futexWake(at: gw, all: false)
 }
@@ -275,60 +514,31 @@ fun rtSchedSearchNanos() -> Int {
 }
 
 // Spin until runnable work appears (on the run queue, or in another carrier's slot it may take), the stop
-// or stop-the-world flag is raised, or `until` passes. Reads without the lock; the caller takes the lock
-// and picks. It also watches the scheduled-mailbox queue, and stops when the queue needs a fiber: it is
-// non-empty with no drainer, or no drainer has popped it for NOMU_MBOX_AGE_NS. It then returns the pop count it judged the
-// queue at (the caller rechecks it under the lock); otherwise -1.
-fun rtSchedSpin(sched: RawPtr, until: Int) -> Int {
+// or stop-the-world flag is raised, or `until` passes. Reads without the lock; the caller picks.
+fun rtSchedSpin(sched: RawPtr, until: Int) {
   let mine = Runtime.carrierLocal()
-  let watchSlots = rtSlotOn != 0
-  // Other carriers' slots are written on every handoff: look at them once a microsecond, well inside the
-  // steal age, so the spin does not pull their cache lines away on every pass.
+  // Other carriers' queues and slots are written on every handoff: look at them once a microsecond, well
+  // inside the steal age, so the spin does not pull their cache lines away on every pass.
   var nextSlotCheck = 0
-  let age = rtMboxAgeNanos
-  var seenPops = -1
-  var seenAt = 0
-  var res = -1
   var go = true
   while go {
-    let h: Int = sched.atomicLoad(fromByteOffset: 0)
     let stp: Int = sched.atomicLoad(fromByteOffset: 40)
     let stw: Int = sched.atomicLoad(fromByteOffset: 136)
-    if h != 0 || stp != 0 || stw != 0 {
+    if rtSchedGlobalNonEmpty(sched) || stp != 0 || stw != 0 {
       go = false
     } else {
       let now = Runtime.monotonicNanos()
-      var slotReady = false
-      if watchSlots && now >= nextSlotCheck {
+      if now >= nextSlotCheck {
         nextSlotCheck = now + 1000
-        slotReady = rtSchedSlotStealable(mine, Runtime.ticks())
+        if rtSchedWorkVisible(mine, Runtime.ticks()) {
+          go = false
+        }
       }
       if now > until {
         go = false
-      } else if slotReady {
-        go = false
-      } else {
-        let mh: Int = sched.atomicLoad(fromByteOffset: 80)
-        if mh == 0 {
-          seenPops = -1
-        } else {
-          let pops: Int = sched.atomicLoad(fromByteOffset: 208)
-          let dr: Int = sched.atomicLoad(fromByteOffset: 200)
-          if dr == 0 {
-            res = pops
-            go = false
-          } else if pops != seenPops {
-            seenPops = pops
-            seenAt = now
-          } else if now - seenAt > age {
-            res = pops
-            go = false
-          }
-        }
       }
     }
   }
-  return res
 }
 
 // Wake the timer thread (it waits on the timer-gen word at sched+56): bump the word, then futexWake.
@@ -348,7 +558,8 @@ fun rtSchedSignalStop(sched: RawPtr) {
 }
 
 // ---- Timer heap (min-heap on the timer-entries buffer; entry i at i*16: expiry +0, fiber +8). Touched
-// only under the timer lock at sched+48. Backs fiberSleep (rt_sleep_ms). ----
+// only under the timer lock at sched+48. Backs fiberSleep (rt_sleep_ms) and a `select`'s `after` case, whose
+// entry holds its select waiter with the low bit set in place of a fiber (`runtime/channel.nomu`). ----
 
 fun rtSchedHeapSwap(ents: RawPtr, a: Int, b: Int) {
   let ea = a * 16
@@ -407,6 +618,89 @@ fun rtSchedTimerPush(sched: RawPtr, expiry: Int, fib: RawPtr) {
   }
 }
 
+// Move entry `i` down to its place in a heap of `n` entries.
+fun rtSchedTimerSiftDown(ents: RawPtr, n: Int, at: Int) {
+  var i = at
+  var go = true
+  while go {
+    let l = 2 * i + 1
+    let r = 2 * i + 2
+    var s = i
+    let es: Int = ents.load(fromByteOffset: s * 16)
+    if l < n {
+      let el: Int = ents.load(fromByteOffset: l * 16)
+      if el < es {
+        s = l
+      }
+    }
+    let es2: Int = ents.load(fromByteOffset: s * 16)
+    if r < n {
+      let er: Int = ents.load(fromByteOffset: r * 16)
+      if er < es2 {
+        s = r
+      }
+    }
+    if s == i {
+      go = false
+    } else {
+      rtSchedHeapSwap(ents, i, s)
+      i = s
+    }
+  }
+}
+
+// Move entry `i` up to its place.
+fun rtSchedTimerSiftUp(ents: RawPtr, at: Int) {
+  var i = at
+  var go = true
+  while go {
+    if i == 0 {
+      go = false
+    } else {
+      let p = (i - 1) / 2
+      let ep: Int = ents.load(fromByteOffset: p * 16)
+      let ei: Int = ents.load(fromByteOffset: i * 16)
+      if ep <= ei {
+        go = false
+      } else {
+        rtSchedHeapSwap(ents, p, i)
+        i = p
+      }
+    }
+  }
+}
+
+// Take entry `i` out: the last entry fills its place and moves to where it belongs.
+fun rtSchedTimerRemoveAt(sched: RawPtr, i: Int) {
+  let ents: RawPtr = sched.load(fromByteOffset: 72)
+  let n: Int = sched.load(fromByteOffset: 64) - 1
+  sched.store(n, toByteOffset: 64)
+  if i == n {
+    return
+  }
+  let xl: Int = ents.load(fromByteOffset: n * 16)
+  let fl: RawPtr = ents.load(fromByteOffset: n * 16 + 8)
+  ents.store(xl, toByteOffset: i * 16)
+  ents.store(fl, toByteOffset: i * 16 + 8)
+  rtSchedTimerSiftDown(ents, n, i)
+  rtSchedTimerSiftUp(ents, i)
+}
+
+// Take out the entry holding `who`, if it is still there. Caller holds the timer lock.
+fun rtSchedTimerRemove(sched: RawPtr, who: RawPtr) {
+  let ents: RawPtr = sched.load(fromByteOffset: 72)
+  let n: Int = sched.load(fromByteOffset: 64)
+  var i = 0
+  while i < n {
+    let f: RawPtr = ents.load(fromByteOffset: i * 16 + 8)
+    if f.eq(who) {
+      rtSchedTimerRemoveAt(sched, i)
+      return
+    }
+    i += 1
+  }
+}
+
 // Remove the earliest-deadline entry (caller checked count > 0); writes its expiry/fiber to out+0 / out+8.
 fun rtSchedTimerPopMin(sched: RawPtr, out: RawPtr) {
   let ents: RawPtr = sched.load(fromByteOffset: 72)
@@ -414,41 +708,7 @@ fun rtSchedTimerPopMin(sched: RawPtr, out: RawPtr) {
   let f0: RawPtr = ents.load(fromByteOffset: 8)
   out.store(x0, toByteOffset: 0)
   out.store(f0, toByteOffset: 8)
-  var n: Int = sched.load(fromByteOffset: 64) - 1
-  sched.store(n, toByteOffset: 64)
-  if n > 0 {
-    let xl: Int = ents.load(fromByteOffset: n * 16)
-    let fl: RawPtr = ents.load(fromByteOffset: n * 16 + 8)
-    ents.store(xl, toByteOffset: 0)
-    ents.store(fl, toByteOffset: 8)
-    var i = 0
-    var go = true
-    while go {
-      let l = 2 * i + 1
-      let r = 2 * i + 2
-      var s = i
-      let es: Int = ents.load(fromByteOffset: s * 16)
-      if l < n {
-        let el: Int = ents.load(fromByteOffset: l * 16)
-        if el < es {
-          s = l
-        }
-      }
-      let es2: Int = ents.load(fromByteOffset: s * 16)
-      if r < n {
-        let er: Int = ents.load(fromByteOffset: r * 16)
-        if er < es2 {
-          s = r
-        }
-      }
-      if s == i {
-        go = false
-      } else {
-        rtSchedHeapSwap(ents, i, s)
-        i = s
-      }
-    }
-  }
+  rtSchedTimerRemoveAt(sched, 0)
 }
 
 // The timer thread: sleep on the timer-gen futex until the earliest deadline (or a push), then unpark the
@@ -476,9 +736,27 @@ fun rtSchedTimerMain(sched: RawPtr) -> RawPtr {
         let now: Int = Runtime.monotonicNanos()
         if next <= now {
           rtSchedTimerPopMin(sched, out)
-          rtSchedMutexUnlockAt(sched.advanced(by: 48))
           let f: RawPtr = out.load(fromByteOffset: 8)
-          rtSchedUnpark(sched, f)
+          if (f.toInt() & 1) == 0 {
+            rtSchedMutexUnlockAt(sched.advanced(by: 48))
+            rtSchedUnpark(sched, f)
+          } else {
+            // A select's `after`: claimed under the timer lock, which its fiber's rtSelectDone takes before
+            // freeing the record, so the record outlives the claim.
+            let w = RawPtr.null.advanced(by: f.toInt() - 1)
+            let sel: RawPtr = w.load(fromByteOffset: 48)
+            let was: Int = sel.atomicCas(0, 1, atByteOffset: 8)
+            rtSchedMutexUnlockAt(sched.advanced(by: 48))
+            if was == 0 {
+              let index: Int = w.load(fromByteOffset: 56)
+              sel.store(index, toByteOffset: 16)
+              w.store(1, toByteOffset: 40)
+              rtSchedMutexLockAt(sel)
+              rtSchedMutexUnlockAt(sel)
+              let fib: RawPtr = sel.load(fromByteOffset: 24)
+              rtSchedUnpark(sched, fib)
+            }
+          }
         } else {
           let tg = sched.advanced(by: 56)
           let gen: Int = tg.atomicLoad(fromByteOffset: 0)
@@ -498,92 +776,78 @@ fun rtSchedTimerMain(sched: RawPtr) -> RawPtr {
 }
 
 // Allocate + seed a fresh fiber: a stack of `bytes` (rtStackNew) and a handle whose first switch-in lands
-// in rtSchedFiberMain. Created parked; the spawner readies and enqueues it.
+// in rtSchedFiberMain. Created parked; the starter readies and enqueues it.
 fun rtSchedFiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr, bytes: Int) -> RawPtr {
   let stack = rtStackNew(bytes)
   let stackTop = stack.advanced(by: bytes)
-  let fib = RawPtr.alloc(bytes: 336, align: 16)
-  fib.store(2, toByteOffset: 168)
-  fib.store(RawPtr.null, toByteOffset: 176)
-  fib.store(entry, toByteOffset: 184)
-  fib.store(arg, toByteOffset: 192)
-  fib.store(sched, toByteOffset: 200)
-  fib.store(stack, toByteOffset: 208)
-  fib.store(bytes, toByteOffset: 312)
-  fib.store(0, toByteOffset: 320)
-  fib.store(RawPtr.null, toByteOffset: 216)
-  fib.store(RawPtr.null, toByteOffset: 224)
-  fib.store(RawPtr.null, toByteOffset: 232)
-  fib.store(RawPtr.null, toByteOffset: 240)   // reg-next
-  fib.store(RawPtr.null, toByteOffset: 248)   // reg-prev
-  fib.store(RawPtr.null, toByteOffset: 256)   // pool-next
-  fib.store(RawPtr.null, toByteOffset: 264)   // anchor-sp
-  fib.store(0, toByteOffset: 272)             // anchor-pc
-  fib.store(RawPtr.null, toByteOffset: 288)   // shadow-top — typed-root list head (erased non-POD T, 100.4.3.6)
-  fib.store(0, toByteOffset: 296)             // drainer: none
-  fib.store(0, toByteOffset: 328)             // joinable until nomuSchedSpawnDetached says otherwise
+  let fib = rtFiberRecordNew()
+  fib.store(2, toByteOffset: 8)             // parked; not a drainer; no wait reason
+  fib.store(RawPtr.null, toByteOffset: 16)
+  fib.store(arg, toByteOffset: 32)
+  fib.store(stack, toByteOffset: 48)
+  fib.store(bytes, toByteOffset: 64)
+  fib.store(sched.atomicFetchAdd(1, atByteOffset: 32) + 1, toByteOffset: 56)    // ID
+  fib.store(RawPtr.null, toByteOffset: 120)  // waits on nothing
+  fib.store(0, toByteOffset: 96)             // no wait to date
+  fib.store(RawPtr.null, toByteOffset: 72)
+  fib.store(RawPtr.null, toByteOffset: 80)   // reg-next
+  fib.store(RawPtr.null, toByteOffset: 88)   // reg-prev
+  fib.store(RawPtr.null, toByteOffset: 104)   // anchor-sp
+  fib.store(0, toByteOffset: 112)             // anchor-pc
+  fib.store(RawPtr.null, toByteOffset: 24)   // shadow-top — typed-root list head (erased non-POD T, 100.4.3.6)
   Runtime.fiberInit(context: fib, stackTop: stackTop, entry: Runtime.ofFunc(rtSchedFiberMain), arg: fib)
-  fib.store(fib, toByteOffset: 72)            // x28: the running fiber
+  let regs: RawPtr = fib.load(fromByteOffset: 0)   // the registers the first switch-in restores
+  regs.store(sched, toByteOffset: 16)         // x21 and x22: rtSchedFiberMain's second and third arguments
+  regs.store(entry, toByteOffset: 24)
+  regs.store(fib, toByteOffset: 72)           // x28: the running fiber
   rtStackLimitSet(fib)
   return fib
 }
 
 // Fiber trampoline: resume with the lock held, release it, run the user body (via callEntry — the subset
-// scheduler → non-subset user body boundary), re-acquire to record completion, wake any joiner, drive the
-// active count to quiescence, and switch back to the carrier that ran us (holding the lock).
-fun rtSchedFiberMain(fib: RawPtr) -> RawPtr {
-  let sched: RawPtr = fib.load(fromByteOffset: 200)
-  rtSchedUnlock(sched)
-  let entry: RawPtr = fib.load(fromByteOffset: 184)
-  let arg: RawPtr = fib.load(fromByteOffset: 192)
-  // The argument (a spawn's managed closure environment) is rooted at fib+192 only until the fiber starts;
+// scheduler → non-subset user body boundary), re-acquire to record completion, and switch back to the carrier
+// that ran us (holding the lock). A fiber's result reaches others through what its body stores (a `Task`, a
+// channel), so the entry's return value is dropped.
+fun rtSchedFiberMain(fib: RawPtr, sched: RawPtr, entry: RawPtr) -> RawPtr {
+  let arg: RawPtr = fib.load(fromByteOffset: 32)
+  // The argument (a fiber's managed closure environment) is rooted at fib+32 only until the fiber starts;
   // from here the entry's own frames hold it. Clear the word so the walk never roots a stale copy.
-  fib.store(RawPtr.null, toByteOffset: 192)
-  let res = Runtime.callEntry(entry, arg: arg)
-  rtSchedLock(sched)
-  fib.store(res, toByteOffset: 216)
-  fib.store(3, toByteOffset: 168)
-  // Stay in the live-fiber registry (150.3.13): the result box at fib+216 is a managed object reachable only
-  // from here until the joiner reads it, so the STW walk must keep rooting it. The final (scope-exit) join
-  // drops the fiber from the registry once the box is no longer needed.
-  let joiner: RawPtr = fib.load(fromByteOffset: 224)
-  if joiner.isNull {
-  } else {
-    rtSchedReadyNext(sched, joiner)
-    rtSchedWake(sched, false)
+  fib.store(RawPtr.null, toByteOffset: 32)
+  Runtime.callEntry(entry, arg: arg)
+  if rtLeakReport {
+    let mainFib: RawPtr = sched.load(fromByteOffset: 216)
+    if fib.eq(mainFib) {
+      rtLeakAtExit(sched)
+    }
   }
+  rtSchedLock(sched)
+  fib.store(3.uint8, toByteOffset: 8)
   // `main` returning ends the program, whatever other fibers are doing. Actor drains finish first.
   let mf: RawPtr = sched.load(fromByteOffset: 216)
   if fib.eq(mf) {
-    sched.store(1, toByteOffset: 224)
+    sched.atomicStore(1, toByteOffset: 224)            // read without the lock by the last drain to end
     let ad: Int = sched.atomicLoad(fromByteOffset: 96)
     if ad == 0 {
       rtSchedSignalStop(sched)
     }
   }
-  let carrierCtx: RawPtr = fib.load(fromByteOffset: 232)
-  Runtime.ctxSwitch(from: fib, to: carrierCtx)
+  Runtime.ctxSwitch(from: fib, to: fib.advanced(by: 72))
   return fib
 }
 
-// A carrier with nothing to run, about to sleep while mailboxes are queued behind a busy drainer, searches
-// instead (when no other carrier is), so it can take them once they age. Caller holds the scheduler lock.
-fun rtSchedMboxBecomeSearcher(sched: RawPtr) -> Bool {
-  let h: RawPtr = sched.load(fromByteOffset: 80)
-  if h.isNull {
-    return false
-  }
-  let was: Int = sched.atomicCas(0, 1, atByteOffset: 328)
-  return was == 0
-}
-
-// The carrier loop: hold the lock, switch into each ready fiber (recording it in this carrier's record), or
-// sleep on the wake-gen futex when the queue is empty. Exit when the stop flag is raised.
-fun rtSchedLoop(sched: RawPtr, myCtx: RawPtr) {
+// The carrier loop: pick a run-queue entry with no lock (rtSchedFind) and run it, a fiber or a mailbox, or,
+// with nothing to run, search or sleep on the wake-gen futex. Exit when the stop flag is raised. The carrier
+// holds no lock while a fiber runs.
+//
+// Sleeping cannot lose work: a carrier counts itself sleeping, then looks at the global queue and at every
+// local queue and slot again before it waits; a readier puts the fiber in a queue, then reads the sleeping
+// count (rtSchedWake). Both sides write before they read, and the atomics are sequentially consistent, so one
+// sees the other. A fiber left in a running carrier's own slot is that carrier's to run, or a searcher's once
+// it ages.
+fun rtSchedLoop(sched: RawPtr) {
   let rec = rtCarrier()
-  rtSchedLock(sched)
+  rtRunqInit(rec)
   var searching = false
-  var searchUntil = 0
   var picks = 0
   var go = true
   while go {
@@ -594,142 +858,242 @@ fun rtSchedLoop(sched: RawPtr, myCtx: RawPtr) {
       let stwReq: Int = sched.atomicLoad(fromByteOffset: 136)
       if stwReq != 0 {
         // Stop-the-world in progress: this carrier is quiescent (no fiber on-CPU), so ack and wait.
-        rtSchedUnlock(sched)
         rtSchedStwParkCarrier(sched)
-        rtSchedLock(sched)
       } else {
         picks += 1
-        let fib = rtSchedPick(sched, rec, picks)
-        var readied = false
+        let fib = rtSchedFind(sched, rec, picks)
         if fib.isNull {
-          // Mailboxes are queued and no drainer will pop them, so ready one here.
-          if rtSchedMboxUnserved(sched) {
-            readied = rtSchedMboxReady(sched)
-          }
-        }
-        if readied {
-        } else if fib.isNull {
+          searching = rtSchedIdle(sched, rec, searching)
           if searching {
-            if Runtime.monotonicNanos() < searchUntil {
-              rtSchedUnlock(sched)
-              let agedAt = rtSchedSpin(sched, searchUntil)
-              rtSchedLock(sched)
-              if agedAt >= 0 {
-                // The scheduled-mailbox queue went unserved while this carrier spun: ready a mailbox
-                // fiber for it if nothing has popped it since.
-                let mh: RawPtr = sched.load(fromByteOffset: 80)
-                let pops: Int = sched.load(fromByteOffset: 208)
-                let dr: Int = sched.load(fromByteOffset: 200)
-                if mh.isNull {
-                } else if dr == 0 || pops == agedAt {
-                  rtSchedMboxReady(sched)
-                }
-              }
-            } else {
-              // Give up the search; the loop rechecks the queue under the lock before sleeping.
-              sched.atomicStore(0, toByteOffset: 328)
-              searching = false
+            let srchUntil: Int = rec.load(fromByteOffset: 152)
+            if srchUntil == 0 {
+              rec.store(Runtime.monotonicNanos() + rtSchedSearchNanos(), toByteOffset: 152)
             }
-          } else if rtSchedMboxBecomeSearcher(sched) {
-            searching = true
-            searchUntil = Runtime.monotonicNanos() + rtSchedSearchNanos()
           } else {
-            let gw = sched.advanced(by: 24)
-            let gen: Int = gw.atomicLoad(fromByteOffset: 0)
-            sched.atomicFetchAdd(1, atByteOffset: 320)
-            rtSchedUnlock(sched)
-            Runtime.futexWait(at: gw, expected: gen, timeoutMicros: 1000000)
-            rtSchedLock(sched)
-            sched.atomicFetchAdd(-1, atByteOffset: 320)
-            let srch: Int = sched.atomicLoad(fromByteOffset: 328)
-            if srch != 0 {
-              searching = true
-              searchUntil = Runtime.monotonicNanos() + rtSchedSearchNanos()
-            }
+            rec.store(0, toByteOffset: 152)
           }
         } else {
           if searching {
             // Found work: end the search, and pass it on if more is queued.
             sched.atomicStore(0, toByteOffset: 328)
             searching = false
-            let more: RawPtr = sched.load(fromByteOffset: 0)
-            if more.isNull {
-            } else {
+            rec.store(0, toByteOffset: 152)
+            if rtSchedGlobalNonEmpty(sched) || rtRunqNonEmpty(rec) {
               rtSchedWake(sched, false)
             }
           }
-          // A mailbox fiber resumed after parking in a handler can pop the scheduled queue again.
-          let drn: Int = fib.load(fromByteOffset: 296)
-          if drn == 2 {
-            fib.store(1, toByteOffset: 296)
-            let dr: Int = sched.load(fromByteOffset: 200)
-            sched.atomicStore(dr + 1, toByteOffset: 200)
-          }
-          fib.store(myCtx, toByteOffset: 232)
-          fib.store(1, toByteOffset: 168)
-          rec.store(fib, toByteOffset: 64)
-          if rtStackMoveResume {
-            rtStackMove(fib)                         // the stress mode: a new stack at every resume
-          }
-          Runtime.ctxSwitch(from: myCtx, to: fib)
-          // If the fiber stopped at a safepoint for STW (state 4), this carrier acks and waits, then
-          // switches back into it to resume past the poll — repeating if another STW round follows. At a
-          // stack check that asked for a move (state 5: a short stack, or the stress mode), it moves the
-          // stack, growing it when short, and switches straight back.
-          var fst: Int = fib.load(fromByteOffset: 168)
-          while fst == 4 || fst == 5 {
-            if fst == 4 {
-              rtSchedUnlock(sched)
-              rtSchedStwParkCarrier(sched)
-              rtSchedLock(sched)
-            }
-            fib.store(1, toByteOffset: 168)
-            rec.store(fib, toByteOffset: 64)
-            if rtStackMoveResume || fst == 5 {
-              rtStackMove(fib)
-            }
-            Runtime.ctxSwitch(from: myCtx, to: fib)
-            fst = fib.load(fromByteOffset: 168)
-          }
-          // A fiber that ran to completion never runs again: its record keeps the result, and its stack goes.
-          if fst == 3 {
-            rtStackFree(fib)
-          }
-          // A mailbox fiber back here while still a drainer parked inside a handler: it cannot pop the
-          // scheduled queue until it resumes.
-          let drAfter: Int = fib.load(fromByteOffset: 296)
-          if drAfter == 1 {
-            fib.store(2, toByteOffset: 296)
-            let dr: Int = sched.load(fromByteOffset: 200)
-            sched.atomicStore(dr - 1, toByteOffset: 200)
-          }
-          // The carrier is between fibers, and another carrier may free this record once it is joined.
-          rec.store(RawPtr.null, toByteOffset: 64)
-          if fst == 3 {
-            let detached: Int = fib.load(fromByteOffset: 328)
-            if detached != 0 {
-              rtSchedRegRemove(sched, fib)
-              rtFiberFree(fib)
-            }
+          if rtSchedEntryIsMailbox(fib) {
+            rtSchedRunMailbox(sched, rec, fib.advanced(by: -1))
+          } else {
+            rtSchedRun(sched, rec, fib)
           }
         }
       }
     }
   }
-  rtSchedUnlock(sched)
+  if searching {
+    sched.atomicStore(0, toByteOffset: 328)
+  }
 }
 
-// Free a finished fiber's record. Under the stress modes it is poisoned and kept, so a late read faults.
+// One idle step, with no lock held: search (spin for work) until the search window closes, else sleep. Returns
+// whether this carrier is searching. The search window's end is in rec+152.
+fun rtSchedIdle(sched: RawPtr, rec: RawPtr, searching: Bool) -> Bool {
+  if searching {
+    let until: Int = rec.load(fromByteOffset: 152)
+    if Runtime.monotonicNanos() < until {
+      rtSchedSpin(sched, until)
+      return true
+    }
+    // Give up the search; the next step rechecks the queues before sleeping.
+    sched.atomicStore(0, toByteOffset: 328)
+    return false
+  }
+  let gw = sched.advanced(by: 24)
+  let gen: Int = gw.atomicLoad(fromByteOffset: 0)
+  sched.atomicFetchAdd(1, atByteOffset: 320)
+  // Counted as sleeping: look once more, so a readying that missed the count is seen here.
+  var work = rtSchedGlobalNonEmpty(sched) || rtSchedWorkVisible(rec, Runtime.ticks())
+  if work == false {
+    let stp: Int = sched.atomicLoad(fromByteOffset: 40)
+    let stw: Int = sched.atomicLoad(fromByteOffset: 136)
+    work = stp != 0 || stw != 0
+  }
+  if work == false {
+    // The last carrier to go idle checks for a deadlock: nothing running and nothing that can wake a fiber.
+    // It waits briefly first; a wake meanwhile bumps the generation.
+    let idle: Int = sched.atomicLoad(fromByteOffset: 320)
+    let ncar: Int = sched.atomicLoad(fromByteOffset: 160)
+    if idle == ncar && rtSchedNothingCanWake(sched) {
+      Runtime.futexWait(at: gw, expected: gen, timeoutMicros: 100000)
+      let again: Int = gw.atomicLoad(fromByteOffset: 0)
+      let idle2: Int = sched.atomicLoad(fromByteOffset: 320)
+      if again == gen && idle2 == ncar && rtSchedNothingCanWake(sched) {
+        rtSchedDeadlock(sched)
+      }
+    } else {
+      Runtime.futexWait(at: gw, expected: gen, timeoutMicros: 1000000)
+    }
+  }
+  sched.atomicFetchAdd(-1, atByteOffset: 320)
+  // A waker raises the search flag for the carrier it wakes (rtSchedWake): take it up.
+  let srch: Int = sched.atomicLoad(fromByteOffset: 328)
+  return srch != 0
+}
+
+// Whether no fiber can ever run again, Go's `checkdead`: no fiber running or runnable, at least one parked,
+// and nothing that could wake one: no timer, no stdin waiter, no actor work, and no collection, stop or exit
+// under way. Read without the scheduler lock; the caller confirms it over a wait.
+fun rtSchedNothingCanWake(sched: RawPtr) -> Bool {
+  let stp: Int = sched.atomicLoad(fromByteOffset: 40)
+  let stw: Int = sched.atomicLoad(fromByteOffset: 136)
+  let gcr: Int = sched.atomicLoad(fromByteOffset: 168)
+  let done: Int = sched.atomicLoad(fromByteOffset: 224)
+  let timers: Int = sched.atomicLoad(fromByteOffset: 64)
+  let drains: Int = sched.atomicLoad(fromByteOffset: 96)
+  let mbq: Int = sched.atomicLoad(fromByteOffset: 80)
+  let stdinWaiters: Int = rtStdin.atomicLoad(fromByteOffset: 48)
+  if stp != 0 || stw != 0 || gcr != 0 || done != 0 || timers != 0 || drains != 0 || mbq != 0 || stdinWaiters != 0 {
+    return false
+  }
+  var parked = 0
+  var cur: RawPtr = sched.load(fromByteOffset: 128)
+  while cur.isNull == false {
+    let stByte: UInt8 = cur.load(fromByteOffset: 8)
+    let st = stByte.int
+    if st == 0 || st == 1 || st == 4 || st == 5 {
+      return false
+    }
+    if st == 2 {
+      parked = parked + 1
+    }
+    cur = cur.load(fromByteOffset: 80)
+  }
+  return parked > 0
+}
+
+// No fiber can run again: say so, dump every fiber, and exit with status 2, as Go's deadlock error does. The
+// carrier that claims the exit (sched+232, as rtSchedFinish does) reports; any other waits for the exit.
+fun rtSchedDeadlock(sched: RawPtr) {
+  let was: Int = sched.atomicCas(0, 1, atByteOffset: 232)
+  if was != 0 {
+    let parked = sched.advanced(by: 232)
+    while true {
+      Runtime.futexWait(at: parked, expected: 1, timeoutMicros: 1000000)
+    }
+  }
+  let buf = RawPtr.alloc(bytes: 1024, align: 8)
+  var fd = -1
+  let first: UInt8 = rtFaultReportPath.load(fromByteOffset: 0)
+  if first.int != 0 {
+    fd = Runtime.createFile(path: rtFaultReportPath, mode: 420)
+  }
+  Runtime.writeFd(fd: 2, buf: buf, count: Runtime.copyLiteral(to: buf, "fatal error: all fibers are asleep - deadlock!\n"))
+  rtFaultEmit(fd, buf, rtFaultPutImage(buf, 0))
+  rtFiberDump(fd, buf)
+  rtFaultEmit(fd, buf, Runtime.copyLiteral(to: buf, "nomu-crash: end\n"))
+  if fd >= 0 {
+    Runtime.closeFd(fd: fd)
+  }
+  Runtime.exit(2)
+}
+
+// Run `fib` on this carrier until it switches back, then settle its state. No lock is held on entry or exit.
+fun rtSchedRun(sched: RawPtr, rec: RawPtr, fib: RawPtr) {
+  fib.store(1.uint8, toByteOffset: 8)
+  rec.store(fib, toByteOffset: 64)
+  if rtStackMoveResume {
+    rtSchedLock(sched)                       // the stress mode's stack pool is the scheduler lock's
+    rtStackMove(fib, 0)                         // the stress mode: a new stack at every resume
+    rtSchedUnlock(sched)
+  }
+  // This carrier's SP goes in the fiber's record (fib+72), which the fiber switches back through.
+  var message = Runtime.ctxSwitch(from: fib.advanced(by: 72), to: fib)
+  // If the fiber stopped at a safepoint for STW (state 4), this carrier acks and waits, then switches back
+  // into it to resume past the poll — repeating if another STW round follows. At a stack check that asked
+  // for a move (state 5: a short stack, or the stress mode), it moves the stack, growing it when short, and
+  // switches straight back.
+  var back = rtSchedSwitchedBack(sched, message, fib)
+  var held = back >= 16
+  var fst = back % 16
+  while fst == 4 || fst == 5 {
+    if fst == 4 {
+      if held {
+        rtSchedUnlock(sched)
+        held = false
+      }
+      rtSchedStwParkCarrier(sched)
+    }
+    fib.store(1.uint8, toByteOffset: 8)
+    rec.store(fib, toByteOffset: 64)
+    if rtStackMoveResume || fst == 5 {
+      if held == false && rtStackGrowLocked() {
+        rtSchedLock(sched)
+        held = true
+      }
+      var need = 0                               // room the fiber's stack check asked for: its message, -(need + 1)
+      if fst == 5 {
+        need = -1 - message.toInt()
+      }
+      rtStackMove(fib, need)
+    }
+    if held {
+      rtSchedUnlock(sched)
+      held = false
+    }
+    message = Runtime.ctxSwitch(from: fib.advanced(by: 72), to: fib)
+    back = rtSchedSwitchedBack(sched, message, fib)
+    held = back >= 16
+    fst = back % 16
+  }
+  // A fiber that ran to completion never runs again: its stack goes now, and its record below.
+  if fst == 3 {
+    if held == false {
+      rtSchedLock(sched)
+      held = true
+    }
+    rtStackFree(fib)
+  }
+  // A mailbox fiber with nothing left to drain: this carrier's idle one, or back to the pool.
+  if fst == 6 {
+    let idle: RawPtr = rec.load(fromByteOffset: 160)
+    if idle.isNull {
+      rec.store(fib, toByteOffset: 160)
+    } else {
+      if held == false {
+        rtSchedLock(sched)
+        held = true
+      }
+      rtSchedDrainerPut(sched, fib)
+    }
+  }
+  // The carrier is between fibers. A finished fiber's record goes, except main's, which the scheduler keeps
+  // to recognize it (sched+216).
+  rec.store(RawPtr.null, toByteOffset: 64)
+  if fst == 3 {
+    let mf: RawPtr = sched.load(fromByteOffset: 216)
+    if fib.eq(mf) == false {
+      rtSchedRegRemove(sched, fib)
+      rtFiberFree(fib)
+    }
+  }
+  if held {
+    rtSchedUnlock(sched)
+  }
+}
+
+// Free a finished fiber's record, into this carrier's pool when it has room. Under the stress modes it is
+// poisoned and kept, so a late read faults.
 fun rtFiberFree(fib: RawPtr) {
   if rtStackMoveOn {
     var off = 0
-    while off < 336 {
+    while off < 128 {
       fib.store(-2401053088876216593, toByteOffset: off)
       off += 8
     }
     return
   }
-  fib.free()
+  rtFiberRecordRelease(fib)
 }
 
 // Run after a carrier leaves its scheduler loop. The first carrier here ends the process; the others wait
@@ -741,6 +1105,9 @@ fun rtSchedFinish(sched: RawPtr) {
   if was == 0 {
     let gc: RawPtr = sched.load(fromByteOffset: 240)
     Runtime.threadJoin(handle: gc)
+    if rtStackStatsOn {
+      rtStackStatsPrint()
+    }
     rtGcRecordFinish()
     Runtime.exit(0)
   }
@@ -750,198 +1117,185 @@ fun rtSchedFinish(sched: RawPtr) {
   }
 }
 
-// A carrier thread's entry (started via threadCreate). `carg` is [0] sched · [8] context buffer · [16] the
-// carrier's number.
+// A carrier thread's entry (started via threadCreate). `carg` is [0] sched · [8] the carrier's number.
 fun rtSchedCarrierMain(carg: RawPtr) -> RawPtr {
-  let index: Int = carg.load(fromByteOffset: 16)
+  let index: Int = carg.load(fromByteOffset: 8)
   rtFaultThreadStart(1, index)
   let sched: RawPtr = carg.load(fromByteOffset: 0)
-  let ctx: RawPtr = carg.load(fromByteOffset: 8)
-  rtSchedLoop(sched, ctx)
+  rtSchedLoop(sched)
   rtSchedFinish(sched)
   return carg
 }
 
-// ---- Actor mailbox + capped mailbox-fiber pool (task 128.1.8 machinery, consolidated). Fire-and-forget
-// message send: nomuSchedActorSend enqueues a message and returns; a pool of ≤64 reusable mailbox fibers
-// drains scheduled mailboxes by running the codegen-emitted nomu_actor_drain (which pops via the C
-// rt_mailbox_pop → nomuSchedMailboxPop and runs each message's thunk). The mailbox/message byte offsets are
-// the ABI with codegen (the layout table above). The global scheduled-mailbox queue lives in the Sched; the STW
-// walk roots its head and tail (nomuSchedStwCollectDefrag). ----
+// ---- Actor mailboxes and mailbox fibers. Fire-and-forget message send: nomuSchedActorSend enqueues a message
+// and returns; the send that schedules a mailbox readies it into the run queues as a tagged entry. The carrier
+// that picks it runs it on a mailbox fiber, which runs the codegen-emitted nomu_actor_drain (popping through the
+// C rt_mailbox_pop → nomuSchedMailboxPop and running each message's thunk). The mailbox/message byte offsets are
+// the ABI with codegen (the layout table above).
+//
+// Each carrier keeps one idle mailbox fiber (rec+160); a handler that parks keeps its fiber, so the carrier
+// takes another from the pool (sched+104, under the scheduler lock) or makes one. A mailbox fiber that finishes
+// its mailbox drains the next one from its carrier's slot without a switch, so actors handing messages back and
+// forth stay on one fiber, as fibers handing off stay on one carrier. ----
 
-// Pop the head of the global scheduled-mailbox queue (mailbox sched_next at +32), or null. Caller holds
-// the scheduler lock; the returned mailbox stays scheduled — the caller is now its drainer.
-fun rtSchedMboxSchedPop(sched: RawPtr) -> RawPtr {
-  let mb: RawPtr = sched.load(fromByteOffset: 80)
-  if mb.isNull {
-    return mb
-  }
-  let nx: RawPtr = mb.load(fromByteOffset: 32)
-  sched.store(nx, toByteOffset: 80)
-  if nx.isNull {
-    sched.store(RawPtr.null, toByteOffset: 88)
-  }
-  mb.store(RawPtr.null, toByteOffset: 32)
-  let pops: Int = sched.load(fromByteOffset: 208)
-  sched.atomicStore(pops + 1, toByteOffset: 208)
-  return mb
-}
+// How many mailboxes a mailbox fiber drains one after another from its carrier's slot before it goes back to
+// the carrier, so a chain of actors handing off cannot keep the carrier's other work waiting.
+let rtDrainChain = 64
 
-// A mailbox fiber: seeded to land here on first switch-in, resumed inside the loop thereafter. Unlike a
-// user fiber, it runs with the scheduler lock HELD at every loop top: it pops a scheduled mailbox under the lock, drops the lock to drain it, re-takes it; when
-// none remain it parks on the free-list (switching to the carrier holding the lock).
-fun rtSchedMailboxFiberMain(fib: RawPtr) -> RawPtr {
-  let sched: RawPtr = fib.load(fromByteOffset: 200)
+// A mailbox fiber: seeded to land here on first switch-in, resumed at its idle switch thereafter. It drains the
+// mailbox waiting at fib+32, then each mailbox its carrier's slot holds, then goes idle (rtSchedDrainerIdle).
+// The mailbox is read and passed on before the drain runs: a collection during a handler may move it, and the
+// drain holds it as a managed reference.
+fun rtSchedMailboxFiberMain(fib: RawPtr, sched: RawPtr) -> RawPtr {
   let drainPtr: RawPtr = sched.load(fromByteOffset: 120)
-  var go = true
-  while go {
-    let mb = rtSchedMboxSchedPop(sched)
-    if mb.isNull {
-      let freeHead: RawPtr = sched.load(fromByteOffset: 104)
-      fib.store(freeHead, toByteOffset: 256)                          // pool_next = free
-      sched.store(fib, toByteOffset: 104)                             // free = self
-      fib.store(2, toByteOffset: 168)                                 // parked
-      fib.store(RawPtr.null, toByteOffset: 264)                       // idle: no roots — STW walk skips it
-      fib.store(2, toByteOffset: 296)                                 // no longer a drainer
-      let dr: Int = sched.load(fromByteOffset: 200)
-      sched.atomicStore(dr - 1, toByteOffset: 200)
-      let carrierCtx: RawPtr = fib.load(fromByteOffset: 232)
-      Runtime.ctxSwitch(from: fib, to: carrierCtx)                                     // hand lock to scheduler; resume with it held
-    } else {
-      // More mailboxes are queued behind this one: let a searcher come, in case this drain runs long.
-      let more: RawPtr = sched.load(fromByteOffset: 80)
-      if more.isNull {
-      } else {
-        rtSchedWake(sched, false)
+  while true {
+    var mb: RawPtr = fib.load(fromByteOffset: 32)
+    fib.store(RawPtr.null, toByteOffset: 32)
+    var n = 0
+    while mb.isNull == false {
+      Runtime.callEntry(drainPtr, arg: mb)                     // nomu_actor_drain(mb), lock-free
+      n += 1
+      mb = RawPtr.null
+      if n < rtDrainChain {
+        mb = rtSchedSlotMailbox()
       }
-      rtSchedUnlock(sched)
-      Runtime.callEntry(drainPtr, arg: mb)                                          // nomu_actor_drain(mb), lock-free
-      rtSchedLock(sched)
     }
+    rtSchedDrainerIdle(fib)
   }
   return fib
 }
 
-// Allocate a fresh mailbox fiber, seeded to enter rtSchedMailboxFiberMain. Infrastructure — not counted
-// in `active`. Caller holds the scheduler lock.
+// Whether the running fiber is a mailbox fiber.
+fun rtSchedInMailboxFiber() -> Bool {
+  let me = rtCurrentFiber()
+  if me.isNull {
+    return false
+  }
+  let d: UInt8 = me.load(fromByteOffset: 9)
+  return d.int == 1
+}
+
+// Take the mailbox in this carrier's slot, or null when the slot is empty or holds a fiber.
+fun rtSchedSlotMailbox() -> RawPtr {
+  let rec = Runtime.carrierLocal()
+  let sl: Int = rec.atomicLoad(fromByteOffset: 104)
+  if sl % 2 == 0 {
+    return RawPtr.null
+  }
+  let got: Int = rec.atomicCas(sl, 0, atByteOffset: 104)
+  if got != sl {
+    return RawPtr.null
+  }
+  return RawPtr.null.advanced(by: sl - 1)
+}
+
+// Go back to the carrier with nothing to drain (state 6, no lock held). The carrier keeps the fiber as its idle
+// one or returns it to the pool (rtSchedRun), once its context is saved; the next mailbox resumes it here.
+fun rtSchedDrainerIdle(fib: RawPtr) {
+  fib.store(6.uint8, toByteOffset: 8)
+  fib.store(RawPtr.null, toByteOffset: 104)                    // idle: no roots, the walk skips it
+  Runtime.ctxSwitch(from: fib, to: fib.advanced(by: 72))
+}
+
+// Run the scheduled mailbox `mb`, a run-queue entry this carrier picked, on its idle mailbox fiber, or one from
+// the pool. No safepoint comes between the pick and the fiber's switch-in, so `mb` cannot move meanwhile.
+fun rtSchedRunMailbox(sched: RawPtr, rec: RawPtr, mb: RawPtr) {
+  var d: RawPtr = rec.load(fromByteOffset: 160)
+  if d.isNull {
+    rtSchedLock(sched)
+    d = rtSchedDrainerTake(sched)
+    rtSchedUnlock(sched)
+  } else {
+    rec.store(RawPtr.null, toByteOffset: 160)
+  }
+  d.store(mb, toByteOffset: 32)
+  d.store(0.uint8, toByteOffset: 8)
+  rtSchedRun(sched, rec, d)
+}
+
+// Allocate a fresh mailbox fiber, seeded to enter rtSchedMailboxFiberMain. Caller holds the scheduler lock.
 fun rtSchedMailboxFiberNew(sched: RawPtr) -> RawPtr {
   let stack = rtStackNew(rtStackStart)
   let stackTop = stack.advanced(by: rtStackStart)
-  let fib = RawPtr.alloc(bytes: 336, align: 16)
-  fib.store(0, toByteOffset: 168)
-  fib.store(RawPtr.null, toByteOffset: 176)
-  fib.store(sched, toByteOffset: 200)
-  fib.store(stack, toByteOffset: 208)
-  fib.store(rtStackStart, toByteOffset: 312)
-  fib.store(0, toByteOffset: 320)
-  fib.store(RawPtr.null, toByteOffset: 232)
-  fib.store(RawPtr.null, toByteOffset: 256)
-  fib.store(RawPtr.null, toByteOffset: 264)   // anchor-sp (set when a handler parks / stops at a safepoint)
-  fib.store(0, toByteOffset: 272)             // anchor-pc
-  fib.store(RawPtr.null, toByteOffset: 288)   // shadow-top — typed-root list head (erased non-POD T, 100.4.3.6)
-  fib.store(0, toByteOffset: 296)             // drainer: none
-  fib.store(0, toByteOffset: 328)             // never freed: mailbox fibers are pooled
+  let fib = RawPtr.alloc(bytes: 128, align: 64)
+  fib.store(0, toByteOffset: 8)
+  fib.store(RawPtr.null, toByteOffset: 16)
+  fib.store(stack, toByteOffset: 48)
+  fib.store(rtStackStart, toByteOffset: 64)
+  fib.store(RawPtr.null, toByteOffset: 72)
+  fib.store(RawPtr.null, toByteOffset: 104)   // anchor-sp (set when a handler parks / stops at a safepoint)
+  fib.store(0, toByteOffset: 112)             // anchor-pc
+  fib.store(RawPtr.null, toByteOffset: 24)   // shadow-top — typed-root list head (erased non-POD T, 100.4.3.6)
+  fib.store(1.uint8, toByteOffset: 9)       // a mailbox fiber
+  fib.store(0, toByteOffset: 96)             // no wait to date
+  fib.store(RawPtr.null, toByteOffset: 32)   // no mailbox yet
   rtSchedRegInsert(sched, fib)                // in the registry so a handler stopped mid-drain is STW-walked
   Runtime.fiberInit(context: fib, stackTop: stackTop, entry: Runtime.ofFunc(rtSchedMailboxFiberMain), arg: fib)
-  fib.store(fib, toByteOffset: 72)            // x28: the running fiber
+  let regs: RawPtr = fib.load(fromByteOffset: 0)   // the registers the first switch-in restores
+  regs.store(sched, toByteOffset: 16)         // x21: rtSchedMailboxFiberMain's second argument
+  regs.store(fib, toByteOffset: 72)           // x28: the running fiber
   rtStackLimitSet(fib)
   return fib
 }
 
-// Ready a mailbox fiber to pop the scheduled queue: a free one, else a new one up to the cap (64). Counts
-// it as a drainer. Returns false at the cap with all busy (a busy fiber pops the queue when it frees).
-// Caller holds the scheduler lock.
-fun rtSchedMboxReady(sched: RawPtr) -> Bool {
-  var f: RawPtr = sched.load(fromByteOffset: 104)
+// A mailbox fiber from the pool, or a new one. Caller holds the scheduler lock.
+fun rtSchedDrainerTake(sched: RawPtr) -> RawPtr {
+  let f: RawPtr = sched.load(fromByteOffset: 104)
   if f.isNull {
     let cnt: Int = sched.load(fromByteOffset: 112)
-    if cnt >= 64 {
-      return false
-    }
-    f = rtSchedMailboxFiberNew(sched)
     sched.store(cnt + 1, toByteOffset: 112)
-  } else {
-    let pn: RawPtr = f.load(fromByteOffset: 256)
-    sched.store(pn, toByteOffset: 104)                           // free = f->pool_next
-    f.store(RawPtr.null, toByteOffset: 256)
-    f.store(RawPtr.null, toByteOffset: 288)                       // reset shadow-top on reuse (typed roots)
+    return rtSchedMailboxFiberNew(sched)
   }
-  f.store(0, toByteOffset: 168)
-  f.store(1, toByteOffset: 296)
-  let dr: Int = sched.load(fromByteOffset: 200)
-  sched.atomicStore(dr + 1, toByteOffset: 200)
-  rtSchedEnqueue(sched, f)
-  return true
+  let pn: RawPtr = f.load(fromByteOffset: 16)
+  sched.store(pn, toByteOffset: 104)
+  f.store(RawPtr.null, toByteOffset: 16)
+  f.store(RawPtr.null, toByteOffset: 24)                      // reset shadow-top on reuse (typed roots)
+  return f
 }
 
-// A send scheduled a mailbox (its 0→1 edge); see that a mailbox fiber will pop it. The send readies none: a
-// drainer already running pops the queue next (in a ping-pong, the sender's own fiber, moments later), and
-// with no drainer an idle carrier readies one (rtSchedLoop), so the send only wakes a carrier when there is
-// no drainer. A busy drainer's backlog reaches other carriers through searchers (NOMU_MBOX_AGE_NS). Readying
-// a fiber on every send instead split a two-actor ping-pong across carriers and grew the pool to its cap
-// (task 234). Caller holds the scheduler lock.
-fun rtSchedMailboxDispatch(sched: RawPtr) {
-  let dr: Int = sched.load(fromByteOffset: 200)
-  if dr == 0 {
-    rtSchedWake(sched, false)
-  }
-}
-
-// Whether an idle carrier should ready a mailbox fiber now: mailboxes are queued and no
-// drainer will pop them. Caller holds the scheduler lock.
-fun rtSchedMboxUnserved(sched: RawPtr) -> Bool {
-  let h: RawPtr = sched.load(fromByteOffset: 80)
-  if h.isNull {
-    return false
-  }
-  let dr: Int = sched.load(fromByteOffset: 200)
-  return dr == 0
+// Return an idle mailbox fiber to the pool. Caller holds the scheduler lock.
+fun rtSchedDrainerPut(sched: RawPtr, f: RawPtr) {
+  let head: RawPtr = sched.load(fromByteOffset: 104)
+  f.store(head, toByteOffset: 16)
+  sched.store(f, toByteOffset: 104)
 }
 
 // ---- Live-fiber registry + self-hosted STW root walk (task 128.3.2). The registry (head at sched+128,
 // intrusive doubly-linked through fib reg-next/reg-prev) tracks every live user fiber so a stop-the-world
 // can enumerate them; each parked fiber carries a user-frame anchor its C dispatch shim captured, which
-// rtWalkFrom reads directly — no libunwind. Maintained under the scheduler lock (insert on spawn, remove
+// rtWalkFrom reads directly — no libunwind. Maintained under the scheduler lock (insert on start, remove
 // on completion). ----
 
 fun rtSchedRegInsert(sched: RawPtr, fib: RawPtr) {
   let head: RawPtr = sched.load(fromByteOffset: 128)
-  fib.store(RawPtr.null, toByteOffset: 248)   // prev = null (new head)
-  fib.store(head, toByteOffset: 240)          // next = old head
+  fib.store(RawPtr.null, toByteOffset: 88)   // prev = null (new head)
+  fib.store(head, toByteOffset: 80)          // next = old head
   if head.isNull {
   } else {
-    head.store(fib, toByteOffset: 248)        // old head's prev = fib
+    head.store(fib, toByteOffset: 88)        // old head's prev = fib
   }
   sched.store(fib, toByteOffset: 128)
-  fib.store(1, toByteOffset: 280)             // registered = 1 (150.3.13: gate for idempotent remove)
 }
 
-// Idempotent: a fiber's structured scope-exit join may finalize it more than once (nested scopes re-run
-// joinSpawns over the same binding), so removing an already-removed fiber is a no-op (150.3.13).
 fun rtSchedRegRemove(sched: RawPtr, fib: RawPtr) {
-  let reg: Int = fib.load(fromByteOffset: 280)
-  if reg == 0 {
-    return
-  }
-  fib.store(0, toByteOffset: 280)
-  let prev: RawPtr = fib.load(fromByteOffset: 248)
-  let next: RawPtr = fib.load(fromByteOffset: 240)
+  let prev: RawPtr = fib.load(fromByteOffset: 88)
+  let next: RawPtr = fib.load(fromByteOffset: 80)
   if prev.isNull {
     sched.store(next, toByteOffset: 128)      // fib was the head
   } else {
-    prev.store(next, toByteOffset: 240)
+    prev.store(next, toByteOffset: 80)
   }
   if next.isNull {
   } else {
-    next.store(prev, toByteOffset: 248)
+    next.store(prev, toByteOffset: 88)
   }
 }
 
 // Store the user-frame anchor (captured by a C dispatch shim) into the current fiber. Called from a Nomu
 // park path just before ctxSwitchTo, so the STW walk finds a valid anchor on every parked fiber.
 fun rtSchedSetAnchor(fib: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
-  fib.store(anchorSp, toByteOffset: 264)
-  fib.store(anchorPc, toByteOffset: 272)
+  fib.store(anchorSp, toByteOffset: 104)
+  fib.store(anchorPc, toByteOffset: 112)
 }
 
 // A carrier acknowledges the stop-the-world and waits for resume. Called by a carrier that has reached a
@@ -1005,10 +1359,8 @@ fun nomuSchedSafepoint(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
   let self = rtCurrentFiber()
   rtSchedSetAnchor(self, anchorSp, anchorPc)
   rtSchedLock(sched)
-  self.store(4, toByteOffset: 168)               // safepoint-stopped
-  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  Runtime.ctxSwitch(from: self, to: carrierCtx)
-  rtSchedUnlock(sched)
+  self.store(4.uint8, toByteOffset: 8)               // safepoint-stopped
+  Runtime.ctxSwitch(from: self, to: self.advanced(by: 72))   // resumes without the scheduler lock
 }
 
 // ---- Entry points generated code calls (symbols nomu_fn_nomuSched*) ----
@@ -1021,6 +1373,8 @@ fun nomuSchedNew() -> RawPtr {
   sched.store(0, toByteOffset: 16)
   sched.store(0, toByteOffset: 256)                      // mutex-word
   sched.store(0, toByteOffset: 24)
+  sched.store(0, toByteOffset: 32)                       // the last fiber ID
+  sched.store(0, toByteOffset: 200)                      // no leak pass requested
   sched.store(0, toByteOffset: 40)
   sched.store(0, toByteOffset: 48)                       // timer-mutex
   sched.store(0, toByteOffset: 56)                       // timer-gen
@@ -1028,8 +1382,8 @@ fun nomuSchedNew() -> RawPtr {
   let ents = RawPtr.alloc(bytes: 256 * 16, align: 8)     // timer heap: 256 entries to start, doubled as needed
   sched.store(256, toByteOffset: 248)                    // timer capacity
   sched.store(ents, toByteOffset: 72)
-  sched.store(RawPtr.null, toByteOffset: 80)             // mbox-sched-head
-  sched.store(RawPtr.null, toByteOffset: 88)             // mbox-sched-tail
+  sched.store(RawPtr.null, toByteOffset: 80)             // global mailbox-queue head
+  sched.store(RawPtr.null, toByteOffset: 88)             // global mailbox-queue tail
   sched.store(0, toByteOffset: 96)                       // active-drains
   sched.store(RawPtr.null, toByteOffset: 104)            // mbfiber-free (pool free-list)
   sched.store(0, toByteOffset: 112)                      // mbfiber-count
@@ -1043,8 +1397,8 @@ fun nomuSchedNew() -> RawPtr {
   sched.store(0, toByteOffset: 176)                      // gc-kind
   sched.store(0, toByteOffset: 320)                      // sleeping
   sched.store(0, toByteOffset: 328)                      // searching
-  sched.store(0, toByteOffset: 200)                      // drainers
-  sched.store(0, toByteOffset: 208)                      // mbox-pops
+  sched.store(0, toByteOffset: 200)                      // unused
+  sched.store(0, toByteOffset: 208)                      // unused
   sched.store(RawPtr.null, toByteOffset: 216)            // main-fiber
   sched.store(0, toByteOffset: 224)                      // main-done
   sched.store(0, toByteOffset: 232)                      // exit-claim
@@ -1058,17 +1412,68 @@ fun nomuSchedNew() -> RawPtr {
 fun nomuSchedSleep(sched: RawPtr, ms: Int, anchorSp: RawPtr, anchorPc: Int) -> Int {
   let self = rtCurrentFiber()
   rtSchedSetAnchor(self, anchorSp, anchorPc)   // user-frame anchor for the STW walk (128.3.2)
+  rtSchedWaiting(self, rtWaitSleep)
   let expiry: Int = Runtime.monotonicNanos() + ms * 1000000
   rtSchedLock(sched)
   rtSchedMutexLockAt(sched.advanced(by: 48))
   rtSchedTimerPush(sched, expiry, self)
   rtSchedMutexUnlockAt(sched.advanced(by: 48))
   rtSchedWakeTimer(sched)
-  self.store(2, toByteOffset: 168)
-  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  Runtime.ctxSwitch(from: self, to: carrierCtx)
-  rtSchedUnlock(sched)
+  self.store(2.uint8, toByteOffset: 8)
+  Runtime.ctxSwitch(from: self, to: self.advanced(by: 72))   // resumes without the scheduler lock
   return ms
+}
+
+// Why a parked fiber waits (fib+10), named in fiber dumps as Go names a goroutine's wait.
+let rtWaitChanReceive = 1
+let rtWaitChanSend = 2
+let rtWaitSelect = 3
+let rtWaitTaskJoin = 4
+let rtWaitSleep = 5
+let rtWaitStdin = 6
+
+// Record why the running fiber is about to park: its reason, and a fresh wait (the collector dates it).
+fun rtSchedWaiting(fib: RawPtr, why: Int) {
+  fib.store(why.uint8, toByteOffset: 10)
+  fib.store(RawPtr.null, toByteOffset: 120)
+  fib.store(0, toByteOffset: 96)
+}
+
+// Park the running fiber, holding the mutex `m` that guards the condition it waits on, and not the scheduler
+// lock: its carrier releases `m` once the fiber's context is saved, so a waker, which must take `m` to find
+// the fiber, cannot ready it early (Go's `gopark` with an unlock function). The fiber waits on `m` alone, so a
+// contended scheduler lock never holds up the others waiting for `m`. Resumes holding the scheduler lock, as
+// every fiber does, and releases it.
+fun nomuSchedParkReleasing(sched: RawPtr, m: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
+  let self = rtCurrentFiber()
+  rtSchedSetAnchor(self, anchorSp, anchorPc)
+  self.store(2.uint8, toByteOffset: 8)
+  // `m` goes to the carrier as the switch's message, which it releases (rtSchedSwitchedBack).
+  Runtime.ctxSwitch(from: self, to: self.advanced(by: 72), message: m)   // resumes without the scheduler lock
+}
+
+// The state of a fiber that just switched back to its carrier, plus 16 when the carrier now holds the
+// scheduler lock. `message` is what the fiber's switch passed. A fiber switches back either holding the
+// scheduler lock, which passes to the carrier, or naming its own lock as the message (nomuSchedParkReleasing),
+// which the carrier releases here first thing: a waker is waiting on it. A fiber stopped at a stack check
+// passes the room it needs as a negative word, -(need + 1) (nomuSchedStackCheck), so one comparison tells a
+// lock's address from it, and it holds the scheduler lock only under the stress modes (rtStackGrowLocked). A
+// user fiber's lock is released without taking the scheduler lock. Once it is released a waker may ready the fiber and another carrier run it, so the
+// state is the parked one, never read. An idle mailbox fiber (state 6) switches back holding no lock.
+fun rtSchedSwitchedBack(sched: RawPtr, message: RawPtr, fib: RawPtr) -> Int {
+  if message.toInt() > 0 {
+    rtSchedMutexUnlockAt(message)
+    return 2
+  }
+  let stByte: UInt8 = fib.load(fromByteOffset: 8)
+  let st = stByte.int
+  if st == 6 {
+    return 6
+  }
+  if st == 5 && rtStackGrowLocked() == false {
+    return 5                                   // stopped to grow, without the lock (nomuSchedStackCheck)
+  }
+  return st + 16
 }
 
 // Park the running fiber until some feeder unparks it (rtSchedUnpark). The caller holds the scheduler lock,
@@ -1078,137 +1483,166 @@ fun nomuSchedSleep(sched: RawPtr, ms: Int, anchorSp: RawPtr, anchorPc: Int) -> I
 fun nomuSchedParkLocked(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
   let self = rtCurrentFiber()
   rtSchedSetAnchor(self, anchorSp, anchorPc)
-  self.store(2, toByteOffset: 168)
-  let carrierCtx: RawPtr = self.load(fromByteOffset: 232)
-  Runtime.ctxSwitch(from: self, to: carrierCtx)
-  rtSchedUnlock(sched)
+  self.store(2.uint8, toByteOffset: 8)
+  Runtime.ctxSwitch(from: self, to: self.advanced(by: 72))   // resumes without the scheduler lock
 }
 
-// Spawn a runnable fiber over the given C-ABI entry (void*(void*)). Returns the fiber handle, which the C
-// spawn_join shim passes back to nomuSchedJoin. Wakes an idle carrier.
-fun nomuSchedSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
-  return rtSchedSpawnSized(sched, entry, arg, rtStackStart)
+// `fiber f(x)` and `task f(x)`: a runnable fiber over the given C-ABI entry (void*(void*)). Wakes an idle
+// carrier.
+fun nomuSchedStartFiber(sched: RawPtr, entry: RawPtr, arg: RawPtr) {
+  rtSchedStartFiberSized(sched, entry, arg, rtStackStart)
 }
 
-// Spawn with a stack of `bytes`: the program's first fiber starts larger (`rtStackMain`).
-fun rtSchedSpawnSized(sched: RawPtr, entry: RawPtr, arg: RawPtr, bytes: Int) -> RawPtr {
+// Start a fiber with a stack of `bytes`: the program's first fiber starts larger (`rtStackMain`).
+fun rtSchedStartFiberSized(sched: RawPtr, entry: RawPtr, arg: RawPtr, bytes: Int) -> RawPtr {
   let fib = rtSchedFiberNew(sched, entry, arg, bytes)
   rtSchedStart(sched, fib)
   return fib
 }
 
-// `fiber f(x)`: a runnable fiber nothing can join.
-fun nomuSchedSpawnDetached(sched: RawPtr, entry: RawPtr, arg: RawPtr) {
-  let fib = rtSchedFiberNew(sched, entry, arg, rtStackStart)
-  fib.store(1, toByteOffset: 328)
-  rtSchedStart(sched, fib)
-}
-
 fun rtSchedStart(sched: RawPtr, fib: RawPtr) {
   rtSchedLock(sched)
-  fib.store(0, toByteOffset: 168)
+  fib.store(0.uint8, toByteOffset: 8)
   rtSchedRegInsert(sched, fib)          // track in the live-fiber registry (STW enumeration, 128.3.2)
-  rtSchedEnqueue(sched, fib)
   rtSchedUnlock(sched)
+  // On a carrier the new fiber joins the local queue's tail, in start order; off one (boot), the global queue.
+  let rec = Runtime.carrierLocal()
+  var local = false
+  if rec.isNull {
+  } else if rtRunqRing(rec).isNull {
+  } else {
+    local = rtRunqPush(rec, fib)
+  }
+  if local == false {
+    rtSchedGlobalPut(sched, fib, false)
+  }
   rtSchedWake(sched, false)
 }
 
-// Await a fiber and return its result. Called from within the joining fiber, which parks lock-coupled
-// (identifying itself through its carrier record) if the target has not completed.
-fun nomuSchedJoin(sched: RawPtr, target: RawPtr, anchorSp: RawPtr, anchorPc: Int, final: Int) -> RawPtr {
-  rtSchedLock(sched)
-  let st: Int = target.load(fromByteOffset: 168)
-  if st == 3 {
-    // already done — fall through holding the lock
+// A mailbox's messages: a queue for many senders and one drainer, with no lock (Vyukov's intrusive queue). A
+// sender swaps itself in as the tail, then links the old tail to it (or sets the head when the queue was
+// empty); between the two the drainer may find the old tail with no next while the tail has moved on, and
+// waits for the link. Mailbox and messages are managed objects: each store into one is followed by the write
+// barrier's remember, and no safepoint falls inside a push or a pop, so a collection never sees one half done.
+//
+// The scheduled flag (mailbox+24) says the mailbox is in a run queue or being drained. A sender that swaps it
+// from 0 to 1 schedules the mailbox; a drainer that finds the queue empty clears it, then looks again, and takes
+// it back if a message came meanwhile, so no message is left with the flag clear.
+
+// Append `msg` to `mailbox`'s queue.
+fun rtMailboxPush(mailbox: RawPtr, msg: RawPtr) {
+  msg.atomicStore(0, toByteOffset: 8)                                  // msg->next = null
+  let prev: Int = mailbox.atomicExchange(msg.toInt(), atByteOffset: 16) // mb_tail = msg
+  rtRememberStore(mailbox)
+  if prev == 0 {
+    mailbox.atomicStore(msg.toInt(), toByteOffset: 8)                  // mb_head = msg
   } else {
-    let me = rtCurrentFiber()
-    rtSchedSetAnchor(me, anchorSp, anchorPc)   // user-frame anchor for the STW walk (128.3.2)
-    target.store(me, toByteOffset: 224)
-    me.store(2, toByteOffset: 168)
-    let carrierCtx: RawPtr = me.load(fromByteOffset: 232)
-    Runtime.ctxSwitch(from: me, to: carrierCtx)                 // resumes here holding the lock (lock-coupled)
+    let p = RawPtr.null.advanced(by: prev)
+    p.atomicStore(msg.toInt(), toByteOffset: 8)                        // prev->next = msg
+    rtRememberStore(p)
   }
-  // The world is stopped for collection only at safepoints; this runs the join body lock-held without a
-  // safepoint, so the box read + registry drop are atomic w.r.t. a collection (150.3.13). `final` (the
-  // structured scope-exit join) drops the fiber now that its box is no longer needed; the returned box roots
-  // itself on the joiner's stack across the caller's load. Removal is idempotent (rtSchedRegRemove).
-  let res: RawPtr = target.load(fromByteOffset: 216)
-  if final != 0 {
-    rtSchedRegRemove(sched, target)
-  }
-  rtSchedUnlock(sched)
-  return res
 }
 
-// Fire-and-forget send: enqueue `msg` on `mailbox` (the ABI offsets above) and return. On the 0→1
-// schedule edge, append the mailbox to the global scheduled queue, bump active-drains, and dispatch a
-// mailbox fiber. The C rt_actor_send shim dispatches here.
+// Take the head of `mailbox`'s queue, or null when it is empty. Only the mailbox's drainer calls it.
+fun rtMailboxTake(mailbox: RawPtr) -> RawPtr {
+  var h: Int = mailbox.atomicLoad(fromByteOffset: 8)
+  if h == 0 {
+    let t: Int = mailbox.atomicLoad(fromByteOffset: 16)
+    if t == 0 {
+      return RawPtr.null
+    }
+    while h == 0 {                                                     // a push between its swap and its link
+      h = mailbox.atomicLoad(fromByteOffset: 8)
+    }
+  }
+  let m = RawPtr.null.advanced(by: h)
+  var next: Int = m.atomicLoad(fromByteOffset: 8)
+  if next == 0 {
+    mailbox.atomicStore(0, toByteOffset: 8)
+    let was: Int = mailbox.atomicCas(h, 0, atByteOffset: 16)
+    if was == h {
+      return m                                                         // the last message
+    }
+    while next == 0 {                                                  // a push linking behind it
+      next = m.atomicLoad(fromByteOffset: 8)
+    }
+  }
+  mailbox.atomicStore(next, toByteOffset: 8)                           // mb_head = next
+  rtRememberStore(mailbox)
+  return m
+}
+
+// Fire-and-forget send: append `msg` to `mailbox` (the ABI offsets above) and return, with no lock. The send
+// that schedules the mailbox bumps active-drains and readies it into this carrier's slot, so a ping-pong of
+// actors stays here. A carrier is woken as for a fiber's readying, except for a send from a mailbox fiber that
+// left the mailbox alone in the slot: the sender's fiber drains it next once its own mailbox empties, and if it
+// does not, its next pop wakes a carrier for it (nomuSchedMailboxPop). A wake on every such send woke carriers
+// that found the mailbox already taken, and split ping-ponging actors across carriers. The C rt_actor_send
+// shim dispatches here.
 fun nomuSchedActorSend(sched: RawPtr, mailbox: RawPtr, msg: RawPtr) {
-  rtSchedLock(sched)
-  msg.store(RawPtr.null, toByteOffset: 8)              // msg->next = null
-  let tail: RawPtr = mailbox.load(fromByteOffset: 16) // mb_tail
-  if tail.isNull {
-    mailbox.store(msg, toByteOffset: 8)               // mb_head = msg
-  } else {
-    tail.store(msg, toByteOffset: 8)                  // mb_tail->next = msg
-    rtRememberStore(tail)                             // young msg stored into a maybe-mature tail message
+  rtMailboxPush(mailbox, msg)
+  let sch: Int = mailbox.atomicLoad(fromByteOffset: 24)
+  if sch != 0 {
+    return
   }
-  mailbox.store(msg, toByteOffset: 16)                // mb_tail = msg
-  rtRememberStore(mailbox)                            // young msg stored into mb_head/mb_tail of a maybe-mature mailbox
-  let sch: Int = mailbox.load(fromByteOffset: 24)     // scheduled
-  if sch == 0 {
-    mailbox.store(1, toByteOffset: 24)
-    mailbox.store(RawPtr.null, toByteOffset: 32)      // sched_next = null
-    let stail: RawPtr = sched.load(fromByteOffset: 88)
-    if stail.isNull {
-      sched.store(mailbox, toByteOffset: 80)
-      sched.store(mailbox, toByteOffset: 88)
-    } else {
-      stail.store(mailbox, toByteOffset: 32)           // stail->sched_next = mailbox
-      rtRememberStore(stail)                           // maybe-young mailbox linked into a maybe-mature stail
-      sched.store(mailbox, toByteOffset: 88)
-    }
-    sched.atomicFetchAdd(1, atByteOffset: 96)          // active-drains++
-    rtSchedMailboxDispatch(sched)
+  let was: Int = mailbox.atomicCas(0, 1, atByteOffset: 24)
+  if was != 0 {
+    return
   }
-  rtSchedUnlock(sched)
+  sched.atomicFetchAdd(1, atByteOffset: 96)                            // active-drains++
+  let alone = rtSchedReadyOn(sched, rtSchedEntryMailbox(mailbox), false)
+  if alone == false || rtSchedInMailboxFiber() == false {
+    rtSchedWake(sched, false)
+  }
 }
 
-// Pop the next message from `mailbox` (FIFO), or null when empty. On empty, clear scheduled and drop
-// active-drains; if that reaches quiescence (no drains, no user fibers), stop. Called from codegen's
-// nomu_actor_drain via the C rt_mailbox_pop shim.
+// Pop the next message from `mailbox` (FIFO), or null when it is empty. On empty, clear scheduled and drop
+// active-drains; if that reaches quiescence (no drains, and `main` done), stop. With a message to run while a
+// mailbox waits in this carrier's slot, wake a carrier to take it, since this drain goes on. Called from
+// codegen's nomu_actor_drain via the C rt_mailbox_pop shim.
 fun nomuSchedMailboxPop(sched: RawPtr, mailbox: RawPtr) -> RawPtr {
-  rtSchedLock(sched)
-  let msg: RawPtr = mailbox.load(fromByteOffset: 8)   // mb_head
-  if msg.isNull {
-    mailbox.store(0, toByteOffset: 24)                // scheduled = 0 (1→0 edge)
-    let r: Int = sched.atomicFetchAdd(-1, atByteOffset: 96)
-    if r == 1 {
-      let done: Int = sched.load(fromByteOffset: 224)
-      if done != 0 {
-        rtSchedSignalStop(sched)
+  var msg = rtMailboxTake(mailbox)
+  while msg.isNull {
+    mailbox.atomicStore(0, toByteOffset: 24)                           // scheduled = 0 (1→0 edge)
+    let t: Int = mailbox.atomicLoad(fromByteOffset: 16)
+    if t == 0 {
+      let r: Int = sched.atomicFetchAdd(-1, atByteOffset: 96)
+      if r == 1 {
+        let done: Int = sched.atomicLoad(fromByteOffset: 224)
+        if done != 0 {
+          rtSchedSignalStop(sched)
+        }
       }
+      return RawPtr.null
     }
-    rtSchedUnlock(sched)
-    return RawPtr.null
+    // A message came after the queue looked empty: drain it here, unless its sender scheduled the mailbox.
+    let was: Int = mailbox.atomicCas(0, 1, atByteOffset: 24)
+    if was != 0 {
+      let r: Int = sched.atomicFetchAdd(-1, atByteOffset: 96)
+      if r == 1 {
+        let done: Int = sched.atomicLoad(fromByteOffset: 224)
+        if done != 0 {
+          rtSchedSignalStop(sched)
+        }
+      }
+      return RawPtr.null
+    }
+    msg = rtMailboxTake(mailbox)
   }
-  let nx: RawPtr = msg.load(fromByteOffset: 8)        // msg->next
-  mailbox.store(nx, toByteOffset: 8)                  // mb_head = next
-  if nx.isNull {
-    mailbox.store(RawPtr.null, toByteOffset: 16)      // mb_tail = null
-  } else {
-    rtRememberStore(mailbox)                          // re-linked head (maybe young) into a maybe-mature mailbox
+  let rec = Runtime.carrierLocal()
+  let waiting: Int = rec.atomicLoad(fromByteOffset: 104)
+  if waiting % 2 == 1 {
+    rtSchedWake(sched, false)
   }
-  rtSchedUnlock(sched)
   return msg
 }
 
-// Boot the scheduler: spawn the main fiber over the user entry, start ncarriers-1 carrier threads, the timer
+// Boot the scheduler: start the main fiber over the user entry, start ncarriers-1 carrier threads, the timer
 // thread and the GC coordinator, and run the scheduler loop on the calling thread too. Never returns: the
 // process ends in rtSchedFinish. Called from the process entry `main`, which codegen emits.
 fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int) {
   sched.store(ncarriers, toByteOffset: 160)           // total carriers, for the STW ack count (128.3.2)
-  let mainFiber = rtSchedSpawnSized(sched, entryFn, RawPtr.null, rtStackMain)
+  let mainFiber = rtSchedStartFiberSized(sched, entryFn, RawPtr.null, rtStackMain)
   sched.store(mainFiber, toByteOffset: 216)           // before a second carrier can run it
   // The timer thread (wakeup feeder): one raw thread draining the deadline heap.
   let th = RawPtr.alloc(bytes: 8, align: 8)
@@ -1220,16 +1654,13 @@ fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int) {
   sched.store(gc, toByteOffset: 240)
   var c = 1
   while c < ncarriers {
-    let ctx = RawPtr.alloc(bytes: 168, align: 16)
-    let carg = RawPtr.alloc(bytes: 24, align: 8)
+    let carg = RawPtr.alloc(bytes: 16, align: 8)
     carg.store(sched, toByteOffset: 0)
-    carg.store(ctx, toByteOffset: 8)
-    carg.store(c, toByteOffset: 16)
+    carg.store(c, toByteOffset: 8)
     let h = RawPtr.alloc(bytes: 8, align: 8)
     Runtime.threadCreate(handle: h, entry: Runtime.ofFunc(rtSchedCarrierMain), arg: carg)
     c = c + 1
   }
-  let mainCtx = RawPtr.alloc(bytes: 168, align: 16)
-  rtSchedLoop(sched, mainCtx)
+  rtSchedLoop(sched)
   rtSchedFinish(sched)
 }

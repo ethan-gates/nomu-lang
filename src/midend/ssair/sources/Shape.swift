@@ -258,7 +258,7 @@ public final class ShapeEnv {
     }
 
     // The shape of fields laid out in order from byte `base`, each at the slots of the fields before it. A
-    // class or actor body, a closure or spawn environment, and an actor message's arguments are this, at
+    // class or actor body, a closure or fiber environment, and an actor message's arguments are this, at
     // their object's first field offset.
     public func fieldsShape(_ fields: [Type], base: Int) -> Shape {
         var s = Shape()

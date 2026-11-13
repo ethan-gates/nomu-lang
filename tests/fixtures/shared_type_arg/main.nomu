@@ -1,0 +1,39 @@
+// A type parameter declared `shared` accepts shareable arguments: a deeply immutable class, a struct of
+// shareable fields, and a type parameter that is `shared` itself, bare or inside another type.
+class Box<shared T> {
+    let v: T
+}
+
+class Frozen {
+    let n: Int
+}
+
+struct Pair<A, B> {
+    let a: A
+    let b: B
+}
+
+class Wrap<shared W> {
+    let inner: Box<W>
+}
+
+fun keep<shared U>(v: U) -> Box<U> {
+    return Box(v: v)
+}
+
+fun keepSome<shared U>(v: U) -> Box<Option<U>> {
+    return Box(v: .some(value: v))
+}
+
+fun main() {
+    let a = Box(v: Frozen(n: 1))
+    let b: Box<Pair<Int, Frozen>> = Box(v: Pair(a: 2, b: Frozen(n: 3)))
+    let w = Wrap(inner: keep(Frozen(n: 4)))
+    print(a.v.n)
+    print(b.v.a + b.v.b.n)
+    print(w.inner.v.n)
+    switch keepSome(5).v {
+    case .some(let v): print(v)
+    case .none: print(0)
+    }
+}

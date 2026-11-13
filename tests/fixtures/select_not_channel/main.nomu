@@ -1,0 +1,11 @@
+// A `select` case must be a channel operation.
+fun value() -> Int {
+  return 1
+}
+
+fun main() {
+  select {
+  case let v = value():
+    print(v)
+  }
+}

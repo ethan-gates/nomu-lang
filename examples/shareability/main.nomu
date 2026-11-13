@@ -1,5 +1,6 @@
-// Shareability checker (M3.3): only value types and closures with shareable
-// captures can cross a task boundary. Classes are task-local by default.
+// Shareability: what a `task` is passed must be shareable — primitives, structs whose
+// fields are shareable, deeply immutable classes, actors. A class with a mutable field
+// stays on its own fiber.
 
 struct Point {
     var x: Int
@@ -14,6 +15,11 @@ fun twice(n: Int) -> Int {
     return n * 2
 }
 
+fun applyOffset(offset: Int, x: Int) -> Int {
+    let addOffset = { (y: Int) -> Int in return y + offset }
+    return apply(addOffset, x)
+}
+
 fun apply(f: (Int) -> Int, x: Int) -> Int {
     return f(x)
 }
@@ -21,19 +27,17 @@ fun apply(f: (Int) -> Int, x: Int) -> Int {
 fun main() {
     // Structs are value types — shareable across task boundaries.
     let p = Point(x: 3, y: 4)
-    fiber let s = sumPoint(p)
-    print(s)   // 7
+    let s = task sumPoint(p)
+    print(s.join())   // 7
 
     // Primitives (Int) are shareable.
     let base = 10
-    fiber let d = twice(base)
-    print(d)   // 20
+    let d = task twice(base)
+    print(d.join())   // 20
 
-    // A closure with only shareable captures is itself shareable.
-    let offset = 5
-    let addOffset = { (x: Int) -> Int in return x + offset }
-    fiber let r = apply(addOffset, 100)
-    print(r)   // 105
+    // A closure value is not passed to a task yet (its captures are not in its type); the task builds it.
+    let r = task applyOffset(5, 100)
+    print(r.join())   // 105
 }
 
 // ── Uncomment the block below to see the shareability error ──────────────────
@@ -44,6 +48,6 @@ fun main() {
 // fun getVal(b: Box) -> Int { return b.val }
 // fun badMain() {
 //     let b = Box(val: 42)
-//     fiber let v = getVal(b)   // error: 'b' has type 'Box' which cannot cross a task boundary
+//     let v = task getVal(b)   // error: type 'Box' is not shareable, so it cannot be passed to a 'task'
 //     print(v)
 // }

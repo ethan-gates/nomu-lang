@@ -10,7 +10,7 @@ import LLVM_C
 enum AggKind { case structVal, classRef }
 
 // A captured local: its name and the (addr, ty) slot it lives in in the enclosing scope. Shared by
-// closures and `fiber let`, which both copy free variables by value into a heap env.
+// closures and fibers, which both copy free variables by value into a heap env.
 typealias Capture = (name: String, local: (addr: LLVMValueRef, ty: LLVMTypeRef))
 
 // A declared LLVM function: its value ref, function type, the source IR its body lowers from, and
@@ -49,7 +49,6 @@ final class LLVMGen {
     let strTy: LLVMTypeRef      // { i64 word0, i64 word1 } — the bit-stealing String (task 121/176)
     let closureHdrTy: LLVMTypeRef  // { i64 header, i8ptr fn } — the fixed prefix of a heap closure { fn, caps… }
     let anyBoxTy: LLVMTypeRef      // { i64 header, i8ptr witness (addr0), p1 payload } — the `any I` heap box (D1)
-    let spawnHandleTy: LLVMTypeRef // { i8ptr fiber (addr0, runtime-owned) } — SpawnHandle (8.2.6)
 
     let zeroSpan = Span(startOffset: -1, endOffset: -1, map: nil)   // synthetic: resolves to line 0
 
@@ -160,7 +159,7 @@ final class LLVMGen {
 
     // M6 GC pointer maps — each heap type gets a type-id keying `typeMaps[id]` (managed-field byte
     // offsets, or a serialized discriminant-keyed map for kind 2), `typeSizes[id]` (fixed size),
-    // `typeKinds[id]` (0 fixed / 1 array / 2 shaped, task 176), `typeStrides[id]` (array element stride).
+    // `typeKinds[id]` (0 fixed / 1 array / 2 shaped, task 176 / 3 a value layout), `typeStrides[id]` (array element stride).
     // Emitted as flat tables at module finalization.
     var typeIds: [String: UInt64] = [:]
     var typeMaps: [[Int32]] = []
@@ -229,6 +228,7 @@ final class LLVMGen {
     var barrierFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var rememberFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var rawAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
+    var rawAllocUninitializedFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var reserveZeroedFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var stopWorldGlobalCache: LLVMValueRef?
     var intFmt: LLVMValueRef?
@@ -244,6 +244,9 @@ final class LLVMGen {
     var measureNoShapedHomes = false
     var measureNoLoopPolls = false
     var measureNoStackChecks = false
+    var dictionaries: [String: DictionaryInstance] = [:]  // the dictionaries this module's concrete calls pass
+    var dictionaryGlobals: [String: LLVMValueRef] = [:]   // and their constants, by `dictionaryKey`
+    var recipes: [String: DictionaryRecipe] = [:]         // this module's recipes, by symbol
     var measureLibcDirect = false        // `measure.libc_direct`: libc calls skip the stack switch
     // Functions whose address `Runtime.ofFunc` takes: entries a thread, a fiber or a signal starts in, which no
     // indirect call in Nomu code reaches (`FrameTable.entries`).
@@ -282,10 +285,6 @@ final class LLVMGen {
         var box: [LLVMTypeRef?] = [i64, i8ptr, p1]
         anyBoxTy = box.withUnsafeMutableBufferPointer {
             LLVMStructTypeInContext(ctx, $0.baseAddress, 3, 0)
-        }
-        var sh: [LLVMTypeRef?] = [i8ptr]
-        spawnHandleTy = sh.withUnsafeMutableBufferPointer {
-            LLVMStructTypeInContext(ctx, $0.baseAddress, 1, 0)
         }
     }
 

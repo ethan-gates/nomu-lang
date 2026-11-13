@@ -137,8 +137,6 @@ public struct Typechecker {
         switch stmt {
         case .binding(let b):
             if !b.isMutable { lets.insert(b.name) }
-        case .spawnLet(let name, _, _, _):
-            lets.insert(name)   // a spawn binding is immutable
         case .fiberStart:
             break
         case .assign(let lhs, _, let span):
@@ -158,6 +156,13 @@ public struct Typechecker {
                 }
                 checkBlock(arm.body, lets: innerLets)
             }
+        case .selectStmt(let sel):
+            for arm in sel.arms {
+                var innerLets = lets
+                if let b = arm.binding { innerLets.insert(b) }   // a case's value binding is immutable
+                checkBlock(arm.body, lets: innerLets)
+            }
+            if let d = sel.defaultBody { checkBlock(d, lets: lets) }
         case .ret, .expr, .breakStmt, .continueStmt:
             break
         }

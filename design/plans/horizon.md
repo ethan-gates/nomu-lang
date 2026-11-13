@@ -34,42 +34,47 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 127  LXR — RC-primary reclamation, on Immix backing; then the GenImmix–LXR comparison   ◀ end goal
 └── benchmark against Go and Swift, on GenImmix (when the language is complete)
     ├── 246  raw pointers into managed memory held across safepoints — done (246.2 recorded with their base)
-    ├── 104  fiber stack strategy — Go-style copying stacks             (before any GC is measured)
-    │   │    104.2 entry check, 104.3 copier in production, 104.4 shrinking
-    │   ├── 194  GC frame metadata — decided: extended statepoints (epic: 239–244, 247)
-    │   │   └── 247  frame table — F2, built at link time
-    │   └── 250  fiber and task surface — 250.1 done; 250.4 retires `fiber let`, closing 104.3.9
-    │       └── 251  generic classes in compiled-once bodies — 251.1, 251.4–251.6, 251.9–251.11 done
-    │           └── 251.2  dictionaries, then 251.3 class construction  ◀ next
-    ├── 235  scheduler run queues — per-carrier queues in place of one lock
-    ├── 236  fiber preemption — take a carrier back from a computing fiber
-    │        couples with 104 (the entry check)
+    ├── 104  fiber stack strategy — done: Go-style copying stacks; growth 2.5–3× faster than Go's
+    │   └── 250  fiber and task surface — done (`fiber`, `task`, `select`, dumps and leaks, a 128-byte record); `task` in compiled-once generic bodies is 251.2.4, the switch follow-ups 254.4
+    │       ├── 102  channels — done
+    │       └── 251  generic classes in compiled-once bodies — done but 251.2.4 (closures, fibers; `task` there waits on it)
+    ├── 194  GC frame metadata — decided: extended statepoints (epic: 239–244, 247)
+    │   └── 247  frame table — F2, built at link time
+    ├── 235  scheduler run queues — per-carrier queues in place of one lock — done (235.1–235.6)
+    ├── 254  scheduler performance — the gaps 235 left: wake churn, the one-carrier cost, fan-in across carriers
+    │   │    250 and 104, which it waited on, are done; 254.5 from 104.5
+    │   ├── 236  fiber preemption — take a carrier back from a computing fiber
+    │   │        couples with 104 (the entry check)
+    │   └── 237  handoff primitives — a direct switch, handoffs marked by the compiler (needs design; syntax or API to agree)
     ├── 245  loop strip mining — polls out of the loops the optimizer sees (29% on array loops)
-    ├── 230  heap sizing — a heap that grows, a clean out-of-memory      (before any GC is measured)
+    ├── 230  heap sizing — a heap that grows, a clean out-of-memory      (before any GC is measured)  ◀ next
     ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
     │        complements 179 (value-level GC classification)
-    ├── 171  modules cleanup — cross-module generics residuals           (perf-accuracy)
-    │        interacts with 170 (method-level generics), 118 (associated types)
+    ├── 253  finish generics — owns 171's residuals and 251's remainder, with 170 and 118 to design  (perf-accuracy)
     └── 217  build graph granularity — sliced keys, scheduler (staged jobs deferred)  (dev-productivity)
 ```
 
-**Where we are:** four levels down from the benchmark. [104](tasks/104-fiber-stack-strategy.md) reached 104.3.9
-(freeing a fiber's record after its last join), which raised the fiber surface, so
-[250](tasks/250-fiber-task-surface.md) redesigns it: detached `fiber f(x)`, and `task f(x)` over channels. 250.2
-needs public generic classes (`Channel<T>`, `Task<T>`), so [251](tasks/251-erased-generic-objects.md) finishes
-them. 251.9 turned up [252](tasks/252-large-struct-return.md), large struct returns miscompiling, and testing it
-turned up lost roots (252.3, 252.4), now fixed. Unwind in that order:
-251.2 and 251.3, 250.2 through 250.8, then 104.3.9, 104.4 and 104.5.
+**Where we are:** [104](tasks/104-fiber-stack-strategy.md) (fiber stacks) and [250](tasks/250-fiber-task-surface.md)
+(the fiber and task surface) are done. 104.5 measured stacks against Go: growth is now 2.5 to 3 times faster, a
+spawn costs the same on one carrier, and the gaps it found in the scheduler (fibers left queued on a busy
+carrier, spawn cost on several carriers) went to [254](tasks/254-scheduler-performance.md). Its policies
+(growth, starting sizes, shrinking, pool sizes) wait in [258](tasks/258-runtime-policy-tuning.md) for real
+programs to tune against, and its libc-or-own choices in [259](tasks/259-libc-or-own-per-routine.md).
+[230](tasks/230-heap-sizing.md) (heap sizing) is next, the other prerequisite before any collector is
+measured. [235](tasks/235-scheduler-run-queues.md) (per-carrier run queues, actors on the run queues with
+lock-free mailboxes) is done; its leftovers are [254](tasks/254-scheduler-performance.md), which comes after 236
+and 237 because they change the paths it tunes.
 
 **Order of the next run:** [234](tasks/234-scheduler-wake-and-pool.md) (the scheduler's wakes, found by 104's
 baseline) is done; [194](tasks/194-gc-frame-metadata.md) is decided (extended statepoints: LLVM's stack
 maps kept, possibly-stack pointers tracked, a link-time frame table, [247](tasks/247-frame-table.md)); [246](tasks/246-raw-pointers-into-managed-memory.md).1 fixed `String.eq`/`lt` and 246.2 closed the class (raw
-pointers recorded with their base); [104](tasks/104-fiber-stack-strategy.md) is in progress (fiber stacks: small stacks copied on growth, as Go's;
-overflow past the limit reports through [219](tasks/219-runtime-fault-handling.md)), then
+pointers recorded with their base); [104](tasks/104-fiber-stack-strategy.md) is done (fiber stacks: small stacks copied on growth, as Go's;
+overflow past the limit reports through [219](tasks/219-runtime-fault-handling.md)); next
 [230](tasks/230-heap-sizing.md) (heap sizing: growth and a clean out-of-memory), all before any collector is
-measured, so the benchmarks run on large, fiber-heavy programs. [235](tasks/235-scheduler-run-queues.md)
-(per-carrier run queues) and [236](tasks/236-fiber-preemption.md) (preemption), found by 234's workloads,
-come before the benchmark against Go and Swift; 236 couples with 104's entry check. 230 is what lets a benchmark's live data
+measured, so the benchmarks run on large, fiber-heavy programs. [236](tasks/236-fiber-preemption.md) (preemption) and
+[237](tasks/237-handoff-primitives.md) (handoff primitives), found by 234's workloads, then
+[254](tasks/254-scheduler-performance.md) (235's leftovers), come before the benchmark against Go and Swift;
+236 couples with 104's entry check. 230 is what lets a benchmark's live data
 exceed 256 MiB: binary-trees at the standard depth 21 crashes today. [217](tasks/217-build-graph-granularity.md)'s
 remaining design (the slice's closure, the header format and hash, per-declaration keys on direct dependencies)
 is paused. Off this chain: [204](tasks/204-yaml-parser-upgrades.md) (YAML parser upgrades),
@@ -85,7 +90,7 @@ ways:
 
 - **Dev-productivity** — [217](tasks/217-build-graph-granularity.md) (keys over what a compile reads, a
   scheduler). It makes building and iterating large programs bearable.
-- **Perf-accuracy** — [171](tasks/171-modules-cleanup.md) (cross-module generics residuals) and
+- **Perf-accuracy** — [171](tasks/171-modules-cleanup.md) (cross-module generics residuals, now tracked by [253](tasks/253-finish-generics.md)) and
   [182](tasks/182-cross-module-inlining.md) (cross-module inlining + inlinable stdlib). They change
   performance enough that a benchmark taken before them would mislead.
 

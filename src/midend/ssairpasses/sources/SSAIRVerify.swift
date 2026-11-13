@@ -106,6 +106,9 @@ private func verifyFunction(_ f: SSAFunction, _ shapes: ShapeEnv,
             case .box(_, _, let s):                 onStack = s
             default:                                continue
             }
+            // A generic class allocated in a compiled-once body has a `.generic` type: the verifier has no class
+            // table, and only a class is allocated.
+            if case .alloc = inst.kind, case .generic = r.type { continue }
             if !onStack && !isManaged(r.type) {
                 errs.append("[\(f.name)] I2: %\(r.id) is a heap allocation of non-managed type \(r.type)")
             }

@@ -1,0 +1,13 @@
+// The bottom of the chain: generics a module two levels up reaches only through `mid`'s bodies.
+package fun second<A, B>(a: A, b: B) -> B {
+  return b
+}
+fun hiddenDepth<T>(x: T, d: Int) -> Int {
+  if d == 0 {
+    return 0
+  }
+  return hiddenDepth(x, d - 1) + 1
+}
+package fun depth<T>(x: T, d: Int) -> Int {
+  return hiddenDepth(x, d)
+}

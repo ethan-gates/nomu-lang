@@ -1,0 +1,8 @@
+// A send case gives no value to bind.
+fun main() {
+  let ch = Channel<Int>.make(capacity: 1)
+  select {
+  case let v = ch.send(1):
+    print(1)
+  }
+}

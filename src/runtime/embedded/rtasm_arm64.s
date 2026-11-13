@@ -3,74 +3,87 @@
 // fiber's registers and stack for another's, so this is genuinely hand-written (selfhosted-scheduler.md
 // §2.1). The x86-64 counterpart is a separate file, deferred until an x86 build target exists.
 //
-// Context buffer layout — 21 × 8-byte slots (168 bytes), the callee-saved set the AArch64 PCS requires a
-// function to preserve (so a switch that saves exactly these is a valid "return" into the other context):
-//   [0..72]   x19–x28   (10 general callee-saved)
-//   [80]      x29 (fp)
-//   [88]      x30 (lr)  — the address execution resumes at when this context is restored
-//   [96]      sp
-//   [104..160] d8–d15   (8 SIMD/FP callee-saved, low 64 bits)
-// This saved set is the contract the GC's parked-fiber walk reads (runtime.md §6), so it is spelled out
-// here rather than left to the assembler.
+// A context is one word: the SP a switch saved. At it, on the switched-out stack, are the callee-saved
+// registers the AArch64 PCS requires a function to preserve (so a switch that saves exactly these is a valid
+// "return" into the other context), 20 × 8-byte slots (160 bytes):
+//   [sp+0..72]   x19–x28   (10 general callee-saved)
+//   [sp+80]      x29 (fp)
+//   [sp+88]      x30 (lr)  — the address execution resumes at when this context is restored
+//   [sp+96..152] d8–d15    (8 SIMD/FP callee-saved, low 64 bits)
+//   [sp+160..223] unused, so the saved set never shares a cache line with the switching frame, which another
+//                core may write while the context is parked (a channel's waiter, its value slot); sharing one
+//                cost about 0.5 ns a hop in the four-carrier channel ping-pong
+// The saved SP is the stack pointer before the switch less 224. This saved set is the contract the GC's
+// parked-fiber walk and the stack mover read (runtime.md §6), so it is spelled out here.
 
 .section __TEXT,__text,regular,pure_instructions
 .p2align 2
 
-// void rtSwitch(void* from, void* to)
-//   x0 = from context buffer (save current registers into it)
-//   x1 = to   context buffer (restore from it, then return into its saved lr)
+// void* rtSwitch(void* from, void* to, void* message)
+//   x0 = from context (push the current registers, then save SP into it)
+//   x1 = to   context (load its SP, pop its registers, then return into its saved lr)
+//   x2 = message, handed to `to` as the return value of the rtSwitch that suspended it; the switch that later
+//        resumes this context hands this call its result the same way. A first switch into a fresh fiber
+//        lands in the trampoline, which ignores it.
 .global _rtSwitch
 _rtSwitch:
-    // Save the current callee-saved set into *from.
-    stp x19, x20, [x0, #0]
-    stp x21, x22, [x0, #16]
-    stp x23, x24, [x0, #32]
-    stp x25, x26, [x0, #48]
-    stp x27, x28, [x0, #64]
-    stp x29, x30, [x0, #80]
+    // *to's saved SP first, so the load overlaps the stores below. Then push the current callee-saved set and
+    // save SP into *from.
+    ldr x10, [x1]
+    sub sp, sp, #224
+    stp x19, x20, [sp, #0]
+    stp x21, x22, [sp, #16]
+    stp x23, x24, [sp, #32]
+    stp x25, x26, [sp, #48]
+    stp x27, x28, [sp, #64]
+    stp x29, x30, [sp, #80]
+    stp d8,  d9,  [sp, #96]
+    stp d10, d11, [sp, #112]
+    stp d12, d13, [sp, #128]
+    stp d14, d15, [sp, #144]
     mov x9, sp
-    str x9, [x0, #96]
-    stp d8,  d9,  [x0, #104]
-    stp d10, d11, [x0, #120]
-    stp d12, d13, [x0, #136]
-    stp d14, d15, [x0, #152]
+    str x9, [x0]
 
-    // Restore the saved set from *to.
-    ldp x19, x20, [x1, #0]
-    ldp x21, x22, [x1, #16]
-    ldp x23, x24, [x1, #32]
-    ldp x25, x26, [x1, #48]
-    ldp x27, x28, [x1, #64]
-    ldp x29, x30, [x1, #80]
-    ldr x9, [x1, #96]
-    mov sp, x9
-    ldp d8,  d9,  [x1, #104]
-    ldp d10, d11, [x1, #120]
-    ldp d12, d13, [x1, #136]
-    ldp d14, d15, [x1, #152]
+    // Pop *to's saved set from its stack, then switch to that stack. The loads go through x10 and SP is set
+    // last: loading through SP right after setting it serializes them behind the write, which costs about
+    // 6 ns a switch on Apple cores.
+    ldp x19, x20, [x10, #0]
+    ldp x21, x22, [x10, #16]
+    ldp x23, x24, [x10, #32]
+    ldp x25, x26, [x10, #48]
+    ldp x27, x28, [x10, #64]
+    ldp x29, x30, [x10, #80]
+    ldp d8,  d9,  [x10, #96]
+    ldp d10, d11, [x10, #112]
+    ldp d12, d13, [x10, #128]
+    ldp d14, d15, [x10, #144]
+    add sp, x10, #224
+    mov x0, x2
     // `ret` jumps to x30, which is now *to*'s saved return address — resuming that context.
     ret
 
 // void rtFiberInit(void* ctx, void* stackTop, void* entry, void* arg)
-//   Seed a fresh fiber's context buffer so the first rtSwitch into it lands in the trampoline below with
-//   the entry function in x19 and its argument in x20. `stackTop` is the high end of the fiber stack
-//   (the stack grows down); it is aligned down to 16 for the AArch64 ABI.
+//   Seed a fresh fiber's context so the first rtSwitch into it lands in the trampoline below with the entry
+//   function in x19 and its argument in x20: a saved register set at the top of the fiber's stack, and the
+//   context pointing at it. `stackTop` is the high end of the fiber stack (the stack grows down); it is
+//   aligned down to 16 for the AArch64 ABI. The other registers start as the stack holds them; the scheduler
+//   sets x21, x22 and x28 for its own fibers.
 //   x0 = ctx, x1 = stackTop, x2 = entry, x3 = arg
 .global _rtFiberInit
 _rtFiberInit:
     and  x9, x1, #0xfffffffffffffff0     // align stackTop down to 16
-    str  x9, [x0, #96]                   // sp
+    sub  x9, x9, #224                    // the saved register set
+    str  x9, [x0]                        // the context's saved SP
     adrp x10, _rtFiberTrampoline@PAGE
     add  x10, x10, _rtFiberTrampoline@PAGEOFF
-    str  x10, [x0, #88]                  // lr = trampoline (first rtSwitch `ret`s here)
-    str  x2, [x0, #0]                    // x19 = entry
-    str  x3, [x0, #8]                    // x20 = arg
-    str  xzr, [x0, #80]                  // fp = 0, terminating the frame-pointer chain
-    str  x28, [x0, #72]                  // x28 = the creator's (the scheduler then sets its own fibers')
+    stp  x2, x3, [x9, #0]                // x19 = entry, x20 = arg
+    str  x28, [x9, #72]                  // x28 = the creator's (the scheduler then sets its own fibers')
+    stp  xzr, x10, [x9, #80]             // fp = 0, terminating the frame-pointer chain; lr = trampoline
     ret
 
-// The fresh-fiber trampoline: the first rtSwitch into a seeded fiber `ret`s here. Call entry(arg) with a
-// terminated frame chain. If entry returns (the fiber ran to completion), fall into a trap — the
+// The fresh-fiber trampoline: the first rtSwitch into a seeded fiber `ret`s here. Call entry(arg, x21, x22)
+// with a terminated frame chain: the scheduler's fibers take two more arguments from the seeded x21 and x22
+// slots, and an entry that takes one argument ignores them. If entry returns (the fiber ran to completion), fall into a trap — the
 // completion path (switching back to the scheduler) is wired by the scheduler rung; a return here in the
 // isolation test means the fiber failed to switch back, which is a bug worth catching loudly. Global, so a
 // backtrace names it: it is every fiber's bottom frame, and the link strips local symbols.
@@ -79,7 +92,9 @@ _rtFiberInit:
 _rtFiberTrampoline:
     mov x29, #0          // no parent frame
     mov x0, x20          // arg
-    blr x19              // entry(arg)
+    mov x1, x21
+    mov x2, x22
+    blr x19              // entry(arg, x21, x22)
     brk #0x1             // fiber returned unexpectedly — trap
 
 // The platform layer's stack switch: every libc call from generated code and the runtime goes through a
@@ -92,20 +107,19 @@ _rtFiberTrampoline:
 // stub branches straight to the function. Arguments and results pass through untouched. A variadic
 // function's stub also copies the caller's outgoing argument area, where Darwin passes variadic arguments
 // (64 bytes: eight of them), to the new stack.
-//   x28 = the running fiber (0 off any fiber): its stack base at +208, size at +312, and its carrier's
-//   context buffer at +232, whose saved SP is at +96 (`runtime/scheduler.nomu`).
+//   x28 = the running fiber (0 off any fiber): its stack base at +48, size at +64, and the SP its carrier
+//   saved when it switched the fiber in at +72 (`runtime/scheduler.nomu`).
 // The switch itself, branching to `target`; `varargs` 1 also copies the outgoing argument area.
 .macro NOMU_SWITCH target, varargs
     cbz  x28, 1f
-    ldr  x9, [x28, #208]                 // the fiber's stack base
-    ldr  x10, [x28, #312]                // its size
+    ldr  x9, [x28, #48]                  // the fiber's stack base
+    ldr  x10, [x28, #64]                 // its size
     mov  x11, sp
     sub  x12, x11, x9
     cmp  x12, x10
     b.hs 1f                              // SP outside the fiber's stack
-    ldr  x12, [x28, #232]                // the carrier's context
+    ldr  x12, [x28, #72]                 // the carrier's saved SP
     cbz  x12, 1f
-    ldr  x12, [x12, #96]                 // the carrier's saved SP
     sub  x12, x12, #256
     stp  x29, x30, [x12, #-32]!          // a frame record on the carrier's stack, chained to the fiber's
     str  x11, [x12, #16]                 // the fiber's SP
@@ -163,6 +177,7 @@ NOMU_LIBC pthread_getspecific, 0
 NOMU_LIBC pthread_join, 0
 NOMU_LIBC pthread_key_create, 0
 NOMU_LIBC pthread_setspecific, 0
+NOMU_LIBC pthread_sigmask, 0
 NOMU_LIBC putchar, 0
 NOMU_LIBC raise, 0
 NOMU_LIBC read, 0
@@ -179,11 +194,16 @@ NOMU_LIBC _NSGetExecutablePath, 0
 
 // The memory routines: `memcpy`, `memmove`, `memset`, `bzero` and `memcmp`, defined here so that every
 // call in a Nomu binary binds to them, the ones LLVM emits on its own included (a local definition wins
-// over libSystem's; libSystem's own calls keep its). Small sizes are done here in straight-line code with
-// overlapping loads and stores, using no stack; larger ones go to libSystem's tuned routines
-// (`_platform_memmove`, `_platform_memset`, `_platform_memcmp`) through the stack switch above
-// (`design/plans/tasks/104-fiber-stack-strategy.md`, 104.3.4). The copy loads everything before it stores,
-// so `memcpy` is also a correct `memmove`.
+// over libSystem's; libSystem's own calls keep its). Small sizes are done in straight-line code with
+// overlapping loads and stores, and middle sizes in loops of 64 bytes, both using no stack. Copies and fills
+// past NOMU_MEM_OWN_MAX go to libSystem's tuned routines (`_platform_memmove`, `_platform_memset`) through
+// the stack switch above, which costs under 1% at those sizes and which they beat our loops at (zeroing about
+// twice as fast). Compares stay here at every size: 32 bytes at a time with vector registers, faster than
+// libSystem's `memcmp` at every size measured (`design/plans/tasks/104-fiber-stack-strategy.md`, 104.3.4 and
+// 104.5.5). The copy is a correct `memmove`: each path loads what a store could overwrite before storing it.
+
+// Up to this many bytes copies and fills run their own loops on the caller's stack; past it, libSystem's.
+.set NOMU_MEM_OWN_MAX, 4096
 
 // void* memmove(void* dst, const void* src, size_t n); memcpy is the same routine.
 .global _memcpy
@@ -249,6 +269,47 @@ Lmove_65:
     stp  q6, q7, [x5, #-32]
     ret
 Lmove_large:
+    cmp  x2, #NOMU_MEM_OWN_MAX
+    b.hi Lmove_libc
+    sub  x9, x0, x1
+    cmp  x9, x2
+    b.lo Lmove_back                      // the destination starts inside the source: copy from the end
+    ldp  q4, q5, [x4, #-64]              // the last 64 bytes, loaded before any store
+    ldp  q6, q7, [x4, #-32]
+    mov  x6, x0
+    mov  x7, x1
+    sub  x8, x2, #64
+Lmove_fwd:
+    ldp  q0, q1, [x7]
+    ldp  q2, q3, [x7, #32]
+    add  x7, x7, #64
+    stp  q0, q1, [x6]
+    stp  q2, q3, [x6, #32]
+    add  x6, x6, #64
+    subs x8, x8, #64
+    b.hi Lmove_fwd
+    stp  q4, q5, [x5, #-64]
+    stp  q6, q7, [x5, #-32]
+    ret
+Lmove_back:
+    ldp  q4, q5, [x1]                    // the first 64 bytes, loaded before any store
+    ldp  q6, q7, [x1, #32]
+    mov  x6, x5
+    mov  x7, x4
+    sub  x8, x2, #64
+Lmove_bwd:
+    ldp  q0, q1, [x7, #-64]
+    ldp  q2, q3, [x7, #-32]
+    sub  x7, x7, #64
+    stp  q0, q1, [x6, #-64]
+    stp  q2, q3, [x6, #-32]
+    sub  x6, x6, #64
+    subs x8, x8, #64
+    b.hi Lmove_bwd
+    stp  q4, q5, [x0]
+    stp  q6, q7, [x0, #32]
+    ret
+Lmove_libc:
     NOMU_SWITCH __platform_memmove, 0
 
 // void bzero(void* dst, size_t n): memset to 0.
@@ -307,6 +368,20 @@ Lset_65:
     stp  q0, q0, [x5, #-32]
     ret
 Lset_large:
+    cmp  x2, #NOMU_MEM_OWN_MAX
+    b.hi Lset_libc
+    stp  q0, q0, [x5, #-64]              // the last 64 bytes, then 64 at a time from the start
+    stp  q0, q0, [x5, #-32]
+    mov  x6, x0
+    sub  x8, x2, #64
+Lset_loop:
+    stp  q0, q0, [x6]
+    stp  q0, q0, [x6, #32]
+    add  x6, x6, #64
+    subs x8, x8, #64
+    b.hi Lset_loop
+    ret
+Lset_libc:
     NOMU_SWITCH __platform_memset, 0
 
 // int memcmp(const void* a, const void* b, size_t n): the sign of the first differing byte's difference
@@ -371,7 +446,54 @@ Lcmp_order:
     csinv w0, w0, wzr, hs                // 1 when a's byte is greater, -1 when smaller
     ret
 Lcmp_large:
-    NOMU_SWITCH __platform_memcmp, 0
+    cmp  x2, #64
+    b.ls Lcmp_16
+    sub  x8, x2, #32                     // 32 bytes at a time while more than 32 remain: equal vectors fold to
+Lcmp_32:                                 // zero; at the first chunk that differs, step back and find the byte
+    ldp  q0, q1, [x0], #32               // with the 16-byte loop below
+    ldp  q2, q3, [x1], #32
+    eor  v0.16b, v0.16b, v2.16b
+    eor  v1.16b, v1.16b, v3.16b
+    orr  v0.16b, v0.16b, v1.16b
+    umaxp v0.16b, v0.16b, v0.16b
+    fmov x6, d0
+    cbnz x6, Lcmp_32_differ
+    subs x8, x8, #32
+    b.hi Lcmp_32
+    sub  x0, x4, #32                     // the last 32 bytes, through the 16-byte loop
+    sub  x1, x5, #32
+    mov  x8, #16
+    b    Lcmp_loop
+Lcmp_32_differ:
+    sub  x0, x0, #32
+    sub  x1, x1, #32
+    add  x4, x0, #32                     // the chunk becomes the whole range the 16-byte loop compares
+    add  x5, x1, #32
+    mov  x8, #16
+    b    Lcmp_loop
+Lcmp_16:
+    sub  x8, x2, #16                     // 16 bytes at a time from the start, then the last 16
+Lcmp_loop:
+    ldp  x6, x9, [x0], #16
+    ldp  x7, x10, [x1], #16
+    cmp  x6, x7
+    b.ne Lcmp_word
+    cmp  x9, x10
+    b.ne Lcmp_word2
+    subs x8, x8, #16
+    b.hi Lcmp_loop
+    ldp  x6, x9, [x4, #-16]
+    ldp  x7, x10, [x5, #-16]
+    cmp  x6, x7
+    b.ne Lcmp_word
+    cmp  x9, x10
+    b.ne Lcmp_word2
+    mov  w0, #0
+    ret
+Lcmp_word2:
+    mov  x6, x9
+    mov  x7, x10
+    b    Lcmp_word
 
 // void* rtThreadStart(void* rec): every thread Nomu creates starts here (`Runtime.threadCreate`). `rec` is
 // a malloc'd { entry, arg }: x28 is set to 0 (no fiber runs yet on this thread, which the libc-call switch

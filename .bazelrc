@@ -1,3 +1,10 @@
 # The git commit the compiler is built from (`//src/buildinfo`), the compiler's identity in the per-host cache
 # key (design/plans/tasks/190-explicit-module-builds.md, D4).
 build --workspace_status_command=tools/workspace_status.sh
+
+# The runtime keeps the running fiber in x28 (`+reserve-x28`). With assertions on, LLVM's AArch64 frame lowering
+# rejects the callee-saved spill that leaves x27 unpaired ("Odd number of callee-saved regs to spill!"); without
+# them it saves x27 alone, which is the code we ship. These two files share a class whose layout depends on
+# NDEBUG, so both build without assertions; the rest of LLVM keeps them.
+# (design/plans/tasks/104-fiber-stack-strategy.md, 104.3.10)
+build --per_file_copt=.*llvm/lib/Target/AArch64/AArch64(FrameLowering|PrologueEpilogue)\.cpp@-DNDEBUG

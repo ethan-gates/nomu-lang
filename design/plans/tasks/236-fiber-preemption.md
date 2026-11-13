@@ -89,6 +89,14 @@ advantages in 194's comparison ([`internals/frames-designs.md`](../../internals/
 ## Dependents
 
 - **[104](104-fiber-stack-strategy.md)**: its entry check is the natural place for a function-entry poll.
+- **[254](254-scheduler-performance.md)** (scheduler performance) waits on this task: the stop points and
+  their checks change the hot paths it tunes.
+- **[254](254-scheduler-performance.md).3, the deferred wake** (built, measured and set aside for now): a
+  readying into the carrier's own slot owes a wake instead of making it, and the readier fires it at its next stop (a park drops it). It relies on a
+  computing fiber reaching a stop soon, which loop polls give. If this task removes loop polls (option (a)),
+  the next stop comes from a signal sent by a monitor, and the deferred wake would delay parallel work by the
+  monitor's period: revert it to waking at once, Go's policy. Function-entry polls also close its gap in
+  loop-free code.
 - **The benchmark against Go and Swift** (`horizon.md`): a workload mixing long computations with
   latency-sensitive work would measure this.
 

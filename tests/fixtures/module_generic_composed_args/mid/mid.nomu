@@ -1,0 +1,31 @@
+// Compiled-once bodies calling generics at types that are not their own parameters: a composed argument, swapped
+// parameters, a parameter name the callee does not use, a concrete argument, and a private generic type.
+import pkg/base
+
+struct Hidden<V> {
+  var v: V
+  var n: Int
+}
+fun open<U>(o: Option<U>, fallback: U) -> U {
+  switch o {
+  case .some(let value):
+    return value
+  case .none:
+    return fallback
+  }
+}
+package fun viaOption<T>(x: T, fallback: T) -> T {
+  let o: Option<T> = .some(value: x)
+  return open(o, fallback)
+}
+package fun viaSwap<P, Q>(p: P, q: Q) -> P {
+  let q2 = second(p, q)
+  return second(q2, p)
+}
+package fun viaConcrete<T>(x: T) -> Int {
+  return depth(1, 3) + depth(x, 2)
+}
+package fun viaHidden<T>(x: T) -> Int {
+  let h = Hidden(v: x, n: 4)
+  return depth(h, h.n)
+}

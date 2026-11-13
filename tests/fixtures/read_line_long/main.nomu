@@ -34,7 +34,7 @@ fun main() {
   let b = readLine()
   let c = readLine()
   let d = readLine()
-  fiber let n = churn()
+  let n = task churn()
   let e = readLine()
   let f = readLine()
   show(a)
@@ -43,6 +43,6 @@ fun main() {
   show(d)
   show(e)
   show(f)
-  print(n)
+  print(n.join())
   print("\n")
 }

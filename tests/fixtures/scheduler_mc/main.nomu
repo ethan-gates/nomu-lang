@@ -108,9 +108,9 @@ fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   return fib
 }
 
-// Spawn runnable: enqueue under the lock (a producer), then wake one idle carrier. The outstanding count
-// is preset by main to the total, so spawn does not touch it.
-fun fiberSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+// Start runnable: enqueue under the lock (a producer), then wake one idle carrier. The outstanding count
+// is preset by main to the total, so starting does not touch it.
+fun fiberStart(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   let fib = fiberNew(sched, entry, arg)
   mutexLock(sched.advanced(by: 16))
   fib.store(0, toByteOffset: 168)
@@ -221,7 +221,7 @@ fun main() {
   // Phase 1 — enqueue before the carriers exist; they will drain these first.
   var i = 0
   while i < phase1 {
-    fiberSpawn(sched, body, arg)
+    fiberStart(sched, body, arg)
     i = i + 1
   }
 
@@ -246,10 +246,10 @@ fun main() {
     now = Runtime.monotonicNanos()
   }
 
-  // Phase 2 — push more work from the main thread; each spawn wakes a sleeping carrier.
+  // Phase 2 — push more work from the main thread; each start wakes a sleeping carrier.
   var j = 0
   while j < phase2 {
-    fiberSpawn(sched, body, arg)
+    fiberStart(sched, body, arg)
     j = j + 1
   }
 

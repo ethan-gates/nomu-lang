@@ -56,6 +56,15 @@ final class FrameTableTests: XCTestCase {
         XCTAssertTrue(p[0].contains("slow path uses 250 bytes"), p[0])
     }
 
+    // The context switch pushes the callee-saved registers on the stack it leaves: 224 bytes, counted.
+    func testContextSwitchCountsTheRegistersItPushes() {
+        let t = table([("main", 100, true), ("__nomu_stack_slow", 50, false)],
+                      calls: [("__nomu_stack_slow", "rtSwitch")])
+        let p = check(t)
+        XCTAssertEqual(p.count, 1)
+        XCTAssertTrue(p[0].contains("slow path uses 274 bytes") && p[0].contains("__nomu_stack_slow -> rtSwitch"), p[0])
+    }
+
     func testUncheckedRecursionBelowACheckedFunctionFails() {
         let t = table([("main", 100, true), ("walk", 50, false)], calls: [("main", "walk"), ("walk", "walk")])
         XCTAssertTrue(check(t).contains { $0.contains("unchecked recursion") && $0.contains("walk -> walk") })

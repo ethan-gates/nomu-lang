@@ -40,11 +40,12 @@ public struct FrameTable {
 
     // The stack reserve G: a checked function's check fails once its SP is within this many bytes of its
     // stack's low end. The runtime's `rtStackReserve` (`runtime/stackmove.nomu`) must be the same.
-    public static let stackReserve = 1024
+    public static let stackReserve = 1152
     // The largest frame a checked function may have: the reserve less the room the check's slow path needs
-    // below the checking frame (256 bytes; the slow path itself is checked against it, `check`). A larger
-    // frame is split behind a wrapper (`nomuSplitLargeFrame`).
-    public static let frameLimit = stackReserve - 256
+    // below the checking frame (384 bytes, which holds the slow path's frames and the 224 bytes its context
+    // switch pushes; the slow path itself is checked against it, `check`). A larger frame is split behind a
+    // wrapper (`nomuSplitLargeFrame`).
+    public static let frameLimit = stackReserve - 384
 
     static let header = "nomu-frames 1"
 
@@ -122,13 +123,15 @@ public struct FrameTable {
         return out
     }
 
-    // Functions defined outside Nomu's code that use no fiber stack: the asm floor's context switch and
-    // fiber setup, its memory routines (straight-line, or switching to the carrier's stack), and the libc
-    // stubs (`nomu_libc_<name>`), which run libc on the carrier's stack.
-    static let noStack: Set<String> = [
-        "rtSwitch", "rtFiberInit", "memcpy", "memmove", "memset", "bzero", "memcmp",
+    // Functions defined outside Nomu's code, by the fiber stack each uses: the asm floor's context switch,
+    // which pushes the callee-saved registers (`rtasm_arm64.s`), and its fiber setup; its memory routines
+    // (straight-line, or switching to the carrier's stack); the libc stubs (`nomu_libc_<name>`), which run libc
+    // on the carrier's stack; and `mach_absolute_time`, a commpage read called directly (`Runtime.ticks()`).
+    static let externalStack: [String: Int] = [
+        "rtSwitch": 224, "rtFiberInit": 0, "memcpy": 0, "memmove": 0, "memset": 0, "bzero": 0, "memcmp": 0,
+        "mach_absolute_time": 0,
     ]
-    static func usesNoStack(_ f: String) -> Bool { noStack.contains(f) || f.hasPrefix("nomu_libc_") }
+    static func externalStackUse(_ f: String) -> Int? { externalStack[f] ?? (f.hasPrefix("nomu_libc_") ? 0 : nil) }
 
     // The slow path a failed check calls (`nomuStackSlow`).
     static let slowPath = "__nomu_stack_slow"
@@ -138,7 +141,7 @@ public struct FrameTable {
     // - below a checked function, every chain of unchecked frames uses at most R, a checked callee
     //   counted with its frame and the slow path its check may call;
     // - the slow path uses at most R − L, the room a checked frame leaves it;
-    // - unchecked code calls only functions with a known frame (Nomu's, or `noStack`), and no unchecked
+    // - unchecked code calls only functions with a known frame (Nomu's, or `externalStack`), and no unchecked
     //   function reaches itself, which no bound would cover.
     // An indirect call counts as a call to every function whose address is taken, entries aside.
     public func check(reserve: Int, frameLimit: Int) -> [String] {
@@ -186,10 +189,13 @@ public struct FrameTable {
                 return ((sizes[c] ?? 0) + slow.bytes, [c + " (checked)"] + slow.chain)
             }
             if defined.contains(c) { return depth(c) }
-            if !FrameTable.usesNoStack(c), reported.insert("unknown " + c).inserted {
-                problems.append("'\(caller)' calls '\(c)', whose stack use is not known")
+            guard let bytes = FrameTable.externalStackUse(c) else {
+                if reported.insert("unknown " + c).inserted {
+                    problems.append("'\(caller)' calls '\(c)', whose stack use is not known")
+                }
+                return (0, [c])
             }
-            return (0, [c])
+            return (bytes, [c])
         }
 
         if defined.contains(FrameTable.slowPath) {

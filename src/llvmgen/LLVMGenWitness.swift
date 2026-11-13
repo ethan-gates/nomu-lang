@@ -353,13 +353,12 @@ extension LLVMGen {
             return v()
         default:
             // A value payload is a proper GC object `{ header, value }`: type-id header at offset 0, value
-            // at offset 8, carrying the value's managed-pointer map (the 150.3.13 pattern — the `{header,
-            // value}` shape spawnBoxTypeId already registers). Header-less, a moving collection reads the
-            // value's first word as a bogus type-id and mis-scans/mis-copies the payload. Readers reach the
-            // value at payload+8 (payloadValue, used by bridgeThunkSelf and propThunk).
+            // at offset 8, carrying the value's managed-pointer map (valueBoxTypeId). Header-less, a moving
+            // collection reads the value's first word as a bogus type-id and mis-scans/mis-copies the
+            // payload. Readers reach the value at payload+8 (payloadValue, used by bridgeThunkSelf and propThunk).
             let bytes = (1 + slotCount(t)) * 8
             let p = rtAllocManaged(LLVMConstInt(i64, UInt64(bytes), 0))
-            writeTypeIdHeaderRaw(p, spawnBoxTypeId(t))
+            writeTypeIdHeaderRaw(p, valueBoxTypeId(t))
             LLVMBuildStore(b, v(), payloadValue(p))
             return p
         }
@@ -438,8 +437,8 @@ extension LLVMGen {
 
     // Emit-position save/restore for building a witness thunk mid-body: the thunk is a fresh function,
     // so its entry block + debug scope are swapped in and the enclosing builder position restored on
-    // exit. Only emission position moves — the tree-walk's local/self/spawn state (owned by the walker,
-    // untouched by thunk bodies) stays put, so this is lighter than the walker's closure/spawn
+    // exit. Only emission position moves — the tree-walk's local/self/fiber state (owned by the walker,
+    // untouched by thunk bodies) stays put, so this is lighter than the walker's closure/fiber
     // `enterThunk`. Both egresses build witness thunks, so it lives here.
     struct EmitScope {
         let block: LLVMBasicBlockRef?

@@ -1,0 +1,23 @@
+// SIGQUIT dumps every fiber and exits with status 2, as Go does (built with `test.runtime_prelude` to raise
+// it). The fiber that raises it is running; the others wait on a channel, a sleep and a task.
+fun hold(ch: Channel<Int>) {
+  switch ch.receive() {
+  case .some(let v):
+  case .none:
+  }
+}
+
+fun nap() -> Int {
+  sleep(60000)
+  return 0
+}
+
+fun main() {
+  let ch = Channel<Int>.make(capacity: 0)
+  fiber hold(ch)
+  let t = task nap()
+  sleep(20)
+  print("dumping\n")
+  Runtime.raise(signal: 3)
+  print("unreachable\n")
+}

@@ -6,6 +6,9 @@ cross-module generics work landed its core surface (functions, types, fields, me
 static methods, computed properties, read/write) and noted edges as deferred at each sub-phase. This task
 is the home for those edges so the remaining module-generics scope has one place with its own phase numbers.
 
+[253](253-finish-generics.md) owns finishing generics, and tracks these open edges by their numbers here; the detail
+stays in this doc.
+
 ## Scope
 
 Collects the deferred edges of cross-module (erased) generics that have no home outside task 100. Method's

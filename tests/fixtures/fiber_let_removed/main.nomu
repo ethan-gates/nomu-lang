@@ -1,0 +1,9 @@
+// The joinable `fiber let` is gone; the error points to `task`.
+fun square(n: Int) -> Int {
+  return n * n
+}
+
+fun main() {
+  fiber let a = square(3)
+  print(a)
+}

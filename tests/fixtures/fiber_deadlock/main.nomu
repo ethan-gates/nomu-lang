@@ -1,0 +1,29 @@
+// Every fiber waits on something no fiber will do: the program fails as Go's does, "all fibers are asleep -
+// deadlock!", with a dump naming each fiber's wait.
+fun pass(from: Channel<Int>, to: Channel<Int>) {
+  switch from.receive() {
+  case .some(let v): to.send(v)
+  case .none:
+  }
+}
+
+fun answer() -> Int {
+  let never = Channel<Int>.make(capacity: 0)
+  select {
+  case let v = never.receive():
+    return 1
+  case never.send(2):
+    return 2
+  }
+  return 0
+}
+
+fun main() {
+  let a = Channel<Int>.make(capacity: 0)
+  let b = Channel<Int>.make(capacity: 0)
+  fiber pass(a, b)
+  fiber pass(b, a)
+  let t = task answer()
+  print("waiting\n")
+  print(t.join())
+}

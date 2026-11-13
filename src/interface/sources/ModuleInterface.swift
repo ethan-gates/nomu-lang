@@ -1,3 +1,4 @@
+import noir
 import ast
 import support
 import modules
@@ -139,6 +140,10 @@ public struct ModuleInterface: Codable, Equatable {
     // A name that resolves to more than one module in the producer is left out. Optional so an older `.nmi`
     // still decodes.
     public var foreignTypes: [String: String]?
+    // What each compiled-once generic's dictionary must hold, with the layouts those needs name (task 251.2). Only
+    // a caller knows the concrete types, so the producer writes this down and the caller fills it in. Absent when
+    // no generic needs anything.
+    public var dictionaries: DictionaryRecipes?
     public init(package: String, modulePath: [String], types: [InterfaceType],
                 enums: [InterfaceEnum] = [], interfaces: [InterfaceProtocol] = [],
                 functions: [InterfaceFunc], reexports: [InterfaceRef] = []) {

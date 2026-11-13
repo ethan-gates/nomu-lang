@@ -41,7 +41,8 @@ safepoint polls (about 1,000 iterations per strip by default).
   level. A loop with a call that can stop gains nothing (the call is the barrier) and is left alone.
 - **`K`:** a constant, or chosen per loop from the body's size, so a chunk's time stays within the
   stop-the-world and preemption latency budgets ([236](236-fiber-preemption.md)). Measure the latency
-  against the gain.
+  against the gain. A chunk would also bound how late [254](254-scheduler-performance.md).3's deferred wake
+  (set aside for now) fires when its readier keeps computing.
 - **Interaction with the inner loop's exit:** the budget test adds a compare per iteration; check it does not
   cost back what the hoisting gains, and that LLVM removes it where it can bound the trip count.
 

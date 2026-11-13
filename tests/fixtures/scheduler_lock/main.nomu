@@ -141,8 +141,8 @@ fun fiberNew(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   return fib
 }
 
-// Spawn runnable: enqueue under the lock (a producer, so it takes the lock like any other).
-fun fiberSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+// Start runnable: enqueue under the lock (a producer, so it takes the lock like any other).
+fun fiberStart(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   let fib = fiberNew(sched, entry, arg)
   mutexLock(sched.advanced(by: 32))
   fib.store(0, toByteOffset: 168)
@@ -151,9 +151,9 @@ fun fiberSpawn(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   return fib
 }
 
-// Spawn parked: created but not enqueued (state parked). Becomes runnable only on the first unpark. Used
+// Start parked: created but not enqueued (state parked). Becomes runnable only on the first unpark. Used
 // by the relay stress so exactly one of the two fibers is runnable at any moment.
-fun fiberSpawnParked(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
+fun fiberStartParked(sched: RawPtr, entry: RawPtr, arg: RawPtr) -> RawPtr {
   let fib = fiberNew(sched, entry, arg)
   fib.store(2, toByteOffset: 168)
   return fib
@@ -294,9 +294,9 @@ fun main() {
   let a3 = RawPtr.alloc(bytes: 16, align: 8)
   a3.store(acc1, toByteOffset: 0)
   a3.store(3, toByteOffset: 8)
-  fiberSpawn(s1, body, a1)
-  fiberSpawn(s1, body, a2)
-  fiberSpawn(s1, body, a3)
+  fiberStart(s1, body, a1)
+  fiberStart(s1, body, a2)
+  fiberStart(s1, body, a3)
   schedRun(s1)
   let total1: Int = acc1.load(fromByteOffset: 0)
   print(total1)
@@ -309,12 +309,12 @@ fun main() {
   let pArg = RawPtr.alloc(bytes: 16, align: 8)
   pArg.store(acc2, toByteOffset: 0)
   pArg.store(s2, toByteOffset: 8)
-  let pFib = fiberSpawn(s2, Runtime.ofFunc(parkBody), pArg)
+  let pFib = fiberStart(s2, Runtime.ofFunc(parkBody), pArg)
   let qArg = RawPtr.alloc(bytes: 24, align: 8)
   qArg.store(acc2, toByteOffset: 0)
   qArg.store(s2, toByteOffset: 8)
   qArg.store(pFib, toByteOffset: 16)
-  fiberSpawn(s2, Runtime.ofFunc(unparkBody), qArg)
+  fiberStart(s2, Runtime.ofFunc(unparkBody), qArg)
   schedRun(s2)
   let total2: Int = acc2.load(fromByteOffset: 0)
   print(total2)
@@ -324,12 +324,12 @@ fun main() {
   let s3 = newSched()
   let acc3 = RawPtr.alloc(bytes: 8, align: 8)
   acc3.store(0, toByteOffset: 0)
-  let cFib = fiberSpawn(s3, Runtime.ofFunc(computeBody), RawPtr.null)
+  let cFib = fiberStart(s3, Runtime.ofFunc(computeBody), RawPtr.null)
   let dArg = RawPtr.alloc(bytes: 24, align: 8)
   dArg.store(acc3, toByteOffset: 0)
   dArg.store(s3, toByteOffset: 8)
   dArg.store(cFib, toByteOffset: 16)
-  fiberSpawn(s3, Runtime.ofFunc(joinBody), dArg)
+  fiberStart(s3, Runtime.ofFunc(joinBody), dArg)
   schedRun(s3)
   let total3: Int = acc3.load(fromByteOffset: 0)
   print(total3)
@@ -348,8 +348,8 @@ fun main() {
   bArg.store(acc4, toByteOffset: 0)
   bArg.store(s4, toByteOffset: 8)
   bArg.store(1000, toByteOffset: 24)
-  let aFib = fiberSpawn(s4, Runtime.ofFunc(relayBody), aArg)
-  let bFib = fiberSpawnParked(s4, Runtime.ofFunc(relayBody), bArg)
+  let aFib = fiberStart(s4, Runtime.ofFunc(relayBody), aArg)
+  let bFib = fiberStartParked(s4, Runtime.ofFunc(relayBody), bArg)
   aArg.store(bFib, toByteOffset: 16)
   bArg.store(aFib, toByteOffset: 16)
   schedRun(s4)

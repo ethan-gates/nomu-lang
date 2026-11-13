@@ -1,5 +1,5 @@
 // Task 128.1.6 · the live-fiber registry, in isolation. An intrusive doubly-linked list of every live
-// fiber, threaded through link slots in the fiber itself, so the scheduler inserts on spawn and removes
+// fiber, threaded through link slots in the fiber itself, so the scheduler inserts on start and removes
 // on completion in O(1) (no scan to find the node), and a stop-the-world walk iterates it to reach every
 // parked fiber's roots. Here it is tested as a data structure on its own — insert, O(1) remove of an
 // arbitrary node (head, tail, or middle), and full iteration — before 128.3.2 drives the iteration from a

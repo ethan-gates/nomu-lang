@@ -85,8 +85,6 @@ private func appendStmt(_ stmt: NOIRStmt, ind: String, into lines: inout [String
     switch stmt.kind {
     case .letBinding(let name, let mut, let value):
         appendValued("\(mut ? "var" : "let") \(name) =", value, ind: ind, into: &lines)
-    case .spawnLet(let name, let value, _):
-        appendValued("fiber let \(name) =", value, ind: ind, into: &lines)
     case .ret(let e):
         if let e { appendValued("return", e, ind: ind, into: &lines) }
         else { lines.append("\(ind)return") }
@@ -197,6 +195,8 @@ private func children(_ e: NOIRExpr) -> [(slot: String, expr: NOIRExpr)] {
         return [("base", base), ("index", idx)]
     case .staticCall(_, _, let args):
         return args.map { ("arg", $0) }
+    case .taskStart(_, let make, let call, let fulfill):
+        return [("make", make), ("call", call), ("fulfill", fulfill)]
     }
 }
 
@@ -222,6 +222,7 @@ private func head(_ e: NOIRExpr) -> String {
     case .index:                   return "index"
     case .staticCall(let t, let m, _): return "staticCall \(t).\(m)"
     case .funcRef(let name):       return "funcRef \(name)"
+    case .taskStart(let binder, _, _, _): return "task \(binder)"
     }
 }
 

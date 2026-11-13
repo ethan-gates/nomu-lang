@@ -31,7 +31,9 @@ public struct Inline: SSAPass {
     public func run(_ module: inout SSAModule) {
         var singleBlock: [String: SSAFunction] = [:]
         var multiBlock: [String: SSAFunction] = [:]
-        for f in module.functions where !f.blocks.isEmpty {
+        // Unspecialized generic code is never inlined (`generics.md`, "Inlining compiled-once code"): its witnesses
+        // and sub-dictionaries are in its own dictionary, and specialization is the lever for a hot generic path.
+        for f in module.functions where !f.blocks.isEmpty && f.generics.isEmpty {
             let total = f.blocks.reduce(0) { $0 + $1.insts.count }
             if f.blocks.count == 1, case .ret = f.blocks[0].terminator.kind, total <= maxSingleInsts {
                 singleBlock[f.name] = f

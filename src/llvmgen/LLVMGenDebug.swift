@@ -60,9 +60,11 @@ extension LLVMGen {
 
     // Point the builder's current debug location at `span`, scoped to the active subprogram.
     func setDebugLoc(_ span: Span) {
-        guard di != nil, let scope = currentScope, span.begin.line > 0 else { return }
-        let loc = LLVMDIBuilderCreateDebugLocation(
-            ctx, UInt32(span.begin.line), UInt32(span.begin.col), scope, nil)
+        guard di != nil, let scope = currentScope else { return }
+        // A body specialized from a `.bir` has no source position. Line 0 says so, and every call in a function with
+        // debug info must have some location.
+        let line = max(span.begin.line, 0)
+        let loc = LLVMDIBuilderCreateDebugLocation(ctx, UInt32(line), line > 0 ? UInt32(span.begin.col) : 0, scope, nil)
         LLVMSetCurrentDebugLocation2(b, loc)
     }
 
@@ -70,8 +72,8 @@ extension LLVMGen {
     func enterDebugScope(_ fn: LLVMValueRef, line: Int) {
         guard di != nil else { return }
         currentScope = LLVMGetSubprogram(fn)
-        if let scope = currentScope, line > 0 {
-            LLVMSetCurrentDebugLocation2(b, LLVMDIBuilderCreateDebugLocation(ctx, UInt32(line), 0, scope, nil))
+        if let scope = currentScope {
+            LLVMSetCurrentDebugLocation2(b, LLVMDIBuilderCreateDebugLocation(ctx, UInt32(max(line, 0)), 0, scope, nil))
         } else {
             LLVMSetCurrentDebugLocation2(b, nil)
         }

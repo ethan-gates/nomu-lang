@@ -72,11 +72,6 @@ enum NOIRGen {
             s.declare(b.name, type, isMutable: b.isMutable)
             return NOIRStmt(kind: .letBinding(name: b.name, isMutable: b.isMutable, value: value), span: b.span)
 
-        case .spawnLet(let name, _, let value, let span):
-            let v = checkExpr(&s, value)
-            s.declare(name, v.type)   // reading a spawn binding yields its result value
-            return NOIRStmt(kind: .spawnLet(name: name, value: v, resultType: v.type), span: span)
-
         case .fiberStart(let call, let span):
             guard case .call = call else {
                 s.diags.error("'fiber' takes a call", at: span)
@@ -239,14 +234,199 @@ enum NOIRGen {
         case .switchStmt(let sw):
             return NOIRStmt(kind: .switchStmt(lowerSwitch(&s, sw)), span: sw.span)
 
+        case .selectStmt(let sel):
+            return lowerSelect(&s, sel)
+
         case .expr(let e):
+            if case .taskStart(_, let span) = e {
+                s.diags.error("the result of 'task' is unused; use 'fiber' to start a fiber with no result", at: span)
+            }
             let ir = checkExpr(&s, e)
             return NOIRStmt(kind: .exprStmt(ir), span: ir.span)
         }
     }
 
-    // What `fiber f(x)` hands to the new fiber crosses a task boundary, so it must be shareable.
-    static func checkFiberArgs(_ s: inout Sema, _ call: NOIRExpr, _ span: Span) {
+    // `task f(x)`: the call runs on a new fiber, which stores its result in a `Task<T>` (the stdlib's), and the
+    // expression gives the `Task`. A call returning nothing gives a `Task<Void>`. The arguments and the result
+    // cross between fibers, so both must be shareable. The fiber's body is built here as NOIR for the lowerer:
+    // `binder` names the `Task`, and `fulfill` stores `binder.v` (the call's result), or `Void()`.
+    static func checkTaskStart(_ s: inout Sema, _ call: Expr, _ span: Span) -> NOIRExpr {
+        guard case .call = call else {
+            s.diags.error("'task' takes a call", at: span)
+            _ = checkExpr(&s, call)
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+        }
+        let c = checkExpr(&s, call)
+        guard c.type != .error else { return NOIRExpr(type: .error, span: span, kind: .intLit(0)) }
+        checkFiberArgs(&s, c, span, keyword: "task")
+        let binder = "$task\(s.taskCounter)"; s.taskCounter += 1
+        let result = "\(binder).v"
+        s.pushScope()
+        defer { s.popScope() }
+        let value: Expr
+        if c.type == .void {
+            value = .call(.ident("Void", span: span), [], span: span)
+        } else {
+            s.declare(result, c.type)
+            value = .ident(result, span: span)
+        }
+        let resultIR = checkExpr(&s, value)
+        guard resultIR.type != .error else { return NOIRExpr(type: .error, span: span, kind: .intLit(0)) }
+        if !s.isShareable(resultIR.type) {
+            s.diags.error("type '\(resultIR.type)' is not shareable, so a 'task' cannot return it", at: span)
+            return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+        }
+        let taskName = s.importedTypeIdentity("Task", at: span)
+        let taskType = Type.generic(base: taskName, args: [resultIR.type])
+        let make = NOIRExpr(type: taskType, span: span,
+                            kind: .call(callee: irVar("\(taskName).make", .function(params: [], ret: taskType), span),
+                                        args: [], typeArgs: [resultIR.type]))
+        s.declare(binder, taskType)
+        let fulfill = checkExpr(&s, .call(.member(.ident(binder, span: span), "fulfill", span: span),
+                                          [Arg(value: value)], span: span))
+        return NOIRExpr(type: taskType, span: span, kind: .taskStart(binder: binder, make: make, call: c, fulfill: fulfill))
+    }
+
+    // `select` (`concurrency.md` §4), rewritten into runtime calls and a branch on the winning case:
+    //
+    //   let $selN.c0 = <channel>; let $selN.v1 = <value> …   each case's operands, once, in source order
+    //   let $selN = __selectBegin(n)                          the select's area in the frame
+    //   __selectRecv($selN, 0, $selN.c0.buf) …                each case, with no safepoint before the wait
+    //   let $selN.w = __selectWait($selN, hasDefault, bufs…)  the winning case, or -1 for `default`; one buffer
+    //                                                         per case, 0 for an `after` or `readLine()`
+    //   if $selN.w == 0 { let v = __selectRecvResult($selN, 0); body } else if … else { default }
+    //
+    // Each channel case is checked as the call it names, so a receive gives `Option<T>` and a send's value is
+    // checked against `T`. `after(ms)` and `readLine()` are recognized as cases here; `after` takes an `Int`,
+    // and a `readLine()` case gives the line as a `String` (read even when unbound, so its block is freed). All of it sits in one block (an `if true`), so its temporaries stay scoped to the select.
+    static func lowerSelect(_ s: inout Sema, _ sel: SelectStmt) -> NOIRStmt {
+        let span = sel.span
+        let tok = "$sel\(s.selectCounter)"; s.selectCounter += 1
+        func block(_ stmts: [NOIRStmt]) -> NOIRStmt {
+            NOIRStmt(kind: .ifStmt(cond: NOIRExpr(type: .bool, span: span, kind: .boolLit(true)), then: stmts, else: nil), span: span)
+        }
+        func int(_ v: Int) -> NOIRExpr { NOIRExpr(type: .int, span: span, kind: .intLit(v)) }
+        if sel.arms.isEmpty {
+            s.diags.error("a 'select' needs at least one case", at: span)
+            return block([])
+        }
+        let channelName = s.importedTypeIdentity("Channel", at: span)
+        enum Kind { case receive, send, after, line }
+        struct Case { let kind: Kind; let elem: Type; let result: Type; let chan: String; let value: String? }
+        var pre: [NOIRStmt] = []
+        var cases: [Case] = []
+        s.pushScope()
+        defer { s.popScope() }
+        for (i, arm) in sel.arms.enumerated() {
+            if case .call(.ident("after", _), let args, _) = arm.op, args.count == 1, args[0].label == nil {
+                if arm.binding != nil { s.diags.error("an 'after' case has no value to bind", at: arm.span) }
+                let ms = checkExpr(&s, args[0].value, expected: .int)
+                if ms.type != .int && ms.type != .error {
+                    s.diags.error("'after' takes its milliseconds as an 'Int', not '\(ms.type)'", at: arm.span)
+                }
+                let value = "\(tok).v\(i)"
+                pre.append(NOIRStmt(kind: .letBinding(name: value, isMutable: false, value: ms), span: arm.span))
+                cases.append(Case(kind: .after, elem: .int, result: .void, chan: "", value: value))
+                continue
+            }
+            if case .call(.ident("readLine", _), let args, _) = arm.op, args.isEmpty {
+                cases.append(Case(kind: .line, elem: .int, result: .void, chan: "", value: nil))
+                continue
+            }
+            let op = checkExpr(&s, arm.op)
+            guard op.type != .error else { return block([]) }
+            guard case .methodCall(let recv, let method, let args) = op.kind,
+                  case .generic(let base, let targs) = recv.type, base == channelName, targs.count == 1,
+                  (method == "receive" && args.isEmpty) || (method == "send" && args.count == 1) else {
+                s.diags.error("a 'select' case is a channel's 'receive()' or 'send(_)', 'after(ms)' or 'readLine()'", at: arm.span)
+                return block([])
+            }
+            let chan = "\(tok).c\(i)"
+            pre.append(NOIRStmt(kind: .letBinding(name: chan, isMutable: false, value: recv), span: arm.span))
+            if method == "send" {
+                if arm.binding != nil { s.diags.error("a 'send' case has no value to bind", at: arm.span) }
+                let value = "\(tok).v\(i)"
+                pre.append(NOIRStmt(kind: .letBinding(name: value, isMutable: false, value: args[0]), span: arm.span))
+                cases.append(Case(kind: .send, elem: targs[0], result: op.type, chan: chan, value: value))
+            } else {
+                cases.append(Case(kind: .receive, elem: targs[0], result: op.type, chan: chan, value: nil))
+            }
+        }
+        let rawTok = irVar(tok, .rawPtr, span)
+        pre.append(NOIRStmt(kind: .letBinding(name: tok, isMutable: false,
+                                              value: s.ptrIntrinsic("__selectBegin", .rawPtr, [int(cases.count)], span)), span: span))
+        var bufs: [NOIRExpr] = []
+        for (i, c) in cases.enumerated() {
+            if c.kind == .line {
+                bufs.append(int(0))
+                let args = [NOIRArg(label: nil, value: rawTok), NOIRArg(label: nil, value: int(i))]
+                pre.append(NOIRStmt(kind: .exprStmt(NOIRExpr(type: .void, span: span,
+                    kind: .call(callee: irVar("__selectLine", .void, span), args: args, typeArgs: []))), span: span))
+                continue
+            }
+            if c.kind == .after {
+                bufs.append(int(0))
+                let args = [NOIRArg(label: nil, value: rawTok), NOIRArg(label: nil, value: int(i)),
+                            NOIRArg(label: nil, value: irVar(c.value!, .int, span))]
+                pre.append(NOIRStmt(kind: .exprStmt(NOIRExpr(type: .void, span: span,
+                    kind: .call(callee: irVar("__selectAfter", .void, span), args: args, typeArgs: []))), span: span))
+                continue
+            }
+            let chanType = Type.generic(base: channelName, args: [c.elem])
+            let buf = checkFieldOf(&s, chanVar: c.chan, chanType: chanType, span)
+            bufs.append(buf)
+            var args: [NOIRArg] = [NOIRArg(label: nil, value: rawTok), NOIRArg(label: nil, value: int(i)), NOIRArg(label: nil, value: buf)]
+            if let v = c.value { args.append(NOIRArg(label: nil, value: irVar(v, c.elem, span))) }
+            let callee = irVar(c.kind == .send ? "__selectSend" : "__selectRecv", .void, span)
+            pre.append(NOIRStmt(kind: .exprStmt(NOIRExpr(type: .void, span: span,
+                                                         kind: .call(callee: callee, args: args, typeArgs: c.kind == .send ? [c.elem] : [c.elem, c.result]))), span: span))
+        }
+        let won = "\(tok).w"
+        let hasDefault = NOIRExpr(type: .int, span: span, kind: .intLit(sel.defaultBody == nil ? 0 : 1))
+        pre.append(NOIRStmt(kind: .letBinding(name: won, isMutable: false,
+                                              value: s.ptrIntrinsic("__selectWait", .int, [rawTok, hasDefault] + bufs, span)), span: span))
+        // The branch on the winner, built from the last case back.
+        var tail: [NOIRStmt]? = sel.defaultBody.map { lowerBlock(&s, $0) }
+        for (i, arm) in sel.arms.enumerated().reversed() {
+            let c = cases[i]
+            s.pushScope()
+            var body: [NOIRStmt] = []
+            if c.kind == .line {
+                let raw = NOIRExpr(type: .stringBase, span: arm.span,
+                                   kind: .call(callee: irVar("__selectLineResult", .stringBase, span),
+                                               args: [NOIRArg(label: nil, value: rawTok), NOIRArg(label: nil, value: int(i))],
+                                               typeArgs: []))
+                let line = wrapString(&s, raw)
+                if let b = arm.binding {
+                    s.declare(b, line.type)
+                    body.append(NOIRStmt(kind: .letBinding(name: b, isMutable: false, value: line), span: arm.span))
+                } else {
+                    body.append(NOIRStmt(kind: .exprStmt(line), span: arm.span))
+                }
+            } else if let b = arm.binding {
+                let result = NOIRExpr(type: c.result, span: arm.span,
+                                      kind: .call(callee: irVar("__selectRecvResult", .void, span),
+                                                  args: [NOIRArg(label: nil, value: rawTok), NOIRArg(label: nil, value: int(i))],
+                                                  typeArgs: [c.elem]))
+                s.declare(b, c.result)
+                body.append(NOIRStmt(kind: .letBinding(name: b, isMutable: false, value: result), span: arm.span))
+            }
+            body += lowerBlock(&s, arm.body)
+            s.popScope()
+            let cond = NOIRExpr(type: .bool, span: arm.span, kind: .binary(.eq, irVar(won, .int, span), int(i)))
+            tail = [NOIRStmt(kind: .ifStmt(cond: cond, then: body, else: tail), span: arm.span)]
+        }
+        return block(pre + (tail ?? []))
+    }
+
+    // `chanVar.buf`, the channel's buffer, checked as an ordinary field access.
+    static func checkFieldOf(_ s: inout Sema, chanVar: String, chanType: Type, _ span: Span) -> NOIRExpr {
+        s.declare(chanVar, chanType)
+        return checkExpr(&s, .member(.ident(chanVar, span: span), "buf", span: span))
+    }
+
+    // What `fiber f(x)` or `task f(x)` hands to the new fiber crosses a task boundary, so it must be shareable.
+    static func checkFiberArgs(_ s: inout Sema, _ call: NOIRExpr, _ span: Span, keyword: String = "fiber") {
         var crossing: [NOIRExpr] = []
         switch call.kind {
         case .call(_, let args, _):            crossing = args.map(\.value)
@@ -255,7 +435,7 @@ enum NOIRGen {
         default: break
         }
         for e in crossing where e.type != .error && !s.isShareable(e.type) {
-            s.diags.error("type '\(e.type)' is not shareable, so it cannot be passed to a 'fiber'", at: span)
+            s.diags.error("type '\(e.type)' is not shareable, so it cannot be passed to a '\(keyword)'", at: span)
         }
     }
 
@@ -274,9 +454,9 @@ enum NOIRGen {
         default:
             enumDecl = nil
         }
-        let savedScope = s.genericScope
-        if let g = enumDecl?.generics, !g.isEmpty { s.genericScope = Set(g.map(\.name)) }
-        defer { s.genericScope = savedScope }
+        let savedScope = s.genericScope, savedCheck = s.checksSharedArgs
+        if let g = enumDecl?.generics, !g.isEmpty { s.genericScope = Set(g.map(\.name)); s.checksSharedArgs = false }
+        defer { s.genericScope = savedScope; s.checksSharedArgs = savedCheck }
         var arms: [NOIRCaseArm] = []
         for arm in sw.cases {
             guard case .enumCase(let name, let names, _) = arm.pattern else { continue }
@@ -654,6 +834,9 @@ enum NOIRGen {
                 return NOIRExpr(type: .error, span: span, kind: .index(base: irBase, idx: irIdx))
             }
             return NOIRExpr(type: elem, span: span, kind: .index(base: irBase, idx: irIdx))
+
+        case .taskStart(let call, let span):
+            return checkTaskStart(&s, call, span)
 
         case .error(let span):
             // A parser error-recovery placeholder. The driver stops before Sema when the
@@ -1372,10 +1555,11 @@ enum NOIRGen {
         case .classDecl(let c):  generics = c.generics
         default: preconditionFailure("lowerGenericDecl on a non-generic-capable decl")
         }
-        let savedScope = s.genericScope; let savedBounds = s.genericBounds
+        let savedScope = s.genericScope; let savedBounds = s.genericBounds, savedShared = s.sharedParams
         s.genericScope = Set(generics.map(\.name))
         for g in generics { s.genericBounds[g.name] = g.bounds.map(\.name) }
-        defer { s.genericScope = savedScope; s.genericBounds = savedBounds }
+        s.sharedParams = Set(generics.filter(\.isShared).map(\.name))
+        defer { s.genericScope = savedScope; s.genericBounds = savedBounds; s.sharedParams = savedShared }
         validateBounds(s, generics)
         let irGenerics = generics.map { NOIRGenericParam(name: $0.name, bounds: $0.bounds.map(\.name), isShared: $0.isShared) }
         switch decl {
@@ -1483,7 +1667,8 @@ enum NOIRGen {
     }
 
     static func registerProps(_ s: inout Sema, _ typeName: String, _ props: [ComputedProperty], generics: [GenericParam] = []) {
-        let saved = s.genericScope; s.genericScope = Set(generics.map(\.name)); defer { s.genericScope = saved }
+        let saved = s.genericScope, savedCheck = s.checksSharedArgs; s.genericScope = Set(generics.map(\.name)); s.checksSharedArgs = false
+        defer { s.genericScope = saved; s.checksSharedArgs = savedCheck }
         var table: [String: Sema.PropInfo] = [:]
         for p in props { table[p.name] = Sema.PropInfo(type: s.resolve(p.type), hasSetter: p.setter != nil) }
         s.computedProps[typeName] = table
@@ -1552,9 +1737,9 @@ enum NOIRGen {
             let ret = s.resolve(h.returnType)
             // Actors are fire-and-forget message-send only (§9): a handler is a one-way message
             // sink and cannot return a value to the sender. There is no reply/ask mechanism; a value
-            // from concurrent work comes from a `fiber let` result or a channel, not an actor.
+            // from concurrent work comes from a `task` or a channel, not an actor.
             if ret != .void {
-                s.diags.error("an actor 'on' handler cannot return a value — actor messages are fire-and-forget (a handler is a one-way message sink). To get a value from concurrent work, use a spawned task's result or a channel, not an actor", at: h.span)
+                s.diags.error("an actor 'on' handler cannot return a value — actor messages are fire-and-forget (a handler is a one-way message sink). To get a value from concurrent work, use a 'task' or a channel, not an actor", at: h.span)
             }
             s.pushScope()
             for f in fields { s.declare(f.name, f.type) }   // handler body sees actor fields by name

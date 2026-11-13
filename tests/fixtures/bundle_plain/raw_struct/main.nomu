@@ -1,8 +1,8 @@
 // Task 125 · slice 3 — RawPtr composition, shareability, and identity.
 //   - FCA: a value struct holding a RawPtr field stays a plain aggregate (no managed pointer, so no
 //     category-3 relocation problem) — store/load through the field works.
-//   - Shareability: a RawPtr is a value word, so it crosses a task boundary (spawn captures it) and
-//     the spawned task reads the same shared off-heap memory.
+//   - Shareability: a RawPtr is a value word, so it crosses a task boundary (a fiber captures it) and
+//     the started task reads the same shared off-heap memory.
 //   - Identity: RawPtr.null / .isNull / .eq.
 // Expected output: 123 / 456 / 123 / 1 / 0 / 1 / 0.
 struct Block {
@@ -27,8 +27,8 @@ package fun bundleMain() {
   print(c)                                  // 456
   print("\n")
 
-  fiber let s = readAt(m, 0)                // RawPtr crosses the task boundary
-  print(s)                                  // 123
+  let s = task readAt(m, 0)                // RawPtr crosses the task boundary
+  print(s.join())                           // 123
   print("\n")
 
   let n = RawPtr.null

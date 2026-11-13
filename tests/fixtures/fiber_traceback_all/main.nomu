@@ -1,0 +1,17 @@
+// With NOMU_TRACEBACK=all, a fault dumps every fiber after the faulting thread's backtrace.
+fun hold(ch: Channel<Int>) {
+  switch ch.receive() {
+  case .some(let v):
+  case .none:
+  }
+}
+
+fun main() {
+  let ch = Channel<Int>.make(capacity: 0)
+  fiber hold(ch)
+  sleep(10)
+  let closed = Channel<Int>.make(capacity: 0)
+  closed.close()
+  print("faulting\n")
+  closed.send(1)
+}

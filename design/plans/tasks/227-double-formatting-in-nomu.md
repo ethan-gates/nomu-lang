@@ -24,3 +24,9 @@ Language surface, each needing agreement:
 The `double` suite cases' output unchanged, plus a sweep against the libc loop over edge values
 (subnormals, powers of ten, the largest and smallest finite values, values just past a rounding
 boundary).
+
+## Also gained
+
+`snprintf` and `strtod` run on the carrier's stack through the platform layer's stubs
+([104](104-fiber-stack-strategy.md) 104.3.3), about 0.7 ns a call (1.4% on `benchmarks/print_loop`). Nomu's own
+routines run on the fiber's stack and drop that cost; measure `print_loop` before and after.

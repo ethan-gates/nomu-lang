@@ -9,12 +9,15 @@ reports `cpu ms`, the process's user plus system time, which shows what spinning
   pingpong_fiber   two fibers handing a turn back and forth (ns per hop)
   pingpong_actor   two actors sending a counter back and forth (ns per hop)
   fanout_actor     one actor sending jobs to 16 actors, by job size (ns per job)
-  forkjoin_fiber   a binary tree of 8,190 spawned and joined fibers, by leaf work (ns per fiber)
+  forkjoin_fiber   a binary tree of 8,190 started and joined fibers, by leaf work (ns per fiber)
   pipeline_actor   items through a chain of 8 busy stage actors, by stage work (ns per item)
   producer_fiber   a producer that keeps running after readying a consumer (the consumer's wait, ns)
   sleepers_fiber   1,024 fibers sleeping 1 ms twenty times (ms; the floor is 20)
   mixed_fiber      compute fibers beside a handing-off pair (ms until each side finishes)
   idle_fiber       mostly asleep, with small bursts (ms; read cpu ms)
+  pingpong_channel two fibers over unbuffered channels (ns per hop)
+  stream_channel   one fiber streaming to another over a buffered channel of 64 (ns per value)
+  fanin_channel    four senders to one receiver over a buffered channel of 64 (ns per value)
 
 Usage:
   tools/schedbench.py [--iters N] [--carriers 1,2,4,8] [--configs a,b,...] [--workloads a,b,...]
@@ -87,6 +90,13 @@ def total_ms(name):
     return metrics
 
 
+def per_hop(name):
+    def metrics(out):
+        r = fields(out, name)[0]
+        return {"ns/hop": r["ns"] / r["hops"]}
+    return metrics
+
+
 def mixed(out):
     r = fields(out, "mixed_fiber")[0]
     return {"pair ms": r["pair_ns"] / 1e6, "compute ms": r["bg_ns"] / 1e6}
@@ -103,6 +113,9 @@ WORKLOADS = {
     "sleepers_fiber": ([], total_ms("sleepers_fiber")),
     "mixed_fiber": (["--config=rt_prelude"], mixed),
     "idle_fiber": ([], total_ms("idle_fiber")),
+    "pingpong_channel": ([], per_hop("pingpong_channel")),
+    "stream_channel": ([], per_hop("stream_channel")),
+    "fanin_channel": ([], per_hop("fanin_channel")),
 }
 
 

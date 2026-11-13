@@ -1,14 +1,15 @@
-// Structured concurrency (M3): `fiber let` runs a computation on its own OS thread;
-// reading the binding joins (blocks until done). Children can't outlive the scope —
-// any unread spawn is joined at block exit.
+// `task f(x)` runs a call on a new fiber; `join()` waits for its result. Arguments are evaluated where the
+// task starts, so `plus(base, 5)` sees `base` as it is then.
 
 fun sq(n : Int) -> Int{return n * n}
 
+fun plus(a: Int, b: Int) -> Int{return a + b}
+
 fun main() {
     let base = 10
-    fiber let a = sq(3) // 9,  concurrent
-    fiber let b = sq(4)           // 16, concurrent
-    fiber let c = base + 5          // 15, captures base by value
-    print(a + b)                    // 25 (joins a and b)
-    print(c)        // 15 (joins c)
+    let a = task sq(3)              // 9,  concurrent
+    let b = task sq(4)              // 16, concurrent
+    let c = task plus(base, 5)      // 15
+    print(a.join() + b.join())      // 25
+    print(c.join())                 // 15
 }
