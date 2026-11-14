@@ -225,9 +225,10 @@ public func computeShapedLiveness(_ f: SSAFunction,
 }
 
 // The frame slots the collector must be told about (task 176.5), and how every slot-derived address maps to
-// its slot. A `stackAlloc` slot is recorded when its type has conditional content (managed words the
-// statepoint rewrite cannot see: a shaped leaf, an enum payload), or when its type has any managed word and
-// its address escapes — it, or an address derived from it (`fieldAddr`, `elementAddr`, a block parameter it
+// its slot. A slot's content is a value of its type, or, for a stack-promoted class instance, the object's
+// body (`objectShape`: its fields, past the header). A `stackAlloc` slot is recorded when its content has
+// conditional words (managed words the statepoint rewrite cannot see: a shaped leaf, an enum payload), or
+// when its content has any managed word and its address escapes — it, or an address derived from it (`fieldAddr`, `elementAddr`, a block parameter it
 // flows into), is an operand of any instruction other than a load, store or address computation through it.
 // A slot that does not escape is promoted to SSA by SROA, where the statepoint rewrite sees its plain managed
 // pointers; an escaped one stays in memory, where it does not. Recording every non-empty slot would block
@@ -311,7 +312,8 @@ public func recordedSlots(_ f: SSAFunction, _ shapes: ShapeEnv) -> RecordedSlots
     }
     var types: [Int: Type] = [:]
     for (id, t) in slotType {
-        if shapes.hasConditional(t) || (escaped.contains(id) && !shapes.shape(t).isEmpty) { types[id] = t }
+        let content = shapes.objectShape(t) ?? shapes.shape(t)
+        if !content.conditional.isEmpty || (escaped.contains(id) && !content.isEmpty) { types[id] = t }
     }
     return RecordedSlots(types: types, root: root.filter { types[$0.value] != nil },
                          ambiguous: ambiguous.filter { root[$0].map { types[$0] != nil } ?? false }.sorted())

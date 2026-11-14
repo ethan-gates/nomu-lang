@@ -1,0 +1,16 @@
+// A recursive enum: `node` holds two `Tree`s inline, so `Tree` has no finite size. Reported as an error
+// naming the path around the cycle (recursive enums are boxed automatically later, task 260).
+enum Tree {
+    case leaf
+    case node(left: Tree, right: Tree)
+}
+
+fun main() {
+    let t = Tree.leaf
+    switch t {
+    case .leaf:
+        print(1)
+    case .node(let l, let r):
+        print(2)
+    }
+}

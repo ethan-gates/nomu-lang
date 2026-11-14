@@ -86,6 +86,31 @@ cases:
     compile:
       expect_error: "initialization cycle: global 'a' reads its own value through a call"
 
+  - name: recursive-enum
+    fixture: tests/fixtures/recursive_enum
+    compile:
+      expect_error: "value type 'Tree' contains itself: Tree.node.left → Tree; recursive enums are not supported yet"
+
+  - name: recursive-struct-mutual
+    fixture: tests/fixtures/recursive_struct_mutual
+    compile:
+      expect_error: "value type 'A' contains itself: A.b → B.a → A; a value type cannot hold itself"
+
+  - name: recursive-generic-struct
+    fixture: tests/fixtures/recursive_generic_struct
+    compile:
+      expect_error: "value type 'S' contains itself: S.p → S"
+
+  - name: recursive-generic-enum
+    fixture: tests/fixtures/recursive_generic_enum
+    compile:
+      expect_error: "value type 'List' contains itself: List.cons.tail → List"
+
+  - name: value-type-nesting
+    fixture: tests/fixtures/value_type_nesting
+    expect:
+      stdout: "17\n"
+
   - name: bundle-plain
     fixture: tests/fixtures/bundle_plain
     expect:

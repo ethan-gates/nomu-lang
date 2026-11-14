@@ -253,9 +253,12 @@ extension LLVMGen {
         if let leaf = shapes.leaf(t) { return Int32(ShapeLeaf.allCases.firstIndex(of: leaf)!) }
         let key = t.description
         if let o = shapeOrdinalForType[key] { return o }
-        // An enum value's descriptor is its kind-2 enum descriptor (discriminant-conditional); any other
-        // aggregate uses its flat value-layout descriptor (task 176.3a/.3b).
+        // An enum value's descriptor is its kind-2 enum descriptor (discriminant-conditional); a class type
+        // here is a stack-promoted instance's slot, whose descriptor is the object's own (offsets from the
+        // object's start, as the slot holds the whole object); any other aggregate uses its flat
+        // value-layout descriptor (task 176.3a/.3b).
         let desc: UInt64 = {
+            if case .named(let n, .class_) = t { return typeId(forHeapType: n) }
             if case .named(let n, .enum_) = t, let c = shapes.shape(t).conditional.first,
                case .enumCases(_, let cases) = c.kind {
                 return enumShapeDescId(n, cases)

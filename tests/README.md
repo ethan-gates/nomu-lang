@@ -180,6 +180,9 @@ excluded.
   down three calls, an erased generic's buffers, a shadow-stack node (task 243, claim 3). Each prints `bad 0`.
 - `stack-move-checks` — the same fixtures, moving the stack at every function-entry stack check
   (`stack_move_checks: 1`) instead of at resumes (task 104).
+- `value-refs` — `tests/fixtures/value_ref_matrix/*` across `pipeline` × `gc`, escape analysis on
+  (`shape` turns it off): structs and enums holding class objects, their escape, the barrier for stores into
+  mature objects, and a stack-promoted object's `String` and enum fields (task 260). Each prints `bad 0`.
 - `layout` — `tests/fixtures/layout_matrix/*` across `pipeline`: value layouts a mono caller and an erased
   body must agree on.
 - `examples` — `examples/*`, the user-facing demos, each against its `expected.txt`, so they keep working.

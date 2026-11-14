@@ -144,12 +144,12 @@ content" is a **recursive structural property** computed from a type's stored pr
 descriptor path already obeys this — that is why `class Holder { var s: String }` works with no per-type
 code), never a maintained list of types. Stage 3b extends the *value-local* path to the same law.
 
-**Scope is bounded by the value-type rule.** A value type may not store a reference field (the frontend
-rejects `struct Pair { var node: SomeClass }` — "use a class"). So the only managed content a value-aggregate
-local can carry is **shaped** (a `String`, directly or nested in a value field/payload). There are no
-ordinary `addrspace(1)` fields in a value aggregate, so homing the whole aggregate to a frame slot hides
-nothing from RS4GC — the Stage 3 "alloca-as-home" model extends directly, with no RS4GC interaction to
-reconcile.
+**Value aggregates may hold references.** This stage was first scoped by a rule that a value type may not
+store a reference field, so a value-aggregate local could carry only shaped content. Generic instances
+(`Option<SomeClass>`) always bypassed the rule, and the aggregate's frame record lists its managed words
+from its shape, plain and shaped alike, so the rule protected nothing and was removed (task 260). A value
+aggregate held in its frame slot is rooted through that record either way; RS4GC never sees its words as
+SSA values.
 
 ### Representation note (corrected after build)
 

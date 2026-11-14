@@ -145,6 +145,7 @@ final class LLVMGen {
     lazy var shapes: ShapeEnv = ShapeEnv(
         structFields: { [unowned self] in self.structMap[$0]?.fields.map(\.type) },
         enumCases: { [unowned self] in self.enumMap[$0]?.cases.map { $0.fields.map(\.type) } },
+        classFields: { [unowned self] in self.classMap[$0]?.fields.map(\.type) },
         resolveOpaque: { [unowned self] in self.concreteUnderlying($0) })
 
     // Whether `t` is a struct wrapping a shaped leaf (`struct String { let base: StringBase }`): byte-identical

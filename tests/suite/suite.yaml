@@ -109,6 +109,15 @@ groups:
       stack_move_checks: 1
     expect:
       stdout: "bad 0\n"
+  # References held in value types (structs and enums holding class objects), with escape analysis on:
+  # placement, and the write barrier for stores into mature objects (task 260).
+  - name: value-refs
+    fixtures: tests/fixtures/value_ref_matrix/*
+    across:
+      - pipeline
+      - gc
+    expect:
+      stdout: "bad 0\n"
   - name: layout
     fixtures: tests/fixtures/layout_matrix/*
     across:

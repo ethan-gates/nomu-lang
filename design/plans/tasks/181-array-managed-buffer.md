@@ -72,6 +72,11 @@ sound for `String` (immutable bytes) and `Channel` (contents the runtime synchro
 [102](102-channels.md)), but an `Array` on a `ManagedBuffer` is mutable: it must not become shareable this way.
 Give the buffer's shareability to its element type and its user, rather than to the class.
 
+## Dependencies
+
+- After [196](196-dense-value-layout.md) (dense value layout), which decides element layout and strides;
+  this task moves `Array` onto that layout rather than settling strides on its own.
+
 ## Refs
 
 Split from [180 managed buffer](180-managed-buffer.md) 180.4 (the Array half); the ad-hoc kind-1 array buffer

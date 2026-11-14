@@ -1,0 +1,12 @@
+// Two structs that hold each other inline: a cycle through two value types, reported once at the first.
+struct A {
+    var b: B
+}
+
+struct B {
+    var a: A
+}
+
+fun main() {
+    print(1)
+}

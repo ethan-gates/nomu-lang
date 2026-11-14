@@ -1,0 +1,79 @@
+// A class instance escape analysis places on the stack, with fields whose managed words the statepoint
+// rewrite cannot see: a heap `String`, an enum with a class payload, a struct holding that enum. The frame
+// records the object's slot with the class's own descriptor, so a collection finds and updates them in place.
+// Calling a method on the object passes its address, which keeps the slot in memory. Read-back values are
+// ones no other allocation makes, so a stale pointer cannot read the right answer by chance.
+class Box {
+  var v: Int
+}
+enum Slot {
+  case empty
+  case full(box: Box)
+}
+struct Cell {
+  var slot: Slot
+  var tag: Int
+}
+class Local {
+  var s: String
+  var slot: Slot
+  var cell: Cell
+  var plain: Box
+
+  fun total() -> Int {
+    var t = self.plain.v + self.cell.tag + self.s.count
+    switch self.slot {
+    case .full(let b):
+      t = t + b.v
+    case .empty:
+      t = t - 1
+    }
+    switch self.cell.slot {
+    case .full(let b):
+      t = t + b.v
+    case .empty:
+      t = t - 1
+    }
+    return t
+  }
+}
+fun heap(i: Int) -> String {
+  if i % 2 == 0 { return "seed-heap-string-xxxxxxxxxxxxxxx".concat("-a") }
+  return "seed-heap-string-xxxxxxxxxxxxxxx".concat("-b")
+}
+// Allocates boxes and same-length strings with other values, so a collection lands between reads and a
+// stale pointer reads something else.
+fun churn(i: Int) -> Int {
+  let b = Box(v: -1 - i)
+  let s = "QQQQ-QQQQ-QQQQQQ-QQQQQQQQQQQQQQQ".concat("-q")
+  var k = 0
+  var t = 0
+  while k < 50 {
+    t = t + k
+    k = k + 1
+  }
+  return t + b.v + s.count
+}
+fun report(bad: Int) {
+  print("bad ")
+  print(bad)
+  print("\n")
+}
+fun main() {
+  let o = Local(s: "x", slot: Slot.empty, cell: Cell(slot: Slot.empty, tag: 0), plain: Box(v: 0))
+  var bad = 0
+  var t = 0
+  var i = 0
+  while i < 60000 {
+    o.s = heap(i)
+    o.slot = Slot.full(box: Box(v: 1000000 + i))
+    o.cell = Cell(slot: Slot.full(box: Box(v: 2000000 + i)), tag: i)
+    o.plain = Box(v: 3000000 + i)
+    t = t + churn(i) + churn(i + 1)
+    if o.s.byte(at: 33).int != 97 + i % 2 { bad = bad + 1 }
+    if o.total() != 3000000 + i + i + 34 + 1000000 + i + 2000000 + i { bad = bad + 1 }
+    i = i + 1
+  }
+  if t == 42 { print("\n") }
+  report(bad)
+}

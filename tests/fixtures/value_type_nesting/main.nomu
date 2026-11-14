@@ -1,0 +1,33 @@
+// Value types that mention themselves without holding themselves inline compile and run: an `Array` holds
+// its elements by reference, and nested generic instances (`Pair<Pair<Int>>`, `Option<Option<Int>>`) are
+// finite.
+struct Pair<T> {
+    var first: T
+    var second: T
+}
+
+struct Node {
+    var value: Int
+    var children: Array<Node>
+}
+
+fun main() {
+    let leaf = Node(value: 2, children: [])
+    let root = Node(value: 1, children: [leaf, leaf])
+    let pp = Pair<Pair<Int>>(first: Pair<Int>(first: 3, second: 4), second: Pair<Int>(first: 5, second: 6))
+    let oo = Option<Option<Int>>.some(value: Option<Int>.some(value: 7))
+    var seven = 0
+    switch oo {
+    case .some(let inner):
+        switch inner {
+        case .some(let v):
+            seven = v
+        case .none:
+            seven = 0
+        }
+    case .none:
+        seven = 0
+    }
+    print(root.value + root.children[0].value + root.children.count + pp.second.first + seven)
+    print("\n")
+}

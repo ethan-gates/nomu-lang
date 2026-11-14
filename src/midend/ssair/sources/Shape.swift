@@ -142,6 +142,7 @@ public struct Shape: Equatable {
 public final class ShapeEnv {
     private let structFields: (String) -> [Type]?
     private let enumCases: (String) -> [[Type]]?
+    private let classFields: (String) -> [Type]?
     private let resolveOpaque: (Type) -> Type
     private var shapes: [String: Shape] = [:]
     private var leaves: [String: ShapeLeaf?] = [:]
@@ -149,10 +150,20 @@ public final class ShapeEnv {
 
     public init(structFields: @escaping (String) -> [Type]?,
                 enumCases: @escaping (String) -> [[Type]]?,
+                classFields: @escaping (String) -> [Type]? = { _ in nil },
                 resolveOpaque: @escaping (Type) -> Type = { $0 }) {
         self.structFields = structFields
         self.enumCases = enumCases
+        self.classFields = classFields
         self.resolveOpaque = resolveOpaque
+    }
+
+    // The shape of a class object's body, offsets from the object's start (the header word is offset 0, the
+    // fields follow): what a stack-promoted instance's slot holds. Nil for any other type, whose slot holds a
+    // value of the type itself (`shape`). The heap object's descriptor is built from the same fields.
+    public func objectShape(_ t: Type) -> Shape? {
+        guard case .named(let n, .class_) = t, let fields = classFields(n) else { return nil }
+        return fieldsShape(fields, base: 8)
     }
 
     // The concrete type a `some I` stands for; an unresolvable one stays opaque.

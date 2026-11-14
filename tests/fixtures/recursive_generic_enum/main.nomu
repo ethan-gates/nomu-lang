@@ -1,0 +1,10 @@
+// A recursive generic enum: `cons` holds a `List<T>` inline.
+enum List<T> {
+    case empty
+    case cons(head: T, tail: List<T>)
+}
+
+fun main() {
+    let l = List<Int>.empty
+    print(1)
+}

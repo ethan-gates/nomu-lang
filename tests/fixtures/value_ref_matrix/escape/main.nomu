@@ -1,0 +1,108 @@
+// Escape analysis over references held in value types: a class object made in a function and placed in a
+// struct or enum escapes with it, through a return, an array, a class field or a call that stores it. A
+// wrong stack placement would leave the struct pointing into a dead frame, which `scribble` overwrites
+// before each read.
+class Box {
+  var v: Int
+}
+struct Pair {
+  var box: Box
+  var n: Int
+}
+enum Slot {
+  case empty
+  case full(box: Box)
+}
+struct Cell {
+  var slot: Slot
+  var tag: Int
+}
+class Keeper {
+  var pair: Pair
+  var slot: Slot
+}
+fun wrap(v: Int) -> Pair {
+  let b = Box(v: v)
+  return Pair(box: b, n: v)
+}
+fun wrapTwice(v: Int) -> Pair {
+  let p = wrap(v: v)
+  return Pair(box: p.box, n: p.n)
+}
+fun fill(v: Int) -> Slot {
+  let b = Box(v: v)
+  return Slot.full(box: b)
+}
+fun cellOf(v: Int) -> Cell {
+  return Cell(slot: fill(v: v), tag: v)
+}
+fun keep(k: Keeper, v: Int) {
+  let b = Box(v: v)
+  k.pair = Pair(box: b, n: v)
+  k.slot = Slot.full(box: Box(v: v + 1))
+}
+fun slotValue(s: Slot) -> Int {
+  switch s {
+  case .full(let b):
+    return b.v
+  case .empty:
+    return -1
+  }
+}
+// Writes over the stack below the caller with a deep chain of frames full of locals.
+fun scribble(d: Int) -> Int {
+  if d == 0 {
+    return 0
+  }
+  let a = d * 3
+  let b = d * 5
+  let c = d * 7
+  return scribble(d: d - 1) + a + b - c
+}
+// Allocates, so a collection lands between reads.
+fun churn(i: Int) -> Int {
+  let b = Box(v: i)
+  var k = 0
+  var t = 0
+  while k < 50 {
+    t = t + k
+    k = k + 1
+  }
+  return t + b.v
+}
+fun report(bad: Int) {
+  print("bad ")
+  print(bad)
+  print("\n")
+}
+fun main() {
+  let keeper = Keeper(pair: wrap(v: 0), slot: Slot.empty)
+  var pairs: Array<Pair> = []
+  var cells: Array<Cell> = []
+  var bad = 0
+  var t = 0
+  var i = 0
+  while i < 60000 {
+    let p = wrapTwice(v: i)
+    let c = cellOf(v: i)
+    keep(k: keeper, v: i)
+    if i % 100 == 0 {
+      pairs.append(wrap(v: i))
+      cells.append(cellOf(v: i))
+    }
+    t = t + scribble(d: 40) + churn(i)
+    if p.box.v != i || p.n != i { bad = bad + 1 }
+    if slotValue(c.slot) != i || c.tag != i { bad = bad + 1 }
+    if keeper.pair.box.v != i { bad = bad + 1 }
+    if slotValue(keeper.slot) != i + 1 { bad = bad + 1 }
+    i = i + 1
+  }
+  var j = 0
+  while j < pairs.count {
+    if pairs[j].box.v != j * 100 { bad = bad + 1 }
+    if slotValue(cells[j].slot) != j * 100 { bad = bad + 1 }
+    j = j + 1
+  }
+  if t == 42 { print("\n") }
+  report(bad)
+}

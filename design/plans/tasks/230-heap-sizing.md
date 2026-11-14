@@ -273,7 +273,7 @@ clear fatal error when it does.
 ## Leads for the benchmark gap
 
 Not part of 230. The binary-trees gap against Go is followed up in [260](260-enum-layout.md) (enum layout,
-then 260.10 for the gaps outside it). Two further leads from `fibers_majors`, each still to be designed:
+then 260.9 for the gaps outside it). Two further leads from `fibers_majors`, each still to be designed:
 
 - a root walk that skips fibers whose stacks have not run since the last collection (160 ns a fiber per
   collection);

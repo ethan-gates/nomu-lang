@@ -1,0 +1,86 @@
+// The write barrier for references held in value types: an object and an array are made first and promoted
+// by the collections that follow, then given structs and enums holding young objects (a class field of
+// struct type, of enum type, a struct field inside a class field, an array element). Each is a store of a
+// young reference into a mature object, which the next minor finds only if the barrier remembered it; the
+// heap verifier's legs check the remembered set before every minor.
+class Box {
+  var v: Int
+}
+struct Pair {
+  var box: Box
+  var n: Int
+}
+enum Slot {
+  case empty
+  case full(box: Box)
+}
+struct Cell {
+  var slot: Slot
+  var tag: Int
+}
+class Keeper {
+  var pair: Pair
+  var slot: Slot
+  var cell: Cell
+}
+fun slotValue(s: Slot) -> Int {
+  switch s {
+  case .full(let b):
+    return b.v
+  case .empty:
+    return -1
+  }
+}
+// Allocates, so a collection lands between reads.
+fun churn(i: Int) -> Int {
+  let b = Box(v: i)
+  var k = 0
+  var t = 0
+  while k < 50 {
+    t = t + k
+    k = k + 1
+  }
+  return t + b.v
+}
+fun report(bad: Int) {
+  print("bad ")
+  print(bad)
+  print("\n")
+}
+fun main() {
+  let keeper = Keeper(pair: Pair(box: Box(v: 0), n: 0), slot: Slot.empty,
+                      cell: Cell(slot: Slot.empty, tag: 0))
+  var pairs: Array<Pair> = []
+  var cells: Array<Cell> = []
+  var j = 0
+  while j < 64 {
+    pairs.append(Pair(box: Box(v: 0), n: 0))
+    cells.append(Cell(slot: Slot.empty, tag: 0))
+    j = j + 1
+  }
+  var t = 0
+  var w = 0
+  while w < 20000 {
+    t = t + churn(w)                    // promote keeper and the arrays before the stores below
+    w = w + 1
+  }
+  var bad = 0
+  var i = 0
+  while i < 60000 {
+    let k = i % 64
+    keeper.pair = Pair(box: Box(v: i), n: i)
+    keeper.slot = Slot.full(box: Box(v: i + 1))
+    keeper.cell = Cell(slot: Slot.full(box: Box(v: i + 2)), tag: i)
+    pairs[k] = Pair(box: Box(v: i + 3), n: k)
+    cells[k] = Cell(slot: Slot.full(box: Box(v: i + 4)), tag: k)
+    t = t + churn(i) + churn(i + 1)
+    if keeper.pair.box.v != i || keeper.pair.n != i { bad = bad + 1 }
+    if slotValue(keeper.slot) != i + 1 { bad = bad + 1 }
+    if slotValue(keeper.cell.slot) != i + 2 || keeper.cell.tag != i { bad = bad + 1 }
+    if pairs[k].box.v != i + 3 { bad = bad + 1 }
+    if slotValue(cells[k].slot) != i + 4 { bad = bad + 1 }
+    i = i + 1
+  }
+  if t == 42 { print("\n") }
+  report(bad)
+}

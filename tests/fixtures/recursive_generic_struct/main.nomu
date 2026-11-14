@@ -1,0 +1,14 @@
+// A cycle through a generic's type argument: `Pair<T>` holds `T` inline, so `S` holding `Pair<S>` holds itself.
+struct Pair<T> {
+    var first: T
+    var second: T
+}
+
+struct S {
+    var p: Pair<S>
+    var n: Int
+}
+
+fun main() {
+    print(1)
+}

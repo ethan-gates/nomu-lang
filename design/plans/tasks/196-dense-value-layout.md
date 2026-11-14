@@ -1,7 +1,7 @@
 # Dense value layout — investigation and performance
 
 **Avenue:** Risk · **Type/Lifecycle:** `perf · evaluate` (codegen + runtime) · **Size:** M ·
-**Status:** evaluate — not opened · **Source:** [176](176-shaped-gc-roots.md) 176.5.1, which found codegen's
+**Status:** in progress — approach and reordering decided; 196.1 next · **Source:** [176](176-shaped-gc-roots.md) 176.5.1, which found codegen's
 field layout disagreeing with the GC descriptors and the erased path.
 
 ## Deliverable
@@ -43,6 +43,43 @@ what a dense layout would buy.
   the VWT must carry alignment and the erased path must compute padded offsets at run time; measure that
   cost on the erased-call benchmarks.
 
+## Decisions
+
+- **How the question is answered — measure the cost per type, decide on principle.** The programs in the
+  repository (benchmarks, examples, fixtures) hold almost no small fields, so a footprint survey over them
+  would read near zero whatever slots cost. 196 measures what slots cost where small fields occur (arrays
+  of `Bool`, `UInt8` and payload-free enums, arrays of flag-like structs, objects holding a few flags), the
+  access cost, and the erased path's cost with alignment; the decision weighs those magnitudes and what
+  comparable languages do (Swift, Go and Rust are all dense). A representative corpus for footprint
+  distributions is left to the benchmark against Go and Swift.
+- **The design evaluated — a Nomu layout function.** Size, alignment and field offsets per type, computed
+  in the midend beside `ShapeEnv` (which already computes slot counts) and read by codegen, the
+  descriptors, `shape(T)` and the erased path. LLVM's data layout is not an option: code outside
+  `llvmgen` cannot see it, and the shape model and the collector's maps live in the midend.
+- **Field reordering — decided: yes, by alignment.** Users never order fields for padding. The order is a
+  pure function of the field types (alignment descending, ties in declared order), so every build and
+  module agrees. Fields whose type is a type parameter keep a fixed place (after the others), so erased
+  code computes an offset as a running sum and never sorts at run time; specialized and erased code agree
+  because both apply the same rule. Under a build that specializes every generic, the rule could be
+  lifted for full reordering, but only build-wide, since layout is shared between modules. Debug info
+  records each field's offset, so debuggers show declared order. C layout for FFI types is left until FFI
+  exists (it would need a way to ask for declared order, which is a syntax decision).
+
+## Work
+
+- **196.1** Per-type cost under slots against dense: memory and time for arrays of `Bool`, `UInt8` and
+  payload-free enums, arrays of flag-like structs, and objects with a few small fields (allocation,
+  collection, iteration).
+- **196.2** Access cost: code size and instruction counts for small-field loads and stores, widened slots
+  against byte access.
+- **196.3** The erased path with alignment: the witness tables carry alignment, offsets become padded
+  running sums; measured on the erased-call benchmarks, against fully reordered offsets computed at run
+  time.
+- **196.4** Confirm nothing maps a Nomu struct onto memory laid out elsewhere (the runtime's records,
+  assembly), which reordering would break.
+- **196.5** The recommendation, and if dense, the layout function's design for [260](260-enum-layout.md)
+  and [181](181-array-managed-buffer.md) to build on.
+
 ## Exit
 
 A recommendation backed by the measurements: keep the slot rule, or adopt one of the dense designs, with
@@ -52,6 +89,7 @@ its expected footprint and time effect on the benchmark corpus.
 
 - After [176](176-shaped-gc-roots.md) 176.5.2 (the slot rule restored and checked), so measurements start
   from a correct baseline.
+- Before [260](260-enum-layout.md).4 (enum layout), which builds on the layout this task settles.
 - Feeds the GC benchmarking ([150](150-selfhosted-gc-ladder.md) GenImmix vs MMTk) and
   [178](178-runtime-gc-performance.md) (runtime and GC throughput): footprint changes nursery pressure.
 

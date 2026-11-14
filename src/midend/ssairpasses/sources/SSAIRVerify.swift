@@ -55,7 +55,10 @@ public func verifySSAIR(_ module: SSAModule) -> [String] {
     for a in module.aggregates where a.kind == .struct_ { structFields[a.name] = a.fields.map(\.type) }
     var enumCases: [String: [[Type]]] = [:]
     for e in module.enums { enumCases[e.name] = e.cases.map { $0.fields.map(\.type) } }
-    let shapes = ShapeEnv(structFields: { structFields[$0] }, enumCases: { enumCases[$0] })
+    var classFields: [String: [Type]] = [:]
+    for a in module.aggregates where a.kind == .class_ { classFields[a.name] = a.fields.map(\.type) }
+    let shapes = ShapeEnv(structFields: { structFields[$0] }, enumCases: { enumCases[$0] },
+                          classFields: { classFields[$0] })
     for f in module.functions { verifyFunction(f, shapes, &errs) }
     return errs
 }
