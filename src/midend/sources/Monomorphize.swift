@@ -167,8 +167,10 @@ private final class Monomorphizer {
             let params = l.generics.map { NOIRGenericParam(name: $0, bounds: []) }
             func fields(_ group: Int) -> [NOIRField] {
                 guard group < l.fields.count else { return [] }
-                return zip(l.fieldNames[group], l.fields[group]).map {
-                    NOIRField(name: $0, type: $1, isMutable: true, span: zero)
+                let marks = l.fromTypeParameter.flatMap { group < $0.count ? $0[group] : nil }
+                return zip(l.fieldNames[group], l.fields[group]).enumerated().map { i, f in
+                    NOIRField(name: f.0, type: f.1, isMutable: true, span: zero,
+                              fromTypeParameter: marks.map { i < $0.count && $0[i] } ?? false)
                 }
             }
             let decl: NOIRDecl
@@ -282,7 +284,8 @@ private final class Monomorphizer {
     }
 
     private func rewriteField(_ f: NOIRField, _ s: [String: Type]) -> NOIRField {
-        NOIRField(name: f.name, type: resolveType(f.type, s), isMutable: f.isMutable, span: f.span)
+        NOIRField(name: f.name, type: resolveType(f.type, s), isMutable: f.isMutable, span: f.span,
+                  fromTypeParameter: f.fromTypeParameter || f.type.mentionsTypeParameter)
     }
 
     private func rewriteActor(_ a: NOIRActor, _ s: [String: Type]) -> NOIRActor {

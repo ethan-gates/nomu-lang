@@ -13,6 +13,29 @@
 // form rtLiveCount describes. Type-ids come from codegen and are always valid, so nothing range-checks them.
 let rtDescSize = 32
 
+// A managed word below this address holds no object: null, or a reference's extra inhabitant (an enum keeps
+// its payload-free cases in its payload reference as the addresses 0, 1, 2, …). The first page
+// is unmapped on every supported platform, so no object lives there. Codegen's `referenceExtraInhabitants`
+// is the same bound.
+let rtNotObjectBound = 4096
+
+// Whether managed word `p` holds no object, so a trace or root walk skips it.
+fun rtNotObject(p: RawPtr) -> Bool {
+  let a = p.toInt()
+  return a >= 0 && a < rtNotObjectBound
+}
+
+// A managed word may carry a tag in its low 3 bits, which objects (8-byte aligned) leave clear: an enum whose
+// payloads are all references keeps its case there. The collector traces the word's object, `rtUntag`, and
+// writes a moved object back with the tag (`rtRefTag`) restored; every reader of a managed word masks it.
+fun rtRefTag(p: RawPtr) -> Int {
+  return p.toInt() % 8
+}
+
+fun rtUntag(p: RawPtr) -> RawPtr {
+  return p.advanced(by: 0 - rtRefTag(p))
+}
+
 fun rtDescField(tid: Int, at: Int) -> Int {
   return Runtime.loadInt32(Runtime.gcDescBase(), at: tid + at)
 }

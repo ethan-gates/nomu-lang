@@ -1,8 +1,9 @@
 # Array buffer onto `ManagedBuffer` — migrate + retire the ad-hoc kind-1 machinery
 
 **Avenue:** Infra (collections-storage consolidation) · **Type/Lifecycle:** `codegen · runtime · ready-to-build`
-· **Size:** M · **Status:** ready-to-build — split out of [180](180-managed-buffer.md) 180.4 so the
-byte-identical String re-key ships on its own; this task carries the one piece with a real layout change.
+· **Size:** M · **Status:** done — `Array`'s buffer is a `ManagedBuffer<EmptyHeader, Element>` at the
+element's own stride; split out of [180](180-managed-buffer.md) 180.4 so the byte-identical String re-key
+shipped on its own.
 · **Source:** the Array half of 180's "adopt" phase, separated because it changes `Array<small-scalar>`
 layout and wants its own differential baseline.
 
@@ -40,42 +41,48 @@ what moves is the stride constant and the descriptor, not the access width.
 
 ## Phases
 
-- **181.1 — packed stride + element access.** Route `EgressArrays` (`lowerArrayLit`, `elementAddr`,
-  `emitArraySet`, `emitArrayAppend`) off `arrayElemStride` onto `rawStride`, so codegen geometry and the
-  stamped descriptor share one stride source. This is where `Array<small-scalar>` layout changes (8-slot →
-  packed) and the element-offset math moves.
-- **181.2 — re-key the descriptor.** `arrayBufTypeId(elem)` becomes `managedBufferTypeId(header: EmptyHeader,
-  element: elem)`; the array buffer is then a genuine `ManagedBuffer` instance stamped with the shared
-  buffer descriptor. The `runtime.c` / `lib.rs` / `runtime.nomu` kind-1 scan is unchanged (same kind, same
-  geometry 180.1.2 already generalized).
-- **181.3 — differential baseline.** Keep `arr-gc` / `arr-gc-evac` green, and add small-scalar /
-  value-aggregate array cases (`Array<UInt8>`, `Array<Point>` with a managed field) exercised across the
-  moving collectors, run against the live array buffer as the regression oracle — the step 180.4 deferred
-  here. A stride or element-map mismatch strands or mis-scans an element and diverges from the baseline.
-- **181.4 — retire the ad-hoc machinery.** With String (180.4) and Array both migrated, delete
-  `registerArrayMap`, `arrayBufTypeId`, and `arrayElemStride`, leaving `registerBufferMap` /
-  `managedBufferTypeId` as the single buffer-descriptor path. `arrayHandleTypeId` (the fixed `{header, len,
-  bufptr}` handle) stays — it is a kind-0 object, not a buffer.
+- **181.1 — packed stride + element access.** Done. `EgressArrays` (`lowerArrayLit`, `elementAddr`,
+  `emitArraySet`, `emitArrayAppend`) steps by `rawStride` (the element's size in the value layout, at least 1,
+  since a descriptor stride of 0 marks a fixed object) from `arrayElementStart`. `Array<Bool>` and
+  `Array<UInt8>` step by 1 byte, a three-byte struct by 3, a zero-size struct by 1.
+- **181.2 — re-key the descriptor.** Done. `arrayBufTypeId(elem)` is
+  `managedBufferTypeId(header: EmptyHeader, element: elem)`; the runtime's buffer scan is unchanged.
+- **181.3 — differential baseline.** Done. `arr-gc` and `arr-gc-evac` pass; new fixture `gc_dense_arrays`
+  (arrays of `Bool`, `UInt8`, a three-byte struct, a struct whose reference precedes its byte field, a struct
+  holding a `String`, and a zero-size struct, built by literal and append and rewritten in place after they
+  survive collections) as suite cases `arr-dense` (GC stress), `arr-dense-release` and `arr-dense-immix`.
+  Full tier 1927 passed before the new cases.
+- **181.4 — retire the ad-hoc machinery.** Done. `registerArrayMap`, `arrayElemStride` and the array-buffer
+  cache are gone; `registerBufferMap` / `managedBufferTypeId` is the single buffer-descriptor path.
+  `arrayHandleTypeId` (the fixed `{header, len, bufptr}` handle) stays.
 
-## Open design fork
+Measured (196.1's pairs, best of 5): `Array<Bool>` and `Array<UInt8>` of 4M take 10 MB of RSS where they
+took 67 MB, matching the hand-packed buffers, and build in 47–49 ms where they took 64.
+
+## Open design fork — decided: keep the inline geometry
 
 Whether `EgressArrays` element store/load should be re-expressed on top of the `storeRef` / `ref` /
 `elementPtr` intrinsics built in [180](180-managed-buffer.md) 180.3, or keep its inline `storeField` geometry
-and share only the descriptor. Re-expressing removes the duplicated barrier/offset arithmetic (one element
-path for every collection); keeping it inline avoids threading `monoTypeArgs` through the array handle's
-element type at codegen. Decide at 181.1 — it sets how much of `EgressArrays` collapses.
+and share only the descriptor and stride. Kept inline: the layout change needs only the stride
+(`rawStride`) and the element start (`arrayElementStart`), and the buffer is byte-identical to a
+`ManagedBuffer<EmptyHeader, Element>` either way, which re-expressing through the intrinsics can still
+build on later.
 
 ## Shareability
 
 `ManagedBuffer` has no fields, so the share rule counts it, and any struct holding one, as shareable. That is
 sound for `String` (immutable bytes) and `Channel` (contents the runtime synchronizes,
 [102](102-channels.md)), but an `Array` on a `ManagedBuffer` is mutable: it must not become shareable this way.
-Give the buffer's shareability to its element type and its user, rather than to the class.
+Give the buffer's shareability to its element type and its user, rather than to the class. Not reached by
+this task: `Array` stays the builtin `.array` type, and only its buffer's descriptor and stride changed, so
+the share rule sees no `ManagedBuffer`.
 
 ## Dependencies
 
-- After [196](196-dense-value-layout.md) (dense value layout), which decides element layout and strides;
-  this task moves `Array` onto that layout rather than settling strides on its own.
+- A dependency of [196](196-dense-value-layout.md) (dense value layout), which owns dense layout for every
+  type and settled element layout: an element's stride is its size from 196's layout function
+  (`ShapeEnv.size`), so `Array<Bool>` and `Array<UInt8>` step by 1 byte once `Array` is a `ManagedBuffer`.
+  196's 196.9 re-measures the byte arrays after this task.
 
 ## Refs
 

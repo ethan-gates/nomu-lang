@@ -47,6 +47,7 @@ public struct OptimizerSettings {
     public var noFrameSplit = false
     public var noStackChecks = false
     public var libcDirect = false
+    public var noSpareBits = false
     // Compiled against the runtime prelude (`test.runtime_prelude`): a white-box test that calls runtime
     // internals by name (`FrameTable.runtimePrelude`).
     public var runtimePrelude = false
@@ -163,13 +164,14 @@ private func emitObjectAttempt(_ ssa: SSAModule, from noirModule: NOIRModule, to
     egress.e.measureNoLoopPolls = optimizer.noLoopPolls
     egress.e.measureNoStackChecks = optimizer.noStackChecks
     egress.e.measureLibcDirect = optimizer.libcDirect
+    egress.e.shapes.spareBits = !optimizer.noSpareBits
     egress.e.countsAllocations = gcRecordLevel > 1
     egress.e.emitsWriteBarrier = gcPlan == 0
     cgStage("llvm", "egress", onStage) { egress.lower(ssaModule, from: noirModule) }
     if let err = egress.error { return err }
     // The entry object must have `main`; a library object need not.
     if requireMain, !egress.loweredMain { return "LLVM: no `main` function to lower" }
-    if let err = checkHostSlotLayout(egress.e) { return err }
+    if let err = checkHostLayout(egress.e) { return err }
 
     var errorMessage: UnsafeMutablePointer<CChar>! = nil
     let verifyRC = cgStage("llvm", "verify", onStage) { LLVMVerifyModule(mod, LLVMReturnStatusAction, &errorMessage) }
@@ -232,9 +234,9 @@ public func objectTarget() -> (triple: String, cpu: String, features: String) {
 
 /// Emit an already-built, verified module to a native object file for the host triple, via
 /// `llvm-c/TargetMachine.h`. Returns nil on success, else an error message.
-// Run the 8-byte-slot layout check (`LLVMGen.checkSlotLayout`) under the host target's data layout, the one
+// Run the layout check (`LLVMGen.checkLayout`) under the host target's data layout, the one
 // `emitModuleObject` stamps onto the module.
-private func checkHostSlotLayout(_ gen: LLVMGen) -> String? {
+private func checkHostLayout(_ gen: LLVMGen) -> String? {
     let triple = LLVMGetDefaultTargetTriple()!
     defer { LLVMDisposeMessage(triple) }
     var target: LLVMTargetRef? = nil
@@ -250,7 +252,7 @@ private func checkHostSlotLayout(_ gen: LLVMGen) -> String? {
     defer { LLVMDisposeTargetMachine(tm) }
     let dl = LLVMCreateTargetDataLayout(tm)!
     defer { LLVMDisposeTargetData(dl) }
-    return gen.checkSlotLayout(dl)
+    return gen.checkLayout(dl)
 }
 
 private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: Bool,

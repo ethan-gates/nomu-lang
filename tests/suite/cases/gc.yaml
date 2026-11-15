@@ -251,6 +251,45 @@ cases:
     collections:
       - min: 1
 
+  - name: gc-actor-small-args
+    fixture: tests/fixtures/gc_actor_small_args
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "ok\n"
+    carriers:
+      - 1
+    collections:
+      - min: 1
+
+  - name: gc-dense-fields
+    fixture: tests/fixtures/gc_dense_fields
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 512
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+    collections:
+      - min: 1
+
+  - name: gc-dense-fields-release
+    fixture: tests/fixtures/gc_dense_fields
+    compile_settings:
+      optimize: true
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+    collections:
+      - min: 1
+
   - name: gc-oom
     fixture: tests/fixtures/gc_pressure
     compile_settings:
@@ -395,7 +434,7 @@ cases:
       escape: false
       rt_prelude: true
     expect:
-      stdout: "99\nTOTAL 2\nLIVE 0 1\nLIVE 1 1\nLIVE 2 0\nLIVE 3 0\nLIVE 4 0\nLIVE 5 0\nFP 32523553956047741\n"
+      stdout: "99\nTOTAL 2\nLIVE 0 1\nLIVE 1 1\nLIVE 2 0\nLIVE 3 0\nLIVE 4 0\nFP 32523553956047741\n"
     carriers: []
 
   - name: mark-verify-arr
@@ -404,7 +443,7 @@ cases:
       escape: false
       rt_prelude: true
     expect:
-      stdout: "TOTAL 5\nLIVE 0 1\nLIVE 1 1\nLIVE 2 3\nLIVE 3 0\nLIVE 4 0\nLIVE 5 0\nLIVE 6 0\nFP 219055701645145072\n"
+      stdout: "TOTAL 5\nLIVE 0 1\nLIVE 1 1\nLIVE 2 3\nLIVE 3 0\nLIVE 4 0\nLIVE 5 0\nFP 219055701645145072\n"
     carriers: []
 
   - name: walk-mark
@@ -536,6 +575,46 @@ cases:
     expect:
       stdout: "200\n19900\n"
     carriers: []
+    collections:
+      - min: 1
+
+  - name: arr-dense
+    fixture: tests/fixtures/gc_dense_arrays
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 512
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+    collections:
+      - min: 1
+
+  - name: arr-dense-release
+    fixture: tests/fixtures/gc_dense_arrays
+    compile_settings:
+      optimize: true
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+    collections:
+      - min: 1
+
+  - name: arr-dense-immix
+    fixture: tests/fixtures/gc_dense_arrays
+    compile_settings:
+      escape: false
+      gc_immix: true
+    run_settings:
+      gc_stress_bytes: 512
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
     collections:
       - min: 1
 

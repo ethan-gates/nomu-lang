@@ -1,0 +1,187 @@
+// Generic enums over every kind of payload, built and read on both sides of the erased boundary:
+// the library's bodies (erased under debug) construct and match `Option<T>`, `Option<Option<T>>`, a generic
+// enum with two payload-free cases, one whose payload has a `Bool` beside its `T`, one over a generic struct,
+// and one held in a generic class; this module (specialized) builds the same values and checks each answer,
+// for T a class, `Int`, `Bool`, `UInt8`, `String`, a payload-free enum and a non-generic enum over a class,
+// while `churn` allocates so a moving collection runs between reads.
+import pkg/lib
+
+class Box {
+  var v: Int
+}
+enum Color {
+  case red
+  case green
+  case blue
+}
+enum Slot {
+  case empty
+  case full(box: Box)
+}
+// Allocates on the heap (the boxes escape into the array), so collections land between reads.
+fun churn(i: Int) -> Int {
+  var boxes: Array<Box> = []
+  var k = 0
+  while k < 20 {
+    boxes.append(Box(v: i + k))
+    k = k + 1
+  }
+  var t = 0
+  k = 0
+  while k < boxes.count {
+    t = t + boxes[k].v
+    k = k + 1
+  }
+  return t
+}
+// A heap string whose length depends on `i`.
+fun heap(i: Int) -> String {
+  let s = "s".concat("-a-heap-string-of-some-length-")
+  if i % 3 == 0 {
+    return s.concat("-and-some-more")
+  }
+  return s
+}
+fun colorOf(i: Int) -> Color {
+  if i % 3 == 0 {
+    return Color.red
+  }
+  if i % 3 == 1 {
+    return Color.green
+  }
+  return Color.blue
+}
+fun colorN(c: Color) -> Int {
+  switch c {
+  case .red:
+    return 1
+  case .green:
+    return 2
+  case .blue:
+    return 3
+  }
+}
+fun slotN(s: Slot) -> Int {
+  switch s {
+  case .empty:
+    return -1
+  case .full(let b):
+    return b.v
+  }
+}
+fun bit(b: Bool) -> Int {
+  if b {
+    return 1
+  }
+  return 0
+}
+fun pick(c: Bool, a: Int, b: Int) -> Int {
+  if c {
+    return a
+  }
+  return b
+}
+fun check(bad: Int, got: Int, want: Int) -> Int {
+  if got != want {
+    return bad + 1
+  }
+  return bad
+}
+// Every library operation for one `i`, against what it must give.
+fun round(i: Int) -> Int {
+  var bad = 0
+  let some = i % 2 == 1
+  let box = Box(v: i)
+  let ob = wrap(box, some)
+  let s = heap(i)
+  let os = wrap(s, some)
+  let oi = wrap(i, some)
+  let obool = wrap(i % 4 == 1, some)
+  let ou8 = wrap((i % 250).uint8, some)
+  let oc = wrap(colorOf(i), some)
+  let oslot = wrap(Slot.full(box: box), some)
+  let oob = wrap(Option<Box>.some(value: box), some)
+  var sink = churn(i)
+  let fallback = Box(v: -7)
+  var want = -7
+  if some {
+    want = i
+  }
+  bad = check(bad, orElse(ob, fallback).v, want)
+  bad = check(bad, bit(isSome(ob)), bit(some))
+  // Built here, specialized, and read there.
+  let local = Option<Box>.some(value: box)
+  bad = check(bad, orElse(local, fallback).v, i)
+  bad = check(bad, bit(isSome(Option<Box>.none)), 0)
+  var wantS = 0
+  if some {
+    wantS = s.count
+  }
+  bad = check(bad, orElse(os, "").count, wantS)
+  bad = check(bad, orElse(oi, -1), pick(some, i, -1))
+  bad = check(bad, bit(orElse(obool, false)), bit(some && i % 4 == 1))
+  bad = check(bad, orElse(ou8, 255.uint8).int, pick(some, i % 250, 255))
+  bad = check(bad, colorN(orElse(oc, Color.blue)), pick(some, colorN(colorOf(i)), 3))
+  bad = check(bad, slotN(orElse(oslot, Slot.empty)), pick(some, i, -1))
+  bad = check(bad, bit(isSome(orElse(oob, Option<Box>.none))), bit(some))
+  // Read here, specialized, after building there.
+  switch ob {
+  case .some(let b):
+    bad = check(bad, b.v, i)
+  case .none:
+    bad = check(bad, bit(some), 0)
+  }
+  switch oi {
+  case .some(let v):
+    bad = check(bad, v, i)
+  case .none:
+    bad = check(bad, bit(some), 0)
+  }
+  sink = sink + churn(i + 1)
+  let w = wrapTwice(box, i)
+  bad = check(bad, depth(w), i % 3)
+  bad = check(bad, depth(wrapTwice(i, i)), i % 3)
+  bad = check(bad, depth(wrapTwice(colorOf(i), i)), i % 3)
+  let m = maybe3(box, i)
+  bad = check(bad, maybe3Kind(m), i % 3)
+  bad = check(bad, maybe3Or(m, fallback).v, pick(i % 3 == 1, i, -7))
+  bad = check(bad, maybe3Kind(maybe3(true, i)), i % 3)
+  bad = check(bad, maybe3Kind(maybe3(s, i)), i % 3)
+  switch m {
+  case .nothing:
+    bad = check(bad, i % 3, 0)
+  case .just(let b):
+    bad = check(bad, b.v, i)
+  case .gone:
+    bad = check(bad, i % 3, 2)
+  }
+  let f = flagged(box, i)
+  bad = check(bad, flaggedFlag(f), pick(i % 2 == 0, -1, bit(i % 4 == 1)))
+  bad = check(bad, flaggedOr(f, fallback).v, pick(i % 2 == 0, -7, i))
+  bad = check(bad, flaggedOr(flagged(i, i), -1), pick(i % 2 == 0, -1, i))
+  let p = wrapPair(box, i)
+  bad = check(bad, pairN(p), pick(i % 2 == 0, -1, i))
+  bad = check(bad, pairOr(p, fallback).v, pick(i % 2 == 0, -7, i))
+  bad = check(bad, pairOr(wrapPair(s, i), "").count, pick(i % 2 == 0, 0, s.count))
+  let c = cellOf(box, some)
+  sink = sink + churn(i + 2)
+  bad = check(bad, cellOr(c, fallback).v, want)
+  cellSet(c, Box(v: i + 1000), !some)
+  sink = sink + churn(i + 3)
+  bad = check(bad, cellOr(c, fallback).v, pick(some, -7, i + 1000))
+  if sink < 0 {
+    bad = bad + 1
+  }
+  return bad
+}
+fun main() {
+  var bad = 0
+  var i = 0
+  while i < 2000 {
+    bad = bad + round(i)
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

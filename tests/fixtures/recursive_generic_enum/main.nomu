@@ -1,4 +1,4 @@
-// A recursive generic enum: `cons` holds a `List<T>` inline.
+// A recursive generic enum: `cons` holds a `List<T>`, so its payload is boxed automatically.
 enum List<T> {
     case empty
     case cons(head: T, tail: List<T>)

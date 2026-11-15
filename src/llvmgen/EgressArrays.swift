@@ -8,21 +8,23 @@ import LLVM_C
 
 // SSAIR→LLVM egress — array emission: the managed `{header, len, buf}` handle layout, literal
 // construction, the bounds-check trap sequence, element addressing, and the `__arraySet`/
-// `__arrayAppend` builtins (append grows/copies the backing buffer). A capability namespace over the
+// `__arrayAppend` builtins (append grows/copies the backing buffer). The buffer is a
+// `ManagedBuffer<EmptyHeader, Element>`: `{ type-id, cap, elements }`, elements from `arrayElementStart`
+// at the element's stride in the value layout (`rawStride`). A capability namespace over the
 // `SSAIRToLLVM` reference; layout/alloc primitives are reached through `g.e`.
 enum EgressArrays {
 
     static func lowerArrayLit(_ g: SSAIRToLLVM, _ elements: [SSAValue], _ elem: Type, _ span: Span) -> LLVMValueRef? {
-        let stride = g.e.arrayElemStride(elem)
+        let stride = g.e.rawStride(elem), start = g.e.arrayElementStart
         let n = elements.count
         let handle = g.e.rtAllocManaged(LLVMConstInt(g.e.i64, 24, 0))
         LLVMBuildStore(g.b, g.e.descOffsetHeader(g.e.arrayHandleTypeId()), handle)
         LLVMBuildStore(g.b, LLVMConstInt(g.e.i64, UInt64(n), 0), g.e.gepByte(handle, LLVMConstInt(g.e.i64, 8, 0)))
-        let buf = g.e.rtAllocManaged(LLVMConstInt(g.e.i64, UInt64(16 + n * stride), 0))
+        let buf = g.e.rtAllocManaged(LLVMConstInt(g.e.i64, UInt64(start + n * stride), 0))
         LLVMBuildStore(g.b, g.e.descOffsetHeader(g.e.arrayBufTypeId(elem)), buf)
         LLVMBuildStore(g.b, LLVMConstInt(g.e.i64, UInt64(n), 0), g.e.gepByte(buf, LLVMConstInt(g.e.i64, 8, 0)))
         for (i, el) in elements.enumerated() {
-            g.e.storeField(buf, g.e.gepByte(buf, LLVMConstInt(g.e.i64, UInt64(16 + i * stride), 0)), g.val(el), type: elem)
+            g.e.storeField(buf, g.e.gepByte(buf, LLVMConstInt(g.e.i64, UInt64(start + i * stride), 0)), g.val(el), type: elem)
         }
         g.e.storeField(handle, g.e.gepByte(handle, LLVMConstInt(g.e.i64, 16, 0)), buf)
         return handle
@@ -45,8 +47,9 @@ enum EgressArrays {
 
     static func elementAddr(_ g: SSAIRToLLVM, _ handle: SSAValue, _ index: SSAValue, _ elemType: Type, _ span: Span) -> LLVMValueRef {
         let buf = LLVMBuildLoad2(g.b, g.e.p1, g.e.gepByte(g.val(handle), LLVMConstInt(g.e.i64, 16, 0)), "arr.buf")!
-        let stride = LLVMConstInt(g.e.i64, UInt64(g.e.arrayElemStride(elemType)), 0)
-        let off = LLVMBuildAdd(g.b, LLVMConstInt(g.e.i64, 16, 0), LLVMBuildMul(g.b, g.val(index), stride, "arr.mul"), "arr.off")!
+        let stride = LLVMConstInt(g.e.i64, UInt64(g.e.rawStride(elemType)), 0)
+        let start = LLVMConstInt(g.e.i64, UInt64(g.e.arrayElementStart), 0)
+        let off = LLVMBuildAdd(g.b, start, LLVMBuildMul(g.b, g.val(index), stride, "arr.mul"), "arr.off")!
         return g.e.gepByte(buf, off)
     }
 
@@ -56,8 +59,9 @@ enum EgressArrays {
         let len = LLVMBuildLoad2(g.b, g.e.i64, g.e.gepByte(handle, LLVMConstInt(g.e.i64, 8, 0)), "arr.len")!
         emitBoundscheck(g, idxV, len)
         let buf = LLVMBuildLoad2(g.b, g.e.p1, g.e.gepByte(handle, LLVMConstInt(g.e.i64, 16, 0)), "arr.buf")!
-        let stride = LLVMConstInt(g.e.i64, UInt64(g.e.arrayElemStride(args[2].type)), 0)
-        let off = LLVMBuildAdd(g.b, LLVMConstInt(g.e.i64, 16, 0), LLVMBuildMul(g.b, idxV, stride, "arr.mul"), "arr.off")!
+        let stride = LLVMConstInt(g.e.i64, UInt64(g.e.rawStride(args[2].type)), 0)
+        let start = LLVMConstInt(g.e.i64, UInt64(g.e.arrayElementStart), 0)
+        let off = LLVMBuildAdd(g.b, start, LLVMBuildMul(g.b, idxV, stride, "arr.mul"), "arr.off")!
         g.e.storeField(buf, g.e.gepByte(buf, off), value, type: args[2].type)
         return LLVMConstInt(g.e.i64, 0, 0)
     }
@@ -68,8 +72,8 @@ enum EgressArrays {
         // The element is read after the grow's allocation (in `app.cont`): a shaped element is read from its
         // home once a collection there has run (`storedOperands`).
         let handle = g.val(args[0])
-        let stride = g.e.arrayElemStride(elem)
-        let strideV = LLVMConstInt(g.e.i64, UInt64(stride), 0)
+        let strideV = LLVMConstInt(g.e.i64, UInt64(g.e.rawStride(elem)), 0)
+        let start = LLVMConstInt(g.e.i64, UInt64(g.e.arrayElementStart), 0)!
         let len = LLVMBuildLoad2(g.b, g.e.i64, g.e.gepByte(handle, LLVMConstInt(g.e.i64, 8, 0)), "app.len")!
         let buf0 = LLVMBuildLoad2(g.b, g.e.p1, g.e.gepByte(handle, LLVMConstInt(g.e.i64, 16, 0)), "app.buf")!
         let cap = LLVMBuildLoad2(g.b, g.e.i64, g.e.gepByte(buf0, LLVMConstInt(g.e.i64, 8, 0)), "app.cap")!
@@ -82,20 +86,20 @@ enum EgressArrays {
         let isZero = LLVMBuildICmp(g.b, LLVMIntEQ, cap, LLVMConstInt(g.e.i64, 0, 0), "app.cap0")!
         let dbl = LLVMBuildMul(g.b, cap, LLVMConstInt(g.e.i64, 2, 0), "app.dbl")!
         let newCap = LLVMBuildSelect(g.b, isZero, LLVMConstInt(g.e.i64, 4, 0), dbl, "app.newcap")!
-        let newBytes = LLVMBuildAdd(g.b, LLVMConstInt(g.e.i64, 16, 0), LLVMBuildMul(g.b, newCap, strideV, "app.nb"), "app.bytes")!
+        let newBytes = LLVMBuildAdd(g.b, start, LLVMBuildMul(g.b, newCap, strideV, "app.nb"), "app.bytes")!
         let newBuf = g.e.rtAllocManaged(newBytes)
         LLVMBuildStore(g.b, g.e.descOffsetHeader(g.e.arrayBufTypeId(elem)), newBuf)
         LLVMBuildStore(g.b, newCap, g.e.gepByte(newBuf, LLVMConstInt(g.e.i64, 8, 0)))
         let copyBytes = LLVMBuildMul(g.b, len, strideV, "app.copy")!
         let (memcpy, mty) = g.e.runtimeFn("memcpy", ret: g.e.i8ptr, params: [g.e.i8ptr, g.e.i8ptr, g.e.i64], varArg: false)
-        _ = g.e.buildCall(memcpy, mty, [g.e.toUnmanaged(g.e.gepByte(newBuf, LLVMConstInt(g.e.i64, 16, 0))),
-                                      g.e.toUnmanaged(g.e.gepByte(buf0, LLVMConstInt(g.e.i64, 16, 0))), copyBytes])
+        _ = g.e.buildCall(memcpy, mty, [g.e.toUnmanaged(g.e.gepByte(newBuf, start)),
+                                      g.e.toUnmanaged(g.e.gepByte(buf0, start)), copyBytes])
         g.e.storeField(handle, g.e.gepByte(handle, LLVMConstInt(g.e.i64, 16, 0)), newBuf)
         LLVMBuildBr(g.b, contBB)
 
         LLVMPositionBuilderAtEnd(g.b, contBB)
         let buf = LLVMBuildLoad2(g.b, g.e.p1, g.e.gepByte(handle, LLVMConstInt(g.e.i64, 16, 0)), "app.buf2")!
-        let off = LLVMBuildAdd(g.b, LLVMConstInt(g.e.i64, 16, 0), LLVMBuildMul(g.b, len, strideV, "app.mul"), "app.off")!
+        let off = LLVMBuildAdd(g.b, start, LLVMBuildMul(g.b, len, strideV, "app.mul"), "app.off")!
         g.e.storeField(buf, g.e.gepByte(buf, off), g.val(args[1]), type: elem)
         LLVMBuildStore(g.b, LLVMBuildAdd(g.b, len, LLVMConstInt(g.e.i64, 1, 0), "app.inc"), g.e.gepByte(handle, LLVMConstInt(g.e.i64, 8, 0)))
         return LLVMConstInt(g.e.i64, 0, 0)

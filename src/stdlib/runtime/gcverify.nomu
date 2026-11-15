@@ -164,7 +164,7 @@ fun rtVerifyHeap(space: RawPtr, slots: RawPtr, ns: Int, rem: RawPtr, nrem: Int, 
   var s = 0
   while s < ns {
     let slot: RawPtr = slots.load(fromByteOffset: s * 8)
-    let obj: RawPtr = slot.load(fromByteOffset: 0)
+    let obj = rtUntag(slot.load(fromByteOffset: 0))
     if !obj.isNull && rtVerifyBlockOf(space, obj.toInt()) >= 0 {
       if rtVsetAdd(seen, obj.toInt()) {
         if top == wcap {
@@ -278,8 +278,8 @@ fun rtVerifyHeap(space: RawPtr, slots: RawPtr, ns: Int, rem: RawPtr, nrem: Int, 
         }
       }
       if off >= 0 {
-        let child: RawPtr = obj.load(fromByteOffset: off)
-        if !child.isNull {
+        let child = rtUntag(obj.load(fromByteOffset: off))
+        if !rtNotObject(child) {
           let ca = child.toInt()
           let cb = rtVerifyBlockOf(space, ca)
           if when == 0 && srcMature && cb >= 0 && rtBlockState(space, cb) == 4 && !rtVsetHas(remSet, a) {

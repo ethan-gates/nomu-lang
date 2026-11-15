@@ -151,7 +151,7 @@ fun rtEvacuate(space: RawPtr, obj: RawPtr) -> RawPtr {
 // cycles resolve through the forwarded-bit guard in rtEvacuate and the mark-bit guard here, so every object
 // is copied and scanned exactly once.
 fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
-  let rootNull = root.eq(RawPtr.null)
+  let rootNull = rtNotObject(root)
   if rootNull {
     return root
   }
@@ -188,11 +188,13 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
       var i = 0
       while i < nptr {
         let off = rtOffsetListed(tid, obj, i)
-        let child: RawPtr = obj.load(fromByteOffset: off)
-        let childNull = child.eq(RawPtr.null)
+        let childWord: RawPtr = obj.load(fromByteOffset: off)
+        let childTag = rtRefTag(childWord)
+        let child = childWord.advanced(by: 0 - childTag)
+        let childNull = rtNotObject(child)
         if !childNull {
           let nc = rtEvacuate(space, child)
-          obj.store(nc, toByteOffset: off)
+          obj.store(nc.advanced(by: childTag), toByteOffset: off)
           if rtTryMarkBare(nc) {
             if top == wcap {
               work = rtStackGrow(work, top)
@@ -212,10 +214,12 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
       let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180): evacuate + write back
       while hk < nhdr {
         let hat = 16 + rtHeaderOffsetAt(tid, hk)
-        let hchild: RawPtr = obj.load(fromByteOffset: hat)
-        if !hchild.eq(RawPtr.null) {
+        let hchildWord: RawPtr = obj.load(fromByteOffset: hat)
+        let hchildTag = rtRefTag(hchildWord)
+        let hchild = hchildWord.advanced(by: 0 - hchildTag)
+        if !rtNotObject(hchild) {
           let hnc = rtEvacuate(space, hchild)
-          obj.store(hnc, toByteOffset: hat)
+          obj.store(hnc.advanced(by: hchildTag), toByteOffset: hat)
           if rtTryMarkBare(hnc) {
             if top == wcap {
               work = rtStackGrow(work, top)
@@ -240,11 +244,13 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
         while i < en {
           let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
-          let child: RawPtr = obj.load(fromByteOffset: at)
-          let childNull = child.eq(RawPtr.null)
+          let childWord: RawPtr = obj.load(fromByteOffset: at)
+          let childTag = rtRefTag(childWord)
+          let child = childWord.advanced(by: 0 - childTag)
+          let childNull = rtNotObject(child)
           if !childNull {
             let nc = rtEvacuate(space, child)
-            obj.store(nc, toByteOffset: at)
+            obj.store(nc.advanced(by: childTag), toByteOffset: at)
             if rtTryMarkBare(nc) {
               if top == wcap {
                 work = rtStackGrow(work, top)
@@ -328,11 +334,13 @@ fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> In
   var i = 0
   while i < nslots {
     let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
-    let old: RawPtr = slot.load(fromByteOffset: 0)
-    let oldNull = old.eq(RawPtr.null)
+    let oldWord: RawPtr = slot.load(fromByteOffset: 0)
+    let oldTag = rtRefTag(oldWord)
+    let old = oldWord.advanced(by: 0 - oldTag)
+    let oldNull = rtNotObject(old)
     if !oldNull {
       let new = rtImmixEvacMark(space, old)
-      slot.store(new, toByteOffset: 0)
+      slot.store(new.advanced(by: oldTag), toByteOffset: 0)
     }
     i = i + 1
   }
@@ -347,8 +355,8 @@ fun rtImmixCollectRootsDefrag(space: RawPtr, slotBuf: RawPtr, nslots: Int) -> In
   var j = 0
   while j < nslots {
     let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
-    let r: RawPtr = slot.load(fromByteOffset: 0)
-    let rNull = r.eq(RawPtr.null)
+    let r = rtUntag(slot.load(fromByteOffset: 0))
+    let rNull = rtNotObject(r)
     if !rNull {
       rtImmixUnmark(r)
     }
@@ -385,11 +393,13 @@ fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) ->
   var i = 0
   while i < nslots {
     let slot: RawPtr = slotBuf.load(fromByteOffset: i * 8)
-    let old: RawPtr = slot.load(fromByteOffset: 0)
-    let oldNull = old.eq(RawPtr.null)
+    let oldWord: RawPtr = slot.load(fromByteOffset: 0)
+    let oldTag = rtRefTag(oldWord)
+    let old = oldWord.advanced(by: 0 - oldTag)
+    let oldNull = rtNotObject(old)
     if !oldNull {
       let new = rtImmixEvacMark(space, old)
-      slot.store(new, toByteOffset: 0)
+      slot.store(new.advanced(by: oldTag), toByteOffset: 0)
     }
     i = i + 1
   }
@@ -407,8 +417,8 @@ fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) ->
   var j = 0
   while j < nslots {
     let slot: RawPtr = slotBuf.load(fromByteOffset: j * 8)
-    let r: RawPtr = slot.load(fromByteOffset: 0)
-    let rNull = r.eq(RawPtr.null)
+    let r = rtUntag(slot.load(fromByteOffset: 0))
+    let rNull = rtNotObject(r)
     if !rNull {
       rtGenUnmarkAndUnlog(space, r)            // unmark + set every survivor unlogged (mature)
     }
@@ -434,15 +444,17 @@ fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) ->
 // queue + the post-fixup list). Returns the updated promoted count. A mature/off-heap referent is unchanged
 // and not recorded — a minor GC never scans the mature space.
 fun rtMinorForward(space: RawPtr, fieldAddr: RawPtr, q: RawPtr, count: Int) -> Int {
-  let old: RawPtr = fieldAddr.load(fromByteOffset: 0)
-  let oldNull = old.eq(RawPtr.null)
+  let oldWord: RawPtr = fieldAddr.load(fromByteOffset: 0)
+  let oldTag = rtRefTag(oldWord)
+  let old = oldWord.advanced(by: 0 - oldTag)
+  let oldNull = rtNotObject(old)
   if oldNull {
     return count
   }
   let new = rtEvacuate(space, old)
   let moved = !new.eq(old)
   if moved {
-    fieldAddr.store(new, toByteOffset: 0)      // fix the slot to the survivor's mature address
+    fieldAddr.store(new.advanced(by: oldTag), toByteOffset: 0)      // fix the slot to the survivor's mature address
     if rtTryMarkBare(new) {
       rtQueuePush(q, count, new)               // first visit → enqueue for scanning + post-fixup (grows if full)
       return count + 1

@@ -36,10 +36,14 @@ public struct DictionaryLayout: Codable, Equatable {
     public let fields: [[Type]]
     public let fieldNames: [[String]]                 // parallel to `fields`
     public let caseNames: [String]                    // an enum's
+    // A struct's or class's fields that came from a type parameter (`NOIRField.fromTypeParameter`), parallel
+    // to `fields`; nil when none did. The value layout reads it, so a specialized type imported by name is
+    // laid out as its producer laid it out.
+    public let fromTypeParameter: [[Bool]]?
     public init(name: String, generics: [String], kind: NamedKind, fields: [[Type]], fieldNames: [[String]],
-                caseNames: [String] = []) {
+                caseNames: [String] = [], fromTypeParameter: [[Bool]]? = nil) {
         self.name = name; self.generics = generics; self.kind = kind; self.fields = fields
-        self.fieldNames = fieldNames; self.caseNames = caseNames
+        self.fieldNames = fieldNames; self.caseNames = caseNames; self.fromTypeParameter = fromTypeParameter
     }
 }
 
@@ -84,7 +88,7 @@ public struct DictionaryRecipes: Codable, Equatable {
                                                     needs: $0.needs.map(need)) },
             layouts: layouts.map { DictionaryLayout(name: name($0.name), generics: $0.generics, kind: $0.kind,
                                                     fields: $0.fields.map { $0.map(type) }, fieldNames: $0.fieldNames,
-                                                    caseNames: $0.caseNames) })
+                                                    caseNames: $0.caseNames, fromTypeParameter: $0.fromTypeParameter) })
     }
 }
 
@@ -216,15 +220,20 @@ private func needs(of body: [NOIRStmt], params: Set<String>, classes: Set<String
 public func dictionaryRecipes(_ decls: [NOIRDecl], imported: DictionaryRecipes? = nil) -> DictionaryRecipes? {
     var classes = Set<String>()
     var known: [String: DictionaryLayout] = [:]
+    func marks(_ fields: [NOIRField]) -> [[Bool]]? {
+        fields.contains { $0.fromTypeParameter } ? [fields.map(\.fromTypeParameter)] : nil
+    }
     for l in imported?.layouts ?? [] { known[l.name] = l }
     for decl in decls {
         switch decl {
         case .structDecl(let s):
             known[s.name] = DictionaryLayout(name: s.name, generics: s.generics.map(\.name), kind: .struct_,
-                                             fields: [s.fields.map(\.type)], fieldNames: [s.fields.map(\.name)])
+                                             fields: [s.fields.map(\.type)], fieldNames: [s.fields.map(\.name)],
+                                             fromTypeParameter: marks(s.fields))
         case .classDecl(let c):
             known[c.name] = DictionaryLayout(name: c.name, generics: c.generics.map(\.name), kind: .class_,
-                                             fields: [c.fields.map(\.type)], fieldNames: [c.fields.map(\.name)])
+                                             fields: [c.fields.map(\.type)], fieldNames: [c.fields.map(\.name)],
+                                             fromTypeParameter: marks(c.fields))
             if !c.generics.isEmpty { classes.insert(c.name) }
         case .enumDecl(let e):
             known[e.name] = DictionaryLayout(name: e.name, generics: e.generics.map(\.name), kind: .enum_,

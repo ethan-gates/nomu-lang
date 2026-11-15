@@ -59,9 +59,11 @@ final class RecordedSlotsTests: XCTestCase {
         let e = env()
         XCTAssertEqual(e.shape(.named("Pair", .struct_)).conditionalWords, [0], "the String's word0")
         XCTAssertEqual(e.shape(.named("Bag", .struct_)).conditionalWords, [], "a plain pointer needs no volatile load")
-        let en: [String: [[Type]]] = ["OptArr": [[.array(.int)], []]]
+        let en: [String: [[Type]]] = ["Either": [[.array(.int)], [.int]], "OptArr": [[.array(.int)], []]]
         let s = structs
         let withEnum = ShapeEnv(structFields: { s[$0] }, enumCases: { en[$0] })
-        XCTAssertEqual(withEnum.shape(.named("OptArr", .enum_)).conditionalWords, [8], "an enum payload's managed word")
+        XCTAssertEqual(withEnum.shape(.named("Either", .enum_)).conditionalWords, [0], "an enum payload's managed word, decoded by the tag")
+        XCTAssertEqual(withEnum.shape(.named("OptArr", .enum_)).conditionalWords, [],
+                       "over its payload's extra inhabitants, an enum's pointer is plain")
     }
 }

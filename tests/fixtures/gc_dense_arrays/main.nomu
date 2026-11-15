@@ -1,0 +1,106 @@
+// Arrays at the element's own stride across moving collections: one-byte elements (Bool, UInt8), a three-byte
+// struct (elements at unaligned offsets), a struct whose reference the layout moves ahead of its byte field, a
+// struct holding a String, and a zero-size struct. Built by literal and append, then rewritten in place once
+// the arrays have survived collections, so stores land in mature buffers.
+class Box {
+  var v: Int
+}
+struct Flags {
+  var a: Bool
+  var b: Bool
+  var c: UInt8
+}
+struct Tagged {
+  var t: UInt8
+  var box: Box
+}
+struct Named {
+  var lit: Bool
+  var s: String
+}
+struct Nothing {
+}
+fun churn(n: Int) -> Int {
+  var keep: Array<Box> = []
+  var i = 0
+  while i < n {
+    keep.append(Box(v: i))
+    if keep.count > 32 { keep = [] }
+    i = i + 1
+  }
+  return keep.count
+}
+fun text(i: Int) -> String {
+  return "dense-array-element-".concat("0123456789")
+}
+fun main() {
+  let n = 2000
+  var bad = 0
+  var bools: Array<Bool> = [true, false, true]
+  var bytes: Array<UInt8> = [1.uint8, 2.uint8]
+  var flags: Array<Flags> = [Flags(a: true, b: false, c: 9.uint8)]
+  var tagged: Array<Tagged> = []
+  var named: Array<Named> = []
+  var nothing: Array<Nothing> = [Nothing()]
+  var i = 0
+  while i < n {
+    bools.append(i % 3 == 0)
+    bytes.append((i % 251).uint8)
+    flags.append(Flags(a: i % 2 == 0, b: i % 5 == 0, c: (i % 7).uint8))
+    tagged.append(Tagged(t: (i % 13).uint8, box: Box(v: i)))
+    named.append(Named(lit: i % 2 == 1, s: text(i)))
+    nothing.append(Nothing())
+    if i % 100 == 0 { bad = bad + churn(500) * 0 }
+    i = i + 1
+  }
+  bad = bad + churn(20000) * 0
+  // Rewrite every other element in place, now that the buffers have survived collections.
+  i = 0
+  while i < n {
+    if i % 2 == 0 {
+      bools[i + 3] = i % 3 != 0
+      bytes[i + 2] = ((i + 1) % 251).uint8
+      flags[i + 1] = Flags(a: i % 2 != 0, b: i % 5 != 0, c: ((i + 1) % 7).uint8)
+      tagged[i] = Tagged(t: ((i + 1) % 13).uint8, box: Box(v: i + 1))
+      named[i] = Named(lit: i % 2 == 0, s: text(i))
+    }
+    i = i + 1
+  }
+  bad = bad + churn(20000) * 0
+  if !bools[0] || bools[1] || !bools[2] { bad = bad + 1 }
+  if bytes[0].int != 1 || bytes[1].int != 2 { bad = bad + 1 }
+  if !flags[0].a || flags[0].b || flags[0].c.int != 9 { bad = bad + 1 }
+  i = 0
+  while i < n {
+    let even = i % 2 == 0
+    let k = i
+    let bExpect = if0(even, k % 3 != 0, k % 3 == 0)
+    if bools[i + 3] != bExpect { bad = bad + 1 }
+    var by = i % 251
+    if even { by = (i + 1) % 251 }
+    if bytes[i + 2].int != by { bad = bad + 1 }
+    let f = flags[i + 1]
+    var fc = i % 7
+    if even { fc = (i + 1) % 7 }
+    if f.a != if0(even, i % 2 != 0, i % 2 == 0) || f.b != if0(even, i % 5 != 0, i % 5 == 0) || f.c.int != fc { bad = bad + 1 }
+    let t = tagged[i]
+    var tv = i
+    var tt = i % 13
+    if even {
+      tv = i + 1
+      tt = (i + 1) % 13
+    }
+    if t.box.v != tv || t.t.int != tt { bad = bad + 1 }
+    let nm = named[i]
+    if nm.lit != if0(even, true, i % 2 == 1) || nm.s.count != 30 { bad = bad + 1 }
+    i = i + 1
+  }
+  if nothing.count != n + 1 { bad = bad + 1 }
+  print("bad ")
+  print(bad)
+  print("\n")
+}
+fun if0(c: Bool, a: Bool, b: Bool) -> Bool {
+  if c { return a }
+  return b
+}

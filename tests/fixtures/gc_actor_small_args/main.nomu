@@ -1,0 +1,42 @@
+// Actor message arguments narrower than a word (two Bools) ahead of a reference. The message stores each
+// argument in its value-layout slot, where its GC descriptor looks; a packed Bool pair once moved the
+// reference off the word the collector scanned.
+class Box {
+  var v: Int
+}
+actor Worker {
+  var sum: Int = 0
+  on take(a: Bool, b: Bool, box: Box) {
+    if a { sum = sum + box.v }
+    if b { sum = sum + 1 }
+    var xs: Array<Box> = []
+    var w = 0
+    while w < 64 {
+      xs.append(Box(v: w))
+      w = w + 1
+    }
+  }
+  on report(want: Int) {
+    if sum != want {
+      print("BAD ")
+      print(sum)
+      print(" want ")
+      print(want)
+      print("\n")
+    } else {
+      print("ok\n")
+    }
+  }
+}
+fun main() {
+  let wk = Worker()
+  var want = 0
+  var i = 0
+  while i < 20000 {
+    wk.take(a: true, b: i % 2 == 0, box: Box(v: i))
+    want = want + i
+    if i % 2 == 0 { want = want + 1 }
+    i = i + 1
+  }
+  wk.report(want: want)
+}

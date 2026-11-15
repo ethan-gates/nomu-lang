@@ -1,29 +1,27 @@
 import noir
 import ast
 import support
+import ssair
 import LLVM_C
 
-// The 8-byte-slot layout check. Every Nomu layout other than codegen's LLVM types computes field offsets
-// as whole 8-byte slots (`slotCount`): the GC descriptors, enum payloads, array strides, the VWT sizes and
-// the erased path's offsets. Codegen's aggregate types must therefore place each field exactly where the slot
-// arithmetic says, or the collector scans the wrong words and an erased body reads the wrong bytes. This
-// compares, under the target's data layout, every aggregate type egress built against that arithmetic, and
-// reports the first disagreement as a compile error.
+// The layout check. Every Nomu layout other than codegen's LLVM types reads field offsets and sizes from the
+// value layout (`ShapeEnv.fieldsLayout`, `ShapeEnv.size`): the GC descriptors, enum payloads, array strides,
+// the VWT sizes and the erased path's offsets. Codegen's aggregate types must therefore place each field
+// exactly where the value layout says, or the collector scans the wrong words and an erased body reads the
+// wrong bytes. This compares, under the target's data layout, every aggregate type egress built against the
+// value layout, and reports the first disagreement as a compile error.
 extension LLVMGen {
-    func checkSlotLayout(_ dl: LLVMTargetDataRef) -> String? {
+    func checkLayout(_ dl: LLVMTargetDataRef) -> String? {
         func size(_ t: LLVMTypeRef) -> Int { Int(LLVMABISizeOfType(dl, t)) }
         func offset(_ t: LLVMTypeRef, _ i: Int) -> Int { Int(LLVMOffsetOfElement(dl, t, UInt32(i))) }
 
-        // Fields laid out from `base`: field i at `base` + the slots of fields before it, elements from
-        // `firstElem` on in `t`.
-        func checkFields(_ what: String, _ t: LLVMTypeRef, _ fields: [Type], base: Int, firstElem: Int) -> String? {
-            var want = base
+        // Field i at `want[i]`, element `index(i)` in `t`.
+        func checkFields(_ what: String, _ t: LLVMTypeRef, _ fields: [Type], _ want: [Int], _ index: (Int) -> Int) -> String? {
             for (i, f) in fields.enumerated() {
-                let got = offset(t, firstElem + i)
-                if got != want {
-                    return "internal: \(what) field \(i) (\(f)) is at byte \(got) in its LLVM layout but at \(want) in the 8-byte-slot layout"
+                let got = offset(t, index(i))
+                if got != want[i] {
+                    return "internal: \(what) field \(i) (\(f)) is at byte \(got) in its LLVM layout but at \(want[i]) in the value layout"
                 }
-                want += slotCount(f) * 8
             }
             return nil
         }
@@ -31,25 +29,76 @@ extension LLVMGen {
         for (name, t) in structTypes.sorted(by: { $0.key < $1.key }) {
             guard let s = structMap[name], !s.fields.isEmpty, LLVMGetTypeKind(t) == LLVMStructTypeKind,
                   !isShapedWrapper(.named(name, .struct_)) else { continue }
-            if let err = checkFields("struct \(name)", t, s.fields.map(\.type), base: 0, firstElem: 0) { return err }
-            if size(t) != slotCount(.named(name, .struct_)) * 8 {
-                return "internal: struct \(name) is \(size(t)) bytes in its LLVM layout but \(slotCount(.named(name, .struct_)) * 8) in the 8-byte-slot layout"
+            if let err = checkFields("struct \(name)", t, s.fields.map(\.type), shapes.structLayout(name).offsets,
+                                     { self.llvmFieldIndex(name, $0) }) {
+                return err
+            }
+            let want = sizeOf(.named(name, .struct_))
+            if size(t) != want {
+                return "internal: struct \(name) is \(size(t)) bytes in its LLVM layout but \(want) in the value layout"
             }
         }
         for (name, t) in classTypes.sorted(by: { $0.key < $1.key }) {
             guard let c = classMap[name] else { continue }
-            if let err = checkFields("class \(name)", t, c.fields.map(\.type), base: 8, firstElem: 1) { return err }
+            if let err = checkFields("class \(name)", t, c.fields.map(\.type), objectLayout(name).offsets,
+                                     { self.llvmFieldIndex(name, $0) }) {
+                return err
+            }
         }
         for (name, t) in actorTypes.sorted(by: { $0.key < $1.key }) {
             guard let a = actorMap[name] else { continue }
-            if let err = checkFields("actor \(name)", t, a.fields.map(\.type), base: 8, firstElem: 1) { return err }
+            if let err = checkFields("actor \(name)", t, a.fields.map(\.type), objectLayout(name).offsets,
+                                     { self.llvmFieldIndex(name, $0) }) {
+                return err
+            }
+            if offset(t, actorMailboxIndex(name)) != actorMailboxOffset(name) {
+                return "internal: actor \(name)'s mailbox is at byte \(offset(t, actorMailboxIndex(name))) in its LLVM layout but at \(actorMailboxOffset(name)) in the value layout"
+            }
         }
-        for name in enumTypes.keys.sorted() {
+        for (key, t) in messageTypes.sorted(by: { $0.key < $1.key }) {
+            let parts = key.split(separator: ":", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let h = actorMap[parts[0]]?.handlers.first(where: { $0.name == parts[1] }) else { continue }
+            if let err = checkFields("message \(key)", t, h.params.map(\.type), messageArgsLayout(h).offsets, { 4 + $0 }) {
+                return err
+            }
+        }
+        for (name, et) in enumTypes.sorted(by: { $0.key < $1.key }) {
             guard let en = enumMap[name] else { continue }
-            for c in en.cases where !c.fields.isEmpty {
-                guard let cst = caseStructType(name, c) else { continue }
-                if let err = checkFields("enum \(name) case \(c.name)", cst, c.fields.map(\.type), base: 0, firstElem: 0) {
+            let want = sizeOf(.named(name, .enum_))
+            if size(et) != want {
+                return "internal: enum \(name) is \(size(et)) bytes in its LLVM layout but \(want) in the value layout"
+            }
+            switch shapes.enumLayout(name) {
+            case .overExtraInhabitants(let p):
+                // The payload case's fields are the enum's elements.
+                let c = en.cases[p]
+                if let err = checkFields("enum \(name) case \(c.name)", et, c.fields.map(\.type),
+                                         shapes.enumCaseLayout(name, p).offsets, { $0 }) {
                     return err
+                }
+            case .tagOnly:
+                break
+            case .spareBits:
+                // Each case's struct is GEP'd over the region from byte 0.
+                for (ci, c) in en.cases.enumerated() where !c.fields.isEmpty {
+                    guard let cst = caseStructType(name, c) else { continue }
+                    if let err = checkFields("enum \(name) case \(c.name)", cst, c.fields.map(\.type),
+                                             shapes.enumCaseLayout(name, ci).offsets, { $0 }) {
+                        return err
+                    }
+                }
+            case .tagged(let tagOffset, _):
+                // Each case's struct is GEP'd over the payload region from byte 0; the tag is the last element.
+                for (ci, c) in en.cases.enumerated() where !c.fields.isEmpty {
+                    guard let cst = caseStructType(name, c) else { continue }
+                    if let err = checkFields("enum \(name) case \(c.name)", cst, c.fields.map(\.type),
+                                             shapes.enumCaseLayout(name, ci).offsets, { $0 }) {
+                        return err
+                    }
+                }
+                let last = Int(LLVMCountStructElementTypes(et)) - 1
+                if offset(et, last) != tagOffset {
+                    return "internal: enum \(name)'s tag is at byte \(offset(et, last)) in its LLVM layout but at \(tagOffset) in the value layout"
                 }
             }
         }

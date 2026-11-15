@@ -118,6 +118,15 @@ groups:
       - gc
     expect:
       stdout: "bad 0\n"
+  # Enum layouts: a tag only, over a payload's extra inhabitants, an appended tag; generic enums across the
+  # erased boundary; recursive enums, boxed.
+  - name: enum-layouts
+    fixtures: tests/fixtures/enum_layout_matrix/*
+    across:
+      - pipeline
+      - gc
+    expect:
+      stdout: "bad 0\n"
   - name: layout
     fixtures: tests/fixtures/layout_matrix/*
     across:

@@ -1,0 +1,33 @@
+// A recursive generic enum and compiled-once bodies over it: under the debug pipeline these run
+// erased, allocating `List$cons<T>` boxes through the generic-class path and reading them back.
+package enum List<T> {
+  case empty
+  case cons(head: T, tail: List<T>)
+}
+package fun push<T>(l: List<T>, v: T) -> List<T> {
+  return List<T>.cons(head: v, tail: l)
+}
+package fun count<T>(l: List<T>) -> Int {
+  switch l {
+  case .empty:
+    return 0
+  case .cons(let h, let t):
+    return 1 + count(t)
+  }
+}
+package fun headOr<T>(l: List<T>, d: T) -> T {
+  switch l {
+  case .empty:
+    return d
+  case .cons(let h, let t):
+    return h
+  }
+}
+package fun drop<T>(l: List<T>) -> List<T> {
+  switch l {
+  case .empty:
+    return l
+  case .cons(let h, let t):
+    return t
+  }
+}

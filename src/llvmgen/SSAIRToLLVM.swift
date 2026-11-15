@@ -67,6 +67,7 @@ final class SSAIRToLLVM {
     var curDictionary: LLVMValueRef? = nil            // this erased function's dictionary pointer, and its words
     var curDictionaryWords: [LLVMValueRef] = []
     var curSizes: [String: LLVMValueRef] = [:]        // each type parameter's size, read at entry
+    var curAligns: [String: LLVMValueRef] = [:]       // its alignment, read from its VWT at entry
     // This module's erased functions, by callable key: an erased body calls them through the witness ABI.
     var erasedSigs: [String: ExternalGenericSig] = [:]
     var curPWTParams: [String: LLVMValueRef] = [:]
@@ -103,11 +104,11 @@ final class SSAIRToLLVM {
         f.generics.flatMap { gp in gp.bounds.sorted().map { (gp.name, $0) } }
     }
 
-    // Derived-VWT layout (task 100.4.3.3.4; backend.md §4). The value layout is the uniform 8-byte-slot
-    // model, so a composed type's size is the sum of its fields' sizes with no alignment padding, and a
-    // field's offset is the running sum of the sizes before it. A type parameter's size is read from its
-    // VWT (runtime); a concrete type's from its static slot count. Enums are deferred (their tagged
-    // layout differs); only struct-composed types are synthesized here.
+    // Derived-VWT layout (task 100.4.3.3.4; backend.md §4): the value layout (`ShapeEnv.fieldsLayout`) computed
+    // at run time, since a type parameter's size and alignment come from its VWT. Each field sits at the next
+    // multiple of its alignment, a run ends rounded up to its largest alignment, and an enum is a tag word and
+    // a word-rounded payload, exactly as the static layout, so erased and specialized code agree. A concrete
+    // type's size and alignment are constants, which fold.
     private func erasedTypeSize(_ t: Type, _ span: Span) -> LLVMValueRef? {
         switch t {
         case .typeParam(let name):
@@ -119,68 +120,413 @@ final class SSAIRToLLVM {
             if e.classMap[base] != nil { return LLVMConstInt(e.i64, 8, 0) }   // a reference
             if let s = e.structMap[base] {
                 let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
-                var total = LLVMConstInt(e.i64, 0, 0)!
-                for f in s.fields {
-                    guard let fs = erasedTypeSize(substType(f.type, subst), span) else { return nil }
-                    total = LLVMBuildAdd(b, total, fs, "sz")!
-                }
-                return total
+                return erasedFieldsLayout(s.fields.map { substType($0.type, subst) }, order: erasedMemoryOrder(s.fields),
+                                          base: 0, span)?.end
             }
             if let en = e.enumMap[base] {
-                // Tagged layout: one tag word, then a payload region sized to the largest case (task
-                // 100.4.3.3.4). Each case's payload size is a prefix sum of its field sizes; the max is a
-                // runtime select chain, since a `T`-carrying case's size is only known via the VWT.
-                let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
-                var maxPayload = LLVMConstInt(e.i64, 0, 0)!
-                for c in en.cases {
-                    var caseSize = LLVMConstInt(e.i64, 0, 0)!
-                    for f in c.fields {
-                        guard let fs = erasedTypeSize(substType(f.type, subst), span) else { return nil }
-                        caseSize = LLVMBuildAdd(b, caseSize, fs, "csz")!
-                    }
-                    let bigger = LLVMBuildICmp(b, LLVMIntUGT, caseSize, maxPayload, "big")!
-                    maxPayload = LLVMBuildSelect(b, bigger, caseSize, maxPayload, "maxpl")!
+                guard let l = erasedEnumLayout(en, args, span) else { return nil }
+                switch l.kind {
+                case .tagOnly(let w):
+                    return const64(w)
+                case .single, .multi:
+                    return l.size
+                case .spareBits:
+                    return const64(e.shapes.size(.named(base, .enum_)))
                 }
-                return LLVMBuildAdd(b, LLVMConstInt(e.i64, 8, 0), maxPayload, "enumsz")!   // tag + payload
             }
             e.fail("100.4.3.3.4: no layout for generic '\(base)'", span); return nil
         default:
-            return LLVMConstInt(e.i64, UInt64(e.slotCount(t) * 8), 0)
+            return LLVMConstInt(e.i64, UInt64(e.sizeOf(t)), 0)
         }
     }
 
-    // The runtime byte offset of field `fieldIndex` in a struct-composed generic — the running sum of
-    // the sizes of the fields before it (8-byte-slot model, no padding).
+    // A type's alignment: a type parameter's from its VWT, a composed generic's the largest of its fields'
+    // (an enum's and a class reference's a word), a concrete type's from the value layout.
+    private func erasedAlign(_ t: Type, _ span: Span) -> LLVMValueRef? {
+        switch t {
+        case .typeParam(let name):
+            guard let a = curAligns[name] else { e.fail("no alignment for type parameter '\(name)'", span); return nil }
+            return a
+        case .generic(let base, let args):
+            if let s = e.structMap[base] {
+                let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
+                return erasedFieldsLayout(s.fields.map { substType($0.type, subst) }, base: 0, span)?.align
+            }
+            if let en = e.enumMap[base] {
+                guard let l = erasedEnumLayout(en, args, span) else { return nil }
+                switch l.kind {
+                case .tagOnly(let w): return const64(w)
+                case .single, .multi: return l.align
+                case .spareBits: return const64(e.shapes.align(.named(base, .enum_)))
+                }
+            }
+            return LLVMConstInt(e.i64, 8, 0)
+        default:
+            return LLVMConstInt(e.i64, UInt64(e.shapes.align(t)), 0)
+        }
+    }
+
+    // The run-time layout of fields placed in `order` (declared positions; declared order when nil) from byte
+    // `base`: the end rounded up to the largest alignment, that alignment, and the offset of field `offsetOf`.
+    private func erasedFieldsLayout(_ types: [Type], order: [Int]? = nil, base: Int, _ span: Span, offsetOf: Int? = nil)
+        -> (end: LLVMValueRef, align: LLVMValueRef, offset: LLVMValueRef?)? {
+        var off = LLVMConstInt(e.i64, UInt64(base), 0)!
+        var maxAlign = LLVMConstInt(e.i64, 1, 0)!
+        var offset: LLVMValueRef? = nil
+        for k in order ?? Array(types.indices) {
+            let t = types[k]
+            guard let size = erasedTypeSize(t, span), let a = erasedAlign(t, span) else { return nil }
+            off = alignUp(off, a)
+            if k == offsetOf { offset = off }
+            off = LLVMBuildAdd(b, off, size, "end")!
+            maxAlign = umax(maxAlign, a)
+        }
+        return (alignUp(off, maxAlign), maxAlign, offset)
+    }
+
+    // A struct's or class's template fields in memory order (`ShapeEnv.memoryOrder`): the fields whose type
+    // mentions no type parameter by alignment, largest first, then the rest in declared order, as the
+    // specialized type's fields are placed. The first group's alignments are compile-time constants.
+    private func erasedMemoryOrder(_ fields: [NOIRField]) -> [Int] {
+        let marks = fields.map { $0.type.mentionsTypeParameter }
+        let aligns = fields.map { $0.type.mentionsTypeParameter ? 0 : staticAlign($0.type) }
+        return fields.indices.sorted { a, b in
+            if marks[a] != marks[b] { return !marks[a] }
+            if !marks[a], aligns[a] != aligns[b] { return aligns[a] > aligns[b] }
+            return a < b
+        }
+    }
+
+    // The alignment of a type that mentions no type parameter: a generic struct application's from its
+    // template's fields, since the shape environment knows only its specialized name.
+    private func staticAlign(_ t: Type) -> Int {
+        if case .generic(let base, let args) = t, let s = e.structMap[base] {
+            let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
+            return s.fields.reduce(1) { max($0, staticAlign(substType($1.type, subst))) }
+        }
+        // A generic enum application's from its run-time layout, which folds to a constant when no argument is a
+        // type parameter.
+        if case .generic(let base, _) = t, e.enumMap[base] != nil, let a = erasedAlign(t, e.zeroSpan),
+           LLVMIsAConstantInt(a) != nil {
+            return Int(LLVMConstIntGetZExtValue(a))
+        }
+        if case .generic = t { return 8 }
+        return e.shapes.align(t)
+    }
+
+    // The run-time byte offset of field `fieldIndex` in a struct-composed generic. A struct value buffer
+    // starts at offset 0; a **class** object (reference receiver, task 100.4.3.9) starts its user fields past
+    // the 8-byte object header. Past the last field it is the value's size, or the object's (rounded up to a
+    // word, as `objectSize`), which `lowerErasedAlloc` allocates.
     private func erasedFieldOffset(_ composed: Type, _ fieldIndex: Int, _ span: Span) -> LLVMValueRef? {
         guard case .generic(let base, let args) = composed else { return LLVMConstInt(e.i64, 0, 0) }
-        // A struct value buffer starts at offset 0; a **class** object (reference receiver, task 100.4.3.9)
-        // starts its user fields past the 8-byte i64 object header. Either way the running offset is the
-        // VWT-derived sum of prior field sizes.
-        let generics: [NOIRGenericParam], fields: [NOIRField], header: UInt64
+        let generics: [NOIRGenericParam], fields: [NOIRField], header: Int
         if let s = e.structMap[base] { generics = s.generics; fields = s.fields; header = 0 }
         else if let c = e.classMap[base] { generics = c.generics; fields = c.fields; header = 8 }
         else { return LLVMConstInt(e.i64, 0, 0) }
         let subst = Dictionary(uniqueKeysWithValues: zip(generics.map(\.name), args))
-        var off = LLVMConstInt(e.i64, header, 0)!
-        for j in 0..<min(fieldIndex, fields.count) {
-            guard let fs = erasedTypeSize(substType(fields[j].type, subst), span) else { return nil }
-            off = LLVMBuildAdd(b, off, fs, "off")!
-        }
-        return off
+        guard let l = erasedFieldsLayout(fields.map { substType($0.type, subst) }, order: erasedMemoryOrder(fields),
+                                         base: header, span, offsetOf: fieldIndex) else { return nil }
+        if let offset = l.offset { return offset }
+        return header == 0 ? l.end : alignUp(l.end, LLVMConstInt(e.i64, 8, 0))
     }
 
-    // The runtime byte offset of payload field `fieldIndex` of case `caseIndex` in an erased generic
-    // enum: past the tag word (offset 8), then the running sum of the case's prior field sizes.
+    // The run-time byte offset of payload field `fieldIndex` of case `caseIndex` in an erased generic enum:
+    // every payload begins at byte 0.
     private func erasedEnumPayloadOffset(_ base: String, _ args: [Type], _ caseIndex: Int, _ fieldIndex: Int, _ span: Span) -> LLVMValueRef? {
-        guard let en = e.enumMap[base], caseIndex < en.cases.count else { return LLVMConstInt(e.i64, 8, 0) }
+        guard let en = e.enumMap[base], caseIndex < en.cases.count else { return const64(0) }
         let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
         let fields = en.cases[caseIndex].fields
-        var off = LLVMConstInt(e.i64, 8, 0)!   // past the tag word
-        for j in 0..<min(fieldIndex, fields.count) {
-            guard let fs = erasedTypeSize(substType(fields[j].type, subst), span) else { return nil }
-            off = LLVMBuildAdd(b, off, fs, "poff")!
+        guard fieldIndex < fields.count else { return const64(0) }
+        return erasedFieldsLayout(fields.map { substType($0.type, subst) }, base: 0, span, offsetOf: fieldIndex)?.offset
+    }
+
+    private func payloadCaseCount(_ en: NOIREnum) -> Int { en.cases.filter { !$0.fields.isEmpty }.count }
+
+    private func const64(_ v: Int) -> LLVMValueRef { LLVMConstInt(e.i64, UInt64(bitPattern: Int64(v)), 0) }
+
+    // MARK: Erased enum layout
+
+    // A type's extra inhabitants at run time (`ExtraInhabitants`), each an `i64`; a count of 0 means none.
+    struct DynExtraInhabitants {
+        var count, offset, first, width, shift: LLVMValueRef
+    }
+
+    // An enum's layout at run time: `ShapeEnv.enumLayout`'s rules, over the type arguments' value witnesses in an
+    // erased body, or the static layout as constants. Which cases have payloads fixes the kind; over one payload
+    // case, whether the other cases live in the payload's extra inhabitants (`overXI`) is decided at run time,
+    // and the payload's extra inhabitants, the appended tag's place, the size and the alignment with it. With
+    // several (`multi`), the tag follows the largest payload.
+    struct DynEnumLayout {
+        enum Kind { case tagOnly(width: Int), single(payloadCase: Int), multi, spareBits(payloadCases: [Int], tagOffset: Int) }
+        let kind: Kind
+        let cases: Int
+        var overXI: LLVMValueRef? = nil
+        var payloadXI: DynExtraInhabitants? = nil
+        var tagOffset: LLVMValueRef? = nil
+        var tagWidth: LLVMValueRef? = nil
+        var size: LLVMValueRef? = nil
+        var align: LLVMValueRef? = nil
+    }
+
+    private func constXI(_ x: ExtraInhabitants?) -> DynExtraInhabitants? {
+        guard let x else { return nil }
+        return DynExtraInhabitants(count: const64(x.count), offset: const64(x.offset), first: const64(x.first),
+                                   width: const64(x.width), shift: const64(x.shift))
+    }
+
+    private func shiftedXI(_ x: DynExtraInhabitants, by off: LLVMValueRef) -> DynExtraInhabitants {
+        var y = x
+        y.offset = LLVMBuildAdd(b, x.offset, off, "xi.off")!
+        return y
+    }
+
+    // The one with more extra inhabitants, ties to `a` (the earlier field), as `ShapeEnv` picks.
+    private func moreXI(_ a: DynExtraInhabitants?, _ x: DynExtraInhabitants) -> DynExtraInhabitants {
+        guard let a else { return x }
+        let more = LLVMBuildICmp(b, LLVMIntUGT, x.count, a.count, "xi.more")!
+        func pick(_ p: LLVMValueRef, _ q: LLVMValueRef) -> LLVMValueRef { LLVMBuildSelect(b, more, p, q, "xi.pick")! }
+        return DynExtraInhabitants(count: pick(x.count, a.count), offset: pick(x.offset, a.offset),
+                                   first: pick(x.first, a.first), width: pick(x.width, a.width), shift: pick(x.shift, a.shift))
+    }
+
+    // An integer field of `width` bytes whose values from `used` are unused (`ExtraInhabitants.unusedValues`).
+    private func unusedValues(offset: LLVMValueRef, width: Int, used: Int) -> DynExtraInhabitants {
+        let x = ExtraInhabitants.unusedValues(offset: 0, width: width, used: used)
+        return DynExtraInhabitants(count: const64(x.count), offset: offset, first: const64(used), width: const64(width),
+                                   shift: const64(0))
+    }
+
+    // A type's extra inhabitants in an erased body: a type parameter's from its value witness, a composed
+    // generic's from its parts, a concrete type's from the static layout.
+    private func erasedExtraInhabitants(_ t: Type, _ span: Span) -> DynExtraInhabitants? {
+        switch t {
+        case .typeParam(let name):
+            guard let vwt = curVWTParams[name] else { return nil }
+            let x = e.loadVWTExtraInhabitants(vwt)
+            return DynExtraInhabitants(count: x.count, offset: x.offset, first: x.first, width: x.width, shift: x.shift)
+        case .generic(let base, let args):
+            if e.classMap[base] != nil {
+                return constXI(ExtraInhabitants(offset: 0, width: 8, first: 0, count: ShapeEnv.referenceExtraInhabitants))
+            }
+            if let s = e.structMap[base] {
+                let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
+                var best: DynExtraInhabitants? = nil
+                for (i, f) in s.fields.enumerated() {
+                    guard let x = erasedExtraInhabitants(substType(f.type, subst), span),
+                          let off = erasedFieldOffset(t, i, span) else { continue }
+                    best = moreXI(best, shiftedXI(x, by: off))
+                }
+                return best
+            }
+            if let en = e.enumMap[base], let l = erasedEnumLayout(en, args, span) { return enumXI(l) }
+            return nil
+        case .array, .function, .existential, .composition:
+            return constXI(ExtraInhabitants(offset: 0, width: 8, first: 0, count: ShapeEnv.referenceExtraInhabitants))
+        default:
+            return constXI(e.shapes.extraInhabitants(t))
         }
-        return off
+    }
+
+    // An enum's own extra inhabitants, from its layout (`ShapeEnv.extraInhabitants`).
+    private func enumXI(_ l: DynEnumLayout) -> DynExtraInhabitants? {
+        switch l.kind {
+        case .tagOnly(let w):
+            return unusedValues(offset: const64(0), width: w, used: l.cases)
+        case .spareBits(_, let tagOffset):
+            return constXI(ExtraInhabitants(offset: tagOffset, width: 8, shift: EnumLayout.spareBitShift, first: l.cases,
+                                            count: (ShapeEnv.referenceExtraInhabitants >> EnumLayout.spareBitShift) - l.cases))
+        case .single, .multi:
+            let used = l.cases - 1
+            let narrow = ShapeEnv.tagWidth(l.cases)
+            let wordTag = LLVMBuildICmp(b, LLVMIntEQ, l.tagWidth!, const64(8), "tag.word")!
+            let tagCount = LLVMBuildSelect(b, wordTag, unusedValues(offset: const64(0), width: 8, used: l.cases).count,
+                                           unusedValues(offset: const64(0), width: narrow, used: l.cases).count, "tag.count")!
+            let tagged = DynExtraInhabitants(count: tagCount, offset: l.tagOffset!, first: const64(l.cases),
+                                             width: l.tagWidth!, shift: const64(0))
+            if case .multi = l.kind { return tagged }
+            guard let x = l.payloadXI else {
+                // With no payload extra inhabitants the cases sit over the payload only when there is one case.
+                let none = DynExtraInhabitants(count: const64(0), offset: const64(0), first: const64(0),
+                                               width: const64(8), shift: const64(0))
+                return l.cases == 1 ? none : tagged
+            }
+            let over = DynExtraInhabitants(count: LLVMBuildSub(b, x.count, const64(used), "xi.left")!, offset: x.offset,
+                                           first: LLVMBuildAdd(b, x.first, const64(used), "xi.first")!,
+                                           width: x.width, shift: x.shift)
+            let o = l.overXI!
+            func pick(_ p: LLVMValueRef, _ q: LLVMValueRef) -> LLVMValueRef { LLVMBuildSelect(b, o, p, q, "xi.enum")! }
+            return DynExtraInhabitants(count: pick(over.count, tagged.count), offset: pick(over.offset, tagged.offset),
+                                       first: pick(over.first, tagged.first), width: pick(over.width, tagged.width),
+                                       shift: pick(over.shift, tagged.shift))
+        }
+    }
+
+    // An erased generic enum's layout from its template and arguments.
+    private func erasedEnumLayout(_ en: NOIREnum, _ args: [Type], _ span: Span) -> DynEnumLayout? {
+        let n = en.cases.count
+        let payloadCases = en.cases.indices.filter { !en.cases[$0].fields.isEmpty }
+        if payloadCases.isEmpty { return DynEnumLayout(kind: .tagOnly(width: ShapeEnv.tagWidth(n)), cases: n) }
+        let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
+        // The spare-bit rule reads the template's field types, which are what a specialized instance's marks
+        // record: a field mentioning a type parameter never qualifies, so a qualifying template's layout is the
+        // static one.
+        if payloadCases.allSatisfy({ c in !en.cases[c].fields.contains { $0.type.mentionsTypeParameter } }),
+           case .spareBits(let payloads, let tagOffset) = e.shapes.enumLayout(en.name) {
+            return DynEnumLayout(kind: .spareBits(payloadCases: payloads, tagOffset: tagOffset), cases: n)
+        }
+        guard payloadCases.count == 1, let p = payloadCases.first else {
+            // The payload region: the largest payload's end and the largest alignment; the tag follows it.
+            var end = const64(0), align = const64(1)
+            for c in payloadCases {
+                guard let l = erasedFieldsLayout(en.cases[c].fields.map { substType($0.type, subst) }, base: 0, span) else { return nil }
+                end = umax(end, l.end)
+                align = umax(align, l.align)
+            }
+            let wide = LLVMBuildICmp(b, LLVMIntUGE, align, const64(8), "pl.wide")!
+            let tagWidth = LLVMBuildSelect(b, wide, const64(8), const64(ShapeEnv.tagWidth(n)), "tag.w")!
+            let tagOffset = alignUp(end, tagWidth)
+            let taggedAlign = umax(align, tagWidth)
+            return DynEnumLayout(kind: .multi, cases: n, tagOffset: tagOffset, tagWidth: tagWidth,
+                                 size: alignUp(LLVMBuildAdd(b, tagOffset, tagWidth, "tag.end")!, taggedAlign), align: taggedAlign)
+        }
+        let fields = en.cases[p].fields.map { substType($0.type, subst) }
+        guard let payload = erasedFieldsLayout(fields, base: 0, span) else { return nil }
+        var xi: DynExtraInhabitants? = nil
+        for (i, f) in fields.enumerated() {
+            guard let x = erasedExtraInhabitants(f, span),
+                  let off = erasedFieldsLayout(fields, base: 0, span, offsetOf: i)?.offset else { continue }
+            xi = moreXI(xi, shiftedXI(x, by: off))
+        }
+        let overXI = xi.map { LLVMBuildICmp(b, LLVMIntUGE, $0.count, const64(n - 1), "xi.fits")! }
+            ?? LLVMConstInt(e.i1, n == 1 ? 1 : 0, 0)!
+        let wide = LLVMBuildICmp(b, LLVMIntUGE, payload.align, const64(8), "pl.wide")!
+        let tagWidth = LLVMBuildSelect(b, wide, const64(8), const64(ShapeEnv.tagWidth(n)), "tag.w")!
+        let tagOffset = alignUp(payload.end, tagWidth)
+        let taggedAlign = umax(payload.align, tagWidth)
+        let taggedSize = alignUp(LLVMBuildAdd(b, tagOffset, tagWidth, "tag.end")!, taggedAlign)
+        return DynEnumLayout(kind: .single(payloadCase: p), cases: n, overXI: overXI, payloadXI: xi,
+                             tagOffset: tagOffset, tagWidth: tagWidth,
+                             size: LLVMBuildSelect(b, overXI, payload.end, taggedSize, "enum.size")!,
+                             align: LLVMBuildSelect(b, overXI, payload.align, taggedAlign, "enum.align")!)
+    }
+
+    // A named enum's static layout in the same form, so the code that reads and writes a case serves both.
+    private func namedEnumLayout(_ name: String) -> DynEnumLayout? {
+        guard let en = e.enumMap[name] else { return nil }
+        let n = en.cases.count
+        let payloadXI = { (p: Int) in self.constXI(self.e.shapes.payloadExtraInhabitants(en.cases[p].fields.map(\.type))) }
+        switch e.shapes.enumLayout(name) {
+        case .tagOnly(let w):
+            return DynEnumLayout(kind: .tagOnly(width: w), cases: n)
+        case .overExtraInhabitants(let p):
+            return DynEnumLayout(kind: .single(payloadCase: p), cases: n, overXI: LLVMConstInt(e.i1, 1, 0),
+                                 payloadXI: payloadXI(p), tagOffset: const64(0), tagWidth: const64(8))
+        case .tagged(let off, let w):
+            let payloads = en.cases.indices.filter { !en.cases[$0].fields.isEmpty }
+            if payloads.count == 1, let p = payloads.first {
+                return DynEnumLayout(kind: .single(payloadCase: p), cases: n, overXI: LLVMConstInt(e.i1, 0, 0),
+                                     payloadXI: payloadXI(p), tagOffset: const64(off), tagWidth: const64(w))
+            }
+            return DynEnumLayout(kind: .multi, cases: n, tagOffset: const64(off), tagWidth: const64(w))
+        case .spareBits(let payloads, let tagOffset):
+            return DynEnumLayout(kind: .spareBits(payloadCases: payloads, tagOffset: tagOffset), cases: n)
+        }
+    }
+
+    // The case index of the enum at `buf`, as an `i64`. Over the payload's extra inhabitants, the k-th past its
+    // first unused value is the k-th payload-free case (declared order, skipping the payload case), and any
+    // other value is the payload case.
+    private func loadEnumCase(_ buf: LLVMValueRef, _ l: DynEnumLayout) -> LLVMValueRef {
+        switch l.kind {
+        case .tagOnly(let w):
+            return e.loadUInt(buf, width: const64(w))
+        case .multi:
+            return e.loadUInt(e.gepByte(buf, l.tagOffset!), width: l.tagWidth!)
+        case .spareBits(let payloads, let tagOffset):
+            let word = LLVMBuildLoad2(b, e.i64, e.gepByte(buf, const64(tagOffset)), "sb.word")!
+            return spareBitCase(word, allPayloads: payloads.count == l.cases)
+        case .single(let p):
+            guard let x = l.payloadXI else {
+                return l.cases == 1 ? const64(p) : e.loadUInt(e.gepByte(buf, l.tagOffset!), width: l.tagWidth!)
+            }
+            let o = l.overXI!
+            let addr = e.gepByte(buf, LLVMBuildSelect(b, o, x.offset, l.tagOffset!, "tag.off")!)
+            let v = e.loadUInt(addr, width: LLVMBuildSelect(b, o, x.width, l.tagWidth!, "tag.width")!)
+            let k = LLVMBuildSub(b, LLVMBuildLShr(b, v, x.shift, "xi.v")!, x.first, "xi.k")!
+            let isEmpty = LLVMBuildICmp(b, LLVMIntULT, k, const64(l.cases - 1), "xi.empty")!
+            let past = LLVMBuildICmp(b, LLVMIntUGE, k, const64(p), "xi.past")!
+            let emptyCase = LLVMBuildAdd(b, k, LLVMBuildZExt(b, past, e.i64, "xi.skip")!, "xi.case")!
+            let fromXI = LLVMBuildSelect(b, isEmpty, emptyCase, const64(p), "xi.tag")!
+            return LLVMBuildSelect(b, o, fromXI, v, "etag")!
+        }
+    }
+
+    // A spare-bit enum's case index from its word (an `i64`): `word >> 3` below the first page, `word & 7` above;
+    // with no payload-free case, `word & 7` alone.
+    private func spareBitCase(_ word: LLVMValueRef, allPayloads: Bool) -> LLVMValueRef {
+        if allPayloads { return LLVMBuildAnd(b, word, const64(7), "sb.c")! }
+        let isEmpty = LLVMBuildICmp(b, LLVMIntULT, word, const64(ShapeEnv.referenceExtraInhabitants), "sb.empty")!
+        return LLVMBuildSelect(b, isEmpty, LLVMBuildLShr(b, word, const64(EnumLayout.spareBitShift), "sb.k")!,
+                               LLVMBuildAnd(b, word, const64(7), "sb.c")!, "sb.tag")!
+    }
+
+    // A spare-bit enum's reference: the word less its own low bits, the same address computation in every case,
+    // so arms that read the same field merge. A pointer derived from the word, which the statepoint rewrite
+    // relocates.
+    private func spareBitUntag(_ word: LLVMValueRef) -> LLVMValueRef {
+        let low = LLVMBuildAnd(b, LLVMBuildPtrToInt(b, word, e.i64, "sb.int")!, const64(7), "sb.low")!
+        return e.gepByte(word, LLVMBuildNeg(b, low, "sb.back")!)
+    }
+
+    // Write case `caseIndex` (an `i64`) into the enum at `buf`, whose payload is already in place: the payload
+    // case's, or zero for a payload-free case.
+    private func storeEnumCase(_ buf: LLVMValueRef, _ l: DynEnumLayout, _ caseIndex: LLVMValueRef) {
+        switch l.kind {
+        case .tagOnly(let w):
+            e.storeUInt(buf, width: const64(w), caseIndex)
+        case .multi:
+            e.storeUInt(e.gepByte(buf, l.tagOffset!), width: l.tagWidth!, caseIndex)
+        case .spareBits(let payloads, let tagOffset):
+            // A payload case adds its index to the reference already stored; a payload-free case is `c << 3`.
+            let buf = e.gepByte(buf, const64(tagOffset))
+            var isPayload = LLVMConstInt(e.i1, 0, 0)!
+            for c in payloads {
+                isPayload = LLVMBuildOr(b, isPayload, LLVMBuildICmp(b, LLVMIntEQ, caseIndex, const64(c), "sb.isc")!, "sb.pl")!
+            }
+            let stored = LLVMBuildLoad2(b, e.i64, buf, "sb.ref")!
+            let tagged = LLVMBuildAdd(b, stored, caseIndex, "sb.tagged")!
+            let empty = LLVMBuildShl(b, caseIndex, const64(EnumLayout.spareBitShift), "sb.k")!
+            LLVMBuildStore(b, LLVMBuildSelect(b, isPayload, tagged, empty, "sb.word")!, buf)
+        case .single(let p):
+            let tagAddr = e.gepByte(buf, l.tagOffset!)
+            guard let x = l.payloadXI else {
+                if l.cases > 1 { e.storeUInt(tagAddr, width: l.tagWidth!, caseIndex) }
+                return
+            }
+            // Over the payload's extra inhabitants the payload case leaves the field as it is: it stores back the
+            // value already there. The address is one offset from `buf`, so it stays a pointer derived from it.
+            let o = l.overXI!
+            let isPayload = LLVMBuildICmp(b, LLVMIntEQ, caseIndex, const64(p), "is.payload")!
+            let past = LLVMBuildZExt(b, LLVMBuildICmp(b, LLVMIntUGT, caseIndex, const64(p), "past")!, e.i64, "skip")!
+            let k = LLVMBuildSub(b, caseIndex, past, "xi.k")!
+            let xiValue = LLVMBuildShl(b, LLVMBuildAdd(b, x.first, k, "xi.n")!, x.shift, "xi.value")!
+            let addr = e.gepByte(buf, LLVMBuildSelect(b, o, x.offset, l.tagOffset!, "case.off")!)
+            let width = LLVMBuildSelect(b, o, x.width, l.tagWidth!, "case.width")!
+            let kept = LLVMBuildSelect(b, isPayload, e.loadUInt(addr, width: width), xiValue, "xi.kept")!
+            e.storeUInt(addr, width: width, LLVMBuildSelect(b, o, kept, caseIndex, "case.value")!)
+        }
+    }
+
+    private func umax(_ x: LLVMValueRef, _ y: LLVMValueRef) -> LLVMValueRef {
+        LLVMBuildSelect(b, LLVMBuildICmp(b, LLVMIntUGT, x, y, "gt")!, x, y, "max")!
+    }
+
+    // `v` rounded up to a multiple of the power of two `a`.
+    private func alignUp(_ v: LLVMValueRef, _ a: LLVMValueRef) -> LLVMValueRef {
+        let one = LLVMConstInt(e.i64, 1, 0)!
+        let bumped = LLVMBuildAdd(b, v, LLVMBuildSub(b, a, one, "am1")!, "bump")!
+        return LLVMBuildAnd(b, bumped, LLVMBuildNeg(b, a, "amask")!, "aligned")!
     }
 
     // Substitute a composed type's template type-parameter names with its actual arguments.
@@ -257,50 +603,73 @@ final class SSAIRToLLVM {
         if let leaf = e.shapes.leaf(t) { return loadLeafWords(p, leaf) }
         var agg = LLVMBuildLoad2(b, lt, p, "ld")!
         for off in words {
-            guard let path = wordPath(lt, off) else {
+            guard let (path, wt) = wordPath(lt, off) else {
                 e.fail("internal: no 8-byte word at byte \(off) of \(t)'s LLVM type", e.zeroSpan)
                 continue
             }
-            let w = LLVMBuildLoad2(b, e.i64, e.gepByte(p, LLVMConstInt(e.i64, UInt64(off), 0)), "ld.w")!
+            let w = LLVMBuildLoad2(b, wt, e.gepByte(p, LLVMConstInt(e.i64, UInt64(off), 0)), "ld.w")!
             LLVMSetVolatile(w, 1)
             agg = insertWord(agg, path, w)
         }
         return agg
     }
 
-    // The index path to the `i64` word at byte `off` of an aggregate's LLVM type, laid out in 8-byte slots
-    // (the layout `checkSlotLayout` holds codegen to): struct elements in order, array elements by stride.
-    private func wordPath(_ t: LLVMTypeRef, _ off: Int) -> [UInt32]? {
+    // The index path to the word at byte `off` of an aggregate's LLVM type, and the word's type (an `i64`, or
+    // a pointer: an enum's payload reference ahead of an appended tag), under LLVM's natural layout (the layout
+    // `checkLayout` holds codegen to): struct elements each at the next multiple of their alignment, array
+    // elements by size.
+    private func wordPath(_ t: LLVMTypeRef, _ off: Int) -> ([UInt32], LLVMTypeRef)? {
         switch LLVMGetTypeKind(t) {
         case LLVMStructTypeKind:
             var at = 0
             for i in 0..<LLVMCountStructElementTypes(t) {
                 let et = LLVMStructGetTypeAtIndex(t, i)!
-                let size = slotBytes(et)
-                if off < at + size { return wordPath(et, off - at).map { [i] + $0 } }
+                at = ShapeEnv.alignUp(at, naturalAlign(et))
+                let size = naturalSize(et)
+                if off < at + size { return off >= at ? wordPath(et, off - at).map { ([i] + $0.0, $0.1) } : nil }
                 at += size
             }
             return nil
         case LLVMArrayTypeKind:
             let et = LLVMGetElementType(t)!
-            let size = slotBytes(et)
+            let size = naturalSize(et)
             guard size > 0, off / size < Int(LLVMGetArrayLength2(t)) else { return nil }
-            return wordPath(et, off % size).map { [UInt32(off / size)] + $0 }
-        case LLVMIntegerTypeKind where LLVMGetIntTypeWidth(t) == 64:
-            return off == 0 ? [] : nil
+            return wordPath(et, off % size).map { ([UInt32(off / size)] + $0.0, $0.1) }
+        case LLVMIntegerTypeKind where LLVMGetIntTypeWidth(t) == 64, LLVMPointerTypeKind:
+            return off == 0 ? ([], t) : nil
         default:
             return nil
         }
     }
 
-    // Bytes an LLVM type fills in the 8-byte-slot layout: every scalar a slot (small fields are stored
-    // widened), aggregates the sum of their parts.
-    private func slotBytes(_ t: LLVMTypeRef) -> Int {
+    // An LLVM type's size and alignment under its natural layout, for the types codegen builds aggregates
+    // from: `i1` and `i8` one byte, `i64`, `double` and pointers eight, structs and arrays from their parts.
+    private func naturalAlign(_ t: LLVMTypeRef) -> Int {
         switch LLVMGetTypeKind(t) {
         case LLVMStructTypeKind:
-            return (0..<LLVMCountStructElementTypes(t)).reduce(0) { $0 + slotBytes(LLVMStructGetTypeAtIndex(t, $1)!) }
+            return (0..<LLVMCountStructElementTypes(t)).reduce(1) { max($0, naturalAlign(LLVMStructGetTypeAtIndex(t, $1)!)) }
         case LLVMArrayTypeKind:
-            return Int(LLVMGetArrayLength2(t)) * slotBytes(LLVMGetElementType(t)!)
+            return naturalAlign(LLVMGetElementType(t)!)
+        case LLVMIntegerTypeKind:
+            return max(Int(LLVMGetIntTypeWidth(t)) / 8, 1)
+        default:
+            return 8
+        }
+    }
+
+    private func naturalSize(_ t: LLVMTypeRef) -> Int {
+        switch LLVMGetTypeKind(t) {
+        case LLVMStructTypeKind:
+            var at = 0
+            for i in 0..<LLVMCountStructElementTypes(t) {
+                let et = LLVMStructGetTypeAtIndex(t, i)!
+                at = ShapeEnv.alignUp(at, naturalAlign(et)) + naturalSize(et)
+            }
+            return ShapeEnv.alignUp(at, naturalAlign(t))
+        case LLVMArrayTypeKind:
+            return Int(LLVMGetArrayLength2(t)) * naturalSize(LLVMGetElementType(t)!)
+        case LLVMIntegerTypeKind:
+            return max(Int(LLVMGetIntTypeWidth(t)) / 8, 1)
         default:
             return 8
         }
@@ -393,7 +762,7 @@ final class SSAIRToLLVM {
         // `EmptyHeader` is compiler GC substrate (task 174.5.1): the zero-field `ManagedBuffer` header codegen
         // names for a heap `String`'s byte buffer (`managedBufferTypeId(EmptyHeader, UInt8)`). It carries no
         // symbols and is never written in source, so it is a compiler builtin — seed its zero-field layout so
-        // `slotCount` and the descriptors read headerSize 0, with no prepended decl.
+        // the value layout and the descriptors read headerSize 0, with no prepended decl.
         if e.structMap["EmptyHeader"] == nil {
             e.structMap["EmptyHeader"] = NOIRStruct(name: "EmptyHeader", fields: [], methods: [],
                                                     span: Span(startOffset: -1, endOffset: -1, map: nil))
@@ -403,7 +772,8 @@ final class SSAIRToLLVM {
         for agg in module.aggregates where e.classMap[agg.name] == nil && agg.kind == .class_ {
             e.classMap[agg.name] = NOIRClass(
                 name: agg.name,
-                fields: agg.fields.map { NOIRField(name: $0.name, type: $0.type, isMutable: $0.isMutable, span: agg.span) },
+                fields: agg.fields.map { NOIRField(name: $0.name, type: $0.type, isMutable: $0.isMutable, span: agg.span,
+                                                   fromTypeParameter: $0.fromTypeParameter) },
                 methods: [], span: agg.span)
         }
 
@@ -765,7 +1135,7 @@ final class SSAIRToLLVM {
         values = [:]; blockMap = [:]; blocksById = [:]; selectOptions = [:]; selectSlots = [:]; pendingIncomings.removeAll(keepingCapacity: true)
         shapedHome = [:]; shapedLive = nil; shapedSlots = [:]; slotRoot = RecordedSlots(); shapedSlotLive = nil
         curVWTParams = [:]; curPWTParams = [:]; curSretParam = nil; curReturnType = nil
-        curDictionary = nil; curDictionaryWords = []; curSizes = [:]
+        curDictionary = nil; curDictionaryWords = []; curSizes = [:]; curAligns = [:]
         curProducerSave = nil; curBackEdges = [:]; headerSaveSlot = [:]; curBlockId = -1
         curFnName = f.name
         e.currentFn = c.fn
@@ -829,6 +1199,7 @@ final class SSAIRToLLVM {
                 for gp in f.generics {
                     curVWTParams[gp.name] = word()
                     curSizes[gp.name] = LLVMBuildPtrToInt(b, word(), e.i64, "size")
+                    if let vwt = curVWTParams[gp.name] { curAligns[gp.name] = e.loadVWTAlign(vwt) }
                 }
                 for pw in erasedPWTs(f) { curPWTParams["\(pw.param)::\(pw.iface)"] = word() }
             }
@@ -1076,9 +1447,23 @@ final class SSAIRToLLVM {
                 push(e.valueWitness(t))
                 return
             }
-            if let en = e.enumMap[base] {
+            if let en = e.enumMap[base], payloadCaseCount(en) <= 1 {
+                // One payload case: its components are registered whatever the case. A payload-free case holds
+                // the zeroed payload with an extra inhabitant written in, which holds no object.
                 let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
-                let tag = LLVMBuildLoad2(b, e.i64, e.gepByte(buf, baseOff), "root.tag")!
+                for (c, kase) in en.cases.enumerated() {
+                    for (i, f) in kase.fields.enumerated() {
+                        let ft = substType(f.type, subst)
+                        guard mentionsTypeParam(ft),
+                              let foff = erasedEnumPayloadOffset(base, args, c, i, span) else { continue }
+                        registerErasedComponents(buf, ft, LLVMBuildAdd(b, baseOff, foff, "coff")!, span, when: when)
+                    }
+                }
+                return
+            }
+            if let en = e.enumMap[base], let l = erasedEnumLayout(en, args, span) {
+                let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
+                let tag = loadEnumCase(e.gepByte(buf, baseOff), l)
                 for (c, kase) in en.cases.enumerated() {
                     var active = LLVMBuildICmp(b, LLVMIntEQ, tag, LLVMConstInt(e.i64, UInt64(c), 0), "root.case")!
                     if let when { active = LLVMBuildAnd(b, when, active, "root.when")! }
@@ -1262,14 +1647,18 @@ final class SSAIRToLLVM {
             if e.isShapedWrapper(base.type) {
                 define(inst, val(base))
             } else {
-                let raw = LLVMBuildExtractValue(b, val(base), UInt32(idx), "fld")!
+                guard case .named(let name, _) = base.type else { e.fail("extractField on a non-nominal value", span); return }
+                let raw = LLVMBuildExtractValue(b, val(base), UInt32(e.llvmFieldIndex(name, idx)), "fld")!
                 define(inst, inst.result.map { e.fromFieldStorage(raw, $0.type) } ?? raw)
             }
         case .enumTag(let base):
-            if case .generic = base.type {
-                define(inst, LLVMBuildLoad2(b, e.i64, val(base), "etag"))   // tag word at offset 0 of the buffer
+            if case .generic(let gb, let ga) = base.type {
+                guard let en = e.enumMap[gb], let l = erasedEnumLayout(en, ga, span) else {
+                    e.fail("enumTag on a non-enum generic", span); return
+                }
+                define(inst, loadEnumCase(val(base), l))
             } else {
-                define(inst, LLVMBuildExtractValue(b, val(base), 0, "tag"))
+                define(inst, enumTag(base, span))
             }
         case .extractPayload(let base, let caseIndex, let fieldIndex):
             define(inst, extractPayload(base, caseIndex, fieldIndex, inst.result!.type, span))
@@ -1453,12 +1842,8 @@ final class SSAIRToLLVM {
         if case .generic(let base, _) = t, let c = e.classMap[base] { return lowerErasedAlloc(t, fields: c.fields.count, span) }
         guard case .named(let name, let kind) = t else { e.fail("7.2.3: alloc of non-nominal type", span); return nil }
         let obj: LLVMValueRef
-        if kind == .actor_, let a = e.actorMap[name] {
-            let slots = 2 + a.fields.reduce(0) { $0 + e.slotCount($1.type) }   // header + fields + mailbox
-            obj = e.rtAllocManaged(LLVMConstInt(e.i64, UInt64(slots * 8), 0))
-        } else if let c = e.classMap[name] {
-            let slots = 1 + c.fields.reduce(0) { $0 + e.slotCount($1.type) }   // header + fields
-            obj = e.rtAllocManaged(LLVMConstInt(e.i64, UInt64(slots * 8), 0))
+        if e.actorMap[name] != nil || e.classMap[name] != nil {
+            obj = e.rtAllocManaged(LLVMConstInt(e.i64, UInt64(e.objectSize(name)), 0))
         } else {
             e.fail("7.2.3: alloc of unknown heap type '\(name)'", span); return nil
         }
@@ -1496,13 +1881,13 @@ final class SSAIRToLLVM {
         switch kind {
         case .struct_:
             guard let st = e.structType(name) else { return nil }
-            return e.structGEP(st, val(base), idx)
+            return e.structGEP(st, val(base), e.llvmFieldIndex(name, idx))
         case .class_:
             guard let ct = e.classType(name) else { return nil }
-            return e.structGEP(ct, val(base), e.fieldLLVMIndex(.classRef, idx))
+            return e.structGEP(ct, val(base), e.llvmFieldIndex(name, idx))
         case .actor_:
             guard let at = e.actorType(name) else { return nil }
-            return e.structGEP(at, val(base), e.fieldLLVMIndex(.classRef, idx))
+            return e.structGEP(at, val(base), e.llvmFieldIndex(name, idx))
         default:
             e.fail("7.2.3: fieldAddr on '\(name)'", span); return nil
         }
@@ -1542,7 +1927,7 @@ final class SSAIRToLLVM {
         }
         var agg = LLVMGetUndef(st)
         for (idx, f) in fields.enumerated() {
-            agg = LLVMBuildInsertValue(b, agg, e.toFieldStorage(val(f), f.type), UInt32(idx), "")
+            agg = LLVMBuildInsertValue(b, agg, e.toFieldStorage(val(f), f.type), UInt32(e.llvmFieldIndex(name, idx)), "")
         }
         return agg
     }
@@ -1552,9 +1937,13 @@ final class SSAIRToLLVM {
         // A residual composed generic enum (`Opt<T>`) is built into a derived-VWT-sized stack buffer: the
         // tag word at offset 0, then each payload field copied to its offset (task 100.4.3.3.4).
         if case .generic(let base, let args) = t, let en = e.enumMap[base], caseIndex < en.cases.count {
-            guard let size = erasedTypeSize(t, span) else { return nil }
+            guard let size = erasedTypeSize(t, span), let l = erasedEnumLayout(en, args, span) else { return nil }
             let buf = e.runtimeSizedBuffer(size, "erased.enum", checked: curChecksStack)
-            LLVMBuildStore(b, LLVMConstInt(e.i64, UInt64(caseIndex), 0), buf)   // tag (i64) at offset 0
+            if case .tagOnly = l.kind {} else {
+                // A payload-free case is the zeroed payload with its extra inhabitant or tag written in.
+                let (memset, msty) = e.runtimeFn("memset", ret: e.i8ptr, params: [e.i8ptr, e.i32, e.i64], varArg: false)
+                _ = e.buildCall(memset, msty, [buf, LLVMConstInt(e.i32, 0, 0), size])
+            }
             let subst = Dictionary(uniqueKeysWithValues: zip(en.generics.map(\.name), args))
             for (i, f) in en.cases[caseIndex].fields.enumerated() where i < fields.count {
                 guard let off = erasedEnumPayloadOffset(base, args, caseIndex, i, span) else { return nil }
@@ -1570,25 +1959,108 @@ final class SSAIRToLLVM {
                     if mentionsTypeParam(ft) { registerErasedComponents(buf, ft, off, span) }   // a generic class
                 }
             }
+            storeEnumCase(buf, l, const64(caseIndex))
             return buf
         }
         guard case .named(let name, _) = t, let et = e.enumType(name),
               let en = e.enumMap[name] else { e.fail("7.2.3: makeEnum of non-enum", span); return nil }
-        // A payload-free case is a constant: its tag and a zero payload region.
-        if fields.isEmpty {
-            var elems: [LLVMValueRef?] = [LLVMConstInt(e.i64, UInt64(caseIndex), 0), LLVMConstNull(LLVMStructGetTypeAtIndex(et, 1))]
-            return elems.withUnsafeMutableBufferPointer { LLVMConstNamedStruct(et, $0.baseAddress, 2) }
-        }
-        let slot = e.entryAlloca(et, "enum")
-        LLVMBuildStore(b, LLVMConstInt(e.i64, UInt64(caseIndex), 0), e.structGEP(et, slot, 0))
-        if !fields.isEmpty {
-            guard let cst = e.caseStructType(name, en.cases[caseIndex]) else { return nil }
-            let payload = e.structGEP(et, slot, 1)
-            for (idx, f) in fields.enumerated() {
-                LLVMBuildStore(b, val(f), e.structGEP(cst, payload, idx))
+        switch e.shapes.enumLayout(name) {
+        case .tagOnly:
+            var elems: [LLVMValueRef?] = [LLVMConstInt(LLVMStructGetTypeAtIndex(et, 0), UInt64(caseIndex), 0)]
+            return elems.withUnsafeMutableBufferPointer { LLVMConstNamedStruct(et, $0.baseAddress, 1) }
+        case .overExtraInhabitants(let p):
+            if caseIndex == p { return payloadAggregate(et, en.cases[p], fields) }
+            // A payload-free case: the zeroed payload with the case's extra inhabitant written in.
+            guard let x = e.shapes.payloadExtraInhabitants(en.cases[p].fields.map(\.type)) else {
+                e.fail("enum \(name) has no extra inhabitants for its cases", span); return nil
             }
+            let k = e.shapes.enumExtraInhabitantIndex(name, caseIndex)
+            let value = UInt64(x.first + k) << UInt64(x.shift)
+            if value == 0 { return LLVMConstNull(et) }
+            let slot = e.entryAlloca(et, "enum")
+            LLVMBuildStore(b, LLVMConstNull(et), slot)
+            LLVMBuildStore(b, LLVMConstInt(e.intType(bytes: x.width), value, 0),
+                           e.gepByte(slot, LLVMConstInt(e.i64, UInt64(x.offset), 0)))
+            return LLVMBuildLoad2(b, et, slot, "enumv")
+        case .spareBits(let payloads, let tagOffset):
+            // The zeroed region with the case's payload over it; then the word at `tagOffset`: the payload case's
+            // reference plus `c`, a pointer derived from it, or `c << 3` for a payload-free case.
+            let index = UInt32(tagOffset / 8)
+            var agg = LLVMConstNull(et)!
+            if payloads.contains(caseIndex), !fields.isEmpty {
+                guard let cst = e.caseStructType(name, en.cases[caseIndex]) else { return nil }
+                let slot = e.entryAlloca(et, "enum")
+                LLVMBuildStore(b, LLVMConstNull(et), slot)
+                for (idx, f) in fields.enumerated() { LLVMBuildStore(b, val(f), e.structGEP(cst, slot, idx)) }
+                agg = LLVMBuildLoad2(b, et, slot, "enumv")!
+                if caseIndex == 0 { return agg }
+                let ref = LLVMBuildExtractValue(b, agg, index, "sb.ref")!
+                return LLVMBuildInsertValue(b, agg, e.gepByte(ref, const64(caseIndex)), index, "enumv")
+            }
+            let word = LLVMConstIntToPtr(const64(caseIndex << EnumLayout.spareBitShift), e.p1)!
+            return LLVMBuildInsertValue(b, agg, word, index, "enumv")
+        case .tagged(_, let w):
+            // The zeroed region with the case's payload over it, then the tag, the last element.
+            let last = LLVMCountStructElementTypes(et) - 1
+            let tag = LLVMConstInt(e.intType(bytes: w), UInt64(caseIndex), 0)!
+            if fields.isEmpty { return LLVMBuildInsertValue(b, LLVMConstNull(et), tag, last, "enumv") }
+            guard let cst = e.caseStructType(name, en.cases[caseIndex]) else { return nil }
+            let slot = e.entryAlloca(et, "enum")
+            LLVMBuildStore(b, LLVMConstNull(et), slot)
+            for (idx, f) in fields.enumerated() {
+                LLVMBuildStore(b, val(f), e.structGEP(cst, slot, idx))
+            }
+            LLVMBuildStore(b, tag, e.structGEP(et, slot, Int(last)))
+            return LLVMBuildLoad2(b, et, slot, "enumv")
         }
-        return LLVMBuildLoad2(b, et, slot, "enumv")
+    }
+
+    // An enum aggregate whose first elements are a case's payload fields, the rest zero.
+    private func payloadAggregate(_ et: LLVMTypeRef, _ c: NOIREnumCase, _ fields: [SSAValue]) -> LLVMValueRef {
+        var agg = LLVMConstNull(et)!
+        for (i, f) in fields.enumerated() where i < c.fields.count {
+            agg = LLVMBuildInsertValue(b, agg, e.toFieldStorage(val(f), c.fields[i].type), UInt32(i), "enumf")!
+        }
+        return agg
+    }
+
+    // A named enum value's case index, as an `i64`. Over the payload's extra inhabitants, the field that holds
+    // them, shifted, is the k-th past its first unused value for the k-th payload-free case (declared order,
+    // skipping the payload case), and anything else is the payload case.
+    private func enumTag(_ base: SSAValue, _ span: Span) -> LLVMValueRef? {
+        guard case .named(let name, _) = base.type, let et = e.enumType(name), let en = e.enumMap[name] else {
+            e.fail("7.2.3: enumTag on non-enum", span); return nil
+        }
+        switch e.shapes.enumLayout(name) {
+        case .tagOnly:
+            return LLVMBuildZExt(b, LLVMBuildExtractValue(b, val(base), 0, "tag")!, e.i64, "tag64")
+        case .tagged(_, let w):
+            let raw = LLVMBuildExtractValue(b, val(base), LLVMCountStructElementTypes(et) - 1, "tag")!
+            return w < 8 ? LLVMBuildZExt(b, raw, e.i64, "tag64") : raw
+        case .spareBits(let payloads, let tagOffset):
+            // The address's low bits and whether it is below the first page are the same before and after the
+            // collector moves the object, so the integer may be taken from any copy of the pointer.
+            let ref = LLVMBuildExtractValue(b, val(base), UInt32(tagOffset / 8), "sb")!
+            let word = LLVMBuildPtrToInt(b, ref, e.i64, "sb.word")!
+            return spareBitCase(word, allPayloads: payloads.count == en.cases.count)
+        case .overExtraInhabitants(let p):
+            guard let x = e.shapes.payloadExtraInhabitants(en.cases[p].fields.map(\.type)) else {
+                return LLVMConstInt(e.i64, UInt64(p), 0)
+            }
+            let slot = e.entryAlloca(et, "enum")
+            LLVMBuildStore(b, val(base), slot)
+            let it = e.intType(bytes: x.width)
+            var v = LLVMBuildLoad2(b, it, e.gepByte(slot, LLVMConstInt(e.i64, UInt64(x.offset), 0)), "xi")!
+            if x.width < 8 { v = LLVMBuildZExt(b, v, e.i64, "xi64")! }
+            if x.shift > 0 { v = LLVMBuildLShr(b, v, LLVMConstInt(e.i64, UInt64(x.shift), 0), "xis")! }
+            let k = LLVMBuildSub(b, v, LLVMConstInt(e.i64, UInt64(x.first), 0), "k")!
+            let empties = UInt64(en.cases.count - 1)
+            let isEmpty = LLVMBuildICmp(b, LLVMIntULT, k, LLVMConstInt(e.i64, empties, 0), "isempty")!
+            // The k-th payload-free case is case k, or k + 1 past the payload case.
+            let pastPayload = LLVMBuildICmp(b, LLVMIntUGE, k, LLVMConstInt(e.i64, UInt64(p), 0), "past")!
+            let emptyCase = LLVMBuildAdd(b, k, LLVMBuildZExt(b, pastPayload, e.i64, "skip")!, "ecase")!
+            return LLVMBuildSelect(b, isEmpty, emptyCase, LLVMConstInt(e.i64, UInt64(p), 0), "tag")
+        }
     }
 
     // Read a payload field of an enum *value*: spill it, GEP the case struct over the payload region.
@@ -1601,15 +2073,32 @@ final class SSAIRToLLVM {
             let ptr = e.gepByte(val(base), off)
             if heldByBuffer(fieldType) { return ptr }
             guard let fty = ty(fieldType, span) else { return nil }
-            return LLVMBuildLoad2(b, fty, ptr, "pl")
+            let v = LLVMBuildLoad2(b, fty, ptr, "pl")!
+            if let en = e.enumMap[genBase], let l = erasedEnumLayout(en, args, span), case .spareBits(_, let tagOffset) = l.kind,
+               LLVMIsAConstantInt(off) != nil, Int(LLVMConstIntGetZExtValue(off)) == tagOffset {
+                return spareBitUntag(v)   // the reference less its case
+            }
+            return v
         }
         guard case .named(let name, _) = base.type, let et = e.enumType(name),
               let en = e.enumMap[name], let cst = e.caseStructType(name, en.cases[caseIndex]),
               let fty = ty(fieldType, span) else { e.fail("7.2.3: extractPayload on non-enum", span); return nil }
+        switch e.shapes.enumLayout(name) {
+        case .overExtraInhabitants:
+            // The payload case's fields are the enum's elements.
+            let raw = LLVMBuildExtractValue(b, val(base), UInt32(fieldIndex), "pl")!
+            return e.fromFieldStorage(raw, fieldType)
+        case .spareBits(_, let tagOffset):
+            // The reference carrying the case is untagged; the case's other fields read as they lie.
+            if e.shapes.enumCaseLayout(name, caseIndex).offsets[fieldIndex] == tagOffset {
+                return spareBitUntag(LLVMBuildExtractValue(b, val(base), UInt32(tagOffset / 8), "sb")!)
+            }
+        case .tagOnly, .tagged:
+            break
+        }
         let slot = e.entryAlloca(et, "enum")
         LLVMBuildStore(b, val(base), slot)
-        let payload = e.structGEP(et, slot, 1)
-        return LLVMBuildLoad2(b, fty, e.structGEP(cst, payload, fieldIndex), "pl")
+        return LLVMBuildLoad2(b, fty, e.structGEP(cst, slot, fieldIndex), "pl")
     }
 
     // Wrap a conformer as `any I` / `any A & B`, or upcast `any B` → `any A` — the SSA `box` op's value
@@ -1742,9 +2231,8 @@ final class SSAIRToLLVM {
     // and String's heap byte buffer (121.1.3) both go through here, so there is no bespoke String allocator.
     func emitManagedBufferAlloc(header hdr: Type, element elem: Type, capacity capV: LLVMValueRef) -> LLVMValueRef {
         let tid = e.managedBufferTypeId(header: hdr, element: elem)
-        let headerSize = e.slotCount(hdr) * 8
         let elemBytes = LLVMBuildMul(b, capV, LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "mb.elembytes")!
-        let bytes = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(16 + headerSize), 0), elemBytes, "mb.bytes")!
+        let bytes = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(e.managedBufferElementStart(header: hdr)), 0), elemBytes, "mb.bytes")!
         let buf = e.rtAllocManaged(bytes)
         LLVMBuildStore(b, e.descOffsetHeader(tid), buf)
         LLVMBuildStore(b, capV, e.gepByte(buf, LLVMConstInt(e.i64, 8, 0)))
@@ -1808,21 +2296,22 @@ final class SSAIRToLLVM {
             let opt = e.runtimeSizedBuffer(size, "chan.opt", checked: curChecksStack)
             _ = e.buildCall(memset, msty, [opt, LLVMConstInt(e.i32, 0, 0), size])
             let ok = e.buildCall(fn, fty, [buf, e.gepByte(opt, off), vwt, waiter])!
-            storeOptionTag(opt, ok, some: some, none: none)
+            guard let l = erasedEnumLayout(en, a, span) else { return nil }
+            storeOptionCase(opt, ok, l, some: some, none: none)
             registerErasedComponents(opt, resultType, LLVMConstInt(e.i64, 0, 0), span)
             return opt
         }
         guard case .named(let n, _) = resultType, let et = e.enumType(n), let en = e.enumMap[n],
               let some = en.cases.firstIndex(where: { $0.name == "some" }),
               let none = en.cases.firstIndex(where: { $0.name == "none" }),
-              let cst = e.caseStructType(n, en.cases[some]) else {
+              let l = namedEnumLayout(n) else {
             e.fail("channelReceive: result is not an Option", span); return nil
         }
         let slot = e.entryAlloca(et, "chan.opt")
         LLVMBuildStore(b, LLVMConstNull(et), slot)
-        let payload = e.structGEP(cst, e.structGEP(et, slot, 1), 0)
+        let payload = e.gepByte(slot, const64(e.shapes.enumCaseLayout(n, some).offsets[0]))
         let ok = e.buildCall(fn, fty, [buf, payload, vwt, waiter])!
-        storeOptionTag(slot, ok, some: some, none: none)
+        storeOptionCase(slot, ok, l, some: some, none: none)
         return LLVMBuildLoad2(b, et, slot, "chan.optv")
     }
 
@@ -1939,13 +2428,12 @@ final class SSAIRToLLVM {
             return (opt, e.gepByte(opt, off))
         }
         guard case .named(let n, _) = optType, let et = e.enumType(n), let en = e.enumMap[n],
-              let some = en.cases.firstIndex(where: { $0.name == "some" }),
-              let cst = e.caseStructType(n, en.cases[some]) else {
+              let some = en.cases.firstIndex(where: { $0.name == "some" }) else {
             e.fail("select: a receive's result is not an Option", span); return nil
         }
         let slot = e.entryAlloca(et, "sel.opt")
         LLVMBuildStore(b, LLVMConstNull(et), slot)
-        return (slot, e.structGEP(cst, e.structGEP(et, slot, 1), 0))
+        return (slot, e.gepByte(slot, const64(e.shapes.enumCaseLayout(n, some).offsets[0])))
     }
 
     // The `Option<T>` a select's receive filled, its tag set from the case's result.
@@ -1958,17 +2446,20 @@ final class SSAIRToLLVM {
               let none = en.cases.firstIndex(where: { $0.name == "none" }) else {
             e.fail("select: a receive's result is not an Option", span); return nil
         }
-        storeOptionTag(opt, ok, some: some, none: none)
+        let layout: DynEnumLayout?
+        if case .generic(_, let a) = optType { layout = erasedEnumLayout(en, a, span) } else { layout = namedEnumLayout(base) }
+        guard let l = layout else { return nil }
+        storeOptionCase(opt, ok, l, some: some, none: none)
         if case .generic = optType { return opt }
         guard let et = e.enumType(base) else { return nil }
         return LLVMBuildLoad2(b, et, opt, "sel.optv")
     }
 
-    // The tag word at offset 0 of an `Option`: `some` when the runtime moved a value (`ok` is 1), else `none`.
-    private func storeOptionTag(_ opt: LLVMValueRef, _ ok: LLVMValueRef, some: Int, none: Int) {
+    // An `Option`'s case: `some` when the runtime moved a value into its payload (`ok` is 1), else `none`, whose
+    // payload the runtime left zero.
+    private func storeOptionCase(_ opt: LLVMValueRef, _ ok: LLVMValueRef, _ l: DynEnumLayout, some: Int, none: Int) {
         let got = LLVMBuildICmp(b, LLVMIntNE, ok, LLVMConstInt(e.i64, 0, 0), "chan.got")!
-        let tag = LLVMBuildSelect(b, got, LLVMConstInt(e.i64, UInt64(some), 0), LLVMConstInt(e.i64, UInt64(none), 0), "chan.tag")!
-        LLVMBuildStore(b, tag, opt)
+        storeEnumCase(opt, l, LLVMBuildSelect(b, got, const64(some), const64(none), "chan.case")!)
     }
 
     // The value witness for a channel's element: a type parameter's from the dictionary, a generic class's
@@ -1996,7 +2487,7 @@ final class SSAIRToLLVM {
         }
         guard let stride = erasedTypeSize(element, span) else { return nil }
         let elemBytes = LLVMBuildMul(b, capacity, stride, "mb.elembytes")!
-        let bytes = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(16 + e.slotCount(header) * 8), 0), elemBytes, "mb.bytes")!
+        let bytes = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(e.managedBufferElementStart(header: header)), 0), elemBytes, "mb.bytes")!
         let desc = LLVMBuildPtrToInt(b, e.loadDictionaryWord(dict, curDictionaryWords.count + i), e.i64, "desc")!
         let buf = e.rtAllocManaged(bytes)
         LLVMBuildStore(b, desc, buf)
@@ -2356,7 +2847,7 @@ final class SSAIRToLLVM {
             let strideV = LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0)
             let bytes = LLVMBuildMul(b, val(args[0]), strideV, "ptr.bytes")!
             let (fn, fty) = e.nomuRawAlloc()
-            return e.buildCall(fn, fty, [bytes, strideV])
+            return e.buildCall(fn, fty, [bytes, LLVMConstInt(e.i64, UInt64(e.shapes.align(elem)), 0)])
         case "__ptrStore":
             let off = LLVMBuildMul(b, val(args[2]), LLVMConstInt(e.i64, UInt64(e.rawStride(args[1].type)), 0), "ptr.off")!
             LLVMBuildStore(b, val(args[1]), e.gepByte(val(args[0]), off))
@@ -2466,7 +2957,7 @@ final class SSAIRToLLVM {
             guard let (hdr, elem) = e.managedBufferArgs(args[0].type) else {
                 e.fail("180: __managedBufferElementPtr receiver is not a ManagedBuffer", span); return nil
             }
-            let elemStart = 16 + e.slotCount(hdr) * 8
+            let elemStart = e.managedBufferElementStart(header: hdr)
             let baseE = e.managedAddress(val(args[0]))
             let ix = LLVMBuildMul(b, val(args[1]), LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "mb.ix")!
             let off = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(elemStart), 0), ix, "mb.eoff")!
@@ -2479,7 +2970,7 @@ final class SSAIRToLLVM {
                 e.fail("180: __managedBufferStoreRef receiver is not a ManagedBuffer", span); return nil
             }
             let recvV = val(args[0])
-            let elemStart = 16 + e.slotCount(hdr) * 8
+            let elemStart = e.managedBufferElementStart(header: hdr)
             let ix = LLVMBuildMul(b, val(args[2]), LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "mb.ix")!
             let off = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(elemStart), 0), ix, "mb.eoff")!
             e.storeField(recvV, e.gepByte(recvV, off), val(args[1]))
@@ -2491,7 +2982,7 @@ final class SSAIRToLLVM {
                 e.fail("180: __managedBufferRef receiver is not a ManagedBuffer", span); return nil
             }
             let recvV = val(args[0])
-            let elemStart = 16 + e.slotCount(hdr) * 8
+            let elemStart = e.managedBufferElementStart(header: hdr)
             let ix = LLVMBuildMul(b, val(args[1]), LLVMConstInt(e.i64, UInt64(e.rawStride(elem)), 0), "mb.ix")!
             let off = LLVMBuildAdd(b, LLVMConstInt(e.i64, UInt64(elemStart), 0), ix, "mb.eoff")!
             return LLVMBuildLoad2(b, e.p1, e.gepByte(recvV, off), "mb.ref")
@@ -2771,13 +3262,13 @@ final class SSAIRToLLVM {
         let selfV = val(args[0])
         if isGet {
             if info.kind == .classRef {
-                return LLVMBuildLoad2(b, fieldTy, e.structGEP(info.ty, selfV, e.fieldLLVMIndex(.classRef, pos)), "ld")
+                return LLVMBuildLoad2(b, fieldTy, e.structGEP(info.ty, selfV, e.llvmFieldIndex(type, pos)), "ld")
             }
-            let raw = LLVMBuildExtractValue(b, selfV, UInt32(pos), "fld")!   // struct value receiver
+            let raw = LLVMBuildExtractValue(b, selfV, UInt32(e.llvmFieldIndex(type, pos)), "fld")!   // struct value receiver
             return e.fromFieldStorage(raw, info.fields[pos].type)
         }
         // setter: `self` is a pointer (class, or a mutating struct receiver passed by address)
-        let slot = e.structGEP(info.ty, selfV, e.fieldLLVMIndex(info.kind, pos))
+        let slot = e.structGEP(info.ty, selfV, e.llvmFieldIndex(type, pos))
         if info.kind == .classRef { e.storeField(selfV, slot, val(args[1])) }
         else { LLVMBuildStore(b, val(args[1]), slot) }
         return LLVMConstInt(e.i64, 0, 0)

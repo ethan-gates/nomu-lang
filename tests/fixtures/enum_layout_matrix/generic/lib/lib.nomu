@@ -1,0 +1,150 @@
+// Generic enums built and read in compiled-once bodies. Under the debug pipeline these bodies run
+// erased, computing each enum's layout from the type argument's value witness (its extra inhabitants); under
+// release they are specialized. Both must agree with the caller's specialized layout.
+package enum Maybe3<T> {
+  case nothing
+  case just(v: T)
+  case gone
+}
+package enum Flagged<T> {
+  case off
+  case set(flag: Bool, value: T)
+}
+package struct Pair<T> {
+  let a: T
+  let n: Int
+}
+package class Cell<T> {
+  var o: Option<T>
+}
+package fun wrap<T>(v: T, some: Bool) -> Option<T> {
+  if some {
+    return Option<T>.some(value: v)
+  }
+  return Option<T>.none
+}
+package fun isSome<T>(o: Option<T>) -> Bool {
+  switch o {
+  case .some(let v):
+    return true
+  case .none:
+    return false
+  }
+}
+package fun orElse<T>(o: Option<T>, d: T) -> T {
+  switch o {
+  case .some(let v):
+    return v
+  case .none:
+    return d
+  }
+}
+package fun wrapTwice<T>(v: T, k: Int) -> Option<Option<T>> {
+  if k % 3 == 0 {
+    return Option<Option<T>>.none
+  }
+  if k % 3 == 1 {
+    return Option<Option<T>>.some(value: Option<T>.none)
+  }
+  return Option<Option<T>>.some(value: Option<T>.some(value: v))
+}
+// 0 for the outer `none`, 1 for an inner `none`, 2 for a value.
+package fun depth<T>(o: Option<Option<T>>) -> Int {
+  switch o {
+  case .none:
+    return 0
+  case .some(let inner):
+    if isSome(inner) {
+      return 2
+    }
+    return 1
+  }
+}
+package fun maybe3<T>(v: T, k: Int) -> Maybe3<T> {
+  if k % 3 == 0 {
+    return Maybe3<T>.nothing
+  }
+  if k % 3 == 1 {
+    return Maybe3<T>.just(v: v)
+  }
+  return Maybe3<T>.gone
+}
+package fun maybe3Kind<T>(m: Maybe3<T>) -> Int {
+  switch m {
+  case .nothing:
+    return 0
+  case .just(let v):
+    return 1
+  case .gone:
+    return 2
+  }
+}
+package fun maybe3Or<T>(m: Maybe3<T>, d: T) -> T {
+  switch m {
+  case .just(let v):
+    return v
+  case .nothing:
+    return d
+  case .gone:
+    return d
+  }
+}
+package fun flagged<T>(v: T, k: Int) -> Flagged<T> {
+  if k % 2 == 0 {
+    return Flagged<T>.off
+  }
+  return Flagged<T>.set(flag: k % 4 == 1, value: v)
+}
+package fun flaggedOr<T>(f: Flagged<T>, d: T) -> T {
+  switch f {
+  case .off:
+    return d
+  case .set(let flag, let value):
+    if flag {
+      return value
+    }
+    return value
+  }
+}
+package fun flaggedFlag<T>(f: Flagged<T>) -> Int {
+  switch f {
+  case .off:
+    return -1
+  case .set(let flag, let value):
+    if flag {
+      return 1
+    }
+    return 0
+  }
+}
+package fun wrapPair<T>(v: T, k: Int) -> Option<Pair<T>> {
+  if k % 2 == 0 {
+    return Option<Pair<T>>.none
+  }
+  return Option<Pair<T>>.some(value: Pair<T>(a: v, n: k))
+}
+package fun pairN<T>(o: Option<Pair<T>>) -> Int {
+  switch o {
+  case .none:
+    return -1
+  case .some(let p):
+    return p.n
+  }
+}
+package fun pairOr<T>(o: Option<Pair<T>>, d: T) -> T {
+  switch o {
+  case .none:
+    return d
+  case .some(let p):
+    return p.a
+  }
+}
+package fun cellOf<T>(v: T, some: Bool) -> Cell<T> {
+  return Cell<T>(o: wrap(v, some))
+}
+package fun cellOr<T>(c: Cell<T>, d: T) -> T {
+  return orElse(c.o, d)
+}
+package fun cellSet<T>(c: Cell<T>, v: T, some: Bool) {
+  c.o = wrap(v, some)
+}

@@ -398,8 +398,8 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
           while sk < cnt {
             let soff = rtLiveOffsetAt(descId, valbase, sk)
             let wordPtr = valbase.advanced(by: soff)
-            let sroot: RawPtr = wordPtr.load(fromByteOffset: 0)
-            if sroot.isNull == false {
+            let sroot = rtUntag(wordPtr.load(fromByteOffset: 0))
+            if !rtNotObject(sroot) {
               if n < cap {
                 outBuf.store(sroot, toByteOffset: n * 8)
               }
@@ -420,8 +420,8 @@ fun rtCollectRoots(outBuf: RawPtr, cap: Int) -> Int {
           let slotOff = rtI32(base, locOff + 8)
           let slotBase = rtSlotBase(reg, sp, frameFp, x19At)
           let slotPtr = slotBase.advanced(by: slotOff)
-          let root: RawPtr = slotPtr.load(fromByteOffset: 0)
-          let rootNull = root.eq(RawPtr.null)
+          let root = rtUntag(slotPtr.load(fromByteOffset: 0))
+          let rootNull = rtNotObject(root)
           if !rootNull {
             if n < cap {
               outBuf.store(root, toByteOffset: n * 8)
@@ -519,8 +519,8 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, x19In: RawPtr, roots: RawPtr, n0: Int, e
           while sk < cnt {
             let soff = rtLiveOffsetAt(descId, valbase, sk)
             let wordPtr = valbase.advanced(by: soff)
-            let sroot: RawPtr = wordPtr.load(fromByteOffset: 0)
-            if sroot.isNull == false {
+            let sroot = rtUntag(wordPtr.load(fromByteOffset: 0))
+            if !rtNotObject(sroot) {
               if emitSlots != 0 {
                 rtQueuePush(roots, n, wordPtr)
               } else {
@@ -547,8 +547,8 @@ fun rtWalkFrom(spIn: RawPtr, pcIn: Int, x19In: RawPtr, roots: RawPtr, n0: Int, e
           let slotOff = rtI32(base, locOff + 8)
           let slotBase = rtSlotBase(reg, sp, frameFp, x19At)
           let slotPtr = slotBase.advanced(by: slotOff)
-          let root: RawPtr = slotPtr.load(fromByteOffset: 0)
-          let rootNull = root.eq(RawPtr.null)
+          let root = rtUntag(slotPtr.load(fromByteOffset: 0))
+          let rootNull = rtNotObject(root)
           if !rootNull {
             // emitSlots != 0: store the slot ADDRESS (a moving collection rewrites it in place with
             // the forwarded pointer); else store the root VALUE (for counting / non-moving scans).
@@ -678,8 +678,8 @@ fun rtWalkShadow(fib: RawPtr, roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
         while i < nptr {
           let off = rtLiveOffsetAt(tid, buf, i)
           let slotPtr = buf.advanced(by: off)
-          let root: RawPtr = slotPtr.load(fromByteOffset: 0)
-          if root.isNull == false {
+          let root = rtUntag(slotPtr.load(fromByteOffset: 0))
+          if !rtNotObject(root) {
             if emitSlots != 0 {
               rtQueuePush(roots, n, slotPtr)
             } else {

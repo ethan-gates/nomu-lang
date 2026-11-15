@@ -130,8 +130,13 @@ public struct NOIRField {
     public let type: Type
     public let isMutable: Bool   // `var` vs `let` field; read by M5-C's deeply-immutable check
     public let span: Span
-    public init(name: String, type: Type, isMutable: Bool, span: Span) {
+    // A field of a specialized generic type whose declared type mentions a type parameter. The value layout
+    // places such fields last, in declared order, so erased code over the template finds the others at
+    // constant offsets.
+    public let fromTypeParameter: Bool
+    public init(name: String, type: Type, isMutable: Bool, span: Span, fromTypeParameter: Bool = false) {
         self.name = name; self.type = type; self.isMutable = isMutable; self.span = span
+        self.fromTypeParameter = fromTypeParameter
     }
 }
 

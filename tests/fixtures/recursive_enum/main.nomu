@@ -1,5 +1,5 @@
-// A recursive enum: `node` holds two `Tree`s inline, so `Tree` has no finite size. Reported as an error
-// naming the path around the cycle (recursive enums are boxed automatically later, task 260).
+// A recursive enum: `node` holds two `Tree`s, so its payload is boxed automatically and `Tree` is
+// one word, null for `leaf`.
 enum Tree {
     case leaf
     case node(left: Tree, right: Tree)

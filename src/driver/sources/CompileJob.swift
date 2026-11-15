@@ -420,13 +420,26 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     program = timings.measure("noir", "merge") { mergeExtensions(program, into: mergeDiags) }
     if mergeDiags.hasErrors { fputs(mergeDiags.render() + "\n", stderr); return false }
 
+    let externalDecls = externals()
+    // The imported type a reference names in its file, when exactly one module in scope (or behind its
+    // qualifier) exports it. Quiet: Sema reports the ambiguous and unknown cases.
+    func resolveImportedType(_ t: TypeRef) -> String? {
+        let mods = t.qualifier.map { fileQualifiers[t.span.file]?[$0] } ?? fileVisible[t.span.file]
+        let exporters = (mods ?? []).filter { moduleTypes[$0]?.contains(t.name) == true }
+        guard exporters.count == 1, let origin = exporters.first else { return nil }
+        return ExternalName.encode(origin: origin, name: t.name)
+    }
     let typeDiags = DiagnosticSink()
-    timings.measure("noir", "typecheck") { var checker = Typechecker(program, diagnostics: typeDiags); checker.check() }
+    timings.measure("noir", "typecheck") {
+        var checker = Typechecker(program, diagnostics: typeDiags, externalDecls: externalDecls,
+                                  resolveImportedType: resolveImportedType)
+        checker.check()
+    }
     if typeDiags.hasErrors { fputs(typeDiags.render() + "\n", stderr); return false }
 
     let subset = options.subsetFuncs.union(runtimeSubsetNames)
     let semaResult = timings.measure("noir", "sema") { () -> SemaResult in
-        var sema = Sema(program, externalDecls: externals(), subsetFuncs: subset,
+        var sema = Sema(program, externalDecls: externalDecls, subsetFuncs: subset,
                         fileVisibleModules: fileVisible, fileQualifiers: fileQualifiers,
                         moduleFuncs: moduleFuncs, moduleTypes: moduleTypes,
                         externalMutatingMethods: externalMutating(),
@@ -482,6 +495,8 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         moduleForMono = injection.module
         localizedGenerics = injection.localizedNames
     }
+    // Recursive enums: each case that holds a member of its own recursive group moves its payload into a box.
+    moduleForMono = timings.measure("noir", "box") { boxRecursiveCases(moduleForMono) }
     let monoDiags = DiagnosticSink()
     let monoModule = timings.measure("noir", "mono") {
         monomorphize(moduleForMono, recipes: dependencyRecipes(), into: monoDiags)
@@ -552,6 +567,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     optimizer.noFrameSplit = jobSettings.bool("measure.no_frame_split")
     optimizer.noStackChecks = jobSettings.bool("measure.no_stack_checks")
     optimizer.libcDirect = jobSettings.bool("measure.libc_direct")
+    optimizer.noSpareBits = jobSettings.bool("measure.no_spare_bits")
     optimizer.runtimePrelude = !options.compilingPrelude && jobSettings.bool("test.runtime_prelude")
     switch jobSettings.choice("opt.escape_provider") {
     case "graph": optimizer.escapeProvider = .graph

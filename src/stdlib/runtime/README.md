@@ -40,6 +40,14 @@ holes: nothing marks the lines it fills, so after the next minor the same holes 
 over live objects, and a new object there reads as logged, so the barrier would miss its nursery pointers.
 `NOMU_GC_VERIFY=1` (`gcverify.nomu`) checks these rules and the collector's others at every collection.
 
+**Every reader of a managed word masks it.** A managed word may carry a tag in its low 3 bits, which objects
+(8-byte aligned) leave clear: an enum whose payload cases each hold a reference at the same offset keeps its
+case there (spare bits). And any word below the first page holds no object (`rtNotObjectBound`): null, or an
+enum's payload-free case. So code that reads a managed word to follow, mark, compare or hash it takes
+`rtUntag` first and skips it when `rtNotObject`; code that writes a moved object back restores the word's tag
+(`rtRefTag`). A new scan, root walk or verifier that reads the raw word would mistake a tagged reference for
+an object three bytes in (`descriptors.nomu`).
+
 **Recording costs nothing when off.** Every recording path is guarded by `Runtime.gcRecordLevel()` (0 off,
 1 `limited`, 2 `full`), which folds to a constant when the runtime compiles, so a lower level's build has
 none of the higher levels' code. Generated code follows the same rule through `LLVMGen.countsAllocations`

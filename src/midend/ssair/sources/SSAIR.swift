@@ -249,9 +249,10 @@ public struct SSAField {
     public let name: String
     public let type: Type
     public let isMutable: Bool
+    public let fromTypeParameter: Bool   // `NOIRField.fromTypeParameter`
 
-    public init(name: String, type: Type, isMutable: Bool) {
-        self.name = name; self.type = type; self.isMutable = isMutable
+    public init(name: String, type: Type, isMutable: Bool, fromTypeParameter: Bool = false) {
+        self.name = name; self.type = type; self.isMutable = isMutable; self.fromTypeParameter = fromTypeParameter
     }
 }
 

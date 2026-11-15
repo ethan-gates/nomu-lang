@@ -1,0 +1,33 @@
+// Value types that mention themselves through imported generics without holding themselves inline: `Many`
+// holds its elements through an array, and `Box<Box<Int>>` and `Option<Option<Int>>` are finite.
+import pkg/box
+
+struct Tree {
+    let value: Int
+    let kids: box.Many<Tree>
+}
+
+struct Pairs {
+    let inner: Box<Box<Int>>
+}
+
+fun main() {
+    let leaf = Tree(value: 2, kids: Many<Tree>(items: []))
+    let root = Tree(value: 1, kids: Many<Tree>(items: [leaf, leaf]))
+    let bb = Pairs(inner: Box<Box<Int>>(item: Box<Int>(item: 4)))
+    let oo = Option<Option<Int>>.some(value: Option<Int>.some(value: 7))
+    var seven = 0
+    switch oo {
+    case .some(let inner):
+        switch inner {
+        case .some(let v):
+            seven = v
+        case .none:
+            seven = 0
+        }
+    case .none:
+        seven = 0
+    }
+    print(root.value + root.kids.items[0].value + root.kids.items.count + bb.inner.item.item + seven)
+    print("\n")
+}

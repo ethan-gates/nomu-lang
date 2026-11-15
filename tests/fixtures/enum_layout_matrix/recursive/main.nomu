@@ -1,0 +1,245 @@
+// Recursive enums, boxed automatically, built and walked while `churn` allocates so moving
+// collections run between steps: a binary tree (one boxed case, the enum one word over its box); an expression
+// tree (several payload cases, two of them boxed beside an unboxed `Int`); two mutually recursive enums; a
+// group running through a struct; a cycle through `Option`; and the library's generic `List<T>`, built here
+// and in compiled-once bodies, over an `Int`, a class and a `String`.
+import pkg/lib
+
+class Box {
+  var v: Int
+}
+enum Tree {
+  case leaf
+  case node(left: Tree, right: Tree, n: Int)
+}
+enum Expr {
+  case lit(n: Int)
+  case add(l: Expr, r: Expr)
+  case mul(l: Expr, r: Expr)
+  case neg(e: Expr)
+}
+enum Ping {
+  case stop
+  case ping(next: Pong)
+}
+enum Pong {
+  case pong(next: Ping, n: Int)
+}
+struct Labeled {
+  let label: String
+  let rest: Chain
+}
+enum Chain {
+  case end
+  case link(l: Labeled)
+}
+enum Rose {
+  case leaf(n: Int)
+  case branch(first: Option<Rose>, box: Box)
+}
+// Allocates on the heap (the boxes escape into the array), so collections land between reads.
+fun churn(i: Int) -> Int {
+  var boxes: Array<Box> = []
+  var k = 0
+  while k < 20 {
+    boxes.append(Box(v: i + k))
+    k = k + 1
+  }
+  var t = 0
+  k = 0
+  while k < boxes.count {
+    t = t + boxes[k].v
+    k = k + 1
+  }
+  return t
+}
+fun build(d: Int, n: Int) -> Tree {
+  if d == 0 {
+    return Tree.leaf
+  }
+  return Tree.node(left: build(d - 1, n * 2), right: build(d - 1, n * 2 + 1), n: n)
+}
+fun sum(t: Tree) -> Int {
+  switch t {
+  case .leaf:
+    return 0
+  case .node(let l, let r, let n):
+    return n + sum(l) + sum(r)
+  }
+}
+fun eval(e: Expr) -> Int {
+  switch e {
+  case .lit(let n):
+    return n
+  case .add(let l, let r):
+    return eval(l) + eval(r)
+  case .mul(let l, let r):
+    return eval(l) * eval(r)
+  case .neg(let x):
+    return 0 - eval(x)
+  }
+}
+// ((i + 2) * (i - 3)) as a tree, with a negation on odd `i`.
+fun expr(i: Int) -> Expr {
+  let a = Expr.add(l: Expr.lit(n: i), r: Expr.lit(n: 2))
+  let b = Expr.add(l: Expr.lit(n: i), r: Expr.neg(e: Expr.lit(n: 3)))
+  let m = Expr.mul(l: a, r: b)
+  if i % 2 == 1 {
+    return Expr.neg(e: m)
+  }
+  return m
+}
+fun pings(k: Int) -> Ping {
+  if k == 0 {
+    return Ping.stop
+  }
+  return Ping.ping(next: Pong.pong(next: pings(k - 1), n: k))
+}
+fun pingSum(p: Ping) -> Int {
+  switch p {
+  case .stop:
+    return 0
+  case .ping(let next):
+    switch next {
+    case .pong(let after, let n):
+      return n + pingSum(after)
+    }
+  }
+}
+fun chain(k: Int) -> Chain {
+  if k == 0 {
+    return Chain.end
+  }
+  return Chain.link(l: Labeled(label: "link-".concat("a-heap-label-long-enough"), rest: chain(k - 1)))
+}
+fun chainLen(c: Chain) -> Int {
+  switch c {
+  case .end:
+    return 0
+  case .link(let l):
+    return l.label.count + chainLen(l.rest)
+  }
+}
+fun rose(k: Int) -> Rose {
+  if k == 0 {
+    return Rose.leaf(n: 5)
+  }
+  return Rose.branch(first: Option<Rose>.some(value: rose(k - 1)), box: Box(v: k))
+}
+fun roseSum(r: Rose) -> Int {
+  switch r {
+  case .leaf(let n):
+    return n
+  case .branch(let first, let b):
+    switch first {
+    case .some(let inner):
+      return b.v + roseSum(inner)
+    case .none:
+      return b.v
+    }
+  }
+}
+fun pick(c: Bool, a: Int, b: Int) -> Int {
+  if c {
+    return a
+  }
+  return b
+}
+fun main() {
+  var bad = 0
+  var keep: Array<Tree> = []
+  var i = 0
+  while i < 1500 {
+    let t = build(i % 6, 1)
+    keep.append(t)
+    var sink = churn(i)
+    // A tree of depth d numbers its nodes 1 to 2^d - 1.
+    let d = i % 6
+    var nodes = 1
+    var k = 0
+    while k < d {
+      nodes = nodes * 2
+      k = k + 1
+    }
+    let want = (nodes - 1) * nodes / 2
+    if sum(t) != want {
+      bad = bad + 1
+    }
+    let e = expr(i)
+    sink = sink + churn(i + 1)
+    if eval(e) != pick(i % 2 == 1, 0 - (i + 2) * (i - 3), (i + 2) * (i - 3)) {
+      bad = bad + 1
+    }
+    let p = pings(i % 7)
+    sink = sink + churn(i + 2)
+    if pingSum(p) != (i % 7) * (i % 7 + 1) / 2 {
+      bad = bad + 1
+    }
+    let c = chain(i % 5)
+    sink = sink + churn(i + 3)
+    if chainLen(c) != (i % 5) * 29 {
+      bad = bad + 1
+    }
+    let r = rose(i % 4)
+    sink = sink + churn(i + 4)
+    if roseSum(r) != 5 + (i % 4) * (i % 4 + 1) / 2 {
+      bad = bad + 1
+    }
+    // The library's list, built there and here, read on both sides.
+    var ints = List<Int>.empty
+    var boxes = List<Box>.empty
+    var strs = List<String>.empty
+    k = 0
+    while k < i % 9 {
+      ints = push(ints, k)
+      boxes = List<Box>.cons(head: Box(v: k), tail: boxes)
+      strs = push(strs, "s-".concat("a-heap-string-long-enough"))
+      k = k + 1
+    }
+    sink = sink + churn(i + 5)
+    if count(ints) != i % 9 || count(boxes) != i % 9 || count(strs) != i % 9 {
+      bad = bad + 1
+    }
+    if headOr(ints, -1) != pick(i % 9 == 0, -1, i % 9 - 1) {
+      bad = bad + 1
+    }
+    if headOr(boxes, Box(v: -1)).v != pick(i % 9 == 0, -1, i % 9 - 1) {
+      bad = bad + 1
+    }
+    if headOr(strs, "").count != pick(i % 9 == 0, 0, 27) {
+      bad = bad + 1
+    }
+    switch drop(boxes) {
+    case .empty:
+      if i % 9 > 1 {
+        bad = bad + 1
+      }
+    case .cons(let h, let t):
+      if h.v != i % 9 - 2 {
+        bad = bad + 1
+      }
+    }
+    if sink < 0 {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  // The kept trees, after every collection above.
+  var j = 0
+  while j < keep.count {
+    let d = j % 6
+    var nodes = 1
+    var k = 0
+    while k < d {
+      nodes = nodes * 2
+      k = k + 1
+    }
+    if sum(keep[j]) != (nodes - 1) * nodes / 2 {
+      bad = bad + 1
+    }
+    j = j + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

@@ -80,6 +80,12 @@ LLVM leaves (`NOMU_DUMP_LLVM` → `.post.ll`) before adding a pass.
   rewriter relocates as heap. Needs SROA of the nested promoted object (so the field becomes an SSA value,
   not a stored stack pointer) and I4 re-expressed against the precise contract rather than faithful
   `escapingValues`. The analysis is ready and subset-validated; this is the transform/verifier half.
+  It also covers a value placed in a struct or enum value: today both escape analyses treat a `makeStruct`
+  or `makeEnum` operand as escaping (the `.aggregate` sink stays terminal in the precise query too). A
+  recursive enum's box ([260](260-enum-layout.md).6, a compiler-made class holding the boxed case's payload)
+  is such an operand, so it is always on the heap, even for an enum that never leaves its frame; the
+  precise query would relax `.aggregate` containment as it does a local class field, and the same transform
+  lets the box live on the stack.
 - **Array inline / small-buffer storage** `[L · deferred]` `[§7.3, deferred stdlib]` — the real
   array-allocation lever is smallvec-style inline stack capacity + heap spill on growth, a representation
   change to `Array` that belongs with the stdlib `Array` design, not a pass. Fixed-`arrayLit` promotion

@@ -133,7 +133,7 @@ fun rtLeakMarkFrom(set: RawPtr, roots: RawPtr, n: Int) {
   let base: RawPtr = roots.load(fromByteOffset: 0)
   var r = 0
   while r < n {
-    let obj: RawPtr = base.load(fromByteOffset: r * 8)
+    let obj = rtUntag(base.load(fromByteOffset: r * 8))
     if obj.isNull == false && rtIsManaged(obj) && rtLeakSetAdd(set, obj) {
       if top == wcap {
         work = rtStackGrow(work, top)
@@ -153,8 +153,8 @@ fun rtLeakMarkFrom(set: RawPtr, roots: RawPtr, n: Int) {
     if kind == 0 {
       var i = 0
       while i < nptr {
-        let child: RawPtr = obj.load(fromByteOffset: rtLiveOffsetAt(tid, obj, i))
-        if child.isNull == false && rtLeakSetAdd(set, child) {
+        let child = rtUntag(obj.load(fromByteOffset: rtLiveOffsetAt(tid, obj, i)))
+        if !rtNotObject(child) && rtLeakSetAdd(set, child) {
           if top == wcap {
             work = rtStackGrow(work, top)
             wcap = wcap + wcap
@@ -171,8 +171,8 @@ fun rtLeakMarkFrom(set: RawPtr, roots: RawPtr, n: Int) {
       var hk = 0
       let nhdr = rtHeaderPtrCount(tid)
       while hk < nhdr {
-        let hchild: RawPtr = obj.load(fromByteOffset: 16 + rtHeaderOffsetAt(tid, hk))
-        if hchild.isNull == false && rtLeakSetAdd(set, hchild) {
+        let hchild = rtUntag(obj.load(fromByteOffset: 16 + rtHeaderOffsetAt(tid, hk)))
+        if !rtNotObject(hchild) && rtLeakSetAdd(set, hchild) {
           if top == wcap {
             work = rtStackGrow(work, top)
             wcap = wcap + wcap
@@ -193,8 +193,8 @@ fun rtLeakMarkFrom(set: RawPtr, roots: RawPtr, n: Int) {
         }
         var i = 0
         while i < en {
-          let child: RawPtr = obj.load(fromByteOffset: elemBase + rtLiveOffsetAt(tid, elemPtr, i))
-          if child.isNull == false && rtLeakSetAdd(set, child) {
+          let child = rtUntag(obj.load(fromByteOffset: elemBase + rtLiveOffsetAt(tid, elemPtr, i)))
+          if !rtNotObject(child) && rtLeakSetAdd(set, child) {
             if top == wcap {
               work = rtStackGrow(work, top)
               wcap = wcap + wcap

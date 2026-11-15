@@ -1,0 +1,331 @@
+// Enums with several payload cases: each payload from byte 0 and the tag after the largest. A word that holds
+// a reference in every payload case is a plain pointer, and the first carries the case in its spare bits
+// (`Shape`, `Duo`, no tag word); the rest is decoded by the tag (`Value`);
+// byte payloads take a byte tag (`Small`, three bytes). Enums whose payloads are each one reference keep their
+// case in the reference's spare bits (`Pet`, and `Node`, whose recursive cases are boxed). The library's
+// generic `Either` is built and read on both sides. Values live in locals, arrays and class fields while
+// `churn` allocates.
+import pkg/lib
+
+class Box {
+  var v: Int
+}
+class Circle {
+  let r: Int
+}
+class Rect {
+  let w: Int
+  let h: Int
+}
+enum Shape {
+  case circle(c: Circle)
+  case rect(r: Rect, scale: Int)
+  case none
+}
+enum Value {
+  case int(n: Int)
+  case str(s: String)
+  case obj(o: Box)
+  case pair(a: Box, b: String)
+  case nothing
+}
+enum Small {
+  case flag(b: Bool)
+  case byte(u: UInt8, ok: Bool)
+  case none
+}
+enum Duo {
+  case boxes(x: Box, y: Box, n: Int)
+  case shapes(x: Circle, y: Rect, n: Int)
+  case empty
+  case gone
+}
+fun duoOf(i: Int) -> Duo {
+  if i % 4 == 0 {
+    return Duo.boxes(x: Box(v: i), y: Box(v: i + 1), n: 2)
+  }
+  if i % 4 == 1 {
+    return Duo.shapes(x: Circle(r: i), y: Rect(w: 2, h: i), n: 3)
+  }
+  if i % 4 == 2 {
+    return Duo.empty
+  }
+  return Duo.gone
+}
+fun duoN(d: Duo) -> Int {
+  switch d {
+  case .boxes(let x, let y, let n):
+    return x.v + y.v + n
+  case .shapes(let x, let y, let n):
+    return x.r + y.w * y.h + n
+  case .empty:
+    return -1
+  case .gone:
+    return -2
+  }
+}
+enum Pet {
+  case cat(c: Circle)
+  case dog(r: Rect)
+  case bird(b: Box)
+  case nobody
+  case unknown
+}
+enum Node {
+  case leaf(b: Box)
+  case add(l: Node, r: Node)
+  case neg(e: Node)
+}
+class Holder {
+  var shape: Shape
+  var value: Value
+  var pet: Pet
+}
+fun petOf(i: Int) -> Pet {
+  if i % 5 == 0 {
+    return Pet.cat(c: Circle(r: i))
+  }
+  if i % 5 == 1 {
+    return Pet.dog(r: Rect(w: i, h: 3))
+  }
+  if i % 5 == 2 {
+    return Pet.bird(b: Box(v: i))
+  }
+  if i % 5 == 3 {
+    return Pet.nobody
+  }
+  return Pet.unknown
+}
+fun petN(p: Pet) -> Int {
+  switch p {
+  case .cat(let c):
+    return c.r
+  case .dog(let r):
+    return r.w * r.h
+  case .bird(let b):
+    return b.v + 1
+  case .nobody:
+    return -1
+  case .unknown:
+    return -2
+  }
+}
+// A tree whose leaves hold `i`, `i + 1`, …, with a negation at every third level.
+fun nodeOf(d: Int, i: Int) -> Node {
+  if d == 0 {
+    return Node.leaf(b: Box(v: i))
+  }
+  let n = Node.add(l: nodeOf(d - 1, i), r: nodeOf(d - 1, i + 1))
+  if d % 3 == 0 {
+    return Node.neg(e: n)
+  }
+  return n
+}
+fun nodeN(n: Node) -> Int {
+  switch n {
+  case .leaf(let b):
+    return b.v
+  case .add(let l, let r):
+    return nodeN(l) + nodeN(r)
+  case .neg(let e):
+    return 0 - nodeN(e)
+  }
+}
+fun churn(i: Int) -> Int {
+  var boxes: Array<Box> = []
+  var k = 0
+  while k < 20 {
+    boxes.append(Box(v: i + k))
+    k = k + 1
+  }
+  var t = 0
+  k = 0
+  while k < boxes.count {
+    t = t + boxes[k].v
+    k = k + 1
+  }
+  return t
+}
+fun shapeOf(i: Int) -> Shape {
+  if i % 3 == 0 {
+    return Shape.circle(c: Circle(r: i))
+  }
+  if i % 3 == 1 {
+    return Shape.rect(r: Rect(w: i, h: 2), scale: 3)
+  }
+  return Shape.none
+}
+fun area(s: Shape) -> Int {
+  switch s {
+  case .circle(let c):
+    return c.r * c.r
+  case .rect(let r, let scale):
+    return r.w * r.h * scale
+  case .none:
+    return -1
+  }
+}
+fun valueOf(i: Int) -> Value {
+  if i % 5 == 0 {
+    return Value.int(n: i)
+  }
+  if i % 5 == 1 {
+    return Value.str(s: "v-".concat("a-heap-string-long-enough"))
+  }
+  if i % 5 == 2 {
+    return Value.obj(o: Box(v: i))
+  }
+  if i % 5 == 3 {
+    return Value.pair(a: Box(v: i), b: "p-".concat("another-heap-string-here"))
+  }
+  return Value.nothing
+}
+fun valueN(v: Value) -> Int {
+  switch v {
+  case .int(let n):
+    return n
+  case .str(let s):
+    return s.count
+  case .obj(let o):
+    return o.v
+  case .pair(let a, let b):
+    return a.v + b.count
+  case .nothing:
+    return -1
+  }
+}
+fun smallOf(i: Int) -> Small {
+  if i % 3 == 0 {
+    return Small.flag(b: i % 2 == 0)
+  }
+  if i % 3 == 1 {
+    return Small.byte(u: (i % 200).uint8, ok: true)
+  }
+  return Small.none
+}
+fun smallN(s: Small) -> Int {
+  switch s {
+  case .flag(let b):
+    if b {
+      return 1
+    }
+    return 0
+  case .byte(let u, let ok):
+    return u.int
+  case .none:
+    return -1
+  }
+}
+fun pick(c: Bool, a: Int, b: Int) -> Int {
+  if c {
+    return a
+  }
+  return b
+}
+fun main() {
+  let n = 1500
+  var shapes: Array<Shape> = []
+  var values: Array<Value> = []
+  var smalls: Array<Small> = []
+  var holders: Array<Holder> = []
+  var pets: Array<Pet> = []
+  var duos: Array<Duo> = []
+  var trees: Array<Node> = []
+  var i = 0
+  while i < n {
+    shapes.append(shapeOf(i))
+    values.append(valueOf(i))
+    smalls.append(smallOf(i))
+    pets.append(petOf(i))
+    duos.append(duoOf(i))
+    trees.append(nodeOf(i % 5, i))
+    holders.append(Holder(shape: shapeOf(i + 1), value: valueOf(i + 1), pet: petOf(i + 1)))
+    i = i + 1
+  }
+  var bad = 0
+  i = 0
+  while i < n {
+    let local = shapeOf(i)
+    let localValue = valueOf(i)
+    var sink = churn(i)
+    if area(shapes[i]) != area(shapeOf(i)) || area(local) != area(shapeOf(i)) {
+      bad = bad + 1
+    }
+    if valueN(values[i]) != valueN(valueOf(i)) || valueN(localValue) != valueN(valueOf(i)) {
+      bad = bad + 1
+    }
+    if smallN(smalls[i]) != smallN(smallOf(i)) {
+      bad = bad + 1
+    }
+    let localPet = petOf(i)
+    let localDuo = duoOf(i + 1)
+    let localTree = nodeOf(i % 4, i)
+    sink = sink + churn(i + 4)
+    if petN(pets[i]) != petN(petOf(i)) || petN(localPet) != petN(petOf(i)) {
+      bad = bad + 1
+    }
+    if duoN(duos[i]) != duoN(duoOf(i)) || duoN(localDuo) != duoN(duoOf(i + 1)) {
+      bad = bad + 1
+    }
+    if nodeN(trees[i]) != nodeN(nodeOf(i % 5, i)) || nodeN(localTree) != nodeN(nodeOf(i % 4, i)) {
+      bad = bad + 1
+    }
+    let h = holders[i]
+    sink = sink + churn(i + 1)
+    if area(h.shape) != area(shapeOf(i + 1)) || valueN(h.value) != valueN(valueOf(i + 1)) {
+      bad = bad + 1
+    }
+    if petN(h.pet) != petN(petOf(i + 1)) {
+      bad = bad + 1
+    }
+    h.shape = shapeOf(i + 2)
+    h.value = valueOf(i + 2)
+    h.pet = petOf(i + 2)
+    sink = sink + churn(i + 2)
+    if area(h.shape) != area(shapeOf(i + 2)) || valueN(h.value) != valueN(valueOf(i + 2)) || petN(h.pet) != petN(petOf(i + 2)) {
+      bad = bad + 1
+    }
+    // The library's `Either`, built there and read on both sides, and built here and read there.
+    let eb = eitherOf(Box(v: i), Box(v: i + 1), i)
+    let es = eitherOf(i, "e-".concat("a-heap-string-long-enough"), i)
+    let eu = eitherOf(true, (i % 100).uint8, i)
+    sink = sink + churn(i + 3)
+    if side(eb) != i % 3 || side(es) != i % 3 || side(eu) != i % 3 {
+      bad = bad + 1
+    }
+    if leftOr(eb, Box(v: -1)).v != pick(i % 3 == 0, i, -1) || rightOr(eb, Box(v: -1)).v != pick(i % 3 == 1, i + 1, -1) {
+      bad = bad + 1
+    }
+    if leftOr(es, -1) != pick(i % 3 == 0, i, -1) || rightOr(es, "").count != pick(i % 3 == 1, 27, 0) {
+      bad = bad + 1
+    }
+    if rightOr(eu, 255.uint8).int != pick(i % 3 == 1, i % 100, 255) {
+      bad = bad + 1
+    }
+    switch eb {
+    case .left(let a):
+      if a.v != i {
+        bad = bad + 1
+      }
+    case .right(let b):
+      if b.v != i + 1 {
+        bad = bad + 1
+      }
+    case .neither:
+      if i % 3 != 2 {
+        bad = bad + 1
+      }
+    }
+    let here = Either<Box, String>.right(b: "h-".concat("a-heap-string-long-enough"))
+    if side(here) != 1 || rightOr(here, "").count != 27 {
+      bad = bad + 1
+    }
+    if sink < 0 {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

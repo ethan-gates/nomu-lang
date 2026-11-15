@@ -500,7 +500,7 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
   let bytes = wcap * 8
   var work = RawPtr.alloc(bytes: bytes, align: 8)
   var top = 0
-  let rootNull = root.eq(RawPtr.null)
+  let rootNull = rtNotObject(root)
   if !rootNull {
     if rtTryMark(root, counts, fp) {
       work.store(root, toByteOffset: 0)
@@ -520,8 +520,8 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
       var i = 0
       while i < nptr {
         let off = rtLiveOffsetAt(tid, obj, i)
-        let child: RawPtr = obj.load(fromByteOffset: off)
-        let childNull = child.eq(RawPtr.null)
+        let child = rtUntag(obj.load(fromByteOffset: off))
+        let childNull = rtNotObject(child)
         if !childNull {
           if rtTryMark(child, counts, fp) {
             let dst = top * 8
@@ -545,8 +545,8 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
       let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
       while hk < nhdr {
         let hat = 16 + rtHeaderOffsetAt(tid, hk)
-        let hchild: RawPtr = obj.load(fromByteOffset: hat)
-        if !hchild.eq(RawPtr.null) {
+        let hchild = rtUntag(obj.load(fromByteOffset: hat))
+        if !rtNotObject(hchild) {
           if rtTryMark(hchild, counts, fp) {
             if top == wcap {
               work = rtStackGrow(work, top)
@@ -571,8 +571,8 @@ fun rtMarkVerifyImmix(space: RawPtr, root: RawPtr, counts: RawPtr, fp: RawPtr) -
         while i < en {
           let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
-          let child: RawPtr = obj.load(fromByteOffset: at)
-          let childNull = child.eq(RawPtr.null)
+          let child = rtUntag(obj.load(fromByteOffset: at))
+          let childNull = rtNotObject(child)
           if !childNull {
             if rtTryMark(child, counts, fp) {
               let dst = top * 8
@@ -622,7 +622,7 @@ fun rtCountMarkedLines(space: RawPtr) -> Int {
 // If `obj` is a non-null marked object (header bit 32 set), clear the mark (restore header to the type-id)
 // and return true; else false. The verifier walks by clearing marks, so it visits each live object once.
 fun rtUnmarkIfMarked(obj: RawPtr) -> Bool {
-  let isNull = obj.eq(RawPtr.null)
+  let isNull = rtNotObject(obj)
   if isNull {
     return false
   }
@@ -697,7 +697,7 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
       var i = 0
       while i < nptr {
         let off = rtLiveOffsetAt(tid, obj, i)
-        let child: RawPtr = obj.load(fromByteOffset: off)
+        let child = rtUntag(obj.load(fromByteOffset: off))
         if rtUnmarkIfMarked(child) {
           if top == wcap {
             work = rtStackGrow(work, top)
@@ -716,7 +716,7 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
       let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
       while hk < nhdr {
         let hat = 16 + rtHeaderOffsetAt(tid, hk)
-        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        let hchild = rtUntag(obj.load(fromByteOffset: hat))
         if rtUnmarkIfMarked(hchild) {
           if top == wcap {
             work = rtStackGrow(work, top)
@@ -804,7 +804,7 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
   var work = rtGcWorkTake()         // grows on demand (rtStackGrow)
   var wcap = rtGcWorkCap()
   var top = 0
-  let rootNull = root.eq(RawPtr.null)
+  let rootNull = rtNotObject(root)
   if !rootNull {
     if rtTryMarkBare(root) {
       work.store(root, toByteOffset: 0)
@@ -831,8 +831,8 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
       var i = 0
       while i < nptr {
         let off = rtLiveOffsetAt(tid, obj, i)
-        let child: RawPtr = obj.load(fromByteOffset: off)
-        let childNull = child.eq(RawPtr.null)
+        let child = rtUntag(obj.load(fromByteOffset: off))
+        let childNull = rtNotObject(child)
         if !childNull {
           if rtTryMarkBare(child) {
             if top == wcap {
@@ -853,8 +853,8 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
       let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
       while hk < nhdr {
         let hat = 16 + rtHeaderOffsetAt(tid, hk)
-        let hchild: RawPtr = obj.load(fromByteOffset: hat)
-        if !hchild.eq(RawPtr.null) {
+        let hchild = rtUntag(obj.load(fromByteOffset: hat))
+        if !rtNotObject(hchild) {
           if rtTryMarkBare(hchild) {
             if top == wcap {
               work = rtStackGrow(work, top)
@@ -879,8 +879,8 @@ fun rtImmixMark(space: RawPtr, root: RawPtr) {
         while i < en {
           let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
-          let child: RawPtr = obj.load(fromByteOffset: at)
-          let childNull = child.eq(RawPtr.null)
+          let child = rtUntag(obj.load(fromByteOffset: at))
+          let childNull = rtNotObject(child)
           if !childNull {
             if rtTryMarkBare(child) {
               if top == wcap {
@@ -1004,7 +1004,7 @@ fun rtImmixUnmark(root: RawPtr) {
       var i = 0
       while i < nptr {
         let off = rtOffsetListed(tid, obj, i)
-        let child: RawPtr = obj.load(fromByteOffset: off)
+        let child = rtUntag(obj.load(fromByteOffset: off))
         if rtUnmarkIfMarked(child) {
           if top == wcap {
             work = rtStackGrow(work, top)
@@ -1023,7 +1023,7 @@ fun rtImmixUnmark(root: RawPtr) {
       let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
       while hk < nhdr {
         let hat = 16 + rtHeaderOffsetAt(tid, hk)
-        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        let hchild = rtUntag(obj.load(fromByteOffset: hat))
         if rtUnmarkIfMarked(hchild) {
           if top == wcap {
             work = rtStackGrow(work, top)
@@ -1047,7 +1047,7 @@ fun rtImmixUnmark(root: RawPtr) {
         while i < en {
           let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
-          let child: RawPtr = obj.load(fromByteOffset: at)
+          let child = rtUntag(obj.load(fromByteOffset: at))
           if rtUnmarkIfMarked(child) {
             if top == wcap {
               work = rtStackGrow(work, top)
@@ -1104,7 +1104,7 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
       var i = 0
       while i < nptr {
         let off = rtOffsetListed(tid, obj, i)
-        let child: RawPtr = obj.load(fromByteOffset: off)
+        let child = rtUntag(obj.load(fromByteOffset: off))
         if rtUnmarkIfMarked(child) {
           if top == wcap {
             work = rtStackGrow(work, top)
@@ -1123,7 +1123,7 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
       let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
       while hk < nhdr {
         let hat = 16 + rtHeaderOffsetAt(tid, hk)
-        let hchild: RawPtr = obj.load(fromByteOffset: hat)
+        let hchild = rtUntag(obj.load(fromByteOffset: hat))
         if rtUnmarkIfMarked(hchild) {
           if top == wcap {
             work = rtStackGrow(work, top)
@@ -1147,7 +1147,7 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
         while i < en {
           let off = rtLiveOffsetAt(tid, elemPtr, i)
           let at = elemBase + off
-          let child: RawPtr = obj.load(fromByteOffset: at)
+          let child = rtUntag(obj.load(fromByteOffset: at))
           if rtUnmarkIfMarked(child) {
             if top == wcap {
               work = rtStackGrow(work, top)

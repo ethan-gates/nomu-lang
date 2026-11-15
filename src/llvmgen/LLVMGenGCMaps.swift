@@ -25,28 +25,13 @@ extension LLVMGen {
         return id
     }
 
-    // Register an array-buffer type-id: `elementOffsets` are the managed-pointer byte offsets within
-    // one element, `stride` its byte size (total size comes from `cap`/`len` at run time).
-    func registerArrayMap(_ elementOffsets: [Int32], stride: Int32, symbol: String, foldable: Bool,
-                          shaped: [(offset: Int32, shapeId: UInt64)] = []) -> UInt64 {
-        let id = UInt64(typeMaps.count)
-        typeMaps.append(elementOffsets)
-        typeSizes.append(0)
-        typeKinds.append(1)      // array
-        typeStrides.append(stride)
-        typeSymbols.append((symbol, foldable))
-        typeShaped.append(shaped)   // each element's shaped fields, enumerated per element
-        typeHeaderSizes.append(0)   // a plain array buffer has no user header (the empty-header case, task 180)
-        typeHeaderMaps.append([])
-        return id
-    }
-
     // Register a buffer type-id with a user header (task 180): a kind-1 buffer `{ type-id, cap, Header,
     // Element[cap] }`. `headerSize` is the header byte size (elements begin at `16 + headerSize`),
     // `headerOffsets` the managed-pointer byte offsets within the header (relative to the header base),
     // `elementOffsets` the managed offsets within one element, `stride` the element byte size. The header
-    // offsets are emitted as the prefix of the pointer map, before the element offsets. A `ManagedBuffer`
-    // instance uses this; the plain array buffer stays the `headerSize = 0` case via `registerArrayMap`.
+    // offsets are emitted as the prefix of the pointer map, before the element offsets. Every buffer uses
+    // this: a `ManagedBuffer` instance, a heap `String`'s bytes and an `Array`'s elements (both the
+    // `headerSize = 0` case, `ManagedBuffer<EmptyHeader, Element>`).
     func registerBufferMap(headerSize: Int32, headerOffsets: [Int32], elementOffsets: [Int32],
                            stride: Int32, symbol: String, foldable: Bool,
                            shaped: [(offset: Int32, shapeId: UInt64)] = []) -> UInt64 {
@@ -106,11 +91,9 @@ extension LLVMGen {
         let fieldTypes: [Type] = classMap[name].map { $0.fields.map(\.type) }
             ?? actorMap[name].map { $0.fields.map(\.type) } ?? []
         let isActor = actorMap[name] != nil
-        var d = descriptorEntries(shapes.fieldsShape(fieldTypes, base: 8))   // header is slot 0; fields follow
-        let slot = 1 + fieldTypes.reduce(0) { $0 + slotCount($1) }
-        if isActor { d.offsets.append(Int32(slot * 8)) }   // trailing mailbox pointer is scanned
-        let totalSlots = slot + (isActor ? 1 : 0)
-        let id = registerMap(d.offsets, sizeBytes: Int32(totalSlots * 8),
+        var d = descriptorEntries(shapes.fieldsShape(fieldTypes, offsets: objectLayout(name).offsets))
+        if isActor { d.offsets.append(Int32(actorMailboxOffset(name))) }   // the mailbox pointer is scanned
+        let id = registerMap(d.offsets, sizeBytes: Int32(objectSize(name)),
                              symbol: Mangle.descriptor("desc", named: name, home: homeModule), foldable: true, shaped: d.shaped)
         typeIds[name] = id
         return id
@@ -122,7 +105,7 @@ extension LLVMGen {
     func leafShapeId(_ leaf: ShapeLeaf) -> UInt64 {
         if let id = leafShapeIds[leaf] { return id }
         let id = registerShapedMap(tagOff: Int32(leaf.tagOffset), tagShift: Int32(leaf.tagShift),
-                                   sizeBytes: Int32(leaf.slots * 8),
+                                   sizeBytes: Int32(leaf.size),
                                    cases: leaf.managedCases.map { (tag: Int32($0.tag), offsets: $0.offsets.map(Int32.init)) },
                                    symbol: Mangle.descriptor(leaf.name, home: homeModule), foldable: true)
         leafShapeIds[leaf] = id
@@ -149,8 +132,7 @@ extension LLVMGen {
     // is small, so a fresh map per call is fine.
     func valueBoxTypeId(_ t: Type) -> UInt64 {
         let d = descriptorEntries(shapes.shape(t).shifted(by: 8))   // result at slot 1 (header is slot 0)
-        let slots = 1 + slotCount(t)
-        return registerMap(d.offsets, sizeBytes: Int32(slots * 8),
+        return registerMap(d.offsets, sizeBytes: Int32(valueBoxSize(t)),
                            symbol: Mangle.descriptor("valuebox", [t], home: homeModule), foldable: true, shaped: d.shaped)
     }
 
@@ -171,27 +153,18 @@ extension LLVMGen {
         return id
     }
 
-    // The array-buffer type-id for element type `elem`: per-element managed-pointer offsets, repeated
-    // `cap` times by the collector. Registered once per element type.
+    // An `Array`'s element buffer is a `ManagedBuffer<EmptyHeader, Element>`: its descriptor, and where its
+    // elements begin (16, past the type-id and capacity words).
     func arrayBufTypeId(_ elem: Type) -> UInt64 {
-        let key = elem.description
-        if let id = arrayBufMapIds[key] { return id }
-        let d = descriptorEntries(shapes.shape(elem))
-        let id = registerArrayMap(d.offsets, stride: Int32(arrayElemStride(elem)),
-                                  symbol: Mangle.descriptor("arraybuf", [elem], home: homeModule), foldable: true, shaped: d.shaped)
-        arrayBufMapIds[key] = id
-        return id
+        managedBufferTypeId(header: .named("EmptyHeader", .struct_), element: elem)
     }
-
-    func arrayElemStride(_ t: Type) -> Int { max(slotCount(t) * 8, 8) }
+    var arrayElementStart: Int { managedBufferElementStart(header: .named("EmptyHeader", .struct_)) }
 
     // The managed-buffer type-id for `ManagedBuffer<Header, Element>` (task 180): a kind-1 buffer whose
-    // header is `Header` (byte size + managed map) and whose elements are `Element` (packed stride +
-    // managed map). `headerSize` is `Header`'s value-layout byte size (elements begin at `16 + headerSize`);
-    // the header/element managed offsets come from `shape(T)` exactly as the array buffer
-    // derives its element map. Element stride is the packed natural size (`rawStride` — `UInt8` → 1, a
-    // reference → 8), the footprint-dense model (180's stride decision), distinct from the array buffer's
-    // 8-slot `arrayElemStride`. Registered once per `(Header, Element)` pair.
+    // header is `Header` (byte size + managed map) and whose elements are `Element` (stride + managed map).
+    // `headerSize` is the header's byte size rounded up to a word (elements begin at `16 + headerSize`); the
+    // header and element managed offsets come from `shape(T)`. The element stride is its size in the value
+    // layout (`rawStride`: `UInt8` → 1, a reference → 8). Registered once per `(Header, Element)` pair.
     func managedBufferTypeId(header: Type, element: Type) -> UInt64 {
         let key = header.description + "$" + element.description
         if let id = managedBufferMapIds[key] { return id }
@@ -203,7 +176,7 @@ extension LLVMGen {
         let headerOffsets = headerShape.managed.map(Int32.init)
         let elem = descriptorEntries(shapes.shape(element))
         let elemOffsets = elem.offsets
-        let id = registerBufferMap(headerSize: Int32(slotCount(header) * 8),
+        let id = registerBufferMap(headerSize: Int32(managedBufferElementStart(header: header) - 16),
                                    headerOffsets: headerOffsets, elementOffsets: elemOffsets,
                                    stride: Int32(rawStride(element)),
                                    symbol: Mangle.descriptor("managedbuffer", [header, element], home: homeModule), foldable: true, shaped: elem.shaped)
@@ -236,7 +209,7 @@ extension LLVMGen {
         // would leave a `String` inside an erased `T` invisible to the typed-root walk (the erased-generic
         // shaped typed-root gap — `internals/gc-model-upgrade.md`).
         let d = descriptorEntries(shapes.shape(t))
-        let id = registerMap(d.offsets, sizeBytes: Int32(slotCount(t) * 8),
+        let id = registerMap(d.offsets, sizeBytes: Int32(sizeOf(t)),
                              symbol: Mangle.descriptor("val", [t], home: homeModule), foldable: true, shaped: d.shaped,
                              valueLayout: true)
         valueDescIds[key] = id
@@ -260,8 +233,8 @@ extension LLVMGen {
         let desc: UInt64 = {
             if case .named(let n, .class_) = t { return typeId(forHeapType: n) }
             if case .named(let n, .enum_) = t, let c = shapes.shape(t).conditional.first,
-               case .enumCases(_, let cases) = c.kind {
-                return enumShapeDescId(n, cases)
+               case .enumCases(_, let tagOffset, let cases) = c.kind {
+                return enumShapeDescId(n, tagOffset: tagOffset, cases)
             }
             return valueDescId(t)
         }()
@@ -298,16 +271,10 @@ extension LLVMGen {
         LLVMSetSection(u, "llvm.metadata")
     }
 
-    // The byte stride of a `Ptr<T>` element (task 125): the natural size of a scalar `T`, so raw typed
-    // memory is packed C-style — distinct from `arrayElemStride`'s 8-byte enum-slot model. Only the
-    // scalar element set (checked in Sema) reaches here.
-    func rawStride(_ t: Type) -> Int {
-        switch t {
-        case .uint8, .bool:                 return 1
-        case .int, .uint64, .double, .rawPtr, .ptr:  return 8
-        default:                            return slotCount(t) * 8   // a struct, enum or `String`: its whole slots
-        }
-    }
+    // The byte stride of an element of `t` in an array, a `ManagedBuffer` or a `Ptr<T>`: its size in the value
+    // layout, so elements are packed (`UInt8` → 1, a reference → 8, a struct its size), and at least 1, so a
+    // zero-size element still has a stride (a stride of 0 marks a fixed object in a descriptor).
+    func rawStride(_ t: Type) -> Int { max(sizeOf(t), 1) }
 
     // A shape as descriptor entries: its plain managed offsets, and each conditional sub-value as an
     // `(offset, sub-descriptor id)` pair the shared enumerator recurses into — a leaf's kind-2 descriptor, or an
@@ -318,17 +285,17 @@ extension LLVMGen {
             switch c.kind {
             case .leaf(let leaf):
                 shaped.append((Int32(c.offset), leafShapeId(leaf)))
-            case .enumCases(let name, let cases):
-                shaped.append((Int32(c.offset), enumShapeDescId(name, cases)))
+            case .enumCases(let name, let tagOffset, let cases):
+                shaped.append((Int32(c.offset), enumShapeDescId(name, tagOffset: tagOffset, cases)))
             }
         }
         return (s.managed.map(Int32.init), shaped)
     }
 
-    // The kind-2 descriptor for an enum with managed content in some cases (task 176.3b): tag is the case
-    // index at offset 0; each case's entries come from its payload shape (`ShapeCase`, offsets from the enum's
-    // start). Memoized by enum name.
-    func enumShapeDescId(_ name: String, _ shapeCases: [ShapeCase]) -> UInt64 {
+    // The kind-2 descriptor for an enum with managed content in some cases (task 176.3b): the tag is the case
+    // index, a word at `tagOffset`; each case's entries come from its payload shape (`ShapeCase`, offsets from
+    // the enum's start). Memoized by enum name.
+    func enumShapeDescId(_ name: String, tagOffset: Int, _ shapeCases: [ShapeCase]) -> UInt64 {
         if let id = enumShapeIds[name] { return id }
         var cases: [(tag: Int32, flat: [Int32], shaped: [(offset: Int32, shapeId: UInt64)])] = []
         for c in shapeCases {
@@ -341,38 +308,24 @@ extension LLVMGen {
             let d = descriptorEntries(c.shape)
             cases.append((tag: Int32(c.tag), flat: d.offsets, shaped: d.shaped))
         }
-        let id = registerEnumShapedMap(sizeBytes: Int32(slotCount(.named(name, .enum_)) * 8), cases: cases,
+        let id = registerEnumShapedMap(sizeBytes: Int32(sizeOf(.named(name, .enum_))), tagOffset: Int32(tagOffset), cases: cases,
                                        symbol: Mangle.descriptor("enum", named: name, home: homeModule), foldable: true)
         enumShapeIds[name] = id
         return id
     }
 
-    // Register an enum kind-2 descriptor (task 176.3b). Tag at offset 0 (the case index, no shift). The map
+    // Register an enum kind-2 descriptor (task 176.3b). The tag is the case index, a word at `tagOffset`. The map
     // is serialized at `emitDescriptors` (deferred) because a nested shaped sub-entry's id resolves to a
     // link-time section offset; stored structurally in `enumKind2Descs` keyed by the returned id.
-    func registerEnumShapedMap(sizeBytes: Int32,
+    func registerEnumShapedMap(sizeBytes: Int32, tagOffset: Int32,
                                cases: [(tag: Int32, flat: [Int32], shaped: [(offset: Int32, shapeId: UInt64)])],
                                symbol: String, foldable: Bool) -> UInt64 {
         let id = UInt64(typeMaps.count)
         typeMaps.append([]); typeSizes.append(sizeBytes); typeKinds.append(2); typeStrides.append(0)
         typeSymbols.append((symbol, foldable)); typeShaped.append([])
         typeHeaderSizes.append(0); typeHeaderMaps.append([])
-        enumKind2Descs[id] = (tagOff: 0, tagShift: 0, cases: cases)
+        enumKind2Descs[id] = (tagOff: tagOffset, tagShift: 0, cases: cases)
         return id
-    }
-
-    // 8-slot ABI count of an LLVM type (a pointer/int is one slot; a struct is the sum of its parts).
-    func abiSlots(_ t: LLVMTypeRef) -> Int {
-        switch LLVMGetTypeKind(t) {
-        case LLVMPointerTypeKind, LLVMIntegerTypeKind:
-            return 1
-        case LLVMStructTypeKind:
-            var n = 0
-            for i in 0..<LLVMCountStructElementTypes(t) { n += abiSlots(LLVMStructGetTypeAtIndex(t, i)) }
-            return n
-        default:
-            return 1
-        }
     }
 
     // Write the type-id into the object's header (slot 0 at the object base) — the descriptor byte

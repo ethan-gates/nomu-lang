@@ -145,8 +145,12 @@ final class LLVMGen {
     lazy var shapes: ShapeEnv = ShapeEnv(
         structFields: { [unowned self] in self.structMap[$0]?.fields.map(\.type) },
         enumCases: { [unowned self] in self.enumMap[$0]?.cases.map { $0.fields.map(\.type) } },
-        classFields: { [unowned self] in self.classMap[$0]?.fields.map(\.type) },
+        classFields: { [unowned self] in self.classMap[$0]?.fields.map(\.type) ?? self.actorMap[$0]?.fields.map(\.type) },
+        fieldMarks: { [unowned self] in (self.structMap[$0]?.fields ?? self.classMap[$0]?.fields)?.map(\.fromTypeParameter) },
+        enumCaseMarks: { [unowned self] in self.enumMap[$0]?.cases.map { $0.fields.map(\.fromTypeParameter) } },
         resolveOpaque: { [unowned self] in self.concreteUnderlying($0) })
+    // Each struct's, class's and actor's LLVM element index by declared field position (`llvmFieldIndex`).
+    var fieldIndexMaps: [String: [Int]] = [:]
 
     // Whether `t` is a struct wrapping a shaped leaf (`struct String { let base: StringBase }`): byte-identical
     // to the leaf, so it lowers to the leaf's type and rides the shaped-value path.
@@ -184,7 +188,6 @@ final class LLVMGen {
     // Drives the link-time offset-as-id descriptor section (task 100.4.7); the flat tables above are
     // the interim representation, retired once the runtime reads descriptors.
     var typeSymbols: [(name: String, foldable: Bool)] = []
-    var arrayBufMapIds: [String: UInt64] = [:]   // element-type description → array-buffer type-id
     var managedBufferMapIds: [String: UInt64] = [:]  // "Header$Element" → managed-buffer type-id (task 180)
     var valueDescIds: [String: UInt64] = [:]     // type description → value-layout descriptor id (VWT type_id, 100.4.7.4)
     // Frame-root shape ordinals (task 176.3): a shaped-containing value aggregate recorded in a deopt bundle

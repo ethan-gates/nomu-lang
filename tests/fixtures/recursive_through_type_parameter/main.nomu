@@ -1,0 +1,17 @@
+// A cycle through a generic's type parameter: `Opt<T>` holds its `T` inline, so `Node` holding `Opt<Node>`
+// holds itself, and the only enum case on the way is `Opt`'s, which boxing would have to change for this
+// one instance. An error, as in Swift; an enum of this module holding itself through `Opt` would box its own
+// case instead.
+enum Opt<T> {
+  case some(v: T)
+  case none
+}
+
+struct Node {
+  let n: Int
+  let o: Opt<Node>
+}
+
+fun main() {
+  print(1)
+}

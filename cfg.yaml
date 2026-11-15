@@ -2,6 +2,7 @@
 # they combine: `-c release -c no_escape`.
 configs:
   mono_all: null
+  mono_none: null
   mono_edge: null
   no_devirt: null
   no_inline: null
@@ -19,8 +20,10 @@ configs:
   measure_no_frame_split: null
   measure_no_stack_checks: null
   measure_libc_direct: null
+  measure_no_spare_bits: null
 opt:
   mono mono_all: all
+  mono mono_none: none
   mono mono_edge: edge
   devirt no_devirt: false
   inline no_inline: false
@@ -51,3 +54,5 @@ measure measure_no_stack_checks:
   no_stack_checks: true
 measure measure_libc_direct:
   libc_direct: true
+measure measure_no_spare_bits:
+  no_spare_bits: true

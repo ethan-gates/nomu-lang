@@ -50,7 +50,9 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 
 **Where we are:** [230](tasks/230-heap-sizing.md) (heap sizing) is done: one large reservation with a soft
 limit that grows with live data and fiber stacks, as Go's heap does, and a fatal out-of-memory report.
-binary-trees at depth 21, which crashed, runs in 7.2 s at 551 MiB against Go's 5.0 s and 201 MiB. Next is
+binary-trees at depth 21, which crashed, runs in 3.9 s at 445 MB against Go's 5.3 s and 205 MB, after the
+enum layout ([260](tasks/260-enum-layout.md)) took a node from 40 bytes to 24; the collector gaps it exposed
+are [262](tasks/262-collector-gaps.md). Next is
 [236](tasks/236-fiber-preemption.md) (preemption). Finished on this chain: 230,
 [159](tasks/159-gc-observability.md) (GC observability), [246](tasks/246-raw-pointers-into-managed-memory.md)
 (raw pointers recorded with their base), [235](tasks/235-scheduler-run-queues.md) (per-carrier run queues),

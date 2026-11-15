@@ -1,0 +1,70 @@
+// Compiled-once bodies over composed values whose type parameters are one byte, a String or another composed
+// value: each field sits at the next multiple of its alignment, which erased code computes from the witnesses.
+package struct Trio<T> {
+  var a: Bool
+  var b: Bool
+  var v: T
+}
+package struct Mix<A, B> {
+  var flag: Bool
+  var a: A
+  var small: UInt8
+  var b: B
+}
+package enum Either<T> {
+  case left(flag: Bool, value: T)
+  case right(n: UInt8)
+}
+package fun make<T>(v: T) -> Trio<T> {
+  return Trio<T>(a: true, b: false, v: v)
+}
+package fun getV<T>(t: Trio<T>) -> T {
+  return t.v
+}
+package fun getB<T>(t: Trio<T>) -> Bool {
+  return t.b
+}
+package fun makeMix<A, B>(a: A, b: B) -> Mix<A, B> {
+  return Mix<A, B>(flag: true, a: a, small: 7.uint8, b: b)
+}
+package fun mixA<A, B>(m: Mix<A, B>) -> A {
+  return m.a
+}
+package fun mixB<A, B>(m: Mix<A, B>) -> B {
+  return m.b
+}
+package fun mixSmall<A, B>(m: Mix<A, B>) -> UInt8 {
+  return m.small
+}
+package fun leftOf<T>(v: T) -> Either<T> {
+  return Either<T>.left(flag: true, value: v)
+}
+package fun valueOf<T>(e: Either<T>, fallback: T) -> T {
+  switch e {
+  case .left(let flag, let value):
+    if flag { return value }
+    return fallback
+  case .right:
+    return fallback
+  }
+}
+// A concrete field after a small one, a concrete generic application of one-byte alignment, and a type
+// parameter: the word field goes first, the one-byte fields after it in declared order, the parameter last.
+package struct Wrap<T> {
+  var tag: Bool
+  var inner: Trio<Bool>
+  var n: Int
+  var v: T
+}
+package fun makeWrap<T>(v: T) -> Wrap<T> {
+  return Wrap<T>(tag: true, inner: make(false), n: 42, v: v)
+}
+package fun wrapN<T>(w: Wrap<T>) -> Int {
+  return w.n
+}
+package fun wrapInnerA<T>(w: Wrap<T>) -> Bool {
+  return w.inner.a
+}
+package fun wrapV<T>(w: Wrap<T>) -> T {
+  return w.v
+}

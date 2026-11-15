@@ -7,7 +7,7 @@ import support   // Type
 // registry below, so a new shaped leaf, or shaped content in any aggregate, needs no change in a consumer.
 // Every consumer (SSAIR liveness and homing, slot recording, the I11 verifier, shape ordinals, GC
 // descriptors, the reload) reads it and decides nothing about shapedness on its own. Offsets are bytes in
-// the 8-byte-slot layout (`slots`), the layout every component shares (the egress checks codegen's LLVM
+// the value layout (`Layout.swift`), the layout every component shares (the egress checks codegen's LLVM
 // types against it).
 
 // The shaped leaves: types whose value is a bit-stealing representation with a discriminant. This is the
@@ -33,12 +33,16 @@ public enum ShapeLeaf: Equatable, Hashable, CaseIterable {
         }
     }
 
-    // Size in 8-byte slots.
+    // Size in 8-byte words.
     public var slots: Int {
         switch self {
         case .stringBase: return 2
         }
     }
+
+    // Size and alignment in bytes: whole words, word-aligned.
+    public var size: Int { slots * 8 }
+    public var align: Int { 8 }
 
     // The discriminant: the byte offset of the word that holds it and the shift that extracts it.
     public var tagOffset: Int {
@@ -68,14 +72,14 @@ public enum ShapeLeaf: Equatable, Hashable, CaseIterable {
 }
 
 // One conditional sub-value of a shape: a shaped leaf, or an enum whose per-case payload shapes are keyed by
-// its tag (the case index, at offset 0 of the enum).
+// its tag (the case index, a word at `tagOffset` from the enum's start).
 public indirect enum ShapeEntryKind: Equatable {
     case leaf(ShapeLeaf)
-    case enumCases(name: String, cases: [ShapeCase])
+    case enumCases(name: String, tagOffset: Int, cases: [ShapeCase])
 }
 
 // An enum case that holds managed content: its tag and its payload's shape, offsets relative to the enum's
-// start (the payload begins at byte 8, past the tag word).
+// start.
 public struct ShapeCase: Equatable {
     public let tag: Int
     public let shape: Shape
@@ -117,7 +121,7 @@ public struct Shape: Equatable {
             switch e.kind {
             case .leaf(let leaf):
                 for w in leaf.managedWords { words.insert(e.offset + w) }
-            case .enumCases(_, let cases):
+            case .enumCases(_, _, let cases):
                 for c in cases {
                     for w in c.shape.managed { words.insert(e.offset + w) }
                     for w in c.shape.conditionalWords { words.insert(e.offset + w) }
@@ -140,21 +144,33 @@ public struct Shape: Equatable {
 // egress registers synthesized layouts) sees the additions; a type's entry never changes once present, so
 // cached shapes stay valid.
 public final class ShapeEnv {
-    private let structFields: (String) -> [Type]?
-    private let enumCases: (String) -> [[Type]]?
-    private let classFields: (String) -> [Type]?
+    let structFields: (String) -> [Type]?
+    let enumCases: (String) -> [[Type]]?
+    let classFields: (String) -> [Type]?
+    let fieldMarks: (String) -> [Bool]?   // a struct's or class's `fromTypeParameter` marks, by declared position
+    let enumCaseMarks: (String) -> [[Bool]]?   // an enum's, by case and declared position
+    // Whether enums whose payloads are all references keep their case in the references' spare bits
+    // (`EnumLayout.spareBits`); off under `measure.no_spare_bits`, which keeps the moved tag.
+    public var spareBits = true
     private let resolveOpaque: (Type) -> Type
     private var shapes: [String: Shape] = [:]
     private var leaves: [String: ShapeLeaf?] = [:]
-    private var inProgress = Set<String>()
+    var layouts: [String: (size: Int, align: Int)] = [:]   // `Layout.swift`'s per-type cache
+    var enumLayouts: [String: EnumLayout] = [:]
+    var extras: [String: ExtraInhabitants?] = [:]
+    var inProgress = Set<String>()
 
     public init(structFields: @escaping (String) -> [Type]?,
                 enumCases: @escaping (String) -> [[Type]]?,
                 classFields: @escaping (String) -> [Type]? = { _ in nil },
+                fieldMarks: @escaping (String) -> [Bool]? = { _ in nil },
+                enumCaseMarks: @escaping (String) -> [[Bool]]? = { _ in nil },
                 resolveOpaque: @escaping (Type) -> Type = { $0 }) {
         self.structFields = structFields
         self.enumCases = enumCases
         self.classFields = classFields
+        self.fieldMarks = fieldMarks
+        self.enumCaseMarks = enumCaseMarks
         self.resolveOpaque = resolveOpaque
     }
 
@@ -163,32 +179,13 @@ public final class ShapeEnv {
     // value of the type itself (`shape`). The heap object's descriptor is built from the same fields.
     public func objectShape(_ t: Type) -> Shape? {
         guard case .named(let n, .class_) = t, let fields = classFields(n) else { return nil }
-        return fieldsShape(fields, base: 8)
+        return fieldsShape(fields, offsets: objectLayout(n, base: 8).offsets)
     }
 
     // The concrete type a `some I` stands for; an unresolvable one stays opaque.
-    private func concrete(_ t: Type) -> Type {
+    func concrete(_ t: Type) -> Type {
         if case .opaque = t { return resolveOpaque(t) }
         return t
-    }
-
-    // Size of a value in 8-byte slots: the layout every component shares. A struct is the sum of its
-    // fields; an enum is one tag word plus its largest case's payload; every other leaf is one word, except a
-    // shaped leaf, which has its own size.
-    public func slots(_ t: Type) -> Int {
-        if let leaf = ShapeLeaf.of(t) { return leaf.slots }
-        switch t {
-        case .named(let n, .struct_):
-            return structFields(n)?.reduce(0) { $0 + slots($1) } ?? 1
-        case .named(let n, .enum_):
-            return 1 + (enumCases(n)?.map { $0.reduce(0) { $0 + slots($1) } }.max() ?? 0)
-        case .opaque:
-            let c = concrete(t)
-            if case .opaque = c { return 1 }
-            return slots(c)
-        default:
-            return 1
-        }
     }
 
     // The shaped leaf a value of type `t` *is*: the leaf itself, or a struct with exactly one field whose type
@@ -241,7 +238,7 @@ public final class ShapeEnv {
             guard !inProgress.contains(key) else { return Shape() }
             inProgress.insert(key)
             defer { inProgress.remove(key) }
-            let s = fieldsShape(structFields(n) ?? [], base: 0)
+            let s = fieldsShape(structFields(n) ?? [], offsets: structLayout(n).offsets)
             shapes[key] = s
             return s
         case .named(let n, .enum_):
@@ -250,13 +247,7 @@ public final class ShapeEnv {
             guard !inProgress.contains(key) else { return Shape() }
             inProgress.insert(key)
             defer { inProgress.remove(key) }
-            var cases: [ShapeCase] = []
-            for (ci, fields) in (enumCases(n) ?? []).enumerated() {
-                let cs = fieldsShape(fields, base: 8)   // the payload begins past the tag word
-                if !cs.isEmpty { cases.append(ShapeCase(tag: ci, shape: cs)) }
-            }
-            let s = cases.isEmpty ? Shape()
-                : Shape(conditional: [ShapeEntry(offset: 0, kind: .enumCases(name: n, cases: cases))])
+            let s = enumShape(n)
             shapes[key] = s
             return s
         case .opaque:
@@ -268,15 +259,47 @@ public final class ShapeEnv {
         }
     }
 
-    // The shape of fields laid out in order from byte `base`, each at the slots of the fields before it. A
-    // class or actor body, a closure or fiber environment, and an actor message's arguments are this, at
-    // their object's first field offset.
+    // An enum's shape, by its layout. Over its payload's extra inhabitants it is the payload's shape: a
+    // payload-free case zeroes the payload and writes an extra inhabitant, which holds no object (null) and
+    // which the payload's own decoding (a leaf's tag, a nested enum's tag) reads as holding none. With a tag,
+    // a word that holds a reference in every payload case is a plain pointer (a payload-free case zeroes it),
+    // and the rest of each case's payload shape is keyed by the tag; a tag-only enum holds nothing.
+    private func enumShape(_ n: String) -> Shape {
+        let all = enumCases(n) ?? []
+        let layout = enumLayout(n)
+        if case .overExtraInhabitants(let p) = layout { return fieldsShape(all[p], base: 0) }
+        if case .spareBits = layout {
+            // Every payload case's managed words are the same plain pointers (one carries the tag, which the
+            // collector masks off), and a payload-free case zeroes them.
+            let p = all.indices.first { !all[$0].isEmpty }!
+            return fieldsShape(all[p], offsets: enumCaseLayout(n, p).offsets)
+        }
+        guard let tag = layout.tag else { return Shape() }
+        let shapes = all.indices.map { fieldsShape(all[$0], offsets: enumCaseLayout(n, $0).offsets) }
+        let payloads = all.indices.filter { !all[$0].isEmpty }
+        var common: Set<Int> = payloads.first.map { Set(shapes[$0].managed) } ?? []
+        for ci in payloads { common.formIntersection(shapes[ci].managed) }
+        var cases: [ShapeCase] = []
+        for ci in all.indices {
+            let cs = Shape(managed: shapes[ci].managed.filter { !common.contains($0) }, conditional: shapes[ci].conditional)
+            if !cs.isEmpty { cases.append(ShapeCase(tag: ci, shape: cs)) }
+        }
+        let conditional = cases.isEmpty ? []
+            : [ShapeEntry(offset: 0, kind: .enumCases(name: n, tagOffset: tag.offset, cases: cases))]
+        return Shape(managed: common.sorted(), conditional: conditional)
+    }
+
+    // The shape of fields laid out from byte `base` (`fieldsLayout`). A class or actor body, a closure or
+    // fiber environment, and an actor message's arguments are this, at their object's first field offset.
     public func fieldsShape(_ fields: [Type], base: Int) -> Shape {
+        fieldsShape(fields, offsets: fieldsLayout(fields, base: base).offsets)
+    }
+
+    // The shape of fields at the given offsets (a struct's or object's, from `structLayout`/`objectLayout`).
+    public func fieldsShape(_ fields: [Type], offsets: [Int]) -> Shape {
         var s = Shape()
-        var off = base
-        for f in fields {
+        for (f, off) in zip(fields, offsets) {
             s.append(shape(f), at: off)
-            off += slots(f) * 8
         }
         return s
     }

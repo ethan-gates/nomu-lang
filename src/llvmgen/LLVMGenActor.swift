@@ -3,6 +3,7 @@ import mangle
 import noir
 import ast
 import support
+import ssair
 import Foundation
 import LLVM_C
 
@@ -24,13 +25,15 @@ extension LLVMGen {
     }
 
     // The per-handler message struct `{ header, next, thunk, self, args… }`. Field indices past the
-    // 4-slot prefix are 4 + argPos. Handlers are void (fire-and-forget), so there is no reply field.
+    // 4-slot prefix are 4 + argPos. Handlers are void (fire-and-forget), so there is no reply field. Each
+    // argument has its field storage type, so it sits where the value layout puts it (`messageArgsLayout`),
+    // which the message's GC descriptor reads.
     func messageType(_ actorName: String, _ h: NOIRHandler) -> LLVMTypeRef? {
         let key = "\(actorName):\(h.name)"
         if let t = messageTypes[key] { return t }
         var elems: [LLVMTypeRef] = [i64, p1, i8ptr, p1]   // header, next, thunk, self
         for p in h.params {
-            guard let t = llvmType(p.type, p.span) else { return nil }
+            guard let t = fieldStorageType(p.type, p.span) else { return nil }
             elems.append(t)
         }
         let mt = LLVMStructCreateNamed(ctx, "msg.\(actorName).\(h.name)")!
@@ -42,24 +45,21 @@ extension LLVMGen {
     // Field index of a handler's i-th arg within the message struct (past the 4-slot prefix).
     func msgArgIndex(_ i: Int) -> Int { 4 + i }
 
-    // Total 8-byte slots a handler's message occupies: 4-slot prefix + args. Every leaf is 8-aligned
-    // and an 8-multiple (the object-model invariant), so LLVM adds no padding and byte offsets equal
-    // slot*8 — the same assumption the class/actor layout makes.
-    func messageSlots(_ h: NOIRHandler) -> Int {
-        var slots = 4
-        for p in h.params { slots += slotCount(p.type) }
-        return slots
+    // A handler's arguments in its message, past the 32-byte prefix.
+    func messageArgsLayout(_ h: NOIRHandler) -> FieldsLayout {
+        shapes.fieldsLayout(h.params.map(\.type), base: 32)
     }
+
+    // A handler's message size in bytes.
+    func messageSize(_ h: NOIRHandler) -> Int { ShapeEnv.alignUp(messageArgsLayout(h).end, 8) }
 
     // Type-id + pointer map for a handler's message. Managed offsets: next (8) and self (24) always,
     // plus any managed pointers inside the args. thunk (16, a code ptr) is never scanned.
     func messageTypeIdValue(_ actorName: String, _ h: NOIRHandler) -> UInt64 {
         let key = "\(actorName):\(h.name)"
         if let id = messageTypeIds[key] { return id }
-        let params = h.params.map(\.type)
-        let d = descriptorEntries(shapes.fieldsShape(params, base: 32))   // args start past the 4-slot prefix
-        let slot = 4 + params.reduce(0) { $0 + slotCount($1) }
-        let id = registerMap([8, 24] + d.offsets, sizeBytes: Int32(slot * 8),   // next, self
+        let d = descriptorEntries(shapes.fieldsShape(h.params.map(\.type), base: 32))   // args past the prefix
+        let id = registerMap([8, 24] + d.offsets, sizeBytes: Int32(messageSize(h)),   // next, self
                              symbol: Mangle.messageDescriptor(actorName, h.name, home: homeModule), foldable: true, shaped: d.shaped)
         messageTypeIds[key] = id
         return id
@@ -160,8 +160,7 @@ extension LLVMGen {
 
         // Allocate + populate the message. header, thunk, self, args are set here; `next` is filled by
         // the runtime. The message stays reachable via the mailbox chain once enqueued (no sender root).
-        let bytes = messageSlots(h) * 8
-        let msg = rtAllocManaged(LLVMConstInt(i64, UInt64(bytes), 0))
+        let msg = rtAllocManaged(LLVMConstInt(i64, UInt64(messageSize(h)), 0))
         writeTypeIdHeaderRaw(msg, messageTypeIdValue(actorName, h))
         LLVMBuildStore(b, thunk, structGEP(mt, msg, 2))         // thunk (code ptr, not managed)
         storeField(msg, structGEP(mt, msg, 3), recvValue)       // self (managed)

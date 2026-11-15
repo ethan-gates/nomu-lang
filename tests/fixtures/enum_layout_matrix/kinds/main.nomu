@@ -1,0 +1,329 @@
+// Each non-generic enum layout built, stored and read back across collections: a tag only; over
+// a payload's extra inhabitants (a class reference's addresses below the first page, a `Bool`'s unused bytes, a `String`'s unused tags,
+// a struct's field, another enum's unused tags); and with a tag appended after the payload (a word after a
+// word-aligned payload, a byte after a byte payload). Values live in locals, arrays and class fields while
+// `churn` allocates, so a moving collection relocates the references they hold.
+class Box {
+  var v: Int
+}
+enum Color {
+  case red
+  case green
+  case blue
+}
+enum Slot {
+  case empty
+  case full(box: Box)
+}
+enum Three {
+  case none
+  case one(box: Box)
+  case gone
+}
+enum Tri {
+  case yes(b: Bool)
+  case unknown
+  case skipped
+}
+enum Name {
+  case anon
+  case named(s: String)
+}
+struct Tagged {
+  let n: Int
+  let s: String
+}
+enum Label {
+  case named(t: Tagged)
+  case missing
+}
+enum Paint {
+  case clear
+  case solid(c: Color)
+}
+enum Count {
+  case none
+  case some(n: Int)
+}
+enum Nested {
+  case outer
+  case inner(s: Slot)
+}
+enum Byte {
+  case none
+  case some(v: UInt8)
+}
+class Holder {
+  var slot: Slot
+  var three: Three
+  var name: Name
+  var label: Label
+  var nested: Nested
+}
+// Allocates on the heap (the boxes escape into the array), so collections land between reads.
+fun churn(i: Int) -> Int {
+  var boxes: Array<Box> = []
+  var k = 0
+  while k < 40 {
+    boxes.append(Box(v: i + k))
+    k = k + 1
+  }
+  var t = 0
+  k = 0
+  while k < boxes.count {
+    t = t + boxes[k].v
+    k = k + 1
+  }
+  return t
+}
+fun heap(s: String, i: Int) -> String {
+  if i % 2 == 0 {
+    return s.concat("-heap-string-long-enough")
+  }
+  return s
+}
+fun colorOf(i: Int) -> Color {
+  if i % 3 == 0 {
+    return Color.red
+  }
+  if i % 3 == 1 {
+    return Color.green
+  }
+  return Color.blue
+}
+fun colorValue(c: Color) -> Int {
+  switch c {
+  case .red:
+    return 1
+  case .green:
+    return 2
+  case .blue:
+    return 3
+  }
+}
+fun slotOf(i: Int) -> Slot {
+  if i % 4 == 0 {
+    return Slot.empty
+  }
+  return Slot.full(box: Box(v: i))
+}
+fun slotValue(s: Slot) -> Int {
+  switch s {
+  case .empty:
+    return -1
+  case .full(let b):
+    return b.v
+  }
+}
+fun threeOf(i: Int) -> Three {
+  if i % 3 == 0 {
+    return Three.none
+  }
+  if i % 3 == 1 {
+    return Three.one(box: Box(v: i))
+  }
+  return Three.gone
+}
+fun threeValue(t: Three) -> Int {
+  switch t {
+  case .none:
+    return -1
+  case .one(let b):
+    return b.v
+  case .gone:
+    return -2
+  }
+}
+fun triOf(i: Int) -> Tri {
+  if i % 4 == 0 {
+    return Tri.unknown
+  }
+  if i % 4 == 1 {
+    return Tri.skipped
+  }
+  return Tri.yes(b: i % 4 == 2)
+}
+fun triValue(t: Tri) -> Int {
+  switch t {
+  case .yes(let b):
+    if b {
+      return 1
+    }
+    return 0
+  case .unknown:
+    return -1
+  case .skipped:
+    return -2
+  }
+}
+fun nameOf(i: Int) -> Name {
+  if i % 3 == 0 {
+    return Name.anon
+  }
+  return Name.named(s: heap(s: "n", i: i))
+}
+fun nameValue(n: Name) -> Int {
+  switch n {
+  case .anon:
+    return -1
+  case .named(let s):
+    return s.count
+  }
+}
+fun labelOf(i: Int) -> Label {
+  if i % 5 == 0 {
+    return Label.missing
+  }
+  return Label.named(t: Tagged(n: i, s: heap(s: "l", i: i)))
+}
+fun labelValue(l: Label) -> Int {
+  switch l {
+  case .missing:
+    return -1
+  case .named(let t):
+    return t.n + t.s.count
+  }
+}
+fun paintOf(i: Int) -> Paint {
+  if i % 4 == 0 {
+    return Paint.clear
+  }
+  return Paint.solid(c: colorOf(i: i))
+}
+fun paintValue(p: Paint) -> Int {
+  switch p {
+  case .clear:
+    return -1
+  case .solid(let c):
+    return colorValue(c: c)
+  }
+}
+fun countOf(i: Int) -> Count {
+  if i % 3 == 0 {
+    return Count.none
+  }
+  return Count.some(n: i * 7)
+}
+fun countValue(c: Count) -> Int {
+  switch c {
+  case .none:
+    return -1
+  case .some(let n):
+    return n
+  }
+}
+fun nestedOf(i: Int) -> Nested {
+  if i % 3 == 0 {
+    return Nested.outer
+  }
+  return Nested.inner(s: slotOf(i: i))
+}
+fun nestedValue(n: Nested) -> Int {
+  switch n {
+  case .outer:
+    return -3
+  case .inner(let s):
+    return slotValue(s: s)
+  }
+}
+fun byteOf(i: Int) -> Byte {
+  if i % 3 == 0 {
+    return Byte.none
+  }
+  return Byte.some(v: (i % 200).uint8)
+}
+fun byteValue(b: Byte) -> Int {
+  switch b {
+  case .none:
+    return -1
+  case .some(let v):
+    return v.int
+  }
+}
+// One value of every kind for `i`, summed.
+fun expected(i: Int) -> Int {
+  return colorValue(c: colorOf(i: i)) + slotValue(s: slotOf(i: i)) + threeValue(t: threeOf(i: i))
+    + triValue(t: triOf(i: i)) + nameValue(n: nameOf(i: i)) + labelValue(l: labelOf(i: i))
+    + paintValue(p: paintOf(i: i)) + countValue(c: countOf(i: i)) + nestedValue(n: nestedOf(i: i))
+    + byteValue(b: byteOf(i: i))
+}
+fun main() {
+  let n = 1000
+  var colors: Array<Color> = []
+  var slots: Array<Slot> = []
+  var threes: Array<Three> = []
+  var tris: Array<Tri> = []
+  var names: Array<Name> = []
+  var labels: Array<Label> = []
+  var paints: Array<Paint> = []
+  var counts: Array<Count> = []
+  var nesteds: Array<Nested> = []
+  var bytes: Array<Byte> = []
+  var holders: Array<Holder> = []
+  var want: Array<Int> = []
+  var i = 0
+  while i < n {
+    colors.append(colorOf(i: i))
+    slots.append(slotOf(i: i))
+    threes.append(threeOf(i: i))
+    tris.append(triOf(i: i))
+    names.append(nameOf(i: i))
+    labels.append(labelOf(i: i))
+    paints.append(paintOf(i: i))
+    counts.append(countOf(i: i))
+    nesteds.append(nestedOf(i: i))
+    bytes.append(byteOf(i: i))
+    holders.append(Holder(slot: slotOf(i: i), three: threeOf(i: i), name: nameOf(i: i), label: labelOf(i: i),
+                          nested: nestedOf(i: i)))
+    want.append(expected(i: i))
+    i = i + 1
+  }
+  var bad = 0
+  var round = 0
+  while round < 4 {
+    var j = 0
+    while j < n {
+      let local = slotOf(i: j)
+      let localName = nameOf(i: j)
+      let localThree = threeOf(i: j)          // `gone` is the address 1: a frame root the walk must skip
+      let localNested = nestedOf(i: j)
+      var sink = churn(i: j)
+      let got = colorValue(c: colors[j]) + slotValue(s: slots[j]) + threeValue(t: threes[j]) + triValue(t: tris[j])
+        + nameValue(n: names[j]) + labelValue(l: labels[j]) + paintValue(p: paints[j]) + countValue(c: counts[j])
+        + nestedValue(n: nesteds[j]) + byteValue(b: bytes[j])
+      if got != want[j] {
+        bad = bad + 1
+      }
+      let h = holders[j]
+      sink = sink + churn(i: j + 1)
+      let held = slotValue(s: h.slot) + threeValue(t: h.three) + nameValue(n: h.name) + labelValue(l: h.label)
+        + nestedValue(n: h.nested)
+      // `slot` and `three` hold what the previous round wrote: `j + round`.
+      let fresh = slotValue(s: slotOf(i: j + round)) + threeValue(t: threeOf(i: j + round)) + nameValue(n: nameOf(i: j))
+        + labelValue(l: labelOf(i: j)) + nestedValue(n: nestedOf(i: j))
+      if held != fresh {
+        bad = bad + 1
+      }
+      if slotValue(s: local) + nameValue(n: localName) != slotValue(s: slotOf(i: j)) + nameValue(n: nameOf(i: j)) {
+        bad = bad + 1
+      }
+      if threeValue(t: localThree) + nestedValue(n: localNested) != threeValue(t: threeOf(i: j)) + nestedValue(n: nestedOf(i: j)) {
+        bad = bad + 1
+      }
+      // Overwrite a field with another case, so a mature holder's field changes kind under the barrier.
+      h.slot = slotOf(i: j + round + 1)
+      h.three = threeOf(i: j + round + 1)
+      if slotValue(s: h.slot) != slotValue(s: slotOf(i: j + round + 1)) {
+        bad = bad + 1
+      }
+      if sink < 0 {
+        bad = bad + 1
+      }
+      j = j + 1
+    }
+    round = round + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

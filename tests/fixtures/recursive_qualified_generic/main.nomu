@@ -1,0 +1,12 @@
+// A cycle through a qualified imported generic: `box.Box<T>` holds its `T` inline, so `S` holding
+// `box.Box<S>` holds itself.
+import pkg/box
+
+struct S {
+    let b: box.Box<S>
+    let n: Int
+}
+
+fun main() {
+    print(1)
+}

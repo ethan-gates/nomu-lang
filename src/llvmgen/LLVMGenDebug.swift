@@ -120,16 +120,12 @@ extension LLVMGen {
         if let c = diTypeCache["s:\(name)"] { return c }
         guard let s = structMap[name] else { return nil }
         var members: [LLVMMetadataRef?] = []
-        var offsetSlots = 0
-        for f in s.fields {
-            let fieldSlots = slotCount(f.type)
+        for (f, off) in zip(s.fields, shapes.structLayout(name).offsets) {
             if let fty = diType(f.type) {
-                members.append(member(f.name, fty, sizeBits: UInt64(fieldSlots) * 64,
-                                      offsetBits: UInt64(offsetSlots) * 64))
+                members.append(member(f.name, fty, sizeBits: UInt64(sizeOf(f.type)) * 8, offsetBits: UInt64(off) * 8))
             }
-            offsetSlots += fieldSlots
         }
-        let t = composite(name, sizeBits: UInt64(offsetSlots) * 64, members: members)
+        let t = composite(name, sizeBits: UInt64(sizeOf(.named(name, .struct_))) * 8, members: members)
         diTypeCache["s:\(name)"] = t
         return t
     }
@@ -140,16 +136,12 @@ extension LLVMGen {
         if let c = diTypeCache["c:\(name)"] { return c }
         guard let cl = classMap[name] else { return nil }
         var members: [LLVMMetadataRef?] = [member("__header", diBasic("Int", dwSigned), sizeBits: 64, offsetBits: 0)]
-        var offsetSlots = 1
-        for f in cl.fields {
-            let fieldSlots = slotCount(f.type)
+        for (f, off) in zip(cl.fields, objectLayout(name).offsets) {
             if let fty = diType(f.type) {
-                members.append(member(f.name, fty, sizeBits: UInt64(fieldSlots) * 64,
-                                      offsetBits: UInt64(offsetSlots) * 64))
+                members.append(member(f.name, fty, sizeBits: UInt64(sizeOf(f.type)) * 8, offsetBits: UInt64(off) * 8))
             }
-            offsetSlots += fieldSlots
         }
-        let obj = composite(name, sizeBits: UInt64(offsetSlots) * 64, members: members)
+        let obj = composite(name, sizeBits: UInt64(objectSize(name)) * 8, members: members)
         let ptr = LLVMDIBuilderCreatePointerType(di, obj, 64, 0, 0, "", 0)
         diTypeCache["c:\(name)"] = ptr
         return ptr

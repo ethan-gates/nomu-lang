@@ -71,3 +71,16 @@ public struct ExternalGenericSig {
     }
     public var bounded: Bool { bounds.contains { !$0.isEmpty } }
 }
+
+extension Type {
+    // Whether a type parameter occurs anywhere in this type.
+    public var mentionsTypeParameter: Bool {
+        switch self {
+        case .typeParam: return true
+        case .generic(_, let args): return args.contains { $0.mentionsTypeParameter }
+        case .array(let e), .ptr(let e): return e.mentionsTypeParameter
+        case .function(let ps, let r): return r.mentionsTypeParameter || ps.contains { $0.mentionsTypeParameter }
+        default: return false
+        }
+    }
+}

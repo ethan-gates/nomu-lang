@@ -196,7 +196,7 @@ extension LLVMGen {
             // holds the object reference, so load it first and GEP the object (past its header). A setter
             // on a class field goes through the barriered `storeField`.
             let base = info.kind == .classRef ? LLVMBuildLoad2(b, p1, valuePtr, "self")! : valuePtr
-            let addr = structGEP(info.ty, base, fieldLLVMIndex(info.kind, pos))
+            let addr = structGEP(info.ty, base, llvmFieldIndex(type, pos))
             if setter {
                 if info.kind == .classRef { storeField(base, addr, LLVMGetParam(fn, 1)!) }
                 else { LLVMBuildStore(b, LLVMGetParam(fn, 1)!, addr) }
@@ -284,9 +284,9 @@ extension LLVMGen {
 
         if let info = aggInfo(type), let pos = info.fields.firstIndex(where: { $0.name == p.name }) {
             // A struct value payload's fields start past the box's 8-byte header; a class payload is the
-            // object itself (header at 0, handled by fieldLLVMIndex's +1).
+            // object itself (header at 0, which `llvmFieldIndex` steps past).
             let base = info.kind == .classRef ? payload : payloadValue(payload)
-            let addr = structGEP(info.ty, base, fieldLLVMIndex(info.kind, pos))
+            let addr = structGEP(info.ty, base, llvmFieldIndex(type, pos))
             if setter {
                 storeField(payload, addr, LLVMGetParam(fn, 1)!)
                 LLVMBuildRetVoid(b)
@@ -356,8 +356,7 @@ extension LLVMGen {
             // at offset 8, carrying the value's managed-pointer map (valueBoxTypeId). Header-less, a moving
             // collection reads the value's first word as a bogus type-id and mis-scans/mis-copies the
             // payload. Readers reach the value at payload+8 (payloadValue, used by bridgeThunkSelf and propThunk).
-            let bytes = (1 + slotCount(t)) * 8
-            let p = rtAllocManaged(LLVMConstInt(i64, UInt64(bytes), 0))
+            let p = rtAllocManaged(LLVMConstInt(i64, UInt64(valueBoxSize(t)), 0))
             writeTypeIdHeaderRaw(p, valueBoxTypeId(t))
             LLVMBuildStore(b, v(), payloadValue(p))
             return p

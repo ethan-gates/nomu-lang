@@ -1,0 +1,10 @@
+// A cycle through an imported generic's type argument: `Option` (from `std`) holds its `T` inline, so `Node`
+// holding `Option<Node>` holds itself.
+struct Node {
+    let value: Int
+    let next: Option<Node>
+}
+
+fun main() {
+    print(1)
+}

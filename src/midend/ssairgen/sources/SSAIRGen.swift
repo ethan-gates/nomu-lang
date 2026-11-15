@@ -110,7 +110,9 @@ public func lowerToSSAIR(_ module: NOIRModule, subsetFuncs: Set<String> = []) ->
     return SSAGenResult(module: ssa, diagnostics: diags)
 }
 
-private func field(_ f: NOIRField) -> SSAField { SSAField(name: f.name, type: f.type, isMutable: f.isMutable) }
+private func field(_ f: NOIRField) -> SSAField {
+    SSAField(name: f.name, type: f.type, isMutable: f.isMutable, fromTypeParameter: f.fromTypeParameter)
+}
 
 private func lowerMethods(_ typeName: String, _ kind: NamedKind, _ methods: [NOIRFunc],
                           _ ownerGenerics: [NOIRGenericParam],

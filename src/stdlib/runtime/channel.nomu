@@ -3,8 +3,8 @@
 //
 // A channel is a `ManagedBuffer<ChannelState, ChannelSlot<T>>`: the collector scans and moves it as any
 // buffer. The core never learns `T`: each call gets the value's address and its value witness, whose size is
-// the element stride (`ChannelSlot<T>` keeps every element a whole number of 8-byte slots) and whose POD flag
-// says whether a slot holds references.
+// the element stride (a size is a multiple of the alignment) and whose POD flag says whether a slot holds
+// references.
 //
 // Layouts (byte offsets):
 //   Buffer: 0 type-id · 8 capacity · 16 state · 80 elements (capacity × size)

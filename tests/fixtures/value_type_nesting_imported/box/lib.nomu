@@ -1,0 +1,8 @@
+// A generic that holds its type argument inline, and one that holds it through an array.
+package struct Box<T> {
+    let item: T
+}
+
+package struct Many<T> {
+    let items: Array<T>
+}

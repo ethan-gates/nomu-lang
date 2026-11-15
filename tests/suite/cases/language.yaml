@@ -88,8 +88,8 @@ cases:
 
   - name: recursive-enum
     fixture: tests/fixtures/recursive_enum
-    compile:
-      expect_error: "value type 'Tree' contains itself: Tree.node.left → Tree; recursive enums are not supported yet"
+    expect:
+      stdout: "1"
 
   - name: recursive-struct-mutual
     fixture: tests/fixtures/recursive_struct_mutual
@@ -103,13 +103,33 @@ cases:
 
   - name: recursive-generic-enum
     fixture: tests/fixtures/recursive_generic_enum
+    expect:
+      stdout: "1"
+
+  - name: recursive-through-type-parameter
+    fixture: tests/fixtures/recursive_through_type_parameter
     compile:
-      expect_error: "value type 'List' contains itself: List.cons.tail → List"
+      expect_error: "value type 'Node' contains itself: Node.o → Node; a value type cannot hold itself except through an enum case"
 
   - name: value-type-nesting
     fixture: tests/fixtures/value_type_nesting
     expect:
       stdout: "17\n"
+
+  - name: recursive-imported-generic
+    fixture: tests/fixtures/recursive_imported_generic
+    compile:
+      expect_error: "value type 'Node' contains itself: Node.next → Node"
+
+  - name: recursive-qualified-generic
+    fixture: tests/fixtures/recursive_qualified_generic
+    compile:
+      expect_error: "value type 'S' contains itself: S.b → S"
+
+  - name: value-type-nesting-imported
+    fixture: tests/fixtures/value_type_nesting_imported
+    expect:
+      stdout: "16\n"
 
   - name: bundle-plain
     fixture: tests/fixtures/bundle_plain

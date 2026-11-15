@@ -1,6 +1,7 @@
 import noir
 import ast
 import support
+import ssair
 import LLVM_C
 
 // Type-layout primitives (moved from the tree-walk into the shared emitter, ssair.md): the
@@ -20,9 +21,10 @@ extension LLVMGen {
         }
         let st = LLVMStructCreateNamed(ctx, "struct.\(name)")!
         structTypes[name] = st   // cache before filling (value structs never self-nest, but be safe)
+        // Elements in memory order (`ShapeEnv.memoryOrder`); `llvmFieldIndex` maps a declared position.
         var elems: [LLVMTypeRef] = []
-        for f in s.fields {
-            guard let ft = fieldStorageType(f.type, f.span) else { return nil }
+        for i in memoryOrder(name) {
+            guard let ft = fieldStorageType(s.fields[i].type, s.fields[i].span) else { return nil }
             elems.append(ft)
         }
         // A zero-field struct (e.g. a method-only `Time`) would lower to LLVM's empty type `{}`, which
@@ -33,16 +35,16 @@ extension LLVMGen {
         return st
     }
 
-    // The LLVM type of a field inside an aggregate (struct, class, actor, enum case). Every Nomu layout
-    // reads fields as whole 8-byte slots (`slotCount`: the GC descriptors, enum payloads, array strides, the
-    // erased path's offsets), so a field narrower than a slot is stored widened to one. Its register type
-    // stays narrow (`llvmType`); `toFieldStorage`/`fromFieldStorage` convert at `insertvalue`/`extractvalue`.
-    // A load or store through a field address keeps the narrow type, which reads or writes the slot's low
-    // bytes (little-endian targets). `checkSlotLayout` rejects any aggregate whose LLVM layout differs.
+    // The LLVM type of a field inside an aggregate (struct, class, actor, enum case, actor message): its
+    // size in the value layout (`ShapeEnv.size`), so LLVM's natural layout places it where the value layout
+    // does. A `Bool` is stored as a byte; its register type stays `i1` (`llvmType`), and
+    // `toFieldStorage`/`fromFieldStorage` convert at `insertvalue`/`extractvalue`. A load or store through a
+    // field address keeps the register type, which LLVM reads and writes as one byte. `checkLayout` rejects
+    // any aggregate whose LLVM layout differs.
     func fieldStorageType(_ t: Type, _ span: Span) -> LLVMTypeRef? {
         switch smallFieldBase(t) {
-        case .bool, .uint8: return i64
-        default:            return llvmType(t, span)
+        case .bool: return i8
+        default:    return llvmType(t, span)
         }
     }
 
@@ -54,16 +56,15 @@ extension LLVMGen {
 
     func toFieldStorage(_ v: LLVMValueRef, _ t: Type) -> LLVMValueRef {
         switch smallFieldBase(t) {
-        case .bool, .uint8: return LLVMBuildZExt(b, v, i64, "fld.wide")!
-        default:            return v
+        case .bool: return LLVMBuildZExt(b, v, i8, "fld.byte")!
+        default:    return v
         }
     }
 
     func fromFieldStorage(_ v: LLVMValueRef, _ t: Type) -> LLVMValueRef {
         switch smallFieldBase(t) {
-        case .bool:  return LLVMBuildTrunc(b, v, i1, "fld.narrow")!
-        case .uint8: return LLVMBuildTrunc(b, v, i8, "fld.narrow")!
-        default:     return v
+        case .bool: return LLVMBuildTrunc(b, v, i1, "fld.bool")!
+        default:    return v
         }
     }
 
@@ -119,41 +120,77 @@ extension LLVMGen {
 
     // A class object is `{ i64 header /*ObjectHeader.type_id, 6.1.2*/, fields… }`, heap-allocated. The
     // header slot mirrors the runtime's `ObjectHeader`; codegen fills the type-id at 6.1.3 (zero until
-    // then). Field index i is therefore at aggregate index i+1.
+    // then). The fields follow in memory order; `llvmFieldIndex` maps a declared position.
     func classType(_ name: String) -> LLVMTypeRef? {
         if let t = classTypes[name] { return t }
         guard let c = classMap[name] else { return nil }
         let ct = LLVMStructCreateNamed(ctx, "class.\(name)")!
         classTypes[name] = ct
         var elems: [LLVMTypeRef] = [i64]   // ObjectHeader
-        for f in c.fields {
-            guard let ft = fieldStorageType(f.type, f.span) else { return nil }
+        for i in memoryOrder(name) {
+            guard let ft = fieldStorageType(c.fields[i].type, c.fields[i].span) else { return nil }
             elems.append(ft)
         }
         setStructBody(ct, elems)
         return ct
     }
 
-    // An actor object is `{ i64 header, fields…, mailbox }`, heap-allocated (M6 · 6.4). Fields sit at
-    // index i+1 (past the header, like a class); the trailing slot holds a managed pointer to the
-    // actor's mailbox object (a GC object — so it is scanned, unlike the old runtime mutex).
+    // An actor object is `{ i64 header, mailbox, fields… }`, heap-allocated (M6 · 6.4). The mailbox slot at
+    // byte 8 holds a managed pointer to the actor's mailbox object (a GC object, so it is scanned); the
+    // fields follow in memory order from byte 16.
     func actorType(_ name: String) -> LLVMTypeRef? {
         if let t = actorTypes[name] { return t }
         guard let a = actorMap[name] else { return nil }
         let at = LLVMStructCreateNamed(ctx, "actor.\(name)")!
         actorTypes[name] = at
-        var elems: [LLVMTypeRef] = [i64]   // ObjectHeader
-        for f in a.fields {
-            guard let ft = fieldStorageType(f.type, f.span) else { return nil }
+        var elems: [LLVMTypeRef] = [i64, p1]   // ObjectHeader, mailbox
+        for i in memoryOrder(name) {
+            guard let ft = fieldStorageType(a.fields[i].type, a.fields[i].span) else { return nil }
             elems.append(ft)
         }
-        elems.append(p1)   // mailbox
         setStructBody(at, elems)
         return at
     }
 
-    // The index of an actor's mailbox slot (after the header and every field).
-    func actorMailboxIndex(_ name: String) -> Int { (actorMap[name]?.fields.count ?? 0) + 1 }
+    // An actor's mailbox slot: element 1, byte 8, just past the header.
+    func actorMailboxIndex(_ name: String) -> Int { 1 }
+    func actorMailboxOffset(_ name: String) -> Int { 8 }
+
+    // Where a class's or actor's fields begin: past the header word, and an actor's mailbox.
+    func objectFieldBase(_ name: String) -> Int { actorMap[name] != nil ? 16 : 8 }
+
+    // A class's or actor's fields: offsets by declared position.
+    func objectLayout(_ name: String) -> FieldsLayout { shapes.objectLayout(name, base: objectFieldBase(name)) }
+
+    // A struct's, class's or actor's declared field positions in memory order.
+    func memoryOrder(_ name: String) -> [Int] {
+        let fields = structMap[name]?.fields ?? classMap[name]?.fields
+        if let fields { return shapes.memoryOrder(fields.map(\.type), marks: fields.map(\.fromTypeParameter)) }
+        return shapes.memoryOrder(actorMap[name]?.fields.map(\.type) ?? [], marks: nil)
+    }
+
+    // The LLVM element index of a struct's, class's or actor's field at declared position `pos`: its place in
+    // memory order, past a class's header or an actor's header and mailbox.
+    func llvmFieldIndex(_ name: String, _ pos: Int) -> Int {
+        if let m = fieldIndexMaps[name] { return m[pos] }
+        let order = memoryOrder(name)
+        let first = structMap[name] != nil ? 0 : (actorMap[name] != nil ? 2 : 1)
+        var m = [Int](repeating: 0, count: order.count)
+        for (k, i) in order.enumerated() { m[i] = first + k }
+        fieldIndexMaps[name] = m
+        return m[pos]
+    }
+
+    // A value box `{ header, value }`'s size in bytes (`boxPayload`).
+    func valueBoxSize(_ t: Type) -> Int { ShapeEnv.alignUp(8 + sizeOf(t), 8) }
+
+    // Where a `ManagedBuffer<Header, Element>`'s elements begin: past the type-id and capacity words and the
+    // header, rounded up to a word, which is every element's alignment or more. A constant, so erased code
+    // that knows only `Header` agrees with specialized code.
+    func managedBufferElementStart(header: Type) -> Int { ShapeEnv.alignUp(16 + sizeOf(header), 8) }
+
+    // A class or actor object's size in bytes: the header word, an actor's mailbox pointer, and the fields.
+    func objectSize(_ name: String) -> Int { ShapeEnv.alignUp(objectLayout(name).end, 8) }
 
     // The aggregate type, kind, and fields of a named struct/class.
     func aggInfo(_ typeName: String) -> (ty: LLVMTypeRef, kind: AggKind, fields: [NOIRField])? {
@@ -162,20 +199,54 @@ extension LLVMGen {
         return nil
     }
 
-    func fieldLLVMIndex(_ kind: AggKind, _ fieldPos: Int) -> Int {
-        kind == .classRef ? fieldPos + 1 : fieldPos   // classes reserve index 0 for the header
-    }
 
-    // An enum lowers to `{ i64 tag, [P x i64] payload }`, P the largest case's slot count. Payload
-    // fields are read/written by GEPing the case's struct type over the payload region.
+    // An enum lowers by its layout (`ShapeEnv.enumLayout`): a tag only, `{ iN tag }`; over its payload's extra
+    // inhabitants, the payload case's fields `{ f0, f1, … }`; with a tag, the payload region then the tag,
+    // `{ region…, iN tag }`, each case's fields read and written by GEPing its struct type over the region. A
+    // word-aligned region is words, a pointer where every payload case holds a reference (the shape's plain
+    // managed words, which the statepoint rewrite relocates) and an `i64` elsewhere; a narrower region is
+    // integers of its alignment.
     func enumType(_ name: String) -> LLVMTypeRef? {
         if let t = enumTypes[name] { return t }
         guard let en = enumMap[name] else { return nil }
         let et = LLVMStructCreateNamed(ctx, "enum.\(name)")!
         enumTypes[name] = et
-        let slots = en.cases.map { caseSlots($0) }.max() ?? 0
-        setStructBody(et, [i64, LLVMArrayType2(i64, UInt64(slots))])
+        switch shapes.enumLayout(name) {
+        case .tagOnly(let w):
+            setStructBody(et, [intType(bytes: w)])
+        case .overExtraInhabitants(let p):
+            guard let fields = caseFieldTypes(en.cases[p]) else { return nil }
+            setStructBody(et, fields)
+        case .tagged(let tagOffset, let w):
+            let region = shapes.enumPayloadRegion(name)
+            var elems: [LLVMTypeRef] = []
+            if region.align >= 8 {
+                let pointers = Set(shapes.shape(.named(name, .enum_)).managed)
+                for off in stride(from: 0, to: tagOffset, by: 8) { elems.append(pointers.contains(off) ? p1 : i64) }
+            } else {
+                elems = Array(repeating: intType(bytes: region.align), count: tagOffset / region.align)
+            }
+            setStructBody(et, elems + [intType(bytes: w)])
+        case .spareBits:
+            // The payload region's words, a pointer where every payload case holds a reference (one of them
+            // carrying the case in its low bits).
+            let pointers = Set(shapes.shape(.named(name, .enum_)).managed)
+            let size = shapes.size(.named(name, .enum_))
+            setStructBody(et, stride(from: 0, to: size, by: 8).map { pointers.contains($0) ? p1 : i64 })
+        }
         return et
+    }
+
+    // The integer type of `bytes` bytes: a tag, or the field an extra inhabitant is written to.
+    func intType(bytes: Int) -> LLVMTypeRef { LLVMIntTypeInContext(ctx, UInt32(bytes * 8))! }
+
+    private func caseFieldTypes(_ c: NOIREnumCase) -> [LLVMTypeRef]? {
+        var elems: [LLVMTypeRef] = []
+        for f in c.fields {
+            guard let t = fieldStorageType(f.type, f.span) else { return nil }
+            elems.append(t)
+        }
+        return elems
     }
 
     // The struct of a case's payload field types — GEP'd over the enum's payload region.
@@ -188,14 +259,12 @@ extension LLVMGen {
         return structTy(elems)
     }
 
-    func caseSlots(_ c: NOIREnumCase) -> Int { c.fields.reduce(0) { $0 + slotCount($1.type) } }
-
     // 6.5.2 — a captured value whose LLVM type carries no managed pointer (the scalar leaves), so a
     // stack-allocated closure env holding only such captures needs no barrier or stack-map scanning.
     func isScalarLeaf(_ ty: LLVMTypeRef) -> Bool { ty == i64 || ty == f64 || ty == i1 }
 
-    // 8-byte slots a value occupies: the layout every component shares (`ShapeEnv.slots`).
-    func slotCount(_ t: Type) -> Int { shapes.slots(t) }
+    // A value's size in bytes: the value layout every component shares (`ShapeEnv.size`).
+    func sizeOf(_ t: Type) -> Int { shapes.size(t) }
 
     func typeMethods(_ typeName: String) -> [NOIRFunc] {
         structMap[typeName]?.methods ?? enumMap[typeName]?.methods ?? classMap[typeName]?.methods ?? []

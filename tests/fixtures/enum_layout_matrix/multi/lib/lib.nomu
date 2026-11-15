@@ -1,0 +1,46 @@
+// A generic enum with several payload cases, built and read in compiled-once bodies: under the debug pipeline
+// they run erased, placing the tag after the largest payload as the value witnesses size it.
+package enum Either<A, B> {
+  case left(a: A)
+  case right(b: B)
+  case neither
+}
+package fun eitherOf<A, B>(a: A, b: B, k: Int) -> Either<A, B> {
+  if k % 3 == 0 {
+    return Either<A, B>.left(a: a)
+  }
+  if k % 3 == 1 {
+    return Either<A, B>.right(b: b)
+  }
+  return Either<A, B>.neither
+}
+package fun side<A, B>(e: Either<A, B>) -> Int {
+  switch e {
+  case .left(let a):
+    return 0
+  case .right(let b):
+    return 1
+  case .neither:
+    return 2
+  }
+}
+package fun leftOr<A, B>(e: Either<A, B>, d: A) -> A {
+  switch e {
+  case .left(let a):
+    return a
+  case .right(let b):
+    return d
+  case .neither:
+    return d
+  }
+}
+package fun rightOr<A, B>(e: Either<A, B>, d: B) -> B {
+  switch e {
+  case .left(let a):
+    return d
+  case .right(let b):
+    return b
+  case .neither:
+    return d
+  }
+}
