@@ -55,13 +55,13 @@ let rtGcPercent = rtEnvGcPercent()
 let rtHeapMaxSetting = rtEnvHeapMax()
 let rtSpace = rtHeapNew(rtHeapMaxSetting)
 let rtHeapReservedBlocks: Int = rtSpace.load(fromByteOffset: 8)
-// The heap's address range [rtHeapLo, rtHeapHi), the whole reservation: the write barrier skips stores into
-// objects outside it (large and immortal objects), which the log-bit table does not cover.
-let rtHeapLo: Int = rtSpace.load(fromByteOffset: 40)
-let rtHeapHi = rtHeapLo + rtHeapReservedBlocks * 32768
-// The log-bit table's base, biased so the barrier indexes it by absolute address: the byte for address `a`
-// is at `rtLogbitBase + (a >> 3 >> 3)` (one bit per 8-byte region).
-let rtLogbitBase = rtLogbitBaseOf(rtSpace)
+// The write barrier's values, together so its inline fast path (`__nomu_remember`, LLVMGenRuntime.swift) reads
+// them from one address: the heap's start @0, the reservation's length in bytes @8, and the log-bit table @16.
+// The table covers the whole reservation, one bit per 8-byte region: the byte for address `a` is at
+// `table + (a - start) / 64`. A store into an object outside the reservation (large and immortal objects)
+// skips the barrier. All zero until filled, which skips every store.
+let rtBarrierRange = Runtime.staticStorage(bytes: 24, align: 8)
+let rtBarrierRangeFilled = rtBarrierRangeFill(rtSpace, rtHeapReservedBlocks)
 
 // The heap's space: a reservation of `setting` bytes when NOMU_HEAP_MAX gives one, which out of memory ends
 // the program when the system refuses; else the default size, halved on each refusal down to the minimum. The
@@ -175,10 +175,13 @@ fun rtEnvHeapMax() -> Int {
   return n * unit
 }
 
-fun rtLogbitBaseOf(space: RawPtr) -> Int {
+fun rtBarrierRangeFill(space: RawPtr, blocks: Int) -> Int {
+  let start: Int = space.load(fromByteOffset: 40)
   let table: RawPtr = space.load(fromByteOffset: 144)
-  let heapBase: Int = space.load(fromByteOffset: 40)
-  return table.toInt() - heapBase / 64
+  rtBarrierRange.store(start, toByteOffset: 0)
+  rtBarrierRange.store(blocks * 32768, toByteOffset: 8)
+  rtBarrierRange.store(table, toByteOffset: 16)
+  return 1
 }
 
 fun rtPositive(v: Int) -> Int {

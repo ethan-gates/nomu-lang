@@ -183,8 +183,11 @@ fun rtVerifyHeap(space: RawPtr, slots: RawPtr, ns: Int, rem: RawPtr, nrem: Int, 
     let a = obj.toInt()
     let bi = rtVerifyBlockOf(space, a)
     // The object itself.
+    // Above the type id only the collector's mark may be set (bits 34–35, 0–2, kept from the cycle that marked
+    // it); the verifier's mark (32) and the forwarding bit (33) are transient.
     let h: Int = obj.load(fromByteOffset: 0)
-    if h >> 32 != 0 {
+    let high = h >> 32
+    if high % 4 != 0 || high >= 16 || rtMarkOf(h) == 3 {
       rtVerifyFail(space, 3, when, obj, -1, RawPtr.null)
     }
     let tid = rtObjTypeId(obj)
@@ -326,7 +329,7 @@ fun rtVerifyFail(space: RawPtr, rule: Int, when: Int, obj: RawPtr, off: Int, chi
   let at = buf.advanced(by: n)
   if rule == 1 { n = n + Runtime.copyLiteral(to: at, "an object outside the nursery points into it and is not remembered") }
   if rule == 2 { n = n + Runtime.copyLiteral(to: at, "a reachable object has a bad type id") }
-  if rule == 3 { n = n + Runtime.copyLiteral(to: at, "a reachable object's header has its mark or forwarding bit set") }
+  if rule == 3 { n = n + Runtime.copyLiteral(to: at, "a reachable object's header has a verifier mark, a forwarding bit or a bad collector mark") }
   if rule == 4 { n = n + Runtime.copyLiteral(to: at, "a reachable object is in a nursery or evacuation-source block after a collection") }
   if rule == 5 { n = n + Runtime.copyLiteral(to: at, "a reachable object lies past the blocks ever used") }
   if rule == 6 { n = n + Runtime.copyLiteral(to: at, "a reachable object is in a free block after a major") }

@@ -1,5 +1,9 @@
 # Configs the integration suite and the tools select (tests/suite, tools/). Each sets one setting, so
 # they combine: `-c release -c no_escape`.
+# Settings an older compiler does not know are skipped, so a toolchain snapshot (tools/snapshot.py) builds
+# against this file after newer settings are added.
+cfg:
+  unknown_settings: ignore
 configs:
   mono_all: null
   mono_none: null
@@ -8,6 +12,7 @@ configs:
   no_inline: null
   no_escape: null
   no_scalar: null
+  no_barrier_elision: null
   rt_prelude: null
   runtime_tier: null
   gc_record: null
@@ -29,6 +34,7 @@ opt:
   inline no_inline: false
   escape no_escape: false
   scalar no_scalar: false
+  barrier_elision no_barrier_elision: false
 test rt_prelude:
   runtime_prelude: true
 test runtime_tier:

@@ -44,7 +44,10 @@ bazel-bin/src/compiler-test/compiler-test tests/suite
   builds the opt `nomu` and keeps it under the host cache's `toolchains/<identity>/` with its memo, label and
   uncommitted patch; `list`, `show`, `path`, `edit`, `rm` and `clear` manage them. Use a snapshot by its path:
   `$(tools/snapshot.py path <label>) build …`. To snapshot an older commit, check it out in this tree and
-  publish; a copy of the tree elsewhere has its own Bazel output directory and rebuilds LLVM.
+  publish; a copy of the tree elsewhere has its own Bazel output directory and rebuilds LLVM. It works on the
+  checkout it runs in, so a commit older than the script takes a copy of it kept outside the tree.
+  The tree's `cfg.yaml` sets `cfg.unknown_settings: ignore`, so a snapshot skips settings added after it was
+  built; a snapshot from before that key existed rejects the file.
 - `stackmap-count.py` — counts the stack-map records (statepoints) in a binary or object, per linked
   object and in total.
 - `workspace_status.sh` — feeds the build's commit stamp (`.bazelrc`).

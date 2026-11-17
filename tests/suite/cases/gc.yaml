@@ -290,6 +290,32 @@ cases:
     collections:
       - min: 1
 
+  - name: gc-wide-shaped
+    fixture: tests/fixtures/gc_wide_shaped
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 512
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+    collections:
+      - min: 1
+
+  - name: gc-wide-shaped-release
+    fixture: tests/fixtures/gc_wide_shaped
+    compile_settings:
+      optimize: true
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+    collections:
+      - min: 1
+
   - name: gc-oom
     fixture: tests/fixtures/gc_pressure
     compile_settings:

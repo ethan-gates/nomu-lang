@@ -92,6 +92,37 @@ final class SSAIRVerifyTests: XCTestCase {
         XCTAssertFalse(verifySSAIR(fn("f", ret: .void, params: [], [bb])).contains { $0.contains("I7") })
     }
 
+    // I7 — a store into an object allocated earlier in the block with no safepoint between needs no barrier
+    // (the object is still young; `BarrierElision`).
+    func testYoungStorePassesClean() {
+        let val = v(0, .named("D", .class_))     // a managed value (a parameter)
+        let obj = v(1, .named("C", .class_))
+        let fld = v(2, .named("D", .class_))
+        let bb = SSABlock(id: 0, params: [], insts: [
+            SSAInst(result: obj, kind: .alloc(.named("C", .class_)), span: sp),
+            SSAInst(result: fld, kind: .fieldAddr(base: obj, fieldIndex: 0), span: sp),
+            SSAInst(result: nil, kind: .store(addr: fld, value: val), span: sp),
+        ], terminator: SSATerm(kind: .ret(nil), span: sp))
+        let errs = verifySSAIR(fn("f", ret: .void, params: [val], [bb]))
+        XCTAssertFalse(errs.contains { $0.contains("I7") }, "\(errs)")
+    }
+
+    // I7 — the same store with a call between the allocation and the store is caught: the call may collect
+    // and promote the object.
+    func testStoreAfterSafepointCaught() {
+        let val = v(0, .named("D", .class_))
+        let obj = v(1, .named("C", .class_))
+        let fld = v(2, .named("D", .class_))
+        let bb = SSABlock(id: 0, params: [], insts: [
+            SSAInst(result: obj, kind: .alloc(.named("C", .class_)), span: sp),
+            SSAInst(result: nil, kind: .call(SSACall(kind: .direct("g"), args: [])), span: sp),   // safepoint
+            SSAInst(result: fld, kind: .fieldAddr(base: obj, fieldIndex: 0), span: sp),
+            SSAInst(result: nil, kind: .store(addr: fld, value: val), span: sp),
+        ], terminator: SSATerm(kind: .ret(nil), span: sp))
+        let errs = verifySSAIR(fn("f", ret: .void, params: [val], [bb]))
+        XCTAssertTrue(errs.contains { $0.contains("I7") }, "\(errs)")
+    }
+
     // I11 — a shaped (`String`) value live across a safepoint is a well-formed shaped root. A String param
     // held live across a call (used again after it) is the legitimate shaped-root case: it must pass clean.
     func testShapedValueAcrossCallPassesClean() {

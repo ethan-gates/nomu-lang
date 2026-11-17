@@ -33,8 +33,8 @@ Untouched pages cost nothing, which holds only while two rules do:
 - No pass reads or writes the blocks or side tables past the blocks ever used (`freeCursor`); on darwin a
   read alone makes a page resident. The suite's `heap-reservation-untouched` case bounds resident memory to
   catch a pass that strays.
-- Anything the write barrier must see lives inside the reservation: its range test (`rtHeapLo`,
-  `rtHeapHi`) and the log-bit table cover that range only. Large objects sit outside it and never move.
+- Anything the write barrier must see lives inside the reservation: its range test (`rtBarrierRange`:
+  the start and length) and the log-bit table cover that range only. Large objects sit outside it and never move.
 
 Under the generational plan the mutator allocates into clean (nursery) blocks only, never a mature block's
 holes: nothing marks the lines it fills, so after the next minor the same holes would be handed out again

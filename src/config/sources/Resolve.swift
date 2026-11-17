@@ -143,6 +143,12 @@ private struct Checked {
     let value: Value
 }
 
+// `cfg.unknown_settings`, a key of the file itself rather than of any schema: `error` (the default) reports a
+// setting the schema does not know, and `ignore` skips it, so a file naming newer settings still resolves under
+// an older reader (compiler development builds the tree's files with snapshots of older compilers). It applies
+// to the layer that declares it, unqualified.
+let unknownSettingsKey = "cfg.unknown_settings"
+
 // Checks each layer's declarations: a known setting, qualifiers naming declared configs, a setting the layer
 // may set, a value of the setting's type, and no two spellings of one declaration in one layer. Returns each
 // layer's declarations by setting, with their values.
@@ -153,8 +159,20 @@ private func check(_ schema: Schema, _ scoped: [ScopedLayer]) throws(ConfigError
         let layer = s.layer, configs = s.configs
         var bySetting: [String: [Checked]] = [:]
         var seen: [String: [Set<String>: Origin]] = [:]
+        let ignoreUnknown = layer.declarations.contains {
+            $0.setting == unknownSettingsKey && $0.configs.isEmpty && $0.value == .string("ignore")
+        }
         for d in layer.declarations {
+            if d.setting == unknownSettingsKey {
+                if !d.configs.isEmpty {
+                    errors.report(ConfigError(.invalidValue, d.origin, "`\(unknownSettingsKey)` takes no config names"))
+                } else if d.value != .string("error") && d.value != .string("ignore") {
+                    errors.report(ConfigError(.invalidValue, d.origin, "`\(unknownSettingsKey)`: expected `error` or `ignore`"))
+                }
+                continue
+            }
             guard let setting = schema[d.setting] else {
+                if ignoreUnknown { continue }
                 errors.report(ConfigError(.unknownSetting, d.origin, "unknown setting `\(d.setting)`",
                                           fix: closest(d.setting, schema.names).map { "did you mean `\($0)`?" }))
                 continue

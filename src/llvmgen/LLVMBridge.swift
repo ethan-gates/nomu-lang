@@ -37,6 +37,7 @@ public struct OptimizerSettings {
     public var inline = true
     public var escape = true
     public var scalar = true
+    public var barrierElision = true
     public var escapeProvider = EscapeProvider.legacy
     public var inlineAlloc = true
     // Measurement only (`measure.*`, task 243.1): unsound switches that remove a cost of finding roots.
@@ -146,6 +147,8 @@ private func emitObjectAttempt(_ ssa: SSAModule, from noirModule: NOIRModule, to
     // Scalar promotion (§7.3.1) rides the escape switch (off ⇒ no promotion) with its own bisect switch;
     // it decomposes a loop-carried non-escaping class the simple-slot path leaves heap.
     if optimizer.escape && optimizer.scalar { passes.append(ScalarPromotion()) }
+    // Last: inlining and promotion settle which allocations and stores share a block.
+    if optimizer.barrierElision { passes.append(BarrierElision()) }
     let pipeline = PassPipeline(passes)
     let violations = pipeline.run(&ssaModule, stem: path, onStage: onStage)
     if let first = violations.first { return "SSAIR verify: \(first)" }

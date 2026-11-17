@@ -165,6 +165,29 @@ final class ResolveTests: XCTestCase {
         }
     }
 
+    // `cfg.unknown_settings: ignore` skips a setting the schema does not know, in the layer that declares it.
+    func testUnknownSettingIgnoredWhenTheLayerSaysSo() throws {
+        let c = try resolveIn([Layer(.entryWorkspace, declarations: [
+            Declaration("cfg.unknown_settings", .string("ignore"), origin: at(1)),
+            Declaration("oven.tmp", .integer(1), origin: at(3)),
+            Declaration("oven.temp", .integer(250), origin: at(4)),
+        ])])
+        XCTAssertEqual(c["oven.temp"], .int(250))
+    }
+
+    func testUnknownSettingStillAnErrorUnderErrorMode() {
+        XCTAssertEqual(errors([Layer(.entryWorkspace, declarations: [
+            Declaration("cfg.unknown_settings", .string("error"), origin: at(1)),
+            Declaration("oven.tmp", .integer(1), origin: at(3)),
+        ])]), [.unknownSetting])
+    }
+
+    func testUnknownSettingsModeTakesErrorOrIgnore() {
+        XCTAssertEqual(errors([Layer(.entryWorkspace, declarations: [
+            Declaration("cfg.unknown_settings", .string("skip"), origin: at(1)),
+        ])]), [.invalidValue])
+    }
+
     func testQualifierNamingAnUndeclaredConfig() {
         XCTAssertEqual(errors([Layer(.entryWorkspace, declarations: [
             Declaration("oven.temp", configs: ["relase"], .integer(1), origin: at(1)),

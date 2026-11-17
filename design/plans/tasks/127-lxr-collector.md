@@ -7,7 +7,7 @@
 ## What
 
 An *owned* RC-hybrid reimplementation behind the same `VMBinding` and reusing the
-`__nomu_write_barrier` seam, replacing/backing today's GenImmix. The footprint endgame — a moving
+`__nomu_write_barrier` seam, beside today's GenImmix. The footprint endgame — a moving
 collector at near-live-set footprint is the performance thesis; LXR pushes footprint further via
 reference counting hybridized with tracing.
 
@@ -26,12 +26,16 @@ comparison confirms it. An earlier plan targeted LXR after the debugger against 
 shipped collector — superseded: GenImmix is now a rung in the self-hosted ladder, and LXR follows it in
 Nomu.
 
-## After the comparison: the default collector
+## Several collectors, one default
 
-The comparison picks Nomu's default collector. Then each other plan either leaves the normal build (its code
-may stay in the tree, with nothing depending on it), or stays selectable through `gc.plan` only if keeping it
-is zero-cost: no binary size, run time or maintenance cost to programs that do not select it. Today a plan
-not selected still costs binary size, because unused functions with safepoints survive dead stripping
+LXR is the intended endgame on the condition that it proves fastest for Nomu. It was designed and
+productionized on the JVM, and Nomu's compiler, runtime and object model differ, so it may not work out here.
+Until it does, the goal is GenImmix as fast as it can be ([262](262-collector-gaps.md)).
+
+Nomu holds several collectors indefinitely, selectable through `gc.plan`: they are compared on larger programs
+that do real work, and that comparison keeps running. It picks the default; it does not retire the others.
+Holding them must be zero-cost: no binary size or run time cost to a program that does not select
+one. Today a plan not selected still costs binary size, because unused functions with safepoints survive dead stripping
 ([158.7](158-gc-packaging.md), [229](229-dead-strip-safepoint-code.md)).
 
 ## Dependencies

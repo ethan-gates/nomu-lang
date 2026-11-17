@@ -559,6 +559,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     optimizer.inline = jobSettings.bool("opt.inline")
     optimizer.escape = jobSettings.bool("opt.escape")
     optimizer.scalar = jobSettings.bool("opt.scalar")
+    optimizer.barrierElision = jobSettings.bool("opt.barrier_elision")
     optimizer.inlineAlloc = jobSettings.bool("opt.inline_alloc")
     optimizer.noStatepoints = jobSettings.bool("measure.no_statepoints")
     optimizer.noShapedHomes = jobSettings.bool("measure.no_shaped_homes")

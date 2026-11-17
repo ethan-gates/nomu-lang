@@ -32,9 +32,9 @@ fun rtBumpAlloc(ctl: RawPtr, n: Int) -> RawPtr {
 
 // Mark-verify tracer (task 150 · rung 2). Trace the live set from a seed root and mark each reachable
 // object, without reclaiming or moving anything (the NoGC heap only grows). The mark lives in the object
-// header: the 8-byte header holds the type-id in its low 32 bits with the high bits zero, so setting bit
-// 32 (adding 2^32) marks the object and leaves the type-id recoverable. Subset code — RawPtr plus the
-// gc-leaf type-table reads, no managed allocation. The object model is read through the per-type-id
+// header: the 8-byte header holds the type-id in its low 32 bits, so setting bit 32 (adding 2^32) marks the
+// object and leaves the type-id recoverable. Bit 32 is the verifier's alone; the collector marks in bits
+// 34–35. Subset code — RawPtr plus the gc-leaf type-table reads, no managed allocation. The object model is read through the per-type-id
 // descriptor tables (c-types.md §1/§3.2): a fixed object scans its managed-offset map; an
 // array buffer { header, cap, elems } scans the per-element map at each of `cap` slots.
 //
@@ -131,13 +131,11 @@ fun rtObjHash(obj: RawPtr, tid: Int) -> Int {
 // running fingerprint `fp` (a summed, order-independent aggregate). Returns true when newly marked.
 fun rtTryMark(obj: RawPtr, counts: RawPtr, fp: RawPtr) -> Bool {
   let h: Int = obj.load(fromByteOffset: 0)
-  let hi = h / 4294967296
-  if hi > 0 {
+  if h / 4294967296 % 2 == 1 {
     return false
   }
-  let tid = h                              // unmarked ⇒ high bits zero ⇒ header == type-id (desc offset)
-  let marked = h + 4294967296
-  obj.store(marked, toByteOffset: 0)
+  let tid = rtObjTypeId(obj)               // the low 32 bits; the collector's mark may sit above them
+  obj.store(h + 4294967296, toByteOffset: 0)
   // `counts` is a dense per-type histogram sized by gcTypeCount(); a type-id is a descriptor byte
   // offset (task 100.4.7), so its ordinal is the offset divided by the record size (task 180: read from
   // the runtime, one source of truth, so growing the record never desyncs this math).

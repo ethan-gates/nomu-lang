@@ -844,26 +844,33 @@ extension LLVMGen {
             // was before a collection moved it (task 176.5.8). The asm is neither hoisted nor merged, so the
             // address is taken from the current, relocated pointer at every store.
             // The heap and its log-bit table exist from startup (`rtSpace`), so the barrier is always on and
-            // its values (`rtHeapLo`, `rtHeapHi`, `rtLogbitBase`) are constants, read with invariant loads.
+            // its values are constants: the runtime's `rtBarrierRange` block (`startup.nomu`) holds the heap's
+            // start, the reservation's length and the table, read from one address with invariant loads.
             let obj = LLVMGetParam(fn, 0)!
             let inRangeBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.inrange")!
             let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.slow")!
             let doneBB = LLVMAppendBasicBlockInContext(ctx, fn, "bar.done")!
             let objInt = managedAddress(obj)
-            // Heap-range guard: the log-bit table only covers [rtHeapLo, rtHeapHi), the Immix heap range, so a
-            // store into an off-heap object (LOS / immortal) skips the barrier rather than indexing the table
-            // out of bounds.
-            let lo = loadRuntimeGlobal("rtHeapLo", i64)
-            let hi = loadRuntimeGlobal("rtHeapHi", i64)
-            let below = LLVMBuildICmp(b, LLVMIntULT, objInt, lo, "obj.below")
-            let above = LLVMBuildICmp(b, LLVMIntUGE, objInt, hi, "obj.above")
-            LLVMBuildCondBr(b, LLVMBuildOr(b, below, above, "obj.oob"), doneBB, inRangeBB)
+            let range = getOrAddGlobal(LLVMArrayType2(i8, 24)!, Mangle.staticStorage("rtBarrierRange", home: []))
+            func field(_ at: UInt64, _ t: LLVMTypeRef, _ name: String) -> LLVMValueRef {
+                let load = LLVMBuildLoad2(b, t, gepByte(range, LLVMConstInt(i64, at, 0)), name)!
+                LLVMSetAlignment(load, 8)
+                markInvariantLoad(load)
+                return load
+            }
+            let start = field(0, i64, "heap.start")
+            let span = field(8, i64, "heap.span")
+            let table = field(16, i8ptr, "logbit.table")
+            // Heap-range guard: the table covers only the reservation, so a store into an object outside it (a
+            // large or immortal object) skips the barrier. One unsigned compare covers both ends: an address
+            // below the start wraps to a large offset.
+            let rel = LLVMBuildSub(b, objInt, start, "heap.off")!
+            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntUGE, rel, span, "obj.oob"), doneBB, inRangeBB)
             LLVMPositionBuilderAtEnd(b, inRangeBB)
-            let region = LLVMBuildLShr(b, objInt, LLVMConstInt(i64, 3, 0), "region")   // one bit per 8-byte region
-            let baseV = loadRuntimeGlobal("rtLogbitBase", i64)
-            let byteOff = LLVMBuildLShr(b, region, LLVMConstInt(i64, 3, 0), "byteoff")
-            let metaPtr = LLVMBuildIntToPtr(b, LLVMBuildAdd(b, baseV, byteOff, "metaint"), i8ptr, "metaptr")
-            let byte = LLVMBuildLoad2(b, i8, metaPtr, "logbyte")
+            // One bit per 8-byte region; the start is block-aligned, so offsets and addresses agree on the bit.
+            let byteOff = LLVMBuildLShr(b, rel, LLVMConstInt(i64, 6, 0), "byteoff")!
+            let byte = LLVMBuildLoad2(b, i8, gepByte(table, byteOff), "logbyte")
+            let region = LLVMBuildLShr(b, rel, LLVMConstInt(i64, 3, 0), "region")!
             let bitpos = LLVMBuildTrunc(b, LLVMBuildAnd(b, region, LLVMConstInt(i64, 7, 0), "bp"), i8, "bitpos")
             let bit = LLVMBuildAnd(b, LLVMBuildLShr(b, byte, bitpos, "sh"), LLVMConstInt(i8, 1, 0), "bit")
             LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, bit, LLVMConstInt(i8, 0, 0), "unlogged"), slowBB, doneBB)

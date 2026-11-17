@@ -31,7 +31,7 @@ func linkBinary(_ link: LinkInputs, into dir: String, timings: Timings) -> [Stri
         fputs("error: cannot write '\(recordFile)'\n", stderr)
         return nil
     }
-    // `-dead_strip` drops code unreachable from the program's entry, and `-x` strips local symbols.
+    // `-dead_strip` drops code unreachable from the program's entry; the binary exports nothing (`linkFlags`).
     var linkArgs = ["-o", binary] + linkFlags + ["-Wl,-oso_prefix," + link.workspaceRoot + "/"]
         + link.objects + [settingsObject, link.runtimeArchive]
     linkArgs.append("-Wl,-sectcreate,__TEXT,__nomu_config,\(recordFile)")

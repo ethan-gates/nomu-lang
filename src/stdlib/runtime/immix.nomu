@@ -51,8 +51,8 @@
 // A bit is 1 when the object is *unlogged* (mature, needs remembering on its first mutation) and 0 when
 // logged (young objects, and mature objects already remembered this cycle). The table starts all-0
 // (a zeroed reservation): young objects never trip the barrier. Promotion sets the unlogged bit (150.4.3);
-// 150.4.2 sets it only via the rtSetUnlogged test hook. The inline barrier indexes this table by absolute
-// address through `rtLogbitBase` (and skips objects outside [rtHeapLo, rtHeapHi)), startup globals set
+// 150.4.2 sets it only via the rtSetUnlogged test hook. The inline barrier indexes this table by the object's
+// offset in the reservation (and skips objects outside it), through `rtBarrierRange`, filled at startup
 // from the runtime's one space (`rtSpace`). The barrier slow path
 // (rtGcRemember) clears the bit and appends the object to the carrier's mod-buffer (the remembered set).
 //
@@ -619,21 +619,19 @@ fun rtCountMarkedLines(space: RawPtr) -> Int {
   return count
 }
 
-// If `obj` is a non-null marked object (header bit 32 set), clear the mark (restore header to the type-id)
-// and return true; else false. The verifier walks by clearing marks, so it visits each live object once.
+// If `obj` is a non-null object carrying the verifier's mark (header bit 32, rtTryMark), clear it and return
+// true; else false. The verifier walks by clearing marks, so it visits each live object once. The collector's
+// mark (bits 34–35) and the forwarding bit are left as they are.
 fun rtUnmarkIfMarked(obj: RawPtr) -> Bool {
   let isNull = rtNotObject(obj)
   if isNull {
     return false
   }
   let h: Int = obj.load(fromByteOffset: 0)
-  let hi = h / 4294967296
-  if hi == 0 {
+  if h / 4294967296 % 2 == 0 {
     return false
   }
-  let lo = hi * 4294967296
-  let tid = h - lo
-  obj.store(tid, toByteOffset: 0)
+  obj.store(h - 4294967296, toByteOffset: 0)
   return true
 }
 
@@ -785,21 +783,49 @@ fun rtLineMarkCheck(space: RawPtr, root: RawPtr) -> Int {
 // not move (150.3.7). Driven explicitly (rtImmixCollect) on a deterministic single-thread root set, as
 // mark-verify drove the tracer; wiring it at a real STW over all mutators is the scheduler-coupled 128.3.2.
 
-// Set the header mark bit (32) if unmarked; return true when newly marked. Like rtTryMark but without the
-// counts/fingerprint bookkeeping (collection needs only the mark).
+// The collector's mark: header bits 34–35 hold 0, 1 or 2, and an object is marked when they equal the current
+// mark value, which each major advances 1 → 2 → 1 (rtAdvanceMark) before it marks. Last cycle's survivors hold
+// the other value and new objects 0, so both read unmarked and no walk clears marks after a collection (as
+// MMTk's Immix rotates its mark state). Bit 32 is the verifier's own mark (rtTryMark), bit 33 the forwarding
+// flag. A minor marks the copies it promotes with the current value too; the next major advances past it.
+let rtMarkUnit = 17179869184                                   // 2^34
+let rtMarkPhase = Runtime.staticStorage(bytes: 8, align: 8)    // 0 or 1; the mark value is this plus 1
+
+fun rtMarkValue() -> Int {
+  let w: Int = rtMarkPhase.load(fromByteOffset: 0)
+  return w + 1
+}
+
+// Start a new marking cycle: every object marked so far reads unmarked.
+fun rtAdvanceMark() {
+  let w: Int = rtMarkPhase.load(fromByteOffset: 0)
+  rtMarkPhase.store(1 - w, toByteOffset: 0)
+}
+
+fun rtMarkOf(h: Int) -> Int {
+  return h / rtMarkUnit % 4
+}
+
+fun rtIsMarked(obj: RawPtr) -> Bool {
+  let h: Int = obj.load(fromByteOffset: 0)
+  return rtMarkOf(h) == rtMarkValue()
+}
+
+// Mark `obj` if unmarked; return true when newly marked. Like rtTryMark but the collector's mark, without the
+// counts/fingerprint bookkeeping.
 fun rtTryMarkBare(obj: RawPtr) -> Bool {
   let h: Int = obj.load(fromByteOffset: 0)
-  let hi = h / 4294967296
-  if hi > 0 {
+  let now = rtMarkValue()
+  let m = rtMarkOf(h)
+  if m == now {
     return false
   }
-  let marked = h + 4294967296
-  obj.store(marked, toByteOffset: 0)
+  obj.store(h + (now - m) * rtMarkUnit, toByteOffset: 0)
   return true
 }
 
-// Mark the transitive live set from `root`: header bit 32 on each object, plus line marks for in-heap
-// objects (rtMarkObjLines; LOS objects get the header bit only, reclaimed by whole chunk).
+// Mark the transitive live set from `root`: the collector's mark on each object (rtTryMarkBare), plus line
+// marks for in-heap objects (rtMarkObjLines; LOS objects get the header mark only, reclaimed by whole chunk).
 fun rtImmixMark(space: RawPtr, root: RawPtr) {
   var work = rtGcWorkTake()         // grows on demand (rtStackGrow)
   var wcap = rtGcWorkCap()
@@ -953,7 +979,7 @@ fun rtImmixSweepBlocks(space: RawPtr) {
 }
 
 // Reclaim the large-object space: walk the LOS list, free every unmarked (dead) chunk, and relink the marked
-// (live) ones (their marks are cleared later by rtImmixUnmark). Reforms losHead over the survivors, and
+// (live) ones (their marks lapse when the next major advances the mark value). Reforms losHead over the survivors, and
 // losBytes to their sizes.
 fun rtImmixSweepLos(space: RawPtr) {
   var cur: RawPtr = space.load(fromByteOffset: 64)
@@ -963,9 +989,7 @@ fun rtImmixSweepLos(space: RawPtr) {
   while !curNull {
     let next: RawPtr = cur.load(fromByteOffset: 0)
     let obj = cur.advanced(by: 8)
-    let h: Int = obj.load(fromByteOffset: 0)
-    let hi = h / 4294967296
-    if hi > 0 {
+    if rtIsMarked(obj) {
       cur.store(newHead, toByteOffset: 0)
       newHead = cur
       live = live + rtObjSize(obj)
@@ -979,8 +1003,8 @@ fun rtImmixSweepLos(space: RawPtr) {
   space.store(live, toByteOffset: 168)
 }
 
-// Clear the header mark bit across the live set (re-walk from root). Runs after the sweeps have read the
-// marks, so the next collection starts clean. Reaches LOS survivors through the graph too.
+// Clear the verifier's mark (bit 32, rtMarkVerify) across the live set from `root`, so the next verification
+// starts clean. Reaches LOS survivors through the graph too. Collections clear nothing (rtAdvanceMark).
 fun rtImmixUnmark(root: RawPtr) {
   var work = rtGcWorkTake()         // grows on demand (rtStackGrow)
   var wcap = rtGcWorkCap()
@@ -1001,109 +1025,10 @@ fun rtImmixUnmark(root: RawPtr) {
       nptr = rtLiveCount(tid, obj)
     }
     if kind == 0 {
+      let offs: RawPtr = rtOffs.load(fromByteOffset: 0)
       var i = 0
       while i < nptr {
-        let off = rtOffsetListed(tid, obj, i)
-        let child = rtUntag(obj.load(fromByteOffset: off))
-        if rtUnmarkIfMarked(child) {
-          if top == wcap {
-            work = rtStackGrow(work, top)
-            wcap = wcap + wcap
-          }
-          work.store(child, toByteOffset: top * 8)
-          top = top + 1
-        }
-        i = i + 1
-      }
-    } else {
-      let ecap: Int = obj.load(fromByteOffset: 8)
-      let stride = rtTypeStride(tid)
-      let elemStart = rtBufElemStart(tid)
-      var hk = 0
-      let nhdr = rtHeaderPtrCount(tid)      // header managed pointers (task 180)
-      while hk < nhdr {
-        let hat = 16 + rtHeaderOffsetAt(tid, hk)
-        let hchild = rtUntag(obj.load(fromByteOffset: hat))
-        if rtUnmarkIfMarked(hchild) {
-          if top == wcap {
-            work = rtStackGrow(work, top)
-            wcap = wcap + wcap
-          }
-          work.store(hchild, toByteOffset: top * 8)
-          top = top + 1
-        }
-        hk = hk + 1
-      }
-      var e = 0
-      let elemShaped = rtShapedCount(tid) > 0   // per-element live words (shaped elements)
-      while e < ecap {
-        let elemBase = elemStart + e * stride
-        let elemPtr = obj.advanced(by: elemBase)
-        var en = nptr
-        if elemShaped {
-          en = rtLiveCount(tid, elemPtr)
-        }
-        var i = 0
-        while i < en {
-          let off = rtLiveOffsetAt(tid, elemPtr, i)
-          let at = elemBase + off
-          let child = rtUntag(obj.load(fromByteOffset: at))
-          if rtUnmarkIfMarked(child) {
-            if top == wcap {
-              work = rtStackGrow(work, top)
-              wcap = wcap + wcap
-            }
-            work.store(child, toByteOffset: top * 8)
-            top = top + 1
-          }
-          i = i + 1
-        }
-        e = e + 1
-      }
-    }
-  }
-  rtGcWorkKeep(work, wcap)
-}
-
-// Clear the header mark bit across the live set from `root` and, in the same walk, set every in-heap survivor
-// unlogged (150.4.4). The generational post-major pass: after the log-bit table has been wiped to logged
-// (rtClearLogTable), this walk re-establishes the unlog invariant — every mature survivor is unlogged so the
-// next minor's write barrier catches its cross-generation stores. Structure mirrors rtImmixUnmark (the header
-// mark dedups the graph so each object is visited once); the only addition is the guarded rtSetUnlogged.
-// Off-heap survivors (LOS/immortal) have no log bit and are skipped — the barrier's heap-range guard skips
-// them too, so their cross-generation stores are out of scope until the LOS remset (150.4.5).
-fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
-  let base: Int = space.load(fromByteOffset: 40)
-  let nb: Int = space.load(fromByteOffset: 8)
-  let heapEnd = base + nb * 32768
-  var work = rtGcWorkTake()         // grows on demand (rtStackGrow)
-  var wcap = rtGcWorkCap()
-  var top = 0
-  if rtUnmarkIfMarked(root) {
-    work.store(root, toByteOffset: 0)
-    top = 1
-  }
-  while top > 0 {
-    top = top - 1
-    let obj: RawPtr = work.load(fromByteOffset: top * 8)
-    let a = obj.toInt()
-    if a >= base {
-      if a < heapEnd {
-        rtSetUnlogged(space, obj)          // in-heap survivor → mature, remember its future young stores
-      }
-    }
-    let tid = rtObjTypeId(obj)
-    let kind = rtTypeKind(tid)
-    var nptr = 0
-    if kind == 0 {
-      nptr = rtOffsetsList(tid, obj)            // each enum field decoded once
-    } else {
-      nptr = rtLiveCount(tid, obj)
-    }
-    if kind == 0 {
-      var i = 0
-      while i < nptr {
-        let off = rtOffsetListed(tid, obj, i)
+        let off = Runtime.loadInt32(offs, at: i * 4)
         let child = rtUntag(obj.load(fromByteOffset: off))
         if rtUnmarkIfMarked(child) {
           if top == wcap {
@@ -1166,14 +1091,14 @@ fun rtGenUnmarkAndUnlog(space: RawPtr, root: RawPtr) {
 }
 
 // One non-moving collection from `root`: clear line marks, mark the live set, reclaim by block and by LOS
-// chunk, unmark, then reset the allocator so the next allocation reuses reclaimed + recyclable space. The
+// chunk, then reset the allocator so the next allocation reuses reclaimed + recyclable space. The
 // heap shrinks: dead blocks return to the pool and dead LOS chunks are freed.
 fun rtImmixCollect(space: RawPtr, root: RawPtr) {
+  rtAdvanceMark()
   rtClearAllLines(space)
   rtImmixMark(space, root)
   rtImmixSweepBlocks(space)
   rtImmixSweepLos(space)
-  rtImmixUnmark(root)
   space.store(-1, toByteOffset: 72)   // allocBlock: none
   space.store(0, toByteOffset: 80)    // allocLine
   space.store(0, toByteOffset: 48)    // allocCursor

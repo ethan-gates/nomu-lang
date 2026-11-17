@@ -26,7 +26,8 @@ import support
 //  • I7 — a barrier is elided only where sound: a managed store into a heap object's field (an address
 //    derived by `fieldAddr` from an `alloc`) must be covered by a `writeBarrier` for the same
 //    object+value in the block. A store into a `stackAlloc` slot needs none (the slot is a scanned
-//    root). I8 (a moved/copied store carries its barrier) is this same post-condition holding after any
+//    root), nor does one into an object allocated earlier in the block with no safepoint between (it is
+//    still young; `BarrierElision`). I8 (a moved/copied store carries its barrier) is this same post-condition holding after any
 //    store-moving transform.
 //  • I9 — safepoint coverage is guaranteed downstream: the egress emits an unconditional poll at every
 //    loop header (a back-edge target), so no loop is an unbounded safepoint-free region. Re-audit here
@@ -194,7 +195,10 @@ private func verifyFunction(_ f: SSAFunction, _ shapes: ShapeEnv,
     // builtin, not `store`, so `elementAddr` is not treated as a heap-field store here.
     for blk in f.blocks {
         var barriered = Set<String>()   // "object.id:value.id" seen so far in this block
+        var young = Set<Int>()          // allocated in this block with no safepoint since
         for inst in blk.insts {
+            if isSafepointInst(inst.kind) { young.removeAll() }
+            if case .alloc = inst.kind, let r = inst.result { young.insert(r.id) }
             switch inst.kind {
             case .writeBarrier(let object, let value):
                 barriered.insert("\(object.id):\(value.id)")
@@ -204,6 +208,7 @@ private func verifyFunction(_ f: SSAFunction, _ shapes: ShapeEnv,
                 // is a scanned root and skips the barrier, any other managed base is a heap object.
                 guard case .fieldAddr(let base, _)? = defKind[addr.id] else { break }
                 if case .stackAlloc(_)? = defKind[base.id] { break }
+                if young.contains(base.id) { break }
                 guard isManaged(base.type) else { break }
                 if !barriered.contains("\(base.id):\(value.id)") {
                     errs.append("[\(f.name)] I7: managed store of %\(value.id) into heap field of %\(base.id) is not barriered")

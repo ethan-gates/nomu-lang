@@ -17,7 +17,8 @@ Usage:
 
 REF is a label, an identity, or a unique prefix of one. Publishing an identity already kept changes only its
 memo and label. To snapshot an older commit, check it out in this tree and publish: a copy of the tree at
-another path has its own Bazel output directory and rebuilds LLVM.
+another path has its own Bazel output directory and rebuilds LLVM. The script works on the checkout it runs in,
+so for a commit older than the script, run a copy kept outside the tree.
 
 The cache root is `NOMU_CACHE_DIR` when set, else `~/Library/Caches/nomu` on macOS (`$XDG_CACHE_HOME/nomu`, or
 `~/.cache/nomu`, elsewhere), as `nomu` chooses it (HostCache.swift).
@@ -31,7 +32,11 @@ import shutil
 import subprocess
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The checkout is the one the command runs in, so a copy of this script kept outside the tree can snapshot a
+# commit older than the script.
+ROOT = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+if not ROOT:
+    sys.exit("snapshot: run inside a nomu-lang checkout")
 TARGET = "//src/nomu-cli:nomu"
 # The paths whose uncommitted changes enter the identity (tools/workspace_status.sh).
 IDENTITY_PATHS = ["src", "MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", "BUILD.bazel"]

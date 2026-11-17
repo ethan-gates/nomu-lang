@@ -1,0 +1,109 @@
+// One object with more than 256 live managed offsets, all inside enum fields: the collector lists such an
+// object's offsets into a buffer that grows past its first 256 entries (rtOffsReserve). Every Box must
+// survive the collections with its value, and the buffer must hold every offset.
+class Box {
+  let v: Int
+}
+enum Slot {
+  case full(box: Box, n: Int)
+  case empty(n: Int)
+}
+struct Row {
+  var s0: Slot
+  var s1: Slot
+  var s2: Slot
+  var s3: Slot
+  var s4: Slot
+  var s5: Slot
+  var s6: Slot
+  var s7: Slot
+  var s8: Slot
+  var s9: Slot
+  var s10: Slot
+  var s11: Slot
+  var s12: Slot
+  var s13: Slot
+  var s14: Slot
+  var s15: Slot
+  var s16: Slot
+  var s17: Slot
+  var s18: Slot
+  var s19: Slot
+}
+class Wide {
+  var r0: Row
+  var r1: Row
+  var r2: Row
+  var r3: Row
+  var r4: Row
+  var r5: Row
+  var r6: Row
+  var r7: Row
+  var r8: Row
+  var r9: Row
+  var r10: Row
+  var r11: Row
+  var r12: Row
+  var r13: Row
+  var r14: Row
+  var r15: Row
+}
+fun slot(v: Int) -> Slot {
+  return Slot.full(box: Box(v: v), n: v)
+}
+fun row(base: Int) -> Row {
+  return Row(s0: slot(v: base + 0), s1: slot(v: base + 1), s2: slot(v: base + 2), s3: slot(v: base + 3), s4: slot(v: base + 4), s5: slot(v: base + 5), s6: slot(v: base + 6), s7: slot(v: base + 7), s8: slot(v: base + 8), s9: slot(v: base + 9), s10: slot(v: base + 10), s11: slot(v: base + 11), s12: slot(v: base + 12), s13: slot(v: base + 13), s14: slot(v: base + 14), s15: slot(v: base + 15), s16: slot(v: base + 16), s17: slot(v: base + 17), s18: slot(v: base + 18), s19: slot(v: base + 19))
+}
+fun value(s: Slot) -> Int {
+  switch s {
+  case .full(let box, let n):
+    if box.v != n {
+      return -1000000
+    }
+    return box.v
+  case .empty(let n):
+    return n
+  }
+}
+fun rowSum(r: Row) -> Int {
+  return value(s: r.s0) + value(s: r.s1) + value(s: r.s2) + value(s: r.s3) + value(s: r.s4) + value(s: r.s5) + value(s: r.s6) + value(s: r.s7) + value(s: r.s8) + value(s: r.s9) + value(s: r.s10) + value(s: r.s11) + value(s: r.s12) + value(s: r.s13) + value(s: r.s14) + value(s: r.s15) + value(s: r.s16) + value(s: r.s17) + value(s: r.s18) + value(s: r.s19)
+}
+fun wide(base: Int) -> Wide {
+  return Wide(r0: row(base: base + 0), r1: row(base: base + 20), r2: row(base: base + 40), r3: row(base: base + 60), r4: row(base: base + 80), r5: row(base: base + 100), r6: row(base: base + 120), r7: row(base: base + 140), r8: row(base: base + 160), r9: row(base: base + 180), r10: row(base: base + 200), r11: row(base: base + 220), r12: row(base: base + 240), r13: row(base: base + 260), r14: row(base: base + 280), r15: row(base: base + 300))
+}
+fun sum(w: Wide) -> Int {
+  return rowSum(r: w.r0) + rowSum(r: w.r1) + rowSum(r: w.r2) + rowSum(r: w.r3) + rowSum(r: w.r4) + rowSum(r: w.r5) + rowSum(r: w.r6) + rowSum(r: w.r7) + rowSum(r: w.r8) + rowSum(r: w.r9) + rowSum(r: w.r10) + rowSum(r: w.r11) + rowSum(r: w.r12) + rowSum(r: w.r13) + rowSum(r: w.r14) + rowSum(r: w.r15)
+}
+fun churn(n: Int) -> Int {
+  var g = 0
+  var j = 0
+  while j < n {
+    let t = Box(v: j)
+    g = g + t.v % 3
+    j = j + 1
+  }
+  return g
+}
+fun main() {
+  let n = 320
+  let want = n * (n - 1) / 2
+  var keep: Array<Wide> = []
+  var bad = 0
+  var round = 0
+  while round < 20 {
+    keep.append(wide(base: 0))
+    let g = churn(20000)
+    var k = 0
+    while k < keep.count {
+      if sum(w: keep[k]) != want {
+        bad = bad + 1
+      }
+      k = k + 1
+    }
+    round = round + g * 0
+    round = round + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

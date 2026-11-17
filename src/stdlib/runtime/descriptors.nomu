@@ -120,37 +120,52 @@ fun rtLiveOffsetAt(tid: Int, base: RawPtr, i: Int) -> Int {
   return rtPairsOffsetAt(flat.advanced(by: nptr * 4), rtShapedCount(tid), base, i - nptr)
 }
 
-// The collector's offset list: a fixed-size object's live managed offsets, listed once per visit
-// (rtOffsetsList) and read back by index (rtOffsetListed). rtLiveCount and rtLiveOffsetAt decode the
-// object's enum fields again for every index, so a walk over an object with k such fields decodes O(k²)
-// cases; the list decodes each once. Word 0 is 1 when the list holds the object, 0 when it overflowed
-// (more than 256 offsets) and the readers fall back to rtLiveOffsetAt. One list for the runtime: the walks
-// that use it run on the collector, under stop-the-world, and read it before visiting the next object.
-let rtOffsList = Runtime.staticStorage(bytes: 2056, align: 8)        // 8 + 256 offsets × 8
+// The collector's offset list: a fixed-size object's live managed offsets, as int32 byte offsets the walks
+// read from `rtOffs` word 0 after rtOffsetsList. An object with no shaped field reads its type's map in place
+// (the offsets after the header offsets), with nothing copied. One with shaped fields (enum, `String`) has
+// them listed into a buffer, each enum field decoded once: rtLiveCount and rtLiveOffsetAt decode the object's
+// enum fields again for every index, so a walk over an object with k such fields would decode O(k²) cases.
+// One list for the runtime: the walks that use it run on the collector, under stop-the-world, and read it
+// before visiting the next object.
+let rtOffs = Runtime.staticStorage(bytes: 24, align: 8)   // {offsets @0, buffer @8, buffer capacity @16}
 
-// List `base`'s live offsets (type `tid`, kind 0) and return their count.
+// Point `rtOffs` at `base`'s live offsets (type `tid`, kind 0) and return their count.
 fun rtOffsetsList(tid: Int, base: RawPtr) -> Int {
-  let n = rtOffsetsInto(tid, base, 0, 0)
-  if n < 0 {
-    rtOffsList.store(0, toByteOffset: 0)
-    return rtLiveCount(tid, base)
+  if rtShapedCount(tid) == 0 {
+    rtOffs.store(rtTypeMap(tid).advanced(by: rtHeaderPtrCount(tid) * 4), toByteOffset: 0)
+    return rtDescField(tid, 12)
   }
-  rtOffsList.store(1, toByteOffset: 0)
+  let n = rtOffsetsInto(tid, base, 0, 0)
+  let buf: RawPtr = rtOffs.load(fromByteOffset: 8)
+  rtOffs.store(buf, toByteOffset: 0)
   return n
 }
 
-// The i-th offset rtOffsetsList listed for `base`.
-fun rtOffsetListed(tid: Int, base: RawPtr, i: Int) -> Int {
-  let listed: Int = rtOffsList.load(fromByteOffset: 0)
-  if listed == 1 {
-    let off: Int = rtOffsList.load(fromByteOffset: 8 + i * 8)
-    return off
+// Make the list buffer hold at least `need` offsets, keeping the ones listed.
+fun rtOffsReserve(need: Int) {
+  let cap: Int = rtOffs.load(fromByteOffset: 16)
+  if need <= cap {
+    return
   }
-  return rtLiveOffsetAt(tid, base, i)
+  var ncap = cap + cap
+  if ncap < 256 {
+    ncap = 256
+  }
+  while ncap < need {
+    ncap = ncap + ncap
+  }
+  let fresh = RawPtr.alloc(bytes: ncap * 4, align: 8)
+  if cap > 0 {
+    let old: RawPtr = rtOffs.load(fromByteOffset: 8)
+    fresh.copyBytes(from: old, byteCount: cap * 4)
+    old.free()
+  }
+  rtOffs.store(fresh, toByteOffset: 8)
+  rtOffs.store(ncap, toByteOffset: 16)
 }
 
-// Append the live offsets of the value of type `tid` at `base`, each plus `rel`, to the list after entry
-// `n`; the new count, or -1 past 256. Mirrors rtLiveCount and rtLiveOffsetAt.
+// Append the live offsets of the value of type `tid` at `base`, each plus `rel`, to the list buffer after
+// entry `n`; the new count. Mirrors rtLiveCount and rtLiveOffsetAt.
 fun rtOffsetsInto(tid: Int, base: RawPtr, n0: Int, rel: Int) -> Int {
   var n = n0
   let map = rtTypeMap(tid)
@@ -173,12 +188,11 @@ fun rtOffsetsInto(tid: Int, base: RawPtr, n0: Int, rel: Int) -> Int {
     nshaped = rtShapedCount(tid)
     pairs = flat.advanced(by: nflat * 4)
   }
-  if n + nflat > 256 {
-    return -1
-  }
+  rtOffsReserve(n + nflat)
+  let buf: RawPtr = rtOffs.load(fromByteOffset: 8)
   var i = 0
   while i < nflat {
-    rtOffsList.store(rel + Runtime.loadInt32(flat, at: i * 4), toByteOffset: 8 + n * 8)
+    Runtime.storeInt32(buf, at: n * 4, rel + Runtime.loadInt32(flat, at: i * 4))
     n = n + 1
     i = i + 1
   }
@@ -187,9 +201,6 @@ fun rtOffsetsInto(tid: Int, base: RawPtr, n0: Int, rel: Int) -> Int {
     let off = Runtime.loadInt32(pairs, at: k * 8)
     let sub = Runtime.loadInt32(pairs, at: k * 8 + 4)
     n = rtOffsetsInto(sub, base.advanced(by: off), n, rel + off)
-    if n < 0 {
-      return -1
-    }
     k = k + 1
   }
   return n

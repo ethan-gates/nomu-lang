@@ -56,10 +56,10 @@ fun checkCycle(rec: RawPtr, c: Int, kind: Int, start: Int, dur: Int) -> Bool {
   var phases: Array<Int> = [1, 2, 17, 18]
   var counters: Array<Int> = [1, 20, 21, 22, 23, 24, 25, 30, 31, 32]
   if kind == 1 {
-    phases = [1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 18]
+    phases = [1, 2, 3, 4, 5, 6, 7, 9, 17, 18]
     counters = [1, 2, 3, 20, 21, 22, 23, 24, 25, 30, 31, 32]
   } else {
-    phases = [1, 2, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    phases = [1, 2, 10, 11, 12, 13, 14, 15, 17, 18]
     counters = [1, 4, 20, 21, 22, 23, 24, 25, 30, 31, 32]
   }
   var i = 0

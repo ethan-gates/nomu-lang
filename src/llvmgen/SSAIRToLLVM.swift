@@ -2934,6 +2934,11 @@ final class SSAIRToLLVM {
             let v = LLVMBuildLoad2(b, e.i32, e.gepByte(val(args[0]), val(args[1])), "ld32")!
             LLVMSetAlignment(v, 4)
             return LLVMBuildSExt(b, v, e.i64, "ld32.x")
+        case "__rawStoreInt32":
+            let v = LLVMBuildTrunc(b, val(args[2]), e.i32, "st32.v")
+            let st = LLVMBuildStore(b, v, e.gepByte(val(args[0]), val(args[1])))
+            LLVMSetAlignment(st, 4)
+            return LLVMConstInt(e.i64, 0, 0)
         case "__sysFatal":
             // write(2, text, len); abort(). Both gc-leaf libc calls.
             let text = val(args[0])

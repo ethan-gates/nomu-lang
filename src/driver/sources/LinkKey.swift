@@ -30,7 +30,10 @@ struct LinkInputs {
 }
 
 // The link's fixed flags (`linkBinary`); with the steps after the link, the recipe its key names.
-let linkFlags = ["-Wl,-dead_strip", "-Wl,-x"]
+// An executable exports nothing: runtime and prelude functions, cross-module specializations and foldable
+// descriptors are weak-ODR definitions, and an exported weak definition is bound by the dynamic loader, so
+// every call to one went through a stub. Local symbols are kept, so profiles and crash reports name functions.
+let linkFlags = ["-Wl,-dead_strip", "-Wl,-exported_symbols_list,/dev/null"]
 let linkRecipe = (["cc"] + linkFlags + ["ZERO_AR_DATE=1", "| frame-index", "| dsym: dsymutil, strip -S", "| sign"])
     .joined(separator: " ")
 

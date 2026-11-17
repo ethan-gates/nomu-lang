@@ -389,9 +389,10 @@ fun rtMsgWalkOne(msg: RawPtr, roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
   var n = n0
   let tid = rtObjTypeId(msg)
   let k = rtOffsetsList(tid, msg)
+  let offs: RawPtr = rtOffs.load(fromByteOffset: 0)
   var i = 0
   while i < k {
-    let off = rtOffsetListed(tid, msg, i)
+    let off = Runtime.loadInt32(offs, at: i * 4)
     let w: RawPtr = msg.load(fromByteOffset: off)
     let u = rtUntag(w)
     if !rtNotObject(u) {

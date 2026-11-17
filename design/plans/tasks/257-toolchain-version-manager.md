@@ -36,6 +36,8 @@ found again later by path. It knows nothing about benchmarks; the comparison too
   - Builds for an older commit run in the main tree, checked out there. Bazel keys its output directory by
     workspace path, so a copy at another path (`git archive`, a worktree) starts with an empty cache and
     rebuilds LLVM (about 8 minutes); in place, only the targets whose inputs changed rebuild.
+  - The script works on the checkout it runs in, so a commit older than the script takes a copy of it kept
+    outside the tree (how 262.7 snapshotted `e994115`).
 - **257.2** A `tools/README.md` entry for `tools/snapshot.py`. Done.
 
 ## Relations

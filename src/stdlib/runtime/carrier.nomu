@@ -532,20 +532,8 @@ fun rtTlabAlloc(tlab: RawPtr, space: RawPtr, n: Int, anchorSp: RawPtr, anchorPc:
 // it region-shifts the object address, tests its log bit, and on the first mutation of an *unlogged* (mature)
 // object calls the slow path here. These accessors index the log-bit side table (descriptor @144) with the
 // exact region math the fast path uses so the two agree on which bit: byte = objInt/64 − heapBaseInt/64
-// (relative to the table start; the fast path folds the heapBaseInt term into `rtLogbitBase`), bit =
-// (objInt/8) mod 8. Bit 1 = unlogged (mature, remember on mutation), 0 = logged. Nomu has no bitwise ops, so
-// powers of two are built by doubling and a single bit is read/set/cleared arithmetically.
-
-// 2^n for n in 0..7 (the bit position within a log-bit byte).
-fun rtPow2(n: Int) -> Int {
-  var v = 1
-  var i = 0
-  while i < n {
-    v = v * 2
-    i = i + 1
-  }
-  return v
-}
+// (relative to the table start; the fast path computes (objInt − heapBaseInt)/64), bit =
+// (objInt/8) mod 8. Bit 1 = unlogged (mature, remember on mutation), 0 = logged.
 
 // The log-bit byte index (into logbitTable) for `obj`.
 fun rtLogByteIndex(space: RawPtr, obj: RawPtr) -> Int {
@@ -556,40 +544,31 @@ fun rtLogByteIndex(space: RawPtr, obj: RawPtr) -> Int {
 
 // The bit position (0..7) of `obj`'s log bit within its byte.
 fun rtLogBitPos(obj: RawPtr) -> Int {
-  let r = obj.toInt() / 8
-  return r - r / 8 * 8
+  return (obj.toInt() >> 3) & 7
 }
 
 // Read `obj`'s log bit: 1 = unlogged (mature, needs remembering), 0 = logged.
 fun rtLogBit(space: RawPtr, obj: RawPtr) -> Int {
   let tbl: RawPtr = space.load(fromByteOffset: 144)
   let byte: UInt8 = tbl.load(fromByteOffset: rtLogByteIndex(space, obj))
-  let mask = rtPow2(rtLogBitPos(obj))
-  let v = byte.int / mask
-  return v - v / 2 * 2
+  return (byte.int >> rtLogBitPos(obj)) & 1
 }
 
 // Set `obj`'s log bit to 1 (unlogged/mature). Idempotent. The 150.4.2 test hook simulates promotion; 150.4.3
 // calls the equivalent on every object it promotes so post-promotion cross-generation stores are remembered.
 fun rtSetUnlogged(space: RawPtr, obj: RawPtr) {
-  if rtLogBit(space, obj) == 1 {
-    return
-  }
   let tbl: RawPtr = space.load(fromByteOffset: 144)
   let bi = rtLogByteIndex(space, obj)
   let byte: UInt8 = tbl.load(fromByteOffset: bi)
-  tbl.store((byte.int + rtPow2(rtLogBitPos(obj))).uint8, toByteOffset: bi)
+  tbl.store((byte.int | (1 << rtLogBitPos(obj))).uint8, toByteOffset: bi)
 }
 
 // Clear `obj`'s log bit to 0 (logged). Idempotent. A mutator calls it only holding rtLogLock (rtGcRemember).
 fun rtClearLogged(space: RawPtr, obj: RawPtr) {
-  if rtLogBit(space, obj) == 0 {
-    return
-  }
   let tbl: RawPtr = space.load(fromByteOffset: 144)
   let bi = rtLogByteIndex(space, obj)
   let byte: UInt8 = tbl.load(fromByteOffset: bi)
-  tbl.store((byte.int - rtPow2(rtLogBitPos(obj))).uint8, toByteOffset: bi)
+  tbl.store((byte.int & (255 - (1 << rtLogBitPos(obj)))).uint8, toByteOffset: bi)
 }
 
 // Reset the whole log-bit table to logged (0) — every 8-byte region unmarked (150.4.4). Used post-major to

@@ -258,8 +258,8 @@ fun rtGcFaultReport(buf: RawPtr, n: Int) -> Int {
 //                6 large objects (one would take mature space past its limit).
 //   phases:      1 time to safepoint (the request to the collector's entry, with every carrier stopped),
 //                2 root walk, 3 remembered-set drain, 4 stack roots, 5 remembered set, 6 large objects,
-//                7 scan, 8 unmark and unlog, 9 nursery reclaim, 10 source selection, 11 prepare, 12 trace,
-//                13 sweep, 14 large-object sweep, 15 log-table clear, 16 unmark, 17 snapshot, 18 collect
+//                7 scan, 8 unmark and unlog (no longer run), 9 nursery reclaim, 10 source selection, 11 prepare, 12 trace,
+//                13 sweep, 14 large-object sweep, 15 log-table clear, 16 unmark (no longer run), 17 snapshot, 18 collect
 //                (the collector's entry to its return; the rest nest in it).
 //   counters:    1 roots, 2 objects promoted, 3 remembered entries, 4 defrag sources, 5 bytes promoted; a
 //                snapshot: 20 free blocks, 21 recyclable, 22 full, 23 nursery, 24 large objects, 25 blocks

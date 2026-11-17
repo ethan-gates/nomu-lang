@@ -60,6 +60,15 @@ enum RuntimeIntrinsics {
             let p = PointerIntrinsics.ptrArg(&s, args[0].value, "Runtime.loadInt32", "pointer")
             let off = PointerIntrinsics.intArg(&s, args[1].value, "Runtime.loadInt32", "at")
             return s.ptrIntrinsic("__rawLoadInt32", .int, [p, off], span)
+        // A 32-bit store of an Int's low 32 bits: loadInt32's counterpart, for lists in the pointer-map format.
+        case "storeInt32":
+            guard PointerIntrinsics.checkArgLabels(&s, args, [nil, "at", nil], "Runtime.storeInt32", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            let p = PointerIntrinsics.ptrArg(&s, args[0].value, "Runtime.storeInt32", "pointer")
+            let off = PointerIntrinsics.intArg(&s, args[1].value, "Runtime.storeInt32", "at")
+            let v = PointerIntrinsics.intArg(&s, args[2].value, "Runtime.storeInt32", "value")
+            return s.ptrIntrinsic("__rawStoreInt32", .void, [p, off, v], span)
         // Write a string literal and a newline to standard error, then abort: the runtime's fatal error. The
         // argument must be a literal, since the runtime subset calls no `String` method. Never returns.
         case "fatal":
