@@ -1,11 +1,11 @@
-# Compiler dev loop: compiler snapshots, A/B benchmarks, a faster suite
+# Compiler dev loop: A/B benchmarks, `compiler-test` with snapshots, a faster suite
 
-**Avenue:** Infra · **Type/Lifecycle:** `tooling · needs-design` · **Size:** M · **Status:** not started ·
+**Avenue:** Infra · **Type/Lifecycle:** `tooling · needs-design` · **Size:** M · **Status:** not started; 265.2 and 265.3 build on [257](257-toolchain-version-manager.md) (done) ·
 **Source:** 250.8.2, whose acceptance needed every benchmark compared against the build before it, and every
 comparison was set up by hand.
 
-For compiler developers. User-facing tools (the cache tools, a user version manager) belong elsewhere;
-a user version manager can grow out of 257.2's snapshots if Nomu needs one.
+For compiler developers. Keeping compilers is [257](257-toolchain-version-manager.md) (the toolchain version manager);
+this task compares them and speeds up the suite. Split from 257, which held both.
 
 ## Why
 
@@ -32,7 +32,7 @@ they are now.
 
 ## The setup done by hand for 250.8.2
 
-This is the work 257.2 to 257.4 replace. Each step was a scratch script written during the session.
+This is the work 257 and 265.3 to 265.4 replace. Each step was a scratch script written during the session.
 
 1. **Keep the old source.** The changed runtime, assembly and compiler files were copied into snapshot
    directories (`src/stdlib/runtime/`, `rtasm_arm64.s`, `StackChecks.cpp`, `FrameTable.swift`,
@@ -80,21 +80,15 @@ Problems that cost time:
 
 ## Plan
 
-- **257.1 Measure the loop.** Time each step of the procedure above and record which ones failed or were
+- **265.1 Measure the loop.** Time each step of the procedure above and record which ones failed or were
   repeated. Split the suite's wall time into compiling, linking, running and the harness's own
   overhead, per tier. Time an opt rebuild after a runtime-only edit and after a compiler edit. Time a benchmark
-  build per compiler. The results choose what 257.5 does.
-- **257.2 Compiler snapshots.**
-  - `tools/snapshot <name>` copies the current opt `nomu` to `~/.cache/nomu/compilers/<name>` with its identity
-    (the git commit and the hash of uncommitted changes, from `tools/workspace_status.sh`).
-  - One `nomu` binary holds the runtime and the prelude, so a snapshot is one file.
-  - This replaces steps 1 to 3 above: snapshot the compiler before a change, and the old source never has to be
-    copied back into the tree.
-  - Snapshots share the host cache safely, since entries are keyed by compiler identity.
-  - `compiler-test --compiler <name|path>` accepts a snapshot name.
-  - `compiler-test` compares its compiler's identity with the working tree's. When they differ, it prints both
-    and names the rebuild command.
-- **257.3 One A/B benchmark runner.** `tools/bench --compilers a,b [cases]`:
+  build per compiler. The results choose what 265.5 does.
+- **265.2 `compiler-test` and snapshots** (snapshots from [257](257-toolchain-version-manager.md)):
+  - `compiler-test --compiler <id|label|path>` accepts a snapshot.
+  - `compiler-test` compares its compiler's identity with the working tree's. When they differ, it prints
+    both and names the rebuild command.
+- **265.3 One A/B benchmark runner.** `tools/bench --compilers a,b [cases]`:
   - builds each benchmark once per compiler, through the host cache;
   - runs paired samples: A and B back to back, order alternating, recording B − A, each sample from a fresh
     copy of its binary;
@@ -112,9 +106,9 @@ Problems that cost time:
   - Each benchmark prints one result line in a common format, so cases are listed in a table instead of parsed
     per benchmark.
   - The existing benchmark tools move onto this runner's build and run steps and keep their own sweeps.
-- **257.4 Adaptive sample counts.** Sample each case until its verdict resolves or a cap is reached, instead of
+- **265.4 Adaptive sample counts.** Sample each case until its verdict resolves or a cap is reached, instead of
   a fixed count. Quick cases finish early; close cases get the samples they need.
-- **257.5 Suite run time.** Act on 257.1's findings and keep each change only if the suite still catches what it
+- **265.5 Suite run time.** Act on 265.1's findings and keep each change only if the suite still catches what it
   catches today (155's `--compiler` teeth check against a pre-fix build). Candidates to evaluate:
   - fixtures shared by several cases and tiers compile once through the host cache;
   - fewer links, where several runs differ only in run settings;
@@ -122,7 +116,8 @@ Problems that cost time:
 
 ## Relations
 
-- [155](155-integration-suite-harness.md) owns the suite harness; 257.2's `--compiler` and staleness check
-  land in it. 155's deferred perf gate stays deferred. 257.3's runner is the comparison it would build on.
+- [155](155-integration-suite-harness.md) owns the suite harness; 265.2's `--compiler` and staleness check
+  land in it. 155's deferred perf gate stays deferred. 265.3's runner is the comparison it would build on.
 - [256](256-host-cache-store-only.md): snapshots and the A/B builds rely on compiler identity in cache keys.
-- [250](250-fiber-task-surface.md) 250.8.3 measures with 257.3's runner once it exists.
+- [250](250-fiber-task-surface.md) 250.8.3 measures with 265.3's runner once it exists.
+- [257](257-toolchain-version-manager.md) keeps the compilers this task compares.

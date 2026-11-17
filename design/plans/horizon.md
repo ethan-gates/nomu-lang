@@ -52,7 +52,8 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 limit that grows with live data and fiber stacks, as Go's heap does, and a fatal out-of-memory report.
 binary-trees at depth 21, which crashed, runs in 3.9 s at 445 MB against Go's 5.3 s and 205 MB, after the
 enum layout ([260](tasks/260-enum-layout.md)) took a node from 40 bytes to 24; the collector gaps it exposed
-are [262](tasks/262-collector-gaps.md). Next is
+are [262](tasks/262-collector-gaps.md), which compares compilers through
+[257](tasks/257-toolchain-version-manager.md)'s snapshots. Next is
 [236](tasks/236-fiber-preemption.md) (preemption). Finished on this chain: 230,
 [159](tasks/159-gc-observability.md) (GC observability), [246](tasks/246-raw-pointers-into-managed-memory.md)
 (raw pointers recorded with their base), [235](tasks/235-scheduler-run-queues.md) (per-carrier run queues),
@@ -68,7 +69,7 @@ which tunes the paths 236 and 237 change. All come before the benchmark against 
 [194](tasks/194-gc-frame-metadata.md) is decided (extended statepoints) and its implementation,
 [247](tasks/247-frame-table.md) (the link-time frame table), is open.
 [217](tasks/217-build-graph-granularity.md)'s remaining design (the slice's closure, the header format and
-hash, per-declaration keys on direct dependencies) is paused. [257](tasks/257-compiler-dev-loop.md).3, a
+hash, per-declaration keys on direct dependencies) is paused. [265](tasks/265-compiler-dev-loop.md).3, a
 checked-in A/B benchmark runner, would serve every measurement on this chain. Off this chain:
 [204](tasks/204-yaml-parser-upgrades.md) (YAML parser upgrades), [205](tasks/205-config-upgrades.md)
 (configuration upgrades), and 176.4 (the escape-promotion placement route) with

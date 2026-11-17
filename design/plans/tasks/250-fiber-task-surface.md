@@ -213,7 +213,7 @@ joins.
     from `main`) peaks at 34 MiB at 4 carriers and at the default count, as at 250.1. At 1 carrier it peaks
     at 4.4 GB: `main` never parks, so every fiber waits with its record and first stack until `main` ends.
     The suite passes 1427/1427, and 541/541 at each stack-move setting.
-    Small switch-cost differences are judged on P-core cycles from the counters (257), since wall time mixes
+    Small switch-cost differences are judged on P-core cycles from the counters (265), since wall time mixes
     in E-core time macOS chooses.
   - **250.8.4** The follow-ups from 250.8.2 (the E-core gap, the saved SP passed by value) moved to
     [254](254-scheduler-performance.md) 254.4.

@@ -120,7 +120,7 @@ not close here if other planned work is expected to close it; record the expecta
   - **Large concurrent programs** to judge it by.
 - **254.4** The context switch (from [250](250-fiber-task-surface.md) 250.8.2, which moved the callee-saved
   registers onto the fiber's stack). Two items, judged on P-core cycles from the hardware counters
-  ([257](257-compiler-dev-loop.md)):
+  ([265](265-compiler-dev-loop.md)):
   - **The E-core gap.** On E cores the switch costs about 2% more cycles a hop than 250.8.1's record-based one;
     on P cores it costs fewer.
   - **The target's saved SP by value.** `rtSwitch` takes a pointer to the slot and starts with a dependent

@@ -1,7 +1,8 @@
 # Collector gaps — binary-trees and Richards against Go
 
 **Avenue:** Risk (perf, footprint) · **Type/Lifecycle:** `runtime · gc · codegen` · **Size:** L ·
-**Status:** issues defined, each measured; none started ·
+**Status:** 262.7 next, with [257](257-toolchain-version-manager.md)'s snapshots; issues defined, each measured;
+none started ·
 **Source:** the enum layout work ([260](260-enum-layout.md)), which removed the enum decoding that had hid
 these costs, and measured binary-trees, Richards and the enum benchmarks against Go.
 
@@ -13,6 +14,14 @@ one core); depth 19 in 0.89 s and 110 MB. Richards (`practice/gen/richards`, its
 `gc_immix`, and 477 ms in Go. Apple M3 Max, release builds. Nomu is ahead on time where the collector is
 cheap and behind on memory; the gaps below are where the collector, its policies and the write barrier
 spend time or memory Go does not.
+
+**Baseline before 262.3** (after 264, best of 7, load average about 3.7): binary-trees depth 19 0.98 s, 110 MB;
+depth 21 4.28 s, 441 MB. Richards 702–713 ms generational, 582–590 ms `gc_immix`, Go 507 ms (477 before). Against
+Go, Richards went from 1.24× to 1.41× generational and 1.01× to 1.15× `gc_immix` since 260, so the slowdown is
+more than the machine. Actors at 1 / 2 / 4 / 8 carriers, ns an item: pingpong_actor 13.7 / 13.6 / 13.6 / 13.6,
+fan-out 28 / 35 / 49 / 103, pipeline 92 / 157 / 81 / 245; Go fan-out 39 / 63 / 70 / 86, pipeline 174 / 120 / 104
+/ 101. Stubs: weak external `_nomu` symbols / calls through a stub are 236 / 425 in `pingpong_actor`, 233 / 438
+in binary-trees, 234 / 475 in Richards.
 
 ## Gaps
 
@@ -56,10 +65,22 @@ reclamation with reference counting on the same Immix heap, or belongs to GenImm
 
 ## Work
 
+Order: 262.7, then 262.3, 262.1, 262.2.
+
+- **262.7** The slowdown since 260. Snapshot the compiler at `e994115` (where the baseline above was
+  recorded) and at the current commit with 257, build Richards and binary-trees with each, and run them
+  side by side. If the slowdown holds, find its cause in `7fa8407` (261, 263 and 264 together).
 - **262.1** The offset list's fast path for objects with no conditional field; re-measure binary-trees.
 - **262.2** The write barrier's fast path, and elision for stores into objects known young; re-measure
   Richards.
-- **262.3** Hidden visibility for runtime calls.
+- **262.3** Hidden visibility for runtime calls. What makes the stubs: runtime and prelude functions are
+  weak-ODR definitions (`weakOriginFiles` in `SSAIRToLLVM.swift`, so per-object copies fold at link, from
+  100.3.7) and exported, so the dynamic loader binds them through `__stubs`. In `pingpong_actor`'s binary 156
+  runtime functions are weak external and 425 call sites go through a stub (`nm -m`, `otool -tV | grep "symbol
+  stub for: _nomu"`). First decide between hidden visibility on the weak definitions (folding kept, as the
+  frame-split `.frame` bodies already are) and plain definitions now that the runtime is its own module. Other
+  weak-ODR users: cross-module generic specializations, foldable GC descriptors and pointer maps,
+  `nomu_actor_drain`.
 - **262.4** Heap sizing that weighs trace work or targets a share of time in the collector.
 - **262.5** The GenImmix-only items (promotion, large objects and minors, the unmark walk, the minor's
   second pass), weighed against how soon LXR replaces them before any is built.
