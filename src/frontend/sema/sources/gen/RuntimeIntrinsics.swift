@@ -367,13 +367,14 @@ enum RuntimeIntrinsics {
         // Asm-floor context switch (task 128.2). `from` and `to` are contexts, one word each: the SP below which
         // a switch pushed the callee-saved set. Pushes the current registers, saves SP into `from`, and resumes
         // `to` (rtSwitch), handing it `message` (null when omitted): `to`'s own switch returns it. Returns the
-        // message the switch that resumes this context passes. Subset-legal (`__sys`).
+        // message the switch that resumes this context passes. The message is one register: a RawPtr, or an Int
+        // the receiver reads back with `toInt()` (a number, never dereferenced). Subset-legal (`__sys`).
         case "ctxSwitch":
             let labels: [String?] = args.count == 3 ? ["from", "to", "message"] : ["from", "to"]
             guard PointerIntrinsics.checkArgLabels(&s, args, labels, "Runtime.ctxSwitch", span) else { return err(span) }
             let from = PointerIntrinsics.ptrArg(&s, args[0].value, "Runtime.ctxSwitch", "from")
             let to = PointerIntrinsics.ptrArg(&s, args[1].value, "Runtime.ctxSwitch", "to")
-            let message = args.count == 3 ? PointerIntrinsics.ptrArg(&s, args[2].value, "Runtime.ctxSwitch", "message")
+            let message = args.count == 3 ? PointerIntrinsics.atomicWordArg(&s, args[2].value, "Runtime.ctxSwitch", "message")
                 : s.ptrIntrinsic("__ptrNull", .rawPtr, [], span)
             return s.ptrIntrinsic("__sysCtxSwitch", .rawPtr, [from, to, message], span)
         // Seed a fresh fiber's context so the first switch into it lands in the trampoline running

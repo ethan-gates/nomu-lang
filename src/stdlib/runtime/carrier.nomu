@@ -8,7 +8,7 @@
 // the end of a collection (evacuation may relocate a carrier's current block).
 
 // ---- The carrier record ----
-// One 192-byte record per carrier, behind the carrier-local slot (`Runtime.carrierLocal()`):
+// One 256-byte record per carrier, behind the carrier-local slot (`Runtime.carrierLocal()`):
 //   0  TLAB (64 bytes): cursor @0, limit @8, block @16, line @24, stressLimit @32, stressBytes @40,
 //      allocObjects @48, allocBytes @56. Cursor and limit are addresses (0 when there is no hole); under
 //      NOMU_GC_STRESS the hole end lives in stressLimit and limit stays 0, so the inline bump always misses.
@@ -27,6 +27,7 @@
 //   168 the state of this carrier's random numbers, never 0 (rtCarrierRandom)
 //   176 this thread's frame-lookup cache for stack walks, or null until a walk needs one (rtFrameCacheTake)
 //   184 this carrier's pool of fiber records and stacks, or null until it frees one (rtPoolMine)
+//   192 this carrier's actor message free lists, or null until it sends or frees a message (rtMsgCache)
 // The TLAB sits at offset 0, so a record is its own TLAB pointer, and it fills the first cache line alone.
 // A record lives for the whole process. The registry is a list of every record, pushed with one CAS at bind
 // and walked under stop-the-world, and by searching carriers looking at slots (records are never removed,
@@ -51,7 +52,7 @@ fun rtCarrierRandom() -> Int {
 // Create this thread's carrier record, register it, and store it in the carrier-local slot. Every carrier
 // binds on entry to its loop; the allocation and barrier slow paths bind a thread that has no record.
 fun rtCarrierBind() -> RawPtr {
-  let rec = RawPtr.alloc(bytes: 192, align: 64)
+  let rec = RawPtr.alloc(bytes: 256, align: 64)
   rec.store(-1, toByteOffset: 16)            // no current block: the first allocation refills
   let cap = 4096
   rec.store(cap, toByteOffset: 80)
@@ -67,6 +68,7 @@ fun rtCarrierBind() -> RawPtr {
   rec.store(RawPtr.null, toByteOffset: 160)
   rec.store(RawPtr.null, toByteOffset: 176)
   rec.store(RawPtr.null, toByteOffset: 184)
+  rec.store(RawPtr.null, toByteOffset: 192)
   var done = false
   while !done {
     let old: Int = rtCarriers.atomicLoad(fromByteOffset: 0)
@@ -650,7 +652,7 @@ fun rtGcRemember(mb: RawPtr, obj: RawPtr) {
     return          // no managed allocation yet → no space, nothing to remember
   }
   // Off-heap objects (LOS / immortal buffers) have no log bit in the table, which covers only the Immix heap.
-  // The inline fast path skips them via its heap-range guard, but the actor/mailbox path calls this directly,
+  // The inline fast path skips them via its heap-range guard, but the global mailbox queue calls this directly,
   // so guard here too — indexing the table with an off-heap address would read out of bounds.
   let base: Int = space.load(fromByteOffset: 40)
   let nb: Int = space.load(fromByteOffset: 8)
@@ -697,7 +699,7 @@ fun rtLogLockTake() {
 }
 
 // Remember `obj` after a runtime-internal store of a young managed pointer into it (task 150.4.5.1). Runtime
-// code that links managed objects — the scheduler's mailbox/message enqueue — stores through gc-leaf raw
+// code that links managed objects — the scheduler's global mailbox queue — stores through gc-leaf raw
 // stores (`__rawStore`), which do not emit the inline write barrier, so a mature object that gains a young
 // referent would be missed by the next minor GC (the minor never rescans mature objects reached through a
 // root; it finds mature→young pointers only via the remembered set). This is the barrier slow path for those

@@ -1,0 +1,19 @@
+// An actor's fields are its handlers' state, used on the actor's fiber; a mutable class passed in at
+// construction would be shared with the code that made the actor.
+class Box {
+    var v: Int
+}
+
+actor Sink {
+    var box: Box
+    on bump() {
+        box.v = box.v + 1
+    }
+}
+
+fun main() {
+    let b = Box(v: 1)
+    let s = Sink(box: b)
+    s.bump()
+    b.v = 5
+}

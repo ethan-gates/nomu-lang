@@ -152,8 +152,27 @@ bool dropInlinedStackChecks(Function &F) {
   return Changed;
 }
 
+// Whether every path through `F` ends in `unreachable` with no call on the way (debug intrinsics aside): the
+// optimizer reduced it to a trap, having proved its body undefined, and with the body went its stack check. It
+// uses no stack, so it needs none.
+static bool onlyTraps(Function &F) {
+  for (BasicBlock &BB : F) {
+    if (!isa<UnreachableInst>(BB.getTerminator()))
+      return false;
+    for (Instruction &I : BB)
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        Function *Callee = CB->getCalledFunction();
+        bool trap = Callee && (Callee->getIntrinsicID() == Intrinsic::trap || Callee->getIntrinsicID() == Intrinsic::ubsantrap);
+        if (!trap && !isa<DbgInfoIntrinsic>(&I))
+          return false;
+      }
+  }
+  return true;
+}
+
 // Expands every stack check in `M`. Returns false, with a message on stderr, when a checked function lost
-// its own placeholder (an optimization that copies a function's body would leave the copy unchecked).
+// its own placeholder (an optimization that copies a function's body would leave the copy unchecked). A
+// function reduced to a trap is the exception (onlyTraps).
 bool expandStackChecks(Module &M) {
   Function *Placeholder = M.getFunction("nomu.stack.check");
   if (!Placeholder)
@@ -179,7 +198,7 @@ bool expandStackChecks(Module &M) {
   }
   bool Ok = true;
   for (Function &F : M)
-    if (!F.isDeclaration() && F.hasFnAttribute("nomu-stack-check") && !Own.count(&F)) {
+    if (!F.isDeclaration() && F.hasFnAttribute("nomu-stack-check") && !Own.count(&F) && !onlyTraps(F)) {
       errs() << "internal: function '" << F.getName() << "' lost its stack check\n";
       Ok = false;
     }

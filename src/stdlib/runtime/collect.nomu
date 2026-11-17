@@ -537,6 +537,13 @@ fun rtQueuePush(q: RawPtr, count: Int, obj: RawPtr) {
   base.store(obj, toByteOffset: count * 8)
 }
 
+// rtQueuePush for a word that is a number, such as the derived-pointer list's offsets.
+fun rtQueuePushInt(q: RawPtr, count: Int, w: Int) {
+  rtQueuePush(q, count, RawPtr.null)
+  let base: RawPtr = q.load(fromByteOffset: 0)
+  base.store(w, toByteOffset: count * 8)
+}
+
 // Scan one object's managed slots for a minor GC, forwarding each young referent (rtMinorForward). Used for
 // the remembered mature objects (find their young children) and, via the Cheney queue, for the promoted
 // objects (a promoted object may still point at other nursery objects). Returns the updated promoted count.
@@ -741,6 +748,7 @@ fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
   rtGcRecordExit(collectStart)
   rtCarriersResetTlabs()        // evacuation may have moved a carrier's block; refill on resume
   rtCarriersResetModBufs()      // the collection consumed the remembered set; start empty next cycle
+  rtMsgReclaim()                // the message pool's free lists rebuilt, its empty slabs released
   return ns
 }
 
@@ -758,7 +766,9 @@ fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
   let collectStart = rtGcRecordEntry(1)
   let roots = rtRootsNew()
   let tw = rtGcPhaseOpen(2)
+  rtMsgMinor.store(1, toByteOffset: 0)            // queued messages: only those sent since the last collection
   let ns = nomuSchedWalkSlots(sched, roots)
+  rtMsgMinor.store(0, toByteOffset: 0)
   rtGcPhaseClose(2, tw)
   let slots: RawPtr = roots.load(fromByteOffset: 0)
   let td = rtGcPhaseOpen(3)
@@ -781,6 +791,7 @@ fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
   rtRootsFree(roots)
   rtGcRecordExit(collectStart)
   rtCarriersResetTlabs()        // the reclaimed nursery blocks moved out from under the carriers' TLABs
+  rtMsgYoungReset()             // every queued message now references mature objects only
   return n
 }
 

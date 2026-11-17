@@ -1,0 +1,58 @@
+// Items through a chain of 8 stage actors to a hub, 12 rounds of 2,000, each message holding a young Box that
+// only the queued message reaches. On several carriers a message is cut on one carrier and freed on another.
+class Box {
+  let v: Int
+}
+actor Stage {
+  var next: Option<Stage>
+  on item(b: Box, round: Int, first: Stage, hub: Hub) {
+    switch next {
+    case .some(let n):
+      n.item(b: Box(v: b.v + 1), round: round, first: first, hub: hub)
+    case .none:
+      hub.done(v: b.v, round: round, first: first, me: hub)
+    }
+  }
+}
+actor Hub {
+  var got: Int = 0
+  var sum: Int = 0
+  on start(round: Int, first: Stage, me: Hub) {
+    var i = 0
+    while i < 2000 {
+      first.item(b: Box(v: i), round: round, first: first, hub: me)
+      i = i + 1
+    }
+  }
+  on done(v: Int, round: Int, first: Stage, me: Hub) {
+    sum = sum + v
+    got = got + 1
+    if got == 2000 {
+      got = 0
+      if round + 1 < 12 {
+        me.start(round: round + 1, first: first, me: me)
+      } else {
+        let want = 12 * (2000 * 1999 / 2 + 2000 * 7)
+        print("bad ")
+        if sum == want {
+          print(0)
+        } else {
+          print(sum - want)
+        }
+        print("\n")
+      }
+    }
+  }
+}
+fun main() {
+  let hub = Hub()
+  var next: Option<Stage> = .none
+  var first = Stage(next: next)
+  var s = 1
+  while s < 8 {
+    next = .some(first)
+    first = Stage(next: next)
+    s += 1
+  }
+  hub.start(round: 0, first: first, me: hub)
+}

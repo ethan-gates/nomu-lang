@@ -630,32 +630,34 @@ fun rtShadowPush(node: RawPtr, buffer: RawPtr, vwt: RawPtr) {
 }
 
 // Restore the shadow-top to a value saved on entry (LIFO pop of every node a frame pushed, on any exit).
-// The saved value is rtShadowSave's offset from the stack top, turned back into an address in the fiber's
-// current stack, which may have moved since the save.
-fun rtShadowPopTo(savedTop: RawPtr) {
+// The saved value is rtShadowSave's offset from the stack top (0 for an empty list), turned back into an
+// address in the fiber's current stack, which may have moved since the save.
+fun rtShadowPopTo(savedTop: Int) {
   let self = rtCurrentFiber()
   if self.isNull {
     return
   }
-  if savedTop.isNull {
+  if savedTop == 0 {
     self.store(RawPtr.null, toByteOffset: 24)
     return
   }
-  self.store(rtAnchorAt(self, savedTop.toInt()), toByteOffset: 24)
+  let base: RawPtr = self.load(fromByteOffset: 48)
+  self.store(base.advanced(by: rtStackSize(self) - savedTop), toByteOffset: 24)
 }
 
 // The current fiber's shadow-top (saved on entry to an erased frame, restored on exit), as an offset from
-// the stack top (null for an empty list): the caller holds it across calls that can move the stack.
-fun rtShadowSave() -> RawPtr {
+// the stack top (0 for an empty list): the caller holds it across calls that can move the stack.
+fun rtShadowSave() -> Int {
   let self = rtCurrentFiber()
   if self.isNull {
-    return RawPtr.null
+    return 0
   }
   let top: RawPtr = self.load(fromByteOffset: 24)
   if top.isNull {
-    return top
+    return 0
   }
-  return RawPtr.null.advanced(by: rtAnchorOffset(top))
+  let base: RawPtr = self.load(fromByteOffset: 48)
+  return base.toInt() + rtStackSize(self) - top.toInt()
 }
 
 // Walk one fiber's typed-root shadow list, appending each registered buffer's interior managed-pointer
@@ -761,8 +763,8 @@ fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
     cur = cur.load(fromByteOffset: 80)
   }
   // The global mailbox queue (sched+80 / sched+88), off the run queues' rings. Rooting the head reaches every
-  // queued mailbox through sched_next, and each one's messages through mb_head and next. Slot mode also fixes
-  // the off-heap tail pointer (sched+88), which no object's pointer map reaches.
+  // queued mailbox through sched_next. Slot mode also fixes the off-heap tail pointer (sched+88), which no
+  // object's pointer map reaches. Queued messages are roots of their own (rtMsgWalk).
   let mboxHead: RawPtr = sched.load(fromByteOffset: 80)
   if mboxHead.isNull == false {
     if emitSlots != 0 {
@@ -781,6 +783,7 @@ fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
   }
   rtFrameCacheDone(cache)
   rtStackScanBytes.store(stackBytes, toByteOffset: 0)
+  n = rtMsgWalk(roots, n, emitSlots)
   return rtWalkRunQueues(roots, n, emitSlots)
 }
 
@@ -821,8 +824,7 @@ fun rtWalkWaitObjects(fib: RawPtr, roots: RawPtr, start: Int, emitSlots: Int) ->
 }
 
 // The scheduled mailboxes waiting in the run queues, as entries tagged in their low bit (scheduler.nomu): each
-// carrier's slot and the live part of its ring. A mailbox roots its queued messages and their receivers
-// through its pointer map. Slot mode stores the mailbox untagged in place, roots that word, and records it
+// carrier's slot and the live part of its ring. Slot mode stores the mailbox untagged in place, roots that word, and records it
 // with the derived pointers so rtRootsFixDerived tags the moved address again after the collection; the world
 // is stopped, so no carrier reads the queues meanwhile. Value mode roots the mailbox and leaves the entry.
 fun rtWalkRunQueues(roots: RawPtr, start: Int, emitSlots: Int) -> Int {
@@ -846,11 +848,11 @@ fun rtWalkRunQueues(roots: RawPtr, start: Int, emitSlots: Int) -> Int {
 }
 
 fun rtWalkRunqEntry(roots: RawPtr, start: Int, emitSlots: Int, slot: RawPtr) -> Int {
-  let e: Int = slot.load(fromByteOffset: 0)
-  if e % 2 == 0 {
+  let e: RawPtr = slot.load(fromByteOffset: 0)
+  if e.toInt() % 2 == 0 {
     return start
   }
-  let mb = RawPtr.null.advanced(by: e - 1)
+  let mb = e.advanced(by: -1)
   if emitSlots == 0 {
     rtQueuePush(roots, start, mb)
     return start + 1
@@ -909,7 +911,7 @@ fun rtRootsAddFixup(roots: RawPtr, bSlot: RawPtr, dSlot: RawPtr, off: Int) {
   let k: Int = roots.load(fromByteOffset: 24)
   rtQueuePush(derived, k, bSlot)
   rtQueuePush(derived, k + 1, dSlot)
-  rtQueuePush(derived, k + 2, RawPtr.null.advanced(by: off))
+  rtQueuePushInt(derived, k + 2, off)
   roots.store(k + 3, toByteOffset: 24)
 }
 
@@ -937,9 +939,9 @@ fun rtRootsFixDerived(roots: RawPtr) {
   while i < k {
     let bSlot: RawPtr = d.load(fromByteOffset: i * 8)
     let dSlot: RawPtr = d.load(fromByteOffset: i * 8 + 8)
-    let off: RawPtr = d.load(fromByteOffset: i * 8 + 16)
+    let off: Int = d.load(fromByteOffset: i * 8 + 16)
     let b: RawPtr = bSlot.load(fromByteOffset: 0)
-    dSlot.store(b.advanced(by: off.toInt()), toByteOffset: 0)
+    dSlot.store(b.advanced(by: off), toByteOffset: 0)
     i = i + 3
   }
 }

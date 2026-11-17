@@ -19,6 +19,7 @@ One module over these files; a name declared in any file is visible in all of th
 | `gcreport.nomu` | the collector's recorder and report |
 | `scheduler.nomu` | the M:N scheduler, timers, actor mailboxes, the stop-the-world handshake, entry points |
 | `io.nomu` | stdin line input and its poller, the array bounds trap |
+| `msgpool.nomu` | the actor message pool: raw slabs by size class, per-carrier free lists, the root walk over queued messages |
 | `channel.nomu` | the channel core under the prelude's `Channel<T>`: the buffer, the waiter queues, park and wake; the one-shot pair (fulfill, await) under `Task<T>`; and `select` (rtSelectWait, rtSelectDone) |
 | `fault.nomu` | the fault handler: the crash report, each runtime thread's alternate signal stack; fiber dumps (SIGQUIT, `NOMU_TRACEBACK=all`); the out-of-memory report |
 | `gcverify.nomu` | the heap verifier: the collector's invariants checked at every collection (`NOMU_GC_VERIFY=1`) |

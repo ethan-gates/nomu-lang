@@ -1102,6 +1102,10 @@ enum NOIRGen {
                 if kind == .actor_, let handler = s.actors[typeName]?.handlers.first(where: { $0.name == name }) {
                     let irArgs = args.map { checkExpr(&s, $0.value) }
                     checkArgTypes(s, irArgs, against: handler.params.map { s.resolve($0.type) }, at: span)
+                    // A message crosses a task boundary to the actor's fiber, so its arguments must be shareable.
+                    for e in irArgs where e.type != .error && !s.isShareable(e.type) {
+                        s.diags.error("type '\(e.type)' is not shareable, so it cannot be passed to actor handler '\(name)'", at: span)
+                    }
                     return NOIRExpr(type: s.resolve(handler.returnType), span: span,
                                   kind: .methodCall(receiver: recv, method: name, args: irArgs))
                 }
@@ -1217,6 +1221,13 @@ enum NOIRGen {
                         s.diags.error("argument of type '\(v.type)' does not match expected '\(exp)'", at: v.span)
                     }
                     return NOIRArg(label: a.label, value: v)
+                }
+                // An actor's fields are its handlers' state, used on the actor's fiber, so what fills them must be
+                // shareable, as a message's arguments are.
+                if k == .actor_ {
+                    for a in irArgs where a.value.type != .error && !s.isShareable(a.value.type) {
+                        s.diags.error("type '\(a.value.type)' is not shareable, so it cannot be passed to actor '\(name)'", at: span)
+                    }
                 }
                 return NOIRExpr(type: .named(name, k), span: span, kind: .construct(typeName: name, args: irArgs))
             }
@@ -1728,8 +1739,9 @@ enum NOIRGen {
 
     static func lowerActor(_ s: inout Sema, _ a: ActorDecl) -> NOIRActor {
         let fields = a.fields.map { af in
-            NOIRActorField(name: af.name, type: s.resolve(af.type),
-                         initializer: af.initializer.map { checkExpr(&s, $0) }, span: af.span)
+            let type = s.resolve(af.type)
+            return NOIRActorField(name: af.name, type: type,
+                                  initializer: af.initializer.map { checkExpr(&s, $0, expected: type) }, span: af.span)
         }
         var handlers: [NOIRHandler] = []
         for h in a.handlers {

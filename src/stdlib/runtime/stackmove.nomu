@@ -227,7 +227,7 @@ fun nomuSchedStackCheck(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int, need: In
       rtSchedLock(sched)
     }
     self.store(5.uint8, toByteOffset: 8)
-    Runtime.ctxSwitch(from: self, to: self.advanced(by: 72), message: RawPtr.null.advanced(by: -1 - room))
+    Runtime.ctxSwitch(from: self, to: self.advanced(by: 72), message: -1 - room)
     // resumes without the scheduler lock
   }
 }
@@ -526,7 +526,8 @@ fun rtStackFree(fib: RawPtr) {
 
 // An anchor that must survive a stop: runtime code that captures its caller's anchor and may park more than
 // once keeps it as an offset from the current fiber's stack top, which a move does not change, and turns it
-// back into an address at each park. Off a fiber the offset is the address itself.
+// back into an address at each park. Off a fiber the offset is the address itself, which only a fiber's park
+// turns back (rtAnchorAt).
 fun rtAnchorOffset(sp: RawPtr) -> Int {
   let fib = rtCurrentFiber()
   if fib.isNull {
@@ -536,9 +537,11 @@ fun rtAnchorOffset(sp: RawPtr) -> Int {
   return base.toInt() + rtStackSize(fib) - sp.toInt()
 }
 
+// The address of anchor offset `off` in `fib`'s stack as it is now. Every caller is a fiber about to park or
+// just resumed, so `fib` is never null; an integer is never turned back into an address (task 263).
 fun rtAnchorAt(fib: RawPtr, off: Int) -> RawPtr {
   if fib.isNull {
-    return RawPtr.null.advanced(by: off)
+    Runtime.fatal("nomu: a stack anchor resolved outside a fiber")
   }
   let base: RawPtr = fib.load(fromByteOffset: 48)
   return base.advanced(by: rtStackSize(fib) - off)

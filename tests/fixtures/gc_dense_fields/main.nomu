@@ -2,7 +2,7 @@
 // an enum payload, an array of structs, an actor message, and a channel of Bool, whose element slot is one byte.
 // Every managed word must sit where its descriptor says, so the collector finds and moves it.
 class Box {
-  var v: Int
+  let v: Int
 }
 struct Cell {
   var lit: Bool

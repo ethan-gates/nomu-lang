@@ -127,6 +127,17 @@ groups:
       - gc
     expect:
       stdout: "bad 0\n"
+  # Actor messages in the message pool (task 261.4): every size class and a large message queued across
+  # collections, and a producer and consumer whose messages are freed on another carrier than cut them.
+  - name: actor-pool
+    fixtures: tests/fixtures/actor_pool_matrix/*
+    across:
+      - pipeline
+      - gc
+    compile_settings:
+      escape: false
+    expect:
+      stdout: "bad 0\n"
   - name: layout
     fixtures: tests/fixtures/layout_matrix/*
     across:

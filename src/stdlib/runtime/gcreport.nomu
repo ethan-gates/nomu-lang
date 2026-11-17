@@ -1226,6 +1226,8 @@ fun rtGcReportJson(rec: RawPtr, name: RawPtr, nameLen: Int, total: Int, numer: I
   rtBufInt(buf, peakInUse * 32768)
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"peakLargeObjects\":"))
   rtBufInt(buf, peakLarge)
+  rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), ",\"peakMessagePoolBytes\":"))
+  rtBufInt(buf, rtMsgPoolPeakBytes())
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 16), "}}}\n"))
   pauses.free()
   durs.free()

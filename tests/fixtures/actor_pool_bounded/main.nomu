@@ -1,0 +1,59 @@
+// Items through a chain of 8 stage actors to a hub, 150 rounds of 20,000. On several carriers the stages
+// spread, so a message is cut on one carrier and freed on another; the pool's free lists pass slots back
+// through its global stacks, which keeps it at about one round's messages.
+class Box {
+  let v: Int
+}
+actor Stage {
+  var next: Option<Stage>
+  on item(b: Box, round: Int, first: Stage, hub: Hub) {
+    switch next {
+    case .some(let n):
+      n.item(b: Box(v: b.v + 1), round: round, first: first, hub: hub)
+    case .none:
+      hub.done(v: b.v, round: round, first: first, me: hub)
+    }
+  }
+}
+actor Hub {
+  var got: Int = 0
+  var sum: Int = 0
+  on start(round: Int, first: Stage, me: Hub) {
+    var i = 0
+    while i < 20000 {
+      first.item(b: Box(v: i), round: round, first: first, hub: me)
+      i = i + 1
+    }
+  }
+  on done(v: Int, round: Int, first: Stage, me: Hub) {
+    sum = sum + v
+    got = got + 1
+    if got == 20000 {
+      got = 0
+      if round + 1 < 150 {
+        me.start(round: round + 1, first: first, me: me)
+      } else {
+        let want = 150 * (20000 * 19999 / 2 + 20000 * 7)
+        print("bad ")
+        if sum == want {
+          print(0)
+        } else {
+          print(sum - want)
+        }
+        print("\n")
+      }
+    }
+  }
+}
+fun main() {
+  let hub = Hub()
+  var next: Option<Stage> = .none
+  var first = Stage(next: next)
+  var s = 1
+  while s < 8 {
+    next = .some(first)
+    first = Stage(next: next)
+    s += 1
+  }
+  hub.start(round: 0, first: first, me: hub)
+}

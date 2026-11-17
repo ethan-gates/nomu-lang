@@ -3,7 +3,7 @@
 // without it. Part of the `runtime` module; see README.md.
 //
 // The handler runs on the faulting thread at an arbitrary instruction, so it takes no locks, allocates
-// nothing, and calls only `write(2)`, `creat(2)`, `close(2)` and `raise(3)`. Each runtime thread gives itself an alternate signal
+// nothing, and calls only `write(2)`, `creat(2)`, `close(2)`, `sigaction(2)` and `raise(3)`. Each runtime thread gives itself an alternate signal
 // stack at its entry (`rtFaultThreadStart`), so a stack overflow is reported too; the stack's first bytes
 // name the thread, and the next are the report's scratch buffer:
 //
@@ -118,8 +118,9 @@ fun rtFaultThreadStart(kind: Int, index: Int) {
 }
 
 // The handler, in the `SA_SIGINFO` shape. The signal comes from `siginfo`: the `int` argument's high bits are
-// undefined on arm64. Installed with SA_RESETHAND, so the `raise` here is delivered with the default action
-// once the handler returns.
+// undefined on arm64. Before its `raise` it restores the signal's default action, so the raise, delivered once
+// the handler returns, ends the process. SA_RESETHAND alone does not: Darwin, as BSD, leaves the handler in
+// place for SIGILL and SIGTRAP, and the raise then ran the handler again, without end (task 264).
 fun rtFaultHandler(sig: Int, info: RawPtr, uctx: RawPtr) {
   let signo = Runtime.loadInt32(info, at: 0)
   let alt = Runtime.currentAltStack()
@@ -173,6 +174,7 @@ fun rtFaultHandler(sig: Int, info: RawPtr, uctx: RawPtr) {
   if fd >= 0 {
     Runtime.closeFd(fd: fd)
   }
+  Runtime.sigaction(signal: signo, handler: RawPtr.null, flags: 0)   // SIG_DFL
   Runtime.raise(signal: signo)
 }
 

@@ -54,6 +54,8 @@ safepoint polls (about 1,000 iterations per strip by default).
   sets, measured.
 - The suite passes, including the GC stress legs (a collection reaches every loop within a chunk).
 
+**Re-measure:** once this lands, re-run the dense-layout benchmark against Go (`practice/gen/dense/run.py`, `practice/go/dense`; [196](196-dense-value-layout.md) 196.9) for the array scans, which are call-free loops with a header poll.
+
 ## Refs
 
 [243](243-frame-mechanism-feasibility.md) ("Results"); [236](236-fiber-preemption.md) ("Asynchronous

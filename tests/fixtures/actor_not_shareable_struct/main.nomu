@@ -1,0 +1,21 @@
+// A struct is shareable only when every field is, so one holding a mutable class cannot go to an actor.
+class Box {
+    var v: Int
+}
+
+struct Holder {
+    let n: Int
+    let box: Box
+}
+
+actor Sink {
+    var sum: Int = 0
+    on take(h: Holder) {
+        sum = sum + h.box.v
+    }
+}
+
+fun main() {
+    let s = Sink()
+    s.take(h: Holder(n: 1, box: Box(v: 2)))
+}

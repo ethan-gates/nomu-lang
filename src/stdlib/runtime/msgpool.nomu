@@ -1,0 +1,511 @@
+// The actor message pool: messages live in raw slabs off the managed heap, and every collection scans the
+// queued ones as roots (task 261.4). A message never touches the nursery, so queued messages are not copied or
+// promoted, and the mailbox links them through raw words that need no write barrier.
+//
+// Size classes: a message of `size` bytes (32 at least: header, next, thunk, self) takes class
+// (size - 17) / 16, a slot of 32 + 16 × class bytes, for sizes up to rtMsgMaxSmall; a larger message takes a
+// block of its own.
+//
+//   Slab (16 KiB, 16 KiB-aligned): 0 class · 8 the next slab · 16 slot size · slots from rtMsgSlabHead. A
+//     message's slab is its address rounded down to 16 KiB.
+//   Large block (16 KiB-aligned): 0 -1 · 8 next · 16 prev · 24 bytes · the message at rtMsgSlabHead.
+//   Slot: a live slot is a message (`header, next, thunk, self, args…`, the ABI with codegen in scheduler.nomu)
+//     whose header is its type id, plus rtMsgListed when a carrier's young list holds it; a free slot's header
+//     is rtMsgSlotFree (-1), or rtMsgSlotFreeListed (-2) while a young list still holds it, and its next word
+//     links the free list. A batch of free slots moving to or from the global pool is a chain of up to
+//     rtMsgBatch slots; its first slot holds the next batch at 16 and the batch's count at 24.
+//   Pool (rtMsgPool): 0 lock · 8 slab list · 16 large list · 24 bytes held in slabs and large blocks ·
+//     32 + class × 8 the class's global stack of batches · 280 the most bytes ever held (the report's).
+//   Carrier cache (the carrier record's +192): per class, its free list's head at class × 16 and count at
+//     class × 16 + 8; then its young list (rtMsgCacheYoung): count, capacity, storage.
+//
+// Allocation and free are gc-leaf: no safepoint, no park, so the carrier cannot change under them and the
+// carrier's lists need no atomics. A free goes to the freeing carrier's list, whichever carrier cut the slot; a
+// list past rtMsgSpillAt hands a batch to the global pool, and an empty one takes a batch back before cutting a
+// new slab. Collections run with every carrier stopped outside these functions, so they read the pool without
+// the lock.
+//
+// Young lists. A minor scans only the small messages sent since the last collection, from the carriers' young
+// lists, and every large message. A message never changes once sent, and the collection after its send promotes
+// all it references, so an older queued message holds no young reference; every collection leaves the nursery
+// empty, so the lists start over after each one. A major scans every live slot. A slot is on at most one list:
+// the send that finds it unlisted adds it, and a slot freed and sent again while listed stays listed. A full
+// list drops its slots freed since. A carrier dropping a slot from its list and another carrier sending in it
+// race on the header: the drop swaps rtMsgSlotFreeListed for rtMsgSlotFree with a compare-and-swap and the send
+// swaps in its header with an exchange, so exactly one of them sees the other's value and the slot stays listed
+// exactly when a list holds it.
+
+let rtMsgPool = Runtime.staticStorage(bytes: 288, align: 64)
+let rtMsgClasses = 31
+let rtMsgMaxSmall = 512
+let rtMsgSlabBytes = 16384
+let rtMsgSlabHead = 64
+let rtMsgBatch = 32
+let rtMsgSpillAt = 64
+let rtMsgSlotFree = -1
+let rtMsgSlotFreeListed = -2
+let rtMsgListed = 1099511627776
+let rtMsgCacheYoung = rtMsgClasses * 16
+let rtMsgCacheBytes = rtMsgClasses * 16 + 24
+// Set while a minor walks its roots: rtMsgWalk then takes only the young lists.
+let rtMsgMinor = Runtime.staticStorage(bytes: 8, align: 8)
+
+fun rtMsgLockTake() {
+  while true {
+    let was: Int = rtMsgPool.atomicCas(0, 1, atByteOffset: 0)
+    if was == 0 {
+      return
+    }
+    var w: Int = rtMsgPool.atomicLoad(fromByteOffset: 0)
+    while w != 0 {
+      w = rtMsgPool.atomicLoad(fromByteOffset: 0)
+    }
+  }
+}
+
+fun rtMsgLockDrop() {
+  rtMsgPool.atomicStore(0, toByteOffset: 0)
+}
+
+// This carrier's per-class free lists and young list, made on first use.
+fun rtMsgCache() -> RawPtr {
+  let rec = rtCarrier()
+  let c: RawPtr = rec.load(fromByteOffset: 192)
+  if c.isNull == false {
+    return c
+  }
+  let made = RawPtr.alloc(bytes: rtMsgCacheBytes, align: 64)
+  var i = 0
+  while i < rtMsgClasses * 2 {
+    made.store(0, toByteOffset: i * 8)
+    i += 1
+  }
+  let cap = 1024
+  made.store(0, toByteOffset: rtMsgCacheYoung)
+  made.store(cap, toByteOffset: rtMsgCacheYoung + 8)
+  made.store(RawPtr.alloc(bytes: cap * 8, align: 8), toByteOffset: rtMsgCacheYoung + 16)
+  rec.store(made, toByteOffset: 192)
+  return made
+}
+
+// The slab or large block holding `msg`.
+fun rtMsgSlabOf(msg: RawPtr) -> RawPtr {
+  return msg.advanced(by: 0 - (msg.toInt() & (rtMsgSlabBytes - 1)))
+}
+
+// A message slot of `size` bytes with its header set to `header` (the message's type id); the rest is
+// undefined until the caller writes it. Called from every actor send (codegen), as a gc-leaf call.
+fun rtMsgAlloc(size: Int, header: Int) -> RawPtr {
+  if size > rtMsgMaxSmall {
+    let m = rtMsgAllocLarge(size)
+    m.store(header, toByteOffset: 0)
+    return m
+  }
+  let cls = (size - 17) / 16
+  let c = rtMsgCache()
+  let at = cls * 16
+  var s: RawPtr = c.load(fromByteOffset: at)
+  if s.isNull {
+    s = rtMsgRefill(c, cls)
+  } else {
+    let nx: RawPtr = s.load(fromByteOffset: 8)
+    c.store(nx, toByteOffset: at)
+    let k: Int = c.load(fromByteOffset: at + 8)
+    c.store(k - 1, toByteOffset: at + 8)
+  }
+  let was: Int = s.atomicExchange(header + rtMsgListed, atByteOffset: 0)
+  if was != rtMsgSlotFreeListed {
+    rtMsgNoteYoung(c, s)
+  }
+  return s
+}
+
+// Add slot `s` to this carrier's young list. A full list first drops the slots freed since (a program that never
+// collects would otherwise grow it without end), and doubles only if that leaves it more than half full.
+fun rtMsgNoteYoung(c: RawPtr, s: RawPtr) {
+  var n: Int = c.load(fromByteOffset: rtMsgCacheYoung)
+  let cap: Int = c.load(fromByteOffset: rtMsgCacheYoung + 8)
+  var buf: RawPtr = c.load(fromByteOffset: rtMsgCacheYoung + 16)
+  if n == cap {
+    var kept = 0
+    var i = 0
+    while i < n {
+      let e: RawPtr = buf.load(fromByteOffset: i * 8)
+      let dropped: Int = e.atomicCas(rtMsgSlotFreeListed, rtMsgSlotFree, atByteOffset: 0)
+      if dropped != rtMsgSlotFreeListed {
+        buf.store(e, toByteOffset: kept * 8)
+        kept += 1
+      }
+      i += 1
+    }
+    n = kept
+    if n * 2 > cap {
+      let grown = RawPtr.alloc(bytes: cap * 16, align: 8)
+      grown.copyBytes(from: buf, byteCount: n * 8)
+      buf.free()
+      buf = grown
+      c.store(grown, toByteOffset: rtMsgCacheYoung + 16)
+      c.store(cap * 2, toByteOffset: rtMsgCacheYoung + 8)
+    }
+  }
+  buf.store(s, toByteOffset: n * 8)
+  c.store(n + 1, toByteOffset: rtMsgCacheYoung)
+}
+
+// Refill this carrier's empty list for `cls` from the global pool, or from a new slab, and take one slot.
+fun rtMsgRefill(c: RawPtr, cls: Int) -> RawPtr {
+  let at = cls * 16
+  rtMsgLockTake()
+  let batch: RawPtr = rtMsgPool.load(fromByteOffset: 32 + cls * 8)
+  if batch.isNull == false {
+    let rest: RawPtr = batch.load(fromByteOffset: 16)
+    rtMsgPool.store(rest, toByteOffset: 32 + cls * 8)
+    rtMsgLockDrop()
+    let k: Int = batch.load(fromByteOffset: 24)
+    let nx: RawPtr = batch.load(fromByteOffset: 8)
+    c.store(nx, toByteOffset: at)
+    c.store(k - 1, toByteOffset: at + 8)
+    return batch
+  }
+  let slab = RawPtr.alloc(bytes: rtMsgSlabBytes, align: rtMsgSlabBytes)
+  let head: RawPtr = rtMsgPool.load(fromByteOffset: 8)
+  slab.store(head, toByteOffset: 8)
+  let sz = 32 + cls * 16
+  slab.store(cls, toByteOffset: 0)
+  slab.store(sz, toByteOffset: 16)
+  // Every slot free before the slab is on the list a collection walks; the first is the one returned, the
+  // rest go on this carrier's list.
+  var list = RawPtr.null
+  var n = 0
+  var off = rtMsgSlabBytes - sz - (rtMsgSlabBytes - rtMsgSlabHead) % sz
+  while off >= rtMsgSlabHead {
+    let s = slab.advanced(by: off)
+    s.store(rtMsgSlotFree, toByteOffset: 0)
+    if off > rtMsgSlabHead {
+      s.store(list, toByteOffset: 8)
+      list = s
+      n += 1
+    }
+    off = off - sz
+  }
+  rtMsgPool.store(slab, toByteOffset: 8)
+  rtMsgHeldAdd(rtMsgSlabBytes)
+  rtMsgLockDrop()
+  c.store(list, toByteOffset: at)
+  c.store(n, toByteOffset: at + 8)
+  return slab.advanced(by: rtMsgSlabHead)
+}
+
+// A message over rtMsgMaxSmall bytes: a block of its own, on the large list.
+fun rtMsgAllocLarge(size: Int) -> RawPtr {
+  let bytes = rtMsgSlabHead + size
+  let blk = RawPtr.alloc(bytes: bytes, align: rtMsgSlabBytes)
+  blk.store(-1, toByteOffset: 0)
+  blk.store(RawPtr.null, toByteOffset: 16)
+  blk.store(bytes, toByteOffset: 24)
+  rtMsgLockTake()
+  let head: RawPtr = rtMsgPool.load(fromByteOffset: 16)
+  blk.store(head, toByteOffset: 8)
+  if head.isNull == false {
+    head.store(blk, toByteOffset: 16)
+  }
+  rtMsgPool.store(blk, toByteOffset: 16)
+  rtMsgHeldAdd(bytes)
+  rtMsgLockDrop()
+  return blk.advanced(by: rtMsgSlabHead)
+}
+
+// Count `bytes` more held by the pool, and the peak. Under the lock.
+fun rtMsgHeldAdd(bytes: Int) {
+  let held: Int = rtMsgPool.load(fromByteOffset: 24)
+  rtMsgPool.store(held + bytes, toByteOffset: 24)
+  let peak: Int = rtMsgPool.load(fromByteOffset: 280)
+  if held + bytes > peak {
+    rtMsgPool.store(held + bytes, toByteOffset: 280)
+  }
+}
+
+// Give `msg` back, once its thunk has read it. Called from every handler thunk (codegen), as a gc-leaf call.
+fun rtMsgFree(msg: RawPtr) {
+  let slab = rtMsgSlabOf(msg)
+  let cls: Int = slab.load(fromByteOffset: 0)
+  if cls < 0 {
+    rtMsgFreeLarge(slab)
+    return
+  }
+  let h: Int = msg.load(fromByteOffset: 0)
+  if h >= rtMsgListed {
+    msg.atomicStore(rtMsgSlotFreeListed, toByteOffset: 0)
+  } else {
+    msg.atomicStore(rtMsgSlotFree, toByteOffset: 0)
+  }
+  let c = rtMsgCache()
+  let at = cls * 16
+  let top: RawPtr = c.load(fromByteOffset: at)
+  msg.store(top, toByteOffset: 8)
+  c.store(msg, toByteOffset: at)
+  let k: Int = c.load(fromByteOffset: at + 8)
+  c.store(k + 1, toByteOffset: at + 8)
+  if k + 1 > rtMsgSpillAt {
+    rtMsgSpill(c, cls)
+  }
+}
+
+// Move a batch from the head of this carrier's list for `cls` to the global pool.
+fun rtMsgSpill(c: RawPtr, cls: Int) {
+  let at = cls * 16
+  let batch: RawPtr = c.load(fromByteOffset: at)
+  var last = batch
+  var i = 1
+  while i < rtMsgBatch {
+    last = last.load(fromByteOffset: 8)
+    i += 1
+  }
+  let rest: RawPtr = last.load(fromByteOffset: 8)
+  last.store(RawPtr.null, toByteOffset: 8)
+  c.store(rest, toByteOffset: at)
+  let k: Int = c.load(fromByteOffset: at + 8)
+  c.store(k - rtMsgBatch, toByteOffset: at + 8)
+  batch.store(rtMsgBatch, toByteOffset: 24)
+  rtMsgLockTake()
+  let top: RawPtr = rtMsgPool.load(fromByteOffset: 32 + cls * 8)
+  batch.store(top, toByteOffset: 16)
+  rtMsgPool.store(batch, toByteOffset: 32 + cls * 8)
+  rtMsgLockDrop()
+}
+
+fun rtMsgFreeLarge(blk: RawPtr) {
+  rtMsgLockTake()
+  let nx: RawPtr = blk.load(fromByteOffset: 8)
+  let pv: RawPtr = blk.load(fromByteOffset: 16)
+  if pv.isNull {
+    rtMsgPool.store(nx, toByteOffset: 16)
+  } else {
+    pv.store(nx, toByteOffset: 8)
+  }
+  if nx.isNull == false {
+    nx.store(pv, toByteOffset: 16)
+  }
+  let bytes: Int = blk.load(fromByteOffset: 24)
+  let held: Int = rtMsgPool.load(fromByteOffset: 24)
+  rtMsgPool.store(held - bytes, toByteOffset: 24)
+  rtMsgLockDrop()
+  blk.free()
+}
+
+// The most bytes the pool has held, for the collector's report.
+fun rtMsgPoolPeakBytes() -> Int {
+  let peak: Int = rtMsgPool.load(fromByteOffset: 280)
+  return peak
+}
+
+// ---- The collector's side. With the world stopped. ----
+
+// Add the managed fields of the queued messages to `roots` (their addresses in slot mode, their values
+// otherwise), after entry `n0`; the new count. Every live slot, or under a minor the young lists'. A queued
+// message holds its receiver and arguments live and is rewritten in place when they move.
+fun rtMsgWalk(roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
+  var n = n0
+  let minor: Int = rtMsgMinor.load(fromByteOffset: 0)
+  if minor != 0 {
+    n = rtMsgWalkYoung(roots, n, emitSlots)
+  } else {
+    var slab: RawPtr = rtMsgPool.load(fromByteOffset: 8)
+    while slab.isNull == false {
+      let sz: Int = slab.load(fromByteOffset: 16)
+      var off = rtMsgSlabHead
+      while off + sz <= rtMsgSlabBytes {
+        let s = slab.advanced(by: off)
+        let h: Int = s.load(fromByteOffset: 0)
+        if h >= 0 {
+          n = rtMsgWalkOne(s, roots, n, emitSlots)
+        }
+        off = off + sz
+      }
+      slab = slab.load(fromByteOffset: 8)
+    }
+  }
+  var blk: RawPtr = rtMsgPool.load(fromByteOffset: 16)
+  while blk.isNull == false {
+    n = rtMsgWalkOne(blk.advanced(by: rtMsgSlabHead), roots, n, emitSlots)
+    blk = blk.load(fromByteOffset: 8)
+  }
+  return n
+}
+
+// Each carrier's young list: the slots still queued.
+fun rtMsgWalkYoung(roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
+  var n = n0
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while rec.isNull == false {
+    let c: RawPtr = rec.load(fromByteOffset: 192)
+    if c.isNull == false {
+      let k: Int = c.load(fromByteOffset: rtMsgCacheYoung)
+      let buf: RawPtr = c.load(fromByteOffset: rtMsgCacheYoung + 16)
+      var i = 0
+      while i < k {
+        let s: RawPtr = buf.load(fromByteOffset: i * 8)
+        let h: Int = s.load(fromByteOffset: 0)
+        if h >= 0 {
+          n = rtMsgWalkOne(s, roots, n, emitSlots)
+        }
+        i += 1
+      }
+    }
+    rec = rec.load(fromByteOffset: 96)
+  }
+  return n
+}
+
+// After every collection: the nursery is empty, so no queued message holds a young reference. Each listed slot
+// is unlisted and each young list starts over.
+fun rtMsgYoungReset() {
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while rec.isNull == false {
+    let c: RawPtr = rec.load(fromByteOffset: 192)
+    if c.isNull == false {
+      let k: Int = c.load(fromByteOffset: rtMsgCacheYoung)
+      let buf: RawPtr = c.load(fromByteOffset: rtMsgCacheYoung + 16)
+      var i = 0
+      while i < k {
+        let s: RawPtr = buf.load(fromByteOffset: i * 8)
+        let h: Int = s.load(fromByteOffset: 0)
+        if h == rtMsgSlotFreeListed {
+          s.store(rtMsgSlotFree, toByteOffset: 0)
+        } else {
+          if h >= rtMsgListed {
+            s.store(h - rtMsgListed, toByteOffset: 0)
+          }
+        }
+        i += 1
+      }
+      c.store(0, toByteOffset: rtMsgCacheYoung)
+    }
+    rec = rec.load(fromByteOffset: 96)
+  }
+}
+
+fun rtMsgWalkOne(msg: RawPtr, roots: RawPtr, n0: Int, emitSlots: Int) -> Int {
+  var n = n0
+  let tid = rtObjTypeId(msg)
+  let k = rtOffsetsList(tid, msg)
+  var i = 0
+  while i < k {
+    let off = rtOffsetListed(tid, msg, i)
+    let w: RawPtr = msg.load(fromByteOffset: off)
+    let u = rtUntag(w)
+    if !rtNotObject(u) {
+      if emitSlots != 0 {
+        rtQueuePush(roots, n, msg.advanced(by: off))
+      } else {
+        rtQueuePush(roots, n, u)
+      }
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+// After a major: rebuild the free lists from the slabs, returning to the raw allocator each slab with no live
+// slot past the first such slab of its class. The young lists start over, every carrier's free lists and the
+// global pool are emptied, and each class's free slots go back to the global pool in batches.
+fun rtMsgReclaim() {
+  rtMsgYoungReset()
+  var rec: RawPtr = rtCarriers.load(fromByteOffset: 0)
+  while rec.isNull == false {
+    let c: RawPtr = rec.load(fromByteOffset: 192)
+    if c.isNull == false {
+      var i = 0
+      while i < rtMsgClasses * 2 {
+        c.store(0, toByteOffset: i * 8)
+        i += 1
+      }
+    }
+    rec = rec.load(fromByteOffset: 96)
+  }
+  // Per class: whether an empty slab is kept (at 0), and the batch being filled (head at 8, count at 16).
+  let work = RawPtr.alloc(bytes: rtMsgClasses * 24, align: 8)
+  var i = 0
+  while i < rtMsgClasses {
+    rtMsgPool.store(RawPtr.null, toByteOffset: 32 + i * 8)
+    work.store(0, toByteOffset: i * 24)
+    work.store(RawPtr.null, toByteOffset: i * 24 + 8)
+    work.store(0, toByteOffset: i * 24 + 16)
+    i += 1
+  }
+  var prev = RawPtr.null
+  var slab: RawPtr = rtMsgPool.load(fromByteOffset: 8)
+  while slab.isNull == false {
+    let next: RawPtr = slab.load(fromByteOffset: 8)
+    let cls: Int = slab.load(fromByteOffset: 0)
+    let sz: Int = slab.load(fromByteOffset: 16)
+    var live = 0
+    var off = rtMsgSlabHead
+    while off + sz <= rtMsgSlabBytes {
+      let h: Int = slab.load(fromByteOffset: off)
+      if h >= 0 {
+        live += 1
+      }
+      off = off + sz
+    }
+    let kept: Int = work.load(fromByteOffset: cls * 24)
+    if live == 0 && kept != 0 {
+      if prev.isNull {
+        rtMsgPool.store(next, toByteOffset: 8)
+      } else {
+        prev.store(next, toByteOffset: 8)
+      }
+      let held: Int = rtMsgPool.load(fromByteOffset: 24)
+      rtMsgPool.store(held - rtMsgSlabBytes, toByteOffset: 24)
+      slab.free()
+    } else {
+      if live == 0 {
+        work.store(1, toByteOffset: cls * 24)
+      }
+      off = rtMsgSlabHead
+      while off + sz <= rtMsgSlabBytes {
+        let s = slab.advanced(by: off)
+        let h: Int = s.load(fromByteOffset: 0)
+        if h < 0 {
+          rtMsgReclaimSlot(work, cls, s)
+        }
+        off = off + sz
+      }
+      prev = slab
+    }
+    slab = next
+  }
+  i = 0
+  while i < rtMsgClasses {
+    let k: Int = work.load(fromByteOffset: i * 24 + 16)
+    if k > 0 {
+      rtMsgReclaimPush(work, i)
+    }
+    i += 1
+  }
+  work.free()
+}
+
+// Add free slot `s` to its class's batch, pushing the batch to the global pool when full.
+fun rtMsgReclaimSlot(work: RawPtr, cls: Int, s: RawPtr) {
+  let head: RawPtr = work.load(fromByteOffset: cls * 24 + 8)
+  s.store(head, toByteOffset: 8)
+  work.store(s, toByteOffset: cls * 24 + 8)
+  let k: Int = work.load(fromByteOffset: cls * 24 + 16)
+  work.store(k + 1, toByteOffset: cls * 24 + 16)
+  if k + 1 == rtMsgBatch {
+    rtMsgReclaimPush(work, cls)
+  }
+}
+
+fun rtMsgReclaimPush(work: RawPtr, cls: Int) {
+  let batch: RawPtr = work.load(fromByteOffset: cls * 24 + 8)
+  let k: Int = work.load(fromByteOffset: cls * 24 + 16)
+  batch.store(k, toByteOffset: 24)
+  let top: RawPtr = rtMsgPool.load(fromByteOffset: 32 + cls * 8)
+  batch.store(top, toByteOffset: 16)
+  rtMsgPool.store(batch, toByteOffset: 32 + cls * 8)
+  work.store(RawPtr.null, toByteOffset: cls * 24 + 8)
+  work.store(0, toByteOffset: cls * 24 + 16)
+}

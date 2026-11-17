@@ -64,6 +64,22 @@ enum PointerIntrinsics {
 
     // MARK: - Static property
 
+    // A machine word that may be an Int or a RawPtr: an atomic op's operand, or a context switch's message. With
+    // `like`, the type the op's other word has; a bare integer literal then takes it.
+    static func atomicWordArg(_ s: inout Sema, _ e: Expr, _ ctx: String, _ what: String, like: Type? = nil) -> NOIRExpr {
+        let v = NOIRGen.checkExpr(&s, e, expected: like == nil || like == .error ? .int : like)
+        if v.type == .error { return v }
+        if v.type != .int && v.type != .rawPtr {
+            s.diags.error("\(ctx) expects an 'Int' or 'RawPtr' \(what), got '\(v.type)'", at: v.span)
+            return NOIRExpr(type: .error, span: v.span, kind: .intLit(0))
+        }
+        if let like, like != .error, v.type != like {
+            s.diags.error("\(ctx) expects its \(what) to be '\(like)' like the other word, got '\(v.type)'", at: v.span)
+            return NOIRExpr(type: .error, span: v.span, kind: .intLit(0))
+        }
+        return v
+    }
+
     // Pointer static properties: `RawPtr.null` / `Ptr<T>.null` — a null address of the named type.
     static func checkPointerStaticMember(_ s: inout Sema, _ tn: String, _ explicit: [Type]?, _ field: String, _ span: Span) -> NOIRExpr {
         guard field == "null" else {
@@ -161,31 +177,35 @@ enum PointerIntrinsics {
             }
             let off = intArg(&s, args[0].value, "RawPtr.load", "fromByteOffset")
             return s.ptrIntrinsic("__rawLoad", elem, [recv, off], span)
-        // Atomics (task 128.1.1, scheduler substrate). i64 sequentially-consistent ops over a RawPtr slot
-        // — the primitive under the MT-safe run queue, STW flags, and futex words. Int-width only for now.
+        // Atomics (task 128.1.1, scheduler substrate). Sequentially-consistent ops on a word at a RawPtr slot —
+        // the primitive under the MT-safe run queue, STW flags, and futex words. A word is an Int or a RawPtr:
+        // a pointer kept in an atomic slot stays a pointer, so reading it back needs no conversion from an
+        // integer (which would lose where it points, task 263). `atomicLoad` takes its type from the context
+        // (Int when there is none); the others from their operands; `atomicFetchAdd` is Int only.
         case "atomicLoad":
             guard checkArgLabels(&s, args, ["fromByteOffset"], "RawPtr.atomicLoad", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
+            let word: Type = expected == .rawPtr ? .rawPtr : .int
             let off = intArg(&s, args[0].value, "RawPtr.atomicLoad", "fromByteOffset")
-            return s.ptrIntrinsic("__atomicLoad", .int, [recv, off], span)
+            return s.ptrIntrinsic("__atomicLoad", word, [recv, off], span)
         case "atomicStore":
             guard checkArgLabels(&s, args, [nil, "toByteOffset"], "RawPtr.atomicStore", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
-            let value = intArg(&s, args[0].value, "RawPtr.atomicStore", "value")
+            let value = atomicWordArg(&s, args[0].value, "RawPtr.atomicStore", "value")
             let off = intArg(&s, args[1].value, "RawPtr.atomicStore", "toByteOffset")
             return s.ptrIntrinsic("__atomicStore", .void, [recv, value, off], span)
         // Compare-and-swap: returns the value read (the old word). The caller compares it to `expected` to
-        // learn whether the swap took, the standard CAS-loop shape.
+        // learn whether the swap took, the standard CAS-loop shape. Both words have one type.
         case "atomicCas":
             guard checkArgLabels(&s, args, [nil, nil, "atByteOffset"], "RawPtr.atomicCas", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
-            let expc = intArg(&s, args[0].value, "RawPtr.atomicCas", "expected")
-            let desr = intArg(&s, args[1].value, "RawPtr.atomicCas", "desired")
+            let expc = atomicWordArg(&s, args[0].value, "RawPtr.atomicCas", "expected")
+            let desr = atomicWordArg(&s, args[1].value, "RawPtr.atomicCas", "desired", like: expc.type)
             let coff = intArg(&s, args[2].value, "RawPtr.atomicCas", "atByteOffset")
-            return s.ptrIntrinsic("__atomicCas", .int, [recv, expc, desr, coff], span)
+            return s.ptrIntrinsic("__atomicCas", expc.type == .error ? .int : expc.type, [recv, expc, desr, coff], span)
         // Fetch-and-add: returns the previous value.
         case "atomicFetchAdd":
             guard checkArgLabels(&s, args, [nil, "atByteOffset"], "RawPtr.atomicFetchAdd", span) else {
@@ -198,9 +218,9 @@ enum PointerIntrinsics {
             guard checkArgLabels(&s, args, [nil, "atByteOffset"], "RawPtr.atomicExchange", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
             }
-            let newv = intArg(&s, args[0].value, "RawPtr.atomicExchange", "value")
+            let newv = atomicWordArg(&s, args[0].value, "RawPtr.atomicExchange", "value")
             let xoff = intArg(&s, args[1].value, "RawPtr.atomicExchange", "atByteOffset")
-            return s.ptrIntrinsic("__atomicExchange", .int, [recv, newv, xoff], span)
+            return s.ptrIntrinsic("__atomicExchange", newv.type == .error ? .int : newv.type, [recv, newv, xoff], span)
         case "eq":
             guard checkArgLabels(&s, args, [nil], "RawPtr.eq", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))

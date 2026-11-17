@@ -171,6 +171,55 @@ cases:
         min: 1
     carriers: []
 
+  # SIGTRAP and SIGILL: Darwin keeps their handler through SA_RESETHAND, so the handler restores the default
+  # action before it re-raises; one report, then the signal ends the run (task 264).
+  - name: crash-sigtrap
+    fixture: tests/fixtures/crash_sigtrap
+    compile_settings:
+      runtime_tier: true
+    timeout_sec: 5
+    expect:
+      signal: SIGTRAP
+    stderr_match:
+      - pattern: "nomu-crash: format 1"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: signal: SIGTRAP (5)"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: end"
+        min: 1
+        max: 1
+    carriers: []
+
+  - name: crash-sigill
+    fixture: tests/fixtures/crash_sigill
+    compile_settings:
+      runtime_tier: true
+    timeout_sec: 5
+    expect:
+      signal: SIGILL
+    stderr_match:
+      - pattern: "nomu-crash: format 1"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: signal: SIGILL (4)"
+        min: 1
+        max: 1
+      - pattern: "nomu-crash: end"
+        min: 1
+        max: 1
+    carriers: []
+
+  # A function the optimizer reduces to a trap keeps no stack check, and needs none (task 264).
+  - name: trap-only-function
+    fixture: tests/fixtures/trap_only_function
+    compile_settings:
+      optimize: true
+    expect:
+      stdout: "ok\n"
+    carriers: []
+
   - name: crash-bounds
     fixture: tests/fixtures/crash_bounds
     expect:
@@ -549,6 +598,57 @@ cases:
     fixture: tests/fixtures/task_not_shareable
     compile:
       expect_error: "type 'Box' is not shareable, so it cannot be passed to a 'task'"
+
+  # An actor message crosses a task boundary, so its arguments must be shareable, as a 'task''s are.
+  - name: actor-not-shareable
+    fixture: tests/fixtures/actor_not_shareable
+    compile:
+      expect_error: "type 'Box' is not shareable, so it cannot be passed to actor handler 'take'"
+
+  - name: actor-not-shareable-struct
+    fixture: tests/fixtures/actor_not_shareable_struct
+    compile:
+      expect_error: "type 'Holder' is not shareable, so it cannot be passed to actor handler 'take'"
+
+  - name: actor-construct-not-shareable
+    fixture: tests/fixtures/actor_construct_not_shareable
+    compile:
+      expect_error: "type 'Box' is not shareable, so it cannot be passed to actor 'Sink'"
+
+  # A message cut on one carrier and freed on another: the pool hands slots back through its global stacks,
+  # so 150 rounds of 20,000 items through 8 stages hold about one round's messages: 17 MiB resident on 4
+  # carriers, against 34 MiB with no hand-back.
+  - name: actor-pool-bounded
+    fixture: tests/fixtures/actor_pool_bounded
+    expect:
+      stdout: "bad 0\n"
+      max_resident_mib: 24
+    carriers:
+      - 4
+
+  # Minors scan only the messages sent since the last collection, from each carrier's young list; on several
+  # carriers one carrier drops a freed slot from its list while another sends in it. Stress collections with
+  # the heap verifier, so a message a minor missed shows as a dangling reference.
+  - name: actor-pool-carriers
+    fixture: tests/fixtures/actor_pool_matrix/pipeline
+    compile_settings:
+      escape: false
+    run_settings:
+      gc_stress_bytes: 4096
+      gc_verify: 1
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 2
+      - 4
+    iterations: 3
+    collections:
+      - min: 50
+
+  - name: actor-shareable-args
+    fixture: tests/fixtures/actor_shareable_args
+    expect:
+      stdout: "lc\n35\n"
 
   - name: task-result-not-shareable
     fixture: tests/fixtures/task_result_not_shareable

@@ -137,10 +137,11 @@ extension LLVMGen {
     }
 
     // The shared type-id for every mailbox object `{ header, mb_head, mb_tail, scheduled, sched_next }`:
-    // mb_head (8), mb_tail (16), sched_next (32) are managed pointers (scanned). 40 bytes.
+    // sched_next (32) is the one managed pointer (scanned); mb_head (8) and mb_tail (16) are raw links into the
+    // message pool (`runtime/msgpool.nomu`). 40 bytes.
     func mailboxTypeIdValue() -> UInt64 {
         if let id = mailboxTypeId { return id }
-        let id = registerMap([8, 16, 32], sizeBytes: 40, symbol: Mangle.descriptor("mailbox", home: homeModule), foldable: true)
+        let id = registerMap([32], sizeBytes: 40, symbol: Mangle.descriptor("mailbox", home: homeModule), foldable: true)
         mailboxTypeId = id
         return id
     }

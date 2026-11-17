@@ -247,10 +247,10 @@ fun rtStdinPollerMain(st: RawPtr) -> RawPtr {
       var c = first
       while !c.isNull {
         let nx: RawPtr = c.load(fromByteOffset: 8)
-        let tag: Int = c.load(fromByteOffset: 0)
+        let tag: RawPtr = c.load(fromByteOffset: 0)
         var keep = true
-        if (tag & 1) == 1 {
-          let sel = RawPtr.null.advanced(by: tag - 1)
+        if (tag.toInt() & 1) == 1 {
+          let sel = tag.advanced(by: -1)
           let was: Int = sel.atomicCas(0, 1, atByteOffset: 8)
           if was == 0 {
             let index: Int = c.load(fromByteOffset: 56)
@@ -273,9 +273,9 @@ fun rtStdinPollerMain(st: RawPtr) -> RawPtr {
       var w = first
       while !w.isNull {
         let nx: RawPtr = w.load(fromByteOffset: 8)
-        let tag: Int = w.load(fromByteOffset: 0)
-        if (tag & 1) == 1 {
-          let sel = RawPtr.null.advanced(by: tag - 1)
+        let tag: RawPtr = w.load(fromByteOffset: 0)
+        if (tag.toInt() & 1) == 1 {
+          let sel = tag.advanced(by: -1)
           rtSchedMutexLockAt(sel)
           rtSchedMutexUnlockAt(sel)
           let fib: RawPtr = sel.load(fromByteOffset: 24)

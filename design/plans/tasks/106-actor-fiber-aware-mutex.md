@@ -1,8 +1,16 @@
 # Actor fiber-aware mutex
 
 **Avenue:** Risk (runtime correctness/perf) · **Type/Lifecycle:** `perf · refactor · ready-to-build` ·
-**Size:** M · **Status:** the one open thread from the C→LLVM transition · **Source:** deferred.md
+**Size:** M · **Status:** done — obsolete; the mailbox runtime replaced the mutex (closed by [261](261-actor-follow-ups.md).2) · **Source:** deferred.md
 (C→LLVM checklist tail)
+
+## Closed
+
+Actors hold no mutex. An actor object is class-shaped with a mailbox in its last slot; a send pushes its
+message lock-free and schedules the mailbox with a compare-and-swap on its `scheduled` word, so one mailbox
+fiber at a time drains it (`nomuSchedActorSend`, `nomuSchedMailboxPop` in `runtime/scheduler.nomu`). A
+handler runs on a pooled mailbox fiber; when it parks, that fiber parks, and the carrier takes another fiber
+from the pool. Nothing in a handler blocks a carrier.
 
 ## What
 

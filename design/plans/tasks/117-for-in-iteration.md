@@ -41,6 +41,8 @@ the above perf-envelope commitment.
 - **Depends on:** a stdlib iterator/sequence interface ([stdlib-core](120-stdlib-core.md)).
 - **Feeds:** the BCE descope (`148-ssair-optimizer-tier.md` §148.4).
 
+**Re-measure:** once this lands, re-run the dense-layout benchmark against Go (`practice/gen/dense/run.py`, `practice/go/dense`; [196](196-dense-value-layout.md) 196.9) for the array scans, without a bounds check per element.
+
 ## Refs
 
 deferred.md "Frontend surface features"; `ssair.md` (BCE); `148-ssair-optimizer-tier.md` §148.4.

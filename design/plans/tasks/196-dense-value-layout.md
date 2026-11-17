@@ -1,7 +1,7 @@
 # Dense value layout — investigation and performance
 
 **Avenue:** Risk · **Type/Lifecycle:** `perf · evaluate` (codegen + runtime) · **Size:** M ·
-**Status:** in progress — the layout function, dense fields and dense arrays are built (196.1–196.8, and [181](181-array-managed-buffer.md)); enums are still padded until [260](260-enum-layout.md)'s layout phases; 196.9 closes once they land · **Source:** [176](176-shaped-gc-roots.md) 176.5.1, which found codegen's
+**Status:** done — every value is laid out dense: fields, buffers and the erased path (196.1–196.8), array elements through [181](181-array-managed-buffer.md), enums through [260](260-enum-layout.md); the 196.1 pairs match their hand-packed twins (196.9) · **Source:** [176](176-shaped-gc-roots.md) 176.5.1, which found codegen's
 field layout disagreeing with the GC descriptors and the erased path.
 
 ## Deliverable
@@ -431,6 +431,32 @@ than its twin (no packing arithmetic). The byte arrays (`Bool`, `UInt8`, payload
 `Array`'s element stride keeps its 8-byte minimum until [181](181-array-managed-buffer.md) moves `Array` onto
 `ManagedBuffer`, whose stride is the element's size.
 
+### 196.9 — the 196.1 pairs with 181 and 260 in
+
+The same runner, best of 5, with the Go programs (`practice/go/dense`) best of 5 beside them. Each "slots"
+program is now the dense layout; its twin is hand-packed.
+
+| program | build ms (Nomu / twin / Go) | scan ms (Nomu / twin / Go) | max RSS MB (Nomu / twin / Go) |
+| --- | --- | --- | --- |
+| `Array<Bool>` | 35 / 31 / 18 | 35 / 28 / 40 | 10 / 10 / 16 |
+| `Array<UInt8>` | 38 / 34 / 18 | 32 / 39 / 39 | 10 / 10 / 19 |
+| `Array<Color>` (4 cases) | 43 / 32 / 17 | 94 / 88 / 91 | 10 / 10 / 17 |
+| `Array<Cell>` (3 flags + `Int`) | 63 / 69 / 79 | 69 / 69 / 103 | 131 / 131 / 136 |
+| class (3 flags + `Int`), ring | 520 / 539 / 226 | 26 / 23 / 29 | 159 / 161 / 64 |
+
+The object pair, from the collector's report: 28 cycles each, peak heap 69 MB, promoted 342 MB for both.
+
+Findings:
+
+- **Every pair matches its twin in memory**, byte arrays included (66–67 MB under slots in 196.1, 10 MB
+  now). Nomu's byte and struct arrays take less memory than Go's.
+- **Scans match the twins and Go.** `Array<UInt8>` now scans faster than its twin, which reads through
+  `elementPtr(at:)` (the raw-path cost 196.1 noted).
+- **Builds.** Byte-array builds are 2× Go, through the append path. The object ring is 2.3× Go's time and
+  2.5× its RSS, through the collector ([262](262-collector-gaps.md)). Layout plays no part in either.
+- **Enum-held references:** binary-trees is in 260.8 (depth 21: 3.89 s and 445 MB, against Go's 5.27 s and
+  205 MB, a node 40 → 24 bytes).
+
 ## Work
 
 - **196.1** Per-type cost under slots against dense: memory and time for arrays of `Bool`, `UInt8` and
@@ -464,7 +490,8 @@ than its twin (no packing arithmetic). The byte arrays (`Bool`, `UInt8`, payload
   hand-packed twins and Go, and binary-trees for enum-held references; 196 is done when they match.
   Arrays done: with 181 in, `Array<Bool>` and `Array<UInt8>` of 4M take 10 MB, matching their twins (they
   took 67). Payload-free enum arrays take 10 MB with 260.4 (`Array<Color>` matches its twin; they took
-  67); generic enum instances (`Option<T>`) follow with 260.5 (`Option<TreeNode>` one word).
+  67); generic enum instances (`Option<T>`) follow with 260.5 (`Option<TreeNode>` one word). Done; see
+  Results.
 
 ## Exit
 

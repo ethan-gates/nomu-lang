@@ -25,6 +25,10 @@ Where these stand against Go, from 235.6 (best of 7, ns; Go with GOMAXPROCS as c
 | `fanin_channel` | 22.6 | 162.6 | 74.9 | 91.5 | 21.1 | 31.9 | 54.7 | 57.2 |
 | `pipeline_actor`, no work | 180.2 | 125.0 | 135.9 | 225.8 | 163.2 | 119.6 | 104.9 | 98.7 |
 
+`pipeline_actor`'s row was measured on runs with no collections; under [230](230-heap-sizing.md)'s heap sizing the same
+source collects and ran 312 / 254 / 205 / 264 ([261](261-actor-follow-ups.md).3, .5). With messages in a pool (261.4)
+it is 96 / 90–160 / 74 / 260, ahead of Go through 4 carriers and still behind at 8.
+
 ## Depends on
 
 Tuning the scheduler before the features that change its hot paths would be measured against a scheduler that

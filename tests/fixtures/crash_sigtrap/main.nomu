@@ -1,0 +1,6 @@
+// A SIGTRAP, as a trap instruction raises one: one crash report, then death by the signal's default action.
+// Darwin keeps a SIGTRAP or SIGILL handler installed through SA_RESETHAND, so the handler must restore the
+// default itself, or its re-raise runs it again without end (task 264).
+fun main() {
+  Runtime.raise(signal: 5)
+}

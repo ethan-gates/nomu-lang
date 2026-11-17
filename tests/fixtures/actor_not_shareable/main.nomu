@@ -1,0 +1,16 @@
+// A mutable class sent to an actor would be shared by the sender and the actor's fiber.
+class Box {
+    var v: Int
+}
+
+actor Sink {
+    var sum: Int = 0
+    on take(b: Box) {
+        sum = sum + b.v
+    }
+}
+
+fun main() {
+    let s = Sink()
+    s.take(b: Box(v: 1))
+}

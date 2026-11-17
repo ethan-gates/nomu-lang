@@ -1,0 +1,17 @@
+import std/time
+
+// A function the optimizer proves undefined (a load through a pointer made from null, which points into no
+// allocation) and reduces to a trap, its stack check with it. Such a function uses no stack, so the stack
+// checks' verification accepts it; it failed the build before (task 264). Never called here.
+fun slab(a: Int) -> Int {
+  let p = RawPtr.null.advanced(by: a - (a & 16383))
+  let x: Int = p.load(fromByteOffset: 0)
+  return x
+}
+fun main() {
+  let now = Time().now
+  if now < 0 {
+    print(slab(now))
+  }
+  print("ok\n")
+}

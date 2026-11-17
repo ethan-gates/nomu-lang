@@ -2070,6 +2070,58 @@ final class SemaTests: XCTestCase {
         XCTAssertEqual(errors(r).components(separatedBy: "a global holds an immutable value").count - 1, 2, errors(r))
     }
 
+    // Atomics on a pointer word keep it a pointer (task 263): each op takes its operands' type, `atomicLoad` the
+    // context's, and a compare-and-swap's two words share one type.
+    func testAtomicsOnRawPtrWords() {
+        let src = """
+        fun f(p: RawPtr, q: RawPtr) -> RawPtr {
+            p.atomicStore(q, toByteOffset: 0)
+            let a: RawPtr = p.atomicLoad(fromByteOffset: 0)
+            let b: RawPtr = p.atomicExchange(a, atByteOffset: 8)
+            let n: Int = p.atomicLoad(fromByteOffset: 16)
+            let m: Int = p.atomicCas(n, n + 1, atByteOffset: 16)
+            if m == n {
+                return p.atomicCas(b, RawPtr.null, atByteOffset: 8)
+            }
+            return b
+        }
+        """
+        let r = sema(src, runtimeTier: true)
+        XCTAssertTrue(r.diagnostics.isEmpty, errors(r))
+    }
+
+    func testAtomicCasRejectsMixedWords() {
+        let src = """
+        fun f(p: RawPtr, q: RawPtr) -> RawPtr {
+            return p.atomicCas(q, 0, atByteOffset: 0)
+        }
+        """
+        let r = sema(src, runtimeTier: true)
+        XCTAssertTrue(r.diagnostics.render().contains("expects its desired to be 'RawPtr' like the other word"), r.diagnostics.render())
+    }
+
+    func testAtomicWordRejectsOtherTypes() {
+        let src = """
+        fun f(p: RawPtr) {
+            p.atomicStore(true, toByteOffset: 0)
+        }
+        """
+        let r = sema(src, runtimeTier: true)
+        XCTAssertTrue(r.diagnostics.render().contains("RawPtr.atomicStore expects an 'Int' or 'RawPtr' value, got 'Bool'"), r.diagnostics.render())
+    }
+
+    // A context switch's message is one register: a pointer, or a number the receiver reads with `toInt()`.
+    func testCtxSwitchMessageMayBeAnInt() {
+        let src = """
+        fun f(a: RawPtr, b: RawPtr) -> Int {
+            let m = Runtime.ctxSwitch(from: a, to: b, message: -5)
+            return m.toInt()
+        }
+        """
+        let r = sema(src, runtimeTier: true)
+        XCTAssertTrue(r.diagnostics.isEmpty, errors(r))
+    }
+
     func testRawPtrGlobalOnlyInRuntimeTier() {
         let src = "let p = RawPtr.null"
         XCTAssertTrue(errors(sema(src)).contains("'RawPtr' is not one"), errors(sema(src)))

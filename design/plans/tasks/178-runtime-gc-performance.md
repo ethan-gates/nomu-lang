@@ -48,3 +48,5 @@ side (horizon "after GenImmix"). Correctness lives in [150](150-selfhosted-gc-la
 - Distinct from [150](150-selfhosted-gc-ladder.md) (correctness bring-up), [158](158-gc-packaging.md)
   (packaging), [159](159-gc-observability.md) (measurement), [177](177-register-resident-gc-roots.md) (the
   root-tax lever).
+
+**Re-measure:** once this lands, re-run the dense-layout benchmark against Go (`practice/gen/dense/run.py`, `practice/go/dense`; [196](196-dense-value-layout.md) 196.9) for the inlined allocation path, which the array fills and the object ring run on.

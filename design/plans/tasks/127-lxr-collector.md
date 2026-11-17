@@ -40,6 +40,8 @@ not selected still costs binary size, because unused functions with safepoints s
 - **Rests on:** [125 unsafe raw memory](125-unsafe-raw-memory.md) + [149 runtime-subset](149-runtime-subset.md)
   (shared with the whole self-hosted runtime) and a clean `VMBinding` + the `__nomu_write_barrier` hook.
 
+**Re-measure:** once this lands, re-run the dense-layout benchmark against Go (`practice/gen/dense/run.py`, `practice/go/dense`; [196](196-dense-value-layout.md) 196.9) for the object ring's collector time and memory.
+
 ## Refs
 
 `memory-model.md` §3 (object model / `VMBinding`); `backend.md`

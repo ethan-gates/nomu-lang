@@ -1,0 +1,5 @@
+// A SIGILL, as an undefined instruction raises one: one crash report, then death by the signal's default
+// action (task 264; see crash_sigtrap).
+fun main() {
+  Runtime.raise(signal: 4)
+}

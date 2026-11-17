@@ -1218,9 +1218,9 @@ final class SSAIRToLLVM {
         if !f.generics.isEmpty, let entry = f.blocks.first, frameBuildsRegistrableComposite(f) {
             for be in backEdges(f) { curBackEdges[be.from] = be.to }
             LLVMPositionBuilderAtEnd(b, blockMap[entry.id])
-            let save = e.preludeFn("nomu_fn_rtShadowSave", ret: e.i8ptr, params: [])
+            let save = e.preludeFn("nomu_fn_rtShadowSave", ret: e.i64, params: [])
             curProducerSave = e.buildCall(save.0, save.1, [])
-            for h in Set(curBackEdges.values) { headerSaveSlot[h] = e.entryAlloca(e.i8ptr, "loopshadow.save") }
+            for h in Set(curBackEdges.values) { headerSaveSlot[h] = e.entryAlloca(e.i64, "loopshadow.save") }
         }
 
         // Pass B — lower each block's instructions and terminator. A GC safepoint poll goes at the top
@@ -1258,7 +1258,7 @@ final class SSAIRToLLVM {
             // Loop-scoped typed-root save (task 100.4.3.6): record the shadow-top on entry to this loop
             // header, so the back-edge can restore it and clear the iteration's producer pushes.
             if let slot = headerSaveSlot[blk.id] {
-                let save = e.preludeFn("nomu_fn_rtShadowSave", ret: e.i8ptr, params: [])
+                let save = e.preludeFn("nomu_fn_rtShadowSave", ret: e.i64, params: [])
                 LLVMBuildStore(b, e.buildCall(save.0, save.1, []), slot)
             }
             lowerBlock(blk)
@@ -1697,8 +1697,8 @@ final class SSAIRToLLVM {
         // unconditional restore here is correct for the standard loop shapes. A `ret` block is never a
         // back-edge source (it branches nowhere), so this never races the function epilogue pop.
         if let header = curBackEdges[curBlockId], let slot = headerSaveSlot[header], curProducerSave != nil {
-            let pop = e.preludeFn("nomu_fn_rtShadowPopTo", ret: e.voidTy, params: [e.i8ptr])
-            _ = e.buildCall(pop.0, pop.1, [LLVMBuildLoad2(b, e.i8ptr, slot, "loopshadow")])
+            let pop = e.preludeFn("nomu_fn_rtShadowPopTo", ret: e.voidTy, params: [e.i64])
+            _ = e.buildCall(pop.0, pop.1, [LLVMBuildLoad2(b, e.i64, slot, "loopshadow")])
         }
         switch term.kind {
         case .br(let target, let args):
@@ -1721,7 +1721,7 @@ final class SSAIRToLLVM {
             // frame's registrations never outlive it. The returned composed buffer's `T`-components are
             // re-registered by the caller (consumer bracketing) or the caller's own prologue, if held.
             if let save = curProducerSave {
-                let pop = e.preludeFn("nomu_fn_rtShadowPopTo", ret: e.voidTy, params: [e.i8ptr])
+                let pop = e.preludeFn("nomu_fn_rtShadowPopTo", ret: e.voidTy, params: [e.i64])
                 _ = e.buildCall(pop.0, pop.1, [save])
             }
             if let sret = curSretParam, let rt = curReturnType, let v = v {
@@ -2576,11 +2576,14 @@ final class SSAIRToLLVM {
         case "__rawLoad":
             guard let lt = ty(resultType, span) else { return nil }
             return LLVMBuildLoad2(b, lt, e.gepByte(val(args[0]), val(args[1])), "raw.load")
-        // Atomics (task 128.1.1, scheduler substrate). i64 seq-cst ops over an addrspace(0) RawPtr slot —
-        // pure LLVM instructions, no OS/asm. The primitive under the MT-safe run queue, STW flags, and
-        // futex words. gc-leaf: no barrier, never a GC root. The fixture keeps offsets 8-aligned.
+        // Atomics (task 128.1.1, scheduler substrate). Seq-cst ops on an i64 or pointer word over an
+        // addrspace(0) RawPtr slot — pure LLVM instructions, no OS/asm. The primitive under the MT-safe run
+        // queue, STW flags, and futex words. gc-leaf: no barrier, never a GC root. The fixture keeps offsets
+        // 8-aligned. A pointer word stays a pointer (task 263); the store, swap and exchange take the type of
+        // their operands.
         case "__atomicLoad":
-            let ld = LLVMBuildLoad2(b, e.i64, e.gepByte(val(args[0]), val(args[1])), "atomic.load")
+            guard let wt = ty(resultType, span) else { return nil }
+            let ld = LLVMBuildLoad2(b, wt, e.gepByte(val(args[0]), val(args[1])), "atomic.load")
             LLVMSetOrdering(ld, LLVMAtomicOrderingSequentiallyConsistent)
             LLVMSetAlignment(ld, 8)
             return ld
@@ -2590,7 +2593,7 @@ final class SSAIRToLLVM {
             LLVMSetAlignment(st, 8)
             return LLVMConstInt(e.i64, 0, 0)
         case "__atomicCas":
-            // cmpxchg yields { i64 old, i1 success }; return the old word (caller compares to `expected`).
+            // cmpxchg yields { old, i1 success }; return the old word (caller compares to `expected`).
             let cx = LLVMBuildAtomicCmpXchg(b, e.gepByte(val(args[0]), val(args[3])),
                                             val(args[1]), val(args[2]),
                                             LLVMAtomicOrderingSequentiallyConsistent,
@@ -2787,7 +2790,13 @@ final class SSAIRToLLVM {
         // that resumes this context passes.
         case "__sysCtxSwitch":
             let (fn, fty) = e.runtimeFn("rtSwitch", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i8ptr], varArg: false)
-            return e.buildCall(fn, fty, [val(args[0]), val(args[1]), val(args[2])])!
+            // An Int message is a number in the register, never dereferenced: the asm boundary is the one place
+            // it is given a pointer's type.
+            var message = val(args[2])
+            if LLVMGetTypeKind(LLVMTypeOf(message)) == LLVMIntegerTypeKind {
+                message = LLVMBuildIntToPtr(b, message, e.i8ptr, "switch.message")!
+            }
+            return e.buildCall(fn, fty, [val(args[0]), val(args[1]), message])!
         case "__sysFiberInit":
             let (fn, fty) = e.runtimeFn("rtFiberInit", ret: e.voidTy,
                                         params: [e.i8ptr, e.i8ptr, e.i8ptr, e.i8ptr], varArg: false)
@@ -3217,7 +3226,7 @@ final class SSAIRToLLVM {
         // return. POD args are left unregistered — the hybrid fast path keeps them pure inline buffers.
         var savedTop: LLVMValueRef? = nil
         if !shadowBufs.isEmpty {
-            let save = e.preludeFn("nomu_fn_rtShadowSave", ret: e.i8ptr, params: [])
+            let save = e.preludeFn("nomu_fn_rtShadowSave", ret: e.i64, params: [])
             savedTop = e.buildCall(save.0, save.1, [])
             let push = e.preludeFn("nomu_fn_rtShadowPush", ret: e.voidTy, params: [e.i8ptr, e.i8ptr, e.i8ptr])
             let nodeTy = e.structTy([e.i8ptr, e.i8ptr, e.i8ptr])
@@ -3230,7 +3239,7 @@ final class SSAIRToLLVM {
         let call = e.buildCall(fn, fnTy, callArgs)
 
         if let st = savedTop {
-            let pop = e.preludeFn("nomu_fn_rtShadowPopTo", ret: e.voidTy, params: [e.i8ptr])
+            let pop = e.preludeFn("nomu_fn_rtShadowPopTo", ret: e.voidTy, params: [e.i64])
             _ = e.buildCall(pop.0, pop.1, [st])
         }
         if let buf = resultBuf, erasedResult {

@@ -625,7 +625,7 @@ fun rtSelectWait(sched: RawPtr, area: RawPtr, hasDefault: Int, anchorSp: RawPtr,
       let ms: Int = c.load(fromByteOffset: 16)
       let expiry: Int = Runtime.monotonicNanos() + ms * 1000000
       rtSchedMutexLockAt(sched.advanced(by: 48))
-      rtSchedTimerPush(sched, expiry, RawPtr.null.advanced(by: w.toInt() + 1))
+      rtSchedTimerPush(sched, expiry, w.advanced(by: 1))
       rtSchedMutexUnlockAt(sched.advanced(by: 48))
       timers = true
     } else {
@@ -699,7 +699,7 @@ fun rtSelectDone(sched: RawPtr, area: RawPtr) {
       rtSchedMutexUnlockAt(sin)
     } else if kind == 2 {
       rtSchedMutexLockAt(sched.advanced(by: 48))
-      rtSchedTimerRemove(sched, RawPtr.null.advanced(by: w.toInt() + 1))
+      rtSchedTimerRemove(sched, w.advanced(by: 1))
       rtSchedMutexUnlockAt(sched.advanced(by: 48))
     } else {
       let buf: RawPtr = c.load(fromByteOffset: 8)

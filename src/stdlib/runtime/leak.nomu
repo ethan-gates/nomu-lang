@@ -297,6 +297,7 @@ fun rtLeakCheck(sched: RawPtr) -> Int {
     n = n + 1
   }
   n = rtWalkRunQueues(roots, n, 0)
+  n = rtMsgWalk(roots, n, 0)
   rtLeakMarkFrom(set, roots, n)
   rtRootsFree(roots)
   var cur: RawPtr = sched.load(fromByteOffset: 128)

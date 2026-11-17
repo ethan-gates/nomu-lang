@@ -65,6 +65,8 @@ reclamation with reference counting on the same Immix heap, or belongs to GenImm
   second pass), weighed against how soon LXR replaces them before any is built.
 - **262.6** Parallel or concurrent marking, with LXR's design.
 
+**Re-measure:** once this lands, re-run the dense-layout benchmark against Go (`practice/gen/dense/run.py`, `practice/go/dense`; [196](196-dense-value-layout.md) 196.9) for the object ring's collector time and memory.
+
 ## Refs
 
 `runtime/descriptors.nomu` (`rtOffsetsInto`, `rtOffsetListed`), `runtime/collect.nomu`, `runtime/immix.nomu`

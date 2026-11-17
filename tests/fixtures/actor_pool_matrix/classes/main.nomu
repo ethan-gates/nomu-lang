@@ -1,0 +1,78 @@
+// Actor messages in several pool size classes and one past the largest (a block of its own), queued while
+// `churn` allocates. On one carrier the actor drains only after `main` ends, so collections run with every
+// message waiting, each holding the only references to young objects (a Box, a built String); the collector
+// must find them in the pool and rewrite them when they move.
+class Box {
+  let v: Int
+}
+struct Eight {
+  let a: Int
+  let b: Int
+  let c: Int
+  let d: Int
+  let e: Int
+  let f: Int
+  let g: Int
+  let h: Int
+}
+actor Sink {
+  var sum: Int = 0
+  on small(n: Int) {
+    sum = sum + n
+  }
+  on boxed(b: Box) {
+    sum = sum + b.v
+  }
+  on text(s: String, b: Box) {
+    sum = sum + s.count + b.v
+  }
+  on mid(e: Eight, b: Box) {
+    sum = sum + e.a + e.h + b.v
+  }
+  on large(e1: Eight, e2: Eight, e3: Eight, e4: Eight, e5: Eight, e6: Eight, e7: Eight, e8: Eight, e9: Eight, b: Box) {
+    sum = sum + e1.a + e5.d + e9.h + b.v
+  }
+  on report(want: Int) {
+    print("bad ")
+    if sum == want {
+      print(0)
+    } else {
+      print(sum - want)
+    }
+    print("\n")
+  }
+}
+fun churn(i: Int) -> Int {
+  var boxes: Array<Box> = []
+  var k = 0
+  while k < 40 {
+    boxes.append(Box(v: i + k))
+    k = k + 1
+  }
+  return boxes[39].v
+}
+fun eight(i: Int) -> Eight {
+  return Eight(a: i, b: 1, c: 2, d: i * 2, e: 3, f: 4, g: 5, h: i * 3)
+}
+fun main() {
+  let s = Sink()
+  var want = 0
+  var t = 0
+  var i = 0
+  while i < 3000 {
+    s.small(n: i)
+    s.boxed(b: Box(v: i))
+    let word = "ab".concat("cd")
+    s.text(s: word, b: Box(v: 1))
+    s.mid(e: eight(i), b: Box(v: 2))
+    let e = eight(i)
+    s.large(e1: e, e2: e, e3: e, e4: e, e5: e, e6: e, e7: e, e8: e, e9: e, b: Box(v: 7))
+    want = want + i + i + (4 + 1) + (i + i * 3 + 2) + (i + i * 2 + i * 3 + 7)
+    t = t + churn(i)
+    i = i + 1
+  }
+  if t == -1 {
+    print("unreachable\n")
+  }
+  s.report(want: want)
+}

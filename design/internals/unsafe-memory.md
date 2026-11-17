@@ -99,7 +99,11 @@ context switch, thread and futex primitives) are not part of this surface: they 
 - `p.load<T: RawScalar>(fromByteOffset: Int) -> T` — `T` inferred from context (a checking-position
   expression; a bare `let x = p.load(…)` errors asking for an annotation).
 - `p.store<T: RawScalar>(_ value: T, toByteOffset: Int) -> Void`.
-- `p.advanced(by: Int) -> RawPtr` — byte arithmetic (GEP over `i8`).
+- `p.advanced(by: Int) -> RawPtr` — byte arithmetic (GEP over `i8`). The result points into the same
+  allocation as `p`: advancing `RawPtr.null` gives a pointer into no allocation, which LLVM may treat as never
+  dereferenced (a load through one compiled to a trap, task 263). There is no conversion from an `Int` to a
+  pointer; a pointer that has to be stored is kept as a `RawPtr` (`load`/`store`, and the runtime tier's
+  atomics, take `RawPtr` words), and a tag in its low bits is added and removed with `advanced`.
 - `p.asPtr<T>() -> Ptr<T>` — reinterpret to a typed pointer (`T` from context).
 - `p.isNull -> Bool` (property) · `p.eq(_ other: RawPtr) -> Bool` — pointer identity.
 

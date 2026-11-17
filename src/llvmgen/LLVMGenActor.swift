@@ -53,29 +53,30 @@ extension LLVMGen {
     // A handler's message size in bytes.
     func messageSize(_ h: NOIRHandler) -> Int { ShapeEnv.alignUp(messageArgsLayout(h).end, 8) }
 
-    // Type-id + pointer map for a handler's message. Managed offsets: next (8) and self (24) always,
-    // plus any managed pointers inside the args. thunk (16, a code ptr) is never scanned.
+    // Type-id + pointer map for a handler's message, which the collector reads to scan a queued message as a
+    // root (`runtime/msgpool.nomu`). Managed offsets: self (24) always, plus any managed pointers inside the
+    // args. next (8) is a raw link between pool slots and thunk (16) a code pointer; neither is scanned.
     func messageTypeIdValue(_ actorName: String, _ h: NOIRHandler) -> UInt64 {
         let key = "\(actorName):\(h.name)"
         if let id = messageTypeIds[key] { return id }
         let d = descriptorEntries(shapes.fieldsShape(h.params.map(\.type), base: 32))   // args past the prefix
-        let id = registerMap([8, 24] + d.offsets, sizeBytes: Int32(messageSize(h)),   // next, self
+        let id = registerMap([24] + d.offsets, sizeBytes: Int32(messageSize(h)),   // self
                              symbol: Mangle.messageDescriptor(actorName, h.name, home: homeModule), foldable: true, shaped: d.shaped)
         messageTypeIds[key] = id
         return id
     }
 
-    // The per-handler drain thunk `void @nomu_onthunk_<A>_<h>(ptr addrspace(1) msg)`: unpack self +
-    // args from the message and call the handler (void — no reply). Runs on a rented pool worker
-    // inside the drain loop; `msg` is a tracked GC root here, so the handler's safepoints relocate it
-    // and `self` correctly.
+    // The per-handler drain thunk `void @nomu_onthunk_<A>_<h>(ptr msg)`: unpack self + args from the
+    // message, give the message back to the pool (`rtMsgFree`), and call the handler (void — no reply). Runs on
+    // a mailbox fiber inside the drain loop. `msg` is a raw pool slot; once read, self and the args are
+    // ordinary values in this frame, relocated at the handler's safepoints.
     func actorThunk(_ actorName: String, _ h: NOIRHandler) -> LLVMValueRef {
         let key = "\(actorName):\(h.name)"
         if let f = actorThunks[key] { return f }
         declareActorHandler(actorName, h.name)
         let handler = callables["m:\(actorName):\(h.name)"]!
         let mt = messageType(actorName, h)!
-        let (fn, _) = emitFunction("nomu_onthunk_\(actorName)_\(h.name)", ret: voidTy, params: [p1])
+        let (fn, _) = emitFunction("nomu_onthunk_\(actorName)_\(h.name)", ret: voidTy, params: [i8ptr])
         LLVMSetLinkage(fn, LLVMInternalLinkage)   // referenced only from this object's sends
         actorThunks[key] = fn
         withStubBody(fn) {
@@ -86,6 +87,8 @@ extension LLVMGen {
                 guard let t = llvmType(p.type, p.span) else { continue }
                 argVals.append(LLVMBuildLoad2(b, t, structGEP(mt, msg, msgArgIndex(i)), p.name))
             }
+            let free = runtimePreludeFn("rtMsgFree", ret: voidTy, params: [i8ptr])
+            markCallGCLeaf(buildCall(free.fn, free.ty, [msg])!)
             _ = buildCall(handler.fn, handler.ty, argVals)   // void handler; any return is dropped
             LLVMBuildRetVoid(b)
         }
@@ -94,16 +97,16 @@ extension LLVMGen {
 
     // The one shared drain loop `void @nomu_actor_drain(ptr addrspace(1) mb)` the mailbox fibers call
     // (`rtSchedMailboxFiberMain`): pop a message, run its thunk, repeat until the mailbox is
-    // empty. `mb` and each `msg` are tracked GC roots across the thunk call — the whole reason this
-    // loop is codegen (not C): a moving GC may relocate them at a handler safepoint. Every module that uses
+    // empty. `mb` is a tracked GC root across the thunk call — the reason this loop is codegen: a moving GC
+    // may relocate it at a handler safepoint. Each `msg` is a raw pool slot, which never moves. Every module that uses
     // actors emits the same body, weak-ODR so the copies fold to one at link.
     func actorDrain() -> (LLVMValueRef, LLVMTypeRef) {
         if let f = actorDrainFn { return f }
-        // The scheduler's mailbox pop (`nomuSchedMailboxPop(sched, mailbox)`), called with the managed mailbox
-        // and returning the managed message, so both stay tracked GC values across the call.
+        // The scheduler's mailbox pop (`nomuSchedMailboxPop(sched, mailbox)`), called with the managed mailbox,
+        // so it stays a tracked GC value across the call, and returning the raw message.
         let popFn = runtimePreludeFn("nomuSchedMailboxPop", ret: i8ptr, params: [i8ptr, i8ptr])
-        let pop = (popFn.fn, fnType(p1, [i8ptr, p1]))
-        let thunkTy = fnType(voidTy, [p1])
+        let pop = (popFn.fn, fnType(i8ptr, [i8ptr, p1]))
+        let thunkTy = fnType(voidTy, [i8ptr])
         let pre = msgPrefixType()
         let (fn, fnTy) = emitFunction("nomu_actor_drain", ret: voidTy, params: [p1])
         LLVMSetLinkage(fn, LLVMWeakODRLinkage)
@@ -116,7 +119,7 @@ extension LLVMGen {
             LLVMBuildBr(b, loopBB)
             LLVMPositionBuilderAtEnd(b, loopBB)
             let msg = buildCall(pop.0, pop.1, [loadRuntimeGlobal("rtSched", i8ptr), mb])!
-            let isNull = LLVMBuildICmp(b, LLVMIntEQ, msg, LLVMConstNull(p1), "empty?")
+            let isNull = LLVMBuildICmp(b, LLVMIntEQ, msg, LLVMConstNull(i8ptr), "empty?")
             LLVMBuildCondBr(b, isNull, exitBB, bodyBB)
             LLVMPositionBuilderAtEnd(b, bodyBB)
             let thunk = LLVMBuildLoad2(b, i8ptr, structGEP(pre, msg, 2), "thunk")!
@@ -143,11 +146,11 @@ extension LLVMGen {
         LLVMBuildStore(b, drain.0, slot)
     }
 
-    // Build + enqueue a handler message from the lowered receiver and argument values (M6 · 6.4): allocate
-    // the message, stamp header/thunk/self/args, and hand it to the scheduler's `nomuSchedActorSend`, which
-    // enqueues it and returns. Fire-and-forget — the only actor operation (§9) — so it yields no value. `argVals` is called
-    // after the allocation: a shaped argument is read from its home then, so a collection at the allocation
-    // that moves its buffer is observed.
+    // Build + enqueue a handler message from the lowered receiver and argument values (M6 · 6.4): take a
+    // slot from the message pool, stamp header/thunk/self/args, and hand it to the scheduler's
+    // `nomuSchedActorSend`, which enqueues it and returns. Fire-and-forget — the only actor operation (§9) — so
+    // it yields no value. The pool call is gc-leaf and the slot is raw memory, so the stores take no write
+    // barrier and no collection can see a half-written message.
     func emitActorSend(_ actorName: String, _ handler: String, _ recvValue: LLVMValueRef,
                        _ argVals: () -> [LLVMValueRef], _ span: Span) -> LLVMValueRef? {
         guard let a = actorMap[actorName],
@@ -158,20 +161,24 @@ extension LLVMGen {
         let thunk = actorThunk(actorName, h)   // per-handler thunk (+ handler + message type)
         guard let mt = messageType(actorName, h), let at = actorType(actorName) else { return nil }
 
-        // Allocate + populate the message. header, thunk, self, args are set here; `next` is filled by
-        // the runtime. The message stays reachable via the mailbox chain once enqueued (no sender root).
-        let msg = rtAllocManaged(LLVMConstInt(i64, UInt64(messageSize(h)), 0))
-        writeTypeIdHeaderRaw(msg, messageTypeIdValue(actorName, h))
+        // Allocate + populate the message. thunk, self and args are set here; the header (the type id) by the
+        // pool, which keeps a mark of its own beside it, and `next` by the scheduler's send. Every collection
+        // scans a live pool slot as a root, so it needs no other.
+        let alloc = runtimePreludeFn("rtMsgAlloc", ret: i8ptr, params: [i64, i64])
+        let msg = buildCall(alloc.fn, alloc.ty, [LLVMConstInt(i64, UInt64(messageSize(h)), 0),
+                                                 descOffsetHeader(messageTypeIdValue(actorName, h))])!
+        markCallGCLeaf(msg)
         LLVMBuildStore(b, thunk, structGEP(mt, msg, 2))         // thunk (code ptr, not managed)
         storeField(msg, structGEP(mt, msg, 3), recvValue)       // self (managed)
         for (i, v) in argVals().enumerated() {
             storeField(msg, structGEP(mt, msg, msgArgIndex(i)), v)
         }
         let mailbox = LLVMBuildLoad2(b, p1, structGEP(at, recvValue, actorMailboxIndex(actorName)), "mailbox")!
-        // The scheduler's send (`nomuSchedActorSend(sched, mailbox, msg)`), with the managed mailbox and message.
+        // The scheduler's send (`nomuSchedActorSend(sched, mailbox, msg)`), with the managed mailbox and the raw
+        // message.
         let sendFn = runtimePreludeFn("nomuSchedActorSend", ret: voidTy, params: [i8ptr, i8ptr, i8ptr])
         let sched = loadRuntimeGlobal("rtSched", i8ptr)
-        _ = buildCall(sendFn.fn, fnType(voidTy, [i8ptr, p1, p1]), [sched, mailbox, msg])
+        _ = buildCall(sendFn.fn, fnType(voidTy, [i8ptr, p1, i8ptr]), [sched, mailbox, msg])
         return LLVMConstNull(p1)   // fire-and-forget: no value
     }
 }

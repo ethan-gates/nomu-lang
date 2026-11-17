@@ -1,7 +1,7 @@
 import std/time
 
 // One hub actor sends short jobs round-robin to 16 worker actors; each worker computes and replies to the
-// hub. Rounds grow the job from nothing to about 10 µs; each prints its total time. Measures how fast
+// hub, which holds the workers. Rounds grow the job from nothing to about 10 µs; each prints its total time. Measures how fast
 // work sent from one actor spreads to idle carriers.
 
 fun spin(work: Int, seed: Int) -> Int {
@@ -15,8 +15,8 @@ fun spin(work: Int, seed: Int) -> Int {
 }
 
 actor Worker {
-    on job(work: Int, seed: Int, msgs: Int, hub: Hub, workers: Array<Worker>) {
-        hub.done(v: spin(work: work, seed: seed), work: work, msgs: msgs, me: hub, workers: workers)
+    on job(work: Int, seed: Int, msgs: Int, hub: Hub) {
+        hub.done(v: spin(work: work, seed: seed), work: work, msgs: msgs, me: hub)
     }
 }
 
@@ -24,17 +24,21 @@ actor Hub {
     var got: Int = 0
     var sum: Int = 0
     var t0: Int = 0
-    on start(work: Int, msgs: Int, me: Hub, workers: Array<Worker>) {
+    var workers: Array<Worker> = []
+    on start(work: Int, msgs: Int, me: Hub) {
+        while workers.count < 16 {
+            workers.append(Worker())
+        }
         got = 0
         t0 = Time().now
         let k = workers.count
         var i = 0
         while i < msgs {
-            workers[i % k].job(work: work, seed: i, msgs: msgs, hub: me, workers: workers)
+            workers[i % k].job(work: work, seed: i, msgs: msgs, hub: me)
             i += 1
         }
     }
-    on done(v: Int, work: Int, msgs: Int, me: Hub, workers: Array<Worker>) {
+    on done(v: Int, work: Int, msgs: Int, me: Hub) {
         sum = sum + v
         got += 1
         if got == msgs {
@@ -51,7 +55,7 @@ actor Hub {
                 if work == 0 {
                     next = 10
                 }
-                me.start(work: next, msgs: msgs, me: me, workers: workers)
+                me.start(work: next, msgs: msgs, me: me)
             } else if sum == 1 {
                 print("\n")
             }
@@ -60,12 +64,6 @@ actor Hub {
 }
 
 fun main() {
-    var workers: Array<Worker> = []
-    var w = 0
-    while w < 16 {
-        workers.append(Worker())
-        w += 1
-    }
     let hub = Hub()
-    hub.start(work: 0, msgs: 50000, me: hub, workers: workers)
+    hub.start(work: 0, msgs: 50000, me: hub)
 }

@@ -86,7 +86,8 @@ Nomu the way the `__raw*`/`__ptr*` intrinsics are:
   - **Entry / TLS / stack setup** — the pre-runtime moment: establish the main carrier's thread-pointer
     slot and initial stack before the scheduler loop is live.
 - **Atomics.** LLVM atomic instructions exposed as intrinsics (no syscall): `__atomicLoad` / `__atomicStore`
-  (with ordering), `__atomicCas`, `__atomicFetchAdd`, `__atomicExchange` (built — all i64 seq-cst), and
+  (with ordering), `__atomicCas`, `__atomicFetchAdd`, `__atomicExchange` (built — seq-cst, on an `Int` or a
+  `RawPtr` word, so a pointer kept in an atomic slot stays a pointer, task 263; fetch-add `Int` only), and
   fences (deferred until an ordering weaker than seq-cst is wanted). These back the MT-safe run queue, the
   STW flags, the single-drain word, and the mutex/condvar futex word — `__atomicExchange` is the mutex's
   swap (128.1.4).

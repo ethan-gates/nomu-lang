@@ -1,0 +1,43 @@
+// Shareable message arguments: plain values, a String, a deeply immutable class, a struct of them, and an
+// actor handle, at a send and at construction. A field defaults to an empty array, typed by its declaration.
+class Config {
+    let base: Int
+    let name: String
+}
+
+struct Pair {
+    let a: Int
+    let config: Config
+}
+
+actor Printer {
+    on show(n: Int) {
+        print(n)
+        print("\n")
+    }
+}
+
+actor Worker {
+    var sum: Int = 0
+    var base: Config
+    var seen: Array<Int> = []
+    on add(n: Int, flag: Bool, label: String, config: Config, pair: Pair) {
+        sum = sum + n + config.base + pair.a + pair.config.base
+        if flag { sum = sum + 1 }
+        seen.append(base.base)
+        sum = sum + seen.count + seen[0]
+        print(label)
+        print(config.name)
+        print("\n")
+    }
+    on report(to: Printer) {
+        to.show(n: sum)
+    }
+}
+
+fun main() {
+    let c = Config(base: 10, name: "c")
+    let w = Worker(base: c)
+    w.add(n: 1, flag: true, label: "l", config: c, pair: Pair(a: 2, config: c))
+    w.report(to: Printer())
+}

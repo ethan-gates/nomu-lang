@@ -2,7 +2,7 @@
 // argument in its value-layout slot, where its GC descriptor looks; a packed Bool pair once moved the
 // reference off the word the collector scanned.
 class Box {
-  var v: Int
+  let v: Int
 }
 actor Worker {
   var sum: Int = 0

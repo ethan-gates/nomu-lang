@@ -34,10 +34,12 @@
 //   Timer entry (16B): 0 expiry-ns · 8 fiber
 //   Mailbox (ABI with codegen): 0 header · 8 mb_head · 16 mb_tail · 24 scheduled · 32 sched_next
 //   Message (ABI with codegen): 0 header · 8 next · 16 thunk · 24 self · args…
-//     Both are GC objects codegen allocates (it supplies their pointer maps). An actor object is class-shaped
-//     with its mailbox in its last slot, which codegen loads at the send, so the runtime never parses an
-//     actor. mb_head, mb_tail, next, self and sched_next are GC-scanned (they chain live queued messages and
-//     global mailbox queue, kept live with the receiver); thunk, a code pointer, is not.
+//     A mailbox is a GC object codegen allocates; a message is a slot in the message pool (msgpool.nomu),
+//     raw memory every collection scans as a root through the message's pointer map (self and the managed
+//     arguments). mb_head, mb_tail and next are raw links between slots, so linking a message takes no write
+//     barrier; sched_next (the global mailbox queue) is the mailbox's one managed word. An actor object is
+//     class-shaped with its mailbox in its first field slot, which codegen loads at the send, so the runtime
+//     never parses an actor; thunk is a code pointer.
 //   Fiber (128B): 0 the context: the SP its last switch saved, where its callee-saved registers sit on its
 //                   own stack (`rtasm_arm64.s`) · 8 three bytes, each read and written alone: 8 state,
 //                   9 drainer (0 a user fiber, 1 a mailbox fiber; a mailbox fiber's mailbox to drain waits at
@@ -117,7 +119,7 @@ fun rtSchedEnqueue(sched: RawPtr, fib: RawPtr) {
   fib.store(RawPtr.null, toByteOffset: 16)
   let tail: RawPtr = sched.load(fromByteOffset: 8)
   if tail.isNull {
-    sched.atomicStore(fib.toInt(), toByteOffset: 0)   // read without the lock by idle carriers (rtSchedIdle)
+    sched.atomicStore(fib, toByteOffset: 0)   // read without the lock by idle carriers (rtSchedIdle)
     sched.store(fib, toByteOffset: 8)
   } else {
     tail.store(fib, toByteOffset: 16)
@@ -170,12 +172,12 @@ fun rtSchedEntryIsMailbox(e: RawPtr) -> Bool {
 fun rtRunqInit(rec: RawPtr) {
   rec.store(0, toByteOffset: 128)
   rec.store(0, toByteOffset: 136)
-  rec.atomicStore(RawPtr.alloc(bytes: rtRunqSize * 8, align: 64).toInt(), toByteOffset: 144)
+  rec.atomicStore(RawPtr.alloc(bytes: rtRunqSize * 8, align: 64), toByteOffset: 144)
 }
 
 fun rtRunqRing(rec: RawPtr) -> RawPtr {
-  let ring: Int = rec.atomicLoad(fromByteOffset: 144)
-  return RawPtr.null.advanced(by: ring)
+  let ring: RawPtr = rec.atomicLoad(fromByteOffset: 144)
+  return ring
 }
 
 // Append `fib` at the tail of the owner's queue; false when it is full.
@@ -186,7 +188,7 @@ fun rtRunqPush(rec: RawPtr, fib: RawPtr) -> Bool {
   if t - h >= rtRunqSize {
     return false
   }
-  ring.atomicStore(fib.toInt(), toByteOffset: (t % rtRunqSize) * 8)
+  ring.atomicStore(fib, toByteOffset: (t % rtRunqSize) * 8)
   rec.atomicStore(t + 1, toByteOffset: 136)
   return true
 }
@@ -200,10 +202,10 @@ fun rtRunqPop(rec: RawPtr) -> RawPtr {
     if t == h {
       return RawPtr.null
     }
-    let fib: Int = ring.atomicLoad(fromByteOffset: (h % rtRunqSize) * 8)
+    let fib: RawPtr = ring.atomicLoad(fromByteOffset: (h % rtRunqSize) * 8)
     let got: Int = rec.atomicCas(h, h + 1, atByteOffset: 128)
     if got == h {
-      return RawPtr.null.advanced(by: fib)
+      return fib
     }
   }
   return RawPtr.null
@@ -233,11 +235,11 @@ fun rtRunqSteal(mine: RawPtr, victim: RawPtr) -> RawPtr {
       }
       let got: Int = victim.atomicCas(h, h + n, atByteOffset: 128)
       if got == h {
-        let fib: Int = ring.atomicLoad(fromByteOffset: ((mt + n - 1) % rtRunqSize) * 8)
+        let fib: RawPtr = ring.atomicLoad(fromByteOffset: ((mt + n - 1) % rtRunqSize) * 8)
         if n > 1 {
           mine.atomicStore(mt + n - 1, toByteOffset: 136)
         }
-        return RawPtr.null.advanced(by: fib)
+        return fib
       }
     }
   }
@@ -275,7 +277,7 @@ fun rtSchedGlobalPutEntry(sched: RawPtr, e: RawPtr, locked: Bool) {
   mb.store(RawPtr.null, toByteOffset: 32)                       // sched_next = null
   let tail: RawPtr = sched.load(fromByteOffset: 88)
   if tail.isNull {
-    sched.atomicStore(mb.toInt(), toByteOffset: 80)             // read without the lock by idle carriers
+    sched.atomicStore(mb, toByteOffset: 80)             // read without the lock by idle carriers
   } else {
     tail.store(mb, toByteOffset: 32)
     rtRememberStore(tail)                                       // a maybe-young mailbox linked into a maybe-mature one
@@ -305,7 +307,7 @@ fun rtSchedGlobalTake(sched: RawPtr) -> RawPtr {
     let mb: RawPtr = sched.load(fromByteOffset: 80)
     if mb.isNull == false {
       let nx: RawPtr = mb.load(fromByteOffset: 32)
-      sched.atomicStore(nx.toInt(), toByteOffset: 80)
+      sched.atomicStore(nx, toByteOffset: 80)
       if nx.isNull {
         sched.store(RawPtr.null, toByteOffset: 88)
       }
@@ -339,11 +341,11 @@ fun rtSchedReadyOn(sched: RawPtr, fib: RawPtr, locked: Bool) -> Bool {
   }
   var put = fib
   if rtSlotOn != 0 {
-    let old: Int = rec.atomicExchange(fib.toInt(), atByteOffset: 104)
-    if old == 0 {
+    let old: RawPtr = rec.atomicExchange(fib, atByteOffset: 104)
+    if old.isNull {
       return true
     }
-    put = RawPtr.null.advanced(by: old)
+    put = old
   }
   if rtRunqPush(rec, put) == false {
     rtSchedGlobalPutEntry(sched, put, locked)
@@ -368,11 +370,10 @@ fun rtSchedFind(sched: RawPtr, rec: RawPtr, picks: Int) -> RawPtr {
     fib = rtSchedGlobalTake(sched)
   }
   if fib.isNull {
-    let sl: Int = rec.atomicLoad(fromByteOffset: 104)
-    if sl != 0 {
-      let got: Int = rec.atomicCas(sl, 0, atByteOffset: 104)
-      if got == sl {
-        let slf = RawPtr.null.advanced(by: sl)
+    let slf: RawPtr = rec.atomicLoad(fromByteOffset: 104)
+    if !slf.isNull {
+      let got: RawPtr = rec.atomicCas(slf, RawPtr.null, atByteOffset: 104)
+      if got.eq(slf) {
         let start: Int = rec.load(fromByteOffset: 120)
         if now - start > rtSliceTicks {
           if rtRunqPush(rec, slf) == false {
@@ -429,13 +430,13 @@ fun rtSchedSteal(mine: RawPtr, now: Int) -> RawPtr {
   r = rtCarriers.load(fromByteOffset: 0)
   while !r.isNull {
     if r.toInt() != mine.toInt() {
-      let sl: Int = r.atomicLoad(fromByteOffset: 104)
-      if sl != 0 {
+      let sl: RawPtr = r.atomicLoad(fromByteOffset: 104)
+      if !sl.isNull {
         let st: Int = r.atomicLoad(fromByteOffset: 112)
         if now - st > rtSlotStealTicks {
-          let got: Int = r.atomicCas(sl, 0, atByteOffset: 104)
-          if got == sl {
-            return RawPtr.null.advanced(by: sl)
+          let got: RawPtr = r.atomicCas(sl, RawPtr.null, atByteOffset: 104)
+          if got.eq(sl) {
+            return sl
           }
         }
       }
@@ -743,7 +744,7 @@ fun rtSchedTimerMain(sched: RawPtr) -> RawPtr {
           } else {
             // A select's `after`: claimed under the timer lock, which its fiber's rtSelectDone takes before
             // freeing the record, so the record outlives the claim.
-            let w = RawPtr.null.advanced(by: f.toInt() - 1)
+            let w = f.advanced(by: -1)
             let sel: RawPtr = w.load(fromByteOffset: 48)
             let was: Int = sel.atomicCas(0, 1, atByteOffset: 8)
             rtSchedMutexUnlockAt(sched.advanced(by: 48))
@@ -1178,15 +1179,15 @@ fun rtSchedInMailboxFiber() -> Bool {
 // Take the mailbox in this carrier's slot, or null when the slot is empty or holds a fiber.
 fun rtSchedSlotMailbox() -> RawPtr {
   let rec = Runtime.carrierLocal()
-  let sl: Int = rec.atomicLoad(fromByteOffset: 104)
-  if sl % 2 == 0 {
+  let sl: RawPtr = rec.atomicLoad(fromByteOffset: 104)
+  if sl.toInt() % 2 == 0 {
     return RawPtr.null
   }
-  let got: Int = rec.atomicCas(sl, 0, atByteOffset: 104)
-  if got != sl {
+  let got: RawPtr = rec.atomicCas(sl, RawPtr.null, atByteOffset: 104)
+  if !got.eq(sl) {
     return RawPtr.null
   }
-  return RawPtr.null.advanced(by: sl - 1)
+  return sl.advanced(by: -1)
 }
 
 // Go back to the carrier with nothing to drain (state 6, no lock held). The carrier keeps the fiber as its idle
@@ -1531,45 +1532,40 @@ fun rtSchedStart(sched: RawPtr, fib: RawPtr) {
 
 // Append `msg` to `mailbox`'s queue.
 fun rtMailboxPush(mailbox: RawPtr, msg: RawPtr) {
-  msg.atomicStore(0, toByteOffset: 8)                                  // msg->next = null
-  let prev: Int = mailbox.atomicExchange(msg.toInt(), atByteOffset: 16) // mb_tail = msg
-  rtRememberStore(mailbox)
-  if prev == 0 {
-    mailbox.atomicStore(msg.toInt(), toByteOffset: 8)                  // mb_head = msg
+  msg.atomicStore(RawPtr.null, toByteOffset: 8)                        // msg->next = null
+  let prev: RawPtr = mailbox.atomicExchange(msg, atByteOffset: 16)      // mb_tail = msg
+  if prev.isNull {
+    mailbox.atomicStore(msg, toByteOffset: 8)                          // mb_head = msg
   } else {
-    let p = RawPtr.null.advanced(by: prev)
-    p.atomicStore(msg.toInt(), toByteOffset: 8)                        // prev->next = msg
-    rtRememberStore(p)
+    prev.atomicStore(msg, toByteOffset: 8)                             // prev->next = msg
   }
 }
 
 // Take the head of `mailbox`'s queue, or null when it is empty. Only the mailbox's drainer calls it.
 fun rtMailboxTake(mailbox: RawPtr) -> RawPtr {
-  var h: Int = mailbox.atomicLoad(fromByteOffset: 8)
-  if h == 0 {
-    let t: Int = mailbox.atomicLoad(fromByteOffset: 16)
-    if t == 0 {
+  var h: RawPtr = mailbox.atomicLoad(fromByteOffset: 8)
+  if h.isNull {
+    let t: RawPtr = mailbox.atomicLoad(fromByteOffset: 16)
+    if t.isNull {
       return RawPtr.null
     }
-    while h == 0 {                                                     // a push between its swap and its link
+    while h.isNull {                                                   // a push between its swap and its link
       h = mailbox.atomicLoad(fromByteOffset: 8)
     }
   }
-  let m = RawPtr.null.advanced(by: h)
-  var next: Int = m.atomicLoad(fromByteOffset: 8)
-  if next == 0 {
-    mailbox.atomicStore(0, toByteOffset: 8)
-    let was: Int = mailbox.atomicCas(h, 0, atByteOffset: 16)
-    if was == h {
-      return m                                                         // the last message
+  var next: RawPtr = h.atomicLoad(fromByteOffset: 8)
+  if next.isNull {
+    mailbox.atomicStore(RawPtr.null, toByteOffset: 8)
+    let was: RawPtr = mailbox.atomicCas(h, RawPtr.null, atByteOffset: 16)
+    if was.eq(h) {
+      return h                                                         // the last message
     }
-    while next == 0 {                                                  // a push linking behind it
-      next = m.atomicLoad(fromByteOffset: 8)
+    while next.isNull {                                                // a push linking behind it
+      next = h.atomicLoad(fromByteOffset: 8)
     }
   }
   mailbox.atomicStore(next, toByteOffset: 8)                           // mb_head = next
-  rtRememberStore(mailbox)
-  return m
+  return h
 }
 
 // Fire-and-forget send: append `msg` to `mailbox` (the ABI offsets above) and return, with no lock. The send
