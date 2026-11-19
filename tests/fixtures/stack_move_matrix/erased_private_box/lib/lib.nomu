@@ -1,0 +1,41 @@
+package interface Sized {
+  fun size() -> Int
+  fun label() -> String
+}
+
+// Internal: boxed as `any Sized` with `T` by an exported generic's compiled-once body. A compiled-once consumer builds
+// its witness table and calls these methods compiled once, by the signatures their recipes carry.
+struct Boxed<T> {
+  let v: T
+  let n: Int
+  let tag: String
+}
+
+extension Boxed: Sized {
+  fun size() -> Int {
+    return self.n
+  }
+  fun label() -> String {
+    return self.tag
+  }
+}
+
+fun churn(n: Int) -> Int {
+  var k = 0
+  var i = 0
+  while i < n {
+    let s = "churn-string-long-enough-for-the-heap-".concat("x")
+    k = k + s.count
+    i = i + 1
+  }
+  return k
+}
+
+package fun sized<T>(x: T, n: Int) -> Int {
+  let s: any Sized = Boxed(v: x, n: n, tag: "boxed-tag-".concat("value"))
+  churn(120)
+  if s.label().eq("boxed-tag-value") == false {
+    return -1
+  }
+  return s.size()
+}

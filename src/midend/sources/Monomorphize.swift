@@ -1,4 +1,5 @@
 import noir
+import ast
 import support
 // Monomorphization — the specialization pass (design: generics.md §6, noir.md).
 // An IR→IR pass, run after Sema/exhaustiveness and before codegen.
@@ -16,9 +17,10 @@ import support
 //
 // The one exception: a **public** generic function is additionally emitted **erased**
 // (type parameters retained, under its bare symbol) so a consumer module can call it
-// through runtime witnesses. Its residual `.typeParam` survives into codegen, which
+// through runtime witnesses. What in it mentions a type parameter survives into codegen, which
 // lowers it to a VWT-driven opaque buffer (cross-module generics; generics.md §6,
-// backend.md §4). Internal generics stay monomorphized-only.
+// backend.md §4); its concrete types are specialized as in any other body. Internal
+// generics stay monomorphized-only.
 //
 // `any I` is left untouched (inherently dynamic — the explicit erasure opt-in), so the
 // witness tables / conformances / interfaces ride through unchanged.
@@ -27,8 +29,11 @@ import support
 // land it is rescoped to within-module (cross-module specialization opt-in), preserving
 // the stable-ABI default at module edges (generics.md §6).
 
-public func monomorphize(_ module: NOIRModule, recipes: DictionaryRecipes? = nil, into diags: DiagnosticSink) -> NOIRModule {
-    Monomorphizer(module: module, recipes: recipes, diags: diags).run()
+// `privateTypes` names this module's types below `package` visibility: their erased methods are emitted only when an
+// erased body uses them.
+public func monomorphize(_ module: NOIRModule, recipes: DictionaryRecipes? = nil, privateTypes: Set<String> = [],
+                         into diags: DiagnosticSink) -> NOIRModule {
+    Monomorphizer(module: module, recipes: recipes, privateTypes: privateTypes, diags: diags).run()
 }
 
 private final class Monomorphizer {
@@ -44,12 +49,16 @@ private final class Monomorphizer {
 
     var out: [NOIRDecl] = []
     var monoTypeArgs: [String: [Type]] = [:]   // mono'd type name → its type args (task 100.4.3.5.3.3)
+    private var instances: [String: (base: String, args: [Type])] = [:]   // a named instance, from when it is enqueued
     // Specialized names already emitted (guards recursion) + requested (dedupes the worklist).
     var doneFuncs = Set<String>(), doneTypes = Set<String>()
     var reqFuncs  = Set<String>(), reqTypes  = Set<String>()
     var funcWork: [(base: String, args: [Type])] = []
     var typeWork: [(base: String, args: [Type])] = []
     var recursionErrored = false
+    // Rewriting a body that stays compiled once: a type that mentions a type parameter stays as written (codegen
+    // holds it by buffer), and only the concrete ones are specialized, as in a non-generic body.
+    var erasing = false
 
     // Cap on type-argument nesting depth (counted as `<` in a specialized name) — beyond
     // this we assume polymorphic recursion (`f<Box<T>>` → `f<Box<Box<T>>>` → …) and error.
@@ -61,8 +70,10 @@ private final class Monomorphizer {
     var dictionaries: [String: DictionaryInstance] = [:]
     var requestedDictionaries = Set<String>()
 
-    init(module: NOIRModule, recipes: DictionaryRecipes?, diags: DiagnosticSink) {
-        self.module = module; self.diags = diags; self.imported = recipes
+    let privateTypes: Set<String>
+
+    init(module: NOIRModule, recipes: DictionaryRecipes?, privateTypes: Set<String>, diags: DiagnosticSink) {
+        self.module = module; self.diags = diags; self.imported = recipes; self.privateTypes = privateTypes
         for r in recipes?.recipes ?? [] { importedRecipes[r.symbol] = r }
     }
 
@@ -101,18 +112,49 @@ private final class Monomorphizer {
         // Generic types' methods are emitted erased below, so their bodies call through this ABI too.
         // In name order, as everything this function emits: dictionary order varies from run to run, and the
         // object must be the same bytes from every compile.
-        for (_, s) in genericStructs.sorted(by: { $0.key < $1.key }) { pending += s.methods.map(\.body) }
-        for (_, e) in genericEnums.sorted(by: { $0.key < $1.key }) { pending += e.methods.map(\.body) }
-        for (_, c) in genericClasses.sorted(by: { $0.key < $1.key }) { pending += c.methods.map(\.body) }
-        // A private generic that an erased body calls has no specialization to call: it is emitted erased too.
+        // An imported type's erased methods are its producer's: a type shipped in a `.bir` keeps its methods only to
+        // specialize them, and its template is emitted for its layout alone.
+        // A type's erased methods are emitted when a consumer can call them, the type being exported, or when an
+        // erased body here uses the type with a type parameter in it; the rest would only be dead-stripped.
+        var keptTypes = Set<String>()
+        func erasedMethods(_ name: String, _ methods: [NOIRFunc]) -> [NOIRFunc] {
+            ExternalName.isEncoded(name) || !keptTypes.contains(name) ? [] : methods
+        }
+        func methodsOf(_ name: String) -> [NOIRFunc] {
+            genericStructs[name]?.methods ?? genericEnums[name]?.methods ?? genericClasses[name]?.methods ?? []
+        }
+        func keep(_ name: String) {
+            guard keptTypes.insert(name).inserted else { return }
+            pending += erasedMethods(name, methodsOf(name)).map { eraseFunc($0).body }
+        }
+        // The erased bodies are rewritten like a concrete one, except that what mentions a type parameter is kept: a
+        // concrete `Option<Node>` there is the specialized enum a concrete caller or field hands it, held by value.
+        erasing = true
+        defer { erasing = false }
+        pending = []
+        for i in out.indices {
+            guard case .funcDecl(let f) = out[i], erased.contains(f.name), !f.generics.isEmpty else { continue }
+            let e = eraseFunc(f)
+            out[i] = .funcDecl(e)
+            pending.append(e.body)
+        }
+        let typeNames = (Array(genericStructs.keys) + Array(genericEnums.keys) + Array(genericClasses.keys)).sorted()
+        for name in typeNames where !privateTypes.contains(name) { keep(name) }
+        // A private generic that an erased body calls has no specialization to call: it is emitted erased too. A
+        // generic type an erased body uses with a type parameter keeps its erased methods, which the body's method
+        // calls and witness tables reach.
         while let body = pending.popLast() {
             var bound = Set<String>(), used: [String] = []
             collectUses(body, &bound, &used)
             for name in used {
                 guard let f = genericFuncs[name], erased.insert(name).inserted else { continue }
-                out.append(.funcDecl(f))
-                pending.append(f.body)
+                let e = eraseFunc(f)
+                out.append(.funcDecl(e))
+                pending.append(e.body)
             }
+            var mentioned = Set<String>()
+            erasedTypeUses(body, into: &mentioned)
+            for name in mentioned.sorted() where methodsOf(name).isEmpty == false { keep(name) }
         }
         // An erased body may hold a composed generic value (`Box<T>`) by buffer and access its fields
         // (task 100.4.3.3.4). Emit each generic type **template** (type parameters retained) so codegen
@@ -126,19 +168,25 @@ private final class Monomorphizer {
         // dead erased methods — awaits type visibility on `NOIRStruct`/`NOIREnum`; members are not
         // individually marked public here, so the type is the unit, 100.4.3.5.3.)
         for (name, s) in genericStructs.sorted(by: { $0.key < $1.key }) {
-            out.append(.structDecl(NOIRStruct(name: name, generics: s.generics, fields: s.fields,
-                                              methods: s.methods, span: s.span)))
+            out.append(.structDecl(NOIRStruct(name: name, generics: s.generics, fields: s.fields.map { rewriteField($0, [:]) },
+                                              methods: erasedMethods(name, s.methods).map(eraseFunc), span: s.span)))
         }
         for (name, e) in genericEnums.sorted(by: { $0.key < $1.key }) {
-            out.append(.enumDecl(NOIREnum(name: name, generics: e.generics, cases: e.cases,
-                                          methods: e.methods, span: e.span)))
+            let cases = e.cases.map { c in NOIREnumCase(name: c.name, fields: c.fields.map { rewriteField($0, [:]) }, span: c.span) }
+            out.append(.enumDecl(NOIREnum(name: name, generics: e.generics, cases: cases,
+                                          methods: erasedMethods(name, e.methods).map(eraseFunc), span: e.span)))
         }
         // A generic **class** template, for the erased method path on a reference receiver (task 100.4.3.9):
         // like structs/enums, retain the template so codegen has the field layout; its methods lower erased
         // with `self` a managed object pointer and fields indexed by VWT-derived offset past the header.
         for (name, c) in genericClasses.sorted(by: { $0.key < $1.key }) {
-            out.append(.classDecl(NOIRClass(name: name, generics: c.generics, fields: c.fields,
-                                            methods: c.methods, span: c.span)))
+            out.append(.classDecl(NOIRClass(name: name, generics: c.generics, fields: c.fields.map { rewriteField($0, [:]) },
+                                            methods: erasedMethods(name, c.methods).map(eraseFunc), span: c.span)))
+        }
+        // The specializations the erased bodies and templates reach.
+        while !funcWork.isEmpty || !typeWork.isEmpty {
+            while let w = funcWork.popLast() { specializeFunc(w.base, w.args) }
+            while let w = typeWork.popLast() { specializeType(w.base, w.args) }
         }
         var result = NOIRModule(decls: out, interfaces: module.interfaces, conformances: module.conformances,
                         composites: module.composites, opaqueUnderlyings: module.opaqueUnderlyings,
@@ -204,7 +252,9 @@ private final class Monomorphizer {
             switch need {
             case .object(let t): return .object(resolveType(t, subst))
             case .arrayBuffer(let e): return .arrayBuffer(element: resolveType(e, subst))
-            case .box(let t): return .box(resolveType(t, subst))
+            case .box(let t, let ifaces): return .box(resolveType(t, subst), interfaces: ifaces)
+            case .callValue(let t): return .callAdapter(resolveType(t, subst))
+            case .closureEntry(let t): return .entryAdapter(resolveType(t, subst))
             case .callee(let callee, let args):
                 let resolved = args.map { resolveType($0, subst) }
                 requestDictionary(callee, resolved)
@@ -212,6 +262,26 @@ private final class Monomorphizer {
             }
         }
         dictionaries[key] = DictionaryInstance(typeArgs: typeArgs, bounds: recipe.bounds, needs: needs)
+        for (arg, bounds) in zip(typeArgs, recipe.bounds) { specializeRequirementTypes(arg, bounds) }
+    }
+
+    // A witness table for `conformer: I` calls the conformer's methods with `Self` set to it. A requirement type
+    // with `Self` inside an applied generic (`Option<Self>`) names an instance (`Option<Num>`) the table's thunks
+    // need even when nothing else here mentions it.
+    // Likewise a static requirement on a generic conformer calls a specialization of the type's static method, or,
+    // for an imported type, the producer's compiled-once one with its dictionary.
+    private func specializeRequirementTypes(_ conformer: Type, _ bounds: [String]) {
+        guard case .named(let name, _) = conformer else { return }
+        for iface in module.interfaces where bounds.contains(iface.name) {
+            let types = iface.methods.flatMap { $0.selfParams + [$0.selfRet] } + iface.properties.map(\.selfType)
+            for t in types where t.mentionsSelf && t != .selfType { _ = resolveType(t.replacingSelf(with: conformer), [:]) }
+            guard let inst = instances[name] else { continue }
+            for m in iface.methods where m.isStatic {
+                let fn = "\(inst.base).\(m.name)"
+                if genericFuncs[fn] != nil { enqueueFunc(fn, inst.args) }
+                else if importedRecipes[fn] != nil { requestDictionary(fn, inst.args) }
+            }
+        }
     }
 
     // MARK: - Specialization
@@ -228,6 +298,10 @@ private final class Monomorphizer {
         let name = specName(base, args)
         guard doneTypes.insert(name).inserted else { return }
         if !args.isEmpty { monoTypeArgs[name] = args }   // for the erased-method call lowering (100.4.3.5.3.3)
+        // An imported generic type's methods are compiled once in its producer. A method may be reached here with
+        // no call naming it, through a bound on a specialized generic or a witness table built for this instance,
+        // so each gets its dictionary.
+        for symbol in importedRecipes.keys.sorted() where symbol.hasPrefix("m:\(base):") { requestDictionary(symbol, args) }
         if let s = genericStructs[base] {
             guard !overDepth(name, at: s.span) else { return }
             let subst = Dictionary(uniqueKeysWithValues: zip(s.generics.map(\.name), args))
@@ -283,6 +357,61 @@ private final class Monomorphizer {
                body: f.body.map { rewriteStmt($0, s) }, isMutating: f.isMutating, span: f.span)
     }
 
+    // The generic types an erased body names with a type parameter in their arguments (`Box<T>`, `Pair<Int, T>`),
+    // anywhere: an expression's type, a binding, a closure parameter, a static call's type.
+    private func erasedTypeUses(_ stmts: [NOIRStmt], into names: inout Set<String>) {
+        func visit(_ t: Type) {
+            switch t {
+            case .generic(let base, let args):
+                if args.contains(where: \.mentionsTypeParameter) { names.insert(base) }
+                args.forEach(visit)
+            case .array(let e), .ptr(let e): visit(e)
+            case .function(let ps, let r): ps.forEach(visit); visit(r)
+            default: break
+            }
+        }
+        func expr(_ e: NOIRExpr) {
+            visit(e.type)
+            switch e.kind {
+            case .intLit, .doubleLit, .boolLit, .stringLit, .funcRef, .globalRef, .varRef: break
+            case .fieldAccess(let base, _): expr(base)
+            case .construct(_, let args), .enumInit(_, _, let args): args.forEach { expr($0.value) }
+            case .methodCall(let r, _, let args): expr(r); args.forEach(expr)
+            case .call(let c, let args, let typeArgs): expr(c); args.forEach { expr($0.value) }; typeArgs.forEach(visit)
+            case .binary(_, let l, let r): expr(l); expr(r)
+            case .closure(let ps, let body): ps.forEach { visit($0.type) }; body.forEach(stmt)
+            case .box(let v, _): expr(v)
+            case .arrayLit(let els): els.forEach(expr)
+            case .index(let b, let i): expr(b); expr(i)
+            case .staticCall(let t, _, let args): visit(t); args.forEach(expr)
+            case .taskStart(_, let make, let call, let fulfill): expr(make); expr(call); expr(fulfill)
+            }
+        }
+        func stmt(_ s: NOIRStmt) {
+            switch s.kind {
+            case .letBinding(_, _, let v): expr(v)
+            case .fiberStart(let c): expr(c)
+            case .assign(let t, let v), .compoundAssign(let t, let v): expr(t); expr(v)
+            case .ret(let e): if let e { expr(e) }
+            case .ifStmt(let c, let t, let e): expr(c); t.forEach(stmt); e?.forEach(stmt)
+            case .whileStmt(let c, let b): expr(c); b.forEach(stmt)
+            case .breakStmt, .continueStmt: break
+            case .switchStmt(let sw):
+                expr(sw.subject)
+                for arm in sw.arms { arm.bindings.forEach { visit($0.type) }; arm.body.forEach(stmt) }
+            case .exprStmt(let e): expr(e)
+            }
+        }
+        stmts.forEach(stmt)
+    }
+
+    // A body compiled once, under `erasing`: its own type parameters kept, its concrete types specialized.
+    private func eraseFunc(_ f: NOIRFunc) -> NOIRFunc {
+        let r = rewriteFunc(f, [:], name: f.name)
+        return NOIRFunc(name: f.name, generics: f.generics, params: r.params, returnType: r.returnType, body: r.body,
+                        isMutating: f.isMutating, span: f.span)
+    }
+
     private func rewriteField(_ f: NOIRField, _ s: [String: Type]) -> NOIRField {
         NOIRField(name: f.name, type: resolveType(f.type, s), isMutable: f.isMutable, span: f.span,
                   fromTypeParameter: f.fromTypeParameter || f.type.mentionsTypeParameter)
@@ -336,12 +465,14 @@ private final class Monomorphizer {
             kind = .enumInit(typeName: namedName(newType) ?? typeName, caseName: caseName, args: rewriteArgs(args, s))
         case .methodCall(let recv, let method, let args):
             if case .generic(let base, let typeArgs) = recv.type, importedRecipes["m:\(base):\(method)"] != nil {
-                requestDictionary("m:\(base):\(method)", typeArgs.map { resolveType($0, s) })
+                let rArgs = typeArgs.map { resolveType($0, s) }
+                if !rArgs.contains(where: \.mentionsTypeParameter) { requestDictionary("m:\(base):\(method)", rArgs) }
             }
             kind = .methodCall(receiver: rewriteExpr(recv, s), method: method, args: args.map { rewriteExpr($0, s) })
         case .call(let callee, let args, let typeArgs):
             let rArgs = typeArgs.map { resolveType($0, s) }
-            if case .varRef(let fname) = callee.kind, genericFuncs[fname] != nil, !rArgs.isEmpty {
+            let concrete = !rArgs.contains(where: \.mentionsTypeParameter)
+            if case .varRef(let fname) = callee.kind, genericFuncs[fname] != nil, !rArgs.isEmpty, concrete {
                 enqueueFunc(fname, rArgs)
                 let sn = specName(fname, rArgs)
                 // Codegen resolves a global call by name (`funcs[sn]`), never the callee's
@@ -350,7 +481,7 @@ private final class Monomorphizer {
                 let newCallee = NOIRExpr(type: .void, span: callee.span, kind: .varRef(sn))
                 kind = .call(callee: newCallee, args: rewriteArgs(args, s), typeArgs: [])
             } else {
-                if case .varRef(let fname) = callee.kind, importedRecipes[fname] != nil { requestDictionary(fname, rArgs) }
+                if case .varRef(let fname) = callee.kind, importedRecipes[fname] != nil, concrete { requestDictionary(fname, rArgs) }
                 kind = .call(callee: rewriteExpr(callee, s), args: rewriteArgs(args, s), typeArgs: rArgs)
             }
         case .binary(let op, let l, let r):
@@ -368,9 +499,21 @@ private final class Monomorphizer {
             // Resolve the dispatch type (a bound type parameter → the concrete conformer) and lower
             // to a direct call of that type's static method free function `Conformer.method`.
             let rty = resolveType(onType, s)
+            // Compiled once, a static call on a type parameter dispatches through its witness.
+            if rty.mentionsTypeParameter {
+                kind = .staticCall(onType: rty, method: method, args: args.map { rewriteExpr($0, s) })
+                return NOIRExpr(type: newType, span: e.span, kind: kind)
+            }
             let tn = namedName(rty) ?? "<unresolved>"
+            let rArgs = args.map { NOIRArg(label: nil, value: rewriteExpr($0, s)) }
+            // A generic type's static method is a generic function over the type's parameters (`Box.make`).
+            if let inst = instances[tn] {
+                let callee = NOIRExpr(type: .void, span: e.span, kind: .varRef("\(inst.base).\(method)"))
+                return rewriteExpr(NOIRExpr(type: resolveType(e.type, s), span: e.span,
+                                            kind: .call(callee: callee, args: rArgs, typeArgs: inst.args)), [:])
+            }
             let callee = NOIRExpr(type: .void, span: e.span, kind: .varRef("\(tn).\(method)"))
-            kind = .call(callee: callee, args: args.map { NOIRArg(label: nil, value: rewriteExpr($0, s)) }, typeArgs: [])
+            kind = .call(callee: callee, args: rArgs, typeArgs: [])
         case .taskStart(let binder, let make, let call, let fulfill):
             kind = .taskStart(binder: binder, make: rewriteExpr(make, s), call: rewriteExpr(call, s),
                               fulfill: rewriteExpr(fulfill, s))
@@ -393,6 +536,7 @@ private final class Monomorphizer {
             return t
         case .generic(let base, let args):
             let rargs = args.map { resolveType($0, s) }
+            if erasing, rargs.contains(where: \.mentionsTypeParameter) { return .generic(base: base, args: rargs) }
             enqueueType(base, rargs)
             return .named(specName(base, rargs), baseKind[base] ?? .struct_)
         case .function(let ps, let r):
@@ -413,41 +557,13 @@ private final class Monomorphizer {
     private func enqueueType(_ base: String, _ args: [Type]) {
         guard genericStructs[base] != nil || genericEnums[base] != nil || genericClasses[base] != nil else { return }
         let n = specName(base, args)
+        instances[n] = (base, args)
         guard !doneTypes.contains(n), reqTypes.insert(n).inserted else { return }
         typeWork.append((base, args))
     }
 
-    // The specialized decl name: `base<argKey,argKey>` — carried as a nominal name; Mangle
-    // 9-encodes the `<`, `>`, `,` (backend.md) into a valid C identifier.
     private func specName(_ base: String, _ args: [Type]) -> String {
-        args.isEmpty ? base : base + "<" + args.map(typeKey).joined(separator: ",") + ">"
-    }
-
-    // A mangling-safe key for a type argument. Named types may already carry `<…>` from a
-    // prior specialization (nesting composes); function/existential/opaque types get an
-    // identifier-ish rendering rather than their spaced `description`.
-    private func typeKey(_ t: Type) -> String {
-        switch t {
-        case .int: return "Int"
-        case .uint8: return "UInt8"
-        case .uint64: return "UInt64"
-        case .double: return "Double"
-        case .bool: return "Bool"
-        case .stringBase: return "String"
-        case .void: return "Void"
-        case .named(let n, _): return n
-        case .generic(let b, let a): return b + "<" + a.map(typeKey).joined(separator: ",") + ">"
-        case .array(let e): return "Array<" + typeKey(e) + ">"
-        case .rawPtr: return "RawPtr"
-        case .ptr(let e): return "Ptr<" + typeKey(e) + ">"
-        case .function(let p, let r): return "fn<" + (p.map(typeKey) + [typeKey(r)]).joined(separator: ",") + ">"
-        case .existential(let i): return "any_" + i
-        case .composition(let is_): return "any_" + is_.joined(separator: "_")
-        case .opaque(let ifs, _): return "some_" + ifs.joined(separator: "_")
-        case .typeParam(let p): return p
-        case .selfType: return "Self"
-        case .error: return "error"
-        }
+        Type.specializedName(base, args)
     }
 
     private func namedName(_ t: Type) -> String? {

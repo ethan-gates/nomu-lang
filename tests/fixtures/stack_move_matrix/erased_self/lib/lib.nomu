@@ -1,0 +1,210 @@
+// Requirements that mention `Self`, called through bounds across a module boundary: `Self` as a parameter and a
+// result, inside another type, as a property, and in static requirements, with conformers declared here.
+package interface Twin {
+    fun clone() -> Self
+    fun combined(with: Self) -> Self
+    fun val() -> Int
+}
+
+package interface Linked {
+    var peer: Self { get }
+    fun val() -> Int
+}
+
+package interface Many {
+    fun all() -> Array<Self>
+    fun maybe(keep: Bool) -> Option<Self>
+    fun pick(from: Array<Self>) -> Self
+    fun apply(f: (Self) -> Int) -> Int
+    fun val() -> Int
+}
+
+package interface Zero {
+    static fun zero() -> Self
+    static fun make(n: Int) -> Self
+    static fun scale() -> Int
+    fun val() -> Int
+}
+
+package interface Copyable {
+    fun copy() -> Self
+    fun val() -> Int
+}
+
+package struct Num: Twin, Many, Zero, Linked {
+    let n: Int
+    let s: String
+    fun clone() -> Num {
+        return Num(n: n + 1, s: s)
+    }
+    fun combined(with: Num) -> Num {
+        return Num(n: n + with.n, s: s.concat(with.s))
+    }
+    fun all() -> Array<Num> {
+        return [Num(n: n, s: s), Num(n: n + 1, s: s)]
+    }
+    fun maybe(keep: Bool) -> Option<Num> {
+        if keep { return Option.some(Num(n: n * 3, s: s)) }
+        return Option.none
+    }
+    fun pick(from: Array<Num>) -> Num {
+        return from[from.count - 1]
+    }
+    fun apply(f: (Num) -> Int) -> Int {
+        return f(self)
+    }
+    var peer: Num {
+        return Num(n: n * 2, s: s)
+    }
+    static fun zero() -> Num {
+        return Num(n: 40, s: "zz")
+    }
+    static fun make(n: Int) -> Num {
+        return Num(n: n, s: "m")
+    }
+    static fun scale() -> Int {
+        return 3
+    }
+    fun val() -> Int {
+        return n + s.count
+    }
+}
+
+package enum Dir: Twin {
+    case up(by: Int)
+    case down
+    fun clone() -> Dir {
+        return Dir.down
+    }
+    fun combined(with: Dir) -> Dir {
+        return Dir.up(by: self.val() + with.val())
+    }
+    fun val() -> Int {
+        switch self {
+        case .up(let by): return by
+        case .down: return 1
+        }
+    }
+}
+
+package class Box: Many, Zero, Linked {
+    let n: Int
+    fun all() -> Array<Box> {
+        return [self, Box(n: n + 5)]
+    }
+    fun maybe(keep: Bool) -> Option<Box> {
+        if keep { return Option.some(Box(n: n * 3)) }
+        return Option.none
+    }
+    fun pick(from: Array<Box>) -> Box {
+        return from[from.count - 1]
+    }
+    fun apply(f: (Box) -> Int) -> Int {
+        return f(self)
+    }
+    var peer: Box {
+        return Box(n: n + 1)
+    }
+    static fun zero() -> Box {
+        return Box(n: 7)
+    }
+    static fun make(n: Int) -> Box {
+        return Box(n: n * 2)
+    }
+    static fun scale() -> Int {
+        return 5
+    }
+    fun val() -> Int {
+        return n
+    }
+}
+
+package struct Pair<T: Twin>: Twin {
+    let a: T
+    let b: T
+    fun clone() -> Pair<T> {
+        return Pair(a: b, b: a)
+    }
+    fun combined(with: Pair<T>) -> Pair<T> {
+        return Pair(a: a.combined(with: with.a), b: b.combined(with: with.b))
+    }
+    fun val() -> Int {
+        return a.val() * 100 + b.val()
+    }
+}
+
+package class Bag<T: Twin>: Twin {
+    let item: T
+    fun clone() -> Bag<T> {
+        return Bag(item: item.clone())
+    }
+    fun combined(with: Bag<T>) -> Bag<T> {
+        return Bag(item: item.combined(with: with.item))
+    }
+    fun val() -> Int {
+        return item.val()
+    }
+}
+
+package struct Wrap<T>: Zero, Copyable {
+    let n: Int
+    let s: String
+    static fun zero() -> Wrap<T> {
+        return Wrap(n: 4, s: "w")
+    }
+    static fun make(n: Int) -> Wrap<T> {
+        return Wrap(n: n, s: "")
+    }
+    static fun scale() -> Int {
+        return 2
+    }
+    fun copy() -> Wrap<T> {
+        return Wrap(n: n * 10, s: s)
+    }
+    fun val() -> Int {
+        return n + s.count
+    }
+}
+
+package class Ref<T>: Copyable {
+    let a: Int
+    fun copy() -> Ref<T> {
+        return Ref(a: a + 7)
+    }
+    fun val() -> Int {
+        return a
+    }
+}
+
+package fun twice<T: Twin>(x: T) -> T {
+    return x.clone().combined(with: x)
+}
+
+package fun peerOf<T: Linked>(x: T) -> Int {
+    return x.peer.peer.val()
+}
+
+package fun firstOf<T: Twin>(xs: Array<T>) -> T {
+    return xs[0].clone()
+}
+
+package fun score<T: Many>(x: T) -> Int {
+    let xs = x.all()
+    var s = xs.count * 1000 + x.pick(xs).val()
+    switch x.maybe(true) {
+    case .some(let y): s = s + y.val() * 10
+    case .none: s = s + 1
+    }
+    switch x.maybe(false) {
+    case .some(let y): s = s + 100000
+    case .none: s = s + 0
+    }
+    s = s + x.apply({ (v: T) -> Int in return v.val() * 100 })
+    return s
+}
+
+package fun zeroOf<T: Zero>(x: T) -> Int {
+    let z = T.zero()
+    let m = T.make(x.val())
+    return z.val() * 1000 + m.val() * T.scale()
+}

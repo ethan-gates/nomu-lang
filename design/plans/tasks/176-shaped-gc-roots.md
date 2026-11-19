@@ -12,7 +12,7 @@ tests) and forced/evac oracles (`pair_string_gc`, `option_string_gc`, `enum_nons
 [178.2](178-runtime-gc-performance.md) and the Option A/B frame-cost measurement is
 [178.3](178-runtime-gc-performance.md), alongside the pre-existing shaped-scan trace-speed item
 [178.1](178-runtime-gc-performance.md). Two shape-descriptor generality gaps (nested enum-in-enum managed
-payloads — fail-stopped at build today, not silent; and cross-module shape-table ordinals — the erased-shaped
+payloads, since lifted in [253](253-finish-generics.md) 253.5; and cross-module shape-table ordinals — the erased-shaped
 path roots through the VWT, a different channel) are absorbed into
 [179](179-value-level-gc-classification.md), whose unified descriptor path is their natural home. **176.5 is
 done (176.5.1–176.5.8) — it was a correctness bug:** a `String` local (or a struct holding one) read after a safepoint uses a stale

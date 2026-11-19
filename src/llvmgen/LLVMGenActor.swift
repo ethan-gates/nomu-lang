@@ -111,6 +111,9 @@ extension LLVMGen {
         let (fn, fnTy) = emitFunction("nomu_actor_drain", ret: voidTy, params: [p1])
         LLVMSetLinkage(fn, LLVMWeakODRLinkage)
         actorDrainFn = (fn, fnTy)
+        // Only a mailbox fiber calls the drain, at the base of its stack, through the scheduler's slot: no indirect
+        // call in Nomu code reaches it, so the stack check counts it as an entry.
+        runtimeEntries.insert("nomu_actor_drain")
         withStubBody(fn) {
             let mb = LLVMGetParam(fn, 0)!
             let loopBB = LLVMAppendBasicBlockInContext(ctx, fn, "drain.loop")!

@@ -256,8 +256,40 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     }()
     // The modules reached through a `test import` (white-box). The build guarantees each is same-package.
     let testTargets = Set(resolved.filter(\.imp.isTest).map { $0.imp.target.joined(separator: "/") })
-    // Whether this module admits a producer-`k` declaration of visibility `v` across the module boundary.
+    // Specializing, this module compiles the bodies its visible dependencies ship, and those may reach modules it
+    // does not import (`main` imports `mid`, whose bodies call `base`). Each module's templates, read once, and the
+    // modules reached beyond `visible`, in a stable order. A reached module's surface loads origin-keyed, out of
+    // scope for this module's source, and its templates, recipes and results load as a visible one's do.
+    let specializes = MonoMode(rawValue: JobSettings(job.settings).choice("opt.mono"))! != .none
+    var shippedBy: [String: [NOIRDecl]] = [:]
+    var reached: [String] = []
+    if specializes {
+        var seen = Set(visible + [originKey])
+        var work = visible
+        while !work.isEmpty {
+            let k = work.removeFirst()
+            guard let path = deps.bir[k] else { continue }
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8), let decls = parseBIR(text) else {
+                fputs("error: cannot read the templates of '\(k)' at '\(path)'\n", stderr)
+                return false
+            }
+            shippedBy[k] = decls
+            for d in decls {
+                for n in collectReferencedNames(d).sorted() {
+                    guard let o = ExternalName.decode(n)?.origin, deps.interfaces[o] != nil, seen.insert(o).inserted
+                    else { continue }
+                    reached.append(o); work.append(o)
+                }
+            }
+        }
+    }
+    let reachedSet = Set(reached)
+    // The modules whose templates, recipes and results this module reads: the visible ones, then the reached ones.
+    let reach = visible + reached
+    // Whether this module admits a producer-`k` declaration of visibility `v` across the module boundary. A reached
+    // module's exported declarations are admitted whatever the package, since only its own package's bodies name them.
     func admits(_ k: String, _ v: Visibility?) -> Bool {
+        if reachedSet.contains(k) { return (v ?? .public) >= .package }
         switch v ?? .public {
         case .public:   return true
         case .package:  return deps.packageKey[k] == job.packageKey
@@ -273,23 +305,14 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         out.interfaces = iface.interfaces.filter { admits(k, $0.visibility) }
         return out
     }
-    // The templates the visible dependencies ship; nil (reported) when an offered `.bir` cannot be read.
-    func importedTemplates() -> [ImportedTemplate]? {
-        var out: [ImportedTemplate] = []
-        for k in visible {
-            guard let path = deps.bir[k] else { continue }
-            guard let text = try? String(contentsOfFile: path, encoding: .utf8), let decls = parseBIR(text) else {
-                fputs("error: cannot read the templates of '\(k)' at '\(path)'\n", stderr)
-                return nil
-            }
-            out.append(contentsOf: decls.map { ImportedTemplate(origin: k, decl: $0) })
-        }
-        return out
+    // The templates the reached dependencies ship, visible ones first.
+    func importedTemplates() -> [ImportedTemplate] {
+        reach.flatMap { k in (shippedBy[k] ?? []).map { ImportedTemplate(origin: k, decl: $0) } }
     }
-    // The dictionary recipes the visible dependencies publish, named as this module names them.
+    // The dictionary recipes the reached dependencies publish, named as this module names them.
     func dependencyRecipes() -> DictionaryRecipes? {
         var recipes: [String: DictionaryRecipe] = [:], layouts: [String: DictionaryLayout] = [:]
-        for k in visible {
+        for k in reach {
             guard let own = deps.interfaces[k]?.dictionaries?.qualified(origin: k) else { continue }
             for r in own.recipes { recipes[r.symbol] = r }
             for l in own.layouts { layouts[l.name] = l }
@@ -298,11 +321,11 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         return DictionaryRecipes(recipes: recipes.values.sorted { $0.symbol < $1.symbol },
                                  layouts: layouts.values.sorted { $0.name < $1.name })
     }
-    // The dependency results module inference reads: each visible dependency's published results, keyed by
+    // The dependency results module inference reads: each reached dependency's published results, keyed by
     // the call names this module uses for them.
     func dependencyResults() -> [String: EscapeSummary] {
         var out: [String: EscapeSummary] = [:]
-        for k in visible {
+        for k in reach {
             guard let published = deps.publishedResults[k] else { continue }
             out.merge(publishedResultsByCallName(published, origin: k)) { a, _ in a }
         }
@@ -334,7 +357,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         fileVisible[f.path] = vis
         fileQualifiers[f.path] = quals
     }
-    // The external declarations visible to this module, each rewritten to its per-origin identity
+    // The external declarations of the reached modules, each rewritten to its per-origin identity
     // (`origin@name`), plus the types (only) a visible signature names from a module it does not import, so
     // values of them type-check while the names stay out of scope.
     func externals() -> [TopDecl] {
@@ -348,12 +371,12 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         }
         var out: [TopDecl] = []
         var pending: [String] = []
-        for k in visible {
+        for k in reach {
             let d = decls(of: k)
             out += d.decls
             pending += d.foreign.values.sorted()
         }
-        var loaded = Set(visible + [originKey])
+        var loaded = Set(reach + [originKey])
         while let o = pending.popLast() {
             guard loaded.insert(o).inserted, deps.interfaces[o] != nil else { continue }
             let d = decls(of: o)
@@ -370,7 +393,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         let own = Set(iface.types.map(\.name)).union(iface.enums.map(\.name))
         let inScope = fileVisible.values.reduce(into: Set<String>()) { $0.formUnion($1) }
         var out: [String: String] = [:]
-        for n in signatureTypeNames(iface) where !own.contains(n) {
+        for n in signatureTypeNames(iface) where !own.contains(n) && !builtinTypeNames.contains(n) {
             let origins = inScope.filter { moduleTypes[$0]?.contains(n) == true }
             if origins.count == 1, let o = origins.first { out[n] = o }
         }
@@ -379,7 +402,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     // Imported methods inferred mutating in their producing module, keyed `origin@Type.method`.
     func externalMutating() -> Set<String> {
         var out: Set<String> = []
-        for k in visible {
+        for k in reach {
             guard let full = deps.interfaces[k] else { continue }
             let iface = admitted(full, producer: k)
             func add(_ typeName: String, _ methods: [InterfaceFunc], _ properties: [InterfaceProperty]) {
@@ -473,7 +496,8 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     iface.foreignTypes = foreignTypeOrigins(iface)
 
     let ownNames = topDeclNames(ownSurface)
-    let shipped = canonicalizeForExport(shippedTemplates(semaResult.module, ownNames: ownNames),
+    let shipped = canonicalizeForExport(shippedTemplates(semaResult.module, ownNames: ownNames,
+                                                                         privateTypes: privateTypeNames(ownSurface)),
                                         origin: originKey, ownNames: ownNames)
     // A library always writes its `.bir`, empty when it ships no templates, so a dependent can rely on it.
     // It needs only sema's templates, so it is written before mono; the `.nmi` waits for module inference.
@@ -489,8 +513,7 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     var moduleForMono = semaResult.module
     var localizedGenerics: Set<String> = []
     if mono != .none {
-        guard let templates = importedTemplates() else { return false }
-        let selected = selectForDial(templates, mode: mono, consumer: moduleForMono)
+        let selected = selectForDial(importedTemplates(), mode: mono, consumer: moduleForMono)
         let injection = injectImportedTemplates(into: moduleForMono, templates: selected)
         moduleForMono = injection.module
         localizedGenerics = injection.localizedNames
@@ -498,8 +521,8 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     // Recursive enums: each case that holds a member of its own recursive group moves its payload into a box.
     moduleForMono = timings.measure("noir", "box") { boxRecursiveCases(moduleForMono) }
     let monoDiags = DiagnosticSink()
-    let monoModule = timings.measure("noir", "mono") {
-        monomorphize(moduleForMono, recipes: dependencyRecipes(), into: monoDiags)
+    var monoModule = timings.measure("noir", "mono") {
+        monomorphize(moduleForMono, recipes: dependencyRecipes(), privateTypes: privateTypeNames(ownSurface), into: monoDiags)
     }
     if !monoDiags.isEmpty { fputs(monoDiags.render() + "\n", stderr); return false }
 
@@ -512,10 +535,15 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
         }
     }
 
-    iface.dictionaries = monoModule.recipes
-
     let extFuncs = semaResult.externalFuncNames.subtracting(localizedGenerics)
-    let extGenerics = semaResult.externalGenericSigs.filter { !localizedGenerics.contains($0.key) }
+    var extGenerics = semaResult.externalGenericSigs.filter { !localizedGenerics.contains($0.key) }
+    // A private generic type's methods, which its producer's `.nmi` does not declare, are known from their recipes: a
+    // witness table built here for the type, boxed as an existential in a compiled-once body, calls them.
+    for r in dependencyRecipes()?.recipes ?? [] where r.symbol.hasPrefix("m:") && extGenerics[r.symbol] == nil
+        && !localizedGenerics.contains(r.symbol) {
+        guard let sig = r.signature else { continue }
+        extGenerics[r.symbol] = ExternalGenericSig(generics: r.generics, bounds: r.bounds, params: sig.params, ret: sig.ret)
+    }
 
     // Codegen: gen SSAIR → module inference → publish → emit. The one lowering of the module: module
     // inference runs over it once, seeded with the dependency results, into the fact store, and the `.nmi`'s
@@ -523,6 +551,13 @@ public func compile(_ job: CompileJob, options: EmitOptions, timings: Timings) -
     // library emits a home-qualified object.
     let gen = timings.measure("ssair", "gen") { lowerToSSAIR(monoModule, subsetFuncs: subset) }
     if gen.diagnostics.hasErrors { fputs("error: SSAIR: " + gen.diagnostics.render() + "\n", stderr); return false }
+    // Closures and fibers in compiled-once bodies add their environments and entry adapters to the dictionaries.
+    let envLayouts = gen.module.aggregates.filter { !$0.generics.isEmpty }.map { a in
+        DictionaryLayout(name: a.name, generics: a.generics.map(\.name), kind: .class_, fields: [a.fields.map(\.type)],
+                         fieldNames: [a.fields.map(\.name)], fromTypeParameter: [a.fields.map(\.fromTypeParameter)])
+    }
+    monoModule.recipes = monoModule.recipes?.adding(gen.module.recipeNeeds, layouts: envLayouts)
+    iface.dictionaries = monoModule.recipes
     var store = factStore
     timings.measure("inference", "module") {
         let summaries = computeEscapeSummaries(gen.module.functions, aggregates: gen.module.aggregates,

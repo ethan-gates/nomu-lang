@@ -1,0 +1,15 @@
+// The handler satisfying a requirement has its name and parameter types.
+interface Sink {
+    fun put(x: Int)
+}
+
+actor Counter: Sink {
+    var n: Int = 0
+    on put(x: String) {
+        n += x.count
+    }
+}
+
+fun main() {
+    let c = Counter()
+}

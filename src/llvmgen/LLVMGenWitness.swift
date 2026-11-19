@@ -1,4 +1,5 @@
 import sema
+import mangle
 import noir
 import ast
 import support
@@ -19,7 +20,7 @@ extension LLVMGen {
 
     // The witness slots of an interface, in the layout order: each method requirement, then each
     // property's `_get` (and `_set` if settable), then a `base_<B>` per transitive base, then the
-    // reserved `type_witness`. Every slot is a pointer, so the witness struct is N pointers and a
+    // `type_witness` (a value payload's descriptor, in an `any` table). Every slot is a pointer, so the witness struct is N pointers and a
     // slot is reached by its index here.
     func witnessSlots(_ iface: String) -> [String] {
         if let cached = witnessSlotsCache[iface] { return cached }
@@ -79,10 +80,15 @@ extension LLVMGen {
             }
         }
         for base in idef.bases {
+            // A constraint-only base is never `any`, so no upcast reads its slot.
+            if interfaceDefs[base]?.isConstraintOnly == true { vals.append(LLVMConstPointerNull(i8ptr)); continue }
             guard let bw = witnessInstance(type, base) else { return nil }
             vals.append(bw)
         }
-        vals.append(LLVMConstPointerNull(i8ptr))   // type_witness (reserved)
+        // type_witness: a value payload's descriptor header, which a compiled-once body boxing this type reads to
+        // stamp the payload it copies the value into; a reference payload is the object itself, so null.
+        vals.append(boxIsValue(type) ? LLVMConstIntToPtr(descOffsetHeader(valueBoxTypeId(.named(type, namedKind(type)))), i8ptr)
+                                     : LLVMConstPointerNull(i8ptr))
         LLVMSetInitializer(g, constStruct(wt, vals))
         return g
     }
@@ -132,13 +138,8 @@ extension LLVMGen {
     // the managed object reference at offset 0, so `self` is that reference loaded as `p1` (the impl takes
     // the object pointer, like `bridgeThunkSelf`'s class path). The GC-trace of a non-POD value buffer — a
     // class reference, or managed fields inside a struct — is handled at the call site (the typed-root
-    // registration, task 100.4.3.6). An actor conformer uses the same reference ABI, but synchronous
-    // requirement dispatch on an actor across the erased boundary is untested, so reject it here.
+    // registration, task 100.4.3.6). An actor conformer's requirements are sends, built before this is reached.
     func bridgeErasedThunkSelf(_ valuePtr: LLVMValueRef, _ type: String, _ c: Callable) -> LLVMValueRef? {
-        if actorMap[type] != nil {
-            fail("100.4.3.3.3: erased requirement dispatch on an actor conformer is not yet supported", zeroSpan)
-            return nil
-        }
         if classMap[type] != nil {
             return LLVMBuildLoad2(b, p1, valuePtr, "self")   // buffer holds the object reference at offset 0
         }
@@ -150,16 +151,16 @@ extension LLVMGen {
     }
 
     // A uniform value-buffer-self thunk `ret(ptr self, params…)` for the erased path — the counterpart of
-    // `methodThunk`, differing only in that `self` is a value-buffer pointer (offset 0) rather than a box.
+    // `methodThunk`, differing only in that `self` is a value-buffer pointer (offset 0) rather than a box. `Self` in
+    // the requirement passes as a type parameter would (`selfSlot`): a buffer result is written to a result buffer
+    // passed after `self`, the slot returning nothing.
     func methodThunkErased(_ type: String, _ iface: String, _ m: NOIRMethodReq) -> LLVMValueRef? {
-        if case .existential = m.ret {
-            fail("100.4.3.3.3: a covariant-Self requirement in a cross-module bounded generic is not yet supported", zeroSpan)
-            return nil
-        }
-        guard let retTy = llvmType(m.ret, zeroSpan) else { return nil }
+        let returnsBuffer = selfSlot(m.selfRet) == .buffer
+        guard let retTy = returnsBuffer ? voidTy : erasedSlotType(m.selfRet) else { return nil }
         var paramTys: [LLVMTypeRef] = [i8ptr]   // self — value-buffer pointer (addrspace 0)
-        for pt in m.params {
-            guard let t = llvmType(pt, zeroSpan) else { return nil }
+        if returnsBuffer { paramTys.append(i8ptr) }
+        for pt in m.selfParams {
+            guard let t = erasedSlotType(pt) else { return nil }
             paramTys.append(t)
         }
         let sname = m.name.replacingOccurrences(of: ".", with: "_")
@@ -167,29 +168,217 @@ extension LLVMGen {
 
         let saved = beginThunk(fn)
         defer { endThunk(saved) }
+        let first: UInt32 = returnsBuffer ? 2 : 1
+        // The result buffer is in the caller's frame and written after the call, which may move the stack.
+        let resultBuf = returnsBuffer ? markFrameAddress(LLVMGetParam(fn, 1)!) : nil
 
-        declareMethod(type, m.name)
+        if actorMap[type] != nil {
+            // An actor's buffer holds its reference; the requirement is its handler, so the call is a send.
+            let actor = LLVMBuildLoad2(b, p1, LLVMGetParam(fn, 0)!, "actor")!
+            let args: [LLVMValueRef] = m.selfParams.enumerated().map { i, pt in
+                let p = LLVMGetParam(fn, first + UInt32(i))!
+                return pt == .selfType ? LLVMBuildLoad2(b, p1, p, "arg")! : p
+            }
+            guard emitActorSend(type, m.name, actor, { args }, zeroSpan) != nil else { return nil }
+            LLVMBuildRetVoid(b)
+            return fn
+        }
+
+        if m.isStatic, let imported = importedGenericStatic(type, m.name) {
+            // The producer's compiled-once static method: as `importedGenericMethod`, without `self`.
+            let isClass = classMap[type] != nil
+            var callArgs: [LLVMValueRef?] = [imported.dict]
+            if imported.returnsBuffer { callArgs.append(resultBuf) }
+            for (i, pt) in m.selfParams.enumerated() {
+                let p = LLVMGetParam(fn, first + UInt32(i))!
+                callArgs.append(pt == .selfType && isClass ? LLVMBuildLoad2(b, p1, p, "arg")! : p)
+            }
+            guard let result = buildCall(imported.fn, imported.ty, callArgs) else { return nil }
+            if imported.returnsBuffer || m.ret == .void { LLVMBuildRetVoid(b) }
+            else if let resultBuf { LLVMBuildStore(b, result, resultBuf); LLVMBuildRetVoid(b) }
+            else { LLVMBuildRet(b, result) }
+            return fn
+        }
+        if m.isStatic {
+            guard let (callee, calleeTy) = staticMethod(type, m) else { return nil }
+            var callArgs: [LLVMValueRef?] = []
+            for (i, pt) in m.selfParams.enumerated() {
+                let p = LLVMGetParam(fn, first + UInt32(i))!
+                guard selfSlot(pt) == .buffer else { callArgs.append(p); continue }
+                guard let v = loadConformer(p, pt, type) else { return nil }
+                callArgs.append(v)
+            }
+            guard let result = buildCall(callee, calleeTy, callArgs) else { return nil }
+            if let resultBuf { LLVMBuildStore(b, result, resultBuf); LLVMBuildRetVoid(b) }
+            else if m.ret == .void { LLVMBuildRetVoid(b) } else { LLVMBuildRet(b, result) }
+            return fn
+        }
+        if importedGenericMethod(type, m.name) != nil {
+            // The producer's compiled-once method passes the conformer as a type parameter too, except that a generic
+            // class is a reference, so only a bare `Self` of a class needs converting.
+            let buffer = LLVMGetParam(fn, 0)!
+            let isClass = classMap[type] != nil
+            let selfArg = isClass ? LLVMBuildLoad2(b, p1, buffer, "self")! : buffer
+            let args: [LLVMValueRef?] = m.selfParams.enumerated().map { i, pt in
+                let p = LLVMGetParam(fn, first + UInt32(i))!
+                return pt == .selfType && isClass ? LLVMBuildLoad2(b, p1, p, "arg")! : p
+            }
+            if m.selfRet == .selfType && isClass {
+                guard let result = callImportedGeneric(type, m.name, self: selfArg, args) else { return nil }
+                LLVMBuildStore(b, result, resultBuf!)
+            } else if returnsBuffer {
+                _ = callImportedGeneric(type, m.name, self: selfArg, args, resultBuffer: resultBuf)
+            } else {
+                guard let result = callImportedGeneric(type, m.name, self: selfArg, args) else { return nil }
+                if m.ret != .void { LLVMBuildRet(b, result); return fn }
+            }
+            LLVMBuildRetVoid(b)
+            return fn
+        }
+        declareMethod(type, m.name, requirement: (m.selfParams, m.selfRet))
         guard let c = callables["m:\(type):\(m.name)"] else { return nil }
         guard let selfArg = bridgeErasedThunkSelf(LLVMGetParam(fn, 0)!, type, c) else { return nil }
         var callArgs: [LLVMValueRef?] = [selfArg]
-        for i in 0..<m.params.count { callArgs.append(LLVMGetParam(fn, UInt32(i + 1))) }
+        for (i, pt) in m.selfParams.enumerated() {
+            let p = LLVMGetParam(fn, first + UInt32(i))!
+            guard selfSlot(pt) == .buffer else { callArgs.append(p); continue }
+            guard let v = loadConformer(p, pt, type) else { return nil }
+            callArgs.append(v)
+        }
         guard let result = buildCall(c.fn, c.ty, callArgs) else { return nil }
-        if m.ret == .void { LLVMBuildRetVoid(b) } else { LLVMBuildRet(b, result) }
+        if let resultBuf {
+            LLVMBuildStore(b, result, resultBuf)
+            LLVMBuildRetVoid(b)
+        } else if m.ret == .void { LLVMBuildRetVoid(b) } else { LLVMBuildRet(b, result) }
         return fn
     }
 
+    // The conformer's static method satisfying static requirement `m`, a free function `Type.method`. An imported
+    // conformer's is declared from the requirement, with `Self` as the conformer.
+    func staticMethod(_ type: String, _ m: NOIRMethodReq) -> (LLVMValueRef, LLVMTypeRef)? {
+        // A generic instance's is the specialization of the type's generic static method, `Box.make<Int>`.
+        let base = String(type.prefix { $0 != "<" })
+        let name = monoTypeArgs[type] != nil ? "\(base).\(m.name)\(type.dropFirst(base.count))" : "\(type).\(m.name)"
+        if funcMap[name] != nil {
+            declareFree(name)
+            guard let c = callables["f:\(name)"] else { return nil }
+            return (c.fn, c.ty)
+        }
+        guard ExternalName.isEncoded(type), monoTypeArgs[type] == nil else {
+            fail("static requirement '\(m.name)' of '\(type)' cannot be called through a bound in a compiled-once body yet", zeroSpan)
+            return nil
+        }
+        if let c = callables["f:\(name)"] { return (c.fn, c.ty) }
+        guard let ret = llvmType(withSelf(m.selfRet, type), zeroSpan) else { return nil }
+        var params: [LLVMTypeRef] = []
+        for p in m.selfParams { guard let t = llvmType(withSelf(p, type), zeroSpan) else { return nil }; params.append(t) }
+        let (fn, fnTy) = emitFunction(Mangle.function(name, home: homeModule), ret: ret, params: params)
+        callables["f:\(name)"] = Callable(fn: fn, ty: fnTy,
+                                           ir: NOIRFunc(name: name, params: [], returnType: withSelf(m.selfRet, type), body: [],
+                                                        isMutating: false, span: zeroSpan),
+                                           selfType: nil, selfByPointer: false)
+        return (fn, fnTy)
+    }
+
+    // An imported generic type's static method `method`, compiled once in its producer for a conformer instance
+    // `type`: the declaration, the instance's dictionary, and whether the result comes back in a result buffer passed
+    // after the dictionary. The declaration is cached under the key the erased call lowering uses.
+    func importedGenericStatic(_ type: String, _ method: String)
+        -> (fn: LLVMValueRef, ty: LLVMTypeRef, dict: LLVMValueRef, returnsBuffer: Bool)? {
+        guard ExternalName.isEncoded(type), let typeArgs = monoTypeArgs[type] else { return nil }
+        let symbol = "\(String(type.prefix { $0 != "<" })).\(method)"
+        guard let sig = externalGenericSigs[symbol] else { return nil }
+        guard let dict = dictionary(dictionaryKey(symbol, typeArgs)) else {
+            fail("no dictionary for '\(symbol)' at \(typeArgs)", zeroSpan); return nil
+        }
+        func reference(_ t: Type) -> Bool {
+            switch t {
+            case .array, .function: return true
+            case .generic(let base, _): return classMap[base] != nil
+            default: return false
+            }
+        }
+        let returnsBuffer = sig.ret.mentionsTypeParameter && !reference(sig.ret)
+        if let c = callables["f:\(symbol)"] { return (c.fn, c.ty, dict, returnsBuffer) }
+        var params = [i8ptr] + (returnsBuffer ? [i8ptr] : [])
+        for p in sig.params {
+            if p.mentionsTypeParameter { params.append(reference(p) ? p1 : i8ptr); continue }
+            guard let t = llvmType(p, zeroSpan) else { return nil }; params.append(t)
+        }
+        guard let ret = returnsBuffer ? voidTy : sig.ret.mentionsTypeParameter ? p1 : llvmType(sig.ret, zeroSpan) else { return nil }
+        let (fn, fnTy) = emitFunction(Mangle.function(symbol, home: homeModule), ret: ret, params: params)
+        callables["f:\(symbol)"] = Callable(fn: fn, ty: fnTy,
+                                           ir: NOIRFunc(name: symbol, params: [], returnType: sig.ret, body: [],
+                                                        isMutating: false, span: zeroSpan),
+                                           selfType: nil, selfByPointer: false)
+        return (fn, fnTy, dict, returnsBuffer)
+    }
+
+    // How the compiled-once witness ABI passes a requirement type: `Self` is a type parameter there, so a type
+    // mentioning it is held by buffer, unless it is a reference (an array, a function value, a generic class).
+    enum SelfSlot { case plain, reference, buffer }
+    func selfSlot(_ t: Type) -> SelfSlot {
+        guard t.mentionsSelf else { return .plain }
+        switch t {
+        case .array, .function: return .reference
+        case .generic(let base, _) where classMap[base] != nil: return .reference
+        default: return .buffer
+        }
+    }
+
+    func erasedSlotType(_ t: Type) -> LLVMTypeRef? {
+        switch selfSlot(t) {
+        case .plain: return llvmType(t, zeroSpan)
+        case .reference: return p1
+        case .buffer: return i8ptr
+        }
+    }
+
+    // A value of requirement type `t` read from its buffer, with `Self` as the conformer.
+    func loadConformer(_ buffer: LLVMValueRef, _ t: Type, _ type: String) -> LLVMValueRef? {
+        guard let lt = llvmType(withSelf(t, type), zeroSpan) else { return nil }
+        return LLVMBuildLoad2(b, lt, buffer, "conformer")
+    }
+
+    // Requirement type `t` with `Self` as the conformer, an applied generic named as its specialized instance
+    // (`Option<Num>`), which Monomorphize made for the witness table (`specializeRequirementTypes`).
+    func withSelf(_ t: Type, _ type: String) -> Type {
+        func named(_ t: Type) -> Type {
+            switch t {
+            case .generic(let base, let args):
+                let resolved = args.map(named)
+                guard let name = monoTypeArgs.first(where: { $0.value == resolved && $0.key.hasPrefix(base + "<") })?.key
+                else { return .generic(base: base, args: resolved) }
+                return .named(name, namedKind(name))
+            case .array(let e): return .array(named(e))
+            case .function(let ps, let r): return .function(params: ps.map(named), ret: named(r))
+            default: return t
+            }
+        }
+        return named(t.replacingSelf(with: .named(type, namedKind(type))))
+    }
+
     // The property counterpart of `methodThunkErased` — value-buffer self (offset 0). A stored-field-backed
-    // requirement is a direct load/store; a computed one routes through the concrete accessor.
+    // requirement is a direct load/store; a computed one routes through the concrete accessor. A `Self` property is
+    // read into a result buffer passed after `self` and written from a buffer.
     func propThunkErased(_ type: String, _ iface: String, _ p: NOIRPropReq, setter: Bool) -> LLVMValueRef? {
-        guard let propTy = llvmType(p.type, zeroSpan) else { return nil }
+        let isSelf = selfSlot(p.selfType) == .buffer
+        guard let slotTy = erasedSlotType(p.selfType), let propTy = llvmType(p.type, zeroSpan) else { return nil }
+        let viaBuffer = isSelf && !setter
         var paramTys: [LLVMTypeRef] = [i8ptr]   // self — value-buffer pointer (addrspace 0)
-        if setter { paramTys.append(propTy) }
+        if setter || viaBuffer { paramTys.append(slotTy) }
         let slot = setter ? "\(p.name)_set" : "\(p.name)_get"
         let (fn, _) = emitFunction("wte_\(type)_\(iface)_\(slot)",
-                                   ret: setter ? voidTy : propTy, params: paramTys)
+                                   ret: setter || viaBuffer ? voidTy : propTy, params: paramTys)
         let saved = beginThunk(fn)
         defer { endThunk(saved) }
         let valuePtr = LLVMGetParam(fn, 0)!
+        // The written value, or the getter's result buffer, in the caller's frame and written after the call.
+        let operand = paramTys.count > 1 ? (viaBuffer ? markFrameAddress(LLVMGetParam(fn, 1)!) : LLVMGetParam(fn, 1)!) : nil
+        func newValue() -> LLVMValueRef? { isSelf ? loadConformer(operand!, p.selfType, type) : operand }
+        func give(_ v: LLVMValueRef) {
+            if viaBuffer { LLVMBuildStore(b, v, operand!); LLVMBuildRetVoid(b) } else { LLVMBuildRet(b, v) }
+        }
 
         if let info = aggInfo(type), let pos = info.fields.firstIndex(where: { $0.name == p.name }) {
             // A value conformer's fields are inline at offset 0 of the buffer; a class conformer's buffer
@@ -198,23 +387,41 @@ extension LLVMGen {
             let base = info.kind == .classRef ? LLVMBuildLoad2(b, p1, valuePtr, "self")! : valuePtr
             let addr = structGEP(info.ty, base, llvmFieldIndex(type, pos))
             if setter {
-                if info.kind == .classRef { storeField(base, addr, LLVMGetParam(fn, 1)!) }
-                else { LLVMBuildStore(b, LLVMGetParam(fn, 1)!, addr) }
+                guard let v = newValue() else { return nil }
+                if info.kind == .classRef { storeField(base, addr, v) } else { LLVMBuildStore(b, v, addr) }
                 LLVMBuildRetVoid(b)
             } else {
-                LLVMBuildRet(b, LLVMBuildLoad2(b, propTy, addr, "fld"))
+                guard let fieldTy = isSelf ? llvmType(withSelf(p.selfType, type), zeroSpan) : propTy else { return nil }
+                give(LLVMBuildLoad2(b, fieldTy, addr, "fld"))
             }
             return fn
         }
 
         let accessor = "\(p.name).\(setter ? "set" : "get")"
-        declareMethod(type, accessor)
+        if importedGenericMethod(type, accessor) != nil {
+            let isClass = classMap[type] != nil
+            let selfArg = isClass ? LLVMBuildLoad2(b, p1, valuePtr, "self")! : valuePtr
+            let bareSelf = p.selfType == .selfType
+            if setter {
+                let v = bareSelf && isClass ? LLVMBuildLoad2(b, p1, operand!, "arg")! : operand
+                _ = callImportedGeneric(type, accessor, self: selfArg, [v])
+                LLVMBuildRetVoid(b)
+            } else if viaBuffer && !(bareSelf && isClass) {
+                _ = callImportedGeneric(type, accessor, self: selfArg, [], resultBuffer: operand)
+                LLVMBuildRetVoid(b)
+            } else {
+                guard let result = callImportedGeneric(type, accessor, self: selfArg, []) else { return nil }
+                give(result)
+            }
+            return fn
+        }
+        declareMethod(type, accessor, requirement: setter ? ([p.selfType], .void) : ([], p.selfType))
         guard let c = callables["m:\(type):\(accessor)"] else { return nil }
         guard let selfArg = bridgeErasedThunkSelf(valuePtr, type, c) else { return nil }
         var callArgs: [LLVMValueRef?] = [selfArg]
-        if setter { callArgs.append(LLVMGetParam(fn, 1)) }
-        let result = buildCall(c.fn, c.ty, callArgs)
-        if setter { LLVMBuildRetVoid(b) } else { LLVMBuildRet(b, result!) }
+        if setter { guard let v = newValue() else { return nil }; callArgs.append(v) }
+        guard let result = buildCall(c.fn, c.ty, callArgs) else { return nil }
+        if setter { LLVMBuildRetVoid(b) } else { give(result) }
         return fn
     }
 
@@ -248,7 +455,42 @@ extension LLVMGen {
         let saved = beginThunk(fn)
         defer { endThunk(saved) }
 
-        declareMethod(type, m.name)
+        if actorMap[type] != nil {
+            // An actor's payload is its reference; the requirement is its handler, so the call is a send.
+            let args = (0..<m.params.count).map { LLVMGetParam(fn, UInt32($0 + 1))! }
+            guard emitActorSend(type, m.name, LLVMGetParam(fn, 0)!, { args }, zeroSpan) != nil else { return nil }
+            LLVMBuildRetVoid(b)
+            return fn
+        }
+        let covariant: Bool = { if case .existential = m.ret { return true }; return false }()
+        if importedGenericMethod(type, m.name) != nil {
+            // The copy out of the box, its root node and a result buffer make a frame too large to run unchecked.
+            if !isRuntimePackage && !measureNoStackChecks { emitStackCheck([]) }
+            let args = (0..<m.params.count).map { LLVMGetParam(fn, UInt32($0 + 1)) }
+            let payload = LLVMGetParam(fn, 0)!
+            if covariant {
+                // The compiled-once method returns the conformer in a result buffer, a class as its reference;
+                // re-box it as `any iface`.
+                var value: LLVMValueRef
+                if classMap[type] != nil {
+                    guard let r = callImportedGenericBoxed(type, m.name, payload: payload, args) else { return nil }
+                    value = r
+                } else {
+                    guard let st = selfLLVMType(type) else { return nil }
+                    let buf = entryAlloca(st, "ret.buf")
+                    _ = callImportedGenericBoxed(type, m.name, payload: payload, args, resultBuffer: buf)
+                    value = LLVMBuildLoad2(b, st, buf, "ret")!
+                }
+                guard let w = witnessInstance(type, iface),
+                      let pl = boxPayload({ value }, .named(type, namedKind(type))) else { return nil }
+                LLVMBuildRet(b, makeAnyBox(w, pl))
+                return fn
+            }
+            guard let result = callImportedGenericBoxed(type, m.name, payload: payload, args) else { return nil }
+            if m.ret == .void { LLVMBuildRetVoid(b) } else { LLVMBuildRet(b, result) }
+            return fn
+        }
+        declareMethod(type, m.name, requirement: (m.params, m.ret))
         guard let c = callables["m:\(type):\(m.name)"] else { return nil }
         guard let selfArg = bridgeThunkSelf(LLVMGetParam(fn, 0)!, type, c) else { return nil }
         var callArgs: [LLVMValueRef?] = [selfArg]
@@ -297,7 +539,12 @@ extension LLVMGen {
         }
 
         let accessor = "\(p.name).\(setter ? "set" : "get")"
-        declareMethod(type, accessor)
+        if importedGenericMethod(type, accessor) != nil {
+            let result = callImportedGenericBoxed(type, accessor, payload: payload, setter ? [LLVMGetParam(fn, 1)] : [])
+            if setter { LLVMBuildRetVoid(b) } else if let result { LLVMBuildRet(b, result) } else { return nil }
+            return fn
+        }
+        declareMethod(type, accessor, requirement: setter ? ([p.type], .void) : ([], p.type))
         guard let c = callables["m:\(type):\(accessor)"] else { return nil }
         guard let selfArg = bridgeThunkSelf(payload, type, c) else { return nil }
         var callArgs: [LLVMValueRef?] = [selfArg]
@@ -335,6 +582,9 @@ extension LLVMGen {
         LLVMSetInitializer(g, constStruct(ct, vals))
         return g
     }
+
+    // Whether an `any` box of `type` copies the value into a payload object; a class or actor is its own payload.
+    func boxIsValue(_ type: String) -> Bool { classMap[type] == nil && actorMap[type] == nil }
 
     // Which interface of a composition declares `method` (used to pick the owning sub-table).
     func compositionOwner(_ ifaces: [String], _ method: String) -> String {
@@ -417,19 +667,93 @@ extension LLVMGen {
     // table is the PWT pointer passed to an erased body, and `self` is the value-buffer pointer
     // (addrspace 0), not a heap box. The slot holds an **erased** thunk (`witnessInstanceErased`) whose
     // self-ABI is that value pointer, so the two agree without touching the existential (`any I`) path.
+    // `resultBuffer` receives a result held by buffer (`slotReturnsBuffer`); the call then returns nothing.
     func witnessDispatchErased(pwt: LLVMValueRef, iface: String, method: String, selfPtr: LLVMValueRef,
                                argVals: [LLVMValueRef], argTys: [LLVMTypeRef], resultType: Type,
-                               span: Span) -> LLVMValueRef? {
+                               resultBuffer: LLVMValueRef? = nil, span: Span) -> LLVMValueRef? {
         let slot = method.replacingOccurrences(of: ".", with: "_")
         let idx = witnessSlotIndex(iface, slot)
         guard idx >= 0 else { fail("8.2.5: no witness slot '\(slot)' in '\(iface)'", span); return nil }
         let fnPtr = LLVMBuildLoad2(b, i8ptr, structGEP(witnessType(iface), pwt, idx), "slot")!
-        guard let retTy = llvmType(resultType, span) else { return nil }
+        guard let retTy = resultBuffer != nil ? voidTy : llvmType(resultType, span) else { return nil }
         var paramTys: [LLVMTypeRef] = [i8ptr]   // self — a value-buffer pointer (addrspace 0)
-        paramTys.append(contentsOf: argTys)
         var callArgs: [LLVMValueRef?] = [selfPtr]
+        if let resultBuffer { paramTys.append(i8ptr); callArgs.append(resultBuffer) }
+        paramTys.append(contentsOf: argTys)
         for v in argVals { callArgs.append(v) }
         return buildCall(fnPtr, fnType(retTy, paramTys), callArgs)
+    }
+
+    // Whether requirement `method` of `iface` (a method, or a property's `name.get`) returns a type mentioning `Self`
+    // held by buffer, which the compiled-once witness ABI returns in a result buffer.
+    func slotReturnsBuffer(_ iface: String, _ method: String) -> Bool {
+        guard let i = interfaceDefs[iface] else { return false }
+        if let m = i.methods.first(where: { $0.name == method }) { return selfSlot(m.selfRet) == .buffer }
+        guard method.hasSuffix(".get"), let p = i.properties.first(where: { $0.name == String(method.dropLast(4)) })
+        else { return false }
+        return selfSlot(p.selfType) == .buffer
+    }
+
+    // MARK: - Imported generic conformers
+
+    // A method of an instance of an imported generic type is compiled once in its producer, behind the witness ABI
+    // (`m:<origin@Type>:method`): its dictionary for the instance's type arguments, then `self` by buffer (a class by
+    // reference), then the arguments. A requirement's arguments and result mention the conformer's type parameters
+    // only as `Self`, the instance itself. Nil when `type` is no such instance. The declaration is cached under the key
+    // the erased call lowering uses, so the two share it.
+    func importedGenericMethod(_ type: String, _ method: String) -> (fn: LLVMValueRef, ty: LLVMTypeRef, dict: LLVMValueRef)? {
+        guard ExternalName.isEncoded(type), let typeArgs = monoTypeArgs[type] else { return nil }
+        let symbol = "m:\(String(type.prefix { $0 != "<" })):\(method)"
+        guard let sig = externalGenericSigs[symbol] else { return nil }
+        guard let dict = dictionary(dictionaryKey(symbol, typeArgs)) else {
+            fail("no dictionary for '\(symbol)' at \(typeArgs)", zeroSpan); return nil
+        }
+        if let c = callables["f:\(symbol)"] { return (c.fn, c.ty, dict) }
+        // A result that mentions the type's parameters, `Self` for a value conformer, comes back in a result buffer
+        // passed after the dictionary; a generic class is a reference and returns as one.
+        let isClass = classMap[type] != nil
+        let returnsBuffer = sig.ret.mentionsTypeParameter && !isClass
+        var params = [i8ptr] + (returnsBuffer ? [i8ptr] : []) + [isClass ? p1 : i8ptr]
+        for p in sig.params.dropFirst() {
+            if p.mentionsTypeParameter { params.append(isClass ? p1 : i8ptr); continue }
+            guard let t = llvmType(p, zeroSpan) else { return nil }; params.append(t)
+        }
+        guard let ret = returnsBuffer ? voidTy : sig.ret.mentionsTypeParameter ? p1 : llvmType(sig.ret, zeroSpan) else { return nil }
+        let base = String(type.prefix { $0 != "<" })
+        let (fn, fnTy) = emitFunction(Mangle.method(base, method, home: homeModule), ret: ret, params: params)
+        callables["f:\(symbol)"] = Callable(fn: fn, ty: fnTy,
+                                           ir: NOIRFunc(name: symbol, params: [], returnType: sig.ret, body: [], isMutating: false,
+                                                        span: zeroSpan),
+                                           selfType: nil, selfByPointer: false)
+        return (fn, fnTy, dict)
+    }
+
+    // Call `method` of an imported generic instance from a thunk, with `self` a value buffer (addrspace 0) or, for a
+    // class, the reference. The caller of the thunk roots the buffer.
+    // `resultBuffer` receives a result held by buffer, a value conformer returned as `Self`.
+    func callImportedGeneric(_ type: String, _ method: String, self selfArg: LLVMValueRef, _ args: [LLVMValueRef?],
+                             resultBuffer: LLVMValueRef? = nil) -> LLVMValueRef? {
+        guard let m = importedGenericMethod(type, method) else { return nil }
+        return buildCall(m.fn, m.ty, [m.dict] + (resultBuffer.map { [$0] } ?? []) + [selfArg] + args)
+    }
+
+    // The same from a boxed thunk: a value conformer is copied out of the box into a frame buffer, registered as a
+    // typed root around the call, since the box may move while the call runs; a class conformer is its reference.
+    func callImportedGenericBoxed(_ type: String, _ method: String, payload: LLVMValueRef, _ args: [LLVMValueRef?],
+                                  resultBuffer: LLVMValueRef? = nil) -> LLVMValueRef? {
+        if classMap[type] != nil { return callImportedGeneric(type, method, self: payload, args) }
+        guard let st = selfLLVMType(type) else { return nil }
+        let buf = entryAlloca(st, "self.buf")
+        LLVMBuildStore(b, LLVMBuildLoad2(b, st, payloadValue(payload), "self")!, buf)
+        let save = preludeFn("nomu_fn_rtShadowSave", ret: i64, params: [])
+        let top = buildCall(save.0, save.1, [])!
+        let push = preludeFn("nomu_fn_rtShadowPush", ret: voidTy, params: [i8ptr, i8ptr, i8ptr])
+        let node = entryAlloca(structTy([i8ptr, i8ptr, i8ptr]), "shadow.node")
+        _ = buildCall(push.0, push.1, [node, buf, valueWitness(.named(type, namedKind(type)))])
+        let result = callImportedGeneric(type, method, self: buf, args, resultBuffer: resultBuffer)
+        let pop = preludeFn("nomu_fn_rtShadowPopTo", ret: voidTy, params: [i64])
+        _ = buildCall(pop.0, pop.1, [top])
+        return result
     }
 
     // MARK: - Thunk emit scope

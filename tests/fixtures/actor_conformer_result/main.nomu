@@ -1,0 +1,15 @@
+// An actor conforms through its handlers, which return nothing, so a requirement with a result has nothing to satisfy it.
+interface Pingable {
+    fun ping() -> Int
+}
+
+actor Server: Pingable {
+    var n: Int = 0
+    on ping() {
+        n += 1
+    }
+}
+
+fun main() {
+    let s = Server()
+}

@@ -1,0 +1,30 @@
+// A generic type inherits an interface default: synthesized on its template, specialized with its other methods.
+interface Valued {
+    fun val() -> Int
+    fun doubled() -> Int {
+        return self.val() * 2
+    }
+}
+
+struct Holder<T>: Valued {
+    let item: T
+    let k: Int
+    fun val() -> Int {
+        return k
+    }
+}
+
+fun viaBound<T: Valued>(x: T) -> Int {
+    return x.doubled()
+}
+
+fun main() {
+    let h = Holder(item: "x", k: 3)
+    let a: any Valued = h
+    print(h.doubled())
+    print(" ")
+    print(viaBound(h))
+    print(" ")
+    print(a.doubled())
+    print("\n")
+}

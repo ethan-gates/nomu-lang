@@ -1,0 +1,18 @@
+// A type argument inferred through an array literal for an `Array<T>` field.
+class Bag<T> {
+    var items: Array<T>
+}
+
+struct Many<T> {
+    let items: Array<T>
+    let first: T
+}
+
+fun main() {
+    let b = Bag(items: [1, 2, 3])
+    let m = Many(items: ["a", "b"], first: "c")
+    print(b.items.count + m.items.count)
+    print(" ")
+    print(m.items[1])
+    print("\n")
+}

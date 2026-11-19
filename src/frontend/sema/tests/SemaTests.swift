@@ -708,7 +708,7 @@ final class SemaTests: XCTestCase {
         XCTAssertTrue(r.diagnostics.hasErrors)
     }
 
-    func testActorConformanceRejected() {
+    func testActorConformanceNeedsNoResult() {
         let r = sema("""
         interface Pingable {
             fun ping() -> Int
@@ -718,7 +718,22 @@ final class SemaTests: XCTestCase {
             on ping() -> Int { return n }
         }
         """)
-        XCTAssertTrue(r.diagnostics.hasErrors)
+        XCTAssertTrue(r.diagnostics.render().contains("method 'ping' returns a value, and a handler returns none"),
+                      r.diagnostics.render())
+    }
+
+    func testActorConformsThroughHandlers() {
+        let r = sema("""
+        interface Sink {
+            fun put(x: Int)
+        }
+        actor Counter: Sink {
+            var n: Int = 0
+            on put(x: Int) { n += x }
+        }
+        """)
+        XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
+        XCTAssertTrue(r.module.conformances.contains { $0.typeName == "Counter" && $0.interfaceName == "Sink" })
     }
 
     func testComputedPropertySatisfiesRequirement() {
@@ -1042,7 +1057,7 @@ final class SemaTests: XCTestCase {
         }
         """)
         XCTAssertTrue(r.diagnostics.isEmpty, r.diagnostics.render())
-        XCTAssertFalse(r.module.interfaces.contains { $0.name == "Combinable" })     // no witness-table layout
+        XCTAssertTrue(r.module.interfaces.contains { $0.name == "Combinable" && $0.isConstraintOnly })  // compiled-once layout only
         XCTAssertFalse(r.module.conformances.contains { $0.interfaceName == "Combinable" })
     }
 

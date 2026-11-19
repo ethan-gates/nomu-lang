@@ -1,0 +1,112 @@
+// Compiled-once values carried through loops: a buffer-held local reassigned from a construction, a call, a switch
+// payload and a bare `T`, two locals swapped each iteration, and an inner loop left by `break` inside an outer one.
+// Each local lives in a slot registered for the whole frame; a back edge clears only the iteration's temporaries.
+package struct Box<T> {
+  var v: T
+  var n: Int
+}
+
+package enum Pick<T> {
+  case one(value: T)
+  case none
+}
+
+fun garbage(i: Int) -> Int {
+  let s = "garbage-string-long-enough-for-the-heap-".concat("x")
+  return s.count + i
+}
+
+fun make<T>(v: T, n: Int) -> Box<T> {
+  return Box(v: v, n: n)
+}
+
+fun pick<T>(v: T, i: Int) -> Pick<T> {
+  if i % 7 == 3 {
+    return .one(value: v)
+  }
+  return .none
+}
+
+package fun churnCall<T>(x: T, y: T, n: Int) -> T {
+  var b = make(x, 0)
+  var i = 0
+  var k = 0
+  while i < n {
+    k = k + garbage(i)
+    if i % 7 == 3 {
+      b = make(y, i)
+    }
+    k = k + garbage(i)
+    i = i + 1
+  }
+  return b.v
+}
+
+package fun churnSwitch<T>(x: T, y: T, n: Int) -> T {
+  var b = x
+  var i = 0
+  var k = 0
+  while i < n {
+    k = k + garbage(i)
+    switch pick(y, i) {
+    case .one(let v):
+      b = v
+    case .none:
+    }
+    k = k + garbage(i)
+    i = i + 1
+  }
+  return b
+}
+
+package fun churnBare<T>(x: T, y: T, n: Int) -> T {
+  var b = x
+  var i = 0
+  var k = 0
+  while i < n {
+    k = k + garbage(i)
+    if i % 7 == 3 {
+      b = y
+    }
+    k = k + garbage(i)
+    i = i + 1
+  }
+  return b
+}
+
+package fun churnSwap<T>(x: T, y: T, n: Int) -> T {
+  var a = make(x, 0)
+  var b = make(y, 0)
+  var i = 0
+  var k = 0
+  while i < n {
+    k = k + garbage(i)
+    let t = a
+    a = b
+    b = t
+    k = k + garbage(i)
+    i = i + 1
+  }
+  return a.v
+}
+
+package fun churnBreak<T>(x: T, y: T, n: Int) -> T {
+  var b = x
+  var o = 0
+  var k = 0
+  while o < n {
+    var i = 0
+    while i < 10 {
+      k = k + garbage(i)
+      let t = make(y, i)
+      if i == 4 {
+        b = t.v
+        break
+      }
+      i = i + 1
+    }
+    k = k + garbage(o)
+    o = o + 1
+  }
+  return b
+}

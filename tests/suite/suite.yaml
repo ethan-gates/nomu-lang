@@ -20,6 +20,17 @@ dimensions:
       compile_settings:
         inline: false
       tier: full
+    # Generics compiled once and optimized, and specialized only where a module calls another's generic directly:
+    # debug compiles them once unoptimized and release specializes them all.
+    - name: release-erased
+      compile_settings:
+        optimize: true
+        mono: none
+      tier: full
+    - name: edge
+      compile_settings:
+        mono: edge
+      tier: full
   gc:
     - name: default
     - name: nursery

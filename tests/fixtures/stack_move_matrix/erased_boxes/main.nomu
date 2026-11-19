@@ -1,0 +1,43 @@
+// Generic conformers boxed as `any I` and `any A & B` across moving collections: boxes made in the library's
+// compiled-once bodies, which copy the value into a payload sized and described through the dictionary, and boxes
+// made here of specialized instances. The names are heap strings, also kept in values built in compiled-once bodies.
+import pkg/lib
+
+struct Holder<T>: Valued, Named {
+    let item: T
+    let k: Int
+    let name: String
+    fun val() -> Int {
+        return k
+    }
+}
+
+fun heap(s: String) -> String {
+    return s.concat("")
+}
+
+fun main() {
+    var bad = 0
+    var i = 0
+    while i < 3000 {
+        let long = heap("a name long enough for the heap")
+        let n = Num(n: i)
+        if wrapOne(n, long).val() != 2 * i { bad = bad + 1 }
+        if both(wrapBoth(n, long)) != 2 * i * 1000 + 32 { bad = bad + 1 }
+        if both(bagBoth(n, long)) != 10 * i * 1000 + 32 { bad = bad + 1 }
+        let p = Pair(a: n, b: Num(n: 1), name: long)
+        let pa: any Valued & Named = p
+        if both(pa) != (i + 1) * 1000 + 32 || !pa.name.eq(long) { bad = bad + 1 }
+        let h = Holder(item: long, k: i, name: long)
+        let ha: any Valued & Named = h
+        let hv: any Valued = h
+        if both(ha) != i * 1000 + 32 || hv.val() != i { bad = bad + 1 }
+        let ws = wrapBoth(Pair(a: n, b: n, name: long), long)
+        if ws.val() != 4 * i || !ws.name.eq(long) { bad = bad + 1 }
+        if !nameAfter(p, long).eq(long) || !tagAfter(n, long).eq(long) { bad = bad + 1 }
+        i = i + 1
+    }
+    print("bad ")
+    print(bad)
+    print("\n")
+}

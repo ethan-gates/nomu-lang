@@ -59,6 +59,41 @@ enum GenericInference {
                       kind: .call(callee: NOIRGen.irVar(name, calleeType, span), args: args, typeArgs: typeArgs))
     }
 
+    // A generic call's arguments, each checked against its parameter as far as it is known: the type parameters the
+    // arguments before it bound, and `.error` for one still unbound, which binds nothing. A bare unbound `T` gives no
+    // expected type. A leading-dot argument (`.some(value: 4)`, `.none`) reads its enum from that type, so while its
+    // parameter has unbound type parameters it waits for the other arguments, and then for the call's expected
+    // type, as a generic construction's fields do.
+    static func checkGenericCallArgs(_ s: inout Sema, _ sig: Sema.FnSig, _ args: [Arg], expected: Type?,
+                                     at span: Span) -> [NOIRArg] {
+        var subst: [String: Type] = [:]
+        var checked: [NOIRArg?] = Array(repeating: nil, count: args.count)
+        func check(_ i: Int, deferring: Bool) {
+            let arg = args[i]
+            guard i < sig.params.count else {
+                checked[i] = NOIRArg(label: arg.label, value: NOIRGen.checkExpr(&s, arg.value))
+                return
+            }
+            let param = sig.params[i]
+            let known = s.substitute(param, subst)
+            var holes: [String: Type] = [:]
+            for g in sig.generics where subst[g.name] == nil { holes[g.name] = .error }
+            let withHoles = s.substitute(known, holes)
+            let exp: Type? = { if case .typeParam = known { return nil }; return withHoles }()
+            if deferring, withHoles != known, isLeadingDot(arg.value) { return }
+            let v = NOIRGen.checkExpr(&s, arg.value, expected: exp)
+            s.unify(param: param, arg: v.type, into: &subst, at: span)
+            subst = subst.filter { $0.value != .error }
+            checked[i] = NOIRArg(label: arg.label, value: v)
+        }
+        for i in args.indices { check(i, deferring: true) }
+        if let expected, sig.generics.contains(where: { subst[$0.name] == nil }) {
+            bindFromExpected(sig.ret, expected, into: &subst)
+        }
+        for i in args.indices where checked[i] == nil { check(i, deferring: false) }
+        return checked.compactMap { $0 }
+    }
+
     // Best-effort binding of return-position type parameters from the call's expected type. Unlike
     // `unify`, it never reports a mismatch: where the shapes line up it binds an unbound parameter,
     // and anywhere they diverge it just stops (the real diagnostic is the "cannot infer" error).
@@ -107,6 +142,8 @@ enum GenericInference {
     // specializes to a concrete `T` — no witness required (M5 5.6).
     static func typeConforms(_ s: inout Sema, _ t: Type, to iface: String) -> Bool {
         if case .named(let tn, _) = t { return s.allConformsTo[tn]?.contains(iface) == true }
+        // A generic type's conformance is declared on its template and holds for every application of it.
+        if case .generic(let base, _) = t { return s.allConformsTo[base]?.contains(iface) == true }
         // A bound type parameter satisfies a bound it declares, directly or by refinement — so a
         // `K: Hashable` in scope can be passed as the argument of a `<K2: Hashable>` type (`Entry<K>`).
         if case .typeParam(let n) = t {

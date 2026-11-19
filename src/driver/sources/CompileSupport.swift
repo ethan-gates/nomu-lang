@@ -129,6 +129,17 @@ func encodeExternalDecl(_ decl: TopDecl, origin: String, ownTypes: Set<String>,
                 fields: $0.fields.map { VarField(name: $0.name, type: encT($0.type)!, isMutable: $0.isMutable, span: $0.span) },
                 span: $0.span) },
             properties: e.properties.map(encP), methods: e.methods.map(encM), conformances: e.conformances, visibility: e.visibility, span: e.span))
+    // An interface keeps its bare name; its requirements' types are encoded like a method's, so a requirement naming
+    // a type from another module (`-> String`) resolves.
+    case .interfaceDecl(let i):
+        return .interfaceDecl(InterfaceDecl(name: i.name, refines: i.refines,
+            methods: i.methods.map { m in
+                InterfaceMethod(name: m.name,
+                                params: m.params.map { Param(label: $0.label, name: $0.name, type: encT($0.type)!, span: $0.span) },
+                                returnType: encT(m.returnType), defaultBody: m.defaultBody, isStatic: m.isStatic, span: m.span)
+            },
+            properties: i.properties.map { InterfacePropertyReq(name: $0.name, type: encT($0.type)!, isSettable: $0.isSettable, span: $0.span) },
+            visibility: i.visibility, span: i.span, origin: origin))
     default:
         return decl
     }
@@ -148,41 +159,55 @@ func reportLeafCollisions(_ collisions: [(file: String, leaf: String, span: Span
 // surface before the prelude is prepended.
 // The imported templates to inject for the consumer dial (task 100.5.2/100.5.4). `all` injects the whole
 // shipped closure (whole-tree specialization). `edge` injects only the generics the consumer's own code
-// calls **directly**, plus the non-public callees those reach — so a nested public generic (one reached
-// only through another specialized body) stays on the erased witness path. The producer ships bodies with
-// their original visibility, so a `.public` template is a generic others may call directly while a
-// non-public one is a private callee that must travel with its caller. The direct-call scan reads the
-// consumer's own function bodies (origin-keyed call targets); a call from inside a type's method is not
-// scanned yet, so it conservatively stays erased under `edge`.
+// calls or names **directly**, plus the non-public callees and types those reach — so a nested public generic
+// (one reached only through another specialized body) stays on the erased witness path. The producer ships
+// bodies with their original visibility, so a `.public` template is a generic others may call directly while a
+// non-public one is a private callee that must travel with its caller. An exported type is one the consumer
+// already knows from the `.nmi`; it goes with its static functions. The direct-call scan reads the consumer's
+// own decls (origin-keyed call targets and type names).
 func selectForDial(_ templates: [ImportedTemplate], mode: MonoMode, consumer: NOIRModule) -> [ImportedTemplate] {
     guard mode != .none else { return [] }
     if mode == .all { return templates }
     func encoded(_ t: ImportedTemplate) -> String { ExternalName.encode(origin: t.origin, name: noirDeclName(t.decl)) }
+    let known = Set(consumer.decls.map(noirDeclName))
     // An "exported" template is one a consumer may call directly — `public` (cross-package) or `package`
     // (same-package, task 187.4.4); either seeds the edge dial. A sub-`package` template is a private callee,
     // pulled in only when a selected body reaches it.
     func isPublic(_ t: ImportedTemplate) -> Bool {
-        if case .funcDecl(let f) = t.decl { return f.visibility >= .package }
-        return false
+        switch t.decl {
+        case .funcDecl(let f):                     return f.visibility >= .package
+        case .structDecl, .classDecl, .enumDecl:   return known.contains(encoded(t))
+        case .actorDecl, .globalDecl:              return false
+        }
     }
     var byEncoded: [String: ImportedTemplate] = [:]
-    for t in templates { byEncoded[encoded(t)] = t }
-    // The generic names the consumer's own code calls directly (origin-keyed, as resolved in its NOIR).
+    var statics: [String: [String]] = [:]
+    for t in templates {
+        let key = encoded(t)
+        byEncoded[key] = t
+        if case .funcDecl = t.decl, let dot = key.lastIndex(of: "."), key[..<dot].contains("@") {
+            statics[String(key[..<dot]), default: []].append(key)
+        }
+    }
+    // The generic names the consumer's own code calls or names directly (origin-keyed, as resolved in its NOIR).
     var direct = Set<String>()
     for decl in consumer.decls { direct.formUnion(collectReferencedNames(decl)) }
 
     var selectedNames = Set<String>()
     var selected: [ImportedTemplate] = []
     var worklist: [ImportedTemplate] = []
-    for t in templates where isPublic(t) && direct.contains(encoded(t)) {
-        if selectedNames.insert(encoded(t)).inserted { selected.append(t); worklist.append(t) }
+    func select(_ key: String) {
+        guard let t = byEncoded[key], selectedNames.insert(key).inserted else { return }
+        selected.append(t); worklist.append(t)
+        for s in statics[key] ?? [] { select(s) }
     }
-    // Pull in the non-public callees the selected bodies reach (they cannot be erased-linked); leave a
+    for t in templates where isPublic(t) && direct.contains(encoded(t)) { select(encoded(t)) }
+    // Pull in the non-public callees and types the selected bodies reach (they cannot be erased-linked); leave a
     // referenced public generic un-injected so it stays on the witness path.
     while let t = worklist.popLast() {
-        for ref in collectReferencedNames(t.decl) {
-            guard let u = byEncoded[ref], !isPublic(u), selectedNames.insert(ref).inserted else { continue }
-            selected.append(u); worklist.append(u)
+        for ref in collectReferencedNames(t.decl).sorted() {
+            guard let u = byEncoded[ref], !isPublic(u) else { continue }
+            select(ref)
         }
     }
     return selected
@@ -219,45 +244,88 @@ func topDeclNames(_ program: Program) -> Set<String> {
     return names
 }
 
-// The decls a dependency ships in its `.bir` (tasks 100.5.1 / 100.5.4): its **public generic** free
-// functions, plus the transitive closure of **non-public** functions those bodies reach — the automatic
-// transitive closure (§100.5). A non-public callee is absent from the `.nmi` (interface-invisible), so the
-// consumer's Sema never sees it; shipping its body lets the consumer emit it locally (internal, origin-
-// keyed) under `--mono`. A public callee is left out: a public generic is already seeded here, and a public
-// non-generic links through the ordinary import path. `ownNames` excludes the prelude (pre-prelude
-// snapshot), so a prelude/builtin callee is never pulled in. Generic **types**/methods ride a later
-// 100.5.4 increment.
-func shippedTemplates(_ module: NOIRModule, ownNames: Set<String>) -> [NOIRDecl] {
-    // This module's own functions, by name, with their positions in `module.decls` (excludes prelude, which
-    // `ownNames` already filters out).
-    var ownFuncs: [String: NOIRDecl] = [:]
+// This module's own types not exported by its `.nmi` (below `package`): a shipped body that reaches one
+// ships its declaration, since no consumer can learn it otherwise.
+func privateTypeNames(_ program: Program) -> Set<String> {
+    var names = Set<String>()
+    for decl in program.decls {
+        switch decl {
+        case .structDecl(let s) where s.visibility < .package: names.insert(s.name)
+        case .classDecl(let c) where c.visibility < .package:  names.insert(c.name)
+        case .enumDecl(let e) where e.visibility < .package:   names.insert(e.name)
+        default: break
+        }
+    }
+    return names
+}
+
+// The decls a dependency ships in its `.bir` (tasks 100.5.1 / 100.5.4): its **public generic** functions and
+// types, plus the transitive closure of the **non-public** functions and types those reach — the automatic
+// transitive closure (§100.5). A type ships whole, with its methods and its static functions (`Box.make`), so
+// a consumer specializes them with it. A non-public callee or type is absent from the `.nmi` (interface-
+// invisible), so the consumer's Sema never sees it; shipping it lets the consumer emit it locally (internal,
+// origin-keyed) under `--mono`. A public callee is left out: a public generic is already seeded here, and a
+// public non-generic links through the ordinary import path. `ownNames` excludes the prelude (pre-prelude
+// snapshot), so a prelude/builtin callee is never pulled in.
+func shippedTemplates(_ module: NOIRModule, ownNames: Set<String>, privateTypes: Set<String>) -> [NOIRDecl] {
+    // This module's own functions and types, by name, with their positions in `module.decls` (excludes
+    // prelude, which `ownNames` already filters out), and each type's static functions.
+    var own: [String: NOIRDecl] = [:]
     var position: [String: Int] = [:]
+    var statics: [String: [String]] = [:]
     for (i, decl) in module.decls.enumerated() {
-        if case .funcDecl(let f) = decl, ownNames.contains(f.name) { ownFuncs[f.name] = decl; position[f.name] = i }
+        let name: String
+        switch decl {
+        case .funcDecl(let f):   name = f.name
+        case .structDecl(let s): name = s.name
+        case .classDecl(let c):  name = c.name
+        case .enumDecl(let e):   name = e.name
+        case .actorDecl, .globalDecl: continue
+        }
+        if ownNames.contains(name) {
+            own[name] = decl; position[name] = i
+        } else if case .funcDecl = decl, let dot = name.firstIndex(of: "."), ownNames.contains(String(name[..<dot])) {
+            own[name] = decl; position[name] = i
+            statics[String(name[..<dot]), default: []].append(name)
+        }
     }
     // An exported generic — `public` (cross-package) or `package` (same-package, task 187.4.4) — seeds the
-    // shipped `.bir` so a consumer that may call it specializes it; a sub-`package` generic ships only as a
+    // shipped `.bir` so a consumer that may call it specializes it; a sub-`package` one ships only as a
     // private callee of a seeded body. (A cross-package consumer never instantiates a `package` generic, so
-    // shipping it in the one `.bir` is harmless — it stays unspecialized there.)
+    // shipping it in the one `.bir` is harmless — it stays unspecialized there.) A static function goes with
+    // its type.
     func isPublic(_ decl: NOIRDecl) -> Bool {
-        if case .funcDecl(let f) = decl { return f.visibility >= .package }
-        return false
+        switch decl {
+        case .funcDecl(let f):   return f.visibility >= .package
+        case .structDecl(let s): return !privateTypes.contains(s.name)
+        case .classDecl(let c):  return !privateTypes.contains(c.name)
+        case .enumDecl(let e):   return !privateTypes.contains(e.name)
+        case .actorDecl, .globalDecl: return false
+        }
     }
     func isGeneric(_ decl: NOIRDecl) -> Bool {
-        if case .funcDecl(let f) = decl { return !f.generics.isEmpty }
-        return false
+        switch decl {
+        case .funcDecl(let f):   return !f.generics.isEmpty && !f.name.contains(".")
+        case .structDecl(let s): return !s.generics.isEmpty
+        case .classDecl(let c):  return !c.generics.isEmpty
+        case .enumDecl(let e):   return !e.generics.isEmpty
+        case .actorDecl, .globalDecl: return false
+        }
     }
     var shippedNames = Set<String>()
     var worklist: [NOIRDecl] = []
-    // Seed: every exported (`public`/`package`) generic function.
-    for (name, decl) in ownFuncs where isPublic(decl) && isGeneric(decl) {
-        shippedNames.insert(name); worklist.append(decl)
+    func ship(_ name: String) {
+        guard let decl = own[name], shippedNames.insert(name).inserted else { return }
+        worklist.append(decl)
+        for s in statics[name] ?? [] { ship(s) }
     }
-    // Close over the non-public functions the shipped bodies reach, transitively.
+    // Seed: every exported (`public`/`package`) generic function and type.
+    for (name, decl) in own.sorted(by: { $0.key < $1.key }) where isPublic(decl) && isGeneric(decl) { ship(name) }
+    // Close over the non-public functions and types the shipped decls reach, transitively.
     while let decl = worklist.popLast() {
         for ref in collectReferencedNames(decl) {
-            guard let callee = ownFuncs[ref], !isPublic(callee), shippedNames.insert(ref).inserted else { continue }
-            worklist.append(callee)
+            guard let callee = own[ref], !isPublic(callee) else { continue }
+            ship(ref)
         }
     }
     // In declaration order, so the `.bir` is the same bytes on every build.

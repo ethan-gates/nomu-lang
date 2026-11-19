@@ -83,22 +83,23 @@ public func interfaceToDecls(_ iface: ModuleInterface) -> [TopDecl] {
         out.append(.interfaceDecl(InterfaceDecl(name: p.name, refines: p.refines.map { Conformance(name: $0, span: zeroSpan) },
                                                 methods: methods, properties: props, visibility: .public, span: zeroSpan)))
     }
+    func conformances(_ names: [String]) -> [Conformance] { names.map { Conformance(name: $0, span: zeroSpan) } }
     for t in iface.types {
         let fields = t.fields.map(field)
         let methods = t.methods.compactMap(method) + t.methods.compactMap(staticMethod)
         let properties = t.properties.map(property)
         if t.keyword == "class" {
             out.append(.classDecl(ClassDecl(name: t.name, generics: generics(t.generics), fields: fields, properties: properties,
-                                            methods: methods, conformances: [], visibility: .public, span: zeroSpan)))
+                                            methods: methods, conformances: conformances(t.conformances), visibility: .public, span: zeroSpan)))
         } else {
             out.append(.structDecl(StructDecl(name: t.name, generics: generics(t.generics), fields: fields, properties: properties,
-                                              methods: methods, conformances: [], visibility: .public, span: zeroSpan)))
+                                              methods: methods, conformances: conformances(t.conformances), visibility: .public, span: zeroSpan)))
         }
     }
     for e in iface.enums {
         let cases = e.cases.map { EnumCaseDecl(name: $0.name, fields: $0.fields.map(field), span: zeroSpan) }
         out.append(.enumDecl(EnumDecl(name: e.name, generics: generics(e.generics), cases: cases, properties: e.properties.map(property),
-                                      methods: e.methods.compactMap(method) + e.methods.compactMap(staticMethod), conformances: [], visibility: .public, span: zeroSpan)))
+                                      methods: e.methods.compactMap(method) + e.methods.compactMap(staticMethod), conformances: conformances(e.conformances), visibility: .public, span: zeroSpan)))
     }
     // Free functions, generic included. A generic function reconstructs with its type parameters +
     // bounds so a consumer's call type-checks; it stays external (Sema marks it, never lowering its

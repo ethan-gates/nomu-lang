@@ -1,0 +1,13 @@
+package fun valueOr<T>(x: T, o: Option<Int>) -> Int {
+  switch o {
+  case .some(let v): return v
+  case .none: return -1
+  }
+}
+
+package fun wrapped<T>(o: Option<T>, fallback: T) -> T {
+  switch o {
+  case .some(let v): return v
+  case .none: return fallback
+  }
+}

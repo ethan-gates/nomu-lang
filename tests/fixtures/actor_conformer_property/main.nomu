@@ -1,0 +1,12 @@
+// A property requirement needs a value from the actor, which only receives messages.
+interface Sized {
+    var size: Int { get }
+}
+
+actor Server: Sized {
+    var size: Int = 0
+}
+
+fun main() {
+    let s = Server()
+}

@@ -107,6 +107,7 @@ public func lowerToSSAIR(_ module: NOIRModule, subsetFuncs: Set<String> = []) ->
                         interfaces: module.interfaces, conformances: module.conformances,
                         composites: module.composites, opaqueUnderlyings: module.opaqueUnderlyings)
     ssa.globals = orderStartupGlobals(globals, functions: ssa.functions, diags: diags) ?? globals
+    ssa.recipeNeeds = sink.recipeNeeds
     return SSAGenResult(module: ssa, diagnostics: diags)
 }
 

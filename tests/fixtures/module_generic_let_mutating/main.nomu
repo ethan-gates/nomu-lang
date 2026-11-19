@@ -1,0 +1,8 @@
+// A method that writes `self`, on an imported generic struct, called on a `let`, is an error.
+import pkg/lib
+
+fun main() {
+  let a = Box(v: "s", n: 0)
+  a.bump()
+  print(a.n)
+}

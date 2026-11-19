@@ -1,0 +1,112 @@
+// Closures, fibers and tasks in compiled-once bodies, across moving collections: the captured values and the values
+// passed through adapters hold heap strings and objects, and the loop allocates and parks.
+import pkg/lib
+
+class Box {
+    let n: Int
+    let text: String
+}
+
+class Counter {
+    var n: Int
+}
+
+struct Stone: Weighed {
+    let w: Int
+    fun weight() -> Int {
+        return w
+    }
+}
+
+fun heap(s: String) -> String {
+    return s.concat("-0123456789abcdefghijklmnopqrstuvwxyz")
+}
+
+fun main() {
+    var bad = 0
+    var i = 0
+    while i < 3000 {
+        let tag = heap("t")
+        let s = applyN(heap("a"), 3, { (v: String) -> String in
+            return v.concat("!")
+        })
+        if s.count != 41 {
+            bad = bad + 1
+        }
+        let k = constant(Box(n: i, text: heap("box")))
+        let keep = heap("churn")
+        if k().n != i || k().text.count != 40 || keep.count != 42 {
+            bad = bad + 1
+        }
+        let t = twice(i, { (v: Int) -> Int in
+            return v + 1
+        })
+        if t != i + 2 {
+            bad = bad + 1
+        }
+        let cell = Cell(value: heap("v"), fold: { (a: String, b: String) -> String in
+            return a.concat(b)
+        })
+        let f = cell.folder(tag)
+        if f().count != 76 {
+            bad = bad + 1
+        }
+        switch curried(Box(n: i + 1, text: tag))(Box(n: 0, text: "")) {
+        case .some(let b):
+            if b.n != i + 1 || b.text.count != 38 {
+                bad = bad + 1
+            }
+        case .none:
+            bad = bad + 1
+        }
+        let seen = Counter(n: 0)
+        eachTwice(Box(n: i, text: heap("each")), { (b: Box) in
+            if b.n == i && b.text.count == 41 {
+                seen.n = seen.n + 1
+            }
+        })
+        let into = sinkInto(cell)
+        into(heap("sunk"))
+        if seen.n != 2 || cell.value.count != 41 {
+            bad = bad + 1
+        }
+        let h = heavier(Stone(w: 3), Stone(w: i))
+        if h() != max(3, i) {
+            bad = bad + 1
+        }
+        switch boxed(heap("o"))() {
+        case .some(let o):
+            if o.count != 38 {
+                bad = bad + 1
+            }
+        case .none:
+            bad = bad + 1
+        }
+        if i % 100 == 0 {
+            if viaTask(heap("task")).count != 41 {
+                bad = bad + 1
+            }
+            let out = Channel<Box>.make(capacity: 1)
+            viaFiber(Box(n: i, text: heap("fiber")), out)
+            switch out.receive() {
+            case .some(let b):
+                if b.n != i || b.text.count != 42 {
+                    bad = bad + 1
+                }
+            case .none:
+                bad = bad + 1
+            }
+        }
+        i = i + 1
+    }
+    print("bad ")
+    print(bad)
+    print("\n")
+}
+
+fun max(a: Int, b: Int) -> Int {
+    if a > b {
+        return a
+    }
+    return b
+}

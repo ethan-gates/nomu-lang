@@ -18,6 +18,8 @@ reports `cpu ms`, the process's user plus system time, which shows what spinning
   pingpong_channel two fibers over unbuffered channels (ns per hop)
   stream_channel   one fiber streaming to another over a buffered channel of 64 (ns per value)
   fanin_channel    four senders to one receiver over a buffered channel of 64 (ns per value)
+  server_sim       a server on simulated I/O, batches of 8 light requests a millisecond (light request
+                   latency, ns); the `heavy` configuration makes every 100th request about 20 ms
 
 Usage:
   tools/schedbench.py [--iters N] [--carriers 1,2,4,8] [--configs a,b,...] [--workloads a,b,...]
@@ -46,6 +48,7 @@ CONFIGS = {
     "steal-10us": {"NOMU_SLOT_STEAL_NS": "10000"},
     "search-5us": {"NOMU_SEARCH_NS": "5000"},
     "search-50us": {"NOMU_SEARCH_NS": "50000"},
+    "heavy": {"HEAVY": "1"},
 }
 DEFAULT_CONFIGS = ["default", "no-slot"]
 
@@ -102,6 +105,12 @@ def mixed(out):
     return {"pair ms": r["pair_ns"] / 1e6, "compute ms": r["bg_ns"] / 1e6}
 
 
+def server_sim(out):
+    r = fields(out, "server_sim")[0]
+    return {"light p50 ns": r["p50"], "light p99 ns": r["p99"], "light max ns": r["max"],
+            "total ms": r["ns"] / 1e6}
+
+
 # name -> (build flags, metrics from its output)
 WORKLOADS = {
     "pingpong_fiber": (["--config=rt_prelude"], pingpong_fiber),
@@ -116,6 +125,7 @@ WORKLOADS = {
     "pingpong_channel": ([], per_hop("pingpong_channel")),
     "stream_channel": ([], per_hop("stream_channel")),
     "fanin_channel": ([], per_hop("fanin_channel")),
+    "server_sim": (["--config=rt_prelude"], server_sim),
 }
 
 

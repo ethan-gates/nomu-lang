@@ -26,6 +26,11 @@
 // Locks: a parker holds only the channel's lock, and its carrier releases it once the fiber's context is saved
 // (nomuSchedParkReleasing), so a waker, which must take that lock to find the fiber, cannot resume it early. A
 // waker readies the fiber under the scheduler lock after releasing the channel's, so the two are never nested.
+//
+// A send or receive whose value type the compiler knows takes the common case inline (`inlineChannelSend` and
+// `inlineChannelReceive` in the LLVM lowering): it takes the lock with one CAS, stores into a free slot or takes
+// a buffered value, and unlocks, and calls rtChanSend or rtChanReceive holding the lock for any other case. The
+// layouts above and the lock word's protocol are shared with that code.
 
 // Take the channel's lock. Its holder never blocks while holding it, so a contended lock is usually free within
 // a few hundred nanoseconds: spin on the word before sleeping in the futex mutex, as Go's runtime lock does. A
@@ -163,11 +168,15 @@ fun rtChanPark(sched: RawPtr, st: RawPtr, w: RawPtr, slot: RawPtr, vwt: RawPtr, 
 }
 
 // Send the value at `src` (a `vwt` value) on the channel `buf`. `w` is the caller's waiter, used if it blocks.
-fun rtChanSend(sched: RawPtr, buf: RawPtr, src: RawPtr, vwt: RawPtr, w: RawPtr, anchorSp: RawPtr,
+// `held` is 1 when the caller holds the channel's lock already: a specialized send takes it inline and stores
+// into a free slot itself, and comes here for every other case.
+fun rtChanSend(sched: RawPtr, buf: RawPtr, src: RawPtr, vwt: RawPtr, w: RawPtr, held: Int, anchorSp: RawPtr,
                anchorPc: Int) {
+  if held == 0 {
+    rtChanLock(rtChanState(buf))
+  }
   let st = rtChanState(buf)
   let size = rtChanSize(vwt)
-  rtChanLock(st)
   let closed: Int = st.load(fromByteOffset: 24)
   if closed != 0 {
     rtSchedMutexUnlockAt(st)
@@ -209,12 +218,15 @@ fun rtChanSend(sched: RawPtr, buf: RawPtr, src: RawPtr, vwt: RawPtr, w: RawPtr, 
 }
 
 // Receive into `dst` (zeroed by the caller, a `vwt` value). Returns 1 with a value, or 0 once the channel is
-// closed and drained, leaving `dst` zeroed.
-fun rtChanReceive(sched: RawPtr, buf: RawPtr, dst: RawPtr, vwt: RawPtr, w: RawPtr, anchorSp: RawPtr,
+// closed and drained, leaving `dst` zeroed. `held` is 1 when the caller holds the channel's lock already: a
+// specialized receive takes it inline and takes a buffered value itself when no sender is parked.
+fun rtChanReceive(sched: RawPtr, buf: RawPtr, dst: RawPtr, vwt: RawPtr, w: RawPtr, held: Int, anchorSp: RawPtr,
                   anchorPc: Int) -> Int {
+  if held == 0 {
+    rtChanLock(rtChanState(buf))
+  }
   let st = rtChanState(buf)
   let size = rtChanSize(vwt)
-  rtChanLock(st)
   let count: Int = st.load(fromByteOffset: 16)
   if count > 0 {
     let cap: Int = buf.load(fromByteOffset: 8)

@@ -66,7 +66,7 @@ func orderStartupGlobals(_ globals: [SSAGlobal], functions: [SSAFunction], diags
                            !call.typeArgs.isEmpty || call.args.contains(where: { passesCode($0.type) }) {
                             targets += addressTaken + allMethods
                         }
-                    case .witness(_, _, let method): targets += methodsByName[method] ?? []
+                    case .witness(_, _, let method), .staticWitness(_, _, let method): targets += methodsByName[method] ?? []
                     case .indirect: targets += addressTaken
                     }
                 case .fiber(let startFn, _, _): targets.append(startFn)

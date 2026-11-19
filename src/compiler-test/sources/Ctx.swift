@@ -8,7 +8,7 @@ import Foundation
 let USAGE = """
     usage: compiler-test <manifest> [--enable a,b,*] [--disable a,b,*] [--where axis=value,…] [--tier fast|full]
                          [--repeat N] [--compiler PATH] [--deadline SEC] [--jobs N] [--check-reproducible]
-                         [--run-setting name=value]
+                         [--run-setting name=value] [--compile-setting name=value]
 
     manifest         the manifest directory, e.g. tests/suite (required)
     --enable LIST    run only these cases (base becomes empty, then these are added)
@@ -21,6 +21,10 @@ let USAGE = """
     --jobs N         pool capacity in cores (default: host cores − 2)
     --run-setting S  add a run setting (name=value, as in a manifest's run_settings) to every run, over the
                      case's own; repeatable. E.g. `--run-setting stack_move=1` runs the suite moving stacks.
+    --compile-setting S
+                     add a compile setting (as in a manifest's compile_settings) to every build, after the
+                     case's own; repeatable. E.g. `--compile-setting mono=none --compile-setting optimize=true`
+                     builds the selection compiled once and optimized.
     --check-reproducible
                      instead of compiling and running, build the selection twice from clean (the second
                      time at other source and cache paths) and compare the outputs byte for byte
@@ -47,6 +51,7 @@ struct Ctx {
     let cases: [ResolvedCase]
     let checkReproducible: Bool   // run the reproducibility sweep instead of the suite (`--check-reproducible`)
     let extraRunEnv: [String: String]   // `--run-setting`s, lowered: added to every run's environment
+    let extraCompileArgs: [String]      // `--compile-setting`s, lowered: added to every build's arguments
 
     // The tier's cases; base = all of them, or empty if --enable was given; add --enable; remove --disable;
     // keep only group runs matching every --where.
@@ -61,7 +66,7 @@ struct Ctx {
 
     // Whether the selection is the whole tier (no name or dimension filter): only then does a run rewrite
     // the persisted order.
-    var selectsWholeTier: Bool { enableList.isEmpty && disableList.isEmpty && whereList.isEmpty && extraRunEnv.isEmpty }
+    var selectsWholeTier: Bool { enableList.isEmpty && disableList.isEmpty && whereList.isEmpty && extraRunEnv.isEmpty && extraCompileArgs.isEmpty }
 
     // Where a configuration's binary is kept: each (fixture, compile settings) gets its own directory under
     // `build/compiler-test/`, so builds of one fixture under different settings never share a path. The
@@ -109,6 +114,7 @@ struct Ctx {
         var jobs: Int? = nil   // pool capacity override; default derives from host cores below
         var checkReproducible = false
         var runSettings: Settings = [:]
+        var compileSettings: Settings = [:]
 
         func parseValued(_ flag: String, _ v: String) {
             switch flag {
@@ -118,12 +124,12 @@ struct Ctx {
                     guard parts.count == 2 else { die("--where takes axis=value, got '\(item)'") }
                     whereList.append((parts[0], parts[1]))
                 }
-            case "--run-setting":
+            case "--run-setting", "--compile-setting":
                 let parts = v.split(separator: "=", maxSplits: 1).map(String.init)
-                guard parts.count == 2 else { die("--run-setting takes name=value, got '\(v)'") }
+                guard parts.count == 2 else { die("\(flag) takes name=value, got '\(v)'") }
                 let value: SettingValue = parts[1] == "true" ? .bool(true) : parts[1] == "false" ? .bool(false)
                     : Int(parts[1]).map { .int($0) } ?? .string(parts[1])
-                runSettings[parts[0]] = value
+                if flag == "--run-setting" { runSettings[parts[0]] = value } else { compileSettings[parts[0]] = value }
             case "--tier":
                 guard let t = Tier(rawValue: v) else { die("--tier takes fast or full") }
                 tier = t
@@ -149,11 +155,11 @@ struct Ctx {
             case "--disable":
                 i += 1; guard i < argv.count else { die("--disable needs a list") }
                 disableList += splitList(argv[i])
-            case "--where", "--tier", "--repeat", "--compiler", "--run-setting":
+            case "--where", "--tier", "--repeat", "--compiler", "--run-setting", "--compile-setting":
                 i += 1; guard i < argv.count else { die("\(a) needs a value") }
                 parseValued(a, argv[i])
             case let f where f.hasPrefix("--where=") || f.hasPrefix("--tier=") || f.hasPrefix("--repeat=")
-                || f.hasPrefix("--compiler=") || f.hasPrefix("--run-setting="):
+                || f.hasPrefix("--compiler=") || f.hasPrefix("--run-setting=") || f.hasPrefix("--compile-setting="):
                 let eq = f.firstIndex(of: "=")!
                 parseValued(String(f[..<eq]), String(f[f.index(after: eq)...]))
             case "--deadline":
@@ -190,7 +196,12 @@ struct Ctx {
         // weights never oversubscribes the CPU — oversubscription starves the cooperative scheduler/STW and
         // wedges a run. `--jobs` overrides.
         let capacity = jobs ?? max(1, ProcessInfo.processInfo.activeProcessorCount - 2)
-        let cases = manifest.resolvedCases(capacity: capacity, projectRoot: root, tier: tier)
+        let extraCompileArgs = lower(compileSettings, at: .compile, in: "--compile-setting").args
+        let cases = manifest.resolvedCases(capacity: capacity, projectRoot: root, tier: tier).map { c in
+            var c = c
+            c.compileArgs += extraCompileArgs
+            return c
+        }
         let axes = Set(manifest.dimensions?.keys.map { $0 } ?? [])
         for (axis, value) in whereList {
             guard axes.contains(axis) else { die("--where: unknown dimension '\(axis)'") }
@@ -202,7 +213,7 @@ struct Ctx {
                    repeatCount: repeatCount, deadline: deadline * Double(repeatCount),
                    poolCapacity: capacity, configPath: configPath, manifest: manifest, projectRoot: root,
                    nomu: resolveNomu(projectRoot: root, override: compiler), cases: cases, checkReproducible: checkReproducible,
-                   extraRunEnv: lower(runSettings, at: .run, in: "--run-setting").env)
+                   extraRunEnv: lower(runSettings, at: .run, in: "--run-setting").env, extraCompileArgs: extraCompileArgs)
     }
 }
 

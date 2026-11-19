@@ -43,7 +43,7 @@ Inference is **bidirectional** — from argument types and from return/context. 
 ## 4. Checking
 
 - **Modular checking against declared bounds.** — Decided (2026-07-20). A generic body is checked **once** against exactly what its bounds promise, nothing about any particular instantiation. This is what keeps witness-passing, monomorphization, and future GC value-witness stenciling all reachable from one checked body (§12).
-- **Bound satisfaction uses all checked conformances.** A `<T: I>` bound is satisfied by any type that conforms to `I` — including an `I` that is constraint-only (`Self`-mentioning). Such bounds compile because monomorphization specializes them to a concrete `T` (§6); no witness for a constraint-only interface is required. So `<T: Cloneable>` and `<T: Combinable>` both work. (Constraint-only / covariant-`Self` legality is defined in `interfaces.md`.)
+- **Bound satisfaction uses all checked conformances.** A `<T: I>` bound is satisfied by any type that conforms to `I` — including an `I` that is constraint-only (`Self`-mentioning). Such bounds compile both specialized (§6) and compiled once, where a constraint-only interface has a compiled-once witness table and no `any I` one. So `<T: Cloneable>` and `<T: Combinable>` both work. (Constraint-only / covariant-`Self` legality is defined in `interfaces.md`.)
 - **Assignment/return/binding annotations are checked.** A `Box<Int>` is not assignable to a `Box<String>` binding/return/target; the mismatch is a clean local error (generic instantiations are distinct types even though they share one runtime representation pre-mono).
 
 ---

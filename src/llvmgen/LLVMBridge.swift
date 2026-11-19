@@ -158,6 +158,7 @@ private func emitObjectAttempt(_ ssa: SSAModule, from noirModule: NOIRModule, to
     egress.e.weakOriginFiles = weakOriginFiles
     egress.e.emitsTypeMaps = emitTypeMaps
     egress.e.homeModule = homeModule
+    egress.e.externalMutatingMethods = noirModule.externalMutatingMethods
     egress.e.dependencyModules = dependencyModules
     egress.e.isRuntimePackage = isRuntimePackage
     egress.e.emitsProcessEntry = requireMain

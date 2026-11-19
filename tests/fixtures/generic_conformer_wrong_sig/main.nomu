@@ -1,0 +1,15 @@
+// A generic type's conformance is checked on its template: `val` returns `T`, where the requirement returns `Int`.
+interface Valued {
+    fun val() -> Int
+}
+
+struct Holder<T>: Valued {
+    let item: T
+    fun val() -> T {
+        return item
+    }
+}
+
+fun main() {
+    print(Holder(item: 3).item)
+}

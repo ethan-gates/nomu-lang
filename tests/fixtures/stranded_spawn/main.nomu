@@ -1,0 +1,73 @@
+import std/time
+
+// Ready work stranded behind running fibers (task 235.9). `main` starts NOMU_CARRIERS - 1 fibers that compute
+// until a flag is set, then a late fiber that sets it, then parks in its joins. A carrier that steals part of
+// `main`'s queue while searching must wake another for the rest: otherwise the late fiber waits behind a
+// running fiber while the other carriers sleep, until their 1 s idle timeout. Each busy fiber gives up after
+// 400 ms and counts that; prints 0 when none gave up. Built with the runtime prelude (`rt_prelude`).
+//
+// Shared state (off-heap): 0 the flag · 8 busy fibers that gave up.
+
+fun spin(work: Int, seed: Int) -> Int {
+    var x = seed
+    var i = 0
+    while i < work {
+        x = x * 6364136223846793005 + 1442695040888963407
+        i += 1
+    }
+    return x
+}
+
+fun busy(st: RawPtr, me: Int) -> Int {
+    let deadline = Time().now + 400000000
+    var acc = me
+    var go = true
+    while go {
+        if st.atomicLoad(fromByteOffset: 0) != 0 {
+            go = false
+        } else if Time().now > deadline {
+            st.atomicFetchAdd(1, atByteOffset: 8)
+            go = false
+        } else {
+            acc = acc + spin(work: 10000, seed: acc)
+        }
+    }
+    return acc
+}
+
+fun late(st: RawPtr) -> Int {
+    st.atomicStore(1, toByteOffset: 0)
+    return 0
+}
+
+// Start `k` busy fibers, then the late one; join them all.
+fun spawn(st: RawPtr, k: Int) -> Int {
+    if k == 0 {
+        let l = task late(st: st)
+        return l.join()
+    }
+    let w = task busy(st: st, me: k)
+    let rest = spawn(st: st, k: k - 1)
+    return rest + w.join()
+}
+
+fun envCarriers() -> Int {
+    let name = RawPtr.alloc(bytes: 32, align: 8)
+    return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_CARRIERS")), 1)
+}
+
+fun main() {
+    let st = RawPtr.alloc(bytes: 16, align: 8)
+    st.atomicStore(0, toByteOffset: 0)
+    st.atomicStore(0, toByteOffset: 8)
+    var n = envCarriers() - 1
+    if n < 1 {
+        n = 1
+    }
+    let sink = spawn(st: st, k: n)
+    if sink == 42 {
+        print("\n")
+    }
+    print(st.atomicLoad(fromByteOffset: 8))
+    print("\n")
+}

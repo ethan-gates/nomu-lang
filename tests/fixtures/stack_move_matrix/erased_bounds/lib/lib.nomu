@@ -1,0 +1,100 @@
+// Bounded generics across a module boundary: conformers declared here and used by the consumer, a generic type
+// conforming, a bound on a generic class dispatched on its field, and a requirement read as a `String` property.
+package interface Valued {
+    fun val() -> Int
+    var label: String { get }
+}
+
+package interface Scaled: Valued {
+    fun scale() -> Int
+}
+
+package struct Coin: Valued {
+    let n: Int
+    let label: String
+    fun val() -> Int {
+        return n
+    }
+}
+
+package class Purse: Scaled {
+    var coins: Array<Coin>
+    let label: String
+    fun val() -> Int {
+        var s = 0
+        var i = 0
+        while i < coins.count {
+            s = s + coins[i].val()
+            i = i + 1
+        }
+        return s
+    }
+    fun scale() -> Int {
+        return 10
+    }
+}
+
+package enum Tier: Valued {
+    case low
+    case high(boost: Int)
+    fun val() -> Int {
+        switch self {
+        case .low:
+            return 1
+        case .high(let boost):
+            return 100 + boost
+        }
+    }
+    // A computed property satisfying the requirement.
+    var label: String {
+        switch self {
+        case .low:
+            return "low"
+        case .high(let boost):
+            return "high"
+        }
+    }
+}
+
+// A generic type conforming, with a bound of its own.
+package struct Pair<T: Valued>: Valued {
+    let a: T
+    let b: T
+    let label: String
+    fun val() -> Int {
+        return a.val() + b.val()
+    }
+}
+
+// A bound on a generic class, dispatched on its `T` field.
+package class Ref<T: Valued> {
+    var item: T
+    fun total() -> Int {
+        return item.val()
+    }
+    fun named() -> String {
+        return item.label.concat("!")
+    }
+}
+
+package fun twice<T: Valued>(x: T) -> Int {
+    return x.val() * 2
+}
+
+package fun labelOf<T: Valued>(x: T) -> String {
+    return x.label
+}
+
+package fun scaled<T: Scaled>(x: T) -> Int {
+    return x.val() * x.scale()
+}
+
+package fun sumAll<T: Valued>(xs: Array<T>) -> Int {
+    var s = 0
+    var i = 0
+    while i < xs.count {
+        s = s + xs[i].val()
+        i = i + 1
+    }
+    return s
+}

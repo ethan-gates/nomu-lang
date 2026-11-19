@@ -1,0 +1,21 @@
+// Interfaces an actor conforms to through its handlers, and generic code calling them compiled once.
+package interface Sink {
+    fun put(x: Int)
+}
+
+package interface Tagged {
+    fun tag(label: String, n: Int)
+}
+
+package fun feedAll<T: Sink>(s: T, n: Int) {
+    var i = 0
+    while i < n {
+        s.put(x: i)
+        i = i + 1
+    }
+}
+
+package fun tagTwice<T: Tagged>(t: T, label: String) {
+    t.tag(label: label, n: 1)
+    t.tag(label: label.concat("!"), n: 2)
+}

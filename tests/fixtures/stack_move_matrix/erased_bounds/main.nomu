@@ -1,0 +1,74 @@
+// Bounded generics across a module boundary, across moving collections: conformers from the library and from here,
+// compiled-once and specialized callers, and the values boxed as `any`; the labels are heap strings.
+import pkg/lib
+
+// One field, a `String`: the struct lowers to the string itself.
+struct Square: Valued {
+    var label: String
+    fun val() -> Int {
+        return 4
+    }
+}
+
+// A generic type conforming here.
+struct Holder<T>: Valued {
+    let item: T
+    let label: String
+    fun val() -> Int {
+        return 7
+    }
+}
+
+fun heap(s: String) -> String {
+    return s.concat("-0123456789abcdefghijklmnopqrstuvwxyz")
+}
+
+fun localTwice<T: Valued>(x: T) -> Int {
+    return x.val() * 2
+}
+
+fun localLabel<T: Valued>(x: T) -> String {
+    return x.label.concat("+")
+}
+
+fun main() {
+    var bad = 0
+    var i = 0
+    while i < 2000 {
+        let coin = Coin(n: 3, label: heap("coin"))
+        if twice(coin) != 6 || localTwice(coin) != 6 { bad = bad + 1 }
+        if !labelOf(coin).eq(heap("coin")) || !localLabel(coin).eq(heap("coin").concat("+")) { bad = bad + 1 }
+        let purse = Purse(coins: [coin, Coin(n: 5, label: heap("five"))], label: heap("purse"))
+        if twice(purse) != 16 || scaled(purse) != 80 || !labelOf(purse).eq(heap("purse")) { bad = bad + 1 }
+        if twice(Tier.high(boost: i)) != 2 * (100 + i) || !labelOf(Tier.low).eq("low") { bad = bad + 1 }
+        let pair = Pair(a: coin, b: Coin(n: 9, label: heap("nine")), label: heap("pair"))
+        if twice(pair) != 24 || localTwice(pair) != 24 || !labelOf(pair).eq(heap("pair")) { bad = bad + 1 }
+        let sq = Square(label: heap("sq"))
+        if twice(sq) != 8 || !labelOf(sq).eq(heap("sq")) || !localLabel(sq).eq(heap("sq").concat("+")) { bad = bad + 1 }
+        let h = Holder(item: heap("held"), label: heap("holder"))
+        if twice(h) != 14 || localTwice(h) != 14 || !labelOf(h).eq(heap("holder")) { bad = bad + 1 }
+        let r = Ref(item: coin)
+        if r.total() != 3 || !r.named().eq(heap("coin").concat("!")) { bad = bad + 1 }
+        let rs = Ref(item: sq)
+        if rs.total() != 4 || !rs.named().eq(heap("sq").concat("!")) { bad = bad + 1 }
+        if sumAll([coin, coin, coin]) != 9 || sumAll([sq, sq]) != 8 { bad = bad + 1 }
+        let b0: any Valued = coin
+        let b1: any Valued = purse
+        let b2: any Valued = Tier.high(boost: 1)
+        let b3: any Valued = pair
+        let b4: any Valued = h
+        let b5: any Valued = sq
+        let boxes: Array<any Valued> = [b0, b1, b2, b3, b4, b5]
+        var sum = 0
+        var j = 0
+        while j < boxes.count {
+            sum = sum + boxes[j].val()
+            j = j + 1
+        }
+        if sum != 3 + 8 + 101 + 12 + 7 + 4 || !boxes[5].label.eq(heap("sq")) || !boxes[1].label.eq(heap("purse")) { bad = bad + 1 }
+        i = i + 1
+    }
+    print("bad ")
+    print(bad)
+    print("\n")
+}

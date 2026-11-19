@@ -1,0 +1,111 @@
+import std/time
+
+// Time to stop the world beside running fibers (task 236.1.2). A driver fiber requests a minor collection
+// every 2 ms, 100 times, while busy fibers run on the other carriers; the collector's recorder (built with
+// `--config=gc_record`) measures each request's time to safepoint, from the request to every carrier stopped.
+// STOP_MODE picks what the busy fibers run:
+//   0  call-free loops, which reach a poll every iteration (the case polls cover)
+//   1  recursion with no loop and no allocation, which reaches no poll inside it (the gap 236.4 closes); the
+//      loop around it polls, since the recursion reaches no stop, so a stop waits out one call
+// Run on two or more carriers: NOMU_CARRIERS - 1 busy fibers, the driver on the remaining carrier. Built with
+// the runtime prelude (`--config=rt_prelude`). Prints `stop_latency mode <m> busy <n> requests <k> ns <total>`.
+
+fun spin(work: Int, seed: Int) -> Int {
+    var x = seed
+    var i = 0
+    while i < work {
+        x = x * 6364136223846793005 + 1442695040888963407
+        i += 1
+    }
+    return x
+}
+
+fun fib(n: Int) -> Int {
+    if n < 2 {
+        return n
+    }
+    return fib(n: n - 1) + fib(n: n - 2)
+}
+
+// Busy until the driver is done; each round is about 1 ms in one call.
+fun busy(mode: Int, done: RawPtr, me: Int) -> Int {
+    var acc = me
+    var rounds = 0
+    while done.atomicLoad(fromByteOffset: 0) == 0 {
+        if mode == 0 {
+            acc = acc + spin(work: 1000000, seed: acc)
+        } else {
+            acc = acc + fib(n: 27)
+        }
+        rounds += 1
+    }
+    return acc + rounds
+}
+
+// Start `k` busy fibers and join them.
+fun spawnBusy(k: Int, mode: Int, done: RawPtr) -> Int {
+    if k == 0 {
+        return 0
+    }
+    let w = task busy(mode: mode, done: done, me: k)
+    let rest = spawnBusy(k: k - 1, mode: mode, done: done)
+    return rest + w.join()
+}
+
+// Wait for a requested collection, stopping at this loop's poll.
+fun awaitCollection(ticket: Int) -> Int {
+    var spins = 0
+    while !rtGcCollected(ticket) {
+        spins += 1
+    }
+    return spins
+}
+
+fun driver(done: RawPtr, requests: Int) -> Int {
+    var spins = 0
+    var i = 0
+    while i < requests {
+        sleep(2)
+        spins += awaitCollection(ticket: rtGcRequest(1))
+        i += 1
+    }
+    done.atomicStore(1, toByteOffset: 0)
+    return spins
+}
+
+fun envMode() -> Int {
+    let name = RawPtr.alloc(bytes: 32, align: 8)
+    return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "STOP_MODE")), 0)
+}
+
+fun envCarriers() -> Int {
+    let name = RawPtr.alloc(bytes: 32, align: 8)
+    return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_CARRIERS")), 1)
+}
+
+fun main() {
+    let mode = envMode()
+    var nbusy = envCarriers() - 1
+    if nbusy < 1 {
+        nbusy = 1
+    }
+    let requests = 100
+    let done = RawPtr.alloc(bytes: 8, align: 8)
+    done.atomicStore(0, toByteOffset: 0)
+    let start = Time().now
+    let d = task driver(done: done, requests: requests)
+    let sink = spawnBusy(k: nbusy, mode: mode, done: done) + d.join()
+    let ns = Time().now - start
+    if sink == 42 {
+        print("\n")
+    }
+    print("stop_latency mode ")
+    print(mode)
+    print(" busy ")
+    print(nbusy)
+    print(" requests ")
+    print(requests)
+    print(" ns ")
+    print(ns)
+    print("\n")
+}

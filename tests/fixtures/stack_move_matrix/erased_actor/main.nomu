@@ -1,0 +1,84 @@
+// Actor conformers, across moving collections: a call through a bound, compiled once in the library and specialized
+// here, through `any` and a composition, and with a `Self` parameter, is a send. One sender's messages run in order,
+// so the actor checks the total in a last message. The labels are heap strings (over 15 bytes), queued while
+// collections move them.
+import pkg/lib
+
+interface Loud: Sink {
+    fun shout(expected: Int)
+}
+
+interface Peer {
+    fun meet(other: Self)
+}
+
+actor Counter: Loud, Tagged, Peer {
+    var count: Int = 0
+    var letters: Int = 0
+    on put(x: Int) {
+        count += x
+    }
+    on tag(label: String, n: Int) {
+        count += n
+        letters += label.count
+    }
+    on meet(other: Counter) {
+        count += 7
+    }
+    on shout(expected: Int) {
+        var bad = 0
+        if count != expected { bad = bad + 1 }
+        if letters != 4000 * 61 { bad = bad + 1 }
+        print("bad ")
+        print(bad)
+        print("\n")
+    }
+}
+
+// A struct holding an actor, conforming for it by hand.
+struct Forward: Sink {
+    let to: Counter
+    fun put(x: Int) {
+        to.put(x: x * 2)
+    }
+}
+
+fun heap(s: String) -> String {
+    return s.concat("")
+}
+
+fun localFeed<T: Sink>(s: T) {
+    s.put(x: 3)
+}
+
+fun greet<T: Peer>(a: T, b: T) {
+    a.meet(b)
+}
+
+fun main() {
+    let c = Counter()
+    var expected = 0
+    var i = 0
+    while i < 4000 {
+        feedAll(c, 4)
+        localFeed(c)
+        tagTwice(c, heap("abcdefghijklmnopqrst"))
+        greet(c, c)
+        let both: any Sink & Tagged = c
+        both.put(x: 1)
+        both.tag(label: heap("uvwxyzABCDEFGHIJKLMN"), n: 0)
+        let s: any Sink = c
+        s.put(x: i)
+        feedAll(Forward(to: c), 2)
+        expected = expected + 6 + 3 + 3 + 7 + 1 + i + 2
+        // Short-lived garbage, so the nursery fills while messages wait in the mailbox.
+        var g = 0
+        while g < 12 {
+            if heap("a string long enough for the heap").count != 33 { expected = expected + 1 }
+            g = g + 1
+        }
+        i = i + 1
+    }
+    let l: any Loud = c
+    l.shout(expected)
+}

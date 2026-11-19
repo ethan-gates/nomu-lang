@@ -1,0 +1,19 @@
+// `main` imports only `mid`; specialized, `mid`'s bodies bring `base`'s functions and types with them.
+import pkg/mid
+
+fun main() {
+  var i = 0
+  var bad = 0
+  while i < 3000 {
+    if reach(i, 3) != 3 + 25 + 26 + 4 + 23 {
+      bad = bad + 1
+    }
+    if reach("s".concat("-a-heap-string-value"), 2) != 2 + 25 + 26 + 3 + 23 {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

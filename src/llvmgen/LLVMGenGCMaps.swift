@@ -300,12 +300,8 @@ extension LLVMGen {
         if let id = enumShapeIds[name] { return id }
         var cases: [(tag: Int32, flat: [Int32], shaped: [(offset: Int32, shapeId: UInt64)])] = []
         for c in shapeCases {
-            // A nested enum-in-enum payload would alias the enumerator's recursion scratch; fail-stop rather
-            // than scan it unsoundly (task 176.3b — the deferred half).
-            if c.shape.conditional.contains(where: { if case .enumCases = $0.kind { return true }; return false }) {
-                fail("176.3b: an enum payload that itself contains a managed enum (\(name)) is not yet supported", zeroSpan)
-                continue
-            }
+            // A payload holding an enum with a tag of its own records it as a sub-descriptor, which the runtime's
+            // enumerator recurses into (`runtime/descriptors.nomu`).
             let d = descriptorEntries(c.shape)
             cases.append((tag: Int32(c.tag), flat: d.offsets, shaped: d.shaped))
         }

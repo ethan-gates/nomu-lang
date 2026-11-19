@@ -14,4 +14,5 @@ final class ClosureSink {
     var lifted: [SSAFunction] = []
     var envAggregates: [SSAAggregate] = []
     var nextId = 0
+    var recipeNeeds: [(symbol: String, need: DictionaryNeed)] = []   // compiled-once bodies' environments and entries
 }

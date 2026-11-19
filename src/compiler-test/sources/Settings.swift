@@ -31,10 +31,11 @@ enum SettingValue: Decodable, Equatable {
 typealias Settings = [String: SettingValue]
 
 // How a setting reaches its stage. `configWhen`: the config selected when the value equals the given
-// boolean. `envWhen`: the variable set to `1` when the value equals the given boolean. `envValue`: the
-// variable set to the value.
+// boolean. `configChoice`: the config named by a prefix and the value, one of the given choices. `envWhen`:
+// the variable set to `1` when the value equals the given boolean. `envValue`: the variable set to the value.
 enum Carrier {
     case configWhen(Bool, String)
+    case configChoice(String, [String])
     case envWhen(Bool, String)
     case envValue(String)
 }
@@ -49,6 +50,8 @@ let settingTable: [String: SettingDef] = [
     // Compile settings.
     "optimize":           SettingDef(stage: .compile, carrier: .configWhen(true, "release"),
                                      help: "release pipeline (LLVM -O2)"),
+    "mono":               SettingDef(stage: .compile, carrier: .configChoice("mono_", ["none", "edge", "all"]),
+                                     help: "which generics are specialized: none (compiled once), edge or all (`opt.mono`)"),
     "inline":             SettingDef(stage: .compile, carrier: .configWhen(false, "no_inline"),
                                      help: "SSAIR inlining (default on)"),
     "escape":             SettingDef(stage: .compile, carrier: .configWhen(false, "no_escape"),
@@ -123,6 +126,11 @@ func lower(_ settings: Settings, at stage: Stage, in owner: String) -> (args: [S
         case .configWhen(let when, let config):
             guard case .bool(let b) = value else { die("\(owner): '\(name)' takes true or false") }
             if b == when { args.append("--config=" + config) }
+        case .configChoice(let prefix, let choices):
+            guard case .string(let v) = value, choices.contains(v) else {
+                die("\(owner): '\(name)' takes one of \(choices.joined(separator: ", "))")
+            }
+            args.append("--config=" + prefix + v)
         case .envWhen(let when, let variable):
             guard case .bool(let b) = value else { die("\(owner): '\(name)' takes true or false") }
             if b == when { env[variable] = "1" }

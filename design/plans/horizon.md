@@ -34,17 +34,20 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 127  LXR — RC-primary reclamation, on Immix backing; then the GenImmix–LXR comparison   ◀ end goal
 └── benchmark against Go and Swift, on GenImmix (when the language is complete)
     │   Language functionality first, in this order:
-    ├── 253  finish generics — owns 171's residuals and 251's remainder (251.2.4: closures and `task` in
-    │        compiled-once bodies), with 170 and 118 to design  ◀ next
-    ├── 236  fiber preemption — take a carrier back from a computing fiber
-    │        couples with 104 (the entry check)
+    ├── 253  finish generics — done; compiled-once performance moved to 268, language features to 269
+    ├── 236  fiber preemption — take a carrier back from a computing fiber  ◀ next
+    │   │    couples with 104 (the entry check)
+    │   ├── 245  loop strip mining — 236.2: polls out of the loops the optimizer sees (29% on array loops)
+    │   └── 270  calls into C as stops — 236.6: the in-C state, carrier handoff
     ├── 237  handoff primitives — a direct switch, handoffs marked by the compiler (needs design; syntax or API to agree)
     ├── 194  GC frame metadata — decided: extended statepoints (epic: 239–244, 247)
     │   └── 247  frame table — F2, built at link time
+    ├── 269  generic language features — a method's own type parameters, associated types, operators as
+    │        requirements (each needs design and agreement)
     │   Then the performance work:
     ├── 254  scheduler performance — the gaps 235 left: wake churn, the one-carrier cost, fan-in across carriers
     │        254.4 (switch follow-ups from 250), 254.5 (from 104.5); waits on 236 and 237
-    ├── 245  loop strip mining — polls out of the loops the optimizer sees (29% on array loops)
+    ├── 268  compiled-once performance — a benchmark set first, then the dictionary, buffers and barriers
     ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
     │        complements 179 (value-level GC classification)
     ├── 262  collector gaps — GenImmix against Go: promotion, large objects, the header log bit, parallel
@@ -58,8 +61,8 @@ binary-trees at depth 21, which crashed, runs in 3.1 s at 445 MB against Go's 5.
 enum layout ([260](tasks/260-enum-layout.md)) took a node from 40 bytes to 24 and
 [262](tasks/262-collector-gaps.md) (collector gaps, paused at 262.5.3) took 4.3 s to 3.1. Richards runs 693 ms
 against Go's 486. 262 compares compilers through [257](tasks/257-toolchain-version-manager.md)'s snapshots.
-Next is
-[253](tasks/253-finish-generics.md) (finish generics). Finished on this chain: 230,
+[253](tasks/253-finish-generics.md) (finish generics) is done; next is [236](tasks/236-fiber-preemption.md)
+(preemption). Finished on this chain: 253, 230,
 [159](tasks/159-gc-observability.md) (GC observability), [246](tasks/246-raw-pointers-into-managed-memory.md)
 (raw pointers recorded with their base), [235](tasks/235-scheduler-run-queues.md) (per-carrier run queues),
 [250](tasks/250-fiber-task-surface.md) (the fiber and task surface) and
@@ -70,10 +73,13 @@ Next is
 
 **Order of the next run:** language functionality before performance work, so the benchmark measures the
 language as designed and tuning is not redone after features land. Functionality:
-[253](tasks/253-finish-generics.md) (finish generics), [236](tasks/236-fiber-preemption.md) (preemption),
+[236](tasks/236-fiber-preemption.md) (preemption, with [245](tasks/245-loop-strip-mining.md), strip mining, and
+[270](tasks/270-c-calls-as-stops.md), calls into C as stops, as its prerequisites),
 [237](tasks/237-handoff-primitives.md) (handoff primitives, once its primitive is decided), then
-[194](tasks/194-gc-frame-metadata.md)'s implementation. Performance: [254](tasks/254-scheduler-performance.md),
-which tunes the paths 236 and 237 change, then [245](tasks/245-loop-strip-mining.md),
+[194](tasks/194-gc-frame-metadata.md)'s implementation, and [269](tasks/269-generic-language-features.md)'s
+features as each is agreed. Performance: [254](tasks/254-scheduler-performance.md),
+which tunes the paths 236 and 237 change, then
+[268](tasks/268-compiled-once-performance.md),
 [182](tasks/182-cross-module-inlining.md) and [262](tasks/262-collector-gaps.md). All come before the benchmark
 against Go and Swift.
 [194](tasks/194-gc-frame-metadata.md) is decided (extended statepoints) and its implementation,

@@ -1,0 +1,36 @@
+// A leading-dot enum argument to a generic function reads its type from the parameter, as far as the other
+// arguments and the expected type have bound it: a concrete `Option<Int>`, an `Option<T>` whose `T` a later
+// argument binds, and one the call's expected type binds. Local and imported.
+import pkg/lib
+
+fun same<T>(o: Option<T>) -> Option<T> {
+  return o
+}
+
+fun count<T>(x: T, o: Option<Int>) -> Int {
+  switch o {
+  case .some(let v): return v
+  case .none: return 0
+  }
+}
+
+fun main() {
+  print(count("s", .some(value: 2)))
+  print(" ")
+  print(count(1, .none))
+  print(" ")
+  let o: Option<Int> = same(.none)
+  switch o {
+  case .some(let v): print(v)
+  case .none: print("none")
+  }
+  print(" ")
+  print(valueOr(1, .some(value: 3)))
+  print(" ")
+  print(valueOr("x", .none))
+  print(" ")
+  print(wrapped(.some(value: 7), 0))
+  print(" ")
+  print(wrapped(.none, 8))
+  print("\n")
+}

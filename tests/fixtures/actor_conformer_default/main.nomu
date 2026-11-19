@@ -1,0 +1,18 @@
+// An interface default would run as a synchronous method, so an actor implements the requirement as a handler.
+interface Sink {
+    fun put(x: Int)
+    fun done() {
+        self.put(x: 0)
+    }
+}
+
+actor Counter: Sink {
+    var n: Int = 0
+    on put(x: Int) {
+        n += x
+    }
+}
+
+fun main() {
+    let c = Counter()
+}

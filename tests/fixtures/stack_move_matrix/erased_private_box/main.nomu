@@ -1,0 +1,20 @@
+// A generic type below `package` boxed as an existential in an exported generic's compiled-once body, held across
+// collections.
+import pkg/lib
+
+fun main() {
+  var bad = 0
+  var i = 0
+  while i < 300 {
+    if sized("value-".concat("string-for-the-heap"), i) != i {
+      bad = bad + 1
+    }
+    if sized(i, i + 1) != i + 1 {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

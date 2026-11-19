@@ -73,7 +73,75 @@ public struct ExternalGenericSig {
 }
 
 extension Type {
+    // The name of a generic type's specialization: `base<argKey,argKey>`, carried as a nominal name; Mangle
+    // 9-encodes the `<`, `>`, `,` (backend.md) into a valid C identifier. `Monomorphize` names its specializations
+    // so, and codegen finds a concrete instance in an imported signature by it.
+    public static func specializedName(_ base: String, _ args: [Type]) -> String {
+        args.isEmpty ? base : base + "<" + args.map(\.specializationKey).joined(separator: ",") + ">"
+    }
+
+    // A mangling-safe key for a type argument. Named types may already carry `<…>` from a
+    // prior specialization (nesting composes); function/existential/opaque types get an
+    // identifier-ish rendering rather than their spaced `description`.
+    public var specializationKey: String {
+        switch self {
+        case .int: return "Int"
+        case .uint8: return "UInt8"
+        case .uint64: return "UInt64"
+        case .double: return "Double"
+        case .bool: return "Bool"
+        case .stringBase: return "String"
+        case .void: return "Void"
+        case .named(let n, _): return n
+        case .generic(let b, let a): return Type.specializedName(b, a)
+        case .array(let e): return "Array<" + e.specializationKey + ">"
+        case .rawPtr: return "RawPtr"
+        case .ptr(let e): return "Ptr<" + e.specializationKey + ">"
+        case .function(let p, let r): return "fn<" + (p + [r]).map(\.specializationKey).joined(separator: ",") + ">"
+        case .existential(let i): return "any_" + i
+        case .composition(let is_): return "any_" + is_.joined(separator: "_")
+        case .opaque(let ifs, _): return "some_" + ifs.joined(separator: "_")
+        case .typeParam(let p): return p
+        case .selfType: return "Self"
+        case .error: return "error"
+        }
+    }
+
     // Whether a type parameter occurs anywhere in this type.
+    // Whether this is, or holds, the error type.
+    public var mentionsError: Bool {
+        switch self {
+        case .error: return true
+        case .generic(_, let args): return args.contains { $0.mentionsError }
+        case .array(let e), .ptr(let e): return e.mentionsError
+        case .function(let ps, let r): return r.mentionsError || ps.contains { $0.mentionsError }
+        default: return false
+        }
+    }
+
+    // `Self` anywhere in the type, as an interface requirement spells it.
+    public var mentionsSelf: Bool {
+        switch self {
+        case .selfType: return true
+        case .generic(_, let args): return args.contains { $0.mentionsSelf }
+        case .array(let e), .ptr(let e): return e.mentionsSelf
+        case .function(let ps, let r): return r.mentionsSelf || ps.contains { $0.mentionsSelf }
+        default: return false
+        }
+    }
+
+    // The type with each `Self` replaced by `t`.
+    public func replacingSelf(with t: Type) -> Type {
+        switch self {
+        case .selfType: return t
+        case .generic(let base, let args): return .generic(base: base, args: args.map { $0.replacingSelf(with: t) })
+        case .array(let e): return .array(e.replacingSelf(with: t))
+        case .ptr(let e): return .ptr(e.replacingSelf(with: t))
+        case .function(let ps, let r): return .function(params: ps.map { $0.replacingSelf(with: t) }, ret: r.replacingSelf(with: t))
+        default: return self
+        }
+    }
+
     public var mentionsTypeParameter: Bool {
         switch self {
         case .typeParam: return true

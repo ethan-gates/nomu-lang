@@ -101,10 +101,9 @@ today** (one fail-stops at build, the other routes through a separate channel), 
 [121](121-string-utf8-model.md); they are generality work this task's unified descriptor path is the natural
 home for.
 
-- **Nested enum-in-enum managed payloads.** 176.3b's shared scan enumerator recurses a matched enum case's
-  sub-shapes through a dedicated alias-free scratch (`gc_live_scratch_enum`). A managed payload that is itself
-  an enum would alias that scratch, so it is **fail-stopped at descriptor build** today — sound, not silent.
-  Resolving it wants a reentrant or depth-indexed scratch in the enumerator both collectors call.
+- **Nested enum-in-enum managed payloads.** **Done** in [253](253-finish-generics.md) 253.5: the runtime's
+  enumerator keeps no scratch and recurses into a case's sub-descriptors, so a payload holding an enum with a
+  tag is a sub-descriptor and the build no longer stops on it.
 - **Cross-module shape-table ordinals.** 176.3's ordinal→descriptor table (`__nomu_shape_table`) is
   per-compilation; ordinals are not unified across modules. The erased-generic shaped path sidesteps this by
   rooting through the VWT (a runtime descriptor-id), a different channel. A cross-module program that must

@@ -2,7 +2,7 @@
 
 **Avenue:** Risk (the performance thesis) · **Type/Lifecycle:** `perf · compiler · ready-to-design` ·
 **Size:** M · **Status:** not started · **Source:** [243](243-frame-mechanism-feasibility.md).1's
-measurement
+measurement; done as [236](236-fiber-preemption.md)'s phase 236.2
 
 ## The cost
 
@@ -46,9 +46,17 @@ safepoint polls (about 1,000 iterations per strip by default).
 - **Interaction with the inner loop's exit:** the budget test adds a compare per iteration; check it does not
   cost back what the hoisting gains, and that LLVM removes it where it can bound the trip count.
 
+## The kernel set
+
+A set of compute kernels, call-free loops of the kinds the optimizer inlines into: `frames_loops` (sieve,
+matrix product) plus an array scan, a hash probe, a sort's inner loop, byte and string processing, and a
+numeric kernel (n-body or spectral-norm). Each built three ways: today's polls, strip-mined, and
+`measure_no_loop_polls`. It measures this task, 236's G3 (polls and the stack check under 3% on a tight
+loop), and 236.3's change to the poll's form. Built first.
+
 ## Done when
 
-- `frames_loops` recovers most of the 29% (`tools/frames-ceiling.py`, against the `measure_no_loop_polls`
+- The kernel set is under 236's G3 (3%) against `measure_no_loop_polls`; `frames_loops` recovers most of the 29% (`tools/frames-ceiling.py`, against the `measure_no_loop_polls`
   build), and the compute benchmarks show no regression.
 - The time from a stop request to the fiber stopping, in a long-running loop, stays within the budget 236
   sets, measured.
@@ -58,6 +66,6 @@ safepoint polls (about 1,000 iterations per strip by default).
 
 ## Refs
 
-[243](243-frame-mechanism-feasibility.md) ("Results"); [236](236-fiber-preemption.md) ("Asynchronous
-preemption", option (e)); `src/llvmgen/SSAIRToLLVM.swift` (`emitHeaderPoll`); `internals/loops.md` (the
+[243](243-frame-mechanism-feasibility.md) ("Results"); [236](236-fiber-preemption.md) (Architecture; a
+prerequisite of it); `src/llvmgen/SSAIRToLLVM.swift` (`emitHeaderPoll`); `internals/loops.md` (the
 back edge hosts the poll); `benchmarks/frames_loops`.

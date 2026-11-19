@@ -57,24 +57,36 @@ public struct NOIRComposite {
 // The requirement surface of an interface, resolved to types — enough for codegen to
 // lay out a witness-table struct (a function-pointer slot per requirement, method then
 // property accessors, then the reserved type-witness slot).
+// A constraint-only interface (a non-covariant `Self`, or a static requirement) has no `any I` witness table, but a
+// bound on it still dispatches through a compiled-once witness table, so it is listed too.
 public struct NOIRInterface {
     public let name: String
     public let methods: [NOIRMethodReq]
     public let properties: [NOIRPropReq]
     public let bases: [String]   // M5 A1.4: transitive base interfaces — a witness carries a pointer to each, so `any B` upcasts to `any A`
+    public let isConstraintOnly: Bool
 
-    public init(name: String, methods: [NOIRMethodReq], properties: [NOIRPropReq], bases: [String]) {
+    public init(name: String, methods: [NOIRMethodReq], properties: [NOIRPropReq], bases: [String],
+                isConstraintOnly: Bool = false) {
         self.name = name; self.methods = methods; self.properties = properties; self.bases = bases
+        self.isConstraintOnly = isConstraintOnly
     }
 }
 
+// `params` and `ret` read `Self` as the interface's existential, the `any I` witness ABI. `selfParams` and `selfRet`
+// keep `Self` as `.selfType`, which the compiled-once witness ABI passes as the conformer's value buffer.
 public struct NOIRMethodReq {
     public let name: String
     public let params: [Type]
     public let ret: Type
+    public let selfParams: [Type]
+    public let selfRet: Type
+    public let isStatic: Bool   // a `static fun` requirement: its slot ignores `self`
 
-    public init(name: String, params: [Type], ret: Type) {
+    public init(name: String, params: [Type], ret: Type, selfParams: [Type]? = nil, selfRet: Type? = nil,
+                isStatic: Bool = false) {
         self.name = name; self.params = params; self.ret = ret
+        self.selfParams = selfParams ?? params; self.selfRet = selfRet ?? ret; self.isStatic = isStatic
     }
 }
 
@@ -82,9 +94,10 @@ public struct NOIRPropReq {
     public let name: String
     public let type: Type
     public let isSettable: Bool
+    public let selfType: Type   // `type` with `Self` kept, as `NOIRMethodReq.selfRet`
 
-    public init(name: String, type: Type, isSettable: Bool) {
-        self.name = name; self.type = type; self.isSettable = isSettable
+    public init(name: String, type: Type, isSettable: Bool, selfType: Type? = nil) {
+        self.name = name; self.type = type; self.isSettable = isSettable; self.selfType = selfType ?? type
     }
 }
 

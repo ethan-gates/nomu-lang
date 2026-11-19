@@ -52,6 +52,8 @@ final class FunctionLowerer {
     // task 100.4.3.3): used to resolve a requirement call on a `.typeParam` receiver to the bound that
     // declares the method, so it lowers to a witness dispatch.
     private var currentGenerics: [NOIRGenericParam] = []
+    // In a compiled-once body, and in closures and fibers lifted from one: the symbol whose dictionary the code reads.
+    private var erasedOwner: String?
 
     init(diags: DiagnosticSink, ctx: ModuleContext, sink: ClosureSink, subsetFuncs: Set<String> = []) {
         self.diags = diags
@@ -63,6 +65,7 @@ final class FunctionLowerer {
 
     func lower(_ f: NOIRFunc) -> SSAFunction? {
         currentGenerics = f.generics
+        if !f.generics.isEmpty { erasedOwner = f.name }
         let params = beginFunction(f)
         return finishFunction(f, params: params, name: f.name)
     }
@@ -86,6 +89,7 @@ final class FunctionLowerer {
         // cross-module copy; own-module calls still use the monomorphized specialization.
         if !ownerGenerics.isEmpty, kind == .struct_ || kind == .enum_ || kind == .class_ {
             currentGenerics = ownerGenerics + f.generics
+            erasedOwner = ModuleContext.methodSymbol(typeName, f.name)
             let selfType = Type.generic(base: typeName, args: ownerGenerics.map { .typeParam($0.name) })
             let selfParam = newValue(selfType)
             // A value receiver (struct/enum) is a value buffer: the erased param IS the buffer pointer (a
@@ -358,32 +362,22 @@ final class FunctionLowerer {
         for n in capNames { guard let v = readVar(n, span) else { return }; caps.append((n, v)) }
 
         let id = sink.nextId; sink.nextId += 1
-        let envName = "fiber.\(id).env"
-        let envType = Type.named(envName, .class_)
-        sink.envAggregates.append(SSAAggregate(
-            name: envName, kind: .class_,
-            fields: caps.map { SSAField(name: $0.name, type: $0.value.type, isMutable: false) }, span: span))
-        var env: SSAValue?
-        if !caps.isEmpty {
-            let e = emit(.alloc(envType), envType, span)
-            for (i, cap) in caps.enumerated() {
-                let addr = emit(.fieldAddr(base: e, fieldIndex: i), cap.value.type, span)
-                emitVoid(.writeBarrier(object: e, value: cap.value), span)
-                emitVoid(.store(addr: addr, value: cap.value), span)
-            }
-            env = e
-        }
+        let env = buildEnv("fiber.\(id).env", caps, closure: false, span)
 
-        // Lift `fiber:N(env) -> resultType { body }`.
+        // Lift `fiber:N(env) -> resultType { body }`. A compiled-once body's fiber drops the result in the body, so
+        // the lifted body returns nothing, whatever the call's type.
         let startName = "fiber:\(id)"
-        let child = FunctionLowerer(diags: diags, ctx: ctx, sink: sink, subsetFuncs: subsetFuncs)
-        if let lifted = child.lowerClosureBody(name: startName, envType: envType,
-                                               captures: caps.map { ($0.name, $0.value.type) },
-                                               params: [], body: body, ret: resultType, span: span) {
-            sink.lifted.append(lifted)
+        var lifted = body, ret = resultType
+        if erasedOwner != nil, case .ret(let call?) = body.first?.kind, body.count == 1 {
+            lifted = [NOIRStmt(kind: .exprStmt(call), span: span)]; ret = .void
+        }
+        if let f = child().lowerClosureBody(name: startName, envType: env.type, captureBase: env.captureBase,
+                                            captures: caps.map { ($0.name, $0.value.type) },
+                                            params: [], body: lifted, ret: ret, span: span) {
+            sink.lifted.append(f)
         }
 
-        emitVoid(.fiber(startFn: startName, env: env, resultType: resultType), span)
+        emitVoid(.fiber(startFn: startName, env: env.value, resultType: ret), span)
     }
 
     // `if cond { then } else { els }` → a condBr to fresh then/else blocks that both branch to a
@@ -493,9 +487,18 @@ final class FunctionLowerer {
         case .call(let callee, let args, let typeArgs):
             return lowerCall(callee: callee, args: args, typeArgs: typeArgs, type: e.type, span: e.span)
 
-        case .staticCall(let onType, let method, _):
-            // Monomorphization rewrites every `.staticCall` to a concrete `.call`, so one reaching
-            // the egress means an unspecialized dispatch (a bug), not valid input.
+        case .staticCall(let onType, let method, let args):
+            // In a compiled-once body a static requirement on a bounded `T` dispatches through the bound's witness
+            // table, with no receiver. Monomorphization rewrites every other `.staticCall` to a concrete `.call`.
+            if case .typeParam(let tp) = onType,
+               let gp = currentGenerics.first(where: { $0.name == tp }),
+               let bound = gp.bounds.first(where: { ctx.interfaceDeclares($0, method) }) {
+                var argVals: [SSAValue] = []
+                for a in args { guard let v = lowerArg(a) else { return nil }; argVals.append(v) }
+                let call = SSACall(kind: .staticWitness(typeParam: tp, interface: bound, method: method), args: argVals)
+                if e.type == .void { emitVoid(.call(call), e.span); return nil }
+                return emit(.call(call), e.type, e.span)
+            }
             fail("static requirement '\(onType).\(method)' was not resolved by monomorphization", e.span)
             return nil
 
@@ -554,39 +557,68 @@ final class FunctionLowerer {
         for n in capNames { guard let v = readVar(n, span) else { return nil }; caps.append((n, v)) }
 
         let id = sink.nextId; sink.nextId += 1
-        let envName = "clo.\(id).env"
-        let envType = Type.named(envName, .class_)
-        sink.envAggregates.append(SSAAggregate(
-            name: envName, kind: .class_,
-            fields: caps.map { SSAField(name: $0.name, type: $0.value.type, isMutable: false) }, span: span))
-
-        // Build the environment at the site (nil when there are no captures).
-        var env: SSAValue?
-        if !caps.isEmpty {
-            let e = emit(.alloc(envType), envType, span)
-            for (i, cap) in caps.enumerated() {
-                let addr = emit(.fieldAddr(base: e, fieldIndex: i), cap.value.type, span)
-                emitVoid(.writeBarrier(object: e, value: cap.value), span)   // egress gates on the value being managed
-                emitVoid(.store(addr: addr, value: cap.value), span)
-            }
-            env = e
-        }
+        let env = buildEnv("clo.\(id).env", caps, closure: true, span)
 
         var ret = Type.void
         if case .function(_, let r) = type { ret = r }
         let liftedName = "clo:\(id)"
-        let child = FunctionLowerer(diags: diags, ctx: ctx, sink: sink)
-        if let lifted = child.lowerClosureBody(name: liftedName, envType: envType,
-                                               captures: caps.map { ($0.name, $0.value.type) },
-                                               params: params, body: body, ret: ret, span: span) {
+        if let owner = erasedOwner { sink.recipeNeeds.append((owner, .closureEntry(type))) }
+        if let lifted = child(subset: false).lowerClosureBody(name: liftedName, envType: env.type, captureBase: env.captureBase,
+                                                              captures: caps.map { ($0.name, $0.value.type) },
+                                                              params: params, body: body, ret: ret, span: span) {
             sink.lifted.append(lifted)
         }
-        return emit(.makeClosure(funcName: liftedName, env: env, onStack: false), type, span)
+        return emit(.makeClosure(funcName: liftedName, env: env.value, onStack: false), type, span)
+    }
+
+    // A lowerer for a body lifted from this one. In a compiled-once body it keeps the type parameters and the
+    // dictionary's owner, since the lifted body reads the same dictionary.
+    private func child(subset: Bool = true) -> FunctionLowerer {
+        let c = FunctionLowerer(diags: diags, ctx: ctx, sink: sink, subsetFuncs: subset ? subsetFuncs : [])
+        if let owner = erasedOwner { c.erasedOwner = owner; c.currentGenerics = currentGenerics }
+        return c
+    }
+
+    // Build the environment of a closure or fiber at the site, holding `caps` from `captureBase` on: nil when there
+    // are no captures. In a compiled-once body it is a class generic over the body's type parameters, sized and
+    // described through the dictionary, and always built: field 0 holds the dictionary, and a closure's field 1 its
+    // lifted body's code address, which the backend stores at `makeClosure`.
+    private func buildEnv(_ name: String, _ caps: [(name: String, value: SSAValue)], closure: Bool,
+                          _ span: Span) -> (type: Type, value: SSAValue?, captureBase: Int) {
+        var fields = caps.map { SSAField(name: $0.name, type: $0.value.type, isMutable: false,
+                                         fromTypeParameter: $0.value.type.mentionsTypeParameter) }
+        guard let owner = erasedOwner else {
+            let envType = Type.named(name, .class_)
+            sink.envAggregates.append(SSAAggregate(name: name, kind: .class_, fields: fields, span: span))
+            if caps.isEmpty { return (envType, nil, 0) }
+            let e = emit(.alloc(envType), envType, span)
+            storeCaptures(e, caps, from: 0, span)
+            return (envType, e, 0)
+        }
+        let prefix = [SSAField(name: "$dictionary", type: .rawPtr, isMutable: false)]
+            + (closure ? [SSAField(name: "$body", type: .rawPtr, isMutable: false)] : [])
+        fields = prefix + fields
+        let envType = Type.generic(base: name, args: currentGenerics.map { .typeParam($0.name) })
+        sink.envAggregates.append(SSAAggregate(name: name, kind: .class_, fields: fields, span: span, generics: currentGenerics))
+        sink.recipeNeeds.append((owner, .object(envType)))
+        let e = emit(.alloc(envType), envType, span)
+        let dict = emit(.dictionary, .rawPtr, span)
+        emitVoid(.store(addr: emit(.fieldAddr(base: e, fieldIndex: 0), .rawPtr, span), value: dict), span)
+        storeCaptures(e, caps, from: prefix.count, span)
+        return (envType, e, prefix.count)
+    }
+
+    private func storeCaptures(_ env: SSAValue, _ caps: [(name: String, value: SSAValue)], from base: Int, _ span: Span) {
+        for (i, cap) in caps.enumerated() {
+            let addr = emit(.fieldAddr(base: env, fieldIndex: base + i), cap.value.type, span)
+            emitVoid(.writeBarrier(object: env, value: cap.value), span)   // egress gates on the value being managed
+            emitVoid(.store(addr: addr, value: cap.value), span)
+        }
     }
 
     // Lower a lifted closure body: env is parameter 0, captures are loaded from it into scope, then the
     // closure's own parameters follow. A fresh scope (no `self`, no enclosing locals).
-    func lowerClosureBody(name: String, envType: Type, captures: [(name: String, type: Type)],
+    func lowerClosureBody(name: String, envType: Type, captureBase: Int = 0, captures: [(name: String, type: Type)],
                           params: [NOIRParam], body: [NOIRStmt], ret: Type, span: Span) -> SSAFunction? {
         lastSpan = span
         let entry = newBlock(); entryId = entry; seal(entry); curId = entry
@@ -594,7 +626,7 @@ final class FunctionLowerer {
         let envParam = newValue(envType)
         var fnParams = [envParam]
         for (i, cap) in captures.enumerated() {
-            let addr = emit(.fieldAddr(base: envParam, fieldIndex: i), cap.type, span)
+            let addr = emit(.fieldAddr(base: envParam, fieldIndex: captureBase + i), cap.type, span)
             let v = emit(.load(addr), cap.type, span)
             bind(cap.name, v, span)
         }
@@ -608,7 +640,8 @@ final class FunctionLowerer {
         if bbs[curId]?.term == nil { terminate(ret == .void ? .ret(nil) : .unreachable, span) }
         let blocks = finalize(returnType: ret)
         if diags.hasErrors { return nil }
-        return SSAFunction(name: name, params: fnParams, returnType: ret, blocks: blocks, isMutating: false, span: span)
+        return SSAFunction(name: name, params: fnParams, returnType: ret, blocks: blocks, isMutating: false, span: span,
+                           generics: erasedOwner != nil ? currentGenerics : [], closureOf: erasedOwner)
     }
 
     // A method call, dispatched by receiver type:

@@ -1,0 +1,13 @@
+// An element that does not conform to the array literal's existential element type is an error.
+interface Shape {
+  fun area() -> Int
+}
+
+struct Plain {
+  let v: Int
+}
+
+fun main() {
+  let xs: Array<any Shape> = [Plain(v: 1)]
+  print(xs.count)
+}

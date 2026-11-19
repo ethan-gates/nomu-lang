@@ -184,3 +184,19 @@ cases:
     carriers: []
     iterations: 10
     weight: 2
+
+  # Ready work stranded behind running fibers (task 235.9): a searcher that steals part of a queue wakes
+  # another for the rest. Before the fix the late fiber waited for the idle timeout, and the busy fibers gave
+  # up at 400 ms.
+  - name: stranded-spawn
+    fixture: tests/fixtures/stranded_spawn
+    compile_settings:
+      rt_prelude: true
+    expect:
+      stdout: "0\n"
+    carriers:
+      - 2
+      - 3
+      - 4
+      - 8
+    iterations: 10

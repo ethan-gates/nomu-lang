@@ -1,0 +1,28 @@
+// The bottom of the chain: what `mid`'s shipped bodies reach in a module `main` does not import.
+package struct Counter {
+  var n: Int
+  var label: String
+  fun bump() {
+    self.n = self.n + 1
+  }
+}
+class Cell {
+  var text: String
+  var next: Int
+}
+fun cellText(c: Cell) -> Int {
+  return c.text.count + c.next
+}
+package fun measure(s: String) -> Int {
+  let c = Cell(text: s.concat("-held-in-a-private-class"), next: 1)
+  return cellText(c)
+}
+package fun tally<T>(x: T, times: Int) -> Int {
+  var c = Counter(n: 0, label: "counter-label-on-the-heap")
+  var i = 0
+  while i < times {
+    c.bump()
+    i = i + 1
+  }
+  return c.n + c.label.count
+}

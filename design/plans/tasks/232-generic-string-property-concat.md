@@ -1,6 +1,6 @@
 # A `String` property read through a generic bound lowers to half a value
 
-**Avenue:** Risk · **Type/Lifecycle:** `compiler · bug` · **Size:** S · **Status:** not started ·
+**Avenue:** Risk · **Type/Lifecycle:** `compiler · bug` · **Size:** S · **Status:** done, in [253](253-finish-generics.md) 253.3.8 ·
 **Source:** found while checking the untested demos in `examples/` for [231](231-suite-manifest-and-fixtures.md).
 
 ## What

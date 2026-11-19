@@ -1,0 +1,61 @@
+// Interface defaults across a module boundary: generic conformers here inherit them, and a conformer in a module
+// importing the interface calls the copy compiled once here.
+package interface Valued {
+    fun val() -> Int
+    var name: String { get }
+    fun doubled() -> Int {
+        return self.val() * 2
+    }
+    fun label() -> String {
+        return self.name.concat(" is valued")
+    }
+    fun same() -> Self {
+        return self
+    }
+}
+
+package struct Num: Valued {
+    let n: Int
+    let name: String
+    fun val() -> Int {
+        return n
+    }
+}
+
+package struct Pair<T: Valued>: Valued {
+    let a: T
+    let b: T
+    let name: String
+    fun val() -> Int {
+        return a.val() + b.val()
+    }
+}
+
+package class Bag<T: Valued>: Valued {
+    let item: T
+    let name: String
+    fun val() -> Int {
+        return item.val() * 10
+    }
+    fun label() -> String {
+        return "bag"
+    }
+}
+
+package enum Opt<T: Valued>: Valued {
+    case some(v: T)
+    case none
+    fun val() -> Int {
+        switch self {
+        case .some(let v): return v.val()
+        case .none: return 0
+        }
+    }
+    var name: String {
+        return "opt"
+    }
+}
+
+package fun score<T: Valued>(x: T) -> Int {
+    return x.doubled() * 1000 + x.label().count * 10 + x.same().val()
+}

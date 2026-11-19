@@ -57,7 +57,9 @@ extension LLVMGen {
     // Is `fn` marked `gc-leaf-function`? A gc-leaf call never becomes a `gc.statepoint`, so a `"deopt"`
     // operand bundle on it is both pointless and harmful — the backend mis-handles a deopt bundle on an
     // ordinary call — so shaped-root bundles must never ride a gc-leaf call (task 176).
+    // An indirect callee (a loaded code pointer) has no attributes to read, so it is never a leaf.
     func isGCLeafFn(_ fn: LLVMValueRef) -> Bool {
+        if LLVMIsAFunction(fn) == nil { return false }
         let name = "gc-leaf-function"
         return name.withCString { LLVMGetStringAttributeAtIndex(fn, funcAttrIndex, $0, UInt32(name.utf8.count)) } != nil
     }
@@ -724,22 +726,23 @@ extension LLVMGen {
         return (f, ty)
     }
 
-    // A channel's operations (`runtime/channel.nomu`): `send(buf, src, vwt, waiter)` and
-    // `receive(buf, dst, vwt, waiter) -> 1 | 0` may park the fiber, so they run through a forwarder that
-    // anchors the caller's frame; `close(buf)` wakes waiters and never parks.
+    // A channel's operations (`runtime/channel.nomu`): `send(buf, src, vwt, waiter, held)` and
+    // `receive(buf, dst, vwt, waiter, held) -> 1 | 0` may park the fiber, so they run through a forwarder that
+    // anchors the caller's frame; `close(buf)` wakes waiters and never parks. `held` is 1 when the caller took
+    // the channel's lock inline.
     func nomuChanSend() -> (LLVMValueRef, LLVMTypeRef) {
-        let target = runtimePreludeFn("rtChanSend", ret: voidTy, params: [i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i64])
-        return schedForwarder("__nomu_chan_send", ret: voidTy, params: [i8ptr, i8ptr, i8ptr, i8ptr]) { fn, sched, sp, pc in
-            let a = (0..<4).map { LLVMGetParam(fn, UInt32($0))! }
+        let target = runtimePreludeFn("rtChanSend", ret: voidTy, params: [i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i64, i8ptr, i64])
+        return schedForwarder("__nomu_chan_send", ret: voidTy, params: [i8ptr, i8ptr, i8ptr, i8ptr, i64]) { fn, sched, sp, pc in
+            let a = (0..<5).map { LLVMGetParam(fn, UInt32($0))! }
             _ = self.buildCall(target.fn, target.ty, [sched] + a + [sp, pc])
             return nil
         }
     }
 
     func nomuChanReceive() -> (LLVMValueRef, LLVMTypeRef) {
-        let target = runtimePreludeFn("rtChanReceive", ret: i64, params: [i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i64])
-        return schedForwarder("__nomu_chan_receive", ret: i64, params: [i8ptr, i8ptr, i8ptr, i8ptr]) { fn, sched, sp, pc in
-            let a = (0..<4).map { LLVMGetParam(fn, UInt32($0))! }
+        let target = runtimePreludeFn("rtChanReceive", ret: i64, params: [i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i64, i8ptr, i64])
+        return schedForwarder("__nomu_chan_receive", ret: i64, params: [i8ptr, i8ptr, i8ptr, i8ptr, i64]) { fn, sched, sp, pc in
+            let a = (0..<5).map { LLVMGetParam(fn, UInt32($0))! }
             return self.buildCall(target.fn, target.ty, [sched] + a + [sp, pc])
         }
     }

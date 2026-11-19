@@ -1,0 +1,145 @@
+import std/time
+
+// A server on simulated I/O (task 236.1.3, goal G5: tail latency in mixed workloads). Every millisecond a
+// timer wakes the arrival fiber, which releases a batch of 8 requests, each its own fiber, for 500 batches.
+// A light request computes about 20 µs; with HEAVY=1, every 100th request computes about 20 ms instead. Each
+// light request records its latency, from its batch's release to its end. Prints the light requests' p50,
+// p99 and largest latency, rounded down to a quarter power of two, and the run's length. Deterministic: the
+// schedule and the work depend on nothing but the request's index. Built with the runtime prelude
+// (`--config=rt_prelude`).
+//
+// Shared state (off-heap): 0 light requests recorded · 8 the latency histogram (256 counts).
+
+fun spin(work: Int, seed: Int) -> Int {
+    var x = seed
+    var i = 0
+    while i < work {
+        x = x * 6364136223846793005 + 1442695040888963407
+        i += 1
+    }
+    return x
+}
+
+// The histogram bucket of `v` ns: exact below 16, then four per power of two.
+fun bucket(v: Int) -> Int {
+    if v < 16 {
+        if v < 0 {
+            return 0
+        }
+        return v
+    }
+    var p = 1
+    var k = 0
+    while p * 2 <= v {
+        p = p * 2
+        k += 1
+    }
+    let sub = v / (p / 4) - 4
+    return 16 + (k - 4) * 4 + sub
+}
+
+// The smallest value in bucket `b`.
+fun bucketFloor(b: Int) -> Int {
+    if b < 16 {
+        return b
+    }
+    let k = (b - 16) / 4 + 4
+    let sub = (b - 16) % 4
+    var p = 1
+    var i = 0
+    while i < k {
+        p = p * 2
+        i += 1
+    }
+    return p / 4 * (4 + sub)
+}
+
+fun request(st: RawPtr, index: Int, released: Int, heavy: Bool) -> Int {
+    if heavy && index % 100 == 0 {
+        return spin(work: 20000000, seed: index)
+    }
+    let r = spin(work: 20000, seed: index)
+    let latency = Time().now - released
+    st.atomicFetchAdd(1, atByteOffset: 8 + 8 * bucket(v: latency))
+    st.atomicFetchAdd(1, atByteOffset: 0)
+    return r
+}
+
+// Release requests `first` to `first + n - 1` and join them.
+fun batch(st: RawPtr, first: Int, n: Int, released: Int, heavy: Bool) -> Int {
+    if n == 0 {
+        return 0
+    }
+    let r = task request(st: st, index: first, released: released, heavy: heavy)
+    let rest = batch(st: st, first: first + 1, n: n - 1, released: released, heavy: heavy)
+    return rest + r.join()
+}
+
+// Batches `k` and on, one a millisecond; each batch is a fiber of its own, joined after the later ones.
+fun arrivals(st: RawPtr, k: Int, batches: Int, heavy: Bool) -> Int {
+    if k == batches {
+        return 0
+    }
+    sleep(1)
+    let released = Time().now
+    let b = task batch(st: st, first: k * 8, n: 8, released: released, heavy: heavy)
+    let rest = arrivals(st: st, k: k + 1, batches: batches, heavy: heavy)
+    return rest + b.join()
+}
+
+fun envHeavy() -> Int {
+    let name = RawPtr.alloc(bytes: 32, align: 8)
+    return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "HEAVY")), 0)
+}
+
+// The smallest bucket floor at or above the `q`-per-1000 quantile of `total` counts.
+fun quantile(st: RawPtr, total: Int, q: Int) -> Int {
+    let target = (total * q + 999) / 1000
+    var seen = 0
+    var b = 0
+    while b < 256 {
+        let c: Int = st.load(fromByteOffset: 8 + 8 * b)
+        seen += c
+        if seen >= target && seen > 0 {
+            return bucketFloor(b: b)
+        }
+        b += 1
+    }
+    return 0
+}
+
+fun main() {
+    let heavy = envHeavy() != 0
+    let st = RawPtr.alloc(bytes: 8 + 8 * 256, align: 8)
+    var i = 0
+    while i < 257 {
+        st.store(0, toByteOffset: 8 * i)
+        i += 1
+    }
+    let start = Time().now
+    let sink = arrivals(st: st, k: 0, batches: 500, heavy: heavy)
+    let ns = Time().now - start
+    if sink == 42 {
+        print("\n")
+    }
+    let total: Int = st.load(fromByteOffset: 0)
+    var top = 255
+    var c: Int = st.load(fromByteOffset: 8 + 8 * top)
+    while top > 0 && c == 0 {
+        top = top - 1
+        c = st.load(fromByteOffset: 8 + 8 * top)
+    }
+    print("server_sim heavy ")
+    print(envHeavy())
+    print(" light ")
+    print(total)
+    print(" p50 ")
+    print(quantile(st: st, total: total, q: 500))
+    print(" p99 ")
+    print(quantile(st: st, total: total, q: 990))
+    print(" max ")
+    print(bucketFloor(b: top))
+    print(" ns ")
+    print(ns)
+    print("\n")
+}

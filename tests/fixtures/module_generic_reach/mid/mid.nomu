@@ -1,0 +1,16 @@
+// Shipped bodies that reach `base`: a generic, a non-generic function, a type with a mutating method, and a
+// private class of this module's own.
+import pkg/base
+
+class Note {
+  var body: String
+  fun size() -> Int {
+    return self.body.count
+  }
+}
+package fun reach<T>(x: T, n: Int) -> Int {
+  var c = Counter(n: n, label: "mid-made-counter-label")
+  c.bump()
+  let note = Note(body: "a-note-body-long-enough")
+  return tally(x, n) + measure("m") + c.n + note.size()
+}

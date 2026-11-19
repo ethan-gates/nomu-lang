@@ -1,0 +1,19 @@
+// A requirement's arguments are sent to the actor, so their types must be shareable.
+class Box {
+    var v: Int
+}
+
+interface Taker {
+    fun take(b: Box)
+}
+
+actor Counter: Taker {
+    var n: Int = 0
+    on take(b: Box) {
+        n += 1
+    }
+}
+
+fun main() {
+    let c = Counter()
+}

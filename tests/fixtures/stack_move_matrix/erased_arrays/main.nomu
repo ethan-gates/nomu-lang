@@ -1,0 +1,67 @@
+// Arrays of `T` built, read and written in compiled-once bodies, across moving collections: the elements hold heap
+// strings, and the loop allocates.
+import pkg/lib
+struct Stone: Weighed {
+    let w: Int
+    let text: String
+    fun weight() -> Int {
+        return w
+    }
+}
+
+fun heap(s: String) -> String {
+    return s.concat("-0123456789abcdefghijklmnopqrstuvwxyz")
+}
+
+fun main() {
+    var bad = 0
+    var i = 0
+    while i < 3000 {
+        let t = three(heap("x"), heap("y"), heap("z"))
+        if t.count != 3 || !t[2].eq(heap("z")) { bad = bad + 1 }
+        let r = repeated(heap("r"), 9)
+        if r.count != 9 || !r[8].eq(heap("r")) { bad = bad + 1 }
+        swapEnds(t)
+        if !t[0].eq(heap("z")) || !t[2].eq(heap("x")) { bad = bad + 1 }
+        let ns = three(1, 2, 3)
+        swapEnds(ns)
+        if ns[0] != 3 || ns[1] != 2 { bad = bad + 1 }
+        let ps = pairs(r)
+        if ps.count != 4 || !ps[3].b.eq(heap("r")) { bad = bad + 1 }
+        let cs = cells(t)
+        if cs.count != 3 || !cs[1].value.eq(heap("y")) { bad = bad + 1 }
+        let nn = nested(heap("n"))
+        if nn.count != 2 || nn[1].count != 2 || !nn[1][1].eq(heap("n")) { bad = bad + 1 }
+        if !lastOf(t).eq(heap("x")) { bad = bad + 1 }
+        let b: UInt8 = 7
+        let bytes = repeated(b, 5)
+        if bytes.count != 5 || bytes[4] != b { bad = bad + 1 }
+        let stones = three(Stone(w: 1, text: heap("a")), Stone(w: 2, text: heap("b")), Stone(w: 4, text: heap("c")))
+        if total(stones) != 7 { bad = bad + 1 }
+        let dd = doubled(t)
+        if dd.count != 6 || !dd[5].eq(heap("x")) || !dd[0].eq(heap("z")) { bad = bad + 1 }
+        let ds = doubled(stones)
+        if total(ds) != 14 || !ds[3].text.eq(heap("b")) { bad = bad + 1 }
+        let m = many(heap("m"), 4)
+        if m.items.count != 4 || !lastItem(m).eq(heap("m")) || !m.tag.eq(heap("m")) { bad = bad + 1 }
+        let rd = reader(t)
+        if !rd(1).eq(heap("y")) { bad = bad + 1 }
+        let os = options(heap("o"))
+        switch os[1] {
+        case .some(let v):
+            if !v.eq(heap("o")) { bad = bad + 1 }
+        case .none:
+            bad = bad + 1
+        }
+        switch os[0] {
+        case .some(let v):
+            bad = bad + 1
+        case .none:
+            bad = bad + 0
+        }
+        i = i + 1
+    }
+    print("bad ")
+    print(bad)
+    print("\n")
+}

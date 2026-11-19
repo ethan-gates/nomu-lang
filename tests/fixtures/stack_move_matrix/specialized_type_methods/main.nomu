@@ -1,0 +1,40 @@
+// Methods on imported generic types, at a value, a heap string and a struct holding one. Specialized, they are
+// compiled here from the library's `.bir`; compiled once, they are the library's.
+import pkg/lib
+
+struct Named {
+    var name: String
+    var n: Int
+}
+
+fun heap(s: String) -> String {
+    return s.concat("-made-long-enough-for-the-heap")
+}
+
+fun main() {
+    var bad = 0
+    var i = 0
+    while i < 3000 {
+        var b = Box<String>.make(heap("b"))
+        b.bump()
+        b.bump()
+        if b.get().count != 31 || b.twice != 4 || b.noted() != 27 { bad = bad + 1 }
+        var c = Box(v: Named(name: heap("n"), n: i), n: i)
+        c.bump()
+        if c.get().n != i || c.get().name.count != 31 || c.twice != 2 * i + 2 { bad = bad + 1 }
+        let s = Stack(items: [heap("x")])
+        var k = 0
+        while k < 12 {
+            s.push(heap("yy"))
+            k = k + 1
+        }
+        if s.size() != 13 || s.top().count != 32 { bad = bad + 1 }
+        let e: Either<Int, String> = .right(value: heap("r"))
+        let f: Either<Int, String> = .left(value: i)
+        if e.rightOr(heap("")).count != 31 || f.rightOr(heap("zz")).count != 32 { bad = bad + 1 }
+        i = i + 1
+    }
+    print("bad ")
+    print(bad)
+    print("\n")
+}

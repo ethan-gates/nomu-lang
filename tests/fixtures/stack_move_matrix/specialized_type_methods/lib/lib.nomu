@@ -1,0 +1,55 @@
+// Generic types whose methods a specializing consumer compiles from the `.bir`: a struct with a mutating method,
+// a computed property and a static function; a class over an array; an enum; and a method that reaches a private
+// class of this module.
+package struct Box<T> {
+    var v: T
+    var n: Int
+    var twice: Int { self.n * 2 }
+    fun get() -> T {
+        return self.v
+    }
+    fun bump() {
+        self.n = self.n + 1
+    }
+    fun noted() -> Int {
+        let t = Tag(text: "a-private-tag-on-the-heap", n: self.n)
+        return t.size()
+    }
+    static fun make(v: T) -> Box<T> {
+        return Box(v: v, n: 0)
+    }
+}
+
+class Tag {
+    var text: String
+    var n: Int
+    fun size() -> Int {
+        return self.text.count + self.n
+    }
+}
+
+package class Stack<T> {
+    var items: Array<T>
+    fun push(x: T) {
+        self.items.append(x)
+    }
+    fun top() -> T {
+        return self.items[self.items.count - 1]
+    }
+    fun size() -> Int {
+        return self.items.count
+    }
+}
+
+package enum Either<L, R> {
+    case left(value: L)
+    case right(value: R)
+    fun rightOr(fallback: R) -> R {
+        switch self {
+        case .left(let v):
+            return fallback
+        case .right(let v):
+            return v
+        }
+    }
+}

@@ -1,0 +1,60 @@
+import pkg/lib
+
+fun main() {
+  var bad = 0
+  var i = 0
+  while i < 3000 {
+    let n = i % 7 + 1
+    // 1 + 2 + … + n, plus n from the specialized call and 1 from the erased one.
+    let want = n * (n + 1) / 2 + n + 1
+    if chain(i, n) != want {
+      bad = bad + 1
+    }
+    if chain("a-heap-string-".concat("argument-value"), n) != want {
+      bad = bad + 1
+    }
+    let xs = [5, 6, 7, i]
+    if look(i, xs, 7) != 4 {
+      bad = bad + 1
+    }
+    if look("s", xs, -5) != -2 {
+      bad = bad + 1
+    }
+    let one: Option<Int> = .some(value: 1)
+    let zero: Option<Int> = .some(value: 0)
+    let noInt: Option<Int> = .none
+    let kept: Option<String> = .some(value: "kept-".concat("a-heap-string-value"))
+    let noString: Option<String> = .none
+    switch pick(i, one, kept) {
+    case .some(let s):
+      if s.count != 24 {
+        bad = bad + 1
+      }
+    case .none: bad = bad + 1
+    }
+    switch pick("s", zero, noString) {
+    case .some(let s):
+      if s.count != 32 {
+        bad = bad + 1
+      }
+    case .none: bad = bad + 1
+    }
+    switch pick(i, noInt, noString) {
+    case .some(let s): bad = bad + 1
+    case .none:
+    }
+    let h = holder("item-".concat("a-heap-string-value"))
+    var j = 0
+    while j < n {
+      h.push(j + 1)
+      j = j + 1
+    }
+    if h.depth() != n * (n + 1) / 2 {
+      bad = bad + 1
+    }
+    i = i + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

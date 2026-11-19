@@ -1,0 +1,104 @@
+// Closures, fibers and tasks in compiled-once bodies. A function value whose type mentions `T` is called through
+// the call adapter its caller's dictionary holds; a closure made here enters through an entry adapter, so a
+// specialized caller calls it with its concrete convention. Lifted bodies read the dictionary from the environment.
+package interface Weighed {
+    fun weight() -> Int
+}
+
+package class Cell<T> {
+    var value: T
+    var fold: (T, T) -> T
+    // A closure made in a method of a generic class, capturing `self` and a `T`.
+    fun folder(extra: T) -> () -> T {
+        let c = self
+        return { () -> T in
+            let fold = c.fold
+            return fold(c.value, extra)
+        }
+    }
+}
+
+package fun applyN<T>(x: T, n: Int, f: (T) -> T) -> T {
+    var v = x
+    var i = 0
+    while i < n {
+        v = f(v)
+        i = i + 1
+    }
+    return v
+}
+
+// A function value returning nothing, called through the adapter with no result address; and a closure made here
+// returning nothing. `Void` in an imported signature is the builtin, though the prelude declares a `Void` struct.
+package fun eachTwice<T>(x: T, f: (T) -> Void) {
+    f(x)
+    f(x)
+}
+
+package fun sinkInto<T>(cell: Cell<T>) -> (T) -> Void {
+    return { (v: T) in
+        cell.value = v
+    }
+}
+
+package fun constant<T>(x: T) -> () -> T {
+    return { () -> T in
+        return x
+    }
+}
+
+// Made here and called here: through the call adapter, then the entry adapter.
+package fun twice<T>(x: T, f: (T) -> T) -> T {
+    let g = { (y: T) -> T in
+        return f(f(y))
+    }
+    return g(x)
+}
+
+// A closure making a closure, both lifted from the same body and reading its dictionary.
+package fun curried<T>(a: T) -> (T) -> Option<T> {
+    let outer = { (b: T) -> (T) -> Option<T> in
+        return { (c: T) -> Option<T> in
+            return .some(value: b)
+        }
+    }
+    return outer(a)
+}
+
+// A requirement call on a captured bounded `T`, through the bound's table in the owner's dictionary.
+package fun heavier<T: Weighed>(a: T, b: T) -> () -> Int {
+    return { () -> Int in
+        if a.weight() > b.weight() {
+            return a.weight()
+        }
+        return b.weight()
+    }
+}
+
+// A generic call inside a lifted body takes its callee's dictionary from the owner's.
+package fun boxed<T>(x: T) -> () -> Option<T> {
+    return { () -> Option<T> in
+        return wrap(x)
+    }
+}
+
+fun wrap<T>(x: T) -> Option<T> {
+    return .some(value: x)
+}
+
+fun identity<shared T>(x: T) -> T {
+    return x
+}
+
+package fun viaTask<shared T>(x: T) -> T {
+    let t = task identity(x)
+    return t.join()
+}
+
+fun deliver<shared T>(x: T, out: Channel<T>) {
+    out.send(x)
+}
+
+package fun viaFiber<shared T>(x: T, out: Channel<T>) {
+    fiber deliver(x, out)
+}

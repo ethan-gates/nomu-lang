@@ -1,0 +1,69 @@
+// Interface defaults across moving collections: the library's generic conformers inherit them, and conformers here,
+// concrete and generic, call the library's compiled-once copies, directly, through bounds and through `any`. The names
+// are heap strings, so the labels the defaults build are too.
+import pkg/lib
+
+struct Sq: Valued {
+    let k: Int
+    let name: String
+    fun val() -> Int {
+        return k * k
+    }
+}
+
+struct Holder<T>: Valued {
+    let item: T
+    let k: Int
+    let name: String
+    fun val() -> Int {
+        return k
+    }
+}
+
+fun heap(s: String) -> String {
+    return s.concat("")
+}
+
+fun localScore<T: Valued>(x: T) -> Int {
+    return x.doubled() * 1000 + x.label().count * 10 + x.same().val()
+}
+
+fun expect<T: Valued>(x: T, a: any Valued, v: Int, labelLength: Int) -> Int {
+    let want = 2 * v * 1000 + labelLength * 10 + v
+    var bad = 0
+    if score(x) != want { bad = bad + 1 }
+    if localScore(x) != want { bad = bad + 1 }
+    if x.doubled() != 2 * v || x.label().count != labelLength || x.same().val() != v { bad = bad + 1 }
+    if a.doubled() != 2 * v || a.label().count != labelLength || a.same().val() != v { bad = bad + 1 }
+    return bad
+}
+
+fun main() {
+    var bad = 0
+    var i = 0
+    while i < 3000 {
+        let long = heap("a name long enough for the heap")
+        let num = Num(n: i, name: long)
+        let numAny: any Valued = num
+        bad = bad + expect(num, numAny, i, 41)
+        let pair = Pair(a: num, b: Num(n: 1, name: heap("x")), name: long)
+        let pairAny: any Valued = pair
+        bad = bad + expect(pair, pairAny, i + 1, 41)
+        let bag = Bag(item: num, name: long)
+        let bagAny: any Valued = bag
+        bad = bad + expect(bag, bagAny, 10 * i, 3)
+        let o: Opt<Num> = Opt.some(v: num)
+        let oAny: any Valued = o
+        bad = bad + expect(o, oAny, i, 13)
+        let sq = Sq(k: i, name: long)
+        let sqAny: any Valued = sq
+        bad = bad + expect(sq, sqAny, i * i, 41)
+        let h = Holder(item: long, k: i, name: long)
+        let hAny: any Valued = h
+        bad = bad + expect(h, hAny, i, 41)
+        i = i + 1
+    }
+    print("bad ")
+    print(bad)
+    print("\n")
+}

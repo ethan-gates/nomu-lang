@@ -12,18 +12,31 @@ import support
 public enum DictionaryNeed: Codable, Equatable {
     case object(Type)                                 // allocates this generic class: its descriptor
     case arrayBuffer(element: Type)                   // grows an array of this: its buffer's descriptor
-    case box(Type)                                    // boxes this as `any I`: its payload's descriptor
+    case box(Type, interfaces: [String])              // boxes this as `any I` (or `any A & B`): its witness table
     case callee(symbol: String, typeArgs: [Type])     // calls this generic: its dictionary
+    case callValue(Type)                              // calls a function value of this type: its call adapter
+    case closureEntry(Type)                           // makes a closure of this type: its entry adapter
 }
 
-// `symbol` is the generic's call symbol: its name, or `m:Type:method` for a method of a generic type.
+// A method's compiled-once signature: `self` first, as `Type<T…>`, then its parameters.
+public struct RecipeSignature: Codable, Equatable {
+    public let params: [Type]
+    public let ret: Type
+    public init(params: [Type], ret: Type) { self.params = params; self.ret = ret }
+}
+
+// `symbol` is the generic's call symbol: its name, or `m:Type:method` for a method of a generic type. A method's
+// recipe carries its signature, so a caller can call it compiled once when the type is private and the `.nmi`
+// declares neither the type nor its methods: a witness table built for the type boxed as an existential does.
 public struct DictionaryRecipe: Codable, Equatable {
     public let symbol: String
     public let generics: [String]
     public let bounds: [[String]]                     // per type parameter, name-sorted
     public let needs: [DictionaryNeed]
-    public init(symbol: String, generics: [String], bounds: [[String]], needs: [DictionaryNeed]) {
-        self.symbol = symbol; self.generics = generics; self.bounds = bounds; self.needs = needs
+    public let signature: RecipeSignature?
+    public init(symbol: String, generics: [String], bounds: [[String]], needs: [DictionaryNeed],
+                signature: RecipeSignature? = nil) {
+        self.symbol = symbol; self.generics = generics; self.bounds = bounds; self.needs = needs; self.signature = signature
     }
 }
 
@@ -79,13 +92,17 @@ public struct DictionaryRecipes: Codable, Equatable {
             switch n {
             case .object(let t): return .object(type(t))
             case .arrayBuffer(let e): return .arrayBuffer(element: type(e))
-            case .box(let t): return .box(type(t))
+            case .box(let t, let ifaces): return .box(type(t), interfaces: ifaces)
             case .callee(let s, let args): return .callee(symbol: symbol(s), typeArgs: args.map(type))
+            case .callValue(let t): return .callValue(type(t))
+            case .closureEntry(let t): return .closureEntry(type(t))
             }
         }
         return DictionaryRecipes(
             recipes: recipes.map { DictionaryRecipe(symbol: symbol($0.symbol), generics: $0.generics, bounds: $0.bounds,
-                                                    needs: $0.needs.map(need)) },
+                                                    needs: $0.needs.map(need),
+                                                    signature: $0.signature.map {
+                                                        RecipeSignature(params: $0.params.map(type), ret: type($0.ret)) }) },
             layouts: layouts.map { DictionaryLayout(name: name($0.name), generics: $0.generics, kind: $0.kind,
                                                     fields: $0.fields.map { $0.map(type) }, fieldNames: $0.fieldNames,
                                                     caseNames: $0.caseNames, fromTypeParameter: $0.fromTypeParameter) })
@@ -98,7 +115,9 @@ public struct DictionaryInstance: Codable, Equatable {
         case dictionary(key: String)
         case object(Type)
         case arrayBuffer(element: Type)
-        case box(Type)
+        case box(Type, interfaces: [String])
+        case callAdapter(Type)                        // a function type, concrete
+        case entryAdapter(Type)                       // likewise
     }
     public let typeArgs: [Type]
     public let bounds: [[String]]
@@ -192,19 +211,28 @@ private func needs(of body: [NOIRStmt], params: Set<String>, classes: Set<String
             if case .generic(let base, _) = e.type, classes.contains(base) { add(.object(e.type)) }
         case .arrayLit:
             if case .array(let element) = e.type, mentions(element, params) { add(.arrayBuffer(element: element)) }
-        case .box(let value, _):
-            if mentions(value.type, params) { add(.box(value.type)) }
-        case .call(let callee, _, let typeArgs):
+        case .box(let value, let interfaces):
+            if mentions(value.type, params) { add(.box(value.type, interfaces: interfaces)) }
+        case .call(let callee, let args, let typeArgs):
             if case .varRef(let name) = callee.kind, !typeArgs.isEmpty, generics.contains(name) {
                 add(.callee(symbol: name, typeArgs: typeArgs))
+            }
+            // A function value whose type mentions `T`: only the caller knows its concrete calling convention, so
+            // the dictionary holds an adapter that takes every argument and the result by address. A named
+            // function's type never mentions `T` without type arguments.
+            if typeArgs.isEmpty, case .function = callee.type, mentions(callee.type, params) {
+                add(.callValue(callee.type))
             }
             // A `ManagedBuffer` whose element mentions `T` (a channel's): the body allocates it with the descriptor
             // of the caller's instantiation, as it does a generic class.
             if case .varRef("__managedBufferCreate") = callee.kind, mentions(e.type, params) { add(.object(e.type)) }
-        case .methodCall(let receiver, let method, _):
-            if case .array(let element) = receiver.type, method == "append", mentions(element, params) {
+            // An append may grow the array into a new buffer, with the descriptor of the caller's instantiation.
+            if case .varRef("__arrayAppend") = callee.kind, let array = args.first?.value.type,
+               case .array(let element) = array, mentions(element, params) {
                 add(.arrayBuffer(element: element))
-            } else if case .generic(let base, let args) = receiver.type, mentions(receiver.type, params) {
+            }
+        case .methodCall(let receiver, let method, _):
+            if case .generic(let base, let args) = receiver.type, mentions(receiver.type, params) {
                 add(.callee(symbol: "m:\(base):\(method)", typeArgs: args))
             }
         default:
@@ -250,21 +278,27 @@ public func dictionaryRecipes(_ decls: [NOIRDecl], imported: DictionaryRecipes? 
     for case .funcDecl(let f) in decls where !f.generics.isEmpty { generics.insert(f.name) }
 
     var recipes: [DictionaryRecipe] = []
-    func record(_ symbol: String, _ params: [NOIRGenericParam], _ body: [NOIRStmt]) {
+    func record(_ symbol: String, _ params: [NOIRGenericParam], _ body: [NOIRStmt], signature: RecipeSignature? = nil) {
         let names = params.map(\.name)
         recipes.append(DictionaryRecipe(symbol: symbol, generics: names, bounds: params.map { $0.bounds.sorted() },
-                                        needs: needs(of: body, params: Set(names), classes: classes, generics: generics)))
+                                        needs: needs(of: body, params: Set(names), classes: classes, generics: generics),
+                                        signature: signature))
+    }
+    func method(_ type: String, _ typeParams: [NOIRGenericParam], _ m: NOIRFunc) {
+        let selfType = Type.generic(base: type, args: typeParams.map { .typeParam($0.name) })
+        record("m:\(type):\(m.name)", typeParams + m.generics, m.body,
+               signature: RecipeSignature(params: [selfType] + m.params.map(\.type), ret: m.returnType))
     }
     for decl in decls {
         switch decl {
         case .funcDecl(let f) where !f.generics.isEmpty:
             record(f.name, f.generics, f.body)
         case .structDecl(let s) where !s.generics.isEmpty:
-            for m in s.methods { record("m:\(s.name):\(m.name)", s.generics + m.generics, m.body) }
+            for m in s.methods { method(s.name, s.generics, m) }
         case .enumDecl(let e) where !e.generics.isEmpty:
-            for m in e.methods { record("m:\(e.name):\(m.name)", e.generics + m.generics, m.body) }
+            for m in e.methods { method(e.name, e.generics, m) }
         case .classDecl(let c) where !c.generics.isEmpty:
-            for m in c.methods { record("m:\(c.name):\(m.name)", c.generics + m.generics, m.body) }
+            for m in c.methods { method(c.name, c.generics, m) }
         default:
             break
         }
@@ -292,6 +326,8 @@ public func dictionaryRecipes(_ decls: [NOIRDecl], imported: DictionaryRecipes? 
             visit(base); args.forEach(reach)
         case .array(let e), .ptr(let e):
             reach(e)
+        case .function(let ps, let r):
+            ps.forEach(reach); reach(r)
         default:
             break
         }
@@ -304,7 +340,7 @@ public func dictionaryRecipes(_ decls: [NOIRDecl], imported: DictionaryRecipes? 
     for r in recipes {
         for n in r.needs {
             switch n {
-            case .object(let t), .box(let t), .arrayBuffer(let t): reach(t)
+            case .object(let t), .box(let t, _), .arrayBuffer(let t), .callValue(let t), .closureEntry(let t): reach(t)
             case .callee(_, let args): args.forEach(reach)
             }
         }
@@ -314,4 +350,23 @@ public func dictionaryRecipes(_ decls: [NOIRDecl], imported: DictionaryRecipes? 
     }
     return DictionaryRecipes(recipes: recipes.sorted { $0.symbol < $1.symbol },
                              layouts: reached.values.sorted { $0.name < $1.name })
+}
+
+extension DictionaryRecipes {
+    // These recipes with `needs` appended to theirs and `more` layouts: what a compiled-once body's closures and
+    // fibers add, known after closure conversion. Appended, so the words the body scan placed keep their indices.
+    public func adding(_ needs: [(symbol: String, need: DictionaryNeed)], layouts more: [DictionaryLayout]) -> DictionaryRecipes {
+        if needs.isEmpty && more.isEmpty { return self }
+        var extra: [String: [DictionaryNeed]] = [:]
+        for (symbol, need) in needs where !(extra[symbol]?.contains(need) ?? false) { extra[symbol, default: []].append(need) }
+        let out = recipes.map { r -> DictionaryRecipe in
+            let add = (extra[r.symbol] ?? []).filter { !r.needs.contains($0) }
+            if add.isEmpty { return r }
+            return DictionaryRecipe(symbol: r.symbol, generics: r.generics, bounds: r.bounds, needs: r.needs + add,
+                                    signature: r.signature)
+        }
+        var all = Dictionary(layouts.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+        for l in more { all[l.name] = l }
+        return DictionaryRecipes(recipes: out, layouts: all.values.sorted { $0.name < $1.name })
+    }
 }

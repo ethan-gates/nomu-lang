@@ -174,6 +174,7 @@ public struct Sema {
         buildShareChecker()
         InterfaceModel.validateInterfaceGraph(self)
         InterfaceModel.checkConformances(&self)
+        InterfaceModel.registerImportedDefaults(&self)
         var decls: [NOIRDecl] = []
         // Globals first: function bodies read them, and a global's initializer may read another.
         for decl in program.decls {
@@ -182,7 +183,11 @@ public struct Sema {
         for decl in program.decls {
             // Interfaces are abstract: validate them, but emit no IR (conformance in a
             // later slice generates the concrete witnesses that carry the defaults).
-            if case .interfaceDecl(let i) = decl { InterfaceModel.checkInterface(&self, i); continue }
+            if case .interfaceDecl(let i) = decl {
+                InterfaceModel.checkInterface(&self, i)
+                decls += InterfaceModel.lowerExportedDefaults(&self, i)
+                continue
+            }
             // Generic *types* lower to one uniform C shape — a `T` field is held boxed
             // (`void*`), sized/copied at construction where the concrete `T` is known; no
             // value witness (M5 5.2.3). Generic *functions* are witness-passed (5.2.2).
@@ -1000,3 +1005,7 @@ public struct Sema {
         return false
     }
 }
+
+// The type names `resolve` maps to a builtin before looking for a declared type: a written `Void` is the builtin even
+// though the prelude declares a `Void` struct, the result of a `task` whose call returns nothing.
+public let builtinTypeNames: Set<String> = ["Int", "UInt8", "UInt64", "Double", "Bool", "StringBase", "RawPtr", "Void"]

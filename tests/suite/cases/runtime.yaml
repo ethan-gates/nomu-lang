@@ -414,6 +414,26 @@ cases:
     collections:
       - min: 1
 
+  # Optimized: the vectorizer loads two references as one vector, and every lane must be rooted
+  # (`nomu-split-reference-aggregates`). A relay's channel went unrooted and stale here before.
+  - name: sched-mixed-load-release
+    fixture: tests/fixtures/sched_mixed_load
+    compile_settings:
+      optimize: true
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+      - 4
+      - 6
+      - 8
+    iterations: 3
+    full_iterations: 10
+    collections:
+      - min: 1
+
   - name: sched-mixed-load-nursery
     fixture: tests/fixtures/sched_mixed_load
     run_settings:
@@ -604,6 +624,31 @@ cases:
     fixture: tests/fixtures/actor_not_shareable
     compile:
       expect_error: "type 'Box' is not shareable, so it cannot be passed to actor handler 'take'"
+
+  - name: actor-conformer-result
+    fixture: tests/fixtures/actor_conformer_result
+    compile:
+      expect_error: "actor 'Server' cannot conform to 'Pingable': method 'ping' returns a value, and a handler returns none"
+
+  - name: actor-conformer-property
+    fixture: tests/fixtures/actor_conformer_property
+    compile:
+      expect_error: "actor 'Server' cannot conform to 'Sized': property 'size' needs a value from the actor"
+
+  - name: actor-conformer-default
+    fixture: tests/fixtures/actor_conformer_default
+    compile:
+      expect_error: "missing handler 'done'; an actor implements each requirement as a handler, so it does not inherit the default"
+
+  - name: actor-conformer-not-shareable
+    fixture: tests/fixtures/actor_conformer_not_shareable
+    compile:
+      expect_error: "parameter 'b' of 'take' has type 'Box', which is not shareable, so it cannot be sent to an actor"
+
+  - name: actor-conformer-signature
+    fixture: tests/fixtures/actor_conformer_signature
+    compile:
+      expect_error: "type 'Counter' does not conform to 'Sink': handler 'put' has the wrong signature"
 
   - name: actor-not-shareable-struct
     fixture: tests/fixtures/actor_not_shareable_struct
@@ -1134,6 +1179,30 @@ cases:
 
   - name: channel-send-closed-parked
     fixture: tests/fixtures/channel_send_closed_parked
+    expect:
+      stdout: "closing\n"
+      signal: SIGABRT
+    stderr_match:
+      - pattern: "nomu: send on a closed channel"
+        min: 1
+
+  # Specialized, a send takes the channel's lock inline and reaches the runtime holding it: the fault there,
+  # and a parked sender's.
+  - name: channel-send-closed-release
+    fixture: tests/fixtures/channel_send_closed
+    compile_args:
+      - "--config=release"
+    expect:
+      stdout: "closed\n"
+      signal: SIGABRT
+    stderr_match:
+      - pattern: "nomu: send on a closed channel"
+        min: 1
+
+  - name: channel-send-closed-parked-release
+    fixture: tests/fixtures/channel_send_closed_parked
+    compile_args:
+      - "--config=release"
     expect:
       stdout: "closing\n"
       signal: SIGABRT

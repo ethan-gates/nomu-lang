@@ -21,6 +21,8 @@ the follow-through. The core erased surface is green (105/105); these are the un
 
 ### 171.1 — Requirement dispatch on a bounded field of a generic class
 
+**Done** in [253](253-finish-generics.md) 253.3.1: the field is passed to the witness as a registered copy.
+
 A method on a generic **class** `Ref<T: I>` that dispatches a requirement on a `T`-typed field
 (`self.item.val()`) fails LLVM verification today:
 
@@ -63,10 +65,10 @@ owner type's parameter** exercised through a field requirement.
 
 The conformer kinds still rejected in the erased bounded-dispatch thunks (deferred in §100.4.3.3.3):
 
-- 171.2.1 — **actor conformers.** Same reference ABI as a class, but synchronous erased dispatch on an actor
+- 171.2.1 — **Done** in 253.3.5: an actor conforms through its handlers, and a requirement call is a send. Was: **actor conformers.** Same reference ABI as a class, but synchronous erased dispatch on an actor
   is untested — rejected in `bridgeErasedThunkSelf`.
-- 171.2.2 — **covariant-`Self` requirements** — rejected in `methodThunkErased`.
-- 171.2.3 — **importing a conformer whose method impls live in the producer** — needs producer-exported
+- 171.2.2 — **Done** in 253.3.6: requirements mentioning `Self`, static ones included, dispatch through a bound in compiled-once code. Was: **covariant-`Self` requirements** — rejected in `methodThunkErased`.
+- 171.2.3 — **Done** in 253.3.2: the consumer builds the witness tables over the producer's methods. Was: **importing a conformer whose method impls live in the producer** — needs producer-exported
   witness tables (the consumer today synthesizes the witness instance from a locally-visible conformance).
 
 *Refs:* `bridgeErasedThunkSelf` / `methodThunkErased` / `witnessInstanceErased` (`LLVMGenWitness.swift`).
@@ -111,15 +113,17 @@ this closes once a non-POD erased field write must survive a minor collection. A
 
 Small correctness-of-diagnostics items, not miscompiles:
 
-- 171.5.1 — **`let`-receiver mutating-call diagnostic for a generic instantiation.** The Sema mutation pass
+- 171.5.1 — **Done** (checked in [253](253-finish-generics.md) 253.6). **`let`-receiver mutating-call diagnostic for a generic instantiation.** The Sema mutation pass
   keys the un-stripped instantiation name (`origin@Box<Int>`), so a mutating method called on a `let`
   receiver of an imported generic type is not rejected (a missing error). The ssairgen self-ABI path already
   strips the suffix (§100.4.3.10); the Sema check wants the same.
-- 171.5.2 — **computed-property *requirement* (conformance sense) on imported types.** §100.4.3.5.4 built
+- 171.5.2 — **Done** in 253.3.2. **computed-property *requirement* (conformance sense) on imported types.** §100.4.3.5.4 built
   computed-property *members*; a computed property that satisfies an **interface requirement** across the
   boundary is unaddressed.
 
 ### 171.6 — Gate erased generic-method emission to public-only
+
+**Done** in [253](253-finish-generics.md) 253.9, gated on use as well as visibility.
 
 The producer emits the erased (compiled-once) copy of a generic type's methods for **all** generic types,
 not just `public` ones (noted in §100.4.3.5.3.1). Only a public generic type's methods can be called across a

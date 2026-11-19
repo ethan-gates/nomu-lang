@@ -1,0 +1,27 @@
+import pkg/lib
+
+fun check(s: String, want: String) -> Int {
+  if s.eq(want) {
+    return 0
+  }
+  return 1
+}
+
+fun main() {
+  var bad = 0
+  var r = 0
+  while r < 200 {
+    let x = "first-heap-string-value-".concat("abcdefghij")
+    let y = "second-heap-string-value-".concat("klmnopqrstuvwxyz")
+    let wantY = "second-heap-string-value-klmnopqrstuvwxyz"
+    bad = bad + check(churnCall(x, y, 40), wantY)
+    bad = bad + check(churnSwitch(x, y, 40), wantY)
+    bad = bad + check(churnBare(x, y, 40), wantY)
+    bad = bad + check(churnSwap(x, y, 40), "first-heap-string-value-abcdefghij")
+    bad = bad + check(churnBreak(x, y, 40), wantY)
+    r = r + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

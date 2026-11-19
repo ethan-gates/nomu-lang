@@ -24,7 +24,9 @@ enum EgressConcurrency {
     // A closure value is a managed `{ i64 header, i8ptr fn, p1 env }` object (the env carries the
     // captures, built separately as a class object). Same shape as an `any` box (one managed field at
     // byte 16), so it reuses the any-box type-id for GC scanning.
-    static func makeClosure(_ g: SSAIRToLLVM, _ funcName: String, _ env: SSAValue?, _ onStack: Bool, _ span: Span) -> LLVMValueRef? {
+    // `code`, when given, is the closure's code in place of the body's: a compiled-once body's entry adapter.
+    static func makeClosure(_ g: SSAIRToLLVM, _ funcName: String, _ env: SSAValue?, _ onStack: Bool, _ span: Span,
+                            code: LLVMValueRef? = nil) -> LLVMValueRef? {
         guard let c = g.e.callables["f:\(funcName)"] else { g.e.fail("7.2.3: unknown closure body '\(funcName)'", span); return nil }
         let cloTy = g.e.structTy([g.e.i64, g.e.i8ptr, g.e.p1])
         // A non-escaping closure object lives on the stack (EA 7.3): an entry alloca in place of the
@@ -34,7 +36,7 @@ enum EgressConcurrency {
         // slot so its managed env field becomes a statepoint-tracked root (I5).
         let obj: LLVMValueRef = onStack ? g.e.entryAlloca(cloTy, "clo") : g.e.rtAllocManaged(LLVMConstInt(g.e.i64, 24, 0))
         LLVMBuildStore(g.b, g.e.descOffsetHeader(g.e.anyBoxTypeId()), g.e.structGEP(cloTy, obj, 0))
-        LLVMBuildStore(g.b, c.fn, g.e.structGEP(cloTy, obj, 1))
+        LLVMBuildStore(g.b, code ?? c.fn, g.e.structGEP(cloTy, obj, 1))
         let envVal = env != nil ? g.val(env!) : LLVMConstNull(g.e.p1)
         g.e.storeField(obj, g.e.structGEP(cloTy, obj, 2), envVal)
         return obj

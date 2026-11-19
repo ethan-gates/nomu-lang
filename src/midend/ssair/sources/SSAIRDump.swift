@@ -109,6 +109,7 @@ private func renderKind(_ kind: SSAInstKind) -> String {
         return env.map { "\(kw) \(name) env \(val($0))" } ?? "\(kw) \(name)"
     case .funcAddr(let name):                   return "funcAddr \(name)"
     case .globalRead(let name):                 return "globalRead \(name)"
+    case .dictionary:                           return "dictionary"
     }
 }
 
@@ -119,6 +120,8 @@ private func renderCall(_ c: SSACall) -> String {
         return "call \(name)\(ta)(\(list(c.args)))"
     case .witness(let recv, let iface, let method):
         return "call witness \(val(recv)).\(iface)::\(method)\(ta)(\(list(c.args)))"
+    case .staticWitness(let tp, let iface, let method):
+        return "call witness \(tp).\(iface)::\(method)\(ta)(\(list(c.args)))"
     case .indirect(let callee):
         return "call \(val(callee))\(ta)(\(list(c.args)))"
     }

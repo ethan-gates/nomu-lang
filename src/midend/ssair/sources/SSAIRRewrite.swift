@@ -7,7 +7,7 @@ import ast
 
 public func remapOperands(_ kind: SSAInstKind, _ f: (SSAValue) -> SSAValue) -> SSAInstKind {
     switch kind {
-    case .constInt, .constDouble, .constBool, .constString, .alloc, .stackAlloc, .funcAddr, .globalRead:
+    case .constInt, .constDouble, .constBool, .constString, .alloc, .stackAlloc, .funcAddr, .globalRead, .dictionary:
         return kind
     case .binary(let op, let a, let b):
         return .binary(op, f(a), f(b))
@@ -54,7 +54,7 @@ public func remapOperands(_ kind: SSAInstKind, _ f: (SSAValue) -> SSAValue) -> S
 
 public func remapCallKind(_ kind: SSACallKind, _ f: (SSAValue) -> SSAValue) -> SSACallKind {
     switch kind {
-    case .direct:
+    case .direct, .staticWitness:
         return kind
     case .witness(let recv, let iface, let method):
         return .witness(receiver: f(recv), interface: iface, method: method)

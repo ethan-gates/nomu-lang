@@ -225,7 +225,8 @@ private func recordCallArgSinks(_ c: SSACall, into g: inout PointsToGraph) {
     let callee: PTGCallee
     switch c.kind {
     case .direct(let name):                            callee = .direct(name)
-    case .witness(_, let interface, let method):       callee = .witness(interface: interface, method: method)
+    case .witness(_, let interface, let method), .staticWitness(_, let interface, let method):
+        callee = .witness(interface: interface, method: method)
     case .indirect:                                    callee = .indirect
     }
     for (i, a) in c.args.enumerated() { g.addSink(a.id, .callArg(callee: callee, paramIndex: i)) }

@@ -75,6 +75,9 @@ final class LLVMGen {
     // source files whose functions get weak (COMDAT-folded) linkage — the interim fix for the prelude
     // being compiled into every module's object (proper fix: prelude-as-packages, task 100.3.7).
     var externalFuncNames: Set<String> = []
+    // Imported methods their producer inferred mutating, keyed `origin@Type.method`: such a method takes `self` by
+    // pointer, which a witness thunk built here for an imported conformer must match.
+    var externalMutatingMethods: Set<String> = []
     // Imported generic functions (task 100.4.3.4): a call emits the erased witness-passing ABI to the
     // producer's compiled-once symbol, keyed by the callee's per-origin identity.
     var externalGenericSigs: [String: ExternalGenericSig] = [:]
@@ -250,6 +253,8 @@ final class LLVMGen {
     var measureNoStackChecks = false
     var dictionaries: [String: DictionaryInstance] = [:]  // the dictionaries this module's concrete calls pass
     var dictionaryGlobals: [String: LLVMValueRef] = [:]   // and their constants, by `dictionaryKey`
+    var callAdapters: [String: LLVMValueRef] = [:]        // by the function type they call
+    var entryAdapters: [String: LLVMValueRef] = [:]       // by the function type they enter
     var recipes: [String: DictionaryRecipe] = [:]         // this module's recipes, by symbol
     var measureLibcDirect = false        // `measure.libc_direct`: libc calls skip the stack switch
     // Functions whose address `Runtime.ofFunc` takes: entries a thread, a fiber or a signal starts in, which no

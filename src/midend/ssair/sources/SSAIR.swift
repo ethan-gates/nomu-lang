@@ -127,6 +127,10 @@ public indirect enum SSAInstKind {
     // Read a global (a module-private top-level `let`, task 224) by name: its value, of the result type.
     // A global never changes after startup, so the read has no ordering against stores.
     case globalRead(String)
+
+    // A compiled-once body's dictionary, a `RawPtr` to a constant: what a closure or fiber it starts stores in
+    // its environment, so the lifted body reads its instantiation's words from there.
+    case dictionary
 }
 
 // A call site. `typeArgs` is non-empty only for a residual generic call the mono pass left dynamic.
@@ -143,6 +147,7 @@ public struct SSACall {
 public enum SSACallKind {
     case direct(String)                                             // known target (named func / builtin)
     case witness(receiver: SSAValue, interface: String, method: String)   // through a witness slot — the devirt target
+    case staticWitness(typeParam: String, interface: String, method: String)  // a static requirement `T.m(…)` through the bound's witness slot, in a compiled-once body
     case indirect(SSAValue)                                         // through a closure / function-pointer value
 }
 
@@ -218,13 +223,17 @@ public struct SSAFunction {
     // hidden PWT parameters (one per (type parameter, bound)) and to dispatch a requirement call on a
     // `.typeParam` receiver through the matching PWT (backend.md §4).
     public let generics: [NOIRGenericParam]
+    // A closure or fiber body lifted from a compiled-once body: the symbol whose dictionary it reads, from its
+    // environment's first field. Param 0 is the environment, then the result's address and each argument's
+    // (`LLVMGen.entryAdapter`). Nil otherwise.
+    public let closureOf: String?
 
     public init(name: String, params: [SSAValue], returnType: Type,
                 blocks: [SSABlock], isMutating: Bool, span: Span, noSafepoint: Bool = false,
-                generics: [NOIRGenericParam] = []) {
+                generics: [NOIRGenericParam] = [], closureOf: String? = nil) {
         self.name = name; self.params = params; self.returnType = returnType
         self.blocks = blocks; self.isMutating = isMutating; self.span = span
-        self.noSafepoint = noSafepoint; self.generics = generics
+        self.noSafepoint = noSafepoint; self.generics = generics; self.closureOf = closureOf
     }
 }
 
@@ -239,9 +248,10 @@ public struct SSAAggregate {
     public let kind: NamedKind
     public let fields: [SSAField]
     public let span: Span
+    public let generics: [NOIRGenericParam]   // an environment lifted from a compiled-once body: its type parameters
 
-    public init(name: String, kind: NamedKind, fields: [SSAField], span: Span) {
-        self.name = name; self.kind = kind; self.fields = fields; self.span = span
+    public init(name: String, kind: NamedKind, fields: [SSAField], span: Span, generics: [NOIRGenericParam] = []) {
+        self.name = name; self.kind = kind; self.fields = fields; self.span = span; self.generics = generics
     }
 }
 
@@ -305,6 +315,9 @@ public struct SSAModule {
     public let conformances: [NOIRConformance]       // drives witness-table instance emission
     public let composites: [NOIRComposite]           // composite (`any A & B`) witnesses to emit
     public let opaqueUnderlyings: [String: Type]     // opaque owner → hidden concrete underlying type
+    // What compiled-once bodies' closures and fibers add to their dictionaries, by the recipe's symbol: their
+    // environments' descriptors and closure entry adapters, known only once closures are converted.
+    public var recipeNeeds: [(symbol: String, need: DictionaryNeed)] = []
 
     public init(functions: [SSAFunction], aggregates: [SSAAggregate] = [], enums: [SSAEnum] = [],
                 interfaces: [NOIRInterface] = [], conformances: [NOIRConformance] = [],

@@ -163,9 +163,14 @@ public struct InterfaceDecl {
     public let properties: [InterfacePropertyReq]
     public let visibility: Visibility
     public let span: Span
+    // The module an imported interface comes from; nil for one declared here. An imported interface keeps its bare
+    // name, so this names what its producer compiled for it (its defaults).
+    public let origin: String?
 
-    public init(name: String, refines: [Conformance], methods: [InterfaceMethod], properties: [InterfacePropertyReq], visibility: Visibility = .internal, span: Span) {
+    public init(name: String, refines: [Conformance], methods: [InterfaceMethod], properties: [InterfacePropertyReq], visibility: Visibility = .internal, span: Span,
+                origin: String? = nil) {
         self.name = name; self.refines = refines; self.methods = methods; self.properties = properties; self.visibility = visibility; self.span = span
+        self.origin = origin
     }
 }
 
@@ -329,7 +334,7 @@ public struct ActorDecl {
     public let name: String
     public let fields: [ActorField]
     public let handlers: [OnHandler]
-    public let conformances: [Conformance]   // M5 A1.3: parsed, but actor conformance is rejected (parked)
+    public let conformances: [Conformance]   // satisfied by handlers (`interfaces.md` §2)
     public let visibility: Visibility
     public let span: Span
 

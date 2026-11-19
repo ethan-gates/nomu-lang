@@ -1,0 +1,33 @@
+// Used only at concrete types: no erased methods.
+struct Unused<T> {
+  let v: T
+  let n: Int
+  fun twice() -> Int {
+    return self.n * 2
+  }
+}
+
+// Used with `T` by an exported generic's compiled-once body: its erased method is called there.
+struct Hidden<T> {
+  let v: T
+  let n: Int
+  fun get() -> T {
+    return self.v
+  }
+  fun bumped() -> Int {
+    return self.n + 1
+  }
+}
+
+package fun concrete(n: Int) -> Int {
+  let u = Unused(v: "s", n: n)
+  return u.twice()
+}
+
+package fun through<T>(x: T, n: Int) -> T {
+  let h = Hidden(v: x, n: n)
+  if h.bumped() != n + 1 {
+    return x
+  }
+  return h.get()
+}

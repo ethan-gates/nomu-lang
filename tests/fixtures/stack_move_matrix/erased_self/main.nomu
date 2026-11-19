@@ -1,0 +1,83 @@
+// Requirements that mention `Self`, across moving collections: conformers from the library and from here, called
+// through the library's compiled-once bodies and specialized here, and a `Self` result boxed as `any`. The strings
+// are on the heap.
+import pkg/lib
+
+struct Pt: Twin, Zero {
+    let a: Int
+    let b: String
+    fun clone() -> Pt {
+        return Pt(a: a * 2, b: b)
+    }
+    fun combined(with: Pt) -> Pt {
+        return Pt(a: a + with.a, b: b.concat(with.b))
+    }
+    static fun zero() -> Pt {
+        return Pt(a: 9, b: "")
+    }
+    static fun make(n: Int) -> Pt {
+        return Pt(a: n + 1, b: "")
+    }
+    static fun scale() -> Int {
+        return 10
+    }
+    fun val() -> Int {
+        return a + b.count
+    }
+}
+
+struct Loc<T>: Zero {
+    let n: Int
+    static fun zero() -> Loc<T> {
+        return Loc(n: 6)
+    }
+    static fun make(n: Int) -> Loc<T> {
+        return Loc(n: n)
+    }
+    static fun scale() -> Int {
+        return 3
+    }
+    fun val() -> Int {
+        return n
+    }
+}
+
+fun heap(s: String) -> String {
+    return s.concat("")
+}
+
+fun localTwice<T: Twin>(x: T) -> T {
+    return x.clone().combined(with: x)
+}
+
+fun main() {
+    var bad = 0
+    var i = 0
+    while i < 4000 {
+        let num = Num(n: i, s: heap("ab"))
+        if twice(num).val() != 2 * i + 1 + 4 || localTwice(num).val() != 2 * i + 1 + 4 { bad = bad + 1 }
+        if twice(Dir.up(by: i)).val() != 1 + i { bad = bad + 1 }
+        if twice(Pt(a: i, b: heap("xy"))).val() != 3 * i + 4 { bad = bad + 1 }
+        let p = Pair(a: Num(n: 1, s: heap("")), b: Num(n: 2, s: heap("")))
+        if twice(p).val() != 303 || localTwice(p).val() != 303 { bad = bad + 1 }
+        let g = Bag(item: Pt(a: i, b: heap("q")))
+        if twice(g).val() != 3 * i + 2 || localTwice(g).val() != 3 * i + 2 { bad = bad + 1 }
+        if peerOf(Box(n: i)) != i + 2 || peerOf(num) != 4 * i + 2 { bad = bad + 1 }
+        if firstOf([Num(n: i, s: heap("")), Num(n: 0, s: heap(""))]).val() != i + 1 { bad = bad + 1 }
+        if score(num) != 2000 + (i + 3) + (3 * i + 2) * 10 + (i + 2) * 100 { bad = bad + 1 }
+        if score(Box(n: i)) != 2000 + (i + 5) + 3 * i * 10 + i * 100 { bad = bad + 1 }
+        if zeroOf(num) != 42000 + (i + 3) * 3 || zeroOf(Box(n: i)) != 7000 + 2 * i * 5 { bad = bad + 1 }
+        if zeroOf(Pt(a: i, b: heap(""))) != 9000 + (i + 1) * 10 { bad = bad + 1 }
+        let w: Wrap<Int> = Wrap(n: i, s: heap("s"))
+        let l: Loc<Int> = Loc(n: i)
+        if zeroOf(w) != 5000 + (i + 1) * 2 || zeroOf(l) != 6000 + i * 3 { bad = bad + 1 }
+        let c: any Copyable = w
+        let r: Ref<Int> = Ref(a: i)
+        let e: any Copyable = r
+        if c.copy().val() != 10 * i + 1 || e.copy().val() != i + 7 { bad = bad + 1 }
+        i = i + 1
+    }
+    print("bad ")
+    print(bad)
+    print("\n")
+}

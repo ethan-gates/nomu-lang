@@ -94,12 +94,107 @@ extension LLVMGen {
                 } else {
                     words.append(LLVMConstIntToPtr(descOffsetHeader(typeId(forHeapType: name)), i8ptr))
                 }
-            case .arrayBuffer, .box:
-                words.append(LLVMConstNull(i8ptr))   // arrays and boxes of `T` are task 253
+            case .callAdapter(let t):
+                guard let w = callAdapter(t) else { return nil }
+                words.append(w)
+            case .entryAdapter(let t):
+                guard let w = entryAdapter(t) else { return nil }
+                words.append(w)
+            case .arrayBuffer(let element):
+                words.append(LLVMConstIntToPtr(descOffsetHeader(arrayBufTypeId(element)), i8ptr))
+            case .box(let t, let ifaces):
+                guard case .named(let name, _) = t,
+                      let w = ifaces.count == 1 ? witnessInstance(name, ifaces[0]) : compositeInstance(name, ifaces)
+                else { return nil }
+                words.append(w)
             }
         }
         LLVMSetInitializer(g, LLVMConstArray2(i8ptr, &words, UInt64(count)))
         return g
+    }
+
+    // A compiled-once body calls a function value whose type mentions `T` through this adapter, since only a caller
+    // with concrete types knows the value's calling convention: `void(code, env, result*, arg*...)`, the closure's code
+    // and environment, then every argument and the result by address, with no result address for a void function.
+    // It loads the arguments as their concrete types, makes the call specialized code makes, and stores the result.
+    func callAdapter(_ t: Type) -> LLVMValueRef? {
+        let key = t.description
+        if let f = callAdapters[key] { return f }
+        guard case .function(let ptys, let rty) = t else { return nil }
+        var argTys: [LLVMTypeRef] = []
+        for p in ptys { guard let lt = llvmType(p, zeroSpan) else { return nil }; argTys.append(lt) }
+        guard let retTy = llvmType(rty, zeroSpan) else { return nil }
+        let returns = rty != .void
+        let params = [i8ptr, p1] + (returns ? [i8ptr] : []) + Array(repeating: i8ptr, count: ptys.count)
+        let (fn, _) = emitFunction("nomu_calladapter.\(callAdapters.count)", ret: voidTy, params: params)
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        callAdapters[key] = fn
+
+        let saved = beginThunk(fn)
+        defer { endThunk(saved) }
+        // The addresses point into the caller's frame, so they are marked where they enter, before the stack check
+        // can move the stack. An indirect call may reach any function, this adapter included, so it checks its stack
+        // as a body does.
+        let addrs = (2..<params.count).map { markFrameAddress(LLVMGetParam(fn, UInt32($0))!) }
+        if !isRuntimePackage && !measureNoStackChecks { emitStackCheck([]) }
+        let code = LLVMGetParam(fn, 0)!
+        var args: [LLVMValueRef?] = [LLVMGetParam(fn, 1)!]
+        let first = returns ? 1 : 0
+        for (i, at) in argTys.enumerated() {
+            args.append(LLVMBuildLoad2(b, at, addrs[first + i], "arg"))
+        }
+        let r = buildCall(code, fnType(retTy, [p1] + argTys), args)
+        if returns, let r { LLVMBuildStore(b, r, addrs[0]) }
+        LLVMBuildRetVoid(b)
+        return fn
+    }
+
+    // The code of a closure a compiled-once body makes: it has the closure's concrete calling convention, so any caller
+    // calls it as specialized code would, and enters the lifted body (`SSAFunction.closureOf`) through the code address
+    // in the environment's second field, with every argument and the result by address. Arguments holding managed
+    // pointers are typed GC roots for the call, as for any call into compiled-once code.
+    func entryAdapter(_ t: Type) -> LLVMValueRef? {
+        let key = t.description
+        if let f = entryAdapters[key] { return f }
+        guard case .function(let ptys, let rty) = t else { return nil }
+        var argTys: [LLVMTypeRef] = []
+        for p in ptys { guard let lt = llvmType(p, zeroSpan) else { return nil }; argTys.append(lt) }
+        guard let retTy = llvmType(rty, zeroSpan) else { return nil }
+        let returns = rty != .void
+        let (fn, _) = emitFunction("nomu_entryadapter.\(entryAdapters.count)", ret: retTy, params: [p1] + argTys)
+        LLVMSetLinkage(fn, LLVMInternalLinkage)
+        entryAdapters[key] = fn
+
+        let saved = beginThunk(fn)
+        defer { endThunk(saved) }
+        if !isRuntimePackage && !measureNoStackChecks { emitStackCheck([]) }
+        let env = LLVMGetParam(fn, 0)!
+        let body = LLVMBuildLoad2(b, i8ptr, gepByte(env, LLVMConstInt(i64, 16, 0)), "env.body")!
+        var args: [LLVMValueRef?] = [env]
+        let result = returns ? entryAlloca(retTy, "entry.ret") : nil
+        if let result { args.append(result) }
+        var roots: [(buf: LLVMValueRef, vwt: LLVMValueRef)] = []
+        for (i, at) in argTys.enumerated() {
+            let slot = entryAlloca(at, "entry.arg")
+            LLVMBuildStore(b, LLVMGetParam(fn, UInt32(i + 1))!, slot)
+            args.append(slot)
+            if !shapes.shape(ptys[i]).isEmpty { roots.append((slot, valueWitness(ptys[i]))) }
+        }
+        var top: LLVMValueRef? = nil
+        if !roots.isEmpty {
+            let save = preludeFn("nomu_fn_rtShadowSave", ret: i64, params: [])
+            top = buildCall(save.0, save.1, [])
+            let push = preludeFn("nomu_fn_rtShadowPush", ret: voidTy, params: [i8ptr, i8ptr, i8ptr])
+            let nodeTy = structTy([i8ptr, i8ptr, i8ptr])
+            for r in roots { _ = buildCall(push.0, push.1, [entryAlloca(nodeTy, "shadow.node"), r.buf, r.vwt]) }
+        }
+        _ = buildCall(body, fnType(voidTy, [p1] + Array(repeating: i8ptr, count: args.count - 1)), args)
+        if let top {
+            let pop = preludeFn("nomu_fn_rtShadowPopTo", ret: voidTy, params: [i64])
+            _ = buildCall(pop.0, pop.1, [top])
+        }
+        if let result { LLVMBuildRet(b, LLVMBuildLoad2(b, retTy, result, "entry.res")) } else { LLVMBuildRetVoid(b) }
+        return fn
     }
 
     // The shared VWT struct type.

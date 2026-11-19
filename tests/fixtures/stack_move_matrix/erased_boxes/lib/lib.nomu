@@ -1,0 +1,73 @@
+// Generic conformers boxed as `any I` and `any A & B`, in compiled-once bodies here, where the table comes from the
+// dictionary, and by an importing module.
+package interface Valued {
+    fun val() -> Int
+}
+
+package interface Named {
+    var name: String { get }
+    fun shout() -> String {
+        return self.name.concat("!")
+    }
+}
+
+package struct Num: Valued {
+    let n: Int
+    fun val() -> Int {
+        return n
+    }
+}
+
+package struct Pair<T: Valued>: Valued, Named {
+    let a: T
+    let b: T
+    let name: String
+    fun val() -> Int {
+        return a.val() + b.val()
+    }
+}
+
+package class Bag<T: Valued>: Valued, Named {
+    let item: T
+    let name: String
+    fun val() -> Int {
+        return item.val() * 10
+    }
+}
+
+package fun both(x: any Valued & Named) -> Int {
+    return x.val() * 1000 + x.shout().count
+}
+
+package fun wrapOne<T: Valued>(x: T, name: String) -> any Valued {
+    return Pair(a: x, b: x, name: name)
+}
+
+package fun wrapBoth<T: Valued>(x: T, name: String) -> any Valued & Named {
+    return Pair(a: x, b: x, name: name)
+}
+
+package fun bagBoth<T: Valued>(x: T, name: String) -> any Valued & Named {
+    return Bag(item: x, name: name)
+}
+
+// A concrete managed field of a value built here (`name`, `tag`) is a root like a `T` field: an allocation between
+// building the value and reading it moves the string.
+package fun nameAfter<T: Valued>(x: T, name: String) -> String {
+    let p = Pair(a: x, b: x, name: name)
+    let more = name.concat(" and some more text to allocate")
+    if more.count == 0 { return more }
+    return p.name
+}
+
+package struct Tagged<T> {
+    let tag: String
+    let n: Int
+}
+
+package fun tagAfter<T>(x: T, tag: String) -> String {
+    let w: Tagged<T> = Tagged(tag: tag, n: 1)
+    let more = tag.concat(" and some more text to allocate")
+    if more.count == 0 { return more }
+    return w.tag
+}

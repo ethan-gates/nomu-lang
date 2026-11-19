@@ -99,4 +99,43 @@ final class DictionaryRecipeTests: XCTestCase {
         let data = try JSONEncoder().encode(r)
         XCTAssertEqual(try JSONDecoder().decode(DictionaryRecipes.self, from: data), r)
     }
+
+    // Calling a function value whose type mentions `T` needs its call adapter; a call of a named function, whose type
+    // never mentions `T` without type arguments, needs none.
+    func testFunctionValueCallNeedsAdapter() {
+        let fnType = Type.function(params: [t], ret: .int)
+        let viaValue = expr(.int, .call(callee: expr(fnType, .varRef("f")), args: [], typeArgs: []))
+        let concrete = expr(.int, .call(callee: expr(.function(params: [.int], ret: .int), .varRef("g")), args: [], typeArgs: []))
+        let r = dictionaryRecipes([generic("h", [stmt(viaValue), stmt(viaValue), stmt(concrete)])])
+        XCTAssertEqual(r?.recipes.first?.needs, [.callValue(fnType)])
+    }
+
+    // An append records its buffer, since it may grow the array: `append` reaches the scan as a call of
+    // `__arrayAppend`, so a body with no array literal records it too.
+    func testAppendNeedsBuffer() {
+        let xs = expr(.array(t), .varRef("xs"))
+        let append = expr(.void, .call(callee: expr(.void, .varRef("__arrayAppend")),
+                                       args: [NOIRArg(label: nil, value: xs), NOIRArg(label: nil, value: expr(t, .varRef("x")))],
+                                       typeArgs: []))
+        let r = dictionaryRecipes([generic("f", [stmt(append), stmt(append)])])
+        XCTAssertEqual(r?.recipes.first?.needs, [.arrayBuffer(element: t)])
+    }
+
+    // Closure conversion's needs append to a recipe, after those the body scan placed, each once, with its layouts.
+    func testAddingAppendsAfterScannedNeeds() {
+        let node = Type.generic(base: "Node", args: [t])
+        let env = Type.generic(base: "clo.0.env", args: [t])
+        let entry = Type.function(params: [], ret: t)
+        let r = DictionaryRecipes(
+            recipes: [DictionaryRecipe(symbol: "f", generics: ["T"], bounds: [[]], needs: [.object(node)]),
+                      DictionaryRecipe(symbol: "g", generics: ["T"], bounds: [[]], needs: [])],
+            layouts: [DictionaryLayout(name: "Node", generics: ["T"], kind: .class_, fields: [[t]], fieldNames: [["v"]])])
+        let envLayout = DictionaryLayout(name: "clo.0.env", generics: ["T"], kind: .class_, fields: [[.rawPtr, t]],
+                                         fieldNames: [["$dictionary", "x"]], fromTypeParameter: [[false, true]])
+        let a = r.adding([("f", .object(env)), ("f", .closureEntry(entry)), ("f", .object(env)), ("f", .object(node))],
+                         layouts: [envLayout])
+        XCTAssertEqual(a.recipes[0].needs, [.object(node), .object(env), .closureEntry(entry)])
+        XCTAssertEqual(a.recipes[1].needs, [])
+        XCTAssertEqual(a.layouts.map(\.name), ["Node", "clo.0.env"])
+    }
 }

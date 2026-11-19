@@ -1,0 +1,100 @@
+// An array literal whose element type is an existential boxes each element, as a `let x: any I = v` does: from an
+// annotation, a parameter, a return type, a composition, and inside a nested literal. The boxes hold structs,
+// classes and a generic conformer while `churn` allocates, so a moving collection relocates what they hold.
+interface Shape {
+  fun area() -> Int
+}
+
+interface Named {
+  fun name() -> String
+}
+
+struct Sq {
+  let s: Int
+  let label: String
+}
+
+extension Sq: Shape {
+  fun area() -> Int {
+    return self.s * self.s
+  }
+}
+
+extension Sq: Named {
+  fun name() -> String {
+    return self.label
+  }
+}
+
+class Rect {
+  let w: Int
+  let h: Int
+}
+
+extension Rect: Shape {
+  fun area() -> Int {
+    return self.w * self.h
+  }
+}
+
+struct Scaled<T> {
+  let inner: T
+  let k: Int
+}
+
+extension Scaled: Shape {
+  fun area() -> Int {
+    return self.k
+  }
+}
+
+fun churn(n: Int) -> Int {
+  var k = 0
+  var i = 0
+  while i < n {
+    let s = "churn-string-long-enough-for-the-heap-".concat("x")
+    k = k + s.count
+    i = i + 1
+  }
+  return k
+}
+
+fun total(xs: Array<any Shape>) -> Int {
+  var t = 0
+  var i = 0
+  while i < xs.count {
+    t = t + xs[i].area()
+    i = i + 1
+  }
+  return t
+}
+
+fun shapes(n: Int) -> Array<any Shape> {
+  return [Sq(s: n, label: "square-label-".concat("value")), Rect(w: n, h: 2)]
+}
+
+fun main() {
+  var bad = 0
+  var r = 0
+  while r < 30 {
+    let a = Sq(s: 2, label: "square-label-".concat("value"))
+    let b = Rect(w: 2, h: 3)
+    let xs: Array<any Shape> = [a, b, Scaled(inner: "inner-".concat("value"), k: 5)]
+    let named: Array<any Shape & Named> = [a, Sq(s: 3, label: "other-label-".concat("value"))]
+    let grid: Array<Array<any Shape>> = [[a], [b, a]]
+    var grown: Array<any Shape> = [b]
+    grown.append(a)
+    churn(300)
+    if total(xs) != 4 + 6 + 5 { bad = bad + 1 }
+    if total([a, b]) != 10 { bad = bad + 1 }
+    if total(shapes(3)) != 9 + 6 { bad = bad + 1 }
+    if total(grid[1]) != 10 { bad = bad + 1 }
+    if total(grown) != 10 { bad = bad + 1 }
+    if named[0].name().eq("square-label-value") == false { bad = bad + 1 }
+    if named[1].name().eq("other-label-value") == false || named[1].area() != 9 { bad = bad + 1 }
+    r = r + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

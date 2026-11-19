@@ -45,21 +45,36 @@ public func injectImportedTemplates(into module: NOIRModule, templates: [Importe
     guard !templates.isEmpty else { return SpecializeInjection(module: module, localizedNames: []) }
 
     // A template whose origin-keyed name already names a decl in the module (its own, or an earlier-
-    // injected one) is skipped — the first binding wins, matching import resolution generally.
-    var existing = Set(module.decls.map(declName))
-    var injected: [NOIRDecl] = []
+    // injected one) is skipped — the first binding wins, matching import resolution generally. The exception
+    // is an imported type: Sema lowered it from the `.nmi` for its layout alone, so the shipped decl, with the
+    // same layout and its methods, replaces it once. Its methods stay reachable erased too (the consumer's own
+    // compiled-once bodies call them that way), so only functions are localized.
+    var decls = module.decls
+    var stubAt: [String: Int] = [:]
+    for (i, d) in decls.enumerated() {
+        switch d {
+        case .structDecl, .classDecl, .enumDecl: stubAt[declName(d)] = i
+        default: break
+        }
+    }
+    var existing = Set(decls.map(declName))
     var localized = Set<String>()
+    var changed = false
     for t in templates {
         let bare = declName(t.decl)
         guard !bare.isEmpty else { continue }
         let key = ExternalName.encode(origin: t.origin, name: bare)
+        if let i = stubAt.removeValue(forKey: key) {
+            decls[i] = renamedInternal(t.decl, to: key); changed = true
+            continue
+        }
         guard existing.insert(key).inserted else { continue }
-        injected.append(renamedInternal(t.decl, to: key))
-        localized.insert(key)
+        decls.append(renamedInternal(t.decl, to: key)); changed = true
+        if case .funcDecl = t.decl { localized.insert(key) }
     }
-    guard !injected.isEmpty else { return SpecializeInjection(module: module, localizedNames: []) }
+    guard changed else { return SpecializeInjection(module: module, localizedNames: []) }
 
-    let merged = NOIRModule(decls: module.decls + injected, interfaces: module.interfaces,
+    let merged = NOIRModule(decls: decls, interfaces: module.interfaces,
                             conformances: module.conformances, composites: module.composites,
                             opaqueUnderlyings: module.opaqueUnderlyings,
                             externalMutatingMethods: module.externalMutatingMethods,
@@ -80,9 +95,19 @@ private func declName(_ d: NOIRDecl) -> String {
 
 // Re-key an injected template to its origin-qualified name and force internal visibility, so the call
 // site (`origin@name<Args>`) matches and `Monomorphize` specializes it without re-emitting an erased copy.
-// Only generic functions are injected for now; a non-function rides through unchanged.
+// A private type the shipped bodies reach is renamed the same way; its methods keep their names.
 private func renamedInternal(_ d: NOIRDecl, to key: String) -> NOIRDecl {
-    guard case .funcDecl(let f) = d else { return d }
-    return .funcDecl(NOIRFunc(name: key, generics: f.generics, params: f.params, returnType: f.returnType,
-                              body: f.body, isMutating: f.isMutating, visibility: .internal, span: f.span))
+    switch d {
+    case .funcDecl(let f):
+        return .funcDecl(NOIRFunc(name: key, generics: f.generics, params: f.params, returnType: f.returnType,
+                                  body: f.body, isMutating: f.isMutating, visibility: .internal, span: f.span))
+    case .structDecl(let s):
+        return .structDecl(NOIRStruct(name: key, generics: s.generics, fields: s.fields, methods: s.methods, span: s.span))
+    case .classDecl(let c):
+        return .classDecl(NOIRClass(name: key, generics: c.generics, fields: c.fields, methods: c.methods, span: c.span))
+    case .enumDecl(let e):
+        return .enumDecl(NOIREnum(name: key, generics: e.generics, cases: e.cases, methods: e.methods, span: e.span))
+    case .actorDecl, .globalDecl:
+        return d
+    }
 }

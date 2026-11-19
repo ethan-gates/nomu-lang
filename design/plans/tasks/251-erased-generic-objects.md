@@ -1,7 +1,7 @@
 # Generic classes and enums in compiled-once bodies
 
 **Avenue:** Usability · **Type/Lifecycle:** `language-feature · ready-to-build` · **Size:** L ·
-**Status:** 251.1, 251.4, 251.5, 251.6, 251.2.1 to 251.2.3, 251.3 and 251.9 to 251.12 done; 251.2.4 open · **Source:** found building [250](250-fiber-task-surface.md) 250.2
+**Status:** done · **Source:** found building [250](250-fiber-task-surface.md) 250.2
 
 Part of [253](253-finish-generics.md), which owns everything else generics lack. This task covers what `Channel<T>`
 needs. Its former steps 251.7, 251.8, 251.13 and 251.14 are now 253.2, 253.7, 253.4 and 253.3.
@@ -68,9 +68,37 @@ needs the same thing.
     A generic function is no longer inlined by SSAIR's inliner, as `generics.md` now records as a decision. This also
     closed a latent bug: the inliner did not rename type parameters, so an inlined body worked only when the names
     matched. Forwarding stayed even with witness parameters, at +0.2%.
-  - **251.2.4** Witness thunks, closures and fibers. A thunk is built where the type is concrete, so it can pass a
-    static dictionary; a closure or fiber in a compiled-once body captures it. Confirmed missing: `fiber f(x)` or
-    `task f(x)` with `x: T` in a compiled-once body fails to compile with "no size for type parameter 'T'" (250.3.3).
+  - **251.2.4** Closures and fibers. **Done.** Before this, a closure capturing a `T`, a closure returned over one,
+    and `fiber f(x)` or `task f(x)` with `x: T` failed to compile with "no size for type parameter 'T'" (250.3.3), and
+    calling a concrete closure passed in as `(T) -> T` crashed in debug: the caller passed a buffer where the body
+    expected the closure, and the body called it with a buffer where the closure expected a value.
+
+    Decided over Swift-style reabstraction at each boundary, and over one by-address convention for every closure: a
+    function value always has its concrete type's calling convention, the one specialized code uses, and only
+    compiled-once code pays. The recipe gains a `callValue` need per function type a body calls, whose word is a call
+    adapter taking every argument and the result by address, and a `closureEntry` need per closure it makes, whose
+    word is an entry adapter with the concrete convention. Reabstraction would also allocate a thunk at each crossing
+    and convert function values held in containers; with adapters nothing converts.
+
+    The environment of a closure or fiber in a compiled-once body is a class generic over the body's type
+    parameters, with captures inline: one allocation, over boxing each captured `T`. Its first field is the
+    dictionary, its second a closure body's code address; its descriptor is an `object` need. These needs come from
+    closure conversion, so the driver appends them to the recipes after SSAIR generation, after the scan's, and the
+    `.nmi` carries the environment's layout. The lifted body reads the dictionary from its environment, takes its
+    result and arguments by address, and lowers as compiled-once code. ABI: `backend.md` §4, function values.
+
+    Also fixed on the way: a function value whose type mentions `T` is now passed directly, as a generic class
+    reference is, where the consumer had passed it by buffer and the producer expected the closure; and an erased
+    call of a prelude generic type's method (`Task.join`) named the function symbol instead of the method's. And a
+    call through a loaded code pointer read function attributes from the load when shaped roots were live across it
+    (`isGCLeafFn`), which crashed the compiler now and then; it only happened on cold builds, where the stack-move
+    matrix compiled this fixture's configurations back to back.
+
+    Test: `erased_closures` in the stack-move matrix, through the call adapter, the entry adapter, both in turn, a
+    closure returning a closure, a closure in a generic class's method, a bounded `T` captured, a generic call inside a
+    lifted body, `Void` closures both ways, `task` and `fiber`, over heap strings and objects, on all 48 legs.
+    It failed to compile before this; with the call adapter's frame addresses left unmarked, the stack-move-check
+    legs crash. Witness thunks for a generic type as a conformer belong to 253.3.3.
 - **251.3** Construct generic classes in compiled-once bodies. **Done.** `Node(...)` with `Node` generic allocates the
   header plus the fields' sizes from the dictionary, writes the descriptor word the dictionary holds for that
   instantiation into the header, and stores each field at its derived offset (`lowerErasedAlloc`). A recipe records

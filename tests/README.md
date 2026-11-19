@@ -122,7 +122,8 @@ A case changes how its fixture is compiled or run only through named settings. T
 setting's stage and its mechanism, is `src/compiler-test/sources/Settings.swift`; an unknown name, or a
 setting at the wrong stage, is an error. Compile settings select configs declared in the repository's root
 `cfg.yaml`; run settings are still environment variables (task 205 moves them).
-- Compile: `optimize` (`-c release`), `inline`, `escape`, `scalar`, `devirt` (each default `true`; `false`
+- Compile: `optimize` (`-c release`), `mono` (`none`, `edge` or `all`: which generics are specialized; selects
+  `mono_<value>`, which wins over `release`'s `all`), `inline`, `escape`, `scalar`, `devirt` (each default `true`; `false`
   selects `no_inline` and the like, turning the pass off), `rt_prelude` (fixtures that call `rt*` directly),
   `runtime_tier` (fixtures that call the `Runtime` intrinsics without the runtime prelude),
   `gc_record` (the collector's recorder at `limited`; `collections` turns it on), `gc_immix` (the `immix`
@@ -140,7 +141,10 @@ setting at the wrong stage, is an error. Compile settings select configs declare
   a fiber's stack does not grow, `NOMU_STACK_MAX`).
 
 `--run-setting name=value` adds a run setting to every run of the selection, over each case's own: for
-example `--run-setting stack_move=1` runs the whole suite moving stacks.
+example `--run-setting stack_move=1` runs the whole suite moving stacks. `--compile-setting name=value` adds a
+compile setting to every build, after the case's own: `--compile-setting mono=none --compile-setting
+optimize=true` builds the selection compiled once and optimized. Cases outside the root workspace
+(`multipackage-*`, `xworkspace-*`) do not see the root `cfg.yaml`'s configs and fail to build under it.
 
 A case that needs a collection at an exact point builds with `rt_prelude` and calls `rtGcRequest(kind)`
 from the fixture: the request goes through the coordinator, and the caller stops at its next safepoint poll.
@@ -160,7 +164,9 @@ dimension value) that they ran: `-evac` cases use `gc_stress_bytes`, `-nursery` 
 
 A matrix is declared once. `dimensions` names axes; each value carries `compile_settings`, `run_settings`,
 `collections` (as on a case) and a `tier`:
-- `pipeline` — `debug`; `release` (`optimize`) and `noinline` (`inline: false`), both `full`.
+- `pipeline` — `debug` (generics compiled once); `release` (`optimize`, generics specialized), `noinline`
+  (`inline: false`), `release-erased` (`optimize` with `mono: none`: compiled once and optimized) and `edge`
+  (`mono: edge`), all `full`.
 - `gc` — `default`; `nursery` (64 blocks); `nursery-tight` (1 block: collections land at points the larger
   nursery never reaches); `stress-minor` (a collection every 4 KiB); `stress-major` (the same, every
   collection major), `full`; `stress-mixed` (the same, every fourth collection major, so minors run after

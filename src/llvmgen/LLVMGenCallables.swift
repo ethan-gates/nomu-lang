@@ -30,9 +30,37 @@ extension LLVMGen {
                         ir: f, selfType: nil, selfByPointer: false)
     }
 
-    func declareMethod(_ typeName: String, _ method: String) {
+    // An imported type's methods have no bodies here, so a witness thunk for an imported conformer passes the
+    // `requirement` the method satisfies, whose signature conformance checking matched against it, and the method is
+    // declared from that. `Self` in the requirement, as the existential of the `any I` witness ABI or as the
+    // compiled-once ABI keeps it, is the conformer itself.
+    func declareMethod(_ typeName: String, _ method: String, requirement: (params: [Type], ret: Type)? = nil) {
         let key = "m:\(typeName):\(method)"
         guard callables[key] == nil else { return }
+        if typeMethods(typeName).first(where: { $0.name == method }) == nil, let requirement,
+           ExternalName.isEncoded(typeName) {
+            let selfType = Type.named(typeName, namedKind(typeName))
+            func concrete(_ t: Type) -> Type {
+                if case .existential = t { return selfType }
+                return withSelf(t, typeName)
+            }
+            let params = requirement.params.enumerated().map {
+                NOIRParam(label: "_", name: "p\($0.offset)", type: concrete($0.element), span: zeroSpan)
+            }
+            let mutating = externalMutatingMethods.contains("\(typeName).\(method)")
+            let byPointer = classMap[typeName] != nil || mutating
+            let f = NOIRFunc(name: method, params: params, returnType: concrete(requirement.ret), body: [],
+                             isMutating: mutating, span: zeroSpan)
+            // The producer's symbol, declared without a body, as a direct call of an imported method declares it.
+            guard let retTy = llvmType(f.returnType, zeroSpan), let st = selfLLVMType(typeName) else { return }
+            var paramTys: [LLVMTypeRef] = [byPointer ? (classMap[typeName] != nil ? p1 : LLVMPointerType(st, 0)!) : st]
+            for p in params { guard let t = llvmType(p.type, zeroSpan) else { return }; paramTys.append(t) }
+            let symbol = Mangle.method(typeName, method, home: homeModule)
+            let (fn, fnTy) = LLVMGetNamedFunction(mod, symbol).map { ($0, LLVMGlobalGetValueType($0)!) }
+                ?? emitFunction(symbol, ret: retTy, params: paramTys)
+            callables[key] = Callable(fn: fn, ty: fnTy, ir: f, selfType: typeName, selfByPointer: byPointer)
+            return
+        }
         guard let f = typeMethods(typeName).first(where: { $0.name == method }) else {
             fail("8.2.3: unknown method '\(typeName).\(method)'", Span(startOffset: -1, endOffset: -1, map: nil))
             return

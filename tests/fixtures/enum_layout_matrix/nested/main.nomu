@@ -1,0 +1,168 @@
+// An enum with a tag inside another enum's payload, both holding references: the outer descriptor records the
+// inner as a sub-descriptor the collector recurses into. Also an enum whose every payload case holds a reference
+// at one offset, beside one that holds a `String` in some cases. Values live in locals, array elements, class
+// and struct fields, a closure's captures and actor messages while `churn` allocates, so a moving collection
+// relocates the references they hold.
+class Node {
+  let v: Int
+}
+
+enum Inner {
+  case text(s: String)
+  case node(n: Node)
+  case other(t: String, k: Int)
+}
+
+enum Outer {
+  case one(e: Inner, k: Int)
+  case two(n: Node)
+  case none
+}
+
+// A reference in every payload case, at the same offset, and a `String` in one.
+enum Common {
+  case a(n: Node, s: String)
+  case b(n: Node, k: Int)
+}
+
+class Holder {
+  var o: Outer
+  var c: Common
+}
+
+struct Pair {
+  var o: Outer
+  var tag: Int
+}
+
+actor Sink {
+  var bad: Int = 0
+  on take(o: Outer, i: Int, done: Channel<Int>) {
+    bad = bad + check(o, i)
+    if i == 63 {
+      done.send(bad)
+    }
+  }
+}
+
+fun churn(n: Int) -> Int {
+  var k = 0
+  var i = 0
+  while i < n {
+    let s = "churn-string-long-enough-for-the-heap-".concat("x")
+    k = k + s.count
+    i = i + 1
+  }
+  return k
+}
+
+fun text(i: Int) -> String {
+  return "inner-heap-string-".concat("value")
+}
+
+fun make(i: Int) -> Outer {
+  if i % 4 == 0 {
+    return Outer.one(e: Inner.text(s: text(i)), k: i)
+  }
+  if i % 4 == 1 {
+    return Outer.one(e: Inner.node(n: Node(v: i)), k: i)
+  }
+  if i % 4 == 2 {
+    return Outer.one(e: Inner.other(t: text(i), k: i), k: i)
+  }
+  return Outer.two(n: Node(v: i))
+}
+
+fun check(o: Outer, i: Int) -> Int {
+  switch o {
+  case .one(let e, let k):
+    if k != i {
+      return 1
+    }
+    switch e {
+    case .text(let s):
+      if i % 4 == 0 && s.eq("inner-heap-string-value") { return 0 }
+      return 1
+    case .node(let n):
+      if i % 4 == 1 && n.v == i { return 0 }
+      return 1
+    case .other(let t, let kk):
+      if i % 4 == 2 && kk == i && t.eq("inner-heap-string-value") { return 0 }
+      return 1
+    }
+  case .two(let n):
+    if i % 4 == 3 && n.v == i { return 0 }
+    return 1
+  case .none: return 1
+  }
+}
+
+fun common(i: Int) -> Common {
+  if i % 2 == 0 {
+    return Common.a(n: Node(v: i), s: text(i))
+  }
+  return Common.b(n: Node(v: i), k: i)
+}
+
+fun checkCommon(c: Common, i: Int) -> Int {
+  switch c {
+  case .a(let n, let s):
+    if i % 2 == 0 && n.v == i && s.eq("inner-heap-string-value") { return 0 }
+    return 1
+  case .b(let n, let k):
+    if i % 2 == 1 && n.v == i && k == i { return 0 }
+    return 1
+  }
+}
+
+fun main() {
+  var bad = 0
+  var round = 0
+  while round < 20 {
+    // Locals.
+    let a = make(round)
+    let b = make(round + 1)
+    let c = common(round)
+    var arr: Array<Outer> = []
+    var hs: Array<Holder> = []
+    var ps: Array<Pair> = []
+    var i = 0
+    while i < 16 {
+      arr.append(make(i))
+      hs.append(Holder(o: make(i), c: common(i)))
+      ps.append(Pair(o: make(i), tag: i))
+      i = i + 1
+    }
+    let captured = make(round + 2)
+    let f = { (x: Int) -> Int in
+      return check(captured, x)
+    }
+    churn(2000)
+    bad = bad + check(a, round) + check(b, round + 1) + checkCommon(c, round) + f(round + 2)
+    i = 0
+    while i < 16 {
+      bad = bad + check(arr[i], i) + check(hs[i].o, i) + checkCommon(hs[i].c, i) + check(ps[i].o, i)
+      if ps[i].tag != i {
+        bad = bad + 1
+      }
+      i = i + 1
+    }
+    round = round + 1
+  }
+  // Actor messages carrying the nested enum, queued while collections run.
+  let sink = Sink()
+  let done = Channel<Int>.make(capacity: 1)
+  var j = 0
+  while j < 64 {
+    sink.take(o: make(j), i: j, done: done)
+    churn(20)
+    j = j + 1
+  }
+  switch done.receive() {
+  case .some(let n): bad = bad + n
+  case .none: bad = bad + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+}

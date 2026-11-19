@@ -471,8 +471,8 @@ fun rtSchedWorkVisible(mine: RawPtr, now: Int) -> Bool {
 
 // Wake idle carriers after making work runnable. `all` (stop, stop-the-world) wakes every sleeper. Otherwise
 // one carrier is woken, and only when one is asleep and none is already searching: a woken carrier searches
-// (spins briefly for work, rtSchedLoop) and wakes the next itself if it finds more than it takes, so one
-// search covers a burst of readyings. Without this, every readying made a system call, and with idle
+// (spins briefly for work, rtSchedLoop) and wakes the next itself if work is left anywhere once it takes its
+// own, so one search covers a burst of readyings. Without this, every readying made a system call, and with idle
 // carriers woke one to find the work already taken (task 234).
 //
 // No work is lost: the work was enqueued under the scheduler lock before this runs. A carrier counts itself
@@ -875,11 +875,14 @@ fun rtSchedLoop(sched: RawPtr) {
           }
         } else {
           if searching {
-            // Found work: end the search, and pass it on if more is queued.
+            // Found work: end the search, and pass it on if more is queued anywhere, another carrier's queue
+            // included. A steal takes half a queue, so the rest can wait behind a running fiber on its carrier;
+            // a readying while this carrier searched skipped its wake, so this is the only one coming (Go's
+            // `resetspinning`).
             sched.atomicStore(0, toByteOffset: 328)
             searching = false
             rec.store(0, toByteOffset: 152)
-            if rtSchedGlobalNonEmpty(sched) || rtRunqNonEmpty(rec) {
+            if rtSchedGlobalNonEmpty(sched) || rtRunqNonEmpty(rec) || rtSchedWorkVisible(rec, Runtime.ticks()) {
               rtSchedWake(sched, false)
             }
           }

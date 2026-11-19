@@ -508,6 +508,15 @@ enum NOIRGen {
             }
             s.diags.error("type '\(t)' does not conform to '\(missing.joined(separator: " & "))'", at: e.span)
             return e
+        // A generic type's application conforms as its template does; its witness, or a composition's, is built per
+        // instantiation where the box is made.
+        case .generic(let base, _):
+            let missing = target.filter { s.allConformsTo[base]?.contains($0) != true || s.hasNonCovariantSelf($0) }
+            if missing.isEmpty {
+                return NOIRExpr(type: expected!, span: e.span, kind: .box(value: e, interfaces: target))
+            }
+            s.diags.error("type '\(e.type)' does not conform to '\(missing.joined(separator: " & "))'", at: e.span)
+            return e
         case .existential(let src):
             // `any B` → `any A` where B refines A: re-box through the source witness's base
             // pointer (M5 A1.4). Composition targets/sources stay unsupported for now.
@@ -809,14 +818,23 @@ enum NOIRGen {
             // the left (needed for an empty literal, which has nothing to infer from).
             var expectedElem: Type? = nil
             if case .array(let e)? = expected { expectedElem = e }
-            let irElems = elems.map { checkExpr(&s, $0, expected: expectedElem) }
-            var elemTy = expectedElem ?? irElems.first?.type
+            // An expected element with a hole (`.error`, a type parameter generic inference has yet to bind) only
+            // guides the elements; the first element's type is the element type. A known one is each element's
+            // target: an `Array<any I>` boxes its elements, as a `let x: any I` does.
+            let hint = expectedElem?.mentionsError == true
+            let irElems = elems.map { e -> NOIRExpr in
+                let v = checkExpr(&s, e, expected: expectedElem)
+                return hint ? v : coerce(&s, v, to: expectedElem)
+            }
+            var elemTy = hint ? (irElems.first?.type ?? expectedElem) : (expectedElem ?? irElems.first?.type)
             if elemTy == nil {
                 s.diags.error("cannot infer the element type of an empty array literal — add an annotation like 'Array<Int>'", at: span)
                 elemTy = .error
             }
-            // Every element must match the element type.
-            for ir in irElems where ir.type != .error && ir.type != elemTy! {
+            // Every element must match the element type. One that could not be boxed to an existential element
+            // type has had its error from `coerce`.
+            let boxes: Bool = { switch elemTy! { case .existential, .composition: return !hint; default: return false } }()
+            for ir in irElems where !boxes && ir.type != .error && ir.type != elemTy! {
                 s.diags.error("array element has type '\(ir.type)', expected '\(elemTy!)'", at: ir.span)
             }
             return NOIRExpr(type: .array(elemTy!), span: span, kind: .arrayLit(elements: irElems))
@@ -1097,6 +1115,11 @@ enum NOIRGen {
                 }
                 return NOIRExpr(type: ret, span: span, kind: .methodCall(receiver: recv, method: name, args: irArgs))
             }
+            // A default requirement an applied generic type inherits, synthesized on its template.
+            if case .generic(let gbase, _) = recv.type,
+               let req = (s.inheritedDefaults[gbase] ?? []).first(where: { $0.name == name }) {
+                return requirementCall(&s, receiver: recv, req, method: name, selfAs: recv.type, args, at: span)
+            }
             if case .named(let typeName, let kind) = recv.type {
                 // Actor send: base.handler(args).
                 if kind == .actor_, let handler = s.actors[typeName]?.handlers.first(where: { $0.name == name }) {
@@ -1235,7 +1258,7 @@ enum NOIRGen {
             if let sig = s.funcs[name] {
                 s.checkVisible(name, sig.visibility, declaredIn: sig.declFile, at: span)
                 if !sig.generics.isEmpty {
-                    let irArgs = args.map { NOIRArg(label: $0.label, value: checkExpr(&s, $0.value)) }
+                    let irArgs = GenericInference.checkGenericCallArgs(&s, sig, args, expected: expected, at: span)
                     return GenericInference.checkGenericCall(&s, name, sig, irArgs, at: span, expected: expected)
                 }
                 let irArgs = checkArgs(&s, args, expectedParams: sig.params)
@@ -1582,6 +1605,7 @@ enum NOIRGen {
             let fields = sd.fields.map { lowerField(s, $0) }
             let methods = lowerMethods(&s, sd.methods, selfType: selfT, fields: fields)
                         + lowerAccessors(&s, sd.properties, selfType: selfT, fields: fields)
+                        + InterfaceModel.lowerInheritedDefaults(&s, sd.name, selfType: selfT, fields: fields)
             lowerStaticMethods(&s, sd.methods, typeName: sd.name, generics: irGenerics)
             return .structDecl(NOIRStruct(name: sd.name, generics: irGenerics,
                                         fields: fields, methods: methods, span: sd.span))
@@ -1590,6 +1614,7 @@ enum NOIRGen {
             let fields = c.fields.map { lowerField(s, $0) }
             let methods = lowerMethods(&s, c.methods, selfType: selfT, fields: fields)
                         + lowerAccessors(&s, c.properties, selfType: selfT, fields: fields)
+                        + InterfaceModel.lowerInheritedDefaults(&s, c.name, selfType: selfT, fields: fields)
             lowerStaticMethods(&s, c.methods, typeName: c.name, generics: irGenerics)
             return .classDecl(NOIRClass(name: c.name, generics: irGenerics,
                                       fields: fields, methods: methods, span: c.span))
@@ -1598,6 +1623,7 @@ enum NOIRGen {
             let cases = e.cases.map { NOIREnumCase(name: $0.name, fields: $0.fields.map { lowerField(s, $0) }, span: $0.span) }
             let methods = lowerMethods(&s, e.methods, selfType: selfT, fields: [])
                         + lowerAccessors(&s, e.properties, selfType: selfT, fields: [])
+                        + InterfaceModel.lowerInheritedDefaults(&s, e.name, selfType: selfT, fields: [])
             lowerStaticMethods(&s, e.methods, typeName: e.name, generics: irGenerics)
             return .enumDecl(NOIREnum(name: e.name, generics: irGenerics, cases: cases, methods: methods, span: e.span))
         default: preconditionFailure("unreachable")

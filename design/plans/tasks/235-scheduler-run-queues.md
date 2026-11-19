@@ -1,7 +1,8 @@
 # Scheduler: one run queue under one lock
 
 **Avenue:** Risk (the "better than Go" concurrency thesis) · **Type/Lifecycle:** `perf · done` ·
-**Size:** M–L · **Status:** done — 235.1 to 235.6 built; 235.4.2, 235.7 and 235.8 moved to [254](254-scheduler-performance.md) · **Source:** [234](234-scheduler-wake-and-pool.md).3's
+**Size:** M–L · **Status:** done — 235.1 to 235.6 and 235.9 built; 235.4.2, 235.7 and 235.8 moved to
+[254](254-scheduler-performance.md) · **Source:** [234](234-scheduler-wake-and-pool.md).3's
 workloads
 
 ## Observed
@@ -251,6 +252,20 @@ Go's model, decided over a lighter step because performance comes first:
   [254](254-scheduler-performance.md).1, with the A/B results and the untried leads.
 - **235.8** Fan-in across carriers (about 160 ns a value on 2 carriers; the senders move between carriers on
   every value). Moved to [254](254-scheduler-performance.md).2.
+
+- **235.9** Ready work stranded behind a running fiber. **Done.** Found by [236](236-fiber-preemption.md).1:
+  `main` spawned N - 1 fibers that compute, then one more, then parked in a join. On 3 or more carriers the last
+  fiber waited 1 s (every run on 3; some on 4 and 8), until the idle sleep's timeout (`rtSchedIdle`'s
+  `futexWait`). The cause, on 3 carriers A, B and C: the first spawn woke B to search; the later spawns skipped
+  their wakes, since B was searching; `main` parked and A took a busy fiber; B stole half of A's queue (one
+  fiber), found its own queue and the global queue empty, and woke no one. The last fiber sat in A's queue
+  behind a fiber that never parks, with C asleep. The fix: a searcher that finds work wakes another when work
+  is visible anywhere, another carrier's queue included (`rtSchedWorkVisible`), as Go's `resetspinning` wakes
+  another spinning M. The suite case `stranded-spawn` (2, 3, 4 and 8 carriers, 10 iterations) passes, and
+  fails with the fix reverted. Scheduler workloads, median of 5, before → after: no time regression;
+  `forkjoin_fiber` 4–22% faster, `pipeline_actor` up to 30% faster (1 µs stages, 4 carriers), `fanout_actor`
+  43–50% faster on 4 carriers, `producer_fiber`'s largest wait 40–75% lower, `server_sim`'s light p99 12–25%
+  lower; `fanin_channel` on 8 carriers spends 23% more CPU for 6% per value, near noise.
 
 ## Dependents
 

@@ -17,18 +17,28 @@ import support
 // already keyed to another module (not in this module's own-name set). Names are never double-encoded —
 // own names are bare by construction.
 //
-// Only generic **functions** are canonicalized today (the shipped unit); a non-function decl rides
-// through unchanged until generic types/methods are shipped (a later 100.5.4 increment).
+// Functions and the private types a shipped body reaches (struct, class, enum, with their methods) are
+// canonicalized. A decl's own name stays bare; the consumer keys it when it injects the decl.
 
-// The identifiers a decl's body references (task 100.5.4): callee / variable names, func refs, and
-// constructed/enum/static type names. Over-approximate — no scope tracking, so a shadowing local may add
-// a spurious name, which at worst ships an unused decl (dead-stripped). Drives the private-callee closure
-// a `.bir` must ship: the reachable non-public callees whose bodies the consumer needs to emit locally,
-// since they are absent from the `.nmi` (interface-invisible) and so unknown to the consumer's Sema.
+// The identifiers a decl references (task 100.5.4): callee / variable names, func refs, and the names of
+// the types its signatures, fields, cases and expressions mention. A type's methods count as part of it.
+// Over-approximate — no scope tracking, so a shadowing local may add a spurious name, which at worst ships
+// an unused decl (dead-stripped). Drives the closure a `.bir` must ship: the reachable non-public callees
+// and types the consumer needs to emit locally, since they are absent from the `.nmi` (interface-
+// invisible) and so unknown to the consumer's Sema.
 public func collectReferencedNames(_ decl: NOIRDecl) -> Set<String> {
-    guard case .funcDecl(let f) = decl else { return [] }
     var names = Set<String>()
+    func visitType(_ t: Type) {
+        switch t {
+        case .named(let n, _):                     names.insert(n)
+        case .generic(let base, let args):         names.insert(base); args.forEach(visitType)
+        case .array(let e), .ptr(let e):           visitType(e)
+        case .function(let p, let r):              p.forEach(visitType); visitType(r)
+        default:                                   break
+        }
+    }
     func visitExpr(_ e: NOIRExpr) {
+        visitType(e.type)
         switch e.kind {
         case .intLit, .doubleLit, .boolLit, .stringLit:
             break
@@ -40,9 +50,9 @@ public func collectReferencedNames(_ decl: NOIRDecl) -> Set<String> {
         case .fieldAccess(let base, _):            visitExpr(base)
         case .methodCall(let r, _, let args):      visitExpr(r); args.forEach(visitExpr)
         case .call(let callee, let args, _):       visitExpr(callee); args.forEach { visitExpr($0.value) }
-        case .staticCall(_, _, let args):          args.forEach(visitExpr)
+        case .staticCall(let t, _, let args):      visitType(t); args.forEach(visitExpr)
         case .binary(_, let l, let r):             visitExpr(l); visitExpr(r)
-        case .closure(_, let body):                body.forEach(visitStmt)
+        case .closure(let ps, let body):           ps.forEach { visitType($0.type) }; body.forEach(visitStmt)
         case .box(let v, _):                       visitExpr(v)
         case .arrayLit(let els):                   els.forEach(visitExpr)
         case .index(let b, let i):                 visitExpr(b); visitExpr(i)
@@ -59,19 +69,37 @@ public func collectReferencedNames(_ decl: NOIRDecl) -> Set<String> {
         case .ifStmt(let c, let th, let el):       visitExpr(c); th.forEach(visitStmt); el?.forEach(visitStmt)
         case .whileStmt(let c, let body):          visitExpr(c); body.forEach(visitStmt)
         case .breakStmt, .continueStmt:            break
-        case .switchStmt(let sw):                  visitExpr(sw.subject); sw.arms.forEach { $0.body.forEach(visitStmt) }
+        case .switchStmt(let sw):
+            visitExpr(sw.subject)
+            sw.arms.forEach { $0.bindings.forEach { visitType($0.type) }; $0.body.forEach(visitStmt) }
         case .exprStmt(let e):                     visitExpr(e)
         }
     }
-    f.body.forEach(visitStmt)
+    func visitFunc(_ f: NOIRFunc) {
+        f.params.forEach { visitType($0.type) }
+        visitType(f.returnType)
+        f.body.forEach(visitStmt)
+    }
+    switch decl {
+    case .funcDecl(let f):   visitFunc(f)
+    case .structDecl(let s): s.fields.forEach { visitType($0.type) }; s.methods.forEach(visitFunc)
+    case .classDecl(let c):  c.fields.forEach { visitType($0.type) }; c.methods.forEach(visitFunc)
+    case .enumDecl(let e):   e.cases.forEach { $0.fields.forEach { visitType($0.type) } }; e.methods.forEach(visitFunc)
+    case .actorDecl, .globalDecl: break
+    }
     return names
 }
 
 public func canonicalizeForExport(_ decls: [NOIRDecl], origin: String, ownNames: Set<String>) -> [NOIRDecl] {
     let c = Canonicalizer(origin: origin, ownNames: ownNames)
     return decls.map { decl in
-        if case .funcDecl(let f) = decl { return .funcDecl(c.function(f)) }
-        return decl
+        switch decl {
+        case .funcDecl(let f):   return .funcDecl(c.function(f))
+        case .structDecl(let s): return .structDecl(c.structDecl(s))
+        case .classDecl(let k):  return .classDecl(c.classDecl(k))
+        case .enumDecl(let e):   return .enumDecl(c.enumDecl(e))
+        case .actorDecl, .globalDecl: return decl
+        }
     }
 }
 
@@ -81,7 +109,14 @@ private final class Canonicalizer {
     init(origin: String, ownNames: Set<String>) { self.origin = origin; self.ownNames = ownNames }
 
     private func key(_ name: String) -> String { ExternalName.encode(origin: origin, name: name) }
-    private func keyed(_ name: String) -> String { ownNames.contains(name) ? key(name) : name }
+    // An own name, or a static function of an own type (`Box.make`), is keyed.
+    private func keyed(_ name: String) -> String {
+        if ownNames.contains(name) { return key(name) }
+        if let dot = name.firstIndex(of: "."), ownNames.contains(String(name[..<dot])) { return key(name) }
+        return name
+    }
+    // An interface keeps its bare name: a consumer knows an imported interface by it (`encodeExternalDecl`).
+    private func interface(_ name: String) -> String { name }
 
     // MARK: types
     func type(_ t: Type) -> Type {
@@ -91,18 +126,40 @@ private final class Canonicalizer {
         case .array(let e):                   return .array(type(e))
         case .ptr(let e):                     return .ptr(type(e))
         case .function(let p, let r):         return .function(params: p.map(type), ret: type(r))
-        case .existential(let n):             return .existential(keyed(n))
-        case .composition(let ns):            return .composition(ns.map(keyed))
-        case .opaque(let ifs, let owner):     return .opaque(interfaces: ifs.map(keyed), owner: owner)
+        case .existential(let n):             return .existential(interface(n))
+        case .composition(let ns):            return .composition(ns.map(interface))
+        case .opaque(let ifs, let owner):     return .opaque(interfaces: ifs.map(interface), owner: owner)
         default:                              return t
         }
     }
 
     // MARK: declarations
-    func function(_ f: NOIRFunc) -> NOIRFunc {
-        let bound = Set(f.params.map(\.name))
+    func generics(_ gs: [NOIRGenericParam]) -> [NOIRGenericParam] {
+        gs.map { NOIRGenericParam(name: $0.name, bounds: $0.bounds.map(interface), isShared: $0.isShared) }
+    }
+    func fields(_ fs: [NOIRField]) -> [NOIRField] {
+        fs.map { NOIRField(name: $0.name, type: type($0.type), isMutable: $0.isMutable, span: $0.span,
+                           fromTypeParameter: $0.fromTypeParameter) }
+    }
+    // A method keeps its name; its type is the keyed owner. `self` is bound in its body.
+    func method(_ f: NOIRFunc) -> NOIRFunc { function(f, bound: ["self"]) }
+    func structDecl(_ s: NOIRStruct) -> NOIRStruct {
+        NOIRStruct(name: s.name, generics: generics(s.generics), fields: fields(s.fields),
+                   methods: s.methods.map(method), span: s.span)
+    }
+    func classDecl(_ c: NOIRClass) -> NOIRClass {
+        NOIRClass(name: c.name, generics: generics(c.generics), fields: fields(c.fields),
+                  methods: c.methods.map(method), span: c.span)
+    }
+    func enumDecl(_ e: NOIREnum) -> NOIREnum {
+        NOIREnum(name: e.name, generics: generics(e.generics),
+                 cases: e.cases.map { NOIREnumCase(name: $0.name, fields: fields($0.fields), span: $0.span) },
+                 methods: e.methods.map(method), span: e.span)
+    }
+    func function(_ f: NOIRFunc, bound outer: Set<String> = []) -> NOIRFunc {
+        let bound = outer.union(f.params.map(\.name))
         return NOIRFunc(name: f.name,
-            generics: f.generics.map { NOIRGenericParam(name: $0.name, bounds: $0.bounds.map(keyed), isShared: $0.isShared) },
+            generics: generics(f.generics),
             params: f.params.map { NOIRParam(label: $0.label, name: $0.name, type: type($0.type), span: $0.span) },
             returnType: type(f.returnType),
             body: stmts(f.body, bound),
@@ -182,7 +239,7 @@ private final class Canonicalizer {
             return here(.closure(params: params.map { NOIRParam(label: $0.label, name: $0.name, type: type($0.type), span: $0.span) },
                                  body: stmts(body, inner)))
         case .box(let value, let interfaces):
-            return here(.box(value: expr(value, bound), interfaces: interfaces.map(keyed)))
+            return here(.box(value: expr(value, bound), interfaces: interfaces.map(interface)))
         case .arrayLit(let elements):
             return here(.arrayLit(elements: elements.map { expr($0, bound) }))
         case .index(let base, let idx):

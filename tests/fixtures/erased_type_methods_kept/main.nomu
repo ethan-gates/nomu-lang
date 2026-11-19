@@ -1,0 +1,10 @@
+// A generic type below `package` keeps its compiled-once methods only when an exported generic's compiled-once
+// body uses it with a type parameter; one used only at concrete types has its specializations alone.
+import pkg/lib
+
+fun main() {
+  print(concrete(4))
+  print(" ")
+  print(through("kept-".concat("value"), 1).count + through(5, 2))
+  print("\n")
+}

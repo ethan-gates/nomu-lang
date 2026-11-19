@@ -1,0 +1,111 @@
+// Arrays of `T` in compiled-once bodies: an array is passed as its handle; elements are sized from the dictionary,
+// and a new element buffer takes its descriptor from the dictionary, for literals and for a growing `append`.
+package struct Pair<T> {
+    let a: T
+    let b: T
+}
+
+package class Cell<T> {
+    var value: T
+}
+
+package fun three<T>(x: T, y: T, z: T) -> Array<T> {
+    return [x, y, z]
+}
+
+package fun repeated<T>(x: T, n: Int) -> Array<T> {
+    var out: Array<T> = []
+    var i = 0
+    while i < n {
+        out.append(x)
+        i = i + 1
+    }
+    return out
+}
+
+package fun swapEnds<T>(xs: Array<T>) {
+    let first = xs[0]
+    xs[0] = xs[xs.count - 1]
+    xs[xs.count - 1] = first
+}
+
+package fun pairs<T>(xs: Array<T>) -> Array<Pair<T>> {
+    var out: Array<Pair<T>> = []
+    var i = 0
+    while i + 1 < xs.count {
+        out.append(Pair(a: xs[i], b: xs[i + 1]))
+        i = i + 2
+    }
+    return out
+}
+
+package fun cells<T>(xs: Array<T>) -> Array<Cell<T>> {
+    var out: Array<Cell<T>> = []
+    var i = 0
+    while i < xs.count {
+        out.append(Cell(value: xs[i]))
+        i = i + 1
+    }
+    return out
+}
+
+package fun nested<T>(x: T) -> Array<Array<T>> {
+    return [[x], [x, x]]
+}
+
+package fun lastOf<T>(xs: Array<T>) -> T {
+    return xs[xs.count - 1]
+}
+
+package interface Weighed {
+    fun weight() -> Int
+}
+
+// A bounded element: the requirement is called on each element read from the array.
+package fun total<T: Weighed>(xs: Array<T>) -> Int {
+    var s = 0
+    var i = 0
+    while i < xs.count {
+        s = s + xs[i].weight()
+        i = i + 1
+    }
+    return s
+}
+
+// An array passed from one compiled-once body to another.
+package fun doubled<T>(xs: Array<T>) -> Array<T> {
+    let out = repeated(xs[0], 0)
+    var i = 0
+    while i < xs.count {
+        out.append(xs[i])
+        out.append(xs[i])
+        i = i + 1
+    }
+    return out
+}
+
+package struct Many<T> {
+    let items: Array<T>
+    let tag: T
+}
+
+// An array held in a generic struct's field.
+package fun many<T>(x: T, n: Int) -> Many<T> {
+    return Many(items: repeated(x, n), tag: x)
+}
+
+package fun lastItem<T>(m: Many<T>) -> T {
+    return m.items[m.items.count - 1]
+}
+
+// An array captured by a closure made here, and read through it.
+package fun reader<T>(xs: Array<T>) -> (Int) -> T {
+    return { (i: Int) -> T in
+        return xs[i]
+    }
+}
+
+// Elements of a generic enum.
+package fun options<T>(x: T) -> Array<Option<T>> {
+    return [Option<T>.none, Option<T>.some(value: x)]
+}

@@ -283,6 +283,109 @@ cases:
     fixture: tests/fixtures/module_generic_composed_args
     expect:
       stdout: "5 heap-string 2 7 3 5 4\n"
+  - name: module-generic-composed-args-specialized
+    fixture: tests/fixtures/module_generic_composed_args
+    compile_args:
+      - "--config=mono_all"
+    expect:
+      stdout: "5 heap-string 2 7 3 5 4\n"
+  - name: module-generic-composed-args-release
+    fixture: tests/fixtures/module_generic_composed_args
+    compile_args:
+      - "--config=release"
+    expect:
+      stdout: "5 heap-string 2 7 3 5 4\n"
+  - name: module-generic-reach
+    fixture: tests/fixtures/module_generic_reach
+    expect:
+      stdout: "bad 0\n"
+  - name: module-generic-reach-specialized
+    fixture: tests/fixtures/module_generic_reach
+    compile_args:
+      - "--config=mono_all"
+    expect:
+      stdout: "bad 0\n"
+  - name: module-generic-reach-edge
+    fixture: tests/fixtures/module_generic_reach
+    compile_args:
+      - "--config=mono_edge"
+    expect:
+      stdout: "bad 0\n"
+  - name: module-generic-reach-release
+    fixture: tests/fixtures/module_generic_reach
+    compile_args:
+      - "--config=release"
+    expect:
+      stdout: "bad 0\n"
+  - name: specialized-type-methods-edge
+    fixture: tests/fixtures/stack_move_matrix/specialized_type_methods
+    compile_args:
+      - "--config=mono_edge"
+    expect:
+      stdout: "bad 0\n"
+  # Concrete instances of generic types inside compiled-once library bodies (`Option<Node>`, `Option<Int>`), held by
+  # value as their concrete callers and fields hold them; the matrix runs it debug and release.
+  # A leading-dot argument to a generic call, typed by its parameter as far as the other arguments and the
+  # expected type bind it; local and imported.
+  - name: generic-implicit-member
+    fixture: tests/fixtures/generic_implicit_member
+    expect:
+      stdout: "2 0 none 3 -1 7 8\n"
+  - name: generic-implicit-member-release
+    fixture: tests/fixtures/generic_implicit_member
+    compile_args:
+      - "--config=release"
+    expect:
+      stdout: "2 0 none 3 -1 7 8\n"
+  # An array literal with an existential element type boxes each element: from an annotation, a parameter, a
+  # return type, a composition and a nested literal, held across collections.
+  - name: existential-array-literal
+    fixture: tests/fixtures/existential_array_literal
+    expect:
+      stdout: "bad 0\n"
+  - name: existential-array-literal-evac
+    fixture: tests/fixtures/existential_array_literal
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "bad 0\n"
+    collections:
+      - min: 1
+  - name: existential-array-literal-release
+    fixture: tests/fixtures/existential_array_literal
+    compile_args:
+      - "--config=release"
+    run_settings:
+      gc_stress_bytes: 4096
+    expect:
+      stdout: "bad 0\n"
+  - name: existential-array-literal-mismatch
+    fixture: tests/fixtures/existential_array_literal_mismatch
+    compile:
+      expect_error: "type 'Plain' does not conform to 'Shape'"
+  - name: module-generic-let-mutating
+    fixture: tests/fixtures/module_generic_let_mutating
+    compile:
+      expect_error: "cannot call mutating method on an immutable value"
+  # A non-public generic type keeps its compiled-once methods only when an exported generic's compiled-once body
+  # uses it with a type parameter.
+  - name: erased-type-methods-kept
+    fixture: tests/fixtures/erased_type_methods_kept
+    expect:
+      stdout: "8 15\n"
+  - name: erased-type-methods-kept-release-erased
+    fixture: tests/fixtures/erased_type_methods_kept
+    compile_args:
+      - "--config=release"
+      - "--config=mono_none"
+    expect:
+      stdout: "8 15\n"
+  - name: erased-concrete-edge
+    fixture: tests/fixtures/stack_move_matrix/erased_concrete
+    compile_args:
+      - "--config=mono_edge"
+    expect:
+      stdout: "bad 0\n"
   - name: module-generic-two-bounds
     fixture: tests/fixtures/module_generic_two_bounds
     expect:
@@ -293,6 +396,20 @@ cases:
       - "--config=mono_all"
     expect:
       stdout: "10\n"
+
+  # A generic type's conformances are checked on its template, and it implements every requirement itself.
+  - name: generic-conformer-default
+    fixture: tests/fixtures/generic_conformer_default
+    expect:
+      stdout: "6 6 6\n"
+  - name: generic-conformer-wrong-signature
+    fixture: tests/fixtures/generic_conformer_wrong_sig
+    compile:
+      expect_error: "type 'Holder' does not conform to 'Valued': method 'val' has the wrong signature"
+  - name: generic-array-field-infer
+    fixture: tests/fixtures/generic_array_field_infer
+    expect:
+      stdout: "5 b\n"
 
   # `<shared T>` on a type: every instantiation's argument must be shareable, whether written, inferred or a
   # type parameter passed on (concurrency.md §5); a `shared` parameter counts, bare or nested.

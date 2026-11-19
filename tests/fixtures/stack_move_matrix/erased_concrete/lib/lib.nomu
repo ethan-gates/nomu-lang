@@ -1,0 +1,119 @@
+// Concrete instances of generic types inside compiled-once bodies. A type in an erased body that mentions no type
+// parameter is the specialized one a concrete caller, field or callee hands it, held by value: an `Option<Node>`
+// field, an `Option<Int>` from a call, an `Option<String>` holding a reference, in signatures, closures and the
+// methods of a generic class.
+package class Node {
+  var v: Int
+  var label: String
+  var next: Option<Node>
+}
+
+fun build(n: Int) -> Node {
+  var node = Node(v: 1, label: "the-last-node-label", next: .none)
+  var i = 1
+  while i < n {
+    node = Node(v: i + 1, label: "node-label-".concat("long-enough-for-the-heap"), next: .some(value: node))
+    i = i + 1
+  }
+  return node
+}
+
+fun find(xs: Array<Int>, x: Int) -> Option<Int> {
+  var i = 0
+  while i < xs.count {
+    if xs[i] == x {
+      return .some(value: i)
+    }
+    i = i + 1
+  }
+  return .none
+}
+
+fun wrap<U>(u: U) -> Option<U> {
+  return .some(value: u)
+}
+
+// Sums the chain's values: switching on an `Option<Node>` field, and reassigning from its payload.
+package fun chain<T>(x: T, n: Int) -> Int {
+  var node = build(n)
+  var sum = node.v
+  var going = true
+  while going {
+    switch node.next {
+    case .some(let nx):
+      node = nx
+      sum = sum + nx.v + nx.label.count - nx.label.count
+    case .none:
+      going = false
+    }
+  }
+  // A specialized generic call's result, and an erased one's.
+  switch wrap(n) {
+  case .some(let k): sum = sum + k
+  case .none: sum = sum - 1000
+  }
+  switch wrap(x) {
+  case .some(let y): sum = sum + 1
+  case .none: sum = sum - 1000
+  }
+  return sum
+}
+
+// An `Option<Int>` from a call, switched on, and from a closure made here.
+package fun look<T>(x: T, xs: Array<Int>, k: Int) -> Int {
+  var r = 0
+  switch find(xs, k) {
+  case .some(let i): r = i
+  case .none: r = -1
+  }
+  let f = { (j: Int) -> Option<Int> in
+    return find(xs, j)
+  }
+  switch f(k) {
+  case .some(let i): r = r + i
+  case .none: r = r - 1
+  }
+  return r
+}
+
+// Concrete generic instances in the signature: held by value on both sides of the call.
+package fun pick<T>(x: T, o: Option<Int>, s: Option<String>) -> Option<String> {
+  switch o {
+  case .some(let v):
+    if v > 0 {
+      return s
+    }
+    return .some(value: "picked-a-fresh-heap-string-".concat("value"))
+  case .none:
+    return .none
+  }
+}
+
+package class Holder<T> {
+  let item: T
+  var head: Option<Node>
+
+  fun depth() -> Int {
+    var n = 0
+    var cur = self.head
+    var going = true
+    while going {
+      switch cur {
+      case .some(let node):
+        n = n + node.v
+        cur = node.next
+      case .none:
+        going = false
+      }
+    }
+    return n
+  }
+
+  fun push(v: Int) {
+    self.head = .some(value: Node(v: v, label: "pushed-node-label-for-the-heap", next: self.head))
+  }
+}
+
+package fun holder<T>(x: T) -> Holder<T> {
+  return Holder(item: x, head: .none)
+}
