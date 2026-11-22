@@ -114,7 +114,7 @@ reuse it rather than rebuild it. What carries across every rung:
   (`nomu_gc_typesize`), and the variable-size kind + stride (`nomu_gc_typekind` / `nomu_gc_typestride`)
   (`c-types.md` §1, §3.2, `memory-model.md` §3). The self-hosted tracer (rung 2+) reads these same static
   tables from Nomu.
-- **The inline barrier / poll hooks.** `__nomu_write_barrier` and `__nomu_poll` (`backend.md`) stay
+- **The inline barrier / poll hooks.** `__nomu_write_barrier` and the loop poll (`backend.md`) stay
   compiler-emitted; rungs fill their *policy*, not their placement.
 
 So self-hosting moves the collector's **policy** (allocate, trace, reclaim, move) into Nomu while the

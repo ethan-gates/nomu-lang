@@ -727,6 +727,7 @@ fun nomuSchedWalkRoots(sched: RawPtr, roots: RawPtr, emitSlots: Int) -> Int {
     if st == 0 { stopped = true }        // ready: parked and since woken, its frames as it left them
     if st == 2 { stopped = true }        // parked at sleep/join
     if st == 4 { stopped = true }        // stopped at a safepoint poll (STW)
+    if st == 7 { stopped = true }        // in C, its frames anchored where it called in (rtEnterC)
     if stopped {
       let stackBase: RawPtr = cur.load(fromByteOffset: 48)
       if stackBase.isNull == false {

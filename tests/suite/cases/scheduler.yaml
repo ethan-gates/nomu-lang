@@ -200,3 +200,17 @@ cases:
       - 4
       - 8
     iterations: 10
+
+  # Preemption (task 236.5): spinners in a call-free loop and in loop-free recursion hold every carrier; the
+  # fiber that ends them runs only if the monitor takes a carrier back. Without preemption it never ends.
+  - name: preempt-spin
+    fixture: tests/fixtures/preempt_spin
+    compile_settings:
+      rt_prelude: true
+    expect:
+      stdout: "done 2\n"
+    carriers:
+      - 1
+      - 2
+    iterations: 5
+    timeout_sec: 20

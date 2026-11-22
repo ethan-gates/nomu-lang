@@ -7,6 +7,12 @@ import std/time
 //   0  call-free loops, which reach a poll every iteration (the case polls cover)
 //   1  recursion with no loop and no allocation, which reaches no poll inside it (the gap 236.4 closes); the
 //      loop around it polls, since the recursion reaches no stop, so a stop waits out one call
+// Modes 2 to 6 keep the busy fibers in the runtime's own code, which has no stops (task 236.8):
+//   2  small objects: TLAB bumps, refills and the minor collections they trigger
+//   3  large arrays built by append: each growth copies the buffer, and past a block it is a large object
+//   4  deep stacks: a fresh fiber recurses STOP_DEPTH frames (default 100,000), so its stack grows by moves
+//   5  channels: each busy fiber hands a counter back and forth with a partner over unbuffered channels
+//   6  print: many small prints through the stdout buffer (run with stdout to /dev/null)
 // Run on two or more carriers: NOMU_CARRIERS - 1 busy fibers, the driver on the remaining carrier. Built with
 // the runtime prelude (`--config=rt_prelude`). Prints `stop_latency mode <m> busy <n> requests <k> ns <total>`.
 
@@ -27,28 +33,136 @@ fun fib(n: Int) -> Int {
     return fib(n: n - 1) + fib(n: n - 2)
 }
 
+class Box {
+    var v: Int
+    var next: Option<Box>
+}
+
+// Mode 2: allocate a chain of `n` small objects, keeping one chain at a time.
+fun churn(n: Int, seed: Int) -> Int {
+    var head = Box(v: seed, next: .none)
+    var i = 0
+    while i < n {
+        head = Box(v: head.v + i, next: .some(head))
+        if i % 64 == 0 {
+            head = Box(v: head.v, next: .none)
+        }
+        i += 1
+    }
+    return head.v
+}
+
+// Mode 3: build an array of `n` by append, then read it.
+fun bigArray(n: Int, seed: Int) -> Int {
+    var xs: Array<Int> = []
+    var i = 0
+    while i < n {
+        xs.append(seed + i)
+        i += 1
+    }
+    return xs[n / 2] + xs.count
+}
+
+// Mode 4: recursion `n` deep, whose frames the stack must hold at once.
+fun deep(n: Int, x: Int) -> Int {
+    if n == 0 {
+        return x
+    }
+    let r = deep(n: n - 1, x: x * 3 + 1)
+    return r * 5 + n
+}
+
+fun deepFiber(n: Int, x: Int) -> Int {
+    return deep(n: n, x: x)
+}
+
+// Mode 5's partner: echo each value back until it is 0.
+fun echo(from: Channel<Int>, to: Channel<Int>) {
+    var open = true
+    while open {
+        switch from.receive() {
+        case .some(let v):
+            to.send(v)
+            if v == 0 {
+                open = false
+            }
+        case .none:
+            open = false
+        }
+    }
+}
+
+// Mode 5: `n` round trips with the partner.
+fun pingPong(a: Channel<Int>, b: Channel<Int>, n: Int) -> Int {
+    var acc = 0
+    var i = 1
+    while i <= n {
+        a.send(i)
+        switch b.receive() {
+        case .some(let v):
+            acc = acc + v
+        case .none:
+            acc = acc - 1
+        }
+        i += 1
+    }
+    return acc
+}
+
+// Mode 6: `n` small prints.
+fun printMany(n: Int, seed: Int) -> Int {
+    var i = 0
+    while i < n {
+        print(seed + i)
+        print(" ")
+        i += 1
+    }
+    print("\n")
+    return n
+}
+
 // Busy until the driver is done; each round is about 1 ms in one call.
-fun busy(mode: Int, done: RawPtr, me: Int) -> Int {
+fun busy(mode: Int, done: RawPtr, me: Int, depth: Int) -> Int {
     var acc = me
     var rounds = 0
+    let a = Channel<Int>.make(capacity: 0)
+    let b = Channel<Int>.make(capacity: 0)
+    if mode == 5 {
+        fiber echo(a, b)
+    }
     while done.atomicLoad(fromByteOffset: 0) == 0 {
         if mode == 0 {
             acc = acc + spin(work: 1000000, seed: acc)
-        } else {
+        } else if mode == 1 {
             acc = acc + fib(n: 27)
+        } else if mode == 2 {
+            acc = acc + churn(n: 100000, seed: acc)
+        } else if mode == 3 {
+            acc = acc + bigArray(n: 1000000, seed: acc)
+        } else if mode == 4 {
+            let t = task deepFiber(n: depth, x: acc)
+            acc = acc + t.join()
+        } else if mode == 5 {
+            acc = acc + pingPong(a: a, b: b, n: 1000)
+        } else {
+            acc = acc + printMany(n: 1000, seed: acc)
         }
         rounds += 1
+    }
+    if mode == 5 {
+        a.send(0)
+        b.receive()
     }
     return acc + rounds
 }
 
 // Start `k` busy fibers and join them.
-fun spawnBusy(k: Int, mode: Int, done: RawPtr) -> Int {
+fun spawnBusy(k: Int, mode: Int, done: RawPtr, depth: Int) -> Int {
     if k == 0 {
         return 0
     }
-    let w = task busy(mode: mode, done: done, me: k)
-    let rest = spawnBusy(k: k - 1, mode: mode, done: done)
+    let w = task busy(mode: mode, done: done, me: k, depth: depth)
+    let rest = spawnBusy(k: k - 1, mode: mode, done: done, depth: depth)
     return rest + w.join()
 }
 
@@ -78,6 +192,11 @@ fun envMode() -> Int {
     return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "STOP_MODE")), 0)
 }
 
+fun envDepth() -> Int {
+    let name = RawPtr.alloc(bytes: 32, align: 8)
+    return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "STOP_DEPTH")), 100000)
+}
+
 fun envCarriers() -> Int {
     let name = RawPtr.alloc(bytes: 32, align: 8)
     return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_CARRIERS")), 1)
@@ -94,7 +213,7 @@ fun main() {
     done.atomicStore(0, toByteOffset: 0)
     let start = Time().now
     let d = task driver(done: done, requests: requests)
-    let sink = spawnBusy(k: nbusy, mode: mode, done: done) + d.join()
+    let sink = spawnBusy(k: nbusy, mode: mode, done: done, depth: envDepth()) + d.join()
     let ns = Time().now - start
     if sink == 42 {
         print("\n")

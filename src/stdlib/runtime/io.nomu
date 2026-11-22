@@ -290,3 +290,285 @@ fun rtStdinPollerMain(st: RawPtr) -> RawPtr {
   }
   return st
 }
+
+// ---- Standard output (tasks 271, 270) ----
+// `print` and `putByte` copy into a buffer the runtime owns, for every fiber, as libc's `stdout` is. A full buffer,
+// a line ended on a terminal (libc's line buffering), and what is left at the program's end go on a queue of
+// chunks, and whoever holds the write lock writes the queue out, in order, with `write`. The buffer's lock is held
+// only to copy and to queue, never across the `write`: a fiber that may block in `write` (a full pipe) has its
+// bytes copied already, holds no managed address, and marks itself in C (rtEnterC), so a stop-the-world goes on
+// without it; a fiber waiting for the write lock waits in C too. Copying keeps managed memory out of the call
+// that can block: a collection may move a `String` while its bytes are written. At the program's end (its exit,
+// a fatal error, a crash: nomuOutFlushAtExit) what is buffered and queued goes out unless another thread holds a
+// lock, where waiting could hang the end. A normal end (main returned: nomuOutFlushAtEnd) waits for the locks
+// instead, as Go's `main` blocks in its own write: a fiber blocked in `write` finishes, and the rest follows it.
+// stderr is not buffered.
+//
+// rtOut: 0 the buffer's lock (a futex mutex word) · 8 the current chunk, null until first use · 24 whether stdout
+// is a terminal: 0 not yet known, 1 a terminal, 2 not · 32 the write lock (a futex mutex word) · 40 the queue's
+// head · 48 its tail. A chunk: 0 the next queued · 8 its length · 16 its bytes, rtOutCap of them, or more for one
+// `print` larger than that.
+let rtOut = Runtime.staticStorage(bytes: 64, align: 8)
+let rtOutCap = 65536
+
+fun rtOutChunk(bytes: Int) -> RawPtr {
+  let c = RawPtr.alloc(bytes: 16 + bytes, align: 8)
+  c.store(RawPtr.null, toByteOffset: 0)
+  c.store(0, toByteOffset: 8)
+  return c
+}
+
+// Whether stdout is a terminal, asked once.
+fun rtOutTerminal() -> Bool {
+  var t: Int = rtOut.load(fromByteOffset: 24)
+  if t == 0 {
+    t = 2
+    if Runtime.isTerminal(fd: 1) != 0 {
+      t = 1
+    }
+    rtOut.store(t, toByteOffset: 24)
+  }
+  return t == 1
+}
+
+// Queue chunk `c`, the buffer's lock held.
+fun rtOutEnqueue(c: RawPtr) {
+  let tail: RawPtr = rtOut.load(fromByteOffset: 48)
+  if tail.isNull {
+    rtOut.store(c, toByteOffset: 40)
+  } else {
+    tail.store(c, toByteOffset: 0)
+  }
+  rtOut.store(c, toByteOffset: 48)
+}
+
+// Queue the current chunk if it holds anything, the buffer's lock held; a fresh one becomes current on next use.
+fun rtOutQueueCurrent() {
+  let c: RawPtr = rtOut.load(fromByteOffset: 8)
+  if c.isNull == false {
+    let len: Int = c.load(fromByteOffset: 8)
+    if len > 0 {
+      rtOutEnqueue(c)
+      rtOut.store(RawPtr.null, toByteOffset: 8)
+    }
+  }
+}
+
+// The current chunk with room for `n` more bytes (n at most rtOutCap), the buffer's lock held: a full one is
+// queued and a fresh one made.
+fun rtOutRoom(n: Int) -> RawPtr {
+  var c: RawPtr = rtOut.load(fromByteOffset: 8)
+  if c.isNull == false {
+    let len: Int = c.load(fromByteOffset: 8)
+    if len + n > rtOutCap {
+      rtOutEnqueue(c)
+      c = RawPtr.null
+    }
+  }
+  if c.isNull {
+    c = rtOutChunk(rtOutCap)
+    rtOut.store(c, toByteOffset: 8)
+  }
+  return c
+}
+
+// After bytes ending with `last` went into the current chunk, the buffer's lock held: on a terminal a line goes
+// out as it ends. Returns whether anything is queued.
+fun rtOutAfter(last: Int) -> Bool {
+  if last == 10 && rtOutTerminal() {
+    rtOutQueueCurrent()
+  }
+  let head: RawPtr = rtOut.load(fromByteOffset: 40)
+  return head.isNull == false
+}
+
+// Write `n` bytes at `p` to stdout, whatever `write` takes at a time; stops at an error.
+fun rtOutWrite(p: RawPtr, n: Int) {
+  var off = 0
+  while off < n {
+    let w = Runtime.writeFd(fd: 1, buf: p.advanced(by: off), count: n - off)
+    if w <= 0 {
+      return
+    }
+    off = off + w
+  }
+}
+
+// Write the queue out, holding the write lock, taking each chunk under the buffer's lock. Called with neither lock
+// held.
+fun rtOutDrainLocked() {
+  var go = true
+  while go {
+    rtSchedMutexLockAt(rtOut)
+    let c: RawPtr = rtOut.load(fromByteOffset: 40)
+    if c.isNull == false {
+      let next: RawPtr = c.load(fromByteOffset: 0)
+      rtOut.store(next, toByteOffset: 40)
+      if next.isNull {
+        rtOut.store(RawPtr.null, toByteOffset: 48)
+      }
+    }
+    rtSchedMutexUnlockAt(rtOut)
+    if c.isNull {
+      go = false
+    } else {
+      let len: Int = c.load(fromByteOffset: 8)
+      rtOutWrite(c.advanced(by: 16), len)
+      c.free()
+    }
+  }
+}
+
+// Write the queue out from a fiber whose frames are anchored at (anchorSp, anchorPc), in C while it waits for the
+// write lock and writes (rtEnterC). Its bytes are copied already; it holds no managed address.
+fun rtOutDrain(anchorSp: RawPtr, anchorPc: Int) {
+  let regs = RawPtr.alloc(bytes: 224, align: 16)
+  Runtime.saveContext(regs: regs)                  // from this frame, live until rtExitC
+  let inC = rtEnterC(anchorSp, anchorPc, regs)
+  rtSchedMutexLockAt(rtOut.advanced(by: 32))
+  rtOutDrainLocked()
+  rtSchedMutexUnlockAt(rtOut.advanced(by: 32))
+  if inC {
+    rtExitC()
+  }
+  regs.free()
+}
+
+// `n` bytes at `p`, from compiled code through `__nomu_out_bytes`, which anchors the caller's frame. The bytes are
+// copied before any write.
+fun nomuOutBytes(sched: RawPtr, p: RawPtr, n: Int, anchorSp: RawPtr, anchorPc: Int) {
+  if n <= 0 {
+    return
+  }
+  rtSchedMutexLockAt(rtOut)
+  var queued = false
+  if n > rtOutCap {
+    rtOutQueueCurrent()
+    let big = rtOutChunk(n)
+    big.advanced(by: 16).copyBytes(from: p, byteCount: n)
+    big.store(n, toByteOffset: 8)
+    rtOutEnqueue(big)
+    queued = true
+  } else {
+    let c = rtOutRoom(n)
+    let len: Int = c.load(fromByteOffset: 8)
+    c.advanced(by: 16 + len).copyBytes(from: p, byteCount: n)
+    c.store(len + n, toByteOffset: 8)
+    let lastByte: UInt8 = p.load(fromByteOffset: n - 1)
+    queued = rtOutAfter(lastByte.int)
+  }
+  if queued == false {
+    let head: RawPtr = rtOut.load(fromByteOffset: 40)
+    queued = head.isNull == false
+  }
+  rtSchedMutexUnlockAt(rtOut)
+  if queued {
+    rtOutDrain(anchorSp, anchorPc)
+  }
+}
+
+// One byte, through `__nomu_out_byte`.
+fun nomuOutByte(sched: RawPtr, b: Int, anchorSp: RawPtr, anchorPc: Int) {
+  rtSchedMutexLockAt(rtOut)
+  let c = rtOutRoom(1)
+  let len: Int = c.load(fromByteOffset: 8)
+  c.store((b % 256).uint8, toByteOffset: 16 + len)
+  c.store(len + 1, toByteOffset: 8)
+  let queued = rtOutAfter(b % 256)
+  rtSchedMutexUnlockAt(rtOut)
+  if queued {
+    rtOutDrain(anchorSp, anchorPc)
+  }
+}
+
+// `v` in decimal, signed (`%lld`), through `__nomu_out_int`.
+fun nomuOutInt(sched: RawPtr, v: Int, anchorSp: RawPtr, anchorPc: Int) {
+  rtOutNumber(v, false, anchorSp, anchorPc)
+}
+
+// `v`'s 64 bits in decimal, unsigned (`%llu`), through `__nomu_out_uint`.
+fun nomuOutUInt(sched: RawPtr, v: Int, anchorSp: RawPtr, anchorPc: Int) {
+  rtOutNumber(v, true, anchorSp, anchorPc)
+}
+
+fun rtOutNumber(v: Int, unsigned: Bool, anchorSp: RawPtr, anchorPc: Int) {
+  rtSchedMutexLockAt(rtOut)
+  let c = rtOutRoom(20)
+  let len: Int = c.load(fromByteOffset: 8)
+  c.store(len + rtOutDecimal(c.advanced(by: 16 + len), v, unsigned), toByteOffset: 8)
+  let head: RawPtr = rtOut.load(fromByteOffset: 40)
+  rtSchedMutexUnlockAt(rtOut)
+  if head.isNull == false {
+    rtOutDrain(anchorSp, anchorPc)
+  }
+}
+
+// `v` in decimal at `at` (at most 20 bytes), its bits unsigned when `unsigned`; returns the length.
+fun rtOutDecimal(at: RawPtr, v: Int, unsigned: Bool) -> Int {
+  if unsigned && v < 0 {
+    // Above Int's range: the bits divided by 10 as the logical shift by one, divided by 5; the last digit is what
+    // remains, in 0...9 once the product wraps.
+    let q = ((v >> 1) & 9223372036854775807) / 5
+    let r = v - q * 10
+    let n = rtOutSigned(at, q)
+    at.store((48 + r).uint8, toByteOffset: n)
+    return n + 1
+  }
+  return rtOutSigned(at, v)
+}
+
+// `v` in decimal at `at`, signed; returns the length. Digits are taken from the value made negative, so the most
+// negative Int needs no special case.
+fun rtOutSigned(at: RawPtr, v: Int) -> Int {
+  var neg = v
+  var sign = 0
+  if v < 0 {
+    sign = 1
+  } else {
+    neg = 0 - v
+  }
+  var digits = 1
+  var t = neg / 10
+  while t != 0 {
+    digits = digits + 1
+    t = t / 10
+  }
+  if sign == 1 {
+    at.store(45.uint8, toByteOffset: 0)
+  }
+  var i = sign + digits - 1
+  var x = neg
+  while i >= sign {
+    at.store((48 - x % 10).uint8, toByteOffset: i)
+    x = x / 10
+    i = i - 1
+  }
+  return sign + digits
+}
+
+// At a normal end, after `main` returns (rtSchedFinish): what is buffered and queued goes out, waiting for a fiber
+// still copying or writing. A detached fiber still running may print after it; the exit's flush
+// (nomuOutFlushAtExit) takes what it can of that, as Go drops a goroutine's output once `main` returns.
+fun nomuOutFlushAtEnd() {
+  rtSchedMutexLockAt(rtOut)
+  rtOutQueueCurrent()
+  rtSchedMutexUnlockAt(rtOut)
+  rtSchedMutexLockAt(rtOut.advanced(by: 32))
+  rtOutDrainLocked()
+  rtSchedMutexUnlockAt(rtOut.advanced(by: 32))
+}
+
+// At the program's end (exit, a fatal error, a crash): what is buffered and queued goes out, unless another
+// thread holds a lock (a crash inside a print, or a write blocked), where waiting could hang the end.
+fun nomuOutFlushAtExit() {
+  if rtOut.atomicCas(0, 1, atByteOffset: 0) != 0 {
+    return
+  }
+  rtOutQueueCurrent()
+  rtSchedMutexUnlockAt(rtOut)
+  if rtOut.atomicCas(0, 1, atByteOffset: 32) != 0 {
+    return
+  }
+  rtOutDrainLocked()
+  rtSchedMutexUnlockAt(rtOut.advanced(by: 32))
+}

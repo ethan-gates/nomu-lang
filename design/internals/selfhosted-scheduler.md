@@ -127,7 +127,7 @@ trampoline can run a fiber's stored user entry — the boundary that lets a subs
 non-subset fiber body, since the closure check sees no named non-subset callee).
 
 **Subset discipline stays fixed.** The codegen contract above the scheduler does not move: statepoints,
-stack maps, the `__nomu_poll` / `__nomu_write_barrier` seams, the header/object model. Self-hosting moves
+stack maps, the loop poll and `__nomu_write_barrier` seam, the header/object model. Self-hosting moves
 the scheduler's *policy* (switch, queue, wake, poll-response, drain) into Nomu; codegen still emits the
 poll and barrier sites, and the scheduler fills what they call.
 
@@ -435,7 +435,7 @@ C-runtime shim (`tools/sysclock.sh`).
 ## 4. Dependencies and pull-forwards
 
 - **The near-term 149 dependency is safepoint-poll suppression** (built), not the stack marker. The
-  scheduler's own loop must not emit a `__nomu_poll` that recursively tries to stop the world; that
+  scheduler's own loop must not emit a poll that recursively tries to stop the world; that
   codegen-site guard (`runtime-subset.md` §4) is in place — a subset function's `noSafepoint` property
   makes the backend elide the loop-header poll (`tools/subset-poll.sh`). The bounded-stack marker
   (`nostackgrow`) stays behind [104](../plans/tasks/104-fiber-stack-strategy.md): with fixed 128 KB fiber

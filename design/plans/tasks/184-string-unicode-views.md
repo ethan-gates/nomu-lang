@@ -25,7 +25,7 @@ interpretation, not storage — every view reads the existing byte surface (`cou
 ## Phases
 
 - **184.1 — `UnicodeScalarView`.** UTF-8 decode, scalar iteration, an opaque scalar index. A scalar is a
-  `UInt32`-carrying value. Pairs with [117 `for … in`](117-for-in-iteration.md) for `for scalar in s.scalars`.
+  `UInt32`-carrying value. Pairs with [117 `for … in`](117-loop-improvements.md) for `for scalar in s.scalars`.
 - **184.2 — `GraphemeView` + normalization.** Grapheme-cluster iteration (a grapheme is a small `String`) and
   Unicode normalization — the correctness top layer. Needs the Unicode data tables (grapheme-break /
   normalization properties); how those tables are embedded is part of this phase.
@@ -35,7 +35,7 @@ interpretation, not storage — every view reads the existing byte surface (`cou
 - **Built on:** [121 String/UTF-8 model](121-string-utf8-model.md) — the byte layer + SSO are complete; the
   views are storage-agnostic reads over `byte(at:)` / `count`. The heap buffer reserves header room for a
   cached scalar count and an `isASCII` fast-path flag (121 Representation), which these views populate/consume.
-- **Couples with:** [117 `for … in`](117-for-in-iteration.md) — scalar and grapheme iteration are the natural
+- **Couples with:** [117 `for … in`](117-loop-improvements.md) — scalar and grapheme iteration are the natural
   `for … in` consumers (bounds-check-free by construction).
 - **Unblocks / serves:** [163 manifest/YAML](163-manifest-yaml.md) and any text processing that needs
   Unicode-correct scalar or grapheme semantics (the byte-level parser already works without this).

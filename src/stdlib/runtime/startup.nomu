@@ -38,6 +38,10 @@ let rtSliceTicks = rtNanosToTicks(rtEnvSliceNanos())
 let rtGlobalCheck = rtEnvGlobalCheck()
 // NOMU_SEARCH_NS: how long a woken carrier searches before sleeping again; 20000 unless set.
 let rtSearchNanos = rtEnvSearchNanos()
+// NOMU_PREEMPT: 0 turns off preemption (the monitor, `scheduler.nomu`); on unless set. The monitor's shortest
+// period is a quarter of the slice (NOMU_SLICE_NS), in microseconds, at least 50.
+let rtPreemptOn = rtEnvPreempt() != 0
+let rtMonitorMinMicros = rtMonitorMin(rtEnvSliceNanos())
 
 // The scheduler.
 let rtSched = nomuSchedNew()
@@ -283,6 +287,19 @@ fun rtEnvSlotStealNanos() -> Int {
 fun rtEnvSliceNanos() -> Int {
   let name = RawPtr.alloc(bytes: 32, align: 8)
   return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_SLICE_NS")), 1000000)
+}
+
+fun rtEnvPreempt() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_PREEMPT")), 1)
+}
+
+fun rtMonitorMin(sliceNanos: Int) -> Int {
+  let us = sliceNanos / 4000
+  if us < 50 {
+    return 50
+  }
+  return us
 }
 
 fun rtEnvGlobalCheck() -> Int {

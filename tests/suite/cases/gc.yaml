@@ -521,6 +521,48 @@ cases:
         min: 1
         max: 1
 
+  # Stop-the-world over fibers in recursion with no loop (task 236.4): they stop at a function-entry check, and
+  # the minor moves the Boxes their frames hold. The second number is 2 only when the collection ran while both
+  # were still recursing.
+  - name: stw-recursion
+    fixture: tests/fixtures/stw_recursion
+    compile_settings:
+      escape: false
+      rt_prelude: true
+    expect:
+      stdout: "333 2\n"
+    carriers:
+      - 3
+      - 4
+      - 8
+    iterations: 3
+    collections:
+      - kind: minor
+        trigger: "program request"
+        min: 1
+        max: 1
+
+  # Stop-the-world while fibers are in the runtime's own code (task 236.8): allocation refills, array growth,
+  # stack moves and channel handoffs, with collections requested back to back. Each worker prints how many of
+  # its rounds checked out. On one carrier the requester's run must still be preempted though a collection
+  # interrupts it every few microseconds (rtSchedRearm); before that fix it never was, and the run hung.
+  - name: stw-runtime
+    fixture: tests/fixtures/stw_runtime
+    compile_settings:
+      rt_prelude: true
+    expect:
+      stdout: "alloc 5 array 5 deep 5 chan 5 collected\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+      - 8
+    iterations: 3
+    collections:
+      - kind: minor
+        trigger: "program request"
+        min: 1
+
   - name: gc-record-full
     fixture: tests/fixtures/gc_record_full
     compile_settings:

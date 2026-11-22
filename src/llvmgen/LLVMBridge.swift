@@ -359,7 +359,7 @@ private func emitModuleObject(_ mod: LLVMModuleRef, to path: String, optimize: B
     // tail recursion elimination, so release runs that first.
     let pipeline = (optimize ? "function(sroa,early-cse,simplifycfg,tailcallelim),nomu-bundle-calls,default<O3>"
                              : "function(mem2reg,sroa),nomu-bundle-calls,always-inline")
-        + ",nomu-indirect-large-values,nomu-expand-stack-checks,nomu-split-reference-aggregates"
+        + ",nomu-indirect-large-values,nomu-expand-loop-polls,nomu-expand-stack-checks,nomu-split-reference-aggregates"
         + track + rewrite
     if optimizer.gcValueRegs > 0 { setGCValueRegisters(optimizer.gcValueRegs) }
     // The frame-address split (`src/llvmpasses`): no address into the frame stays in a register across a stop,

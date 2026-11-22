@@ -1,7 +1,7 @@
 # Loop strip mining: polls out of the loops the optimizer sees
 
-**Avenue:** Risk (the performance thesis) · **Type/Lifecycle:** `perf · compiler · ready-to-design` ·
-**Size:** M · **Status:** not started · **Source:** [243](243-frame-mechanism-feasibility.md).1's
+**Avenue:** Risk (the performance thesis) · **Type/Lifecycle:** `perf · compiler · done` ·
+**Size:** M · **Status:** done — loop polls as a placeholder the optimizer moves loads around, strip-mined out of call-free innermost loops before the vectorizer, expanded after optimization; counted loops reach the no-poll speed; loops that keep a bounds check moved to [117](117-loop-improvements.md).2, `bytes`' uninlined calls to [182](182-cross-module-inlining.md) · **Source:** [243](243-frame-mechanism-feasibility.md).1's
 measurement; done as [236](236-fiber-preemption.md)'s phase 236.2
 
 ## The cost
@@ -53,6 +53,69 @@ matrix product) plus an array scan, a hash probe, a sort's inner loop, byte and 
 numeric kernel (n-body or spectral-norm). Each built three ways: today's polls, strip-mined, and
 `measure_no_loop_polls`. It measures this task, 236's G3 (polls and the stack check under 3% on a tight
 loop), and 236.3's change to the poll's form. Built first.
+
+### The kernel set's first results
+
+Built: `benchmarks/loop_kernels` and `tools/loopbench.py`. Release, one carrier, median of 7, checksums equal
+across builds:
+
+| kernel | today | no loop polls |
+|---|---|---|
+| sieve | 71.2 ms | −11.9% |
+| matmul | 70.5 ms | −41.7% |
+| sum | 104.7 ms | −84.3% |
+| count | 107.9 ms | −84.5% |
+| probe | 6.1 ms | −8.1% |
+| insertion | 44.6 ms | −20.3% |
+| bytes | 137.3 ms | −10.4% |
+| spectral | 3.4 ms | −6.9% |
+
+The counted loops lose most: without the poll LLVM vectorizes `sum` and `count`, and hoists `matmul`'s loads.
+The poll costs more than 243.1's 29% wherever a loop would vectorize.
+
+## Built
+
+Three parts, in LLVM's pipeline (`src/llvmpasses/LoopPolls.cpp`; `backend.md`, the loop poll):
+
+1. **The placeholder.** Codegen emits each loop header's poll as `nomu.loop.poll(flag, slow)`, touching only
+   memory the program cannot see, with a `deopt` bundle for the shaped roots live at the header (empty when
+   none, so inlining merges a caller's into it). The optimizer keeps it in its loop and hoists the program's
+   loads across it. Sound because a stop moves objects only through relocation, which the statepoint rewrite
+   applies to every value live across the expanded poll, and rewrites shaped frame words only where they are
+   read volatile (`loadReloading`); another fiber changes this fiber's memory only through atomics, actors and
+   channels (`unsafe-memory.md` §6 states the rule for raw memory).
+2. **Strip mining** (`nomu-strip-mine-loops`, at the vectorizer's start): each innermost loop whose only stop is
+   its poll runs in chunks of up to 1,000 iterations (16,384 instructions a chunk at most), the poll in an
+   outer loop between chunks. When the latch's exit count is known, each chunk runs
+   `min(remaining, 1000)` iterations and the inner latch tests only its counter, so a counted loop keeps one
+   countable exit and vectorizes; otherwise the latch's own test is `and`ed with the counter's. A loop with no
+   preheader gets one.
+3. **Expansion** (`nomu-expand-loop-polls`, after optimization, before the frame-address tracking and the
+   statepoint rewrite): the placeholder becomes the stop-flag load and the slow-path call.
+
+### Results
+
+Release, one carrier, median of 7, checksums equal across builds (`tools/loopbench.py`):
+
+| kernel | before | placeholder | strip-mined | no loop polls |
+|---|---|---|---|---|
+| sieve | 71.2 ms | 67.6 | 72.2 | −13% |
+| matmul | 70.5 ms | 52.3 | 50.6 | −22% |
+| sum | 104.7 ms | 56.8 | 16.1 | 0% |
+| count | 107.9 ms | 56.8 | 16.0 | 0% |
+| probe | 6.1 ms | 5.6 | 5.7 | −4% |
+| insertion | 44.6 ms | 43.5 | 43.6 | −19% |
+| bytes | 137.3 ms | 137.2 | 137.6 | −14% |
+| spectral | 3.4 ms | 2.9 | 3.3 | −7% |
+
+The last column is the no-poll build's change against the strip-mined one. Counted loops meet 236's G3.
+The loops that keep a bounds check (`matmul`, `insertion`, `sieve`) reload their arrays in the chunk loop;
+moved to [117](117-loop-improvements.md).2 with what was ruled out. `bytes` calls `String.byte` and
+`String.count` across modules, uninlined, so its loop is not strip-mined: [182](182-cross-module-inlining.md).
+
+Time to stop all fibers in call-free loops (`tools/stopbench.py`, µs p50 / p99 / max): 6 / 21 / 30 at 2
+carriers, 10 / 23 / 42 at 4, 17 / 57 / 69 at 8 — under P4's 100 µs. The full suite passes (743 fast, 4,212
+full tier).
 
 ## Done when
 

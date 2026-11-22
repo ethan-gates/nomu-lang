@@ -20,7 +20,7 @@ for the generics model.
 
 - **Depends on:** the M5 generics + interfaces model (present).
 - **Enables:** richer stdlib interfaces (e.g. an iterator/sequence with an associated element type —
-  ties to [`for … in`](117-for-in-iteration.md) and [stdlib-core](120-stdlib-core.md)).
+  ties to [`for … in`](117-loop-improvements.md) and [stdlib-core](120-stdlib-core.md)).
 
 ## Refs
 

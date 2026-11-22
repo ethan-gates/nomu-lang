@@ -175,61 +175,111 @@ fun rtStackSize(fib: RawPtr) -> Int {
 let rtStackCheckCount = Runtime.staticStorage(bytes: 8, align: 8)
 
 // Set fiber `fib`'s stack limit (offset 40) from its stack, at creation and after every move. Under
-// NOMU_STACK_MOVE_CHECKS the limit is all ones, so every check takes the slow path, which decides whether to
-// move.
+// NOMU_STACK_MOVE_CHECKS the limit is all ones but the last bit, so every entry check takes the slow path, which
+// decides whether to move, while loop polls, which look for all ones (a request to stop, the request word in
+// `scheduler.nomu`), do not.
 fun rtStackLimitSet(fib: RawPtr) {
   if rtStackMoveChecks > 0 {
-    fib.store(-1, toByteOffset: 40)
+    fib.atomicStore(-2, toByteOffset: 40)
     return
   }
   let base: RawPtr = fib.load(fromByteOffset: 48)
-  fib.store(base.toInt() + rtStackReserve, toByteOffset: 40)
+  fib.atomicStore(base.toInt() + rtStackReserve, toByteOffset: 40)
 }
 
 // The stack check's slow path: a checked function's SP (`anchorSp`, the forwarder's caller), less `need`,
 // compared below the limit. `need` is 0 for an ordinary check; a wrapper around a function whose frame is
 // larger than the reserve holds passes that frame's size, which must fit below its SP too. Short, the stack
 // grows (the stop below, `rtStackMove`) to hold `need` and the reserve below the used part, or past the maximum size the
-// program stops. Otherwise the limit was raised on purpose (the stress mode), and every Nth check moves
-// the stack at its size, when its used part is under `rtStackMoveChecksUsed`. An SP outside the running fiber's stack is on a stack the runtime does not own (a
+// program stops. Otherwise the limit was raised on purpose: by a request to stop (the request word,
+// `scheduler.nomu`), or by the stress mode, where every Nth check moves the stack at its size, when its used
+// part is under `rtStackMoveChecksUsed`. An SP outside the running fiber's stack is on a stack the runtime does not own (a
 // white-box test's own fibers, built with `Runtime.fiberInit`), which nothing checks or moves.
 fun nomuSchedStackCheck(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int, need: Int) {
   let self = rtCurrentFiber()
   if self.isNull {
     return
   }
-  let base: RawPtr = self.load(fromByteOffset: 48)
-  let size = rtStackSize(self)
-  let sp = anchorSp.toInt()
-  if sp < base.toInt() || sp >= base.toInt() + size {
+  // `room` is the room a move must make, or -1 for no move (-2: the SP is on a stack the runtime does not own).
+  // `state` is what the fiber stops in, or -1 to go on: 5 to have its stack moved.
+  let room = rtStackMoveRoom(self, anchorSp.toInt(), need)
+  if room == -2 {
     return
   }
-  var move = false
-  var room = 0
-  if sp - need < base.toInt() + rtStackReserve {
-    if rtStackGrown(base.toInt() + size - sp + need, size) > rtStackMax {
-      Runtime.fatal("nomu: stack overflow: a fiber's stack reached its maximum size")
-    }
-    move = true
-    room = need
-  } else if rtStackMoveChecks > 0 && base.toInt() + size - sp < rtStackMoveChecksUsed {
-    let n: Int = rtStackCheckCount.atomicFetchAdd(1, atByteOffset: 0)
-    move = n % rtStackMoveChecks == 0
+  // With no move, a limit raised by a request (the request word, `scheduler.nomu`) is restored, and a pending
+  // stop-the-world is acted on. An ordinary check (`need` 0) stops here, as a loop poll does: the call into this
+  // slow path is a statepoint carrying the shaped values live at the check, so the checked frame is described. A
+  // check with a `need` cannot stop: a wrapper's large arguments sit in an older frame's slot no map records
+  // (`nomuSplitLargeFrame`), and a runtime-sized buffer's check records no shaped values (`runtimeSizedBuffer`,
+  // which passes at least 1). Those raise the limit again, for the next stop to act on. A preemption
+  // (`scheduler.nomu`) is acted on the same way: an ordinary check yields here.
+  var state = 5
+  if room < 0 {
+    state = rtCheckRequest(self, need)
   }
-  // Stop here to have the stack moved: switch to the carrier in state 5, which moves the stack (growing it when
-  // short, `rtStackMove`) and switches straight back. The room the check asked for goes to the carrier as the
-  // switch's message, as -(need + 1) so it is never taken for a mutex to release (rtSchedSwitchedBack). Written
-  // out here, with no call of its own, so the slow path stays within what a checked frame leaves it. The
-  // scheduler lock is taken only under the stress modes, whose stack pool it guards (rtStackGrowLocked).
-  if move {
+  // Stop here: for a stop-the-world, in state 4 holding the scheduler lock, as nomuSchedSafepoint does; to yield,
+  // ready (state 0) holding the lock, for the carrier to queue (rtSchedYieldPreempted); to have the stack moved,
+  // in state 5, which moves the stack (growing it when short, `rtStackMove`) and switches straight back. The room
+  // the check asked for goes to the carrier as the switch's message, as -(need + 1) so it is never taken for a
+  // mutex to release (rtSchedSwitchedBack), which reads it only in state 5 (otherwise `room` is -1, the message 0). Written out here, with no call of its
+  // own, so the slow path stays within what a checked frame leaves it. For a move the scheduler lock is taken
+  // only under the stress modes, whose stack pool it guards (rtStackGrowLocked).
+  if state >= 0 {
     rtSchedSetAnchor(self, anchorSp, anchorPc)
-    if rtStackMoveOn {
+    if state != 5 || rtStackMoveOn {
       rtSchedLock(sched)
     }
-    self.store(5.uint8, toByteOffset: 8)
+    self.store(state.uint8, toByteOffset: 8)
     Runtime.ctxSwitch(from: self, to: self.advanced(by: 72), message: -1 - room)
     // resumes without the scheduler lock
   }
+}
+
+// Whether the stack check at SP `sp` asking for `need` moves the stack: the room the move must make (0 for a move
+// at the stack's size, the stress mode's), -1 for no move, or -2 when `sp` is outside the fiber's stack, on a
+// stack the runtime does not own (a white-box test's own fibers, built with `Runtime.fiberInit`), which nothing
+// checks or moves. Past the maximum size the program stops. Out of line, to keep the slow path's frame small.
+fun rtStackMoveRoom(self: RawPtr, sp: Int, need: Int) -> Int {
+  let base: RawPtr = self.load(fromByteOffset: 48)
+  let lo = base.toInt()
+  let size = rtStackSize(self)
+  if sp < lo || sp >= lo + size {
+    return -2
+  }
+  if sp - need < lo + rtStackReserve {
+    if rtStackGrown(lo + size - sp + need, size) > rtStackMax {
+      Runtime.fatal("nomu: stack overflow: a fiber's stack reached its maximum size")
+    }
+    return need
+  }
+  if rtStackMoveChecks > 0 && lo + size - sp < rtStackMoveChecksUsed {
+    let n: Int = rtStackCheckCount.atomicFetchAdd(1, atByteOffset: 0)
+    if n % rtStackMoveChecks == 0 {
+      return 0
+    }
+  }
+  return -1
+}
+
+// What a request asks of an ordinary stack check (`need` 0), with no move: the state to stop in, 4 for a pending
+// stop-the-world or 0 (ready) to yield to a preemption, taking the request; -1 for none. A check with a `need`
+// cannot stop, and raises the limit again for the next stop. Out of line, to keep the slow path's own frame small.
+fun rtCheckRequest(self: RawPtr, need: Int) -> Int {
+  if rtStopPending(self) {
+    if need == 0 {
+      return 4
+    }
+    rtRequestStop(self)
+    return -1
+  }
+  if rtPreemptAsked(self) {
+    if need == 0 {
+      Runtime.carrierLocal().atomicStore(RawPtr.null, toByteOffset: 208)
+      return 0
+    }
+    rtRequestStop(self)
+  }
+  return -1
 }
 
 // Whether a stack move at a check or a resume holds the scheduler lock. Only the stress modes need it, for their

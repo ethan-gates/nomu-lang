@@ -46,7 +46,7 @@ A general runtime-check primitive and the full lifecycle of the checks it insert
   intact. Relying on LLVM's CVP/SCEV/IRCE alone is what pushed Rust toward iterators and Swift toward a SIL
   pass; LLVM stays a free baseline for the simple affine cases that survive to it. (SSAIR stays the optimizer
   tier — this does not pull SIL's single-IR abstraction into one of our IRs: NOIR resolves, SSAIR optimizes.)
-- **`for … in` is the primary bounds-check-free path.** [117](117-for-in-iteration.md) fuses the bound into
+- **`for … in` is the primary bounds-check-free path.** [117](117-loop-improvements.md) fuses the bound into
   iteration, so sequential access has no per-element check to eliminate. `precondition` + BCE is the
   random-access fallback (a parser computing an arbitrary offset).
 - **Trap, not a catchable exception** — a precondition failure aborts the process, matching Swift.
@@ -64,7 +64,7 @@ A general runtime-check primitive and the full lifecycle of the checks it insert
 - **Feeds / shares with:** [148](148-ssair-optimizer-tier.md) §148.4 (the removal pass — the analysis half is
   already scoped there) and §148.6 (dominator tree + analysis-with-invalidation infra);
   [167](167-fact-store.md) (the integer-relation store a `prove`-style pass needs).
-- **Complements:** [117](117-for-in-iteration.md) — the structural fast path; this task is the random-access
+- **Complements:** [117](117-loop-improvements.md) — the structural fast path; this task is the random-access
   fallback.
 - **Motivated by / unblocks:** [121](121-string-utf8-model.md) — restores a checked `String.byte(at:)`; and
   any future user-facing checked indexing or self-hosted collection accessor.

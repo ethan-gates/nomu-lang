@@ -129,7 +129,7 @@ public struct FrameTable {
     // on the carrier's stack; `nomu_oom_on_carrier`, which runs the out-of-memory report there too; and
     // `mach_absolute_time`, a commpage read called directly (`Runtime.ticks()`).
     static let externalStack: [String: Int] = [
-        "rtSwitch": 224, "rtFiberInit": 0, "memcpy": 0, "memmove": 0, "memset": 0, "bzero": 0, "memcmp": 0,
+        "rtSwitch": 224, "rtFiberInit": 0, "rtSaveContext": 0, "memcpy": 0, "memmove": 0, "memset": 0, "bzero": 0, "memcmp": 0,
         "mach_absolute_time": 0, "nomu_oom_on_carrier": 0,
     ]
     static func externalStackUse(_ f: String) -> Int? { externalStack[f] ?? (f.hasPrefix("nomu_libc_") ? 0 : nil) }

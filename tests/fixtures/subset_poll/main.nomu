@@ -1,5 +1,5 @@
 // Task 149 · poll-suppression slice (128.1.1 prerequisite). A runtime-subset function with a loop.
-// Codegen normally drops a `__nomu_poll` safepoint at every loop header so a stop-the-world collector
+// Codegen normally drops a safepoint poll at every loop header so a stop-the-world collector
 // can pause the mutator (runtime.md §6). Runtime-subset code may itself run during a stop-the-world, so
 // that poll would be self-referential — under `--runtime-subset=ramp` the loop header carries no poll
 // (runtime-subset.md §4). The result is identical either way; suppression is a codegen property, not a

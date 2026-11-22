@@ -28,6 +28,12 @@
 //   176 this thread's frame-lookup cache for stack walks, or null until a walk needs one (rtFrameCacheTake)
 //   184 this carrier's pool of fiber records and stacks, or null until it frees one (rtPoolMine)
 //   192 this carrier's actor message free lists, or null until it sends or frees a message (rtMsgCache)
+//   200 how many fibers this carrier has switched in (rtSchedArm); the monitor reads it
+//   208 the fiber the monitor asks to yield, or null (rtSchedMonitorMain)
+//   216 the switch count the monitor saw at its last tick · 224 the fiber it saw running (the monitor's own)
+//   232 whether the running fiber is in C (rtEnterC): 0 no · 1 yes · 4g + 2 yes, claimed by stop-the-world g;
+//       a parked spare is in C too (rtSchedRetire)
+//   240 handoff (task 270.3): 0 a carrier · 1 handed off, to retire once its fiber leaves · 2 a parked spare
 // The TLAB sits at offset 0, so a record is its own TLAB pointer, and it fills the first cache line alone.
 // A record lives for the whole process. The registry is a list of every record, pushed with one CAS at bind
 // and walked under stop-the-world, and by searching carriers looking at slots (records are never removed,

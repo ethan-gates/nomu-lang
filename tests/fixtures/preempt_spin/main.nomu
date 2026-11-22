@@ -1,0 +1,41 @@
+// Preemption (task 236.5). On one carrier, two fibers compute until a flag is set: one in a loop with no call,
+// one in recursion with no loop. The fiber that sets the flag starts after them, so it runs only if the monitor
+// takes the carrier back from a spinner: at the loop's poll and at the recursion's entry check. Prints "done 2"
+// once both spinners have seen the flag. Without preemption the program never ends. Built with
+// `test.runtime_prelude` (for the raw flag word).
+
+fun spinLoop(st: RawPtr) -> Int {
+    var n = 0
+    while st.atomicLoad(fromByteOffset: 0) == 0 {
+        n = n + 1
+    }
+    return 1
+}
+
+// Recurse in pairs until the flag is set; each call checks it once, and only the entry check can stop it.
+fun spinRecursion(st: RawPtr, depth: Int) -> Int {
+    if st.atomicLoad(fromByteOffset: 0) != 0 {
+        return 1
+    }
+    if depth == 0 {
+        return spinRecursion(st: st, depth: 20)
+    }
+    return spinRecursion(st: st, depth: depth - 1)
+}
+
+fun setter(st: RawPtr) -> Int {
+    st.atomicStore(1, toByteOffset: 0)
+    return 0
+}
+
+fun main() {
+    let st = RawPtr.alloc(bytes: 8, align: 8)
+    st.atomicStore(0, toByteOffset: 0)
+    let a = task spinLoop(st: st)
+    let b = task spinRecursion(st: st, depth: 20)
+    let c = task setter(st: st)
+    let seen = a.join() + b.join() + c.join()
+    print("done ")
+    print(seen)
+    print("\n")
+}

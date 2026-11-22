@@ -19,6 +19,25 @@
 .section __TEXT,__text,regular,pure_instructions
 .p2align 2
 
+// void rtSaveContext(void* regs)
+//   Save the callee-saved set, the frame pointer and the return address into the 224 bytes at x0, in rtSwitch's
+//   layout, without switching: a fiber going into C (task 270, `rtEnterC`) points its context at it, so a
+//   collection walks its frames from there as it walks a switched-out fiber's. The caller is the frame that
+//   stays live across the call into C; x29 and x30 are its frame pointer and the address it returns to.
+.global _rtSaveContext
+_rtSaveContext:
+    stp x19, x20, [x0, #0]
+    stp x21, x22, [x0, #16]
+    stp x23, x24, [x0, #32]
+    stp x25, x26, [x0, #48]
+    stp x27, x28, [x0, #64]
+    stp x29, x30, [x0, #80]
+    stp d8,  d9,  [x0, #96]
+    stp d10, d11, [x0, #112]
+    stp d12, d13, [x0, #128]
+    stp d14, d15, [x0, #144]
+    ret
+
 // void* rtSwitch(void* from, void* to, void* message)
 //   x0 = from context (push the current registers, then save SP into it)
 //   x1 = to   context (load its SP, pop its registers, then return into its saved lr)
@@ -160,6 +179,7 @@ NOMU_LIBC exit, 0
 NOMU_LIBC free, 0
 NOMU_LIBC getenv, 0
 NOMU_LIBC getpagesize, 0
+NOMU_LIBC isatty, 0
 NOMU_LIBC kevent, 0
 NOMU_LIBC kqueue, 0
 NOMU_LIBC mach_absolute_time, 0

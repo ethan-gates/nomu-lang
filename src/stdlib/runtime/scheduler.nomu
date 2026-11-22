@@ -30,7 +30,7 @@
 //   (384B, 64-aligned) Words written on every handoff sit on cache lines of their own, apart from the words
 //   a searching carrier spins on (run-queue head, stop, stop-the-world): 256 the scheduler lock's mutex word;
 //   320 sleeping (carriers asleep on the wake-gen futex) · 328 searching (1 while a woken carrier looks for
-//   work; see rtSchedWake).
+//   work; see rtSchedWake) · 336 carriers parked as spares (rtSchedRetire).
 //   Timer entry (16B): 0 expiry-ns · 8 fiber
 //   Mailbox (ABI with codegen): 0 header · 8 mb_head · 16 mb_tail · 24 scheduled · 32 sched_next
 //   Message (ABI with codegen): 0 header · 8 next · 16 thunk · 24 self · args…
@@ -67,7 +67,7 @@
 //   (nomuSchedStackCheck).
 //   state: 0 ready · 1 running · 2 parked · 3 done · 4 stopped at a safepoint for STW · 5 stopped at a stack
 //          check to be moved (stackmove.nomu) · 6 a mailbox fiber with nothing to drain, back at its carrier
-//          without the scheduler lock (rtSchedDrainerIdle)
+//          without the scheduler lock (rtSchedDrainerIdle) · 7 running, in a call into C (rtEnterC)
 //   mutex-word: 0 unlocked · 1 locked · 2 contended
 //   anchor-sp/anchor-pc (task 128.3.2): the user-frame (sp, pc) captured by the C dispatch shim at the
 //   point the fiber stopped (a park at join/sleep, or a safepoint poll) — a statepoint return address the
@@ -860,6 +860,12 @@ fun rtSchedLoop(sched: RawPtr) {
       if stwReq != 0 {
         // Stop-the-world in progress: this carrier is quiescent (no fiber on-CPU), so ack and wait.
         rtSchedStwParkCarrier(sched)
+      } else if rec.atomicLoad(fromByteOffset: 240) == 1 {
+        if searching {
+          sched.atomicStore(0, toByteOffset: 328)
+          searching = false
+        }
+        rtSchedRetire(sched, rec)
       } else {
         picks += 1
         let fib = rtSchedFind(sched, rec, picks)
@@ -926,12 +932,12 @@ fun rtSchedIdle(sched: RawPtr, rec: RawPtr, searching: Bool) -> Bool {
   if work == false {
     // The last carrier to go idle checks for a deadlock: nothing running and nothing that can wake a fiber.
     // It waits briefly first; a wake meanwhile bumps the generation.
-    let idle: Int = sched.atomicLoad(fromByteOffset: 320)
+    let idle: Int = sched.atomicLoad(fromByteOffset: 320) + sched.atomicLoad(fromByteOffset: 336)
     let ncar: Int = sched.atomicLoad(fromByteOffset: 160)
     if idle == ncar && rtSchedNothingCanWake(sched) {
       Runtime.futexWait(at: gw, expected: gen, timeoutMicros: 100000)
       let again: Int = gw.atomicLoad(fromByteOffset: 0)
-      let idle2: Int = sched.atomicLoad(fromByteOffset: 320)
+      let idle2: Int = sched.atomicLoad(fromByteOffset: 320) + sched.atomicLoad(fromByteOffset: 336)
       if again == gen && idle2 == ncar && rtSchedNothingCanWake(sched) {
         rtSchedDeadlock(sched)
       }
@@ -1005,12 +1011,14 @@ fun rtSchedDeadlock(sched: RawPtr) {
 // Run `fib` on this carrier until it switches back, then settle its state. No lock is held on entry or exit.
 fun rtSchedRun(sched: RawPtr, rec: RawPtr, fib: RawPtr) {
   fib.store(1.uint8, toByteOffset: 8)
-  rec.store(fib, toByteOffset: 64)
   if rtStackMoveResume {
     rtSchedLock(sched)                       // the stress mode's stack pool is the scheduler lock's
     rtStackMove(fib, 0)                         // the stress mode: a new stack at every resume
     rtSchedUnlock(sched)
   }
+  // Armed last before the switch: a move sets the limit (rtStackLimitSet), which would drop a request raised
+  // before it.
+  rtSchedArm(rec, fib)
   // This carrier's SP goes in the fiber's record (fib+72), which the fiber switches back through.
   var message = Runtime.ctxSwitch(from: fib.advanced(by: 72), to: fib)
   // If the fiber stopped at a safepoint for STW (state 4), this carrier acks and waits, then switches back
@@ -1029,7 +1037,6 @@ fun rtSchedRun(sched: RawPtr, rec: RawPtr, fib: RawPtr) {
       rtSchedStwParkCarrier(sched)
     }
     fib.store(1.uint8, toByteOffset: 8)
-    rec.store(fib, toByteOffset: 64)
     if rtStackMoveResume || fst == 5 {
       if held == false && rtStackGrowLocked() {
         rtSchedLock(sched)
@@ -1045,10 +1052,16 @@ fun rtSchedRun(sched: RawPtr, rec: RawPtr, fib: RawPtr) {
       rtSchedUnlock(sched)
       held = false
     }
+    rtSchedRearm(rec, fib)                       // last before the switch, after any move (above)
     message = Runtime.ctxSwitch(from: fib.advanced(by: 72), to: fib)
     back = rtSchedSwitchedBack(sched, message, fib)
     held = back >= 16
     fst = back % 16
+  }
+  // A fiber that yielded to a preemption (state 0, the lock held) goes on the global queue, now that its context
+  // is saved; another carrier takes it only once the lock is released, below.
+  if fst == 0 && held {
+    rtSchedEnqueue(sched, fib)
   }
   // A fiber that ran to completion never runs again: its stack goes now, and its record below.
   if fst == 3 {
@@ -1113,6 +1126,7 @@ fun rtSchedFinish(sched: RawPtr) {
       rtStackStatsPrint()
     }
     rtGcRecordFinish()
+    nomuOutFlushAtEnd()
     Runtime.exit(0)
   }
   let parked = sched.advanced(by: 232)
@@ -1349,18 +1363,361 @@ fun rtStwAckTag(g: Int) -> Int {
   return g % 2147483648 * 4294967296
 }
 
-// The stop-the-world flag: an `Int`, nonzero while a collection asks running fibers to stop. Codegen's
-// inline poll reads it by symbol (`nomu_static_rtStopWorld`) at every loop back-edge; the GC coordinator
-// (rtGcCoordinatorMain) writes it.
+// The stop-the-world flag: an `Int`, nonzero while a collection asks running fibers to stop. The GC
+// coordinator (rtGcCoordinatorMain) writes it.
 let rtStopWorld = Runtime.staticStorage(bytes: 8, align: 8)
 
-// The safepoint slow path under the Nomu plan (called from __nomu_gc_poll_slow when `rtStopWorld` is
-// set). The running fiber records the user-frame anchor its C poll shim captured, marks itself
-// safepoint-stopped (state 4), and switches to its carrier — which then acks the STW and waits. On resume
-// the carrier switches back in and this returns, so the fiber continues past the poll. The carrier holds
+// ---- The request word ----
+// A running fiber is asked to stop through its stack limit (fiber+40), the word its function-entry check and
+// its loop polls compare the SP with (task 236.3, Go's stack guard): a request writes all ones there, so the
+// next check or poll takes its slow path. The slow path restores the limit, then looks at what was asked (the
+// stop-the-world flag) and acts on it; a limit left raised on a fiber that parked first is restored there with
+// nothing pending. The stress mode NOMU_STACK_MOVE_CHECKS keeps the limit at all ones (rtStackLimitSet).
+//
+// Who sees a request: the coordinator raises the flag, then raises the limit of each carrier's running fiber
+// (rtStopRunningFibers). A carrier switching a fiber in restores its limit, publishes it as running (rec+64),
+// then reads the flag and raises the limit itself when it is set (rtSchedArm). Both sides write before they
+// read, with sequentially consistent atomics, so one of them sees the other: a fiber switched in while the
+// world stops always has its limit raised.
+
+// Raise the stack limit of fiber `fib`: its next stack check or loop poll takes the slow path.
+fun rtRequestStop(fib: RawPtr) {
+  fib.atomicStore(-1, toByteOffset: 40)
+}
+
+// Switch fiber `fib` in on the carrier `rec`: restore its limit, publish it as running, and raise the limit
+// again if the world is stopping (the request word, above).
+fun rtSchedArm(rec: RawPtr, fib: RawPtr) {
+  rtStackLimitSet(fib)
+  rec.atomicStore(RawPtr.null, toByteOffset: 208)       // a request for the fiber before is void
+  let switches: Int = rec.load(fromByteOffset: 200)
+  rec.atomicStore(switches + 1, toByteOffset: 200)
+  rec.atomicStore(fib, toByteOffset: 64)
+  if rtStopWorld.atomicLoad(fromByteOffset: 0) != 0 {
+    rtRequestStop(fib)
+  }
+}
+
+// Switch fiber `fib` back in on `rec` after a stop (a stop-the-world, or a stack move) in the same run: restore its
+// limit and raise it again if the world is stopping or the monitor named it the carrier's target. The switch count
+// and the target stay as they were, so the run keeps its age: a fiber stopped by collections more often than the
+// monitor ticks would otherwise never be preempted. The monitor names the target before it raises the limit, and
+// this restores the limit before it reads the target, so a request made meanwhile is never lost.
+fun rtSchedRearm(rec: RawPtr, fib: RawPtr) {
+  rtStackLimitSet(fib)
+  let target: RawPtr = rec.atomicLoad(fromByteOffset: 208)
+  if rtStopWorld.atomicLoad(fromByteOffset: 0) != 0 || target.eq(fib) {
+    rtRequestStop(fib)
+  }
+}
+
+// Raise the limit of every carrier's running fiber, after the stop-the-world flag is raised.
+fun rtStopRunningFibers() {
+  var r: RawPtr = rtCarriers.atomicLoad(fromByteOffset: 0)
+  while !r.isNull {
+    let cur: RawPtr = r.atomicLoad(fromByteOffset: 64)
+    if !cur.isNull {
+      rtRequestStop(cur)
+    }
+    r = r.load(fromByteOffset: 96)
+  }
+}
+
+// Restore the running fiber's limit and report whether it must stop for a collection. The limit is restored
+// before the flag is read, so a request raised meanwhile raises it again after.
+fun rtStopPending(self: RawPtr) -> Bool {
+  rtStackLimitSet(self)
+  return rtStopWorld.atomicLoad(fromByteOffset: 0) != 0
+}
+
+// ---- A fiber in C (task 270) ----
+// A fiber about to make a call into C that may block, at a point where no frame of its own below the call holds
+// a managed address a map does not record, marks itself in C (rtEnterC): its anchor names the frame that called
+// in, described by that call's stack map, its state is 7, and its carrier's word rec+232 is 1. A stop-the-world
+// does not wait for it: the coordinator claims the carrier, replacing 1 with 4g + 2 for its generation g
+// (rtClaimInC), and counts the claim as the carrier's acknowledgement; the root walk scans the fiber from its
+// anchor, and no stack is moved under it (shrinking leaves state 7 alone). Back from C (rtExitC), the fiber
+// takes its word from 1 to 0 and goes on, or, finding it claimed, waits for that stop-the-world to end before
+// it runs Nomu code again. A carrier is claimed at most once a generation.
+
+// Mark the running fiber in C, its frames anchored at (anchorSp, anchorPc), its registers saved at `regs` by the
+// frame that stays live across the call into C (`Runtime.saveContext`): the fiber's context points there, so the
+// walk finds the anchor frame's x19 as it does for a switched-out fiber (rtX19AtAnchor). False off a fiber, where
+// nothing needs marking. A stop-the-world already under way is told, so it claims the carrier without waiting.
+fun rtEnterC(anchorSp: RawPtr, anchorPc: Int, regs: RawPtr) -> Bool {
+  let rec = Runtime.carrierLocal()
+  if rec.isNull {
+    return false
+  }
+  let self: RawPtr = rec.load(fromByteOffset: 64)
+  if self.isNull {
+    return false
+  }
+  rtSchedSetAnchor(self, anchorSp, anchorPc)
+  self.store(regs, toByteOffset: 0)
+  self.store(7.uint8, toByteOffset: 8)
+  rec.atomicStore(1, toByteOffset: 232)
+  if rtStopWorld.atomicLoad(fromByteOffset: 0) != 0 {
+    Runtime.futexWake(at: rtSched.advanced(by: 144), all: true)   // the coordinator waits on the ack word
+  }
+  return true
+}
+
+// Back from C: running again, after waiting out a stop-the-world that claimed this carrier meanwhile.
+fun rtExitC() {
+  let rec = Runtime.carrierLocal()
+  rtLeaveC(rec)
+  let self: RawPtr = rec.load(fromByteOffset: 64)
+  self.store(1.uint8, toByteOffset: 8)
+}
+
+// Take carrier `rec`'s in-C word back to 0, waiting out a stop-the-world that claimed it.
+fun rtLeaveC(rec: RawPtr) {
+  let gw = rtSched.advanced(by: 152)
+  var go = true
+  while go {
+    let v: Int = rec.atomicLoad(fromByteOffset: 232)
+    if v == 1 {
+      go = rec.atomicCas(1, 0, atByteOffset: 232) != 1
+    } else {
+      let g = (v - 2) / 4
+      while gw.atomicLoad(fromByteOffset: 0) == g {
+        Runtime.futexWait(at: gw, expected: g, timeoutMicros: 1000000)
+      }
+      go = rec.atomicCas(v, 0, atByteOffset: 232) != v
+    }
+  }
+}
+
+// The coordinator, stop-the-world `g` under way: claim every carrier whose fiber is in C and not yet claimed for
+// `g`, each an acknowledgement on the ack word. Returns how many it claimed.
+fun rtClaimInC(sched: RawPtr, g: Int) -> Int {
+  let claimed = 4 * g + 2
+  var n = 0
+  var r: RawPtr = rtCarriers.atomicLoad(fromByteOffset: 0)
+  while !r.isNull {
+    let v: Int = r.atomicLoad(fromByteOffset: 232)
+    if v != 0 && v != claimed {
+      if r.atomicCas(v, claimed, atByteOffset: 232) == v {
+        sched.atomicFetchAdd(1, atByteOffset: 144)
+        n = n + 1
+      }
+    }
+    r = r.load(fromByteOffset: 96)
+  }
+  return n
+}
+
+// ---- Carrier handoff (task 270.3) ----
+// A carrier whose fiber is in C past a monitor tick, while work waits, is handed off, as Go hands a P from an M in
+// a syscall to another M: the monitor marks it (rec+240 = 1) and wakes a parked spare, or starts a new carrier,
+// so as many carriers run Nomu code as before. When its fiber leaves it (back from C, then parked, finished or
+// yielded) the handed-off carrier retires: its queued work goes to the global queue, and it parks as a spare
+// (rec+240 = 2), in C as far as a stop-the-world is concerned, so the coordinator claims it as acknowledged.
+// Carriers are made only under the scheduler lock with no stop-the-world requested, which is raised under the
+// same lock: a stop-the-world reads the carrier count (sched+160) after any carrier made before it, so every
+// carrier it counts acknowledges.
+
+// Hand carrier `r` off (the monitor): wake a parked spare, or make a carrier.
+fun rtHandOff(sched: RawPtr, r: RawPtr) {
+  rtSchedLock(sched)
+  let stw: Int = sched.atomicLoad(fromByteOffset: 136)
+  let state: Int = r.atomicLoad(fromByteOffset: 240)
+  if stw == 0 && state == 0 {
+    r.atomicStore(1, toByteOffset: 240)
+    var woke = false
+    var s: RawPtr = rtCarriers.atomicLoad(fromByteOffset: 0)
+    while !s.isNull && !woke {
+      if s.atomicCas(2, 0, atByteOffset: 240) == 2 {
+        sched.atomicFetchAdd(-1, atByteOffset: 336)
+        Runtime.futexWake(at: s.advanced(by: 240), all: false)
+        woke = true
+      }
+      s = s.load(fromByteOffset: 96)
+    }
+    if !woke {
+      let index: Int = sched.atomicFetchAdd(1, atByteOffset: 160)
+      let carg = RawPtr.alloc(bytes: 16, align: 8)
+      carg.store(sched, toByteOffset: 0)
+      carg.store(index, toByteOffset: 8)
+      let h = RawPtr.alloc(bytes: 8, align: 8)
+      Runtime.threadCreate(handle: h, entry: Runtime.ofFunc(rtSchedCarrierMain), arg: carg)
+    }
+  }
+  rtSchedUnlock(sched)
+}
+
+// Retire carrier `rec`, handed off and now between fibers: its queued work to the global queue, then park as a
+// spare until a handoff wakes it or the program stops. In C while parked (rec+232), so a stop-the-world claims it.
+fun rtSchedRetire(sched: RawPtr, rec: RawPtr) {
+  var moved = false
+  let slotFib: RawPtr = rec.atomicExchange(RawPtr.null, atByteOffset: 104)
+  if !slotFib.isNull {
+    rtSchedGlobalPutEntry(sched, slotFib, false)
+    moved = true
+  }
+  var f = rtRunqPop(rec)
+  while !f.isNull {
+    rtSchedGlobalPutEntry(sched, f, false)
+    moved = true
+    f = rtRunqPop(rec)
+  }
+  if moved {
+    rtSchedWake(sched, false)
+  }
+  rec.atomicStore(1, toByteOffset: 232)
+  sched.atomicFetchAdd(1, atByteOffset: 336)
+  rec.atomicStore(2, toByteOffset: 240)
+  if rtStopWorld.atomicLoad(fromByteOffset: 0) != 0 {
+    Runtime.futexWake(at: sched.advanced(by: 144), all: true)   // the coordinator, to claim it
+  }
+  let word = rec.advanced(by: 240)
+  while word.atomicLoad(fromByteOffset: 0) == 2 && sched.atomicLoad(fromByteOffset: 40) == 0 {
+    Runtime.futexWait(at: word, expected: 2, timeoutMicros: 1000000)
+  }
+  rtLeaveC(rec)
+}
+
+// ---- Preemption (task 236.5) ----
+// A fiber computing past its slice while work waits on its carrier gives the carrier up at its next stop (a
+// loop poll or an ordinary function-entry check), as Go's `sysmon` asks of a goroutine. The monitor, a thread
+// of its own, looks at every carrier each tick: one running the same fiber with no switch since the last tick
+// (its count at rec+200 unchanged) has run at least one period, a quarter of the slice. If work waits there (its run
+// queue or slot, or the global queue with no carrier asleep to take it) it names the fiber as the carrier's
+// target (rec+208) and raises the fiber's limit (the request word, above); with carriers asleep it wakes one
+// instead. The period drops to the shortest when a carrier ran one fiber across the tick or has work waiting
+// behind its fiber, doubles up to rtMonitorBusyMicros while carriers run only short bursts, and up to
+// rtMonitorMaxMicros while none runs a fiber. The fiber, at its stop, restores its limit; a pending stop-the-world comes first,
+// then, if it is its carrier's target, it puts itself on the global queue and switches to its carrier
+// (rtSchedYieldPreempted). A stale request (the fiber switched out first) finds another target and is dropped.
+
+let rtMonitorMaxMicros = 10000
+let rtMonitorBusyMicros = 1000
+// The word the monitor sleeps on between ticks: nothing wakes it; the wait's timeout is the period.
+let rtMonitorWord = Runtime.staticStorage(bytes: 8, align: 8)
+
+fun rtSchedMonitorMain(sched: RawPtr) -> RawPtr {
+  rtFaultThreadStart(5, 0)
+  var period = rtMonitorMinMicros
+  var go = true
+  while go {
+    Runtime.futexWait(at: rtMonitorWord, expected: 0, timeoutMicros: period)
+    let stp: Int = sched.atomicLoad(fromByteOffset: 40)
+    if stp != 0 {
+      go = false
+    } else {
+      let seen = rtMonitorTick(sched)
+      if seen == 2 {
+        period = rtMonitorMinMicros
+      } else {
+        var cap = rtMonitorMaxMicros
+        if seen == 1 {
+          cap = rtMonitorBusyMicros
+        }
+        period = period * 2
+        if period > cap {
+          period = cap
+        }
+      }
+    }
+  }
+  return sched
+}
+
+// One look at every carrier; returns 2 when one ran the same fiber across the tick or has work waiting behind its
+// fiber, else 1 when one runs a fiber, else 0.
+fun rtMonitorTick(sched: RawPtr) -> Int {
+  var busy = 0
+  var r: RawPtr = rtCarriers.atomicLoad(fromByteOffset: 0)
+  while !r.isNull {
+    let fib: RawPtr = r.atomicLoad(fromByteOffset: 64)
+    let switches: Int = r.atomicLoad(fromByteOffset: 200)
+    if !fib.isNull {
+      if busy == 0 {
+        busy = 1
+      }
+      let lastSwitches: Int = r.load(fromByteOffset: 216)
+      let lastFib: RawPtr = r.load(fromByteOffset: 224)
+      let long = switches == lastSwitches && fib.eq(lastFib)
+      let waits = rtWorkWaits(sched, r)
+      let inC: Int = r.atomicLoad(fromByteOffset: 232)
+      if long || waits {
+        busy = 2
+      }
+      if long && inC != 0 && (waits || rtSchedWorkVisible(r, Runtime.ticks())) {
+        let sleeping: Int = sched.atomicLoad(fromByteOffset: 320)
+        if sleeping > 0 {
+          rtSchedWake(sched, false)
+        } else if r.atomicLoad(fromByteOffset: 240) == 0 {
+          rtHandOff(sched, r)
+        }
+      } else if long && waits {
+        let sleeping: Int = sched.atomicLoad(fromByteOffset: 320)
+        if sleeping > 0 {
+          rtSchedWake(sched, false)
+        } else {
+          r.atomicStore(fib, toByteOffset: 208)
+          rtRequestStop(fib)
+        }
+      }
+    }
+    r.store(switches, toByteOffset: 216)
+    r.store(fib, toByteOffset: 224)
+    r = r.load(fromByteOffset: 96)
+  }
+  return busy
+}
+
+// Whether work waits for carrier `r`: in its run queue or slot, or on the global queue.
+fun rtWorkWaits(sched: RawPtr, r: RawPtr) -> Bool {
+  if rtRunqRing(r).isNull {
+    return false
+  }
+  if rtRunqNonEmpty(r) {
+    return true
+  }
+  let slot: Int = r.atomicLoad(fromByteOffset: 104)
+  return slot != 0 || rtSchedGlobalNonEmpty(sched)
+}
+
+// Whether the monitor asked the running fiber `self` to yield.
+fun rtPreemptAsked(self: RawPtr) -> Bool {
+  let rec = Runtime.carrierLocal()
+  if rec.isNull {
+    return false
+  }
+  let target: RawPtr = rec.atomicLoad(fromByteOffset: 208)
+  return target.eq(self)
+}
+
+// Give the carrier up: the running fiber `self`, at a stop whose frame its anchor names, switches to its
+// carrier ready (state 0) holding the scheduler lock, and the carrier, its context saved, puts it on the global
+// queue before releasing the lock (rtSchedRun). It wakes no carrier: the monitor preempts only with none asleep,
+// and a carrier about to sleep looks at the global queue first. The stack check's slow path does the same inline
+// (`nomuSchedStackCheck`), within its stack budget.
+fun rtSchedYieldPreempted(sched: RawPtr, self: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
+  let rec = Runtime.carrierLocal()
+  rec.atomicStore(RawPtr.null, toByteOffset: 208)
+  rtSchedSetAnchor(self, anchorSp, anchorPc)
+  rtSchedLock(sched)
+  self.store(0.uint8, toByteOffset: 8)
+  Runtime.ctxSwitch(from: self, to: self.advanced(by: 72))   // resumes without the scheduler lock
+}
+
+// The safepoint slow path (called from __nomu_gc_poll_slow when a loop poll finds its fiber's limit raised).
+// With no stop-the-world pending (a raise left from before the fiber parked) it restores the limit and
+// returns. Otherwise the running fiber records the user-frame anchor its poll's forwarder captured, marks
+// itself safepoint-stopped (state 4), and switches to its carrier — which then acks the STW and waits. On
+// resume the carrier switches back in and this returns, so the fiber continues past the poll. The carrier holds
 // the scheduler lock across the switch (the lock-coupled protocol), released here after switch-back-in.
 fun nomuSchedSafepoint(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int) {
   let self = rtCurrentFiber()
+  if rtStopPending(self) == false {
+    if rtPreemptAsked(self) {
+      rtSchedYieldPreempted(sched, self, anchorSp, anchorPc)
+    }
+    return
+  }
   rtSchedSetAnchor(self, anchorSp, anchorPc)
   rtSchedLock(sched)
   self.store(4.uint8, toByteOffset: 8)               // safepoint-stopped
@@ -1651,6 +2008,11 @@ fun nomuSchedBoot(sched: RawPtr, entryFn: RawPtr, ncarriers: Int) {
   let gc = RawPtr.alloc(bytes: 8, align: 8)
   Runtime.threadCreate(handle: gc, entry: Runtime.ofFunc(rtGcCoordinatorMain), arg: sched)
   sched.store(gc, toByteOffset: 240)
+  // The monitor (preemption): one raw thread, never joined; the program's exit ends it.
+  if rtPreemptOn && ncarriers > 0 {
+    let mon = RawPtr.alloc(bytes: 8, align: 8)
+    Runtime.threadCreate(handle: mon, entry: Runtime.ofFunc(rtSchedMonitorMain), arg: sched)
+  }
   var c = 1
   while c < ncarriers {
     let carg = RawPtr.alloc(bytes: 16, align: 8)

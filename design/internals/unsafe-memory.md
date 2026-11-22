@@ -153,6 +153,11 @@ is the caller's obligation. Typed `Ptr<T>` access carries `T`'s aliasing informa
 access is treated as may-alias-anything, so a miscompile cannot arise from an over-narrow assumption.
 This is the conservative-but-correct baseline; tightening it is future work (§7).
 
+**Memory another fiber writes is read with atomics.** The optimizer moves plain loads across loop polls
+(`backend.md`, the loop poll), so a loop that waits on a plain load for another fiber's write may never see
+it: the load can be hoisted out of the loop. Such a read is a data race; it uses `atomicLoad` (and the writer
+`atomicStore`), which the optimizer keeps in place.
+
 ## 7. Held back / deferred
 
 - **Capability / `unsafe { }` region.** A gated region (new grammar) confining raw operations, possibly

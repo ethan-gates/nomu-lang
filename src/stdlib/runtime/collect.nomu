@@ -783,7 +783,8 @@ fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
 // reserve fills, a major at true OOM, a stress collection, or a white-box test's rtGcRequest. The requester
 // has already set stw-request (+136) and the kind (+176) under the scheduler lock. The coordinator then stops the world: it
 // raises `rtStopWorld`, wakes idle carriers so they ack, and sleeps on the ack count (+144), which each
-// carrier's ack bumps and wakes (rtSchedStwParkCarrier), until every carrier has acked. With the world
+// carrier's ack bumps and wakes (rtSchedStwParkCarrier), until every carrier has acked. Running fibers see the
+// request through their stack limits (the request word, `scheduler.nomu`). With the world
 // stopped it reads the kind and runs that collection, then resumes the world: it resets the kind, the ack count and
 // the request, clears `rtStopWorld`, and bumps stw-gen (+152), which the parked carriers wait on. It exits
 // on the scheduler's stop flag (+40). nomuSchedBoot starts and joins it.
@@ -803,14 +804,19 @@ fun rtGcCoordinatorMain(sched: RawPtr) -> RawPtr {
       req.atomicStore(0, toByteOffset: 0)                 // consume the request (stw-request is already set)
       let ncarriers: Int = sched.atomicLoad(fromByteOffset: 160)
       rtStopWorld.atomicStore(1, toByteOffset: 0)
+      rtStopRunningFibers()                               // running fibers stop at their next check or poll
       rtSchedWake(sched, true)                            // idle carriers wake, see the request, and ack
       // The ack word carries this STW's generation tag over the count (rtSchedStwParkCarrier); the futex
       // compares the count, its low 32 bits.
+      // A carrier whose fiber is in C acknowledges through its claim (rtClaimInC), looked for on every wake.
+      let gen: Int = sched.atomicLoad(fromByteOffset: 152)
+      rtClaimInC(sched, gen)
       let ackWord: Int = ack.atomicLoad(fromByteOffset: 0)
       var acked = ackWord % 4294967296
       var waiting = acked < ncarriers
       while waiting {
         Runtime.futexWait(at: ack, expected: acked, timeoutMicros: 1000)
+        rtClaimInC(sched, gen)
         let aw: Int = ack.atomicLoad(fromByteOffset: 0)
         acked = aw % 4294967296
         let done: Int = sched.atomicLoad(fromByteOffset: 40)

@@ -1,0 +1,195 @@
+// Stop-the-world while fibers are in the runtime's own code, which has no stops (task 236.8). Four workers run
+// rounds through runtime paths with live objects in hand: small-object allocation (TLAB refills), an array of
+// objects grown by append (growth copies, then a large object), a fresh fiber recursing with an object in
+// every frame (its stack grows by moves), and messages handed back and forth over a channel. A requester asks
+// for minor collections back to back until every worker is done, so collections land while the workers are
+// in those paths and move what they hold. Each worker counts the rounds whose result checked out and prints
+// the count. Built with `test.runtime_prelude` (for `rtGcRequest`).
+class Box {
+  var v: Int
+  var next: Option<Box>
+}
+
+// A channel's message: shareable, so deeply immutable.
+class Msg {
+  let v: Int
+  let prev: Option<Msg>
+}
+
+let rounds = 5
+
+// A chain of `n` Boxes, summed from the head.
+fun chainSum(n: Int) -> Int {
+  var head = Box(v: 0, next: .none)
+  var i = 1
+  while i < n {
+    head = Box(v: i, next: .some(head))
+    i += 1
+  }
+  var sum = 0
+  var cur: Option<Box> = .some(head)
+  var walking = true
+  while walking {
+    switch cur {
+    case .some(let b):
+      sum = sum + b.v
+      cur = b.next
+    case .none:
+      walking = false
+    }
+  }
+  return sum
+}
+
+fun allocWorker(n: Int) -> Int {
+  var ok = 0
+  var r = 0
+  while r < rounds {
+    if chainSum(n) == n * (n - 1) / 2 {
+      ok += 1
+    }
+    r += 1
+  }
+  return ok
+}
+
+fun arrayWorker(n: Int) -> Int {
+  var ok = 0
+  var r = 0
+  while r < rounds {
+    var xs: Array<Box> = []
+    var i = 0
+    while i < n {
+      xs.append(Box(v: i, next: .none))
+      i += 1
+    }
+    var sum = 0
+    i = 0
+    while i < n {
+      sum = sum + xs[i].v
+      i += 1
+    }
+    if sum == n * (n - 1) / 2 {
+      ok += 1
+    }
+    r += 1
+  }
+  return ok
+}
+
+// 0 + 1 + … + n, a Box per frame live across the call below it.
+fun down(n: Int, b: Box) -> Int {
+  if n == 0 {
+    return b.v
+  }
+  let c = Box(v: b.v + 1, next: .none)
+  return b.v + down(n - 1, c)
+}
+
+fun deepFiber(n: Int) -> Int {
+  return down(n, Box(v: 0, next: .none))
+}
+
+fun deepWorker(n: Int) -> Int {
+  var ok = 0
+  var r = 0
+  while r < rounds {
+    let t = task deepFiber(n: n)
+    if t.join() == n * (n + 1) / 2 {
+      ok += 1
+    }
+    r += 1
+  }
+  return ok
+}
+
+// Send each message back with its value plus one, until a message of -1.
+fun echo(from: Channel<Msg>, to: Channel<Msg>) {
+  var open = true
+  while open {
+    switch from.receive() {
+    case .some(let b):
+      to.send(Msg(v: b.v + 1, prev: .some(b)))
+      if b.v < 0 {
+        open = false
+      }
+    case .none:
+      open = false
+    }
+  }
+}
+
+fun chanWorker(n: Int) -> Int {
+  let a = Channel<Msg>.make(capacity: 0)
+  let b = Channel<Msg>.make(capacity: 0)
+  fiber echo(a, b)
+  var ok = 0
+  var r = 0
+  while r < rounds {
+    var good = true
+    var i = 0
+    while i < n {
+      a.send(Msg(v: i, prev: .none))
+      switch b.receive() {
+      case .some(let back):
+        if back.v != i + 1 {
+          good = false
+        }
+      case .none:
+        good = false
+      }
+      i += 1
+    }
+    if good {
+      ok += 1
+    }
+    r += 1
+  }
+  a.send(Msg(v: -1, prev: .none))
+  b.receive()
+  return ok
+}
+
+fun requester(st: RawPtr) -> Int {
+  var requests = 0
+  while st.atomicLoad(fromByteOffset: 0) < 4 {
+    let ticket = rtGcRequest(1)
+    while !rtGcCollected(ticket) {
+      requests = requests + 0
+    }
+    requests += 1
+  }
+  return requests
+}
+
+fun finish(st: RawPtr, ok: Int) -> Int {
+  st.atomicFetchAdd(1, atByteOffset: 0)
+  return ok
+}
+
+fun main() {
+  let st = RawPtr.alloc(bytes: 8, align: 8)
+  st.atomicStore(0, toByteOffset: 0)
+  let req = task requester(st: st)
+  let w1 = task allocWorker(n: 20000)
+  let w2 = task arrayWorker(n: 50000)
+  let w3 = task deepWorker(n: 20000)
+  let w4 = task chanWorker(n: 1000)
+  let a = finish(st: st, ok: w1.join())
+  let b = finish(st: st, ok: w2.join())
+  let c = finish(st: st, ok: w3.join())
+  let d = finish(st: st, ok: w4.join())
+  let made = req.join()
+  print("alloc ")
+  print(a)
+  print(" array ")
+  print(b)
+  print(" deep ")
+  print(c)
+  print(" chan ")
+  print(d)
+  if made > 0 {
+    print(" collected")
+  }
+  print("\n")
+}

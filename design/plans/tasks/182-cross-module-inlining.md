@@ -60,6 +60,13 @@ Make a function **inlinable across the module boundary**, and in particular make
   for `String`; it is the general capability for a fast cross-module stdlib and the home for "how do core ops
   inline without LTO." Build it when a cross-module hot path measures a real call-overhead gap.
 
+## A measured case
+
+`benchmarks/loop_kernels`' `bytes` kernel (from [245](245-loop-strip-mining.md)) reads a string byte by byte
+through `String.byte(at:)` and `String.count`, which stay calls across the module boundary. Its loop therefore
+keeps its poll in place (strip mining needs a loop without calls) and does not vectorize: 14% behind the no-poll
+build on `tools/loopbench.py`. Inlining the two accessors would make it a call-free loop.
+
 ## Dependencies & relationships
 
 - **Builds on [148 SSAIR optimizer tier](148-ssair-optimizer-tier.md)** — the intra-module `Inline` pass

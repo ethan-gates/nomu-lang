@@ -11,7 +11,7 @@ The channels library — typed communication between fibers/tasks on the M:N run
 
 `Task` is written over a one-shot channel, and stop signals are closed channels (`concurrency.md` §7, §8),
 so channels come first in the concurrency surface. Channels implement the iteration protocol
-([117](117-for-in-iteration.md)).
+([117](117-loop-improvements.md)).
 
 ## Dependencies & triggers
 

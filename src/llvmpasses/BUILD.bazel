@@ -9,6 +9,7 @@ cc_library(
         "CallBundles.cpp",
         "FrameAddressSplit.cpp",
         "LargeValues.cpp",
+        "LoopPolls.cpp",
         "ReferenceAggregates.cpp",
         "StackChecks.cpp",
         "TrackFrameAddresses.cpp",

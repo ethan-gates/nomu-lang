@@ -49,6 +49,7 @@ CONFIGS = {
     "search-5us": {"NOMU_SEARCH_NS": "5000"},
     "search-50us": {"NOMU_SEARCH_NS": "50000"},
     "heavy": {"HEAVY": "1"},
+    "no-preempt": {"NOMU_PREEMPT": "0"},
 }
 DEFAULT_CONFIGS = ["default", "no-slot"]
 

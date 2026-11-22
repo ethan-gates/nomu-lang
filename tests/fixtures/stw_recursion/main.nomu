@@ -1,0 +1,57 @@
+// Stop-the-world over fibers in recursion (task 236.4). Two workers each hold a live Box across a deep
+// recursion with no loop and no allocation, so they can stop only at a function-entry stack check. Each counts
+// itself in before it recurses; worker 222 waits in a loop until both are in, then requests a minor collection
+// (`rtGcRequest`), waits for it, and sets a flag. Both workers stop at their next entry check, the walk finds
+// their Boxes in the recursion's frames, and the minor moves them. Each worker then reads the flag at once (no
+// stop between): 1 when the collection ran while it was still recursing, so it stopped at an entry. Each prints
+// its moved Box's value and the flag: 111 + 222 = 333, and 1 + 1 = 2. Built with `test.runtime_prelude` (for
+// `rtGcRequest`); runs on three or more carriers, so both workers and the requester run at once.
+class Box {
+  var v: Int
+}
+
+// fib(n) leaves, each returning b.v; b is live across both calls.
+fun walk(b: Box, n: Int) -> Int {
+  if n < 2 {
+    return b.v
+  }
+  let x = walk(b: b, n: n - 1)
+  let y = walk(b: b, n: n - 2)
+  return x + y - b.v + b.v
+}
+
+fun worker(id: Int, st: RawPtr) -> Int {
+  let a = Box(v: id)
+  st.atomicFetchAdd(1, atByteOffset: 0)           // counted in
+  let leaves = walk(b: a, n: 36)
+  let ran: Int = st.atomicLoad(fromByteOffset: 8)  // the collection ran during the recursion
+  return (leaves / 24157817 - id) + a.v + ran * 1000
+}
+
+fun requester(st: RawPtr) -> Int {
+  var spins = 0
+  while st.atomicLoad(fromByteOffset: 0) < 2 {
+    spins = spins + 1
+  }
+  let ticket = rtGcRequest(1)
+  while !rtGcCollected(ticket) {
+    spins = spins + 1
+  }
+  st.atomicStore(1, toByteOffset: 8)
+  return spins % 1
+}
+
+fun main() {
+  let st = RawPtr.alloc(bytes: 16, align: 8)
+  st.atomicStore(0, toByteOffset: 0)
+  st.atomicStore(0, toByteOffset: 8)
+  let r = task requester(st: st)
+  let x = task worker(id: 111, st: st)
+  let y = task worker(id: 222, st: st)
+  let a = x.join()
+  let b = y.join()
+  print(a % 1000 + b % 1000 + r.join())
+  print(" ")
+  print(a / 1000 + b / 1000)
+  print("\n")
+}

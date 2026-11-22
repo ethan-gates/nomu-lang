@@ -118,7 +118,7 @@ interface, and making the stdlib/runtime inline into clients without LTO — is
 - **Dominating-redundant + constant-fold BCE** `[M · deferred]` `[§7.5]` — the retained residual:
   redundant-with-a-dominating-check (RMW / repeated same `(array, index)`), and `a[k]` with `k`+length
   statically known. Needs a dominator tree (§148.6) + light value-numbering, no loop reasoning. The
-  loop-bound case is descoped in favor of `for … in` bounds-check-free-by-construction ([117](117-for-in-iteration.md)).
+  loop-bound case is descoped in favor of `for … in` bounds-check-free-by-construction ([117](117-loop-improvements.md)).
 
 ## 148.5 · Classic SSA optimizations (only where language-aware)
 

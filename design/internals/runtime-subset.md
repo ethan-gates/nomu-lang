@@ -21,7 +21,7 @@ Designation sources (both feed the same `subsetFuncs` set, resolved in the drive
 
 **Built (poll-suppression).** The safepoint-poll codegen guard (§4). The resolved `noSafepoint` property
 rides from the subset designation to the backend (`SSAFunction.noSafepoint`, seeded in `lowerToSSAIR` from
-the designated set), and `SSAIRToLLVM` elides the loop-header `__nomu_poll` for a subset function. This is
+the designated set), and `SSAIRToLLVM` elides the loop-header poll for a subset function. This is
 the guard the self-hosted scheduler loop needs (128.1.1): the loop runs during a stop-the-world, so a poll
 there would recurse. Verified in emitted machine code (`tools/subset-poll.sh`).
 
@@ -64,7 +64,7 @@ inserts would be self-referential inside runtime code:
 2. **Write barrier.** Codegen emits `__nomu_write_barrier` on managed-pointer stores (`runtime.md` §6);
    the barrier code is what that call lands in. Barrier code emitting a barrier recurses. (Runtime code
    works over `addrspace(0)` raw memory, which has no managed stores to barrier.)
-3. **Compiler-inserted safepoint.** Codegen drops `__nomu_poll` at loop back-edges so a fiber can be
+3. **Compiler-inserted safepoint.** Codegen drops a poll at loop back-edges so a fiber can be
    stopped for collection (`runtime.md` §6). Code running *during* a stop-the-world pause cannot itself
    hit a poll that tries to stop the world.
 4. **Bounded stack (nosplit).** Functions that run where the stack cannot grow — a signal / STW context,
@@ -139,7 +139,7 @@ Two layers, both reading the resolved property set (§3):
   `__nomu_write_barrier` that the closure check somehow admitted is a hard error at the emission point.
   The two layers agree; the guard is the belt to the closure check's suspenders. **Built:** the
   safepoint-poll elision — `SSAFunction.noSafepoint` (seeded in `lowerToSSAIR` from the designated set)
-  makes `SSAIRToLLVM` skip the loop-header `__nomu_poll`. The write-barrier elision is inert today (subset
+  makes `SSAIRToLLVM` skip the loop-header poll. The write-barrier elision is inert today (subset
   code holds no managed store to barrier) and the hard-error backstops are not yet wired.
 
 Diagnostics surface as ordinary Sema-level errors (the property set is known before codegen).

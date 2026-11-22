@@ -1,0 +1,320 @@
+import std/time
+
+// Call-free loop kernels, the loops a loop-header safepoint poll costs most in (task 245, the kernel set; 236's
+// goal G3). Each kernel runs for several rounds whose inputs depend on the round, so no round can be skipped or
+// hoisted; each prints `kernel <name> ns <total>`, and the program ends with `checksum <n>`, which every build
+// configuration must print the same. `tools/loopbench.py` builds it with and without loop polls and compares.
+//
+//   sieve      flags over 2,000,000 integers (frames_loops)
+//   matmul     a 160x160 integer matrix product (frames_loops)
+//   sum        the sum of a 1,000,000-element array: a counted loop
+//   count      elements over a threshold: a counted loop with a branch
+//   probe      lookups in an open-addressing hash table: an uncounted probe loop
+//   insertion  insertion sort of 64-element runs: an uncounted inner loop that shifts
+//   bytes      a byte histogram over a 1 MB string
+//   spectral   spectral-norm's A·v and Aᵀ·v over 500 doubles
+
+fun sieve(flags: Array<Int>, n: Int) -> Int {
+    var i = 0
+    while i < n {
+        flags[i] = 1
+        i = i + 1
+    }
+    var count = 0
+    var p = 2
+    while p < n {
+        if flags[p] == 1 {
+            count = count + 1
+            var m = p + p
+            while m < n {
+                flags[m] = 0
+                m = m + p
+            }
+        }
+        p = p + 1
+    }
+    return count
+}
+
+fun matmul(a: Array<Int>, b: Array<Int>, c: Array<Int>, n: Int, k0: Int) -> Int {
+    var i = 0
+    while i < n {
+        var j = 0
+        while j < n {
+            var s = 0
+            var k = 0
+            while k < n {
+                s = s + a[i * n + k] * (b[k * n + j] + k0)
+                k = k + 1
+            }
+            c[i * n + j] = s % 1000003
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return c[n * n - 1]
+}
+
+fun sum(a: Array<Int>, k0: Int) -> Int {
+    var s = k0
+    var i = 0
+    while i < a.count {
+        s = s + a[i]
+        i = i + 1
+    }
+    return s
+}
+
+fun count(a: Array<Int>, threshold: Int) -> Int {
+    var n = 0
+    var i = 0
+    while i < a.count {
+        if a[i] > threshold {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// The slot of `key` in `table` (keys stored plus one; 0 is empty), probing linearly; -1 when absent.
+fun find(table: Array<Int>, mask: Int, key: Int) -> Int {
+    var slot = (key * 40503) & mask
+    while table[slot] != 0 {
+        if table[slot] == key + 1 {
+            return slot
+        }
+        slot = (slot + 1) & mask
+    }
+    return -1
+}
+
+fun probe(table: Array<Int>, mask: Int, keys: Int, k0: Int) -> Int {
+    var found = 0
+    var k = 0
+    while k < keys {
+        if find(table: table, mask: mask, key: (k * 7 + k0) % (keys * 2)) >= 0 {
+            found = found + 1
+        }
+        k = k + 1
+    }
+    return found
+}
+
+// Sort each 64-element run of `a` in place by insertion, after refilling it from the round.
+fun insertion(a: Array<Int>, k0: Int) -> Int {
+    var i = 0
+    while i < a.count {
+        a[i] = (i * 2654435761 + k0) % 100003
+        i = i + 1
+    }
+    var start = 0
+    while start + 64 <= a.count {
+        var j = start + 1
+        while j < start + 64 {
+            let v = a[j]
+            var h = j - 1
+            while h >= start && a[h] > v {
+                a[h + 1] = a[h]
+                h = h - 1
+            }
+            a[h + 1] = v
+            j = j + 1
+        }
+        start = start + 64
+    }
+    return a[a.count - 1]
+}
+
+fun bytes(s: String, hist: Array<Int>, k0: Int) -> Int {
+    var i = 0
+    while i < 256 {
+        hist[i] = 0
+        i = i + 1
+    }
+    i = k0 % 7
+    while i < s.count {
+        let b = s.byte(at: i).int
+        hist[b] = hist[b] + 1
+        i = i + 1
+    }
+    return hist[97] + hist[101]
+}
+
+fun spectralA(i: Int, j: Int) -> Double {
+    return 1.0 / ((i + j) * (i + j + 1) / 2 + i + 1).double
+}
+
+// out = A·v, then v = Aᵀ·out; returns a scaled sample of v.
+fun spectral(v: Array<Double>, out: Array<Double>, n: Int) -> Int {
+    var i = 0
+    while i < n {
+        var s = 0.0
+        var j = 0
+        while j < n {
+            s = s + spectralA(i: i, j: j) * v[j]
+            j = j + 1
+        }
+        out[i] = s
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        var s = 0.0
+        var j = 0
+        while j < n {
+            s = s + spectralA(i: j, j: i) * out[j]
+            j = j + 1
+        }
+        v[i] = s
+        i = i + 1
+    }
+    return (v[0] * 1000000.0).int
+}
+
+fun report(name: String, ns: Int) {
+    print("kernel ")
+    print(name)
+    print(" ns ")
+    print(ns)
+    print("\n")
+}
+
+fun main() {
+    var check = 0
+
+    let n = 2000000
+    var flags: Array<Int> = []
+    var big: Array<Int> = []
+    var i = 0
+    while i < n {
+        flags.append(0)
+        i = i + 1
+    }
+    i = 0
+    while i < 1000000 {
+        big.append((i * 2654435761) % 1000003)
+        i = i + 1
+    }
+
+    var t = Time().now
+    var round = 0
+    while round < 10 {
+        check = check + sieve(flags: flags, n: n - round)
+        round = round + 1
+    }
+    report(name: "sieve", ns: Time().now - t)
+
+    let m = 160
+    var a: Array<Int> = []
+    var b: Array<Int> = []
+    var c: Array<Int> = []
+    i = 0
+    while i < m * m {
+        a.append(i % 97)
+        b.append(i % 89)
+        c.append(0)
+        i = i + 1
+    }
+    t = Time().now
+    round = 0
+    while round < 20 {
+        check = check + matmul(a: a, b: b, c: c, n: m, k0: round)
+        round = round + 1
+    }
+    report(name: "matmul", ns: Time().now - t)
+
+    t = Time().now
+    round = 0
+    while round < 200 {
+        check = check + sum(a: big, k0: round)
+        round = round + 1
+    }
+    report(name: "sum", ns: Time().now - t)
+
+    t = Time().now
+    round = 0
+    while round < 200 {
+        check = check + count(a: big, threshold: 500000 + round)
+        round = round + 1
+    }
+    report(name: "count", ns: Time().now - t)
+
+    let mask = 65535
+    var table: Array<Int> = []
+    i = 0
+    while i <= mask {
+        table.append(0)
+        i = i + 1
+    }
+    let keys = 40000
+    i = 0
+    while i < keys {
+        var slot = (i * 40503) & mask
+        while table[slot] != 0 {
+            slot = (slot + 1) & mask
+        }
+        table[slot] = i + 1
+        i = i + 1
+    }
+    t = Time().now
+    round = 0
+    while round < 100 {
+        check = check + probe(table: table, mask: mask, keys: keys, k0: round)
+        round = round + 1
+    }
+    report(name: "probe", ns: Time().now - t)
+
+    var runs: Array<Int> = []
+    i = 0
+    while i < 65536 {
+        runs.append(0)
+        i = i + 1
+    }
+    t = Time().now
+    round = 0
+    while round < 50 {
+        check = check + insertion(a: runs, k0: round)
+        round = round + 1
+    }
+    report(name: "insertion", ns: Time().now - t)
+
+    var text = "the quick brown fox jumps over the lazy dog; "
+    while text.count < 1000000 {
+        text = text.concat(text)
+    }
+    var hist: Array<Int> = []
+    i = 0
+    while i < 256 {
+        hist.append(0)
+        i = i + 1
+    }
+    t = Time().now
+    round = 0
+    while round < 50 {
+        check = check + bytes(s: text, hist: hist, k0: round)
+        round = round + 1
+    }
+    report(name: "bytes", ns: Time().now - t)
+
+    let sn = 500
+    var v: Array<Double> = []
+    var out: Array<Double> = []
+    i = 0
+    while i < sn {
+        v.append(1.0)
+        out.append(0.0)
+        i = i + 1
+    }
+    t = Time().now
+    round = 0
+    while round < 10 {
+        check = check + spectral(v: v, out: out, n: sn)
+        round = round + 1
+    }
+    report(name: "spectral", ns: Time().now - t)
+
+    print("checksum ")
+    print(check)
+    print("\n")
+}

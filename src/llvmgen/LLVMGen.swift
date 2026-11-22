@@ -225,10 +225,9 @@ final class LLVMGen {
     let dwUnsignedChar: LLVMDWARFTypeEncoding = 8 // DW_ATE_unsigned_char
     let dwUnsigned: LLVMDWARFTypeEncoding = 7     // DW_ATE_unsigned
 
-    // Runtime-fn declarations + the inert mutator seams (`__nomu_poll`/`__nomu_gc_alloc`/
-    // `__nomu_write_barrier`), cached once each.
+    // Runtime-fn declarations + the inert mutator seams (`__nomu_gc_alloc`/`__nomu_write_barrier`), cached
+    // once each.
     var runtimeFns: [String: (fn: LLVMValueRef, ty: LLVMTypeRef)] = [:]
-    var pollFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var gcAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var allocSlowFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?   // the allocation miss path (`__nomu_alloc_slow`)
     var forwarderFns: [String: (fn: LLVMValueRef, ty: LLVMTypeRef)] = [:]   // the scheduler forwarders
@@ -237,7 +236,6 @@ final class LLVMGen {
     var rawAllocFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var rawAllocUninitializedFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
     var reserveZeroedFn: (fn: LLVMValueRef, ty: LLVMTypeRef)?
-    var stopWorldGlobalCache: LLVMValueRef?
     var intFmt: LLVMValueRef?
     var uintFmt: LLVMValueRef?
     var strFmt: LLVMValueRef?

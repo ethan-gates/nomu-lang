@@ -127,7 +127,9 @@ not close here if other planned work is expected to close it; record the expecta
     load, which delays resolving the `ret`'s misprediction. A prototype where the caller loads the SP early and
     passes the value made `pingpong_fiber` at 1 carrier 0.9 ns a hop faster than 250.8.1 (250.8.2: 0.4).
     `ctx_swap` and the scheduler test fixtures use the pointer form and need updating.
-- **254.5** Fibers left queued on a busy carrier (from [104](104-fiber-stack-strategy.md) 104.5.2). A searcher
+- **254.5** Fibers left queued on a busy carrier (from [104](104-fiber-stack-strategy.md) 104.5.2). **Done** by
+  [235](235-scheduler-run-queues.md).9, which adopted the rule below and measured every scheduler workload with
+  it (no time regression; `fanin_channel` on 8 carriers 23% more CPU). A searcher
   that finds work wakes another only when its own local queue or the global queue still holds work
   (`rtSchedLoop`). Work left in another carrier's local queue gets no searcher, and with no preemption it waits
   until that carrier's fiber parks. Four compute-only tasks started together on 4 carriers ran on about 2: 158 ms
@@ -135,6 +137,11 @@ not close here if other planned work is expected to close it; record the expecta
   searching (`resetspinning`). That rule, tried as an experiment and reverted: the same tasks 84 ms;
   `deep_recursion` at 4 carriers 80 → 44 ms (Go 35). It adds wakes, so it meets 254.3's wake churn; judge it by
   254.3's acceptance (every scheduler benchmark at 1, 2, 4 and 8 carriers, wall and CPU time).
+- **254.6** A fiber contending for a runtime lock holds its carrier (from [270](270-c-calls-as-stops.md)). The
+  runtime's mutexes and channel locks spin, then sleep the carrier in `__ulock_wait`; a sleeping carrier
+  neither acknowledges a stop-the-world nor can be handed off. The wait is short because a lock holder never
+  stops while holding a runtime lock. Parking the contending fiber instead (a fiber-aware lock) frees the
+  carrier; measure contended channel and select workloads first.
 
 ## Refs
 

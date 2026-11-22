@@ -2,7 +2,7 @@
 
 **Avenue:** Usability · **Type/Lifecycle:** `language-feature · shipped (tails open)` · **Size:** M ·
 **Status:** shipped (slices 1+2; inference tail open) · **Source:** surfaced while scoping
-[for … in](117-for-in-iteration.md) and real Array/String — the prerequisite the roadmap never filed as
+[for … in](117-loop-improvements.md) and real Array/String — the prerequisite the roadmap never filed as
 its own task.
 
 ## What
@@ -46,7 +46,7 @@ rejected. So this blocks:
 
 - Real, extensible [Array](120-stdlib-core.md) / [String](121-string-utf8-model.md) as Nomu types (retiring
   the ~64 `.array`/`.string` special-case sites; fixing the String immortal-buffer leak).
-- The **real-iterables** form of [for … in](117-for-in-iteration.md) (a `Sequence`/`Iterator` interface a
+- The **real-iterables** form of [for … in](117-loop-improvements.md) (a `Sequence`/`Iterator` interface a
   generic collection conforms to).
 - The [generic hash map](124-generic-hashmap.md) (a generic value type with methods).
 
@@ -103,7 +103,7 @@ frontend. Recorded here because the "already built" finding is what made this an
   (`genericMemberType`) and the concrete method pipeline (both present).
 - **Blocks:** [120 Array](120-stdlib-core.md), [121 String](121-string-utf8-model.md),
   [124 generic hash map](124-generic-hashmap.md), and the real-iterables form of
-  [117 for … in](117-for-in-iteration.md).
+  [117 for … in](117-loop-improvements.md).
 - **Interacts with:** [118 associated types + where-clauses](118-associated-types.md) (the next layer of
   generics depth); the D6 spill.
 

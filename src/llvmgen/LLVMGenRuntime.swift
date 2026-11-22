@@ -4,7 +4,7 @@ import LLVM_C
 import NomuLLVMPasses
 
 // Runtime/GC-ABI emission (moved into the shared emitter, ssair.md): the function-creation
-// seam, runtime-fn declarations, the inert mutator seams (`__nomu_poll`/`__nomu_gc_alloc`/
+// seam, runtime-fn declarations, the inert mutator seams (the loop poll placeholder/`__nomu_gc_alloc`/
 // `__nomu_write_barrier`), managed allocation + the write-barrier store, and small LLVM helpers
 // (`buildCall`/`structGEP`/`gepByte`/`toUnmanaged`/string literals). Both egresses emit through here.
 extension LLVMGen {
@@ -30,6 +30,10 @@ extension LLVMGen {
     // stay plain (no statepoint). Conservative: mislabeling a GC-triggering call as leaf is unsound.
     static let gcLeafRuntimeFns: Set<String> = [
         "printf",
+        // The runtime's stdout buffer at the program's end (`runtime/io.nomu`): never allocates on the managed
+        // heap, parks or stops.
+        "nomu_fn_nomuOutFlushAtExit",
+        "rtSaveContext",    // stores registers into a block (`rtasm_arm64.s`): no call, no stop
         "memcpy",           // libc block copy — never allocates
         "memset",           // libc fill — never allocates
         "memcmp",           // libc byte compare — never allocates
@@ -241,7 +245,7 @@ extension LLVMGen {
     static let libcViaCarrier: Set<String> = [
         "abort", "clock_gettime_nsec_np", "close", "creat", "dprintf", "exit", "free", "getenv",
         "getpagesize", "kevent", "kqueue", "mach_absolute_time", "mach_timebase_info", "malloc", "mmap",
-        "mprotect", "munmap", "pipe", "poll", "posix_memalign", "printf", "pthread_create",
+        "isatty", "mprotect", "munmap", "pipe", "poll", "posix_memalign", "printf", "pthread_create",
         "pthread_getspecific", "pthread_join", "pthread_key_create", "pthread_setspecific", "pthread_sigmask", "putchar",
         "raise", "read", "sigaction", "sigaltstack", "snprintf", "strlen", "strpbrk", "strtod", "sysconf",
         "sysctlbyname", "write",
@@ -306,8 +310,8 @@ extension LLVMGen {
     // When shaped roots are live across this allocation (task 176), the hit path is emitted here, in the
     // allocating function, instead: a collection can run in the slow call, so the shaped roots must ride
     // that call's `"deopt"` bundle, and the always-inliner drops a bundle on the call it collapses. Emitting
-    // the slow call in place lets RS4GC record the roots on its statepoint, as `emitSafepointPollWithDeopt`
-    // does for the poll.
+    // the slow call in place lets RS4GC record the roots on its statepoint, as the loop poll's placeholder
+    // carries them for the poll.
     func rtAllocManaged(_ bytes: LLVMValueRef) -> LLVMValueRef {
         if pendingDeoptApplies(), let fn = currentFn {
             return emitAllocHitPath(fn, bytes, deoptOps: pendingDeopt!)
@@ -383,69 +387,6 @@ extension LLVMGen {
         sv = LLVMBuildInsertValue(b, sv, w0, 0, "lit0")!
         sv = LLVMBuildInsertValue(b, sv, w1, 1, "lit1")!
         return sv!
-    }
-
-    // The stop-the-world flag the poll tests: the runtime's `rtStopWorld` static-storage block, an `Int` read
-    // by symbol (declared here, defined by the runtime module; the same global when this is that module).
-    func stopWorldGlobal() -> LLVMValueRef {
-        if let g = stopWorldGlobalCache { return g }
-        let g = getOrAddGlobal(i64, Mangle.staticStorage("rtStopWorld", home: []))
-        stopWorldGlobalCache = g
-        return g
-    }
-
-    // The `__nomu_poll` seam: load the stop-world flag; if set, call the (non-leaf) slow path (a
-    // statepoint). `alwaysinline` collapses the fast path into each poll site.
-    func nomuPoll() -> (LLVMValueRef, LLVMTypeRef) {
-        if let p = pollFn { return p }
-        let ty = fnType(voidTy, [])
-        let fn = LLVMAddFunction(mod, "__nomu_poll", ty)!
-        LLVMSetLinkage(fn, LLVMInternalLinkage)
-        addAlwaysInline(fn)   // not `gc-leaf`: the slow path calls a statepoint
-        let flag = stopWorldGlobal()
-        let slow = nomuPollSlow()
-        withStubBody(fn) {
-            let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.slow")
-            let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.cont")
-            let v = LLVMBuildLoad2(b, i64, flag, "stopreq")!
-            LLVMSetVolatile(v, 1)
-            let stop = LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstInt(i64, 0, 0), "stop")
-            LLVMBuildCondBr(b, stop, slowBB, contBB)
-            LLVMPositionBuilderAtEnd(b, slowBB)
-            _ = buildCall(slow.0, slow.1, [])
-            LLVMBuildBr(b, contBB)
-            LLVMPositionBuilderAtEnd(b, contBB)
-            LLVMBuildRetVoid(b)
-        }
-        pollFn = (fn, ty)
-        return pollFn!
-    }
-
-    func emitSafepointPoll() {
-        let p = nomuPoll()
-        _ = buildCall(p.0, p.1, [])
-    }
-
-    // A loop-header poll that records shaped roots (task 176 Stage 4). The poll is inlined at this site —
-    // rather than calling the shared `alwaysinline` `__nomu_poll` — because the always-inliner does not
-    // thread a `"deopt"` operand bundle onto the inlined seam's inner statepoint. Emitting the slow-path
-    // `__nomu_gc_poll_slow` call here, in the Nomu body, lets the bundle ride it directly, so
-    // `rewrite-statepoints-for-gc` records the shaped roots on that statepoint. Fast path is identical to
-    // `__nomu_poll`: a volatile flag load + branch. Leaves the builder at the continuation block.
-    func emitSafepointPollWithDeopt(_ deoptOps: [LLVMValueRef?]) {
-        guard let fn = currentFn else { emitSafepointPoll(); return }
-        let flag = stopWorldGlobal()
-        let slow = nomuPollSlow()
-        let slowBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.slow")
-        let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "poll.cont")
-        let v = LLVMBuildLoad2(b, i64, flag, "stopreq")!
-        LLVMSetVolatile(v, 1)
-        let stop = LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstInt(i64, 0, 0), "stop")
-        LLVMBuildCondBr(b, stop, slowBB, contBB)
-        LLVMPositionBuilderAtEnd(b, slowBB)
-        _ = buildCallWithDeopt(slow.0, slow.1, [], deoptOps)
-        LLVMBuildBr(b, contBB)
-        LLVMPositionBuilderAtEnd(b, contBB)
     }
 
     // The `__nomu_gc_alloc` seam: the allocation hit path, `alwaysinline`, so every allocation site bumps the
@@ -630,6 +571,19 @@ extension LLVMGen {
         return (fn, ty)
     }
 
+    // The stdout buffer's entry points (`runtime/io.nomu`): `__nomu_out_bytes(p, n)`, `__nomu_out_byte(b)`,
+    // `__nomu_out_int(v)`, `__nomu_out_uint(v)`. Each copies or formats into the buffer, then may write it out in C
+    // (task 270), where a collection goes on without waiting: so the call is a stop, through a forwarder that
+    // anchors the caller's frame.
+    func nomuOut(_ name: String, _ params: [LLVMTypeRef]) -> (LLVMValueRef, LLVMTypeRef) {
+        let target = runtimePreludeFn("nomuOut" + name, ret: voidTy, params: [i8ptr] + params + [i8ptr, i64])
+        return schedForwarder("__nomu_out_" + name.lowercased(), ret: voidTy, params: params) { fn, sched, sp, pc in
+            let a = (0..<params.count).map { LLVMGetParam(fn, UInt32($0)) }
+            _ = self.buildCall(target.fn, target.ty, [sched] + a + [sp, pc])
+            return nil
+        }
+    }
+
     // `__nomu_gc_poll_slow()`: the safepoint slow path, called from the inline poll when the stop-the-world
     // flag is set. Parks the fiber at its caller's anchor until the world resumes (`nomuSchedSafepoint`).
     // Not gc-leaf: the call from the poll site is a statepoint.
@@ -707,13 +661,54 @@ extension LLVMGen {
             let contBB = LLVMAppendBasicBlockInContext(ctx, fn, "stk.cont")
             LLVMBuildCondBr(b, short, slowBB, contBB)
             LLVMPositionBuilderAtEnd(b, slowBB)
+            // The room asked for is at least 1, even for an empty buffer: a slow path asked for no room is an
+            // ordinary check, which may stop for a collection, and this call records no shaped values.
             let slow = nomuStackSlow()
-            let call = buildCall(slow.0, slow.1, [size])!
+            let room = LLVMBuildAdd(b, size, LLVMConstInt(i64, 1, 0), "stk.room")!
+            let call = buildCall(slow.0, slow.1, [room])!
             LLVMSetInstructionCallConv(call, LLVMPreserveMostCallConv.rawValue)
             LLVMBuildBr(b, contBB)
             LLVMPositionBuilderAtEnd(b, contBB)
         }
         return markFrameAddress(LLVMBuildArrayAlloca(b, i8, size, name)!)
+    }
+
+    // A loop header's poll, as the placeholder `nomu.loop.poll(slow, offFiber)` (`src/llvmpasses/LoopPolls.cpp`):
+    // the optimizer keeps it in its loop and moves the program's memory operations around it, and the pass
+    // `nomu-expand-loop-polls` turns it into the stack-limit compare and slow-path call after optimization.
+    // `offFiber` is set in the runtime package, whose code also runs on threads with no fiber (startup, the
+    // collector's coordinator, the timer thread), where x28 is 0: its polls test x28 first. It always
+    // carries a `deopt` bundle, the shaped values live at the header or none, so the inliner merges a caller's
+    // recorded values into it (`nomu-bundle-calls` skips `nomu.` calls).
+    func emitLoopPoll(_ deoptOps: [LLVMValueRef?]) {
+        let p = loopPollPlaceholder()
+        var args: [LLVMValueRef?] = [nomuPollSlow().0, LLVMConstInt(LLVMInt1TypeInContext(ctx), isRuntimePackage ? 1 : 0, 0)]
+        if measureNoStatepoints {
+            _ = buildCall(p.0, p.1, args)
+            return
+        }
+        var ops = deoptOps
+        let bundle = ops.withUnsafeMutableBufferPointer { op in
+            "deopt".withCString { LLVMCreateOperandBundle($0, 5, op.baseAddress, UInt32(op.count)) }
+        }
+        var bundles: [LLVMOperandBundleRef?] = [bundle]
+        _ = args.withUnsafeMutableBufferPointer { ap in
+            bundles.withUnsafeMutableBufferPointer { bp in
+                LLVMBuildCallWithOperandBundles(b, p.1, p.0, ap.baseAddress, UInt32(ap.count),
+                                                bp.baseAddress, UInt32(bp.count), "")
+            }
+        }
+        LLVMDisposeOperandBundle(bundle)
+    }
+
+    // `void nomu.loop.poll(ptr slow, i1 offFiber)`, marked to touch only inaccessible memory.
+    private func loopPollPlaceholder() -> (LLVMValueRef, LLVMTypeRef) {
+        let name = "nomu.loop.poll"
+        let ty = fnType(voidTy, [i8ptr, LLVMInt1TypeInContext(ctx)])
+        if let f = LLVMGetNamedFunction(mod, name) { return (f, ty) }
+        let f = LLVMAddFunction(mod, name, ty)!
+        nomuMarkLoopPollPlaceholder(f)
+        return (f, ty)
     }
 
     // `void nomu.stack.check(ptr slow)`, marked to touch only inaccessible memory.
@@ -916,6 +911,30 @@ extension LLVMGen {
         let name = "gc-leaf-function"
         LLVMAddCallSiteAttribute(call, funcAttrIndex, LLVMCreateStringAttribute(ctx, name, UInt32(name.utf8.count), "", 0))
         return call
+    }
+
+    // A managed pointer from the raw address `raw` the runtime held (a fiber routine's environment): the same
+    // register move as `pinnedAddress`, opaque to the optimizer, then `inttoptr` into the managed space, which
+    // the statepoint rewrite takes as a base of its own (an `addrspacecast` there it rejects). From here every
+    // stop records and relocates it.
+    func adoptManaged(_ raw: LLVMValueRef) -> LLVMValueRef {
+        let ty = fnType(i64, [i8ptr])
+        let text = "mov $0, $1"
+        let constraints = "=r,r"
+        let asm = text.withCString { a in
+            constraints.withCString { c in
+                LLVMGetInlineAsm(ty, UnsafeMutablePointer(mutating: a), text.utf8.count,
+                                 UnsafeMutablePointer(mutating: c), constraints.utf8.count,
+                                 1, 0, LLVMInlineAsmDialectATT, 0)
+            }
+        }
+        var args: [LLVMValueRef?] = [raw]
+        let word = args.withUnsafeMutableBufferPointer {
+            LLVMBuildCall2(b, ty, asm, $0.baseAddress, 1, "env.addr")!
+        }
+        let name = "gc-leaf-function"
+        LLVMAddCallSiteAttribute(word, funcAttrIndex, LLVMCreateStringAttribute(ctx, name, UInt32(name.utf8.count), "", 0))
+        return LLVMBuildIntToPtr(b, word, p1, "env")!
     }
 
     // Unmanaged memory (`RawPtr.alloc`, `Ptr<T>.alloc`; `unsafe-memory.md`): `__nomu_raw_alloc(bytes, align)`,

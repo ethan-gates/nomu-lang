@@ -58,7 +58,7 @@ already tracks that reachability, so a `Substring` keeps its parent's buffer ali
   shaped `base` field, GC-scanned there).
 - **Couples with:** [184 Unicode views](184-string-unicode-views.md) (scalar/grapheme-boundary slicing),
   [183 bounds checks](183-precondition-bounds-checks.md) (slice-range validation),
-  [117 `for … in`](117-for-in-iteration.md) (iterating a substring's bytes/scalars).
+  [117 `for … in`](117-loop-improvements.md) (iterating a substring's bytes/scalars).
 - **Rests on:** the tracing GC keeping the referenced parent buffer alive — no lifetimes, no refcount.
 
 ## Refs

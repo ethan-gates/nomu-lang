@@ -14,49 +14,56 @@ enum EgressBuiltins {
 
     static func emitPrint(_ g: SSAIRToLLVM, _ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
         guard let arg = args.first else { g.e.fail("7.2.3: print expects one argument", span); return nil }
+        // Into the runtime's stdout buffer (`runtime/io.nomu`, tasks 271, 270) through its forwarders, each a stop
+        // (`nomuOut`): an integer formatted there, a `String`'s bytes copied there, a `Double` formatted into this
+        // frame and copied.
         let value = g.val(arg)
-        let (fn, pty) = g.e.runtimeFn("printf", ret: g.e.i32, params: [g.e.i8ptr], varArg: true)
+        let outInt = g.e.nomuOut("Int", [g.e.i64])
         switch arg.type {
         case .int:
-            return g.e.buildCall(fn, pty, [g.e.intFormat(), value])
+            return g.e.buildCall(outInt.0, outInt.1, [value])
         case .double:
             let (pf, pfty) = printDoubleFn(g.e)
-            let call = g.e.buildCall(pf, pfty, [value])!
-            g.e.markCallGCLeaf(call)
-            return call
+            let buf = g.e.entryAlloca(LLVMArrayType2(g.e.i8, 32)!, "print.double")
+            let len = g.e.buildCall(pf, pfty, [value, buf])!
+            g.e.markCallGCLeaf(len)
+            let outBytes = g.e.nomuOut("Bytes", [g.e.i8ptr, g.e.i64])
+            return g.e.buildCall(outBytes.0, outBytes.1, [buf, len])
         case .uint8:
-            return g.e.buildCall(fn, pty, [g.e.intFormat(), LLVMBuildZExt(g.b, value, g.e.i64, "u82i")])
+            return g.e.buildCall(outInt.0, outInt.1, [LLVMBuildZExt(g.b, value, g.e.i64, "u82i")])
         case .uint64:
-            return g.e.buildCall(fn, pty, [g.e.uintFormat(), value])
+            let outUInt = g.e.nomuOut("UInt", [g.e.i64])
+            return g.e.buildCall(outUInt.0, outUInt.1, [value])
         case .bool:
-            return g.e.buildCall(fn, pty, [g.e.intFormat(), LLVMBuildZExt(g.b, value, g.e.i64, "b2i")])
+            return g.e.buildCall(outInt.0, outInt.1, [LLVMBuildZExt(g.b, value, g.e.i64, "b2i")])
         case .stringBase:
-            // Print the UTF-8 bytes through `%.*s`, reading the tag-aware address and byte count off the
-            // bit-stealing layout — the same two StringBase ops the byte layer uses (task 121).
-            let data = g.strPtr(value)
-            let len32 = LLVMBuildTrunc(g.b, g.strLen(value), g.e.i32, "len32")
-            return g.e.buildCall(fn, pty, [g.e.strFormat(), len32, data])
+            // The UTF-8 bytes, at the tag-aware address and byte count off the bit-stealing layout — the same two
+            // StringBase ops the byte layer uses (task 121). Copied before the runtime can write or stop.
+            let outBytes = g.e.nomuOut("Bytes", [g.e.i8ptr, g.e.i64])
+            return g.e.buildCall(outBytes.0, outBytes.1, [g.strPtr(value), g.strLen(value)])
         default:
             g.e.fail("7.2.3: print supports Int, UInt8, Double, Bool, or String", span); return nil
         }
     }
 
-    // putByte(b): write one raw byte to stdout via libc `putchar`. Output is libc-buffered (block- or
-    // line-buffered) and flushed on normal program exit; no explicit flush primitive is exposed.
+    // putByte(b): one raw byte into the runtime's stdout buffer, in order with `print` (`runtime/io.nomu`):
+    // line-buffered on a terminal, else written when full and at exit; no explicit flush primitive is exposed.
     static func emitPutByte(_ g: SSAIRToLLVM, _ args: [SSAValue], _ span: Span) -> LLVMValueRef? {
         guard let arg = args.first else { g.e.fail("putByte expects one argument", span); return nil }
-        let (fn, fty) = g.e.runtimeFn("putchar", ret: g.e.i32, params: [g.e.i32], varArg: false)
-        let c = LLVMBuildZExt(g.b, g.val(arg), g.e.i32, "byte")
-        return g.e.buildCall(fn, fty, [c])
+        let out = g.e.nomuOut("Byte", [g.e.i64])
+        let c = LLVMBuildZExt(g.b, g.val(arg), g.e.i64, "byte")
+        return g.e.buildCall(out.0, out.1, [c])
     }
 
     // `__nomu_print_double(x)`, built once per module: print a Double with the fewest significant digits
     // that read back to the same value, always with a decimal point (`42.0`, never `42`), then a newline.
     // `snprintf("%.*g")` at precision 1, 2, … until `strtod` returns `x` (17 always does); `.0` is appended
-    // when the result has no '.', exponent, or inf/nan letter; out through `printf`, as every `print` is.
+    // when the result has no '.', exponent, or inf/nan letter, then the newline; into the caller's 32-byte `buf`,
+    // returning the length, for the caller to print through the stdout buffer. `snprintf` only formats, never
+    // blocks: a leaf.
     // Shortest round-trip formatting in Nomu is task 227. No GC strategy: it never allocates or parks.
     static func printDoubleFn(_ e: LLVMGen) -> (LLVMValueRef, LLVMTypeRef) {
-        let ty = e.fnType(e.voidTy, [e.f64])
+        let ty = e.fnType(e.i64, [e.f64, e.i8ptr])
         if let f = LLVMGetNamedFunction(e.mod, "__nomu_print_double") { return (f, ty) }
         let b = e.b
         let fn = LLVMAddFunction(e.mod, "__nomu_print_double", ty)!
@@ -66,14 +73,11 @@ enum EgressBuiltins {
         let strtod = e.runtimeFn("strtod", ret: e.f64, params: [e.i8ptr, e.i8ptr], varArg: false)
         let strpbrk = e.runtimeFn("strpbrk", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr], varArg: false)
         let strlen = e.runtimeFn("strlen", ret: e.i64, params: [e.i8ptr], varArg: false)
-        let printf = e.runtimeFn("printf", ret: i32, params: [e.i8ptr], varArg: true)
         e.withStubBody(fn) {
             let x = LLVMGetParam(fn, 0)!
-            let bufTy = LLVMArrayType2(e.i8, 32)!
-            let buf = LLVMBuildAlloca(b, bufTy, "buf")!
+            let buf = LLVMGetParam(fn, 1)!
             let gFmt = LLVMBuildGlobalStringPtr(b, "%.*g", "fmt_g")!
             let marks = LLVMBuildGlobalStringPtr(b, ".eEnN", "fmt_g_marks")!
-            let line = LLVMBuildGlobalStringPtr(b, "%s\n", "fmt_line")!
             let entry = LLVMGetInsertBlock(b)!
             let loop = LLVMAppendBasicBlockInContext(e.ctx, fn, "prec.try")!
             let next = LLVMAppendBasicBlockInContext(e.ctx, fn, "prec.next")!
@@ -118,8 +122,9 @@ enum EgressBuiltins {
             LLVMBuildBr(b, out)
 
             LLVMPositionBuilderAtEnd(b, out)
-            _ = e.buildCall(printf.0, printf.1, [line, buf])
-            LLVMBuildRetVoid(b)
+            let len = e.buildCall(strlen.0, strlen.1, [buf])!
+            LLVMBuildStore(b, LLVMConstInt(e.i8, 10, 0), e.gepByte(buf, len))   // '\n', in the buffer's room
+            LLVMBuildRet(b, LLVMBuildAdd(b, len, LLVMConstInt(e.i64, 1, 0), "len.nl")!)
         }
         return (fn, ty)
     }

@@ -724,9 +724,11 @@ final class SSAIRToLLVM {
     }
 
     // The loop-header safepoint poll, recording the shaped values live at the header as shaped roots on the
-    // poll's statepoint (task 176). A header with no live homed shaped value emits the plain poll.
+    // poll's statepoint (task 176). Emitted as the loop poll placeholder, expanded after optimization
+    // (`emitLoopPoll`, `src/llvmpasses/LoopPolls.cpp`).
     // The function-entry stack check, recording the shaped values live into the entry block (their homes
-    // are set up for it in `setUpShapedHomes`).
+    // are set up for it in `setUpShapedHomes`). The check can stop for a collection (task 236.4); what it records
+    // is exact at the entry, and `nomu-expand-stack-checks` moves it only past values a stop describes.
     private func emitEntryStackCheck(_ blockId: Int) {
         let ops = shapedDeoptOps(homed: shapedLive?.liveInBlock[blockId] ?? [],
                                  slots: slotRoot.roots(shapedSlotLive?.liveInBlock[blockId] ?? []))
@@ -737,8 +739,7 @@ final class SSAIRToLLVM {
         if e.measureNoLoopPolls { return }
         let ops = shapedDeoptOps(homed: shapedLive?.liveInBlock[blockId] ?? [],
                                  slots: slotRoot.roots(shapedSlotLive?.liveInBlock[blockId] ?? []))
-        if ops.isEmpty { e.emitSafepointPoll(); return }
-        e.emitSafepointPollWithDeopt(ops)
+        e.emitLoopPoll(ops)
     }
 
     // MARK: - Entry
@@ -1262,6 +1263,13 @@ final class SSAIRToLLVM {
             if let st = selfType, byPointer, e.classMap[st] == nil, e.actorMap[st] == nil,
                let p = f.params.first, let v = values[p.id] {
                 values[p.id] = e.markFrameAddress(v)
+            }
+            // A fiber routine's environment arrives as the raw pointer the runtime held (its parameter is
+            // addrspace(0), below). It becomes a managed pointer here, first in the entry, so the entry's stack
+            // check and every later stop record and relocate it: a collection may move it before its captures
+            // are read.
+            if f.name.hasPrefix("fiber:"), let p = f.params.first, let raw = values[p.id] {
+                values[p.id] = e.adoptManaged(raw)
             }
             if f.closureOf != nil {
                 // Every argument arrives by address: a buffer-held one is used as its buffer, any other loaded here.
@@ -3039,6 +3047,9 @@ final class SSAIRToLLVM {
             let nev = LLVMBuildTrunc(b, val(args[4]), e.i32, "nev")
             let r = e.buildCall(fn, fty, [kq, val(args[1]), nch, val(args[3]), nev, LLVMConstNull(e.i8ptr)])
             return LLVMBuildSExt(b, r!, e.i64, "kevent.r")
+        case "__sysIsatty":
+            let (fn, fty) = e.runtimeFn("isatty", ret: e.i32, params: [e.i32], varArg: false)
+            return LLVMBuildSExt(b, e.buildCall(fn, fty, [LLVMBuildTrunc(b, val(args[0]), e.i32, "tty.fd")])!, e.i64, "tty.r")
         case "__sysPipe":
             let (fn, fty) = e.runtimeFn("pipe", ret: e.i32, params: [e.i8ptr], varArg: false)
             return LLVMBuildSExt(b, e.buildCall(fn, fty, [val(args[0])])!, e.i64, "pipe.r")
@@ -3128,6 +3139,10 @@ final class SSAIRToLLVM {
             return LLVMBuildSExt(b, r!, e.i64, "raise.r")
         // Asm-floor context switch (task 128.2): rtSwitch(from, to, message), returning the message the switch
         // that resumes this context passes.
+        case "__sysSaveContext":
+            let (fn, fty) = e.runtimeFn("rtSaveContext", ret: e.voidTy, params: [e.i8ptr], varArg: false)
+            _ = e.buildCall(fn, fty, [val(args[0])])
+            return LLVMConstInt(e.i64, 0, 0)
         case "__sysCtxSwitch":
             let (fn, fty) = e.runtimeFn("rtSwitch", ret: e.i8ptr, params: [e.i8ptr, e.i8ptr, e.i8ptr], varArg: false)
             // An Int message is a number in the register, never dereferenced: the asm boundary is the one place
@@ -3157,6 +3172,9 @@ final class SSAIRToLLVM {
             let r = e.buildCall(fn, fty, [val(args[0]), LLVMConstNull(e.i8ptr), start, rec])
             return LLVMBuildSExt(b, r!, e.i64, "thread.create.r")
         case "__sysExit":
+            // The runtime's stdout buffer goes out first, as `exit` flushes libc's (`runtime/io.nomu`).
+            let flush = e.runtimePreludeFn("nomuOutFlushAtExit", ret: e.voidTy, params: [])
+            _ = e.buildCall(flush.fn, flush.ty, [])
             let (fn, fty) = e.runtimeFn("exit", ret: e.voidTy, params: [e.i32], varArg: false)
             return e.buildCall(fn, fty, [LLVMBuildTrunc(b, val(args[0]), e.i32, "exit.code")])
         case "__sysThreadJoin":
@@ -3280,7 +3298,10 @@ final class SSAIRToLLVM {
             LLVMSetAlignment(st, 4)
             return LLVMConstInt(e.i64, 0, 0)
         case "__sysFatal":
-            // write(2, text, len); abort(). Both gc-leaf libc calls.
+            // The runtime's stdout buffer out (what the program printed), then write(2, text, len); abort().
+            // All gc-leaf.
+            let flush = e.runtimePreludeFn("nomuOutFlushAtExit", ret: e.voidTy, params: [])
+            _ = e.buildCall(flush.fn, flush.ty, [])
             let text = val(args[0])
             let (wfn, wty) = e.runtimeFn("write", ret: e.i64, params: [e.i32, e.i8ptr, e.i64], varArg: false)
             _ = e.buildCall(wfn, wty, [LLVMConstInt(e.i32, 2, 0), strPtr(text), strLen(text)])

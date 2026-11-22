@@ -58,7 +58,7 @@ The IR is designed so all four compose (see ordering), rather than as four indep
 
 ## Lowering out to LLVM
 
-`LLVMGen` is the shared GC-ABI emitter (address spaces, the `__nomu_gc_alloc`/`__nomu_write_barrier`/`__nomu_poll` hooks, object/witness/any-box layout, the `gc "statepoint-example"` attribute, calls); `SSAIRToLLVM` is a CFG-walk egress that holds one `LLVMGen` and lowers through its primitives — the only egress since M7.7. The mapping is close to mechanical: blocks → LLVM basic blocks, SSA values → LLVM values, block args → LLVM φ, the `alloc`/`store`/barrier/dispatch ops → the emitted forms. Because SSAIR values are already SSA (no alloca-per-scalar-local), the statepoint rewrite sees SSA-valued GC pointers directly — the mem2reg-before-statepoint dependency is gone for scalars. Statepoint insertion stays **late** (post-opt, at the LLVM level, `backend.md`).
+`LLVMGen` is the shared GC-ABI emitter (address spaces, the `__nomu_gc_alloc`/`__nomu_write_barrier` hooks and the loop poll placeholder, object/witness/any-box layout, the `gc "statepoint-example"` attribute, calls); `SSAIRToLLVM` is a CFG-walk egress that holds one `LLVMGen` and lowers through its primitives — the only egress since M7.7. The mapping is close to mechanical: blocks → LLVM basic blocks, SSA values → LLVM values, block args → LLVM φ, the `alloc`/`store`/barrier/dispatch ops → the emitted forms. Because SSAIR values are already SSA (no alloca-per-scalar-local), the statepoint rewrite sees SSA-valued GC pointers directly — the mem2reg-before-statepoint dependency is gone for scalars. Statepoint insertion stays **late** (post-opt, at the LLVM level, `backend.md`).
 
 ## GC-precision invariants (the tier's soundness contract)
 

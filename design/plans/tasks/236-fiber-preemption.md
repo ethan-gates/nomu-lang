@@ -1,7 +1,7 @@
 # Fiber preemption: a running fiber keeps its carrier until it parks
 
 **Avenue:** Risk (the "better than Go" concurrency thesis) · **Type/Lifecycle:** `runtime · issue defined`
-· **Size:** M–L · **Status:** 236.1 done (baselines below); 236.2 (245) next · **Source:** [234](234-scheduler-wake-and-pool.md).3's
+· **Size:** M–L · **Status:** done; time to stop in large copies and stack moves is a recorded limit (236.10) · **Source:** [234](234-scheduler-wake-and-pool.md).3's
 workloads
 
 ## Observed
@@ -90,29 +90,170 @@ running fiber's record (`[x28+40]`, `emitStackCheck`); the loop poll reads a glo
     through `runtime/metrics`).
   - **236.1.3** G5: a server workload on simulated I/O, fibers woken by timers or pipes standing in for
     requests; deterministic, so it is also a test fixture.
-- **236.2 Strip mining: task [245](245-loop-strip-mining.md).** Its kernel set first, then the transformation.
+- **236.2 Strip mining: task [245](245-loop-strip-mining.md).** **Done:** counted loops at the no-poll speed;
+  loops that keep a bounds check moved to [117](117-loop-improvements.md).2. Its kernel set first, then the transformation.
   After 236.1, so the baselines are taken before loops stop differently; before 236.3, which checks the poll's
   new form on the kernel set. Carries G3.
-- **236.3 One request word.** The request word is the running fiber's stack limit: a stop-the-world or a
-  preemption poisons it, as Go does its stack guard, and switching a fiber in restores it. The loop poll
-  becomes the entry check's compare (SP against the limit, one load through x28), and `rtStopWorld` goes.
-  Poll cost checked on 245's kernel set.
-- **236.4 Stops at function entry.** The entry check's slow path tells an overflow from a request and parks
-  on a request; a frame-split wrapper (a nonzero `need`) skips the stop (notes from 252). Closes the
-  stop-the-world gap in recursion and straight-line code; G2 re-measured.
-- **236.5 The monitor and preemption.** An adaptive monitor thread. Each carrier counts its switches; a count
-  unchanged across two ticks means a fiber has run past its slice, as Go's `sysmon` sees it, with no clock
-  read on the switch path. It preempts only when that carrier has queued work, and the preempted fiber goes
-  to the global queue. 254.3's deferred wake checked against it; G1 re-measured.
-- **236.6 Calls into C as stops: task [270](270-c-calls-as-stops.md).** The in-C record, collection without
-  waiting, carrier handoff, the eager syscall offload retired. Needs 236.3 and 236.5. Carries G2's C-call
-  part and G4.
-- **236.7 The runtime's own code.** A stress test that stops the world while fibers are in runtime loops,
-  holding G2 under the rule that those loops stay short. Any time after 236.4.
-- **236.8 Verify and fold.** G1–G5 against 236.1's baselines. The design folds into `runtime.md` §6 and
-  `concurrency.md`.
+- **236.3 One request word.** **Done.** The request word is the running fiber's stack limit: a stop-the-world
+  writes all ones there, as Go does its stack guard; the coordinator raises the stop flag, then each carrier's
+  running fiber's limit, and a carrier switching a fiber in restores its limit, publishes it, then reads the
+  flag (`rtSchedArm`), so one of them always sees the other. The loop poll loads the limit through x28 and
+  compares it with all ones (a loop needs no SP test: a stack overflows at an entry); `rtStopWorld` stays as the
+  flag the slow paths read, and codegen no longer reads it. The slow paths restore the limit before reading the
+  flag, so a raise left on a fiber that parked first clears itself. Runtime-package polls test x28 for 0 first,
+  since that code also runs with no fiber. Measured: time to stop in loops unchanged (p99 14 / 15 / 35 µs at 2
+  / 4 / 8 carriers); the kernel set within run-to-run noise except `probe`, about 10% slower (its loops run a few
+  iterations, and the poll is now four instructions, a copy of x28 among them, against the old two). Until
+  236.4, a fiber in recursion takes the entry check's slow path at every call while a stop is pending: its time
+  to stop rose from 0.8 to 1.7 ms at p99.
+- **236.4 Stops at function entry.** **Done.** The entry check's slow path parks for a pending stop-the-world
+  when its `need` is 0, as a loop poll does; a frame-split wrapper's check and a runtime-sized buffer's (which
+  now asks for at least 1) raise the limit again for the next stop. Time to stop in recursion with no loop: p99
+  14 / 37 / 75 µs at 2 / 4 / 8 carriers, from 0.8–1.7 ms. Suite case `stw-recursion`. Five places had relied on
+  the check never collecting, each found by the suite:
+  - **The carrier armed a fiber before moving its stack** (236.3's bug): the move reset the limit and dropped a
+    request raised meanwhile. Arming is now last before each switch.
+  - **A large argument forwarded past the check** (`LargeValues.cpp`): a call reached with no stop since entry
+    passed on the pointer its argument arrived in, so the values sat in an unrecorded slot across the check. Only
+    a frame-split wrapper, whose check never stops, forwards now.
+  - **The check moved past values a stop does not describe** (`StackChecks.cpp`): after optimization the check
+    moves to just before the function's first call, past a raw managed address (`pinnedAddress`), a shaped
+    value's words or a store. It now moves only past instructions whose results a stop describes (comparisons,
+    arithmetic, address offsets, loads of managed pointers); otherwise it stays at the entry.
+  - **A fiber routine's environment arrived raw** (`SSAIRToLLVM`): its captures were read off an untracked
+    pointer, safe only while nothing could collect before they were read. It becomes a managed pointer first in
+    the entry (`adoptManaged`).
+  - **The stack-move stress mode's limit** was the request value, so every loop poll took its slow path (the
+    `stack-move-checks` cases went from 2 s to 900 s): the stress mode now uses all ones but the last bit.
+- **236.5 The monitor and preemption.** **Done.** A monitor thread (`rtSchedMonitorMain`) looks at every carrier
+  each tick: the same fiber running with no switch since the last tick (the carrier's switch count, rec+200,
+  unchanged; no clock read on the switch path) has run at least one period, a quarter of the slice. If work
+  waits there (its run queue or slot, or the global queue) it names the fiber as the carrier's target (rec+208)
+  and raises the fiber's limit; with a carrier asleep it wakes one instead. The period stays at its shortest while
+  a carrier runs one fiber across a tick or has work waiting behind it, backs off to 1 ms while carriers run only
+  short bursts, and to 10 ms while none runs a fiber (a first version reset it whenever a fiber ran, and
+  `idle_fiber` spent 23–34% more CPU). At its next loop poll or ordinary entry check the fiber restores its limit, stops for a
+  pending stop-the-world first, and otherwise, as its carrier's target, switches back ready holding the
+  scheduler lock; the carrier puts it on the global queue before releasing the lock. `NOMU_PREEMPT=0` turns it
+  off. 254.3's deferred wake was set aside before this task and is not in the code, so there is nothing to check
+  against it. Suite case `preempt-spin`: spinners in a call-free loop and in loop-free recursion hold every
+  carrier, and the fiber that ends them runs only through preemption.
+  G1 and G5 (`tools/schedbench.py`, median of 5): `producer_fiber` on one carrier, the readied consumer's wait
+  p50 / p99 / max 0.46 / 0.92 / 1.05 ms, from 402 ms; `server_sim` with heavy requests, light p99 0.66 ms on one
+  carrier (from 14.7 ms) and 0.52 ms on two (from 2.1 ms), against 0.46 and 0.26 ms light-only; the one-carrier
+  heavy run ends in 692 ms, from 1,178. `mixed_fiber` is unchanged: preemption shares the carrier fairly, so the
+  handing pair still waits its turn behind 256 compute fibers; its end is bound by the compute.
+  Against `NOMU_PREEMPT=0`, every scheduler workload at 1–8 carriers: within run-to-run noise (the actor fan-out
+  and pipeline swing both ways, as before), `idle_fiber`'s CPU within noise (−13% to +11%), and the latency
+  workloads better.
+- **236.6 Print through a runtime buffer: task [271](271-print-without-printf.md).** **Done** (`print_loop`
+  277 → 34 ms). `print` copies into a
+  stdout buffer the runtime owns and flushes it with `write`, so the one call that can block is not variadic and
+  holds no managed memory: what 236.7 needs to make it a stop.
+- **236.7 Calls into C as stops: task [270](270-c-calls-as-stops.md).** **Done:** a collection beside a `print`
+  blocked 2 s in `write` takes 1–3 ms (was 1.95 s); a carrier blocked in C is handed off to a spare, so two
+  compute fibers on two carriers finish in 423 ms beside it (785 without). Carries G2's C-call part and G4.
+- **236.8 The runtime's own code.** **Done.** `benchmarks/stop_latency` gained modes 2–6, which keep busy fibers in
+  runtime code (small-object allocation, arrays grown by append, fresh fibers recursing deep, a channel
+  ping-pong, small prints), and its Go counterpart the same; `tools/stopbench.py` runs both (`--depth` sets
+  mode 4's recursion). Time to stop is below Go's in every mode but arrays grown by append, where the two are
+  even (both wait out the same copy), so G2 holds (results below). Two modes pass the 100 µs ceiling, in Go too:
+  large copies and deep stacks, whose cost grows with the data.
+  - **Allocation, channels and print** stay within 6–34 µs at p99, as the call-free loops do: their runtime loops
+    are short (a hole scan is at most one block's 128 lines, a refill zeroes at most one 32 KiB block).
+  - **Arrays grown by append** (mode 3): p99 108 / 196 / 566 µs at 2 / 4 / 8 carriers against Go's 66 / 229 /
+    524; an earlier run had 60 / 227 / 463 against 82 / 262 / 655. The growth copy is a `memcpy` from compiled code, a plain call into C with no stop, so a stop waits
+    out the copy (4 MB at the last doubling here).
+  - **Deep stacks** (mode 4): p99 0.6–0.8 ms at 100,000 frames (Go 1.6–1.8), 2.8–3.1 ms at 300,000, 3.9–5.8 ms at
+    1,000,000, against Go's 5.2–7.3 and 12.6–14.7 ms at the larger two. Two parts: the stack move, runtime code that
+    copies the used stack and walks every frame with no stop (1,755 moves averaging 480 µs at 300,000 frames,
+    `NOMU_STACK_STATS=1`); and the return path, where unwinding meets no entry check or poll (p99 1.3 ms at
+    300,000 frames with stacks started at 64 MiB, so nothing moves). Go's stack copy is not preemptible either.
+  - **Found: a fiber stopped by frequent collections was never preempted.** Resuming a fiber after a
+    stop-the-world or a stack move went through `rtSchedArm`, which counts a switch and clears the monitor's
+    target, so the monitor saw a fresh run at every tick while collections came faster than it ticked. On one
+    carrier a fiber requesting collections back to back held the carrier forever. A resume within the same run
+    now goes through `rtSchedRearm`, which keeps the count and the target and raises the limit again for either a
+    stop or the target.
+  - Suite case `stw-runtime`: workers in allocation refills, array growth, stack moves and channel handoffs
+    check their results while a requester asks for minor collections back to back, on 1–8 carriers; the
+    compiler before the fix times out on one carrier.
+- **236.9 Verify and fold.** **Done.** G1–G5 against 236.1's baselines (results below): G1, G2, G4 and G5 met; G3
+  met on counted loops, with the misses owned by 117.2, 182 and 236.10. The design is folded into `runtime.md`
+  §2 and §6 and `concurrency.md` §1. `tools/loopbench.py` gained the `no-stops` configuration (no loop polls
+  and no entry checks), G3's bound.
+- **236.10 Left after verifying.** **Done**, with one limit recorded.
+  - **`probe`'s poll: improved, 13% → 7% behind the no-poll build.** Two kinds of redundant poll are dropped
+    (`LoopPolls.cpp`). Strip mining deletes the polls the optimizer left outside every cycle (the copy loop
+    rotation puts in a loop's guard, a peeled or fully unrolled iteration's): each ran once in straight-line code
+    between two stops. The poll expansion deletes a loop header's poll when another poll it keeps dominates
+    every latch, as a strip-mined inner loop's poll does for its outer loop; loops go innermost first, so the
+    poll an outer loop relies on stays. `find`, inlined into `probe`, went from three checks of the request word
+    a call to one beside its entry check. The rest of the gap is the chunk counter on an inner loop that runs
+    one or two iterations. Time to stop unchanged (`tools/stopbench.py` modes 0, 1, 2, 5).
+  - **A normal exit dropped output queued behind a blocked write: fixed.** The exit flush skips the queue when
+    another thread holds a lock (`nomuOutFlushAtExit`), so a crash inside a print cannot hang the exit. A normal
+    end now flushes first with `nomuOutFlushAtEnd` (`rtSchedFinish`), which waits for the locks, as Go's `main`
+    blocks in its own write: with a detached fiber blocked in `write` on a stalled pipe, `main`'s last line came
+    out 3 of 3 runs, against 0 of 3 before. A program whose reader never reads now waits at its end, as Go's
+    does. Not in the suite: it needs a pipe whose reader stalls.
+  - **Time to stop in large copies and stack moves:** a recorded limit (236.8), shared with Go; at or below Go's,
+    so G2 holds. Taken up only if a workload needs it. The candidates, each with its cost:
+    - **Chunked growth copies** with a poll between chunks. A collection mid-copy finds the new buffer holding
+      copied young references the copy wrote with no barrier, so the collector would have to treat it as
+      remembered or the copy would need barriers.
+    - **A stop before a stack move** when one is pending, at an ordinary check (`need` 0; a wrapper's check
+      cannot stop). Helps only a request that arrives before the move starts; most of the wait is a move
+      already under way.
+    - **An abortable move:** checks the request during the frame walk, drops the new stack and starts over
+      after the stop. Collections more frequent than a move would starve it, so it needs a rule such as
+      finishing on the second try.
 
-Phases run in number order. 236.2 and 236.6 are tasks of their own, done as phases of this one.
+Phases run in number order. 236.2, 236.6 and 236.7 are tasks of their own, done as phases of this one.
+
+### 236.9 results: the goals against the baselines
+
+Release build, the same machine as 236.1, median of 5 (`tools/schedbench.py`) or 3 (`tools/stopbench.py`);
+`tools/loopbench.py` median of 7.
+
+**G1, wait behind compute: met.** `producer_fiber` on one carrier, the readied consumer's wait p50 / p99 / max
+0.46 / 0.92 / 1.05 ms, from 402 ms (`NOMU_PREEMPT=0`: 336 ms); misses 14,802 of 20,000, from 19,992. With
+carriers to spare the wait stays 5 / 8 / 14–41 µs. `mixed_fiber` is unchanged (pair 63 / 35 / 21 / 19 ms at
+1 / 2 / 4 / 8 carriers): preemption shares the carrier fairly, so the pair waits its turn behind the compute,
+and its end is bound by the compute (59 / 31 / 16 / 8 ms).
+
+**G2, time to stop: met.** At or below Go in every mode at p99, µs (2 / 4 / 8 carriers):
+
+| | Nomu | Go 1.27 | 236.1's Nomu |
+|---|---|---|---|
+| call-free loops | 13 / 14 / 38 | 12 / 33 / 131 | 18 / 32 / 37 |
+| recursion, no loop | 13 / 16 / 33 | 25 / 57 / 164 | 810 / 777 / 843 |
+
+Runtime code (236.8): below Go except arrays grown by append, where the two are even; large copies and deep
+stacks pass 100 µs in both. A fiber in a blocked call into C: a collection beside a `print` blocked 2 s in
+`write` finishes in 0.27–0.92 ms (1.95 s before 236.7).
+
+**G3, polls and stack checks under 3%: met on counted loops.** Each kernel's change with no loop polls, then with
+no polls and no entry checks:
+
+| kernel | ms | no polls | no stops | owner of the gap |
+|---|---|---|---|---|
+| sum | 15.5 | −0.4% | −0.9% | |
+| count | 15.3 | −0.4% | +0.2% | |
+| spectral | 3.2 | +0.3% | +1.7% | |
+| sieve | 69.6 | −13.2% | −13.1% | 117.2 (bounds check) |
+| matmul | 49.5 | −21.9% | −23.3% | 117.2 |
+| insertion | 41.8 | −16.4% | −19.4% | 117.2 |
+| probe | 6.0 | −13.1% | −12.9% | 236.10 (now −7%) |
+| bytes | 134.2 | −0.9% | −10.1% | 182 (entry checks in uninlined cross-module calls) |
+
+**G4, a fiber blocked in C gives up its carrier: met.** Two carriers, one fiber blocked in `print`'s write on a
+stalled pipe, two fibers computing: they finish in 338–377 ms, against 635–650 ms with `NOMU_PREEMPT=0`. The
+per-call cost against a raw call and cgo belongs to compiled code's stub path, in 130.
+
+**G5, tail latency: met on one and two carriers,** where 236.1 judged it. `server_sim` light p99 with heavy
+requests 0.66 / 0.52 ms at 1 / 2 carriers, from 14.7 / 2.1 ms, against 0.46 / 0.26 ms light-only; the
+one-carrier heavy run ends in 683 ms, from 1,178. At 4 and 8 carriers 66 / 57 µs.
 
 ### 236.1 results: the baselines
 
@@ -148,6 +289,30 @@ against `practice/go/stop_latency` and Go's `/sched/pauses/stopping/gc:seconds`;
 In loops, Nomu's polls stop all fibers 2–5× faster than Go's signals at 4 and 8 carriers, and stay under
 P4's 100 µs. In recursion a stop waits out the call in progress (about 0.8 ms here; unbounded in general):
 the gap 236.4 closes. Go's histogram reports bucket upper bounds, so its figures are coarser.
+
+**236.8, time to stop with fibers in runtime code** (`tools/stopbench.py --modes 0,2,3,4,5,6`, median of 3 runs,
+with 236.8's fix; mode 0 for reference; mode 4 at its default 100,000 frames; µs, p50 / p99 / max):
+
+| mode | carriers | Nomu | Go 1.27 |
+|---|---|---|---|
+| 0 call-free loops | 2 | 5 / 11 / 13 | 6 / 12 / 16 |
+| | 4 | 8 / 14 / 15 | 25 / 33 / 197 |
+| | 8 | 19 / 38 / 40 | 82 / 131 / 229 |
+| 2 small objects | 2 | 5 / 11 / 13 | 7 / 12 / 14 |
+| | 4 | 7 / 14 / 19 | 12 / 33 / 197 |
+| | 8 | 15 / 34 / 41 | 33 / 197 / 229 |
+| 3 arrays by append | 2 | 6 / 108 / 116 | 0 / 66 / 229 |
+| | 4 | 12 / 196 / 454 | 14 / 229 / 524 |
+| | 8 | 66 / 566 / 1,682 | 131 / 524 / 786 |
+| 4 deep stacks | 2 | 133 / 570 / 585 | 328 / 1,573 / 1,573 |
+| | 4 | 286 / 743 / 751 | 918 / 1,835 / 1,835 |
+| | 8 | 443 / 767 / 782 | 1,311 / 1,835 / 2,097 |
+| 5 channels | 2 | 2 / 7 / 12 | 7 / 14 / 25 |
+| | 4 | 2 / 6 / 8 | 12 / 29 / 33 |
+| | 8 | 5 / 14 / 21 | 25 / 49 / 57 |
+| 6 print | 2 | 4 / 11 / 16 | 0 / 14 / 16 |
+| | 4 | 9 / 14 / 15 | 8 / 16 / 20 |
+| | 8 | 16 / 25 / 27 | 10 / 25 / 33 |
 
 **G5, tail latency in mixed workloads** (`tools/schedbench.py`, `server_sim`; light requests' latency, from
 release to end; `heavy` makes every 100th request about 20 ms):
@@ -267,7 +432,8 @@ later step and does not change this architecture.
   poll is one load, and the common case is a poll that finds nothing.
 - **Blocking syscalls take the single C-call path.** The eager handoff to an offload carrier before every call
   goes: a syscall that does not block pays nothing, and the monitor hands off the carrier of one that does.
-- **The runtime's own code has no stops,** under the rule that its loops stay short, checked by a stress test.
+- **The runtime's own code has no stops,** under the rule that its loops stay short, checked by a stress test
+  (236.8). The stack move is the exception: it grows with the stack, as Go's copy does.
 - **Strip mining ([245](245-loop-strip-mining.md)) is a prerequisite of this task,** for G3; the one path for
   calls into C is its own task, [270](270-c-calls-as-stops.md), also a prerequisite.
 - **Callbacks from C into Nomu** re-enter while the fiber is marked in C; the marker must nest. Left to
@@ -281,6 +447,7 @@ later step and does not change this architecture.
 
 - Large arguments pass through a frame-split wrapper by pointer, in a slot in an older frame whose references are not
   recorded (`LargeValues.cpp`). That is sound while the stack check's slow path cannot collect. A stop added at the
-  check must skip wrappers, which the slow path can tell by a nonzero `need`, or record those slots.
+  check must skip wrappers, which the slow path can tell by a nonzero `need`, or record those slots. Done in 236.4:
+  wrappers skip the stop, and only wrappers forward an arrived pointer.
 - A return hijack stops a fiber with its result in flight, which the caller's map does not describe: in registers, or
   in the caller's slot for a large result. The stub would need the returning function's result layout.

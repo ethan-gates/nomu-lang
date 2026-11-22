@@ -138,7 +138,7 @@ Performance-first shapes three choices:
   spilling the condition or IV to memory where an `alloca` would block the mem2reg the optimizer
   wants — reuse the existing alloca-per-local pattern and let mem2reg promote it.
 - **Cheap back-edge safepoint.** The per-iteration poll (8.4.2) is the loop's GC tax; it is the
-  inert `__nomu_poll` seam at the loop header, which M6 filled with the branch-on-flag poll
+  loop poll at the loop header (a placeholder strip-mined and expanded in the LLVM pipeline), which M6 filled with the branch-on-flag poll
   (`runtime.md` §6; `backend.md`). Placement: a loop body that already **calls
   or allocates** hits a statepoint each iteration, so its back-edge poll is redundant → elide it
   there; a **call-and-alloc-free** loop reaches no statepoint on its own and **must keep** the poll

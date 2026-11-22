@@ -1,0 +1,72 @@
+import std/time
+
+// Calls into C in loops, with managed references live across each call (task 270.1): what making a call into C
+// a stop costs, when its live references must be spilled and reloaded around it. Each kernel prints
+// `kernel <name> ns <total>`; the program ends with `checksum <n>`.
+//
+//   clock   the clock read 2,000,000 times, a Box's field summed alongside
+//   alloc   raw memory allocated and freed 1,000,000 times, two Boxes' fields summed alongside
+//   print   a short line printed 200,000 times (stdout to a file or a pipe; the results are its `kernel` lines)
+
+class Box {
+    var v: Int
+}
+
+fun clockLoop(a: Box, n: Int) -> Int {
+    var s = 0
+    var i = 0
+    while i < n {
+        s = s + Time().now % 7 + a.v
+        i = i + 1
+    }
+    return s
+}
+
+fun allocLoop(a: Box, b: Box, n: Int) -> Int {
+    var s = 0
+    var i = 0
+    while i < n {
+        let p = RawPtr.alloc(bytes: 64, align: 8)
+        p.store(i, toByteOffset: 0)
+        let x: Int = p.load(fromByteOffset: 0)
+        p.free()
+        s = s + x % 3 + a.v + b.v
+        i = i + 1
+    }
+    return s
+}
+
+fun printLoop(a: Box, n: Int) -> Int {
+    var i = 0
+    var s = 0
+    while i < n {
+        print("x\n")
+        s = s + a.v
+        i = i + 1
+    }
+    return s
+}
+
+fun main() {
+    let a = Box(v: 3)
+    let b = Box(v: 5)
+    var check = 0
+    var t = Time().now
+    check = check + clockLoop(a: a, n: 2000000)
+    let tClock = Time().now - t
+    t = Time().now
+    check = check + allocLoop(a: a, b: b, n: 1000000)
+    let tAlloc = Time().now - t
+    t = Time().now
+    check = check + printLoop(a: a, n: 200000)
+    let tPrint = Time().now - t
+    print("kernel clock ns ")
+    print(tClock)
+    print("\nkernel alloc ns ")
+    print(tAlloc)
+    print("\nkernel print ns ")
+    print(tPrint)
+    print("\nchecksum ")
+    print(check % 1000000)
+    print("\n")
+}

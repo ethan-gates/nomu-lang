@@ -7,7 +7,7 @@
 // stack at its entry (`rtFaultThreadStart`), so a stack overflow is reported too; the stack's first bytes
 // name the thread, and the next are the report's scratch buffer:
 //
-//   [0] kind: 0 main · 1 carrier · 2 timer · 3 GC coordinator · 4 stdin poller
+//   [0] kind: 0 main · 1 carrier · 2 timer · 3 GC coordinator · 4 stdin poller · 5 monitor
 //   [8] index (a carrier's number)
 //   [16, 16 + 1024) the report's text
 //
@@ -122,6 +122,7 @@ fun rtFaultThreadStart(kind: Int, index: Int) {
 // the handler returns, ends the process. SA_RESETHAND alone does not: Darwin, as BSD, leaves the handler in
 // place for SIGILL and SIGTRAP, and the raise then ran the handler again, without end (task 264).
 fun rtFaultHandler(sig: Int, info: RawPtr, uctx: RawPtr) {
+  nomuOutFlushAtExit()                          // what the program printed, before the report (`io.nomu`)
   let signo = Runtime.loadInt32(info, at: 0)
   let alt = Runtime.currentAltStack()
   var kind = -1
@@ -538,6 +539,7 @@ fun rtFaultPutThread(buf: RawPtr, n: Int, kind: Int, index: Int) -> Int {
   if kind == 2 { return n + Runtime.copyLiteral(to: at, "timer") }
   if kind == 3 { return n + Runtime.copyLiteral(to: at, "GC coordinator") }
   if kind == 4 { return n + Runtime.copyLiteral(to: at, "stdin poller") }
+  if kind == 5 { return n + Runtime.copyLiteral(to: at, "monitor") }
   return n + Runtime.copyLiteral(to: at, "unknown (not started by the runtime)")
 }
 

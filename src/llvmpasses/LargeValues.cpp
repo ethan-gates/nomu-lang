@@ -16,7 +16,8 @@
 // slot holds a reference at a stop and the collector does not need to see them. The callee never writes an
 // argument's slot. A call whose result is returned at once passes its own result pointer along, and a call
 // reached with no stop since entry passes on the pointer an argument arrived in, so a wrapper needs no slots.
-// That relies on the stack check's slow path never collecting; preemption at the check must revisit it.
+// An ordinary stack check is a stop (it parks for a stop-the-world, task 236.4), so only a frame-split
+// wrapper, whose check asks for room and never stops, forwards past its check.
 //
 // The rule depends only on the types, so it needs no agreement beyond that: definitions, declarations from
 // other modules, direct and indirect calls and function pointers all follow it.
@@ -190,6 +191,13 @@ ReturnInst *returnedAtOnce(CallInst *CI) {
   return R && CI->hasOneUse() && R->getReturnValue() == CI ? R : nullptr;
 }
 
+// Whether `C` is a stack check that can stop: an ordinary one. A frame-split wrapper's asks for room
+// (`!nomu.stack.need`) and never stops (`nomuSchedStackCheck`).
+bool stoppingStackCheck(const CallInst &C) {
+  const Function *Callee = C.getCalledFunction();
+  return Callee && Callee->getName() == "nomu.stack.check" && !C.getMetadata("nomu.stack.need");
+}
+
 // Whether `CI` is in the entry block with nothing before it that can stop.
 bool noStopSinceEntry(CallInst *CI) {
   BasicBlock &Entry = CI->getFunction()->getEntryBlock();
@@ -198,7 +206,7 @@ bool noStopSinceEntry(CallInst *CI) {
   for (Instruction &I : Entry) {
     if (&I == CI)
       return true;
-    if (auto *C = dyn_cast<CallInst>(&I); C && canStop(*C))
+    if (auto *C = dyn_cast<CallInst>(&I); C && (canStop(*C) || stoppingStackCheck(*C)))
       return false;
   }
   return false;

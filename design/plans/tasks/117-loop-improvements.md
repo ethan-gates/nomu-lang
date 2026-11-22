@@ -1,9 +1,29 @@
-# `for … in` + iteration protocol + ranges
+# Loop improvements: `for … in`, iteration, and loops that keep a bounds check
 
-**Avenue:** Usability · **Type/Lifecycle:** `language-feature · needs-design` · **Size:** M ·
-**Status:** needs-design · **Source:** deferred.md (frontend surface group)
+**Avenue:** Usability · **Type/Lifecycle:** `language-feature · perf · needs-design` · **Size:** M–L ·
+**Status:** needs-design · **Source:** deferred.md (frontend surface group); 117.2 from
+[245](245-loop-strip-mining.md)
 
-## What
+## Phases
+
+- **117.1 `for … in`, ranges and the iteration protocol** (below). Syntax needs agreement.
+- **117.2 Loops that keep a bounds check reload their arrays after strip mining.** A loop whose bounds check
+  stays (a computed index, `a[i * n + k]`; a stride, `m += p`; an exit that depends on data) exits early to the
+  trap, so its loads of an array's count and buffer pointer do not run on every path through an iteration.
+  With loop polls strip-mined, the chunk loop reloads them every iteration; with no polls at all, LLVM keeps
+  them in registers. On `tools/loopbench.py`: `matmul` 22%, `insertion` 20%, `sieve` 10% behind the no-poll
+  build. The experiment that dropped the poll placeholder's `deopt` bundle to test LLVM's
+  invariant-load peeling is void: its build ran with `--verify-cache`, which failed on the changed output and left
+  the previous binary, so peeling is not ruled out (an experiment that changes codegen through the environment
+  needs a fresh `NOMU_CACHE_DIR`). Leads: removing the check itself (range facts for a computed or strided index, in SSAIR or
+  at the LLVM level; [148](148-ssair-optimizer-tier.md).4); marking an array object dereferenceable, so its
+  count and buffer loads can be hoisted without running on every path; strip mining earlier in LLVM's
+  pipeline, before the passes that keep those loads in registers. 117.1 removes the check from loops over a
+  collection or range; computed indices and data-dependent exits keep it.
+- **117.3 Re-measure once 117.1 lands.** Rewrite the kernel set's loops that fit `for … in`
+  (`benchmarks/loop_kernels`) and run `tools/loopbench.py`: those loops should reach the no-poll speed.
+
+## 117.1 · `for … in`
 
 `for x in xs`, range syntax (`0..<n`), and the iterator / sequence interface they lower to.
 

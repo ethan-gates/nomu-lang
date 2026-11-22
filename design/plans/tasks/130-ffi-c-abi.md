@@ -41,6 +41,11 @@ unless reaching it costs too much binary size, other runtime performance, or com
 **Soundness**
 - **F10. FFI keeps the collector correct,** with misuse caught at compile time where possible.
 
+**From [270](270-c-calls-as-stops.md):** the in-C state (`rtEnterC`, `rtExitC`, the coordinator's claim, carrier
+handoff with spare carriers) is built; a call into C from compiled code reaches it through the stub that switches
+to the carrier's stack, as a stop with the in-C record, which lands with the binding surface, and is measured
+against a raw call and cgo then. Callbacks re-enter with the record nested.
+
 **Measured by** a set run against cgo on the same machine: a leaf call, a blocking call, a same-thread
 callback, a foreign-thread callback, a struct by value and by pointer, and cross-compiling a program that uses
 a real C library (SQLite).

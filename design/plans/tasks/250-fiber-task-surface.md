@@ -226,4 +226,4 @@ joins.
 ## Refs
 
 `concurrency.md` §4, §7, §8; [104](104-fiber-stack-strategy.md) 104.3.9; [103](103-dynamic-spawn-group.md);
-[117](117-for-in-iteration.md).
+[117](117-loop-improvements.md).

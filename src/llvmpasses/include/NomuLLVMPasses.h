@@ -17,7 +17,8 @@ void nomuRegisterFrameAddressSplit(void);
 // LLVMRunPasses, with Nomu's IR passes available by name in `pipeline`: `nomu-track-frame-addresses` turns
 // the pointers marked with `nomu.frame.addr` into tracked values (`TrackFrameAddresses.cpp`; run it after
 // optimization and before `rewrite-statepoints-for-gc`), `nomu-drop-frame-addresses` drops the markers
-// instead (measurement only), and `nomu-expand-stack-checks` expands each function's stack-check placeholder
+// instead (measurement only), `nomu-expand-loop-polls` expands each loop poll placeholder into the poll
+// (`LoopPolls.cpp`; after optimization, before the rewrite), and `nomu-expand-stack-checks` expands each function's stack-check placeholder
 // and deletes the copies inlining made (`StackChecks.cpp`; after optimization, before the rewrite), and
 // `nomu-indirect-large-values` passes values too large for registers through explicit
 // pointers (`LargeValues.cpp`; after optimization, before those two), and `nomu-bundle-calls` gives every
@@ -29,6 +30,9 @@ LLVMErrorRef nomuRunPasses(LLVMModuleRef module, const char *pipeline, LLVMTarge
 // Marks the stack-check placeholder `nomu.stack.check` as touching only inaccessible memory, not throwing
 // and always returning (`StackChecks.cpp`).
 void nomuMarkStackCheckPlaceholder(LLVMValueRef function);
+// Marks the loop poll placeholder `nomu.loop.poll` as touching only inaccessible memory, not throwing and
+// always returning (`LoopPolls.cpp`).
+void nomuMarkLoopPollPlaceholder(LLVMValueRef function);
 // Split `function`, whose frame is `need` bytes or less, into a wrapper (its name, checking for `need`
 // bytes below its SP) and an unchecked body (`<name>.frame`). Returns the body.
 LLVMValueRef nomuSplitLargeFrame(LLVMValueRef function, uint64_t need);

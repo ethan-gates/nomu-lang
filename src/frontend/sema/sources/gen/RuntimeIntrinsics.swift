@@ -174,6 +174,12 @@ enum RuntimeIntrinsics {
             return s.ptrIntrinsic("__sysCreat", .int,
                                   [PointerIntrinsics.ptrArg(&s, args[0].value, "Runtime.createFile", "path"),
                                    PointerIntrinsics.intArg(&s, args[1].value, "Runtime.createFile", "mode")], span)
+        // `isatty(fd)`: 1 when `fd` is a terminal, else 0 (the runtime's stdout buffer, `runtime/io.nomu`).
+        case "isTerminal":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["fd"], "Runtime.isTerminal", span) else {
+                return NOIRExpr(type: .error, span: span, kind: .intLit(0))
+            }
+            return s.ptrIntrinsic("__sysIsatty", .int, [PointerIntrinsics.intArg(&s, args[0].value, "Runtime.isTerminal", "fd")], span)
         case "closeFd":
             guard PointerIntrinsics.checkArgLabels(&s, args, ["fd"], "Runtime.closeFd", span) else {
                 return NOIRExpr(type: .error, span: span, kind: .intLit(0))
@@ -378,6 +384,11 @@ enum RuntimeIntrinsics {
         // `to` (rtSwitch), handing it `message` (null when omitted): `to`'s own switch returns it. Returns the
         // message the switch that resumes this context passes. The message is one register: a RawPtr, or an Int
         // the receiver reads back with `toInt()` (a number, never dereferenced). Subset-legal (`__sys`).
+        // Save the callee-saved registers, frame pointer and return address into `regs` (224 bytes), in a
+        // switch's layout, without switching (rtSaveContext; task 270's fiber in C). Subset-legal (`__sys`).
+        case "saveContext":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["regs"], "Runtime.saveContext", span) else { return err(span) }
+            return s.ptrIntrinsic("__sysSaveContext", .void, [PointerIntrinsics.ptrArg(&s, args[0].value, "Runtime.saveContext", "regs")], span)
         case "ctxSwitch":
             let labels: [String?] = args.count == 3 ? ["from", "to", "message"] : ["from", "to"]
             guard PointerIntrinsics.checkArgLabels(&s, args, labels, "Runtime.ctxSwitch", span) else { return err(span) }

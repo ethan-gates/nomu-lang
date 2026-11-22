@@ -23,6 +23,9 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
@@ -44,6 +47,8 @@ using namespace llvm;
 namespace nomu {
 bool expandStackChecks(Module &M);          // StackChecks.cpp
 bool dropInlinedStackChecks(Function &F);   // StackChecks.cpp
+bool expandLoopPolls(Module &M);            // LoopPolls.cpp
+bool stripMineLoops(Function &F, LoopInfo &LI, ScalarEvolution &SE, DominatorTree &DT);   // LoopPolls.cpp
 void indirectLargeValues(Module &M);        // LargeValues.cpp
 bool bundleCalls(Module &M);                // CallBundles.cpp
 bool splitReferenceAggregates(Module &M);   // ReferenceAggregates.cpp
@@ -252,6 +257,23 @@ struct ExpandStackChecksPass : PassInfoMixin<ExpandStackChecksPass> {
   }
 };
 
+// The new-PM pass `nomu-expand-loop-polls` (`LoopPolls.cpp`).
+struct ExpandLoopPollsPass : PassInfoMixin<ExpandLoopPollsPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    return nomu::expandLoopPolls(M) ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  }
+};
+
+// The new-PM pass `nomu-strip-mine-loops` (`LoopPolls.cpp`), at the vectorizer's start.
+struct StripMineLoopsPass : PassInfoMixin<StripMineLoopsPass> {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    return nomu::stripMineLoops(F, FAM.getResult<LoopAnalysis>(F), FAM.getResult<ScalarEvolutionAnalysis>(F),
+                                FAM.getResult<DominatorTreeAnalysis>(F))
+               ? PreservedAnalyses::none()
+               : PreservedAnalyses::all();
+  }
+};
+
 // The new-PM pass `nomu-bundle-calls` (`CallBundles.cpp`).
 struct BundleCallsPass : PassInfoMixin<BundleCallsPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
@@ -303,6 +325,10 @@ extern "C" LLVMErrorRef nomuRunPasses(LLVMModuleRef ModRef, const char *Pipeline
           MPM.addPass(IndirectLargeValuesPass());
           return true;
         }
+        if (Name == "nomu-expand-loop-polls") {
+          MPM.addPass(ExpandLoopPollsPass());
+          return true;
+        }
         if (Name == "nomu-expand-stack-checks") {
           MPM.addPass(ExpandStackChecksPass(&Failed));
           return true;
@@ -311,6 +337,9 @@ extern "C" LLVMErrorRef nomuRunPasses(LLVMModuleRef ModRef, const char *Pipeline
       });
   PB.registerPeepholeEPCallback([](FunctionPassManager &FPM, OptimizationLevel) {
     FPM.addPass(DropInlinedStackChecksPass());
+  });
+  PB.registerVectorizerStartEPCallback([](FunctionPassManager &FPM, OptimizationLevel) {
+    FPM.addPass(StripMineLoopsPass());
   });
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;

@@ -15,6 +15,8 @@
 #include "NomuLLVMPasses.h"
 
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -67,12 +69,79 @@ bool usesStack(const Instruction &I) {
   return true;
 }
 
+// Whether a check moved from `I`'s place to a later point may run after `I`. The check can stop for a collection
+// (task 236.4), and what a stop describes is the managed pointers the statepoint rewrite tracks and the shaped
+// values the check records, which codegen chose at the entry. A value made before the stop and used after it must
+// be one of those or hold no managed address: an integer or float computed from arguments, a comparison, an
+// address offset, a managed pointer loaded. A raw address of a managed object (`pinnedAddress`'s asm, a pointer
+// cast), a shaped value's words (an aggregate, a loaded integer) or a store is not, and keeps the check in place.
+bool passable(const Instruction &I) {
+  if (isa<PHINode>(I) || isa<BranchInst>(I) || isa<SwitchInst>(I) || isa<CmpInst>(I) || isa<BinaryOperator>(I) ||
+      isa<SelectInst>(I) || isa<GetElementPtrInst>(I) || isa<AllocaInst>(I) || isa<FreezeInst>(I) ||
+      isa<UnreachableInst>(I))
+    return true;
+  if (auto *C = dyn_cast<CastInst>(&I))
+    return !isa<PtrToIntInst>(C) && !isa<IntToPtrInst>(C) && !isa<AddrSpaceCastInst>(C) &&
+           !C->getSrcTy()->isPointerTy() && !C->getDestTy()->isPointerTy();
+  if (auto *L = dyn_cast<LoadInst>(&I))
+    return L->getType()->isPointerTy() && L->getType()->getPointerAddressSpace() == 1 && !L->isVolatile();
+  if (auto *CB = dyn_cast<CallBase>(&I)) {
+    if (CB->isInlineAsm())
+      return false;
+    if (isa<DbgInfoIntrinsic>(CB) || CB->isLifetimeStartOrEnd())
+      return true;
+    if (const Function *Callee = CB->getCalledFunction()) {
+      StringRef Name = Callee->getName();
+      if (Name == "nomu.frame.addr" || Name == "llvm.read_register.i64")
+        return true;
+      if (CB->getIntrinsicID() && !CB->mayHaveSideEffects() && !CB->getType()->isPointerTy())
+        return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+// Whether the check `CI` may move to `At`: every instruction on a path from it to `At` is passable.
+bool passable(CallInst *CI, Instruction *At) {
+  BasicBlock *From = CI->getParent(), *To = At->getParent();
+  // The blocks that reach `To`, found backwards, and those `From` reaches, forwards without leaving through `To`.
+  SmallPtrSet<BasicBlock *, 16> Reaches;
+  SmallVector<BasicBlock *, 16> Work{To};
+  while (!Work.empty()) {
+    BasicBlock *B = Work.pop_back_val();
+    if (!Reaches.insert(B).second)
+      continue;
+    for (BasicBlock *P : predecessors(B))
+      Work.push_back(P);
+  }
+  SmallPtrSet<BasicBlock *, 16> Seen;
+  Work.push_back(From);
+  while (!Work.empty()) {
+    BasicBlock *B = Work.pop_back_val();
+    if (!Seen.insert(B).second || !Reaches.count(B))
+      continue;
+    auto I = B == From ? std::next(CI->getIterator()) : B->begin();
+    for (; I != B->end(); ++I) {
+      if (B == To && &*I == At)
+        break;
+      if (!passable(*I))
+        return false;
+    }
+    if (B != To)
+      for (BasicBlock *S : successors(B))
+        Work.push_back(S);
+  }
+  return true;
+}
+
 // Where the check goes: before the function's first call on every path, since the reserve already holds
 // the function's own frame and the check only has to precede what it calls. That is the nearest common
 // dominator of its calls (before the first call there, else at its end), moved out of any loop to the
 // loop's preheader. Paths that call nothing pass no check, so LLVM's shrink-wrapping keeps them free of the
-// prologue too. Returns null when the function calls nothing (it needs no check). A placeholder whose
-// recorded values do not all dominate that point stays where it is.
+// prologue too. Returns null when the function calls nothing (it needs no check). A placeholder whose recorded
+// values do not all dominate that point stays where it is, and so does one that would pass a value a stop does
+// not describe (`passable`).
 Instruction *placement(CallInst *CI, DominatorTree &DT, LoopInfo &LI) {
   Function &F = *CI->getFunction();
   BasicBlock *Common = nullptr;
@@ -100,7 +169,7 @@ Instruction *placement(CallInst *CI, DominatorTree &DT, LoopInfo &LI) {
   for (const Use &Op : CI->operands())
     if (auto *Def = dyn_cast<Instruction>(Op.get()); Def && !DT.dominates(Def, At))
       return CI;
-  return At;
+  return passable(CI, At) ? At : CI;
 }
 
 // The room a check needs below its SP beyond the reserve: a wrapper's `!nomu.stack.need` (the frame of the

@@ -9,9 +9,15 @@ runs of that run's p50, p99 and max, in µs.
 
   mode 0  busy fibers in call-free loops (a poll every iteration)
   mode 1  busy fibers in recursion with no loop and no allocation (a stop waits out the call)
+  modes 2-6 keep the busy fibers in the runtime's own code, which has no stops (task 236.8):
+  mode 2  small objects (TLAB refills, minor collections)
+  mode 3  large arrays built by append (growth copies, large objects)
+  mode 4  a fresh fiber recursing --depth frames (stack moves)
+  mode 5  a channel ping-pong with a partner fiber
+  mode 6  many small prints, stdout to /dev/null
 
 Usage:
-  tools/stopbench.py [--iters N] [--carriers 2,4,8] [--modes 0,1] [--no-go]
+  tools/stopbench.py [--iters N] [--carriers 2,4,8] [--modes 0,1] [--depth N] [--no-go]
 
 Needs the built `nomu` (`bazel build -c opt //src/nomu-cli:nomu`) and, for Go, `go` on PATH.
 """
@@ -49,12 +55,14 @@ def build_go(tmp):
     return out
 
 
-def run_nomu(binary, mode, carriers, tmp):
+def run_nomu(binary, mode, carriers, tmp, depth):
     rep = os.path.join(tmp, "report")
     shutil.rmtree(rep, ignore_errors=True)
     os.makedirs(rep)
-    env = dict(os.environ, NOMU_CARRIERS=str(carriers), STOP_MODE=str(mode), NOMU_GC_REPORT_DIR=rep)
-    r = subprocess.run([binary], env=env, capture_output=True, text=True, timeout=300)
+    env = dict(os.environ, NOMU_CARRIERS=str(carriers), STOP_MODE=str(mode), STOP_DEPTH=str(depth),
+               NOMU_GC_REPORT_DIR=rep)
+    r = subprocess.run([binary], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                       timeout=300)
     if r.returncode != 0:
         return None
     files = [f for f in glob.glob(os.path.join(rep, "*.json")) if not f.endswith(".trace.json")]
@@ -62,10 +70,11 @@ def run_nomu(binary, mode, carriers, tmp):
     return (t["p50"], t["p99"], t["max"])
 
 
-def run_go(binary, mode, carriers):
-    env = dict(os.environ, GOMAXPROCS=str(carriers), STOP_MODE=str(mode))
-    r = subprocess.run([binary], env=env, capture_output=True, text=True, timeout=300)
-    m = re.search(r"stop_us p50 ([\d.]+) p99 ([\d.]+) max ([\d.]+)", r.stdout)
+def run_go(binary, mode, carriers, depth):
+    env = dict(os.environ, GOMAXPROCS=str(carriers), STOP_MODE=str(mode), STOP_DEPTH=str(depth))
+    r = subprocess.run([binary], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                       timeout=300)
+    m = re.search(r"stop_us p50 ([\d.]+) p99 ([\d.]+) max ([\d.]+)", r.stderr)
     return tuple(float(x) for x in m.groups()) if m else None
 
 
@@ -74,6 +83,7 @@ def main():
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--carriers", default="2,4,8")
     ap.add_argument("--modes", default="0,1")
+    ap.add_argument("--depth", type=int, default=100000, help="mode 4's recursion depth")
     ap.add_argument("--no-go", action="store_true")
     a = ap.parse_args()
     carriers = [int(c) for c in a.carriers.split(",")]
@@ -87,8 +97,8 @@ def main():
         for mode in modes:
             for c in carriers:
                 row = f"{'mode ' + str(mode):<10}{c:>9}"
-                for run in ([lambda: run_nomu(nomu, mode, c, tmp)]
-                            + ([] if go is None else [lambda: run_go(go, mode, c)])):
+                for run in ([lambda: run_nomu(nomu, mode, c, tmp, a.depth)]
+                            + ([] if go is None else [lambda: run_go(go, mode, c, a.depth)])):
                     rs = [x for x in (run() for _ in range(a.iters)) if x is not None]
                     if not rs:
                         row += f"{'fail':>10}{'':>16}"
