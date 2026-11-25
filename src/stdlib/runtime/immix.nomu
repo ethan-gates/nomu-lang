@@ -9,13 +9,16 @@
 // (§10.2, Decided), one byte per entry, over the reserved heap range. Entry value 0 is the initial state
 // (block FREE / line unmarked), and `RawPtr.alloc` zero-fills, so the fresh tables start correct.
 //
-// Space descriptor (184 bytes):
+// Space descriptor (200 bytes):
 //   { heapBase: RawPtr @0, numBlocks: Int @8, lineTable: RawPtr @16, blockTable: RawPtr @24,
 //     freeCursor: Int @32, heapBaseInt: Int @40, allocCursor: Int @48, allocLimit: Int @56,
 //     losHead: RawPtr @64, allocBlock: Int @72, allocLine: Int @80, freeList: RawPtr @88,
 //     freeListTop: Int @96, scanBlock: Int @104, defragTable: RawPtr @112, poolLock: Int @120,
 //     nurseryReserve: Int @128, nurseryUsed: Int @136, logbitTable: RawPtr @144, recorder: RawPtr @152,
-//     heapLimit: Int @160, losBytes: Int @168, liveBlocks: Int @176 }.
+//     heapLimit: Int @160, losBytes: Int @168, liveBlocks: Int @176, returnedTable: RawPtr @184,
+//     returnedBlocks: Int @192 }.
+// returnedTable has a byte per block, 1 when the block's pages were returned to the OS (rtHeapReturnFree);
+// returnedBlocks counts them. Every returned block is free and sits at the bottom of the free list.
 // recorder is the collector's recorder (rtRecNew), null unless `gc.record` is on. numBlocks is the
 // reservation: the address range and the side tables cover it, and it bounds every address test.
 // heapLimit (L) is mature space's soft limit in blocks, set after each major (rtHeapResize); the nursery
@@ -82,10 +85,11 @@ fun rtImmixNew(heap: RawPtr, numBlocks: Int, limitBlocks: Int) -> RawPtr {
   let blockTable = rtReserve(numBlocks, 8)
   let freeList = rtReserve(numBlocks * 8, 8)
   let defragTable = rtReserve(numBlocks, 8)
+  let returnedTable = rtReserve(numBlocks, 8)
   // Log-bit side table (150.4.2): one bit per 8-byte region = one byte per 64 heap bytes = 512 bytes per
   // 32 KiB block, plus a word of slack for the top-of-heap boundary index. Zero → all objects logged.
   let logbitTable = rtReserve(numBlocks * 512 + 64, 8)
-  let ctl = RawPtr.alloc(bytes: 184, align: 8)
+  let ctl = RawPtr.alloc(bytes: 200, align: 8)
   ctl.store(heap, toByteOffset: 0)
   ctl.store(numBlocks, toByteOffset: 8)
   ctl.store(lineTable, toByteOffset: 16)
@@ -109,6 +113,8 @@ fun rtImmixNew(heap: RawPtr, numBlocks: Int, limitBlocks: Int) -> RawPtr {
   ctl.store(RawPtr.null, toByteOffset: 152)  // recorder: null unless `gc.record` is on
   ctl.store(0, toByteOffset: 168)            // losBytes
   ctl.store(0, toByteOffset: 176)            // liveBlocks
+  ctl.store(returnedTable, toByteOffset: 184) // blocks whose pages went back to the OS
+  ctl.store(0, toByteOffset: 192)            // returnedBlocks
   rtHeapSetLimit(ctl, limitBlocks)           // heapLimit and the nursery reserve
   if Runtime.gcRecordLevel() > 0 {
     ctl.store(rtRecNew(0), toByteOffset: 152)
@@ -134,13 +140,14 @@ fun rtGenReserve(space: RawPtr) -> Int {
 }
 
 // ---- Heap sizing: the soft limit and the nursery ----
-// Mature space may hold L blocks (heapLimit @160), large objects counted in blocks; the nursery reserve sits
-// on top. After each major L becomes live + (live + stacks) × r, r = NOMU_GC_PERCENT / 100 (Go's GOGC shape;
-// stacks are the fibers' used stack bytes in blocks, rtStackScanBytes), at least the 4 MiB minimum and,
-// with the nursery, at most the reservation. A major runs when mature space
-// reaches L (rtGenCollect, and the large-object path in rtTlabAlloc) or the mutator's blocks run out
-// (rtImmixRefill). The nursery is a quarter of L, clamped to 4–64 MiB: a plain fraction would give a small
-// heap a tiny nursery and a large heap a huge one.
+// After each major the heap may grow to live + (live + stacks) × r blocks, r = NOMU_GC_PERCENT / 100 (Go's GOGC
+// shape; stacks are the fibers' used stack bytes in blocks, rtStackScanBytes), within the reservation. That
+// allowance covers the nursery as Go's heap goal covers all of its heap: mature space may hold L blocks
+// (heapLimit @160, large objects counted in blocks), the allowance less the active nursery reserve, and at
+// least the 4 MiB minimum. With the nursery on top instead, binary-trees' peak was twice its live set plus the
+// whole nursery. A major runs when mature space reaches L (rtGenCollect, and the large-object path in
+// rtTlabAlloc) or the mutator's blocks run out (rtImmixRefill). The nursery is a quarter of the allowance,
+// clamped to 4–64 MiB: a plain fraction would give a small heap a tiny nursery and a large heap a huge one.
 
 // The nursery reserve for a heap limit of `limit` blocks: a quarter, within 128–2048 blocks.
 fun rtNurseryFor(limit: Int) -> Int {
@@ -154,24 +161,30 @@ fun rtNurseryFor(limit: Int) -> Int {
   return n
 }
 
-// Set L to `limit` blocks, at least the minimum heap, and the nursery reserve to match, with the two inside the
-// reservation: past it, the nursery is cut to a quarter of the reservation and L takes the rest.
+// Set the heap's allowance to `limit` blocks: the nursery reserve to match it, and L to the rest, at least the
+// minimum heap, with the two inside the reservation (past it, the nursery is cut to a quarter of the
+// reservation and L takes the rest).
 fun rtHeapSetLimit(space: RawPtr, limit: Int) {
   let reserved: Int = space.load(fromByteOffset: 8)
-  var l = limit
   let minimum = rtHeapMinimum / 32768
+  var total = limit
+  if total < minimum {
+    total = minimum
+  }
+  var n = rtNurseryFor(total)
+  if n > reserved / 4 {
+    n = reserved / 4
+  }
+  space.store(n, toByteOffset: 128)
+  let nursery = rtGenReserve(space)
+  var l = total - nursery
   if l < minimum {
     l = minimum
   }
-  var n = rtNurseryFor(l)
-  if l + n > reserved {
-    if n > reserved / 4 {
-      n = reserved / 4
-    }
-    l = reserved - n
+  if l + nursery > reserved {
+    l = reserved - nursery
   }
   space.store(l, toByteOffset: 160)
-  space.store(n, toByteOffset: 128)
 }
 
 // The mutator's block cap: L plus the active nursery reserve (none under the `immix` plan).
@@ -200,6 +213,74 @@ fun rtMatureBlocks(space: RawPtr) -> Int {
   let flTop: Int = space.load(fromByteOffset: 96)
   let nursery: Int = space.load(fromByteOffset: 136)
   return fc - flTop - nursery + rtLosBlocks(space)
+}
+
+// ---- Returning free blocks to the OS ----
+// After a major the heap may hold more free blocks than it will use before the next one: blocks touched while
+// the live set was larger, or by a phase that has ended. rtHeapReturnFree hands their pages back (Runtime.advise),
+// keeping the resident blocks within the allowance (L and the nursery) and a tenth more, as Go's scavenger keeps
+// its heap near the goal. Returned blocks stay free blocks, at the bottom of the free list, so the allocator takes
+// every resident free block first and a returned one only when the heap needs it, taking its pages back as it
+// does (rtBlockReclaim). Their contents are undefined then; every hole is zeroed before the mutator gets it and
+// the collector's copies write whole objects, so nothing reads them.
+
+// Whether block `bi`'s pages were returned to the OS.
+fun rtBlockReturned(space: RawPtr, bi: Int) -> Bool {
+  let tbl: RawPtr = space.load(fromByteOffset: 184)
+  let b: UInt8 = tbl.load(fromByteOffset: bi)
+  return b.int != 0
+}
+
+// Take back the pages of block `bi`, just popped from the free list, if they were returned.
+fun rtBlockReclaim(space: RawPtr, bi: Int) {
+  if rtBlockReturned(space, bi) {
+    let tbl: RawPtr = space.load(fromByteOffset: 184)
+    tbl.store(0.uint8, toByteOffset: bi)
+    let n: Int = space.load(fromByteOffset: 192)
+    space.store(n - 1, toByteOffset: 192)
+    let r = Runtime.advise(base: rtBlockAddr(space, bi), bytes: 32768, reuse: 1)
+  }
+}
+
+// At the end of a major, after the sweep (which put the returned blocks at the bottom of the free list) and
+// rtHeapResize: return free blocks, from the bottom of the free list up, until the resident blocks (those ever
+// handed out less those returned) are within the allowance and a tenth. The free list's entries are in address
+// order above the returned ones, so a run of adjacent blocks goes back in one call.
+fun rtHeapReturnFree(space: RawPtr) {
+  let fc: Int = space.load(fromByteOffset: 32)
+  let top: Int = space.load(fromByteOffset: 96)
+  var returned: Int = space.load(fromByteOffset: 192)
+  let limit: Int = space.load(fromByteOffset: 160)
+  let allowance = limit + rtGenReserve(space)
+  var excess = fc - returned - (allowance + allowance / 10)
+  if excess <= 0 {
+    return
+  }
+  let fl: RawPtr = space.load(fromByteOffset: 88)
+  let tbl: RawPtr = space.load(fromByteOffset: 184)
+  var i = returned
+  while excess > 0 && i < top {
+    let first: Int = fl.load(fromByteOffset: i * 8)
+    var count = 1
+    tbl.store(1.uint8, toByteOffset: first)
+    i = i + 1
+    excess = excess - 1
+    var run = true
+    while run && excess > 0 && i < top {
+      let next: Int = fl.load(fromByteOffset: i * 8)
+      if next == first + count {
+        tbl.store(1.uint8, toByteOffset: next)
+        count = count + 1
+        i = i + 1
+        excess = excess - 1
+      } else {
+        run = false
+      }
+    }
+    let r = Runtime.advise(base: rtBlockAddr(space, first), bytes: count * 32768, reuse: 0)
+    returned = returned + count
+  }
+  space.store(returned, toByteOffset: 192)
 }
 
 // After a major, which empties the nursery: record the live blocks and set L from them and the fibers' stacks.
@@ -319,6 +400,7 @@ fun rtNextAllocBlock(space: RawPtr, cap: Int, recyclable: Bool) -> Int {
     let newTop = top - 1
     let bi: Int = fl.load(fromByteOffset: newTop * 8)
     space.store(newTop, toByteOffset: 96)
+    rtBlockReclaim(space, bi)
     return bi
   }
   var sb: Int = space.load(fromByteOffset: 104)
@@ -948,6 +1030,16 @@ fun rtImmixSweepBlocks(space: RawPtr) {
   space.store(0, toByteOffset: 96)           // reset free list
   let fl: RawPtr = space.load(fromByteOffset: 88)
   let dt: RawPtr = space.load(fromByteOffset: 112)
+  // Returned blocks first, so they sit at the bottom of the list and are taken last (rtHeapReturnFree).
+  var ri = 0
+  while ri < fc {
+    if rtBlockReturned(space, ri) {
+      let top: Int = space.load(fromByteOffset: 96)
+      fl.store(ri, toByteOffset: top * 8)
+      space.store(top + 1, toByteOffset: 96)
+    }
+    ri = ri + 1
+  }
   var bi = 0
   while bi < fc {
     let firstLine = bi * 128
@@ -963,9 +1055,11 @@ fun rtImmixSweepBlocks(space: RawPtr) {
     dt.store(marked.uint8, toByteOffset: bi)   // record the live-line count for next collection's defrag selection
     if marked == 0 {
       rtSetBlockState(space, bi, 0)
-      let top: Int = space.load(fromByteOffset: 96)
-      fl.store(bi, toByteOffset: top * 8)
-      space.store(top + 1, toByteOffset: 96)
+      if !rtBlockReturned(space, bi) {
+        let top: Int = space.load(fromByteOffset: 96)
+        fl.store(bi, toByteOffset: top * 8)
+        space.store(top + 1, toByteOffset: 96)
+      }
     } else {
       if marked == 128 {
         rtSetBlockState(space, bi, 2)

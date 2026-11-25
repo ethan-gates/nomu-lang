@@ -44,6 +44,26 @@ one. Today a plan not selected still costs binary size, because unused functions
 - **Rests on:** [125 unsafe raw memory](125-unsafe-raw-memory.md) + [149 runtime-subset](149-runtime-subset.md)
   (shared with the whole self-hosted runtime) and a clean `VMBinding` + the `__nomu_write_barrier` hook.
 
+## To explore: types that cannot form cycles
+
+Reference counting reclaims everything but cycles, which LXR leaves to its backup trace. A type whose instances
+can never be part of a cycle could tell the collector so, as Koka's inductive immutable data does (Perceus,
+MSR-TR-2020-42, §2.7.4) and as Bacon and Rajan's cycle collector uses for "green" objects that never become
+cycle candidates.
+
+- **The rule, inferred by the compiler:** value types and primitives are acyclic. A class is acyclic when its
+  reference fields are all `let`, each field's type is acyclic, and its initializer does not hand out `self`
+  before construction ends: closing a cycle needs some object to point to one created after it, which takes a
+  mutation. Recursive immutable types (a list, a tree) are acyclic. An array buffer is acyclic when its element
+  type cannot reach it. Generics are conditional (`Box<T>` is acyclic when `T` is). This is nearly the
+  structural derivation of shareable deeply-immutable classes (`concurrency.md` §5), so the check can share
+  its code.
+- **Where it lives:** one bit in the type descriptor (`runtime/descriptors.nomu`, beside `kind` at offset 8). It
+  is a property of the type, the collector already reads the descriptor for each object it scans, and the
+  header's spare bits are for per-object state (the mark and log bits).
+- **Open:** what it buys LXR. With trial deletion the win is known; with LXR's backup trace it might let the trace
+  skip acyclic subgraphs or run less often. Check against the LXR paper before adding the bit.
+
 **Re-measure:** once this lands, re-run the dense-layout benchmark against Go (`practice/gen/dense/run.py`, `practice/go/dense`; [196](196-dense-value-layout.md) 196.9) for the object ring's collector time and memory.
 
 ## Refs

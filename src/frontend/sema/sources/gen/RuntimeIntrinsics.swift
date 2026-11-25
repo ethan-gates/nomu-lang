@@ -375,6 +375,15 @@ enum RuntimeIntrinsics {
             let bytes = PointerIntrinsics.intArg(&s, args[1].value, "Runtime.protect", "bytes")
             let access = PointerIntrinsics.intArg(&s, args[2].value, "Runtime.protect", "access")
             return s.ptrIntrinsic("__sysProtect", .int, [base, bytes, access], span)
+        // Memory advice (the heap returning free blocks to the OS): madvise over whole pages from `base`. `reuse`
+        // 0 releases the pages, whose contents are then undefined; 1 takes them back before reuse. Returns 0 on
+        // success.
+        case "advise":
+            guard PointerIntrinsics.checkArgLabels(&s, args, ["base", "bytes", "reuse"], "Runtime.advise", span) else { return err(span) }
+            let base = PointerIntrinsics.ptrArg(&s, args[0].value, "Runtime.advise", "base")
+            let bytes = PointerIntrinsics.intArg(&s, args[1].value, "Runtime.advise", "bytes")
+            let reuse = PointerIntrinsics.intArg(&s, args[2].value, "Runtime.advise", "reuse")
+            return s.ptrIntrinsic("__sysAdvise", .int, [base, bytes, reuse], span)
         case "raise":
             guard PointerIntrinsics.checkArgLabels(&s, args, ["signal"], "Runtime.raise", span) else { return err(span) }
             let sg = PointerIntrinsics.intArg(&s, args[0].value, "Runtime.raise", "signal")

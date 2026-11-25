@@ -184,6 +184,7 @@ NOMU_LIBC kevent, 0
 NOMU_LIBC kqueue, 0
 NOMU_LIBC mach_absolute_time, 0
 NOMU_LIBC mach_timebase_info, 0
+NOMU_LIBC madvise, 0
 NOMU_LIBC malloc, 0
 NOMU_LIBC mmap, 0
 NOMU_LIBC mprotect, 0

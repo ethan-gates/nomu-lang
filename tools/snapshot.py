@@ -7,7 +7,10 @@ uncommitted changes), with a memo, an optional label, and the uncommitted diff a
 snapshot by its path; nothing here selects a default toolchain.
 
 Usage:
-  tools/snapshot.py publish [--memo TEXT] [--label NAME]   build the tree as it stands and keep the toolchain
+  bazel run -c opt //:publish -- [--memo TEXT] [--label NAME]
+                                                           build the tree as it stands and keep the toolchain
+  tools/snapshot.py publish --binary PATH [--memo TEXT] [--label NAME]
+                                                           keep a built toolchain (what //:publish runs)
   tools/snapshot.py edit REF [--memo TEXT] [--label NAME]  change a snapshot's memo or label
   tools/snapshot.py list                                   every snapshot, newest first (* = the tree's identity)
   tools/snapshot.py show REF                               a snapshot's metadata and patch
@@ -16,7 +19,8 @@ Usage:
   tools/snapshot.py clear                                  delete every snapshot
 
 REF is a label, an identity, or a unique prefix of one. Publishing an identity already kept changes only its
-memo and label. To snapshot an older commit, check it out in this tree and publish: a copy of the tree at
+memo and label. Bazel builds the toolchain and hands it to `publish` (`tools/publish/`), so nothing here reads
+Bazel's output tree. To snapshot an older commit, check it out in this tree and publish: a copy of the tree at
 another path has its own Bazel output directory and rebuilds LLVM. The script works on the checkout it runs in,
 so for a commit older than the script, run a copy kept outside the tree.
 
@@ -37,7 +41,6 @@ import sys
 ROOT = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
 if not ROOT:
     sys.exit("snapshot: run inside a nomu-lang checkout")
-TARGET = "//src/nomu-cli:nomu"
 # The paths whose uncommitted changes enter the identity (tools/workspace_status.sh).
 IDENTITY_PATHS = ["src", "MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", "BUILD.bazel"]
 
@@ -78,15 +81,6 @@ def tree_identity():
         if key == "STABLE_NOMU_COMPILER_IDENTITY":
             return value
     return None
-
-
-def stamped():
-    status = {}
-    with open(os.path.join(ROOT, "bazel-out", "stable-status.txt")) as f:
-        for line in f:
-            key, _, value = line.rstrip("\n").partition(" ")
-            status[key] = value
-    return status.get("STABLE_NOMU_COMPILER_IDENTITY"), status.get("STABLE_NOMU_GIT_COMMIT")
 
 
 def uncommitted_patch():
@@ -147,23 +141,20 @@ def set_label(meta, label):
     meta["label"] = label or None
 
 
+# Keep `args.binary`, the toolchain `bazel run //:publish` just built. Its identity is the tree's: the binary
+# carries the identity it was stamped with, so one built before the tree changed is refused.
 def cmd_publish(args):
-    r = subprocess.run(["bazel", "build", "-c", "opt", TARGET], cwd=ROOT)
-    if r.returncode != 0:
-        die("the toolchain failed to build")
-    q = run(["bazel", "cquery", "-c", "opt", "--output=files", TARGET])
-    binary = os.path.join(ROOT, q.stdout.strip().splitlines()[-1]) if q.returncode == 0 and q.stdout.strip() else ""
+    binary = args.binary
     if not os.path.isfile(binary):
-        die(f"could not find the built toolchain:\n{q.stderr}")
-    identity, commit = stamped()
+        die(f"no toolchain at {binary}")
+    identity = tree_identity()
     if not identity or identity == "unstamped":
-        die("the build is unstamped (not a git checkout?)")
-    now_identity = tree_identity()
-    if now_identity != identity:
-        die(f"the tree changed during the build ({short(identity)} built, {short(now_identity)} now); publish again")
+        die("the tree is unstamped (not a git checkout?)")
     with open(binary, "rb") as f:
         if identity.encode() not in f.read():
-            die(f"{binary} does not carry the identity {identity}; is it the build just made?")
+            die(f"the toolchain does not carry the tree's identity {short(identity)}: the tree changed after the "
+                "build; publish again")
+    commit = identity.partition("-")[0]
 
     d = os.path.join(toolchains_dir(), identity)
     meta_path = os.path.join(d, "meta.json")
@@ -266,7 +257,8 @@ def cmd_clear(args):
 def main():
     p = argparse.ArgumentParser(prog="tools/snapshot.py", description="Toolchain snapshots (task 257).")
     sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("publish", help="build the tree and keep the toolchain")
+    s = sub.add_parser("publish", help="keep a built toolchain (run through `bazel run -c opt //:publish`)")
+    s.add_argument("--binary", required=True, help="the toolchain to keep, which Bazel passes")
     s.add_argument("--memo")
     s.add_argument("--label")
     s.set_defaults(fn=cmd_publish)

@@ -40,9 +40,12 @@ bazel-bin/src/compiler-test/compiler-test tests/suite
 - `frame-stackaddr-ir.py` — classifies the non-GC pointers live across each statepoint in post-rewrite LLVM
   IR (`NOMU_DUMP_LLVM=1 nomu build --emit-llvm …` writes `<object>.post.ll`) by origin: alloca, parameter,
   load, call (task 241).
-- `snapshot.py` — an inventory of toolchains built from this checkout (task 257). `publish --memo … [--label …]`
-  builds the opt `nomu` and keeps it under the host cache's `toolchains/<identity>/` with its memo, label and
-  uncommitted patch; `list`, `show`, `path`, `edit`, `rm` and `clear` manage them. Use a snapshot by its path:
+- `snapshot.py` — an inventory of toolchains built from this checkout (task 257). `bazel run -c opt //:publish --
+  [--label …] [--memo …]` builds the opt `nomu` and keeps it under the host cache's `toolchains/<identity>/` with
+  its memo, label and uncommitted patch (`//:install` puts it in `bin/` instead); `list`, `show`, `path`, `edit`,
+  `rm` and `clear` manage them. To compare compilers, publish each variant and run them by their snapshot
+  paths: read nothing from `bazel-bin` or `bazel-out`, which a rebuild overwrites and which point into the
+  shared Bazel cache. Use a snapshot by its path:
   `$(tools/snapshot.py path <label>) build …`. To snapshot an older commit, check it out in this tree and
   publish; a copy of the tree elsewhere has its own Bazel output directory and rebuilds LLVM. It works on the
   checkout it runs in, so a commit older than the script takes a copy of it kept outside the tree.

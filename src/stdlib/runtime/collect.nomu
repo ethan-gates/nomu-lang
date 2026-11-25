@@ -722,6 +722,7 @@ fun nomuSchedStwCollectDefrag(sched: RawPtr) -> Int {
     rtImmixCollectRootsDefrag(space, slots, ns)
   }
   rtHeapResize(space)           // L from what survived (heap sizing, immix.nomu)
+  rtHeapReturnFree(space)       // free blocks past the allowance go back to the OS
   if rtGcVerify {
     rtVerifyHeap(space, slots, ns, RawPtr.null, 0, 2)   // before the run queues' entries are tagged again
   }

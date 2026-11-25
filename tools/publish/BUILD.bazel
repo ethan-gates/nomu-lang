@@ -1,0 +1,12 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+# `bazel run -c opt //:publish -- [--label NAME] [--memo TEXT]`: keep the freshly built `nomu` as a toolchain
+# snapshot (`tools/snapshot.py publish`). Bazel hands the binary over through runfiles, so nothing reads its
+# output tree.
+sh_binary(
+    name = "publish",
+    srcs = ["publish.sh"],
+    data = ["//src/nomu-cli:nomu"],
+    args = ["$(rootpath //src/nomu-cli:nomu)"],
+    visibility = ["//visibility:public"],
+)

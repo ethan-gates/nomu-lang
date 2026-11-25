@@ -437,6 +437,8 @@ fun rtGcRecordSnapshot(rec: RawPtr) {
   rtRecCounter(rec, 23, nursery)
   rtRecCounter(rec, 24, los)
   rtRecCounter(rec, 25, nb)
+  let returned: Int = space.load(fromByteOffset: 192)
+  rtRecCounter(rec, 26, returned)
   rtRecClose(rec, 17, start, 0)
 }
 
@@ -631,6 +633,7 @@ fun rtGcName(at: RawPtr, table: Int, id: Int) -> Int {
     else if id == 23 { n = Runtime.copyLiteral(to: at, "nursery blocks") }
     else if id == 24 { n = Runtime.copyLiteral(to: at, "large objects") }
     else if id == 25 { n = Runtime.copyLiteral(to: at, "heap blocks") }
+    else if id == 26 { n = Runtime.copyLiteral(to: at, "returned blocks") }
     else if id == 30 { n = Runtime.copyLiteral(to: at, "blocks refilled") }
     else if id == 31 { n = Runtime.copyLiteral(to: at, "large objects allocated") }
     else if id == 32 { n = Runtime.copyLiteral(to: at, "large-object bytes allocated") }
@@ -651,7 +654,7 @@ fun rtGcPutNames(buf: RawPtr) {
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "},\"counters\":{"))
   rtGcPutNameList(buf, 4, 1, 5)
   rtBufByte(buf, 44)
-  rtGcPutNameList(buf, 4, 20, 25)
+  rtGcPutNameList(buf, 4, 20, 26)
   rtBufByte(buf, 44)
   rtGcPutNameList(buf, 4, 30, 34)
   rtBufGrew(buf, Runtime.copyLiteral(to: rtBufAt(buf, 64), "}}"))

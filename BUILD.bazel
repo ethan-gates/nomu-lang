@@ -10,6 +10,11 @@ alias(
     actual = "//tools/install:install",
 )
 
+alias(
+    name = "publish",
+    actual = "//tools/publish:publish",
+)
+
 # Every Nomu source in the suite fixtures, examples and benchmarks, as test data (the import scanner's
 # conformance test reads them through runfiles).
 filegroup(

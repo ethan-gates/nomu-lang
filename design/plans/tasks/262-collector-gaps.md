@@ -1,9 +1,9 @@
 # Collector gaps — binary-trees and Richards against Go
 
 **Avenue:** Risk (perf, footprint) · **Type/Lifecycle:** `runtime · gc · codegen` · **Size:** L ·
-**Status:** paused, 262.5.3 next when it resumes; 262.7 done (no slowdown since 260; the baseline below); 262.3 done (no stubs: binary-trees
-4% faster); 262.1 done (offsets read in place: binary-trees 10% faster); 262.4 closed (heap limit stays in bytes); 262.5.1 done (no unmark walk: binary-trees 10% faster, `immix` 29%); 262.5.2 done (pass folded into the scan, under 1%); 262.5.3 next; 262.2 done (262.2.1: Richards 3% faster;
-262.2.3: binary-trees 6% faster) ·
+**Status:** 262.5.7 next (a parallel minor); 262.5.6 done (the header explains the live set; the nursery inside the limit: peak 447 → 385 MiB at depth 21; free blocks returned at majors: mean footprint −21%); 262.7 done (no slowdown since 260; the baseline below); 262.3 done (no stubs: binary-trees
+4% faster); 262.1 done (offsets read in place: binary-trees 10% faster); 262.4 closed (heap limit stays in bytes); 262.5.1 done (no unmark walk: binary-trees 10% faster, `immix` 29%); 262.5.2 done (pass folded into the scan, under 1%); 262.2.1–262.2.3 done (262.2.1: Richards 3% faster;
+262.2.3: binary-trees 6% faster); 262.2.4 done (the barrier's check, not an optimizer fence, is Richards' 22%); 262.2.5–262.2.6 open (elision across blocks and stops) ·
 **Source:** the enum layout work ([260](260-enum-layout.md)), which removed the enum decoding that had hid
 these costs, and measured binary-trees, Richards and the enum benchmarks against Go.
 
@@ -64,7 +64,15 @@ gaps are work here as much as the shared ones.
 
 ## Work
 
-Order: 262.5 (262.5.3 next), then 262.6.
+**Measuring a collector's cost.** A plan's cost is its total CPU time less what the program would cost with no
+collector at all, which no run shows. The lower-bound-overhead method (Cai, *Garbage Collection Across the
+Stack*, ANU 2026, ch. 3; Cai et al., ISPASS 2022) estimates it: run each workload under several plans and heap
+sizes, subtract from each run the time plainly the collector's (its pauses and its own threads), and take the
+smallest result as the program's cost. Each plan's cost is then its total less that, a lower bound that
+includes its barriers and allocation paths. `gc_immix` with no collection, used as Richards' control in 262.2,
+is one such run. Compare total CPU, not pause times.
+
+Order: 262.5.7, then 262.5.3 and the rest of 262.5, then 262.6. 262.2.5 and 262.2.6 are open beside them.
 
 - **262.7** The slowdown since 260. **Done: none.** The toolchains at `e994115` (where 592 ms was recorded)
   and at `a61bc20` (261, 263 and 264 in), snapshotted with [257](257-toolchain-version-manager.md) and run
@@ -113,6 +121,55 @@ Order: 262.5 (262.5.3 next), then 262.6.
   - Considered, not built here: the log bit in the object's header, a load from the object and a bit test
     (about 3 instructions, no range check). It changes the header, the collector's log-bit handling and its
     concurrency, and differs from LXR's side-table field logging; moved to 262.5.5 as a GenImmix item.
+  - **262.2.4** Whether the barrier fences the optimizer. **Done: it does not; the check itself is the cost.**
+    Richards pays about 22% for its barrier, where measured write barriers average about 0.9% (Yang, Blackburn,
+    Frampton and Hosking, "Barriers reconsidered, friendlier still!", ISMM 2012). The suspicion was that the
+    fast path's side-effecting inline asm (176.5.8) and its opaque slow-path call, neither carrying memory
+    effects, made every barrier a memory clobber for LLVM. Variants of one compiler, each Richards built fresh,
+    run interleaved 15 times (best / median ms; generational unless named):
+
+    | variant | ms |
+    |---|---|
+    | as built | 598 / 606 |
+    | asm and slow path confined to inaccessible memory | 604 / 613 |
+    | slow path marked unlikely (branch weights) and its call `cold` | 563–569 / 570–577 |
+    | that, the slow path through an asm stub under `preserve_mostcc` | 558–564 / 563–578 |
+    | the check kept, an empty asm in place of the call | 574 / 582 |
+    | no barrier (sound here only: Richards never collects) | 489 / 492 |
+    | `gc_immix` | 489–492 / 493–502 |
+    | range block reached without the GOT (hidden visibility) | 596 / 600 |
+
+    - Richards runs no collection (`gc.record`: 0 cycles), so nothing is promoted, no log bit is ever set and
+      the slow path never runs. The whole gap to `gc_immix` is the barrier: the generational plan with no
+      barrier matches `gc_immix`.
+    - The memory effects change nothing. The cost splits into the check, about 85 ms (the variant with an
+      empty asm for the call), and the call's presence, about 25 ms: values live across it move into
+      callee-saved registers, so each function with a barrier saves more in its prologue. Marking the slow
+      path unlikely and cold takes back most of the 25 ms; `preserve_mostcc` adds a few more.
+    - The check is 12 instructions and four dependent loads a store: the GOT entry of `rtBarrierRange`, the
+      heap's start and span, the table, then the log byte. Hidden visibility drops the GOT load but LLVM then
+      rematerializes the address at each use (86 `adrp` against 54), and it is slower.
+    - Removing the call alone does not measure the check: with no effect left, LLVM deletes it.
+
+    Kept: the slow path's branch is marked unlikely and its call `cold` (`nomuRememberBarrier`): Richards 600 →
+    564 ms best, 605 → 573 median, interleaved 15 times; suite 4220/4220 full. The check's cost is the larger
+    lever, through fewer loads; it goes with the header log bit (262.5.5), or a side table at a fixed address
+    (MMTk's side metadata).
+  - **262.2.5** Young objects tracked across blocks. `BarrierElision` drops a barrier only within one block. A
+    data-flow pass over the function (with phis), as the Dart VM's `WriteBarrierElimination` does, keeps an
+    object known young until a stop. Every entry and loop header is a stop, so the gain is limited until 262.2.6.
+  - **262.2.6** Elision across stops, with the runtime's help (needs design). Dart elides across instructions
+    that can collect because its runtime adds each live temporary a collection promotes to the remembered set
+    (and, under concurrent marking, to a deferred marking stack), so a later store into it without a barrier is
+    still seen; large arrays are left out, since rescanning them costs more than their barriers. Nomu's stack
+    maps name every live value at a stop, so a minor collection could remember the promoted objects they hold.
+    To design: which frames' values count (Dart takes only the top frame, for stops that do not call), the cost
+    of rescanning them, and what LXR's concurrent tracing would need besides.
+  - Not numbered: a "returns a fresh object" fact in function summaries, so elision follows a constructor
+    call (Zee and Rinard, "Write barrier removal by static analysis", OOPSLA 2002, which also reorders
+    allocations so the object pointed to comes first). Waits on how the summaries grow. If objects are ever
+    allocated straight into the mature space, 262.2.3's reasoning (every mutator allocation is young) no
+    longer holds.
 - **262.3** Stubs on runtime calls. **Done.** What made the stubs: runtime and prelude functions are weak-ODR
   definitions (`weakOriginFiles` in `SSAIRToLLVM.swift`, so per-object copies fold at link, from 100.3.7) and
   were exported, so the dynamic loader bound them through `__stubs`. Of hidden visibility on every weak-ODR
@@ -165,8 +222,79 @@ Order: 262.5 (262.5.3 next), then 262.6.
     `after-262.5.2`, interleaved, control copy: depth 19 698 → 693 ms (control 700), depth 21 3123 → 3099 ms
     (control 3127), under 1%. Kept for the simpler minor. Suite 2089/2089, fast tier with `gc_verify` 622/622.
     What remains of the minors is the scan itself, the copying 262.5.3 addresses.
-  - **262.5.3** Nursery promotion: a variable nursery, aging, or a parallel minor.
+  - **262.5.3** Nursery promotion: a larger or adaptive nursery, or aging (explore after 262.5.6 and 262.5.7).
+    Binary-trees at depth 21, recording build for the collector columns, best of 3 for wall and RSS:
+
+    | nursery | minors | majors | promoted | collector | wall | RSS |
+    |---|---|---|---|---|---|---|
+    | 4 MiB | 3476 | 36 | 3575 MiB | 2928 ms | 4.75 s | 280 MiB |
+    | 16 MiB | 858 | 20 | 2159 MiB | 1776 ms | 3.70 s | 334 MiB |
+    | default (a quarter of L, at most 64 MiB) | 354 | 11 | 983 MiB | 840 ms | 2.82 s | 447 MiB |
+    | 128 MiB | 105 | 4 | 528 MiB | 456 ms | 2.47 s | 540 MiB |
+    | 256 MiB | 52 | 2 | 266 MiB | 230 ms | 2.26 s | 547 MiB |
+
+    Each minor promotes about 5 MiB, what is live at that moment (mostly the tree being built), so promotion
+    and the majors it drives halve with each doubling of the nursery, at a cost in RSS. Aging would keep those
+    short-lived survivors out of mature space but copies them all the same.
   - **262.5.4** Large objects deciding between majors and minors.
+  - **262.5.6** RSS beyond the live heap (carries over: the Immix block pool is LXR's too). At the default
+    nursery binary-trees peaks at 208 MiB in use and 447 MiB resident (Go: 205 MB). The rest is free heap
+    blocks: touched once, never returned to the OS (the runtime has no `madvise`). In steady state 3464 of
+    5748 touched blocks are free; after the peak major 6657 of 11265 (208 MiB); `vmmap` puts 343 MiB of the
+    heap reservation resident against malloc's 38 MiB and stacks under 1 MiB. Returning free blocks does not
+    lower the peak, though: after the peak major 4606 blocks are live, L = live × 2 = 9212 and the nursery adds
+    2048, 11260 blocks, and the program fills that before the next major (the touched high-water mark is
+    11265). The peak is the sizing policy: twice the live set, with the nursery on top.
+    - **262.5.6.1** Why the live set is about 1.4× Go's (144 MiB of full blocks at the peak; Go's 205 MB peak
+      at the same 100% growth suggests about 100 MB). **Done: the object header.** A tree node is 24 bytes (an
+      8-byte header and two references), Go's 16 (its type information lives outside the object). Live at the
+      peak: the depth-21 tree (4,194,303 nodes) and the last iteration's depth-20 trees (2,097,151), 96 + 48 =
+      144 MiB, the full blocks exactly, so line fragmentation is nil; at 16 bytes the same nodes are 96 MiB,
+      about 192 MB at twice the live set, near Go's peak. The header stays (Immix and LXR need each object's
+      type at the object); compressed references would close the gap, parked as
+      [272](272-compressed-references.md).
+    - **262.5.6.2** The nursery inside the heap limit, as Go's heap goal covers everything. **Built**
+      (`rtHeapSetLimit`): the allowance live + (live + stacks) × r covers the nursery, mature space gets the rest
+      and at least the minimum, and the `immix` plan, with no nursery, is unchanged. Snapshots `nursery-on-top`
+      and `nursery-in-limit`, interleaved (binary-trees best of 7, Richards best of 15):
+
+      | workload | on top | in the limit |
+      |---|---|---|
+      | binary-trees depth 19 | 0.630 s, 112 MiB | 0.640 s, 94 MiB |
+      | binary-trees depth 21 | 2.830 s, 447 MiB | 2.930 s, 385 MiB |
+      | Richards | 0.545 s | 0.547 s |
+
+      About 15% less peak memory for 2–4% more time on binary-trees (majors 11 → 15 at depth 21); Richards does
+      not collect. Against Go's 205 MB at depth 21, 2.2× → 1.9×. Suite 4220/4220 full. Kept: LXR is the endgame, so GenImmix
+      takes Go's memory-for-time trade where it is a realistic one, not the fastest setting regardless of
+      memory.
+    - **262.5.6.3** Return free blocks to the OS at each major. **Done** (`rtHeapReturnFree`, `immix.nomu`).
+      After the sweep and the resize, free blocks go back (`Runtime.advise`: `MADV_FREE_REUSABLE` on darwin,
+      `MADV_DONTNEED` on Linux) from the bottom of the free list, until the resident blocks are within the
+      allowance and a tenth, as Go's scavenger keeps its heap near the goal. The sweep puts returned blocks at the
+      bottom (a byte per block, descriptor @184 and @192), so the allocator takes every resident free block first;
+      popping a returned one takes its pages back (`MADV_FREE_REUSE`). The report counts them (counter 26).
+      Binary-trees at depth 21: after the stretch tree's major the heap returns 3089 blocks and stays at
+      96–118 MiB resident through the middle phase. Snapshots `nursery-in-limit` and `return-free`, interleaved,
+      sampled every 20 ms with `proc_pid_rusage` (best of 5 wall; mean and peak physical footprint):
+
+      | workload | before | returning |
+      |---|---|---|
+      | binary-trees depth 21 | 3.03 s, 365 / 385 MiB | 3.01 s, 287 / 382 MiB |
+      | binary-trees depth 19 | 0.67 s, 65 / 90 MiB | 0.67 s, 58 / 94 MiB |
+      | Richards | 563 / 571 ms | 565 / 569 ms |
+
+      The mean footprint falls 21% at depth 21; peaks and time are unchanged, as expected (262.5.6). RSS does
+      not move on darwin: reusable pages stay counted until the system takes them, so footprint is the measure.
+      Suite 4220/4220 full.
+  - **262.5.7** A parallel minor: the minor's scan and copy on several threads, 552 ms of 840 ms of collector
+    time at depth 21. Objects, barriers and the mutator's view stay as they are.
+  - **262.5.8** A background scavenger (carries over: the block pool is shared). 262.5.6 returns memory inside
+    the major's pause; Go returns it from a paced background scavenger instead (about 1% of a core, RSS kept
+    near the heap goal), which keeps the cost out of pauses and returns only blocks idle a while, so less is
+    returned and faulted back soon after. It costs synchronization with carriers taking blocks, coordination
+    with the collector's walks, pacing and a lifecycle; the monitor thread could carry it, as Go's `sysmon`
+    wakes its scavenger. Evaluate once 262.5.6 shows what returning costs in the pause and in faults.
   - **262.5.5** The barrier's log bit in the object header (one load from the object and a bit test, no range
     check), measured against 262.2.1's side table; considered under 262.2.
 - **262.6** Parallel or concurrent marking, with LXR's design.

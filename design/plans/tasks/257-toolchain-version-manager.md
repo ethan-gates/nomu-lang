@@ -1,6 +1,6 @@
 # Toolchain version manager
 
-**Avenue:** Infra · **Type/Lifecycle:** `tooling` · **Size:** S · **Status:** done (257.1, 257.2) ·
+**Avenue:** Infra · **Type/Lifecycle:** `tooling` · **Size:** S · **Status:** done (257.1, 257.2, 257.3) ·
 **Source:** [262](262-collector-gaps.md), whose baseline needed the toolchain at an older commit, and the
 copy built for it at a new path rebuilt LLVM from nothing.
 
@@ -39,6 +39,12 @@ found again later by path. It knows nothing about benchmarks; the comparison too
   - The script works on the checkout it runs in, so a commit older than the script takes a copy of it kept
     outside the tree (how 262.7 snapshotted `e994115`).
 - **257.2** A `tools/README.md` entry for `tools/snapshot.py`. Done.
+- **257.3** Publishing through Bazel. Done. `bazel run -c opt //:publish -- [--label NAME] [--memo TEXT]` builds
+  the toolchain and hands it to `snapshot.py publish --binary` through its runfiles (`tools/publish/`), beside
+  `//:install`, which puts it in `bin/`. `publish` no longer runs `bazel cquery` or reads
+  `bazel-out/stable-status.txt`: the identity is the tree's (`tools/workspace_status.sh`), and a binary that does
+  not carry it, one built before the tree changed, is refused. Nothing reads Bazel's output tree, which a
+  rebuild overwrites and which points into the shared Bazel cache.
 
 ## Relations
 

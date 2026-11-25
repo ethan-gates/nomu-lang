@@ -38,6 +38,12 @@ struct TargetPlatform {
         }
     }
 
+    // `madvise` advice for heap blocks returned to the OS and taken back. Darwin's `MADV_FREE_REUSABLE` (7)
+    // releases the pages and keeps the process's footprint accounting right, and `MADV_FREE_REUSE` (8) takes them
+    // back; Linux's `MADV_DONTNEED` (4) releases them and needs nothing on reuse (`MADV_NORMAL`, 0).
+    var adviseRelease: Int32 { os == .darwin ? 7 : 4 }
+    var adviseReuse: Int32 { os == .darwin ? 8 : 0 }
+
     // Whether the carrier-local slot is read and written in place. On darwin-arm64 it is the thread's TSD
     // array (`TPIDRRO_EL0`) indexed by the key, as libpthread reads it. Elsewhere it goes through
     // `pthread_getspecific` / `pthread_setspecific` until a direct form is written (glibc keeps keys in a

@@ -244,7 +244,7 @@ extension LLVMGen {
     // not all Nomu's to route.
     static let libcViaCarrier: Set<String> = [
         "abort", "clock_gettime_nsec_np", "close", "creat", "dprintf", "exit", "free", "getenv",
-        "getpagesize", "kevent", "kqueue", "mach_absolute_time", "mach_timebase_info", "malloc", "mmap",
+        "getpagesize", "kevent", "kqueue", "mach_absolute_time", "mach_timebase_info", "madvise", "malloc", "mmap",
         "isatty", "mprotect", "munmap", "pipe", "poll", "posix_memalign", "printf", "pthread_create",
         "pthread_getspecific", "pthread_join", "pthread_key_create", "pthread_setspecific", "pthread_sigmask", "putchar",
         "raise", "read", "sigaction", "sigaltstack", "snprintf", "strlen", "strpbrk", "strtod", "sysconf",
@@ -871,17 +871,39 @@ extension LLVMGen {
             let region = LLVMBuildLShr(b, rel, LLVMConstInt(i64, 3, 0), "region")!
             let bitpos = LLVMBuildTrunc(b, LLVMBuildAnd(b, region, LLVMConstInt(i64, 7, 0), "bp"), i8, "bitpos")
             let bit = LLVMBuildAnd(b, LLVMBuildLShr(b, byte, bitpos, "sh"), LLVMConstInt(i8, 1, 0), "bit")
-            LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, bit, LLVMConstInt(i8, 0, 0), "unlogged"), slowBB, doneBB)
+            let unlogged = LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntNE, bit, LLVMConstInt(i8, 0, 0), "unlogged"), slowBB, doneBB)!
+            // The slow path runs once per object a collection promotes, so it is marked unlikely and its call
+            // cold: otherwise values live across the call take callee-saved registers on every path, and each
+            // function with a barrier saves them in its prologue (about 6% on Richards).
+            setBranchWeights(unlogged, taken: 1, notTaken: 1 << 20)
             LLVMPositionBuilderAtEnd(b, slowBB)
             // The slow path never polls or parks, so its call is gc-leaf.
             let slow = buildCall(slowPath.fn, slowPath.ty, [LLVMBuildIntToPtr(b, objInt, i8ptr, "obj.raw")])!
             markCallGCLeaf(slow)
+            let cold = "cold"
+            LLVMAddCallSiteAttribute(slow, funcAttrIndex,
+                                     LLVMCreateEnumAttribute(ctx, LLVMGetEnumAttributeKindForName(cold, cold.utf8.count), 0))
             LLVMBuildBr(b, doneBB)
             LLVMPositionBuilderAtEnd(b, doneBB)
             LLVMBuildRetVoid(b)
         }
         rememberFn = (fn, ty)
         return rememberFn!
+    }
+
+    // `!prof` branch weights on the conditional branch `br`: `taken` for its first successor, `notTaken` for its
+    // second.
+    func setBranchWeights(_ br: LLVMValueRef, taken: UInt64, notTaken: UInt64) {
+        let i32 = LLVMInt32TypeInContext(ctx)
+        let tag = "branch_weights"
+        var ops: [LLVMMetadataRef?] = [
+            LLVMMDStringInContext2(ctx, tag, tag.utf8.count),
+            LLVMValueAsMetadata(LLVMConstInt(i32, taken, 0)),
+            LLVMValueAsMetadata(LLVMConstInt(i32, notTaken, 0)),
+        ]
+        let node = ops.withUnsafeMutableBufferPointer { LLVMMDNodeInContext2(ctx, $0.baseAddress, $0.count) }!
+        let kind = "prof"
+        LLVMSetMetadata(br, LLVMGetMDKindIDInContext(ctx, kind, UInt32(kind.utf8.count)), LLVMMetadataAsValue(ctx, node))
     }
 
     // The integer address of managed pointer `p`, produced by a one-instruction side-effecting inline asm

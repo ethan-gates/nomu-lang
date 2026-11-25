@@ -3132,6 +3132,15 @@ final class SSAIRToLLVM {
             let (fn, fty) = e.runtimeFn("mprotect", ret: i32, params: [e.i8ptr, e.i64, i32], varArg: false)
             let r = e.buildCall(fn, fty, [val(args[0]), val(args[1]), LLVMBuildTrunc(b, val(args[2]), i32, "prot")])
             return LLVMBuildSExt(b, r!, e.i64, "mprotect.r")
+        case "__sysAdvise":
+            let i32 = e.i32
+            let p = TargetPlatform.host
+            let (fn, fty) = e.runtimeFn("madvise", ret: i32, params: [e.i8ptr, e.i64, i32], varArg: false)
+            let reuse = LLVMBuildICmp(b, LLVMIntNE, val(args[2]), LLVMConstInt(e.i64, 0, 0), "reuse")
+            let advice = LLVMBuildSelect(b, reuse, LLVMConstInt(i32, UInt64(p.adviseReuse), 0),
+                                         LLVMConstInt(i32, UInt64(p.adviseRelease), 0), "advice")
+            let r = e.buildCall(fn, fty, [val(args[0]), val(args[1]), advice])
+            return LLVMBuildSExt(b, r!, e.i64, "madvise.r")
         case "__sysRaise":
             let i32 = e.i32
             let (fn, fty) = e.runtimeFn("raise", ret: i32, params: [i32], varArg: false)
