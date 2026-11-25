@@ -40,26 +40,33 @@ fun player(st: RawPtr, me: Int, n: Int) -> Int {
     let sched = rtSched
     let other = 1 - me
     var i = 0
+    // No loop runs while the scheduler lock is held: a loop's poll can yield to preemption, which takes that lock.
+    // The partner readies this player only after giving it the turn, so one park suffices; were the turn not
+    // ours after it, the outer loop tries again with the lock released.
     while i < n {
         rtSchedLock(sched)
         var turn: Int = st.load(fromByteOffset: 0)
-        while turn != me {
+        if turn != me {
             st.store(rtCurrentFiber(), toByteOffset: 8 + 8 * me)
             nomuSchedParkLocked(sched, RawPtr.null, 0)
             rtSchedLock(sched)
             turn = st.load(fromByteOffset: 0)
         }
-        st.store(other, toByteOffset: 0)
-        let w: RawPtr = st.load(fromByteOffset: 8 + 8 * other)
-        if w.isNull {
-            rtSchedUnlock(sched)
+        if turn == me {
+            st.store(other, toByteOffset: 0)
+            let w: RawPtr = st.load(fromByteOffset: 8 + 8 * other)
+            if w.isNull {
+                rtSchedUnlock(sched)
+            } else {
+                st.store(RawPtr.null, toByteOffset: 8 + 8 * other)
+                rtSchedReadyNext(sched, w)
+                rtSchedUnlock(sched)
+                rtSchedWake(sched, false)
+            }
+            i = i + 1
         } else {
-            st.store(RawPtr.null, toByteOffset: 8 + 8 * other)
-            rtSchedReadyNext(sched, w)
             rtSchedUnlock(sched)
-            rtSchedWake(sched, false)
         }
-        i = i + 1
     }
     return Time().now
 }

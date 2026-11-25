@@ -33,14 +33,13 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
 127  LXR — RC-primary reclamation, on Immix backing; then the GenImmix–LXR comparison   ◀ end goal
 └── benchmark against Go and Swift, on GenImmix (when the language is complete)
     │   Language functionality first, in this order:
-    ├── 237  handoff primitives — a direct switch, handoffs marked by the compiler (needs design; syntax or API to agree)  ◀ next
-    ├── 194  GC frame metadata — decided: extended statepoints (epic: 239–244, 247)
+    ├── 194  GC frame metadata — decided: extended statepoints (epic: 239–244, 247)  ◀ next
     │   └── 247  frame table — F2, built at link time
     ├── 269  generic language features — a method's own type parameters, associated types, operators as
     │        requirements (each needs design and agreement)
     │   Then the performance work:
     ├── 254  scheduler performance — the gaps 235 left: wake churn, the one-carrier cost, fan-in across carriers
-    │        254.4 (switch follow-ups from 250), 254.5 (from 104.5); waits on 237
+    │        254.4 (switch follow-ups from 250), 254.7 (small jobs spreading, from 237)
     ├── 268  compiled-once performance — a benchmark set first, then the dictionary, buffers and barriers
     ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
     │        complements 179 (value-level GC classification)
@@ -49,8 +48,9 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
     └── 217  build graph granularity — sliced keys, scheduler (staged jobs deferred)  (dev-productivity)
 ```
 
-**Where we are:** next is [237](tasks/237-handoff-primitives.md) (handoff primitives), which starts with a
-decision on the primitive. binary-trees at depth 21 runs in 3.1 s at 445 MB against Go's 5.0 s and 224 MB;
+**Where we are:** [237](tasks/237-handoff-primitives.md) (handoffs in the runtime) is done: a fiber hop on 8
+carriers takes 28 ns (65 before) and a channel hop 58 ns at a tenth of the CPU, and the design is in
+`runtime.md` §1.1. Next is [194](tasks/194-gc-frame-metadata.md)'s implementation. binary-trees at depth 21 runs in 3.1 s at 445 MB against Go's 5.0 s and 224 MB;
 Richards runs 693 ms against Go's 486. [262](tasks/262-collector-gaps.md) (collector gaps, paused at 262.5.3)
 compares compilers through [257](tasks/257-toolchain-version-manager.md)'s snapshots. The stack policies (growth,
 starting sizes, shrinking, pool sizes) wait in [258](tasks/258-runtime-policy-tuning.md) for real programs to
@@ -58,10 +58,9 @@ tune against, and the libc-or-own choices in [259](tasks/259-libc-or-own-per-rou
 
 **Order of the next run:** language functionality before performance work, so the benchmark measures the
 language as designed and tuning is not redone after features land. Functionality:
-[237](tasks/237-handoff-primitives.md) (handoff primitives, once its primitive is decided), then
 [194](tasks/194-gc-frame-metadata.md)'s implementation, and [269](tasks/269-generic-language-features.md)'s
 features as each is agreed. Performance: [254](tasks/254-scheduler-performance.md),
-which tunes the paths preemption and 237 change, then
+which tunes the paths preemption and 237 changed, then
 [268](tasks/268-compiled-once-performance.md),
 [182](tasks/182-cross-module-inlining.md) and [262](tasks/262-collector-gaps.md). All come before the benchmark
 against Go and Swift.

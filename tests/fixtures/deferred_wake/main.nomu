@@ -1,0 +1,114 @@
+// The deferred wake (`runtime/scheduler.nomu`). A readying that fills its carrier's empty slot owes its wake: a park drops it
+// (the readied fiber runs here next), and a readier that keeps running pays it at its next stop. Three shapes:
+//   pingpong  two fibers hand a counter back and forth; every readying is followed by a park
+//   spin      the main fiber sends to a parked receiver, then spins until the receiver has run, never parking:
+//             only the paid wake brings another carrier to take the receiver, so with preemption off
+//             (`preempt: 0`) a lost wake hangs the run
+//   task      a task's end readies its joiner
+// Prints each shape's count of rounds that checked out.
+
+fun bounce(from: Channel<Int>, to: Channel<Int>) {
+  var open = true
+  while open {
+    switch from.receive() {
+    case .some(let v):
+      if v == 0 {
+        open = false
+      }
+      to.send(v)
+    case .none:
+      open = false
+    }
+  }
+}
+
+fun pingpong(n: Int) -> Int {
+  let a = Channel<Int>.make(capacity: 0)
+  let b = Channel<Int>.make(capacity: 0)
+  fiber bounce(a, b)
+  var ok = 0
+  var i = 1
+  while i <= n {
+    a.send(i)
+    switch b.receive() {
+    case .some(let v):
+      if v == i {
+        ok += 1
+      }
+    case .none:
+      ok = ok - 1
+    }
+    i += 1
+  }
+  a.send(0)
+  b.receive()
+  return ok
+}
+
+// Store each value received into `flag` until 0.
+fun mark(from: Channel<Int>, flag: RawPtr) {
+  var open = true
+  while open {
+    switch from.receive() {
+    case .some(let v):
+      flag.atomicStore(v, toByteOffset: 0)
+      if v == 0 {
+        open = false
+      }
+    case .none:
+      open = false
+    }
+  }
+}
+
+fun spin(rounds: Int) -> Int {
+  let flag = RawPtr.alloc(bytes: 8, align: 8)
+  flag.atomicStore(-1, toByteOffset: 0)
+  let ch = Channel<Int>.make(capacity: 0)
+  fiber mark(ch, flag)
+  var ok = 0
+  var r = 1
+  while r <= rounds {
+    ch.send(r)
+    var spins = 0
+    while flag.atomicLoad(fromByteOffset: 0) != r {
+      spins += 1
+    }
+    if spins >= 0 {
+      ok += 1
+    }
+    r += 1
+  }
+  ch.send(0)
+  return ok
+}
+
+fun leaf(x: Int) -> Int {
+  return x * 2
+}
+
+fun tasks(n: Int) -> Int {
+  var ok = 0
+  var i = 0
+  while i < n {
+    let t = task leaf(x: i)
+    if t.join() == i * 2 {
+      ok += 1
+    }
+    i += 1
+  }
+  return ok
+}
+
+fun main() {
+  let p = pingpong(n: 10000)
+  let s = spin(rounds: 200)
+  let t = tasks(n: 1000)
+  print("pingpong ")
+  print(p)
+  print(" spin ")
+  print(s)
+  print(" task ")
+  print(t)
+  print("\n")
+}

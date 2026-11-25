@@ -1,4 +1,4 @@
-// Stop-the-world while fibers are in the runtime's own code, which has no stops (task 236.8). Four workers run
+// Stop-the-world while fibers are in the runtime's own code, which has no stops. Four workers run
 // rounds through runtime paths with live objects in hand: small-object allocation (TLAB refills), an array of
 // objects grown by append (growth copies, then a large object), a fresh fiber recursing with an object in
 // every frame (its stack grows by moves), and messages handed back and forth over a channel. A requester asks

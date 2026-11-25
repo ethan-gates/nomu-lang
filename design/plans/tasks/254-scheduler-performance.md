@@ -1,8 +1,8 @@
 # Scheduler performance: the gaps left after the run queues
 
 **Avenue:** Risk (the "better than Go" concurrency thesis) · **Type/Lifecycle:** `perf · issue defined` ·
-**Size:** M · **Status:** issue defined; waits on [236](236-fiber-preemption.md) and
-[237](237-handoff-primitives.md) ([250](250-fiber-task-surface.md) and [104](104-fiber-stack-strategy.md) are done) ·
+**Size:** M · **Status:** issue defined; ready: [236](236-fiber-preemption.md), [237](237-handoff-primitives.md),
+[250](250-fiber-task-surface.md) and [104](104-fiber-stack-strategy.md) are done ·
 **Source:** [235](235-scheduler-run-queues.md)
 (235.4.2, 235.7, 235.8)
 
@@ -37,9 +37,10 @@ is about to change, so this task comes after them:
 - **[236](236-fiber-preemption.md), preemption.** It decides the stop points (loop polls kept and strip-mined,
   function-entry polls, or signals), which 254.3's deferred wake fires at, and adds a check to the poll or the
   entry that every handoff pays. Its monitor and slices also change when a carrier gives up a fiber.
-- **[237](237-handoff-primitives.md), handoff primitives.** A direct switch from a readier to the fiber it
+- **[237](237-handoff-primitives.md), handoff primitives (done).** A direct switch from a readier to the fiber it
   readies skips the run queue, the pick and the wake, which is most of what 254.1 measures, and changes which
-  carrier a handed-off fiber runs on, which 254.2's steals depend on.
+  carrier a handed-off fiber runs on, which 254.2's steals depend on. 237 also removed the clock read from every
+  pick and switch (`runtime.md` §1.1).
 - **[250](250-fiber-task-surface.md), the fiber and task surface, through 250.8 (done).** 250.3 replaces the join with
   a `Task` over a one-shot channel (the spawn and join that `forkjoin_fiber` measures); 250.5 adds `select`,
   whose waiters change how a channel operation parks and wakes, and with it [135](135-cancellation-continuations.md)'s
@@ -76,7 +77,7 @@ not close here if other planned work is expected to close it; record the expecta
   work only elsewhere search (look once a microsecond) instead of stealing at once; no change, since the steals
   come from the pick itself. Untried: a steal policy that leaves a just-readied fiber to its owner (Go's
   `runqsteal` takes `runnext` only after 3 µs, but not the ring), or a cheaper cross-carrier handoff.
-- **254.3** Wake churn (from 235.4.2, set aside there). On several carriers nearly every wake is wasted: the
+- **254.3** Wake churn (from 235.4.2, set aside there). **Moved to [237](237-handoff-primitives.md)**, which builds the deferred wake below with a direct switch at park. On several carriers nearly every wake is wasted: the
   readied fiber runs on the readier's carrier moments later, the woken carrier searches its window, finds
   nothing and sleeps, and the next readying wakes another, a system call on the readier's path each time. Go's
   `wakep` does the same, which is why `go chan` sits near 100 ns on 8.
@@ -142,6 +143,12 @@ not close here if other planned work is expected to close it; record the expecta
   neither acknowledges a stop-the-world nor can be handed off. The wait is short because a lock holder never
   stops while holding a runtime lock. Parking the contending fiber instead (a fiber-aware lock) frees the
   carrier; measure contended channel and select workloads first.
+- **254.7** Small jobs spreading from one actor on 8 carriers (from [237](237-handoff-primitives.md) 237.4).
+  `fanout_actor`'s 10-work round is 4% slower than before 237 in steady state (a variant repeating it 300 times:
+  254 against 244 ns a job), up to 19% on the single round that follows the no-work round, where idle carriers
+  ramp up. Since 237 a searcher ages another carrier's slot from a first-seen word its observers stamp
+  (`rtSlotSeen`), where the carrier once stamped its own switch-in. Count wakes, searches and slot takes on both
+  compilers during the ramp, as 237.4 did for `stream_channel`.
 
 ## Refs
 

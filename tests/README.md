@@ -138,7 +138,8 @@ setting at the wrong stage, is an error. Compile settings select configs declare
   `stack_stats` (stack moves and shrink passes, with their bytes and time, printed to stderr at exit,
   `NOMU_STACK_STATS`),
   `stack_start` (a new fiber's stack size in bytes, `NOMU_STACK_START`), `stack_max` (the size past which
-  a fiber's stack does not grow, `NOMU_STACK_MAX`).
+  a fiber's stack does not grow, `NOMU_STACK_MAX`), `preempt` (`0` turns off the monitor, `NOMU_PREEMPT`),
+  `defer_wake` (`0` makes every readying into the slot wake a carrier at once, `NOMU_DEFER_WAKE`).
 
 `--run-setting name=value` adds a run setting to every run of the selection, over each case's own: for
 example `--run-setting stack_move=1` runs the whole suite moving stacks. `--compile-setting name=value` adds a

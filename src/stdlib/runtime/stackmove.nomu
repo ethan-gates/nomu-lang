@@ -216,6 +216,9 @@ fun nomuSchedStackCheck(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int, need: In
   var state = 5
   if room < 0 {
     state = rtCheckRequest(self, need)
+    if state < 0 {
+      rtSchedSettleWake(self)                   // with no move the reserve is free; otherwise the carrier pays it
+    }
   }
   // Stop here: for a stop-the-world, in state 4 holding the scheduler lock, as nomuSchedSafepoint does; to yield,
   // ready (state 0) holding the lock, for the carrier to queue (rtSchedYieldPreempted); to have the stack moved,
@@ -230,7 +233,7 @@ fun nomuSchedStackCheck(sched: RawPtr, anchorSp: RawPtr, anchorPc: Int, need: In
       rtSchedLock(sched)
     }
     self.store(state.uint8, toByteOffset: 8)
-    Runtime.ctxSwitch(from: self, to: self.advanced(by: 72), message: -1 - room)
+    rtSchedResumed(Runtime.ctxSwitch(from: self, to: self.advanced(by: 72), message: -1 - room))
     // resumes without the scheduler lock
   }
 }

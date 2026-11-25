@@ -26,7 +26,8 @@ Usage:
                       [--json out.json]
   tools/schedbench.py --list        the configurations and their settings
 
-Needs the built `nomu` (`bazel build -c opt //src/nomu-cli:nomu`).
+Needs the built `nomu` (`bazel build -c opt //src/nomu-cli:nomu`), or SCHEDBENCH_NOMU naming another compiler
+(a kept copy, for a before/after comparison).
 """
 
 import json
@@ -38,7 +39,8 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NOMU = os.path.join(ROOT, "bazel-bin", "src", "nomu-cli", "nomu")
+# The compiler to build with: SCHEDBENCH_NOMU overrides the built one, to measure a kept older compiler.
+NOMU = os.environ.get("SCHEDBENCH_NOMU", os.path.join(ROOT, "bazel-bin", "src", "nomu-cli", "nomu"))
 
 # name -> its NOMU_* settings; anything unset keeps the runtime's default.
 CONFIGS = {
@@ -50,6 +52,9 @@ CONFIGS = {
     "search-50us": {"NOMU_SEARCH_NS": "50000"},
     "heavy": {"HEAVY": "1"},
     "no-preempt": {"NOMU_PREEMPT": "0"},
+    "no-defer-wake": {"NOMU_DEFER_WAKE": "0"},
+    "no-direct": {"NOMU_DIRECT_SWITCH": "0"},
+    "neither": {"NOMU_DEFER_WAKE": "0", "NOMU_DIRECT_SWITCH": "0"},
 }
 DEFAULT_CONFIGS = ["default", "no-slot"]
 

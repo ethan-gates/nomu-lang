@@ -28,19 +28,27 @@ let rtGcVerify = rtPositive(rtEnvGcVerify()) > 0
 let rtCarrierCount = rtEnvCarrierCount()
 // NOMU_SLOT: 0 turns off the run-queue slot (rtSchedReadyNext readies onto the run queue instead); on unless set.
 let rtSlotOn = rtEnvSlot()
-// NOMU_SLOT_STEAL_NS: how long a carrier's current fiber must have run before a searcher may take the fiber
-// waiting in its slot; 3000 unless set. NOMU_SLICE_NS: how long a chain of fibers handed through one
-// carrier's slot runs before the next one goes to the back of the run queue; 1 ms unless set. Both are
-// kept in ticks (`Runtime.ticks()`). NOMU_GLOBAL_CHECK: a carrier takes from the run queue before its slot
-// every this many picks; 61 unless set.
+// NOMU_SLOT_STEAL_NS: how long a searcher sees a carrier go without a switch before it takes the fiber waiting in
+// that carrier's slot (rtSlotAged); 3000 unless set, kept in ticks (`Runtime.ticks()`). NOMU_SLICE_NS: the slice,
+// which sets the monitor's shortest period (a quarter of it), so a run, a fiber or a chain of fibers handed
+// through one carrier's slot, gives the carrier up within a period or two of it while work waits; 1 ms unless
+// set. NOMU_GLOBAL_CHECK: a carrier takes from the run queue before its slot every this many picks; 61 unless
+// set.
 let rtSlotStealTicks = rtNanosToTicks(rtEnvSlotStealNanos())
-let rtSliceTicks = rtNanosToTicks(rtEnvSliceNanos())
 let rtGlobalCheck = rtEnvGlobalCheck()
 // NOMU_SEARCH_NS: how long a woken carrier searches before sleeping again; 20000 unless set.
 let rtSearchNanos = rtEnvSearchNanos()
 // NOMU_PREEMPT: 0 turns off preemption (the monitor, `scheduler.nomu`); on unless set. The monitor's shortest
 // period is a quarter of the slice (NOMU_SLICE_NS), in microseconds, at least 50.
 let rtPreemptOn = rtEnvPreempt() != 0
+// NOMU_DEFER_WAKE: how many of the readier's stops a wake owed for the slot's fiber waits out before it is paid
+// (the deferred wake, `scheduler.nomu`); 0 makes every readying into the slot wake a carrier at once (Go's
+// `wakep`). 3 unless set: the fewest that a send then a receive passes before it parks, so a handoff drops its wake.
+let rtDeferStops = rtEnvDeferWake()
+let rtDeferWakeOn = rtDeferStops > 0
+// NOMU_DIRECT_SWITCH: 0 makes a parking fiber always switch back to its carrier, in place of switching straight
+// into the fiber in its carrier's slot (the direct switch, `scheduler.nomu`); on unless set.
+let rtDirectOn = rtEnvDirectSwitch() != 0
 let rtMonitorMinMicros = rtMonitorMin(rtEnvSliceNanos())
 
 // The scheduler.
@@ -287,6 +295,16 @@ fun rtEnvSlotStealNanos() -> Int {
 fun rtEnvSliceNanos() -> Int {
   let name = RawPtr.alloc(bytes: 32, align: 8)
   return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_SLICE_NS")), 1000000)
+}
+
+fun rtEnvDirectSwitch() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_DIRECT_SWITCH")), 1)
+}
+
+fun rtEnvDeferWake() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_DEFER_WAKE")), 3)
 }
 
 fun rtEnvPreempt() -> Int {

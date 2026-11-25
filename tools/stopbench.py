@@ -9,7 +9,7 @@ runs of that run's p50, p99 and max, in µs.
 
   mode 0  busy fibers in call-free loops (a poll every iteration)
   mode 1  busy fibers in recursion with no loop and no allocation (a stop waits out the call)
-  modes 2-6 keep the busy fibers in the runtime's own code, which has no stops (task 236.8):
+  modes 2-6 keep the busy fibers in the runtime's own code, which has no stops:
   mode 2  small objects (TLAB refills, minor collections)
   mode 3  large arrays built by append (growth copies, large objects)
   mode 4  a fresh fiber recursing --depth frames (stack moves)

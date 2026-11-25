@@ -34,7 +34,8 @@ the differential oracle, exactly the method the GC ladder uses (`NOMU_GC_PLAN=no
 
 **Siblings:** the concurrency *model* this realizes (park/unpark/current, actors, structured concurrency,
 cancellation) is `concurrency.md`; the runtime *mechanism* it replaces (scheduler model, wakeup feeders,
-cross-thread resume, GC touchpoints, and the as-built C scheduler, §8) is `runtime.md`; the subset rules
+cross-thread resume, GC touchpoints, the run-queue and wake policy as built in §1.1, and the as-built C
+scheduler, §8) is `runtime.md`; the subset rules
 it is written under are `runtime-subset.md` (149); the raw-memory primitives it shares with the GC are
 `unsafe-memory.md` (125); the GC-side root-scanning pieces that couple to the carrier machinery are
 `selfhosted-gc.md` §9 and task 128.3.
@@ -234,7 +235,10 @@ terminal rung and lives under 128.3 because it is inherited from the GC ladder.
    back to the carrier while holding it, so its context is fully saved before any waker (which must hold
    the same lock to enqueue) can re-queue it. `park`/`parkLocked`, `unpark`/`unparkLocked`, `joinFiber`
    (check+register+park under the lock, closing the join lost-wakeup window), and the `fiberMain`
-   completion path are all threaded through it. Added one substrate primitive — `RawPtr.atomicExchange`
+   completion path are all threaded through it. Since [237](../plans/tasks/237-handoff-primitives.md), a
+   fiber parking under this handoff with a fiber in its carrier's slot switches straight into that fiber and
+   hands the lock to it, which releases it at its resume point as it would from the carrier
+   (`rtSchedDirectTarget`, `runtime.md` §1.1). Added one substrate primitive — `RawPtr.atomicExchange`
    (`__atomicExchange`, LLVM `atomicrmw xchg`, the mutex's swap), covered directly in `tools/atomics.sh`.
    Four scenarios green (`tools/scheduler-lock.sh`, `tests/fixtures/scheduler_lock.nomu`): spawn/run/complete=6,
    park/unpark=111, join=42, and a **parking-heavy relay** (two fibers bounce a token 1000 rounds each,
@@ -452,8 +456,11 @@ C-runtime shim (`tools/sysclock.sh`).
 
 ## 5. What this ladder excludes (deferred)
 
-- **Work-stealing** — single shared run queue first (as the C scheduler does); per-carrier queues +
-  stealing are a later throughput rung (`runtime.md` §1, M4.3c).
+- **Work-stealing** — single shared run queue first (as the C scheduler does). **Built since**, past this
+  ladder: per-carrier run queues and a slot, stealing, Go's wake policy, the deferred wake and the direct
+  switch at park ([234](../plans/tasks/234-scheduler-wake-and-pool.md),
+  [235](../plans/tasks/235-scheduler-run-queues.md), [237](../plans/tasks/237-handoff-primitives.md));
+  the policy as built is `runtime.md` §1.1.
 - **Contiguous stack growth** — fixed 128 KB fiber stacks first; copy-on-grow rides
   [104](../plans/tasks/104-fiber-stack-strategy.md) and the dynamic spawn group
   ([103](../plans/tasks/103-dynamic-spawn-group.md)), `runtime.md` §1.

@@ -8,7 +8,7 @@
 // the end of a collection (evacuation may relocate a carrier's current block).
 
 // ---- The carrier record ----
-// One 256-byte record per carrier, behind the carrier-local slot (`Runtime.carrierLocal()`):
+// One record per carrier, behind the carrier-local slot (`Runtime.carrierLocal()`):
 //   0  TLAB (64 bytes): cursor @0, limit @8, block @16, line @24, stressLimit @32, stressBytes @40,
 //      allocObjects @48, allocBytes @56. Cursor and limit are addresses (0 when there is no hole); under
 //      NOMU_GC_STRESS the hole end lives in stressLimit and limit stays 0, so the inline bump always misses.
@@ -18,8 +18,9 @@
 //   72 the mod-buffer (24 bytes): count @72, cap @80, storage @88
 //   96 the next record in the registry
 //   104 the run-queue slot: a fiber readied by this carrier's running fiber, to run next here (rtSchedReadyNext)
-//   112 when this carrier switched into its current fiber, in ticks (a searcher ages the slot by it)
-//   120 when this carrier's current slice began, in ticks (fibers taken from the slot inherit it)
+//   112 how many runs this carrier has started: switch-ins that begin a slice, not a fiber taken from the slot,
+//       which inherits its readier's slice (rtSchedFind); the monitor ages a run by it
+//   120 the run count the monitor saw at its last tick (the monitor's own)
 //   128 the local run queue's head (taken by the owner and by stealers) · 136 its tail (written by the owner)
 //   144 its ring of rtRunqSize fibers, null on a thread that runs no scheduler loop (rtRunqInit)
 //   152 when this carrier's search window ends, in ns (0 when it is not searching)
@@ -30,11 +31,16 @@
 //   192 this carrier's actor message free lists, or null until it sends or frees a message (rtMsgCache)
 //   200 how many fibers this carrier has switched in (rtSchedArm); the monitor reads it
 //   208 the fiber the monitor asks to yield, or null (rtSchedMonitorMain)
-//   216 the switch count the monitor saw at its last tick · 224 the fiber it saw running (the monitor's own)
+//   216 the switch count the monitor saw at its last tick (the monitor's own)
+//   224 the carrier this one, searching, last looked at (rtSlotSeen) · 264 the first-seen word that look would write
 //   232 whether the running fiber is in C (rtEnterC): 0 no · 1 yes · 4g + 2 yes, claimed by stop-the-world g;
 //       a parked spare is in C too (rtSchedRetire)
 //   240 handoff (task 270.3): 0 a carrier · 1 handed off, to retire once its fiber leaves · 2 a parked spare
-// The TLAB sits at offset 0, so a record is its own TLAB pointer, and it fills the first cache line alone.
+//   248 the deferred wake (`scheduler.nomu`): in the low 16 bits the stops an owed wake for the slot's fiber has
+//       left (0 for none), above them how many readyings wake at once
+//   256 the first-seen word (rtSlotSeen): the switch count's low 16 bits, and above them when an observer first
+//       saw that count, in ticks; written by observers, never by this carrier's switches
+// 320 bytes, so the first-seen word's line, which observers write, holds nothing else. The TLAB sits at offset 0, so a record is its own TLAB pointer, and it fills the first cache line alone.
 // A record lives for the whole process. The registry is a list of every record, pushed with one CAS at bind
 // and walked under stop-the-world, and by searching carriers looking at slots (records are never removed,
 // so that walk needs no lock).
@@ -58,7 +64,7 @@ fun rtCarrierRandom() -> Int {
 // Create this thread's carrier record, register it, and store it in the carrier-local slot. Every carrier
 // binds on entry to its loop; the allocation and barrier slow paths bind a thread that has no record.
 fun rtCarrierBind() -> RawPtr {
-  let rec = RawPtr.alloc(bytes: 256, align: 64)
+  let rec = RawPtr.alloc(bytes: 320, align: 64)
   rec.store(-1, toByteOffset: 16)            // no current block: the first allocation refills
   let cap = 4096
   rec.store(cap, toByteOffset: 80)
@@ -75,6 +81,10 @@ fun rtCarrierBind() -> RawPtr {
   rec.store(RawPtr.null, toByteOffset: 176)
   rec.store(RawPtr.null, toByteOffset: 184)
   rec.store(RawPtr.null, toByteOffset: 192)
+  rec.store(RawPtr.null, toByteOffset: 224)
+  rec.store(0, toByteOffset: 248)
+  rec.store(65535, toByteOffset: 256)                      // a count no switch has made yet
+  rec.store(0, toByteOffset: 264)
   var done = false
   while !done {
     let old: Int = rtCarriers.atomicLoad(fromByteOffset: 0)
@@ -244,7 +254,7 @@ fun rtSelfhostOom(trigger: Int, anchorOff: Int, anchorPc: Int) -> Bool {
   rtSchedLock(sched)
   rtGcRaise(sched, 0, trigger)                    // a major
   self.store(4.uint8, toByteOffset: 8)                // safepoint-stopped; the carrier acks + waits, then resumes us
-  Runtime.ctxSwitch(from: self, to: self.advanced(by: 72))   // resumes without the scheduler lock
+  rtSchedResumed(Runtime.ctxSwitch(from: self, to: self.advanced(by: 72)))   // resumes without the scheduler lock
   // Retry-worthy iff the heap is not completely full after the collection: any free block suffices for a
   // non-LOS allocation (a hole is at most one block). Checking `> 0` rather than a before/after delta avoids
   // a false OOM when a concurrent carrier grabs the reclaimed blocks first — genuine OOM is a heap that a full
@@ -269,7 +279,7 @@ fun rtSelfhostMinorGc(trigger: Int, anchorOff: Int, anchorPc: Int) -> Bool {
   rtSchedLock(sched)
   rtGcRaise(sched, 1, trigger)                    // a minor, unless a major is already pending
   self.store(4.uint8, toByteOffset: 8)                // safepoint-stopped; the carrier acks + waits, then resumes us
-  Runtime.ctxSwitch(from: self, to: self.advanced(by: 72))   // resumes without the scheduler lock
+  rtSchedResumed(Runtime.ctxSwitch(from: self, to: self.advanced(by: 72)))   // resumes without the scheduler lock
   return true
 }
 

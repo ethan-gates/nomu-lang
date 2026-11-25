@@ -1,0 +1,70 @@
+// A chain of handoffs shares its carrier. A pair hands a counter back and forth over unbuffered channels;
+// every hop is a park that switches straight into the partner, which inherits the run, so no hop goes through the
+// carrier's queue. After 1,000 hops the pair starts a compute fiber and keeps handing off until it finishes. On one
+// carrier the compute fiber runs only if the monitor ends the chain's run once it holds the carrier past its slice
+// while work waits; if it never did, the pair would hand off forever and the program would not end.
+
+fun bounce(from: Channel<Int>, to: Channel<Int>) {
+  var open = true
+  while open {
+    switch from.receive() {
+    case .some(let v):
+      to.send(v + 1)
+      if v < 0 {
+        open = false
+      }
+    case .none:
+      open = false
+    }
+  }
+}
+
+fun pair(done: RawPtr) -> Int {
+  let a = Channel<Int>.make(capacity: 0)
+  let b = Channel<Int>.make(capacity: 0)
+  fiber bounce(a, b)
+  var hops = 0
+  var started = false
+  while done.atomicLoad(fromByteOffset: 0) == 0 {
+    if hops >= 1000 && started == false {
+      fiber compute(done)
+      started = true
+    }
+    a.send(hops)
+    switch b.receive() {
+    case .some(let v):
+      hops = v
+    case .none:
+      hops = -1
+    }
+  }
+  a.send(-5)
+  b.receive()
+  return hops
+}
+
+fun compute(done: RawPtr) {
+  var x = 1
+  var i = 0
+  while i < 50000000 {
+    x = x * 6364136223846793005 + 1442695040888963407
+    i += 1
+  }
+  if x != 0 {
+    done.atomicStore(1, toByteOffset: 0)
+  } else {
+    done.atomicStore(2, toByteOffset: 0)
+  }
+}
+
+fun main() {
+  let done = RawPtr.alloc(bytes: 8, align: 8)
+  done.atomicStore(0, toByteOffset: 0)
+  let p = task pair(done: done)
+  let hops = p.join()
+  if hops > 1000 && done.atomicLoad(fromByteOffset: 0) == 1 {
+    print("fair\n")
+  } else {
+    print("unfair\n")
+  }
+}

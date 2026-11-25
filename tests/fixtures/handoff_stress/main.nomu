@@ -1,0 +1,119 @@
+// Handoffs under stops, steals and stack moves. Eight pairs of fibers, more than there are carriers,
+// hand messages (managed objects) back and forth over unbuffered channels, so most hops are a park that switches
+// straight into the partner (the direct switch) while searchers on other carriers race for the slot. Every 50th
+// hop the receiving side recurses 3,000 frames with an object in each, so a fiber that was just switched in grows
+// its stack by a move. Each round starts fresh fibers, whose stacks start small. A requester asks for minor
+// collections back to back until every pair is done, so stops land in the middle of handoff chains and move
+// the messages in flight. Each pair counts the hops whose value checked out; the program prints the total.
+// Built with `test.runtime_prelude` (for `rtGcRequest`).
+class Box {
+  var v: Int
+}
+
+// A channel's message: shareable, so deeply immutable.
+class Msg {
+  let v: Int
+  let prev: Option<Msg>
+}
+
+// 0 + 1 + … + n, a Box per frame live across the call below it.
+fun down(n: Int, b: Box) -> Int {
+  if n == 0 {
+    return b.v
+  }
+  let c = Box(v: b.v + 1)
+  return b.v + down(n - 1, c)
+}
+
+// Answer each message with its value plus one, until a message of -1.
+fun answer(from: Channel<Msg>, to: Channel<Msg>) {
+  var open = true
+  var hops = 0
+  while open {
+    switch from.receive() {
+    case .some(let m):
+      hops += 1
+      var extra = 0
+      if hops % 50 == 0 {
+        extra = down(3000, Box(v: 0)) - 3000 * 3001 / 2
+      }
+      to.send(Msg(v: m.v + 1 + extra, prev: .some(m)))
+      if m.v < 0 {
+        open = false
+      }
+    case .none:
+      open = false
+    }
+  }
+}
+
+fun ask(n: Int) -> Int {
+  let a = Channel<Msg>.make(capacity: 0)
+  let b = Channel<Msg>.make(capacity: 0)
+  fiber answer(a, b)
+  var ok = 0
+  var i = 0
+  while i < n {
+    a.send(Msg(v: i, prev: .none))
+    switch b.receive() {
+    case .some(let m):
+      var back = 0
+      switch m.prev {
+      case .some(let p):
+        back = p.v
+      case .none:
+        back = -1
+      }
+      if m.v == i + 1 && back == i {
+        ok += 1
+      }
+    case .none:
+      ok = ok - 1
+    }
+    i += 1
+  }
+  a.send(Msg(v: -1, prev: .none))
+  b.receive()
+  return ok
+}
+
+// `pairs` pairs at once, joined.
+fun round(pairs: Int, n: Int) -> Int {
+  if pairs == 0 {
+    return 0
+  }
+  let t = task ask(n: n)
+  let rest = round(pairs: pairs - 1, n: n)
+  return rest + t.join()
+}
+
+fun requester(st: RawPtr) -> Int {
+  var made = 0
+  while st.atomicLoad(fromByteOffset: 0) == 0 {
+    let ticket = rtGcRequest(1)
+    while !rtGcCollected(ticket) {
+      made = made + 0
+    }
+    made += 1
+  }
+  return made
+}
+
+fun main() {
+  let st = RawPtr.alloc(bytes: 8, align: 8)
+  st.atomicStore(0, toByteOffset: 0)
+  let req = task requester(st: st)
+  var total = 0
+  var r = 0
+  while r < 5 {
+    total = total + round(pairs: 8, n: 1000)
+    r += 1
+  }
+  st.atomicStore(1, toByteOffset: 0)
+  let made = req.join()
+  print(total)
+  if made > 0 {
+    print(" collected")
+  }
+  print("\n")
+}

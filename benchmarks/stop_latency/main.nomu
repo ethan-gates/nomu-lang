@@ -7,7 +7,7 @@ import std/time
 //   0  call-free loops, which reach a poll every iteration (the case polls cover)
 //   1  recursion with no loop and no allocation, which reaches no poll inside it (the gap 236.4 closes); the
 //      loop around it polls, since the recursion reaches no stop, so a stop waits out one call
-// Modes 2 to 6 keep the busy fibers in the runtime's own code, which has no stops (task 236.8):
+// Modes 2 to 6 keep the busy fibers in the runtime's own code, which has no stops:
 //   2  small objects: TLAB bumps, refills and the minor collections they trigger
 //   3  large arrays built by append: each growth copies the buffer, and past a block it is a large object
 //   4  deep stacks: a fresh fiber recurses STOP_DEPTH frames (default 100,000), so its stack grows by moves

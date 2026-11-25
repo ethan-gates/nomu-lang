@@ -45,6 +45,15 @@ or the first real Nomu programs. The collector should be the one being benchmark
   - a soft limit below the maximum that the policy collects harder to stay under, with a cap on collection
     CPU past which the heap exceeds it, as Go's `GOMEMLIMIT` does.
 
+- **258.7 The slot's steal age.** A searcher takes the fiber in another carrier's slot once that carrier has gone
+  `NOMU_SLOT_STEAL_NS` without a switch (`rtSlotAged`, [237](237-handoff-primitives.md).4); 3 µs, Go's. A direct
+  handoff parks within tens of ns, so 1 µs is the candidate: on 237.4's runs it took `producer_fiber`'s stranded wait
+  from 8 / 12–14 to 7 / 10–12 µs (p50 / p99) and `stream_channel`'s CPU on 8 carriers from 831 to 435 ms, with
+  ping-pong unchanged. What it would cost is unmeasured: a readier that works 1–3 µs after readying, then parks,
+  would lose the fiber to another carrier, splitting the pair across cores. Measure on a workload of that shape
+  (work of 0.5 to 5 µs between readying and parking) and on server workloads once networking
+  ([255](255-networking.md)) exists, where such readiers are common.
+
 Other runtime policies join this task when their owners reach the point of tuning on workloads.
 
 ## Relations

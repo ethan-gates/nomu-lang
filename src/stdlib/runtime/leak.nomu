@@ -367,5 +367,5 @@ fun rtLeakAtExit(sched: RawPtr) {
   sched.atomicStore(1, toByteOffset: 200)
   rtGcRaise(sched, 1, 5)
   self.store(4.uint8, toByteOffset: 8)
-  Runtime.ctxSwitch(from: self, to: self.advanced(by: 72))    // resumes without the scheduler lock
+  rtSchedResumed(Runtime.ctxSwitch(from: self, to: self.advanced(by: 72)))    // resumes without the scheduler lock
 }

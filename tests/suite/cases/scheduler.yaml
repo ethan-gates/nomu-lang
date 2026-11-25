@@ -214,3 +214,78 @@ cases:
       - 2
     iterations: 5
     timeout_sec: 20
+
+  # The deferred wake: a readying into the slot owes its wake, a park drops it, and a readier that
+  # keeps running pays it at its next stop. With preemption off, only the paid wake gets the receiver of the
+  # `spin` shape run, so a lost wake hangs the run; on one carrier that shape needs preemption.
+  - name: deferred-wake
+    fixture: tests/fixtures/deferred_wake
+    expect:
+      stdout: "pingpong 10000 spin 200 task 1000\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+      - 8
+    iterations: 3
+    timeout_sec: 30
+
+  - name: deferred-wake-no-preempt
+    fixture: tests/fixtures/deferred_wake
+    run_settings:
+      preempt: "0"
+    expect:
+      stdout: "pingpong 10000 spin 200 task 1000\n"
+    carriers:
+      - 2
+      - 4
+      - 8
+    iterations: 5
+    timeout_sec: 30
+
+  # The direct switch: handoff chains under back-to-back collections, steals of the slot, and stack
+  # moves of a fiber just switched in. Each hop's value and the message it answers are checked.
+  - name: handoff-stress
+    fixture: tests/fixtures/handoff_stress
+    compile_settings:
+      rt_prelude: true
+    expect:
+      stdout: "40000 collected\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+      - 8
+    iterations: 3
+    timeout_sec: 60
+    collections:
+      - kind: minor
+        trigger: "program request"
+        min: 1
+
+  - name: handoff-stress-no-preempt
+    fixture: tests/fixtures/handoff_stress
+    compile_settings:
+      rt_prelude: true
+    run_settings:
+      preempt: "0"
+    expect:
+      stdout: "40000 collected\n"
+    carriers:
+      - 2
+      - 4
+      - 8
+    iterations: 3
+    timeout_sec: 60
+
+  # A chain of handoffs is one run: on one carrier the monitor ends it once it holds the carrier past
+  # its slice while a compute fiber waits. Without that the pair hands off forever and the run times out.
+  - name: handoff-fair
+    fixture: tests/fixtures/handoff_fair
+    expect:
+      stdout: "fair\n"
+    carriers:
+      - 1
+      - 2
+    iterations: 3
+    timeout_sec: 20

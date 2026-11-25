@@ -68,13 +68,15 @@ fun consumer(st: RawPtr, me: Int) -> Int {
             let now = Time().now
             rtSchedLock(sched)
             let stamp: Int = st.load(fromByteOffset: 72 + 8 * me)
+            rtSchedUnlock(sched)
             if stamp != 0 {
                 let off = 256 + 8 * bucket(v: now - stamp)
+                rtSchedLock(sched)
                 let c: Int = st.load(fromByteOffset: off)
                 st.store(c + 1, toByteOffset: off)
+                rtSchedUnlock(sched)
                 n += 1
             }
-            rtSchedUnlock(sched)
         }
     }
     return n
@@ -86,6 +88,7 @@ fun producer(st: RawPtr, items: Int, work: Int) -> Int {
     var k = 0
     while k < items {
         let i = k % 8
+        let now = Time().now
         rtSchedLock(sched)
         let w: RawPtr = st.load(fromByteOffset: 8 + 8 * i)
         if w.isNull {
@@ -94,7 +97,7 @@ fun producer(st: RawPtr, items: Int, work: Int) -> Int {
             rtSchedUnlock(sched)
         } else {
             st.store(RawPtr.null, toByteOffset: 8 + 8 * i)
-            st.store(Time().now, toByteOffset: 72 + 8 * i)
+            st.store(now, toByteOffset: 72 + 8 * i)
             rtSchedReadyNext(sched, w)
             rtSchedUnlock(sched)
             rtSchedWake(sched, false)
@@ -102,10 +105,15 @@ fun producer(st: RawPtr, items: Int, work: Int) -> Int {
         x = spin(work: work, seed: x)
         k += 1
     }
+    // Each step under the lock on its own: a loop's poll and a call's entry check can yield to preemption, which
+    // takes the scheduler lock. A consumer reads the stop flag under the lock before it parks, so none parks after
+    // the flag is set, and each parked one is taken below.
     rtSchedLock(sched)
     st.store(1, toByteOffset: 0)
+    rtSchedUnlock(sched)
     var i = 0
     while i < 8 {
+        rtSchedLock(sched)
         let w: RawPtr = st.load(fromByteOffset: 8 + 8 * i)
         if w.isNull {
         } else {
@@ -114,9 +122,9 @@ fun producer(st: RawPtr, items: Int, work: Int) -> Int {
             w.store(0, toByteOffset: 168)
             rtSchedEnqueue(sched, w)
         }
+        rtSchedUnlock(sched)
         i += 1
     }
-    rtSchedUnlock(sched)
     rtSchedWake(sched, true)
     return x
 }

@@ -542,7 +542,7 @@ cases:
         min: 1
         max: 1
 
-  # Stop-the-world while fibers are in the runtime's own code (task 236.8): allocation refills, array growth,
+  # Stop-the-world while fibers are in the runtime's own code: allocation refills, array growth,
   # stack moves and channel handoffs, with collections requested back to back. Each worker prints how many of
   # its rounds checked out. On one carrier the requester's run must still be preempted though a collection
   # interrupts it every few microseconds (rtSchedRearm); before that fix it never was, and the run hung.

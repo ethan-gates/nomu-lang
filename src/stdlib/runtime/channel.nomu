@@ -101,10 +101,14 @@ fun rtChanDequeue(st: RawPtr, at: Int) -> RawPtr {
   return w
 }
 
-// Ready a parked waiter after its result is set, onto this carrier's run queue with no lock. Called without
-// the channel's lock; the waiter's carrier released it after the switch, so its context is saved.
+// Ready a parked waiter after its result is set, onto this carrier's run queue with no lock, and wake a carrier
+// for it, or owe the wake when it went into this carrier's empty slot (rtSchedOweWake). Called without the
+// channel's lock; the waiter's carrier released it after the switch, so its context is saved.
 fun rtChanWake(sched: RawPtr, fib: RawPtr) {
-  rtSchedReadyOn(sched, fib, false)
+  let slot = rtSchedReadyOn(sched, fib, false)
+  if slot && rtSchedOweWake() {
+    return
+  }
   rtSchedWake(sched, false)
 }
 
