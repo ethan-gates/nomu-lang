@@ -261,7 +261,9 @@ fun rtGcFaultReport(buf: RawPtr, n: Int) -> Int {
 //                7 scan, 8 unmark and unlog (no longer run), 9 nursery reclaim, 10 source selection, 11 prepare, 12 trace,
 //                13 sweep, 14 large-object sweep, 15 log-table clear, 16 unmark (no longer run), 17 snapshot, 18 collect
 //                (the collector's entry to its return; the rest nest in it).
-//   counters:    1 roots, 2 objects promoted, 3 remembered entries, 4 defrag sources, 5 bytes promoted; a
+//   counters:    1 roots, 2 objects promoted, 3 remembered entries, 4 defrag sources, 5 bytes promoted, 6 minor
+//                workers (the coordinator and the helpers that joined), 7 chunks shared and 8 idle sleeps in
+//                a minor's trace; a
 //                snapshot: 20 free blocks, 21 recyclable, 22 full, 23 nursery, 24 large objects, 25 blocks
 //                in the heap; since the last cycle: 30 blocks refilled, 31 large objects allocated, 32 their
 //                bytes, and at the `full` level 33 objects allocated, 34 bytes allocated (every allocation,
@@ -627,6 +629,9 @@ fun rtGcName(at: RawPtr, table: Int, id: Int) -> Int {
     else if id == 3 { n = Runtime.copyLiteral(to: at, "remembered entries") }
     else if id == 4 { n = Runtime.copyLiteral(to: at, "defrag sources") }
     else if id == 5 { n = Runtime.copyLiteral(to: at, "bytes promoted") }
+    else if id == 6 { n = Runtime.copyLiteral(to: at, "minor workers") }
+    else if id == 7 { n = Runtime.copyLiteral(to: at, "minor chunks shared") }
+    else if id == 8 { n = Runtime.copyLiteral(to: at, "minor idle sleeps") }
     else if id == 20 { n = Runtime.copyLiteral(to: at, "free blocks") }
     else if id == 21 { n = Runtime.copyLiteral(to: at, "recyclable blocks") }
     else if id == 22 { n = Runtime.copyLiteral(to: at, "full blocks") }

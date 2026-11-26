@@ -172,7 +172,8 @@ A matrix is declared once. `dimensions` names axes; each value carries `compile_
   nursery never reaches); `stress-minor` (a collection every 4 KiB); `stress-major` (the same, every
   collection major), `full`; `stress-mixed` (the same, every fourth collection major, so minors run after
   majors: `stress_major_every`; the heap verifier on: `gc_verify`), `full`; `stress-minor-verify`
-  (`stress-minor` with the heap verifier on), `full`.
+  (`stress-minor` with the heap verifier on), `full`; `stress-parallel` (`stress-minor-verify` with every minor
+  traced in parallel by every helper: `gc_parallel_min: 0`), `full`.
 
 A `group` names fixtures by a directory glob (`dir/*`, every subdirectory), the axes it spans (`across`),
 shared settings and a default `expect`. It expands to one run per fixture and combination of values, named

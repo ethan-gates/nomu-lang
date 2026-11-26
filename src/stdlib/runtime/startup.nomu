@@ -26,6 +26,13 @@ let rtGcStressCount = Runtime.staticStorage(bytes: 8, align: 8)
 let rtGcVerify = rtPositive(rtEnvGcVerify()) > 0
 // NOMU_CARRIERS: the number of carrier threads the scheduler boots with; 4 unless set to 1 or more.
 let rtCarrierCount = rtEnvCarrierCount()
+// NOMU_GC_THREADS: the most threads a minor collection traces on, the coordinator and parked carriers
+// (selfhosted-gc.md §11.7); the carriers and the coordinator unless set, at least 1 and at most that.
+let rtGcThreads = rtEnvGcThreads()
+// NOMU_GC_PARALLEL_MIN: the objects and roots a minor's coordinator handles alone before it recruits the parked
+// carriers, so a minor that ends sooner pays for no wake; 4096 unless set (about 50 µs of tracing). 0 is a stress
+// setting: every minor recruits at once, and recruits every helper.
+let rtGcParallelMin = rtEnvGcParallelMin()
 // NOMU_SLOT: 0 turns off the run-queue slot (rtSchedReadyNext readies onto the run queue instead); on unless set.
 let rtSlotOn = rtEnvSlot()
 // NOMU_SLOT_STEAL_NS: how long a searcher sees a carrier go without a switch before it takes the fiber waiting in
@@ -280,6 +287,24 @@ fun rtEnvIntOr(v: RawPtr, dflt: Int) -> Int {
     return dflt
   }
   return rtEnvParseInt(v)
+}
+
+fun rtEnvGcThreads() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  let most = rtCarrierCount + 1
+  let n = rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_GC_THREADS")), most)
+  if n < 1 {
+    return 1
+  }
+  if n > most {
+    return most
+  }
+  return n
+}
+
+fun rtEnvGcParallelMin() -> Int {
+  let name = RawPtr.alloc(bytes: 32, align: 8)
+  return rtEnvIntOr(rtEnvValue(name, Runtime.copyLiteral(to: name, "NOMU_GC_PARALLEL_MIN")), 4096)
 }
 
 fun rtEnvSlot() -> Int {

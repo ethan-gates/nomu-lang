@@ -608,7 +608,7 @@ remaining high bits are free but too few for a full pointer. Options:
 **Decided: pointer-in-payload-word-0 + 2 header state bits** — it needs no new side structure, the state
 bits sit in already-free header space, and it matches the oracle's layout. Single-threaded first cut needs
 no atomics on the state bits; the being-forwarded state and a CAS are added when the collector runs
-concurrently (post-scheduler). The one guard is a build-time check that no managed type is smaller than
+concurrently; the parallel minor adds them (§11.7). The one guard is a build-time check that no managed type is smaller than
 one payload word (150.3.6 verifies this against the type tables; header + ≥1 field holds for every managed
 type today).
 
@@ -914,3 +914,107 @@ next is [127 LXR](../plans/tasks/127-lxr-collector.md) on rung 3's region machin
 - **Added:** the `NURSERY` block state + nursery reserve accounting, the self-hosted log-bit table + barrier
   slow path, the per-carrier mod-buffers, and the minor-collection driver (a restricted-from-space
   `rtEvacuate` with the remembered set as an extra root source).
+
+### 11.7 Parallel minor (Decided)
+
+The minor's trace and copy run on several threads inside the pause. Objects, the barrier, the remembered
+set and the mutator's view are unchanged. Priorities, in order: soundness, pause length, then total CPU.
+Task: [262](../plans/tasks/262-collector-gaps.md) 262.5.7.
+
+**Workers: the coordinator and the parked carriers.** A carrier that acks a stop waits in
+`rtSchedStwParkCarrier` for the stw-gen bump. Before each wait it calls `rtMinorHelp`, which joins an open
+minor. The coordinator recruits them (`rtMinorRecruit`): it opens the job (`rtMinorJob`) and wakes stw-gen's
+futex without bumping it, once for each helper the team allows, so that many parked carriers look at the job.
+**The team is sized by the work:** one helper for every 64 blocks (2 MiB) the last minor's copies took, at
+least one, as HotSpot sizes its GC threads by heap size. The workers count the blocks as they take them, under
+the copy lock, so sizing costs nothing per object. Past what a minor's work spreads over, more helpers spin,
+contend and sleep: on binary-trees and the enum tree at 8 carriers, waking every carrier cost up to 1.8× the
+CPU of the sized team for the same wall time and pauses (262.5.7.6). Growing the team on demand (a busy worker
+wakes another while none is idle) grew it to every carrier on these minors and did no better. The coordinator starts work at once; a helper that arrives late joins the
+trace in progress. A carrier woken between its look at the job and its wait sleeps through that minor, which
+costs a helper and nothing else. `NOMU_GC_THREADS` caps the workers (the carriers and the coordinator by
+default). A carrier whose fiber
+is in C acks through its claim (`rtClaimInC`) and keeps running C code, so it does not help. A join count
+records the helpers inside the trace, and the coordinator waits for it to reach zero before the reclaim, so
+no helper touches collector state after the trace ends. Go takes the same route (its GC workers run on its
+Ps); a dedicated worker pool (HotSpot, MMTk) was the alternative, at the cost of a thread lifecycle and
+sizing of its own.
+
+**Forwarding: claim, then copy.** §10.8 reserved a being-forwarded state for this. It is header bit 33 with
+collector mark value 3, a value the mark never takes (it rotates 1 ↔ 2, and new objects hold 0). A worker
+reaching an unforwarded nursery object:
+
+1. reads the header h and CASes it to the busy state; a failed CAS means another worker claimed it;
+2. on success, allocates from its own copy cursor, copies the object, writes h with this cycle's mark into
+   the copy's header, marks the copy's lines and sets its log bit (unlogged), writes the copy's address into
+   the original's payload word 0, then stores the forwarded header (bit 33, mark value 0) with an atomic
+   store, so a reader that sees it also sees word 0 and the copy;
+3. on failure, spins on an atomic load of the header until it reads forwarded, then reads word 0.
+
+The winner alone pushes the copy for scanning, so the copy's mark needs no CAS. Only nursery objects are
+claimed, and only workers touch them while the world is stopped. Majors, the verifier and the serial path
+never see the busy state. Copy-then-CAS (HotSpot's) was the alternative; it needs the whole forwarding
+record in one word, the header, which would change §10.8 for majors as well.
+
+**Work: a local stack per worker and a shared chunk pool.** The trace is depth-first: a worker pops an
+object and forwards its slots, pushing each copy it wins. Workers first claim the roots in ranges of 64 by
+an atomic counter (stack slots, then the remembered set); one worker claims the large-object list whole. A
+depth-first stack over a tree stays shallow (tens of entries), so sharing is driven by demand: every 32
+objects a worker checks for idle workers and an empty pool, and if both, moves the bottom half of its stack
+(at most a chunk of 256), the entries nearest the roots, into the pool, and wakes the idle. A lock guards the
+pool, and the lock orders a chunk's entries (and the copies they name) for the worker that takes it.
+Termination: a worker with an empty stack raises the idle count and waits for a chunk, spinning briefly and
+then sleeping on the pool's chunk count. A worker leaves idle only by taking a chunk under the lock, and only
+a working worker adds one, so "every joined worker idle and the pool empty", seen under the lock, holds from
+then on; the worker that sees it marks the job done with a CAS on the joined count, which also closes it to
+late joins. The coordinator then waits for every helper to leave before reclaiming the nursery.
+Binary-trees' roots are its recursion's frames, one subtree each, the largest about half the nursery's
+survivors, so the pool is what spreads the work. Chase-Lev deques with stealing balance more finely and can replace the pool
+later without touching the rest.
+
+**Copy allocation: a cursor per worker.** Each worker has a record (`rtCopyWorker`): its copy cursor and its
+work stack. It bumps within its own block and takes whole blocks (recyclable, then free) from the shared
+allocator under `rtCopyLock`. A worker keeps its block from one minor to the
+next, as the serial cursor keeps its place, and a major resets every cursor. The minor's room check (whether
+the reservation's free blocks could hold the whole nursery, `rtGenCollect`) adds one block for each worker's
+part-filled block.
+
+**Races and why each is absent.**
+- *A slot.* Each slot is forwarded by one worker: stack slots are distinct, the remembered set holds each
+  object once a cycle (`rtGcRemember` clears its bit under `rtLogLock`), each copy is scanned by the worker
+  that won it, and each large object enters once.
+- *Line marks.* A byte per line, and a worker marks only lines in its own blocks.
+- *Log bits for promoted objects.* A log byte covers 64 bytes, inside one 256-byte line, inside one worker's
+  block, so its read-modify-write races with no other worker. The copier sets them, at the claim: an object
+  shared through the pool is scanned by another worker, whose write to that byte would race the copier's.
+- *The offset list.* An object with shaped fields lists its offsets into a buffer; each worker has its own
+  (`rtOffsetsListIn`), and the single-threaded walks keep the global `rtOffs`.
+- *Log bits for remembered objects.* Mature neighbours can share a log byte across workers, so their unlogs
+  run in a short serial pass before the workers start.
+- *Counters.* Promoted bytes and counts are kept per worker and summed at the end.
+
+**When it runs parallel: recruit once the work proves large.** Every minor starts on the coordinator alone.
+Once it has handled `NOMU_GC_PARALLEL_MIN` roots and objects (4096 by default, about 50 µs of tracing) with
+work left, it recruits the helpers; a minor that ends sooner pays for no wake. The nursery's size predicts
+nothing here, since a minor runs when the nursery is full; the survivors decide the work, and the
+coordinator's own progress measures them as they are found. Of 0 (recruit at once), 1024, 4096, 8192 and
+16384, 4096 kept the median pause within 6 µs of one worker while giving up 0.15 ms at p90 against
+recruiting at once (262.5.7.5). `NOMU_GC_PARALLEL_MIN=0` is a stress setting: every minor recruits at once and
+takes every helper.
+
+**Idle workers.** An idle worker checks the pool 64 times, then sleeps on the chunk count (1 ms at most). A
+sharer wakes one sleeper, and only when one is asleep: the count goes up before the sleepers are read, and a
+sleeper counts itself before a wait that rechecks the count, so no wake is lost. The chunk count sits on its
+own cache line, apart from the pool's lock.
+`NOMU_GC_THREADS=1` keeps every minor on one worker, deterministic in placement, for tests and comparison.
+One trace serves both: with one worker it runs the same code with no helpers. The depth-first trace replaced
+the Cheney scan on one worker first, and was faster (262.5.7.2).
+
+**Testing.** The suite's `stress-parallel` value runs every minor parallel with every helper
+(`gc_parallel_min: 0`), whatever its size, under `gc_verify` (which checks the heap after each minor); `--run-setting gc_parallel_min=0` runs
+the whole suite that way, its carrier matrices at 1, 2, 4 and 8. `gc-parallel-shared` points thousands of
+remembered objects and a stack array at the same young objects, so workers meet in the claim.
+
+**Measure.** Each minor's pause (median and worst) and the collector's total CPU across workers, at 1, 2, 4
+and 8 workers: binary-trees at depths 19 and 21, the enum array benchmark (`practice/gen/enum260`), and the
+actor benchmarks, whose mutators run on several carriers.

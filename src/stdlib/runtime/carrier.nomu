@@ -317,7 +317,7 @@ fun rtGcCollected(ticket: Int) -> Bool {
 // which reclaims mature garbage, collects the nursery and sets L again. A minor's promotions may pass L: the
 // collector's copies draw blocks up to the reservation, so a minor runs out of room only when the
 // reservation does, and it runs a major in its place when the reservation's free blocks could not hold the
-// whole nursery. NOMU_MATURE_FLOOR (the mature-pressure knob) runs a major while fewer than that many blocks
+// whole nursery and a part-filled block for each of the collector's workers (rtCopyWorker). NOMU_MATURE_FLOOR (the mature-pressure knob) runs a major while fewer than that many blocks
 // remain below L. Called without the pool lock held. `minorTrigger` is the active nursery reserve
 // (rtGenReserve, > 0); `trigger` is why the collection was raised (the recorder's trigger id: nursery full or
 // allocation stress). Returns whether a collection ran.
@@ -329,7 +329,7 @@ fun rtGenCollect(minorTrigger: Int, trigger: Int, anchorOff: Int, anchorPc: Int)
   let fc: Int = space.load(fromByteOffset: 32)
   let flTop: Int = space.load(fromByteOffset: 96)
   let nursery: Int = space.load(fromByteOffset: 136)
-  if room <= rtMatureFloor || reserved - fc + flTop < nursery {
+  if room <= rtMatureFloor || reserved - fc + flTop < nursery + rtCarrierCount + 1 {
     var why = trigger
     if trigger == 1 {
       why = 2                                    // a nursery-full minor escalated: mature space is full

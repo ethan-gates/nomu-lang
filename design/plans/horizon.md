@@ -44,14 +44,14 @@ no C remains under the runtime. (223's blocker 6, the asm floor moving into the 
     ├── 182  cross-module inlining & inlinable stdlib                    (perf-accuracy)
     │        complements 179 (value-level GC classification)
     ├── 262  collector gaps — GenImmix against Go: promotion, large objects, the header log bit, parallel
-    │        marking  (paused; 262.5.3 next)
+    │        marking  (active; 262.5.7 parallel minor done, 262.5.3 next)
     └── 217  build graph granularity — sliced keys, scheduler (staged jobs deferred)  (dev-productivity)
 ```
 
 **Where we are:** [237](tasks/237-handoff-primitives.md) (handoffs in the runtime) is done: a fiber hop on 8
 carriers takes 28 ns (65 before) and a channel hop 58 ns at a tenth of the CPU, and the design is in
 `runtime.md` §1.1. Next is [194](tasks/194-gc-frame-metadata.md)'s implementation. binary-trees at depth 21 runs in 3.1 s at 445 MB against Go's 5.0 s and 224 MB;
-Richards runs 693 ms against Go's 486. [262](tasks/262-collector-gaps.md) (collector gaps, paused at 262.5.3)
+Richards runs 693 ms against Go's 486. [262](tasks/262-collector-gaps.md) (collector gaps, active ahead of 194: 262.5.7, a parallel minor, done; 262.5.3 next)
 compares compilers through [257](tasks/257-toolchain-version-manager.md)'s snapshots. The stack policies (growth,
 starting sizes, shrinking, pool sizes) wait in [258](tasks/258-runtime-policy-tuning.md) for real programs to
 tune against, and the libc-or-own choices in [259](tasks/259-libc-or-own-per-routine.md).

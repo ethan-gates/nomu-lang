@@ -370,6 +370,30 @@ cases:
       - kind: minor
         min: 2
 
+  # Every minor parallel, on the coordinator and the parked carriers, with many remembered objects and a stack
+  # array reaching the same young objects (selfhosted-gc.md §11.7).
+  - name: gc-parallel-shared
+    fixture: tests/fixtures/gc_parallel_shared
+    compile_settings:
+      escape: false
+    run_settings:
+      nursery_blocks: 1
+      gc_parallel_min: 0
+      gc_verify: 1
+    expect:
+      stdout: "bad 0\n"
+    carriers:
+      - 1
+      - 2
+      - 4
+      - 8
+    iterations: 2
+    full_iterations: 8
+    weight: 8
+    collections:
+      - kind: minor
+        min: 40
+
   - name: gc-request-precedence
     fixture: tests/fixtures/gc_request_precedence
     compile_settings:

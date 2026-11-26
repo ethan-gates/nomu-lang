@@ -1,7 +1,7 @@
 # Collector gaps — binary-trees and Richards against Go
 
 **Avenue:** Risk (perf, footprint) · **Type/Lifecycle:** `runtime · gc · codegen` · **Size:** L ·
-**Status:** 262.5.7 next (a parallel minor); 262.5.6 done (the header explains the live set; the nursery inside the limit: peak 447 → 385 MiB at depth 21; free blocks returned at majors: mean footprint −21%); 262.7 done (no slowdown since 260; the baseline below); 262.3 done (no stubs: binary-trees
+**Status:** 262.5.7 active (a parallel minor; 262.5.7 done: parallel minors on the parked carriers, recruited once a minor's work passes 4096 objects, the team sized by the last minor's copies (binary-trees depth 21: wall 2996 → 2617 ms, longest minor 35 → 7.5 ms; at 8 carriers CPU within 10% of one worker); 262.5.3 next); 262.5.6 done (the header explains the live set; the nursery inside the limit: peak 447 → 385 MiB at depth 21; free blocks returned at majors: mean footprint −21%); 262.7 done (no slowdown since 260; the baseline below); 262.3 done (no stubs: binary-trees
 4% faster); 262.1 done (offsets read in place: binary-trees 10% faster); 262.4 closed (heap limit stays in bytes); 262.5.1 done (no unmark walk: binary-trees 10% faster, `immix` 29%); 262.5.2 done (pass folded into the scan, under 1%); 262.2.1–262.2.3 done (262.2.1: Richards 3% faster;
 262.2.3: binary-trees 6% faster); 262.2.4 done (the barrier's check, not an optimizer fence, is Richards' 22%); 262.2.5–262.2.6 open (elision across blocks and stops) ·
 **Source:** the enum layout work ([260](260-enum-layout.md)), which removed the enum decoding that had hid
@@ -72,7 +72,7 @@ smallest result as the program's cost. Each plan's cost is then its total less t
 includes its barriers and allocation paths. `gc_immix` with no collection, used as Richards' control in 262.2,
 is one such run. Compare total CPU, not pause times.
 
-Order: 262.5.7, then 262.5.3 and the rest of 262.5, then 262.6. 262.2.5 and 262.2.6 are open beside them.
+Order: 262.5.3 and the rest of 262.5 (262.5.7 done), then 262.6. 262.2.5 and 262.2.6 are open beside them.
 
 - **262.7** The slowdown since 260. **Done: none.** The toolchains at `e994115` (where 592 ms was recorded)
   and at `a61bc20` (261, 263 and 264 in), snapshotted with [257](257-toolchain-version-manager.md) and run
@@ -236,6 +236,10 @@ Order: 262.5.7, then 262.5.3 and the rest of 262.5, then 262.6. 262.2.5 and 262.
     Each minor promotes about 5 MiB, what is live at that moment (mostly the tree being built), so promotion
     and the majors it drives halve with each doubling of the nursery, at a cost in RSS. Aging would keep those
     short-lived survivors out of mature space but copies them all the same.
+    The table predates the parallel minor (262.5.7). With it, re-sweep the recruitment count
+    (`NOMU_GC_PARALLEL_MIN`, 4096, chosen when a recruit woke every carrier; now a recruit wakes a team sized
+    by the work, so recruiting earlier may pay) against the nursery sizes, since both set how large minors
+    are.
   - **262.5.4** Large objects deciding between majors and minors.
   - **262.5.6** RSS beyond the live heap (carries over: the Immix block pool is LXR's too). At the default
     nursery binary-trees peaks at 208 MiB in use and 447 MiB resident (Go: 205 MB). The rest is free heap
@@ -288,7 +292,106 @@ Order: 262.5.7, then 262.5.3 and the rest of 262.5, then 262.6. 262.2.5 and 262.
       not move on darwin: reusable pages stay counted until the system takes them, so footprint is the measure.
       Suite 4220/4220 full.
   - **262.5.7** A parallel minor: the minor's scan and copy on several threads, 552 ms of 840 ms of collector
-    time at depth 21. Objects, barriers and the mutator's view stay as they are.
+    time at depth 21. Objects, barriers and the mutator's view stay as they are. Priorities: soundness, then
+    pause length, then total CPU. Design in `selfhosted-gc.md` §11.7.
+    - **262.5.7.1** The design. **Done.** Workers are the coordinator and the parked carriers. Forwarding
+      claims the object by a CAS to a busy header state (bit 33 with mark value 3), then copies and publishes.
+      Work is shared through a local stack per worker and a lock-guarded chunk pool. Each worker copies into its
+      own blocks, which keeps line marks and promoted objects' log bits free of races; remembered objects'
+      unlogs move to a serial pass. Small minors and `NOMU_GC_THREADS=1` stay on one worker.
+    - **262.5.7.2** Forwarding by claim, and the depth-first trace, on one worker. **Done.** `rtMinorClaim`
+      (`collect.nomu`) CASes a nursery object's header to busy, copies it, writes payload word 0 and stores the
+      forwarded header atomically; the winner alone pushes the copy. The minor's roots push onto a work stack
+      and the trace pops depth-first, in place of the Cheney queue, which is removed. Snapshot `cheney` against
+      the tree, interleaved, load average about 5: binary-trees depth 19 667 → 664 ms best (671 → 673 median, 15
+      rounds), depth 21 2980 → 2933 ms (2987 → 2935 median, 7 rounds). Recording builds at depth 21, the same
+      277 minors and 857 MiB promoted: the minors' scan 479 → 425 ms, the longest minor 41.7 → 33.1 ms; the
+      depth-first order saves more than the CAS costs. Suite 4220/4220 full (3 repeats).
+    - **262.5.7.3** A copy cursor per worker. **Done.** The space's single copy cursor became a table of worker
+      records (`rtCopyWorker`, `immix.nomu`; space @48), one for the coordinator and one for each carrier, 128
+      bytes apart: a copy cursor and the minor's work stack, which is now kept from one minor to the next in
+      place of a 512 KiB allocation each minor. `rtNextHole` takes a cursor and takes whole blocks under
+      `rtCopyLock`; majors copy on worker 0 and reset every record (freeing the stacks). `rtGenCollect`'s room
+      check counts a part-filled block for each worker. Still one worker: binary-trees depth 19 672 → 672 ms,
+      depth 21 2952 → 2952 ms (best, against 262.5.7.2's binaries, interleaved). Suite 4220/4220 full (3
+      repeats).
+    - **262.5.7.4** The chunk pool and termination, the parked carriers as helpers. **Done** (`collect.nomu`:
+      `rtMinorJob`, `rtMinorWork`, `rtMinorHelp`, `rtMinorShare`, `rtMinorAwait`). Parked carriers join from
+      `rtSchedStwParkCarrier`, woken on stw-gen's futex; roots are claimed in ranges; sharing is on demand (the
+      bottom half of a stack when workers are idle and the pool empty); termination is decided under the pool's
+      lock. Two races found in review and closed before the first run: a stale "pool empty" read could end the
+      trace with a chunk pooled (fixed by deciding under the lock), and the scanner of a shared object rewriting
+      a log byte its copier was writing (fixed by setting line marks and log bits at the claim). The global
+      offset list became one per worker (`rtOffsetsListIn`). Settings `NOMU_GC_THREADS` (default: carriers + 1)
+      and `NOMU_GC_PARALLEL_MIN` (here in nursery blocks; 262.5.7.5 made it the objects handled before recruiting); report counter 6
+      (minor workers). Tests: suite value `stress-parallel`, case `gc-parallel-shared` (1, 2, 4, 8 carriers);
+      suite 4701/4701 full (3 repeats), and 4701/4701 with `--run-setting gc_parallel_min=0`, with and without
+      `gc_verify`. Binary-trees depth 21 at 4 carriers (5 workers), recording build: minors 521 → 146 ms in
+      all, the longest 39.0 → 8.0 ms, p90 5.4 → 1.5 ms; wall 2955 → 2658 ms best of 5 against 262.5.7.3's
+      binary. On one worker the new path costs: wall 3050 ms, minors' scan 507 ms against 262.5.7.2's 425.
+    - **262.5.7.5** When to go parallel, and the one-worker cost. **Done.**
+      - Recruit once the work proves large: the nursery-size threshold could not tell (a minor runs when the
+        nursery is full), so every minor starts on the coordinator, which recruits the parked carriers
+        (`rtMinorRecruit`) after `NOMU_GC_PARALLEL_MIN` roots and objects with work left. Binary-trees depth 21,
+        4 carriers, 5 recording runs pooled (about 1390 minors each):
+
+        | recruit after | p50 | p75 | p90 | p99 | max |
+        |---|---|---|---|---|---|
+        | one worker | 85 µs | 1.26 ms | 5.3 ms | 26 ms | 39 ms |
+        | 0 | 102 µs | 0.37 ms | 1.29 ms | 6.4 ms | 10.0 ms |
+        | 1024 | 105 µs | 0.38 ms | 1.29 ms | 7.1 ms | 11.2 ms |
+        | 4096 | 91 µs | 0.42 ms | 1.44 ms | 6.0 ms | 9.5 ms |
+        | 8192 | 89 µs | 0.47 ms | 1.50 ms | 6.0 ms | 9.4 ms |
+
+        Chosen: 4096 (about 50 µs of tracing), the median within 6 µs of one worker.
+      - The one-worker cost: LLVM turned the claim's line-marking loop into a `memset` call per object; the
+        first and last lines are now two stores, with a loop only between. Promoted counts are kept only when
+        the collector records. One-worker minors at depth 21 (recording builds, 5 runs): 262.5.7.2 445 ms,
+        262.5.7.4 543 ms, now 489 ms; wall 2950 / 3030 ms against 262.5.7.3. Marking at the pop and the
+        sharing check's shape measured no difference; the rest is not found.
+      - Result, 4 carriers, one worker against the default (best wall, median CPU, 7–11 rounds interleaved):
+
+        | workload | one worker | parallel |
+        |---|---|---|
+        | binary-trees depth 21 | 2996 ms, CPU 3039 | 2617 ms, CPU 3113; minors 482 → 154 ms, longest 35.4 → 7.5 |
+        | binary-trees depth 19 | 683 ms, CPU 699 | 598 ms, CPU 761 |
+        | enum `tree` (`practice/gen/enum260/tree`) | 374 ms, CPU 378 | 289 ms, CPU 445 |
+        | enum `live`, `alloc_live`, `fanout_actor`, `pipeline_actor` | unchanged | unchanged |
+
+        Wall falls 11–23% where minors are large; CPU rises 2–18%, the idle helpers' spinning and waking and
+        the cost of sharing. Pooled pauses at depth 21: p50 81 → 89 µs, p90 5.1 → 1.3 ms, p99 25 → 5.8 ms.
+      - The heap verifier takes 30 s to over 200 s on binary-trees depth 19 depending on threads and load; it
+        is correct, only slow.
+      - Suite 4701/4701 full (3 repeats), and 4701/4701 with `--run-setting gc_parallel_min=0`.
+    - **262.5.7.6** The parallel minor's CPU. **Done.** The extra CPU grew with the carriers (binary-trees
+      depth 21 at 8 carriers: user +170 ms, system 92 → 371 ms, 19,000 more context switches; enum tree +78%),
+      and wall time was best at 4–5 workers. Counters added (report 7 chunks shared, 8 idle sleeps): about 470
+      shares and 180 sleeps a parallel minor at 4 carriers, 810 and 220 at 8. Tried and measured no gain: waking
+      one idle worker for each chunk, longer spinning (1000, 10000), spinning on the pool lock before its futex
+      (more system time). Growing the team on demand grew it to every carrier and was slightly worse. Kept:
+      the team sized by the last minor's copies, one helper for every 64 blocks, at least one
+      (`rtMinorRecruit`; workers count blocks under the copy lock); a sharer wakes a sleeper only when one is
+      asleep; the chunk count on its own line. Of 8, 16, 32, 64 blocks and every carrier, 64 gave the same wall
+      time or better and the least CPU; pauses pooled over 4 recording runs matched every-carrier within noise
+      (p90 1.6–2.2 ms, p99 6–7 ms at 4 and 8 carriers). `NOMU_GC_PARALLEL_MIN=0` (the stress setting) takes every
+      helper, so the stress tests keep many workers. Median CPU against 262.5.7.5, 7 rounds interleaved, load
+      3–7: enum tree at 8 carriers 682 → 436 ms (one worker 395), at 4 477 → 456; binary-trees depth 19 at 8
+      981 → 779 (one worker 777), at 4 754 → 707; depth 21 at 8 3524 → 3390 (one worker 3088). Wall within noise
+      of 262.5.7.5, and still 10–20% under one worker. Suite 4701/4701 full (3 repeats), and with
+      `gc_parallel_min=0` and `gc_verify` everywhere.
+    - **262.5.7.7** The one-worker cost left from 262.5.7.4. **Investigated, not found; parked.** One-worker minor
+      time at binary-trees depth 21, recording builds, 5 runs each: 262.5.7.2 458 ms, now 495–527. The recording
+      build's promoted counts moved from the claim (a load and store on the worker record per copy) to locals at
+      the pop, so recording builds compare like for like with 262.5.7.2's (kept; suite 4701/4701 full, 3
+      repeats, and with `gc_parallel_min=0` and `gc_verify` everywhere). Ruled out, each within noise:
+      the claim's CAS and release store (plain stores while the coordinator is alone: 506 against 495, reverted);
+      the line marks and log bit at the claim (marks at the pop); the per-worker offset list (the global one);
+      the trace loop's sharing and recruit checks (removed). Summed samples over 5 runs put the gap in
+      `rtMinorClaim` (about 120 samples net of the work it took over from the old loop) and `rtMinorScanObj` (about
+      90), with machine code nearly the same as 262.5.7.2's. Left: 262.5.7.3's worker records (the copy cursor
+      and work stack moved, blocks taken under a lock), checked then by wall time only, and code layout. A
+      bisect needs the 262.5.7.2 and 262.5.7.3 sources rebuilt as snapshots. About 1.5% of binary-trees' run
+      time, paid only by minors too small to recruit helpers.
   - **262.5.8** A background scavenger (carries over: the block pool is shared). 262.5.6 returns memory inside
     the major's pause; Go returns it from a paced background scavenger instead (about 1% of a core, RSS kept
     near the heap goal), which keeps the cost out of pauses and returns only blocks idle a while, so less is

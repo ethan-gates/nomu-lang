@@ -11,8 +11,8 @@
 //
 // Space descriptor (200 bytes):
 //   { heapBase: RawPtr @0, numBlocks: Int @8, lineTable: RawPtr @16, blockTable: RawPtr @24,
-//     freeCursor: Int @32, heapBaseInt: Int @40, allocCursor: Int @48, allocLimit: Int @56,
-//     losHead: RawPtr @64, allocBlock: Int @72, allocLine: Int @80, freeList: RawPtr @88,
+//     freeCursor: Int @32, heapBaseInt: Int @40, copyWorkers: RawPtr @48, (unused) @56,
+//     losHead: RawPtr @64, (unused) @72, (unused) @80, freeList: RawPtr @88,
 //     freeListTop: Int @96, scanBlock: Int @104, defragTable: RawPtr @112, poolLock: Int @120,
 //     nurseryReserve: Int @128, nurseryUsed: Int @136, logbitTable: RawPtr @144, recorder: RawPtr @152,
 //     heapLimit: Int @160, losBytes: Int @168, liveBlocks: Int @176, returnedTable: RawPtr @184,
@@ -30,9 +30,8 @@
 // a pass that read the tables to numBlocks would make the whole reservation's tables resident (on darwin a
 // read alone does), and the suite's `heap-reservation-untouched` case bounds a run's resident memory to
 // catch one.
-// allocCursor/allocLimit are heap-relative byte offsets bounding the current hole (0/0 → refill). freeCursor
-// bumps never-used blocks. allocBlock/allocLine track the block being filled + its next line to scan for
-// holes (allocBlock −1 = none). freeList is a stack of reclaimed empty block indices (freeListTop entries).
+// copyWorkers is the collector's worker records, one for each thread that may copy (rtCopyWorker). freeCursor
+// bumps never-used blocks. freeList is a stack of reclaimed empty block indices (freeListTop entries).
 // scanBlock is the next block index the allocator scans for a recyclable block. losHead is the large-object
 // list. defragTable is a per-block side table holding each block's live-line count from the last sweep — the
 // fragmentation histogram the defrag trigger (150.3.8) selects evacuation sources from (§10.6). Block state
@@ -97,11 +96,11 @@ fun rtImmixNew(heap: RawPtr, numBlocks: Int, limitBlocks: Int) -> RawPtr {
   ctl.store(0, toByteOffset: 32)
   let baseInt = heap.toInt()
   ctl.store(baseInt, toByteOffset: 40)
-  ctl.store(0, toByteOffset: 48)     // allocCursor
-  ctl.store(0, toByteOffset: 56)     // allocLimit
+  ctl.store(rtCopyWorkersNew(), toByteOffset: 48)
+  ctl.store(0, toByteOffset: 56)     // unused
   ctl.store(0, toByteOffset: 64)     // losHead (null)
-  ctl.store(-1, toByteOffset: 72)    // allocBlock (none)
-  ctl.store(0, toByteOffset: 80)     // allocLine
+  ctl.store(0, toByteOffset: 72)     // unused
+  ctl.store(0, toByteOffset: 80)     // unused
   ctl.store(freeList, toByteOffset: 88)
   ctl.store(0, toByteOffset: 96)     // freeListTop
   ctl.store(0, toByteOffset: 104)    // scanBlock
@@ -446,38 +445,117 @@ fun rtNextRecyclable(space: RawPtr) -> Int {
   return found
 }
 
-// Advance the allocator to the next hole (a run of free/unmarked lines) big enough for `need` bytes, setting
-// allocCursor/allocLimit (heap-relative offsets). Scans the current block's line table forward from
-// allocLine; on block exhaustion picks the next block (rtNextAllocBlock). Returns false when the heap is
-// exhausted. A run too small for `need` is skipped (a fragmentation cost accepted in the first cut). Because
+// ---- The collector's worker records ----
+// One record for each thread that may copy in a collection: the coordinator (record 0) and each carrier
+// (selfhosted-gc.md §11.7). A record is 128 bytes, a cache line on Apple silicon, so workers share none:
+//   0  the copy cursor: cursor @0, limit @8 (heap-relative offsets bounding the current hole, 0/0 → refill),
+//      block @16 (−1 = none), line @24 (the next line to scan for holes)
+//   32 the minor's work stack: base @32, cap @40 (a handle for rtQueuePush)
+//   48 the objects this worker scanned in the last minor · 56 their bytes, when the collector records
+//   64 this worker's offset list (rtOffsetsListIn): offsets @64, buffer @72, capacity @80
+// A worker bumps within its own block and takes whole blocks under rtCopyLock, so the lines it marks and the
+// log bits of the objects it copies are its own. The cursors keep their place from one minor to the next;
+// a major resets them (rtCopyWorkersReset).
+let rtCopyWorkerBytes = 128
+
+// The worker records, one for the coordinator and one for each carrier, cursors reset.
+fun rtCopyWorkersNew() -> RawPtr {
+  let n = rtCarrierCount + 1
+  let t = RawPtr.alloc(bytes: n * rtCopyWorkerBytes, align: 128)
+  var w = 0
+  while w < n {
+    let rec = t.advanced(by: w * rtCopyWorkerBytes)
+    rtCopyCursorReset(rec)
+    rec.store(RawPtr.null, toByteOffset: 32)   // no work stack until a minor needs one
+    rec.store(0, toByteOffset: 40)
+    rec.store(RawPtr.null, toByteOffset: 72)   // no offset buffer until an object with shaped fields needs one
+    rec.store(0, toByteOffset: 80)
+    w = w + 1
+  }
+  return t
+}
+
+// Worker `w`'s record.
+fun rtCopyWorker(space: RawPtr, w: Int) -> RawPtr {
+  let t: RawPtr = space.load(fromByteOffset: 48)
+  return t.advanced(by: w * rtCopyWorkerBytes)
+}
+
+fun rtCopyCursorReset(cur: RawPtr) {
+  cur.store(0, toByteOffset: 0)
+  cur.store(0, toByteOffset: 8)
+  cur.store(-1, toByteOffset: 16)
+  cur.store(0, toByteOffset: 24)
+}
+
+// Reset every worker's copy cursor, so the next copy takes a block afresh, and free the work stacks, so a stack
+// grown by a deep minor is not held past the major.
+fun rtCopyWorkersReset(space: RawPtr) {
+  var w = 0
+  while w <= rtCarrierCount {
+    let rec = rtCopyWorker(space, w)
+    rtCopyCursorReset(rec)
+    let st: RawPtr = rec.load(fromByteOffset: 32)
+    if !st.isNull {
+      st.free()
+      rec.store(RawPtr.null, toByteOffset: 32)
+      rec.store(0, toByteOffset: 40)
+    }
+    w = w + 1
+  }
+}
+
+// Give worker record `rec` a work stack if it has none: 64Ki entries (512 KiB), which rtQueuePush doubles when
+// full. Malloc-backed, off the managed heap.
+fun rtCopyStackTake(rec: RawPtr) {
+  let st: RawPtr = rec.load(fromByteOffset: 32)
+  if st.isNull {
+    let cap0 = 65536
+    rec.store(RawPtr.alloc(bytes: cap0 * 8, align: 8), toByteOffset: 32)
+    rec.store(cap0, toByteOffset: 40)
+  }
+}
+
+// Guards the block pool (the free list, scanBlock, freeCursor) while the collector's workers take blocks. The
+// mutators are stopped then, so poolLock is not needed beside it.
+let rtCopyLock = Runtime.staticStorage(bytes: 8, align: 8)
+
+// Advance copy cursor `cur` to the next hole (a run of free/unmarked lines) big enough for `need` bytes, setting
+// its cursor and limit (heap-relative offsets). Scans the cursor's block's line table forward from its line;
+// on block exhaustion takes the next block (rtNextRecyclable, then rtNextAllocBlock) under rtCopyLock. Returns
+// false when the heap is exhausted. A run too small for `need` is skipped (a fragmentation cost accepted in the first cut). Because
 // the line table is the last collection's liveness (a freshly acquired or reclaimed block reads all-free),
 // the same scan serves fresh blocks (one whole-block hole) and recyclable blocks (holes between live lines).
-fun rtNextHole(space: RawPtr, need: Int) -> Bool {
+fun rtNextHole(space: RawPtr, cur: RawPtr, need: Int) -> Bool {
   var done = false
   var result = false
   while !done {
-    let ab: Int = space.load(fromByteOffset: 72)
+    let ab: Int = cur.load(fromByteOffset: 16)
     if ab < 0 {
       let reserved: Int = space.load(fromByteOffset: 8)
+      rtSchedMutexLockAt(rtCopyLock)
       var nb = rtNextRecyclable(space)
       if nb < 0 {
         nb = rtNextAllocBlock(space, reserved, false)    // the collector's copies may pass the heap limit
       }
+      let took: Int = rtMinorJob.load(fromByteOffset: 72)
+      rtMinorJob.store(took + 1, toByteOffset: 72)       // the parallel minor sizes its team by these (rtMinorRecruit)
+      rtSchedMutexUnlockAt(rtCopyLock)
       if nb < 0 {
         done = true
       } else {
-        space.store(nb, toByteOffset: 72)
-        space.store(0, toByteOffset: 80)
+        cur.store(nb, toByteOffset: 16)
+        cur.store(0, toByteOffset: 24)
       }
     } else {
-      let al: Int = space.load(fromByteOffset: 80)
+      let al: Int = cur.load(fromByteOffset: 24)
       if al >= 128 {
-        space.store(-1, toByteOffset: 72)      // block exhausted → pick another next iteration
+        cur.store(-1, toByteOffset: 16)        // block exhausted → take another next iteration
       } else {
         let firstLine = ab * 128
         let gi = firstLine + al
         if rtLineMarked(space, gi) == 1 {
-          space.store(al + 1, toByteOffset: 80)
+          cur.store(al + 1, toByteOffset: 24)
         } else {
           var e = al
           var run = true
@@ -493,14 +571,14 @@ fun rtNextHole(space: RawPtr, need: Int) -> Bool {
               }
             }
           }
-          space.store(e, toByteOffset: 80)     // advance past this run
+          cur.store(e, toByteOffset: 24)       // advance past this run
           let runLines = e - al
           let holeBytes = runLines * 256
           if holeBytes >= need {
             let startOff = ab * 32768 + al * 256
             let endOff = ab * 32768 + e * 256
-            space.store(startOff, toByteOffset: 48)
-            space.store(endOff, toByteOffset: 56)
+            cur.store(startOff, toByteOffset: 0)
+            cur.store(endOff, toByteOffset: 8)
             done = true
             result = true
           }
@@ -515,8 +593,14 @@ fun rtNextHole(space: RawPtr, need: Int) -> Bool {
 // within the current hole, and on exhaustion advance to the next hole/block (rtNextHole), reusing reclaimed
 // and recyclable space produced by collection (150.3.5). An object larger than a block routes to the
 // large-object space (150.3.3). Returns a RawPtr into the heap (or a LOS chunk), or RawPtr.null when the
-// heap is exhausted. The collector's single-threaded copy allocator; mutators allocate through rtTlabAlloc.
+// heap is exhausted. The collector's copy allocator, on the coordinator's cursor (worker 0); mutators allocate
+// through rtTlabAlloc.
 fun rtImmixAlloc(space: RawPtr, n: Int) -> RawPtr {
+  return rtImmixAllocOn(space, rtCopyWorker(space, 0), n)
+}
+
+// rtImmixAlloc on copy cursor `cur`.
+fun rtImmixAllocOn(space: RawPtr, cur: RawPtr, n: Int) -> RawPtr {
   let bumped = n + 7
   let need = bumped / 8 * 8
   if need > 32768 {
@@ -525,15 +609,15 @@ fun rtImmixAlloc(space: RawPtr, n: Int) -> RawPtr {
   var done = false
   var result = RawPtr.null
   while !done {
-    let cur: Int = space.load(fromByteOffset: 48)
-    let lim: Int = space.load(fromByteOffset: 56)
-    if cur + need <= lim {
+    let at: Int = cur.load(fromByteOffset: 0)
+    let lim: Int = cur.load(fromByteOffset: 8)
+    if at + need <= lim {
       let heap: RawPtr = space.load(fromByteOffset: 0)
-      result = heap.advanced(by: cur)
-      space.store(cur + need, toByteOffset: 48)
+      result = heap.advanced(by: at)
+      cur.store(at + need, toByteOffset: 0)
       done = true
     } else {
-      let ok = rtNextHole(space, need)
+      let ok = rtNextHole(space, cur, need)
       if !ok {
         result = RawPtr.null
         done = true
@@ -1193,11 +1277,7 @@ fun rtImmixCollect(space: RawPtr, root: RawPtr) {
   rtImmixMark(space, root)
   rtImmixSweepBlocks(space)
   rtImmixSweepLos(space)
-  space.store(-1, toByteOffset: 72)   // allocBlock: none
-  space.store(0, toByteOffset: 80)    // allocLine
-  space.store(0, toByteOffset: 48)    // allocCursor
-  space.store(0, toByteOffset: 56)    // allocLimit
-  space.store(0, toByteOffset: 104)   // scanBlock (rescan recyclable from the start)
+  rtResetAllocator(space)
   rtGcWorkRelease()
 }
 

@@ -1516,7 +1516,10 @@ fun rtSchedStwParkCarrier(sched: RawPtr) {
   if acked {
     Runtime.futexWake(at: ack, all: true)                     // the initiator waits on the ack count
   }
+  // Parked, the carrier helps a parallel minor's trace when one opens: the coordinator wakes stw-gen's futex
+  // without bumping it, and rtMinorHelp returns at once when no minor is open.
   while gw.atomicLoad(fromByteOffset: 0) == g {
+    rtMinorHelp()
     Runtime.futexWait(at: gw, expected: g, timeoutMicros: 1000000)
   }
 }

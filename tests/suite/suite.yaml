@@ -66,6 +66,16 @@ dimensions:
       collections:
         - min: 100
       tier: full
+    # Every minor parallel, whatever its size, with the heap verifier on: the coordinator and the parked
+    # carriers share each trace (selfhosted-gc.md §11.7).
+    - name: stress-parallel
+      run_settings:
+        gc_stress_bytes: 4096
+        gc_parallel_min: 0
+        gc_verify: 1
+      collections:
+        - min: 100
+      tier: full
     - name: stress-major
       run_settings:
         gc_stress_bytes: 4096

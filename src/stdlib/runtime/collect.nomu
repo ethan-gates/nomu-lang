@@ -289,19 +289,13 @@ fun rtImmixEvacMark(space: RawPtr, root: RawPtr) -> RawPtr {
 fun rtSetupCopyAllocator(space: RawPtr) {
   let fc: Int = space.load(fromByteOffset: 32)
   space.store(fc, toByteOffset: 104)        // recyclable scan past every used block
-  space.store(-1, toByteOffset: 72)         // allocBlock: none → first copy draws a fresh/free block
-  space.store(0, toByteOffset: 80)          // allocLine
-  space.store(0, toByteOffset: 48)          // allocCursor
-  space.store(0, toByteOffset: 56)          // allocLimit
+  rtCopyWorkersReset(space)                 // no current block → the first copy draws a fresh/free block
 }
 
 // Reset the mutator's allocator after a collection: no current block, rescan recyclable from the start so
 // reclaimed + recyclable space is reused by the next allocation.
 fun rtResetAllocator(space: RawPtr) {
-  space.store(-1, toByteOffset: 72)
-  space.store(0, toByteOffset: 80)
-  space.store(0, toByteOffset: 48)
-  space.store(0, toByteOffset: 56)
+  rtCopyWorkersReset(space)
   space.store(0, toByteOffset: 104)
 }
 
@@ -425,15 +419,86 @@ fun rtImmixCollectRootsDefragGen(space: RawPtr, slotBuf: RawPtr, nslots: Int) ->
 // survivor (promote-all, Appel-style). Its root set is the stack roots plus the drained remembered set (the
 // per-carrier mod-buffers the write barrier filled) — the mature space is never scanned, which is the whole
 // point of the barrier: mature→young pointers are reached through the remembered set, not a mature-heap walk.
-// The mature space is not swept. Reuses rtEvacuate + the forwarding record (§10.8): a NURSERY block is turned
-// into a DEFRAG_SOURCE (state 3) so rtEvacuate copies its objects, and the copy allocator draws fresh mature
-// (non-nursery) blocks, so every survivor is promoted. Emptied nursery blocks are reclaimed whole.
+// The mature space is not swept. A NURSERY block is turned into a DEFRAG_SOURCE (state 3) so rtMinorClaim
+// copies its objects, and the copy allocator draws fresh mature (non-nursery) blocks, so every survivor is
+// promoted. Emptied nursery blocks are reclaimed whole. The trace is depth-first over a work stack, the shape
+// the parallel minor shares between workers (selfhosted-gc.md §11.7).
 
-// Forward one managed slot at `fieldAddr` for a minor GC: evacuate the referent (copies it to mature iff it is
-// a nursery source), rewrite the slot in place, and record a freshly-promoted object in `promoted` (the Cheney
-// queue + the post-fixup list). Returns the updated promoted count. A mature/off-heap referent is unchanged
-// and not recorded — a minor GC never scans the mature space.
-fun rtMinorForward(space: RawPtr, fieldAddr: RawPtr, q: RawPtr, count: Int) -> Int {
+// The minor's forwarding states in a nursery object's header, over bit 33 (forwarded) and the collector's mark
+// (bits 34–35). A worker claims the object by a CAS to busy (bit 33 with mark value 3, a value the mark never
+// takes), copies it, writes the copy's address into payload word 0, then stores forwarded (bit 33, mark 0)
+// atomically, so a worker that reads forwarded also reads the address and the copy (selfhosted-gc.md §11.7).
+let rtFwdBit = 8589934592                      // 2^33
+let rtMarkBits = 51539607552                   // bits 34–35
+
+// The survivor of `obj` for a minor. A nursery object is claimed and copied, or, when another call claimed it,
+// its copy is read once published; anything else (mature, off-heap) comes back unchanged. The result is the
+// survivor's address plus 1 when this call made the copy, so the caller alone pushes it for scanning. The copy
+// goes into worker `w`'s blocks.
+fun rtMinorClaim(space: RawPtr, w: RawPtr, obj: RawPtr) -> RawPtr {
+  let base: Int = space.load(fromByteOffset: 40)
+  let nb: Int = space.load(fromByteOffset: 8)
+  let a = obj.toInt()
+  if a < base {
+    return obj                       // off-heap (LOS): never moves
+  }
+  if a >= base + nb * 32768 {
+    return obj
+  }
+  if rtBlockState(space, (a - base) / 32768) != 3 {
+    return obj                       // mature, or a copy made this minor
+  }
+  var result = obj
+  var trying = true
+  while trying {
+    let h: Int = obj.atomicLoad(fromByteOffset: 0)
+    if (h & rtFwdBit) == 0 {
+      let clean = h - (h & rtMarkBits)
+      let got: Int = obj.atomicCas(h, clean + rtFwdBit + rtMarkBits, atByteOffset: 0)
+      if got == h {
+        let size = rtObjSize(obj)                  // a buffer's cap is payload word 0: read before the clobber
+        let dst = rtImmixAllocOn(space, w, size)
+        if dst.isNull {
+          Runtime.fatal("nomu: a minor collection found no room to promote into")
+        }
+        rtCopyWords(dst, obj, size)
+        dst.store(clean + rtMarkValue() * rtMarkUnit, toByteOffset: 0)   // marked this cycle, not forwarded
+        obj.store(dst, toByteOffset: 8)
+        obj.atomicStore(clean + rtFwdBit, toByteOffset: 0)                // publish: forwarded, word 0 set
+        // The copy is mature: its lines are taken until the next major, and it is unlogged, so a store of a
+        // young object into it is remembered. Both lie in w's own block, so no other worker writes them, and no
+        // worker reads them during the trace, so they follow the publish. The copy is in the heap, so its lines
+        // are marked with no range check (rtMarkObjLines has one). Most objects span one or two lines, marked
+        // by two stores; a loop over every line compiles to a memset call per object.
+        let lines: RawPtr = space.load(fromByteOffset: 16)
+        let off = dst.toInt() - base
+        let first = off >> 8
+        let last = (off + size - 1) >> 8
+        lines.store(1.uint8, toByteOffset: first)
+        lines.store(1.uint8, toByteOffset: last)
+        var li = first + 1
+        while li < last {
+          lines.store(1.uint8, toByteOffset: li)
+          li = li + 1
+        }
+        rtSetUnlogged(space, dst)
+        result = dst.advanced(by: 1)
+        trying = false
+      }
+    } else if (h & rtMarkBits) != rtMarkBits {
+      result = obj.load(fromByteOffset: 8)        // forwarded
+      trying = false
+    }
+    // busy: another worker is copying it; read the header again
+  }
+  return result
+}
+
+// Forward one managed slot at `fieldAddr` for a minor GC: claim the referent (copies it to mature iff it is in
+// the nursery), rewrite the slot in place, and push a copy this call made onto worker `w`'s work stack (`count`
+// entries). Returns the updated count. A mature/off-heap referent is unchanged and not pushed — a minor GC
+// never scans the mature space.
+fun rtMinorForward(space: RawPtr, w: RawPtr, fieldAddr: RawPtr, count: Int) -> Int {
   let oldWord: RawPtr = fieldAddr.load(fromByteOffset: 0)
   let oldTag = rtRefTag(oldWord)
   let old = oldWord.advanced(by: 0 - oldTag)
@@ -441,12 +506,14 @@ fun rtMinorForward(space: RawPtr, fieldAddr: RawPtr, q: RawPtr, count: Int) -> I
   if oldNull {
     return count
   }
-  let new = rtEvacuate(space, old)
+  let got = rtMinorClaim(space, w, old)
+  let won = got.toInt() & 1
+  let new = got.advanced(by: 0 - won)
   let moved = !new.eq(old)
   if moved {
     fieldAddr.store(new.advanced(by: oldTag), toByteOffset: 0)      // fix the slot to the survivor's mature address
-    if rtTryMarkBare(new) {
-      rtQueuePush(q, count, new)               // first visit → enqueue for scanning + post-fixup (grows if full)
+    if won == 1 {
+      rtQueuePush(w.advanced(by: 32), count, new)   // copied here → push for scanning (grows if full)
       return count + 1
     }
   }
@@ -505,9 +572,8 @@ fun rtGcWorkRelease() {
   rtGcWork.store(0, toByteOffset: 8)
 }
 
-// The promotion queue is a growable dynamic array behind a stable 2-word handle {base @0, cap @8}: a minor's
-// promotion count is bounded only by the nursery's live objects, which grows with the nursery reserve, so a
-// fixed array can overflow (a large nursery promoting many survivors). Region/block collectors (Immix, G1,
+// A growable dynamic array behind a stable 2-word handle {base @0, cap @8}, for the minor's work stack and the
+// root lists: their sizes are bounded only by the live objects and roots, so a fixed array can overflow. Region/block collectors (Immix, G1,
 // MMTk) use growable work stacks for the same reason. `q` is passed by value into the scan helpers, so growth
 // must not move the value the callers hold — the handle stays put; only the buffer it points at is realloc'd.
 // The buffer is malloc-backed (`RawPtr.alloc`), off the GC heap, so growth during the STW never re-enters
@@ -535,24 +601,24 @@ fun rtQueuePushInt(q: RawPtr, count: Int, w: Int) {
 }
 
 // Scan one object's managed slots for a minor GC, forwarding each young referent (rtMinorForward). Used for
-// the remembered mature objects (find their young children) and, via the Cheney queue, for the promoted
-// objects (a promoted object may still point at other nursery objects). Returns the updated promoted count.
-fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
+// the remembered mature objects (find their young children) and, via the work stack, for the promoted
+// objects (a promoted object may still point at other nursery objects). Returns the work stack's new count.
+fun rtMinorScanObj(space: RawPtr, w: RawPtr, obj: RawPtr, count0: Int) -> Int {
   var count = count0
   let tid = rtObjTypeId(obj)
   let kind = rtTypeKind(tid)
   var nptr = 0
   if kind == 0 {
-    nptr = rtOffsetsList(tid, obj)            // each enum field decoded once
+    nptr = rtOffsetsListIn(w.advanced(by: 64), tid, obj)   // each enum field decoded once, in w's own list
   } else {
     nptr = rtLiveCount(tid, obj)
   }
   if kind == 0 {
-    let offs: RawPtr = rtOffs.load(fromByteOffset: 0)
+    let offs: RawPtr = w.load(fromByteOffset: 64)
     var i = 0
     while i < nptr {
       let off = Runtime.loadInt32(offs, at: i * 4)
-      count = rtMinorForward(space, obj.advanced(by: off), q, count)
+      count = rtMinorForward(space, w, obj.advanced(by: off), count)
       i = i + 1
     }
   } else {
@@ -562,7 +628,7 @@ fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
     var hk = 0
     let nhdr = rtHeaderPtrCount(tid)        // header managed pointers (task 180)
     while hk < nhdr {
-      count = rtMinorForward(space, obj.advanced(by: 16 + rtHeaderOffsetAt(tid, hk)), q, count)
+      count = rtMinorForward(space, w, obj.advanced(by: 16 + rtHeaderOffsetAt(tid, hk)), count)
       hk = hk + 1
     }
     var e = 0
@@ -577,7 +643,7 @@ fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
       var i = 0
       while i < en {
         let off = rtLiveOffsetAt(tid, elemPtr, i)
-        count = rtMinorForward(space, obj.advanced(by: elemBase + off), q, count)
+        count = rtMinorForward(space, w, obj.advanced(by: elemBase + off), count)
         i = i + 1
       }
       e = e + 1
@@ -591,13 +657,16 @@ fun rtMinorScanObj(space: RawPtr, obj: RawPtr, q: RawPtr, count0: Int) -> Int {
 // live nursery object into mature Immix, rewrite each slot to its survivor, reclaim the emptied nursery blocks,
 // and re-establish the log bits (promoted + remembered objects are unlogged so their next mutation is caught).
 // The mature space is neither scanned nor swept. Returns the number of objects promoted.
-// Promotions fill the holes of the recyclable blocks the last major left, then clean blocks. The copy
-// allocator keeps its place from one minor to the next and only a major resets it (rtResetAllocator), so each
+// The trace starts on the coordinator alone; once it has handled rtGcParallelMin objects and roots with work
+// left, it recruits the carriers parked at this stop (rtMinorHelp), up to rtGcThreads workers in all
+// (selfhosted-gc.md §11.7).
+// Promotions fill the holes of the recyclable blocks the last major left, then clean blocks. Each worker's
+// copy cursor keeps its place from one minor to the next and only a major resets it (rtResetAllocator), so each
 // hole and the tail of each partly filled block is taken once per major cycle, as Immix's allocator does.
 // Each promoted object's lines are marked, so the rule the heap verifier checks holds between majors: a
 // reachable object in a recyclable block lies on marked lines, which no allocator hands out.
-fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: RawPtr, nrem: Int) -> Int {
-  // From-space = the NURSERY blocks; turn each into a DEFRAG_SOURCE so rtEvacuate copies its objects.
+fun rtImmixCollectMinor(sched: RawPtr, space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: RawPtr, nrem: Int) -> Int {
+  // From-space = the NURSERY blocks; turn each into a DEFRAG_SOURCE so rtMinorClaim copies its objects.
   let fc: Int = space.load(fromByteOffset: 32)
   var bi = 0
   while bi < fc {
@@ -606,77 +675,74 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
     }
     bi = bi + 1
   }
-  // Promotion queue: a growable dynamic array behind a stable 2-word handle {base @0, cap @8}. rtQueuePush
-  // doubles the buffer when full, so a minor promoting more than the initial capacity grows instead of
-  // overflowing. Starts small (64Ki entries = 512 KiB) — most minors promote little; a large-survivor minor
-  // grows to the nursery-bounded worst case. The queue is malloc-backed (off the GC heap).
-  let cap0 = 65536
-  let q = RawPtr.alloc(bytes: 16, align: 8)
-  q.store(RawPtr.alloc(bytes: cap0 * 8, align: 8), toByteOffset: 0)
-  q.store(cap0, toByteOffset: 8)
-  var count = 0
-  // Root source 1 — stack slots. A young root is promoted + its slot fixed up; a mature root is left alone.
-  var tp = rtGcPhaseOpen(4)
-  var s = 0
-  while s < nslots {
-    let slot: RawPtr = slotBuf.load(fromByteOffset: s * 8)
-    count = rtMinorForward(space, slot, q, count)
-    s = s + 1
-  }
-  rtGcPhaseClose(4, tp)
-  // Root source 2 — the remembered set: scan each logged mature object's slots for young referents, then
-  // re-unlog it so a store into it next cycle is remembered again.
-  tp = rtGcPhaseOpen(5)
+  // Each remembered object is unlogged here, before the trace, so a store into it next cycle is remembered
+  // again. Serial: mature neighbours share a log byte, which two workers would rewrite at once.
   var r = 0
   while r < nrem {
     let robj: RawPtr = remBuf.load(fromByteOffset: r * 8)
-    let robjNull = robj.eq(RawPtr.null)
-    if !robjNull {
-      count = rtMinorScanObj(space, robj, q, count)
+    if !robj.isNull {
       rtSetUnlogged(space, robj)
     }
     r = r + 1
   }
-  // Root source 3 — the large-object space (150.4.5.1.1). LOS objects are off-heap (never in the nursery, never
-  // moved) and carry no log bit, so the write barrier's heap-range guard skips stores into them and the
-  // remembered set never captures a mature LOS→young pointer (e.g. a large Array<class> that gains a young
-  // element). Treat every live LOS object as an old root: scan its managed slots for young referents each
-  // minor. The mature Immix space still relies on the barrier + remembered set; only the barrier-less off-heap
-  // space is scanned wholesale. Immortal buffers (String bytes) hold no managed pointers, so they need no
-  // scanning and are not on this list. A dead-but-unswept LOS object keeps its young referents alive until the
-  // next major sweeps it — conservative, not incorrect.
-  rtGcPhaseClose(5, tp)
-  tp = rtGcPhaseOpen(6)
-  var los: RawPtr = space.load(fromByteOffset: 64)
-  var losNull = los.eq(RawPtr.null)
-  while !losNull {
-    let losObj = los.advanced(by: 8)                 // object starts after the link word (rtLosAlloc)
-    count = rtMinorScanObj(space, losObj, q, count)
-    los = los.load(fromByteOffset: 0)                // next LOS node
-    losNull = los.eq(RawPtr.null)
+  // Open the job. Helpers may join only past the threshold, and while the coordinator's trace is open.
+  let job = rtMinorJob
+  job.store(space, toByteOffset: 0)
+  job.store(slotBuf, toByteOffset: 8)
+  job.store(nslots, toByteOffset: 16)
+  job.store(remBuf, toByteOffset: 24)
+  job.store(nrem, toByteOffset: 32)
+  job.store(0, toByteOffset: 40)                 // helpers allowed to join: none until the recruit sizes the team
+  job.store(sched, toByteOffset: 56)
+  job.store(0, toByteOffset: 72)                 // blocks the copy cursors take in this minor (rtNextHole)
+  job.atomicStore(0, toByteOffset: 128)          // the next stack slot to claim
+  job.atomicStore(0, toByteOffset: 136)          // the next remembered object to claim
+  job.atomicStore(0, toByteOffset: 144)          // the large-object list, unclaimed
+  job.atomicStore(0, toByteOffset: 256)          // the pool's lock
+  job.store(RawPtr.null, toByteOffset: 264)      // the pool's chunks
+  job.atomicStore(0, toByteOffset: 640)          // the pool's chunk count
+  job.atomicStore(0, toByteOffset: 384)          // idle workers
+  job.atomicStore(0, toByteOffset: 392)          // idle workers asleep
+  job.atomicStore(1, toByteOffset: 512)          // joined workers: the coordinator
+  job.atomicStore(0, toByteOffset: 520)          // helpers that have left
+  job.atomicStore(0, toByteOffset: 576)          // chunks shared, when recording
+  job.atomicStore(0, toByteOffset: 584)          // idle sleeps, when recording
+  job.atomicStore(0, toByteOffset: 48)          // closed until the coordinator recruits (rtMinorRecruit)
+  rtMinorWork(space, job, rtCopyWorker(space, 0), true)
+  // The trace is done. Close the job and wait for every helper to leave it before anything else changes. The
+  // blocks this minor's copies took size the next minor's team (rtMinorRecruit).
+  job.atomicStore(0, toByteOffset: 48)
+  let took: Int = job.load(fromByteOffset: 72)
+  job.store(took, toByteOffset: 64)
+  let jw: Int = job.atomicLoad(fromByteOffset: 512)
+  let joined = jw % rtMinorDone
+  var left: Int = job.atomicLoad(fromByteOffset: 520)
+  while left < joined - 1 {
+    Runtime.futexWait(at: job.advanced(by: 520), expected: left, timeoutMicros: 100)
+    left = job.atomicLoad(fromByteOffset: 520)
   }
-  rtGcPhaseClose(6, tp)
-  // Cheney: scan each promoted object for further nursery referents (its young children promote too). Each is
-  // mature now, so it is set unlogged (a future store of a young object into it must be remembered) and its
-  // lines marked, here where the scan visits it once. Its mark stays: the next major advances the mark value.
-  tp = rtGcPhaseOpen(7)
-  var scan = 0
+  var promoted = 0
   var promotedBytes = 0
-  while scan < count {
-    let qbase: RawPtr = q.load(fromByteOffset: 0)
-    let obj: RawPtr = qbase.load(fromByteOffset: scan * 8)
-    scan = scan + 1
-    let size = rtObjSize(obj)
-    promotedBytes = promotedBytes + size
-    rtMarkObjLines(space, obj, size)             // its lines are taken until the next major
-    rtSetUnlogged(space, obj)
-    count = rtMinorScanObj(space, obj, q, count)
+  var wi = 0
+  while wi < joined {
+    let rec = rtCopyWorker(space, wi)
+    let np: Int = rec.load(fromByteOffset: 48)
+    let nbytes: Int = rec.load(fromByteOffset: 56)
+    promoted = promoted + np
+    promotedBytes = promotedBytes + nbytes
+    wi = wi + 1
   }
-  rtGcPhaseClose(7, tp)
   rtGcCounter(5, promotedBytes)
+  rtGcCounter(6, joined)
+  if Runtime.gcRecordLevel() > 0 {
+    let shared: Int = job.atomicLoad(fromByteOffset: 576)
+    let slept: Int = job.atomicLoad(fromByteOffset: 584)
+    rtGcCounter(7, shared)
+    rtGcCounter(8, slept)
+  }
   // Reclaim the emptied nursery blocks (every live object promoted out) onto the free list; mature blocks are
   // left untouched (not swept).
-  tp = rtGcPhaseOpen(9)
+  let tp = rtGcPhaseOpen(9)
   let fl: RawPtr = space.load(fromByteOffset: 88)
   var bj = 0
   while bj < fc {
@@ -690,10 +756,337 @@ fun rtImmixCollectMinor(space: RawPtr, slotBuf: RawPtr, nslots: Int, remBuf: Raw
   }
   space.store(0, toByteOffset: 136)              // the nursery is empty again
   rtGcPhaseClose(9, tp)
-  let qbaseFree: RawPtr = q.load(fromByteOffset: 0)   // free the (possibly grown) buffer, then the handle
-  qbaseFree.free()
-  q.free()
-  return count
+  return promoted
+}
+
+// ---- The parallel minor's job (selfhosted-gc.md §11.7) ----
+// One job, open while a minor traces; the words several workers write sit on their own 128-byte lines:
+//   0 space · 8 stack slots · 16 their count · 24 remembered set · 32 its count · 40 helpers allowed to join
+//   48 open: 1 while helpers may join · 56 the scheduler, whose stw-gen futex the parked carriers wait on
+//   64 the blocks the last minor's copies took · 72 those this minor's have taken so far (under rtCopyLock)
+//   128 the next stack slot to claim · 136 the next remembered object · 144 the large-object list, 1 once claimed
+//   256 the pool's lock · 264 its chunks (a list), both touched only under the lock
+//   384 idle workers · 392 those asleep on the chunk count
+//   512 joined workers, the coordinator included, plus rtMinorDone once the trace is done · 520 helpers that left
+//   576 chunks shared · 584 idle sleeps (both counted when the collector records)
+//   640 the pool's chunk count, which idle workers poll and sleep on, on a line apart from the lock's
+// A chunk is {next @0, count @8, entries @16}, rtMinorChunk entries, malloc-backed.
+let rtMinorJob = Runtime.staticStorage(bytes: 768, align: 128)
+let rtMinorDone = 1099511627776                  // 2^40
+let rtMinorChunk = 256
+let rtMinorClaimRange = 64                       // root entries a worker claims at a time
+let rtMinorSpins = 64                            // idle checks before a worker sleeps on the chunk count
+// The blocks of copies per helper a minor's team is sized by (rtMinorRecruit): 2 MiB. Measured against 8, 16, 32
+// blocks and every carrier, on binary-trees and the enum tree at 4 and 8 carriers: the same wall time or
+// better, and the least CPU.
+let rtMinorBlocksPerHelper = 64
+
+// A parked carrier's turn at an open minor: join it if there is room, trace until the trace is done, then
+// leave. Returns at once when no minor is open. Called from rtSchedStwParkCarrier on the carrier's own stack.
+fun rtMinorHelp() {
+  let job = rtMinorJob
+  let open: Int = job.atomicLoad(fromByteOffset: 48)
+  if open == 0 {
+    return
+  }
+  let most: Int = job.load(fromByteOffset: 40)
+  var idx = -1
+  var trying = true
+  while trying {
+    let jw: Int = job.atomicLoad(fromByteOffset: 512)
+    if jw >= rtMinorDone || jw > most {
+      trying = false                             // done, or full: the coordinator and `most` helpers
+    } else {
+      let got: Int = job.atomicCas(jw, jw + 1, atByteOffset: 512)
+      if got == jw {
+        idx = jw
+        trying = false
+      }
+    }
+  }
+  if idx < 0 {
+    return
+  }
+  let space: RawPtr = job.load(fromByteOffset: 0)
+  rtMinorWork(space, job, rtCopyWorker(space, idx), false)
+  job.atomicFetchAdd(1, atByteOffset: 520)
+  Runtime.futexWake(at: job.advanced(by: 520), all: true)
+}
+
+// Open the job to a team of helpers and wake them, from the carriers parked at this stop (rtMinorHelp). The
+// team is one helper for every rtMinorBlocksPerHelper blocks the last minor's copies took, at least one, at most
+// rtGcThreads − 1: past what a minor's work can spread over, more helpers spin and contend (HotSpot sizes its
+// GC threads by heap size the same way). A minor larger than the last gets a small team once. With
+// rtGcParallelMin 0, a stress setting, the team is every helper.
+fun rtMinorRecruit(job: RawPtr) {
+  let last: Int = job.load(fromByteOffset: 64)
+  var n = last / rtMinorBlocksPerHelper
+  if n < 1 {
+    n = 1
+  }
+  if n > rtGcThreads - 1 || rtGcParallelMin == 0 {
+    n = rtGcThreads - 1                          // the stress setting takes every helper, for the most races
+  }
+  job.store(n, toByteOffset: 40)
+  job.atomicStore(1, toByteOffset: 48)
+  let sched: RawPtr = job.load(fromByteOffset: 56)
+  let gw = sched.advanced(by: 152)
+  if n == rtGcThreads - 1 {
+    Runtime.futexWake(at: gw, all: true)
+  } else {
+    var k = 0
+    while k < n {
+      Runtime.futexWake(at: gw, all: false)
+      k = k + 1
+    }
+  }
+}
+
+// One worker's part of a minor, on worker record `w`: claim ranges of the roots, then trace depth-first from
+// its own stack, sharing work through the pool, until every joined worker is idle with the pool empty. The
+// coordinator (`coord`) records the phases, and recruits the helpers (rtMinorRecruit) once it has handled
+// rtGcParallelMin objects and roots with work to spare: a small minor ends sooner than a helper could wake. When
+// the collector records, the worker leaves the objects it scanned and their bytes in its record: each promoted
+// object is pushed once and popped once, so the workers' sums are the minor's promotion.
+fun rtMinorWork(space: RawPtr, job: RawPtr, w: RawPtr, coord: Bool) {
+  rtCopyStackTake(w)
+  // The coordinator's roots and objects left before it recruits; -1 once it has, for a helper, or with no
+  // helpers to recruit.
+  var recruit = -1
+  if coord && rtGcThreads > 1 {
+    recruit = rtGcParallelMin
+    if recruit <= 0 {
+      rtMinorRecruit(job)
+      recruit = -1
+    }
+  }
+  var count = 0
+  // Root source 1 — stack slots. A young root is promoted + its slot fixed up; a mature root is left alone.
+  var tp = 0
+  if coord {
+    tp = rtGcPhaseOpen(4)
+  }
+  let slotBuf: RawPtr = job.load(fromByteOffset: 8)
+  let nslots: Int = job.load(fromByteOffset: 16)
+  var claiming = true
+  while claiming {
+    let i: Int = job.atomicFetchAdd(rtMinorClaimRange, atByteOffset: 128)
+    if i >= nslots {
+      claiming = false
+    } else {
+      var end = i + rtMinorClaimRange
+      if end > nslots {
+        end = nslots
+      }
+      var s = i
+      while s < end {
+        let slot: RawPtr = slotBuf.load(fromByteOffset: s * 8)
+        count = rtMinorForward(space, w, slot, count)
+        s = s + 1
+      }
+      if recruit > 0 {
+        recruit = recruit - (end - i)
+        if recruit <= 0 {
+          recruit = 0                            // recruited at the trace's first check with work to spare
+        }
+      }
+    }
+  }
+  // Root source 2 — the remembered set: scan each logged mature object's slots for young referents (unlogged
+  // before the trace, rtImmixCollectMinor).
+  if coord {
+    rtGcPhaseClose(4, tp)
+    tp = rtGcPhaseOpen(5)
+  }
+  let remBuf: RawPtr = job.load(fromByteOffset: 24)
+  let nrem: Int = job.load(fromByteOffset: 32)
+  claiming = true
+  while claiming {
+    let i: Int = job.atomicFetchAdd(rtMinorClaimRange, atByteOffset: 136)
+    if i >= nrem {
+      claiming = false
+    } else {
+      var end = i + rtMinorClaimRange
+      if end > nrem {
+        end = nrem
+      }
+      var r = i
+      while r < end {
+        let robj: RawPtr = remBuf.load(fromByteOffset: r * 8)
+        if !robj.isNull {
+          count = rtMinorScanObj(space, w, robj, count)
+        }
+        r = r + 1
+      }
+      if recruit > 0 {
+        recruit = recruit - (end - i)
+        if recruit <= 0 {
+          recruit = 0                            // recruited at the trace's first check with work to spare
+        }
+      }
+    }
+  }
+  // Root source 3 — the large-object space (150.4.5.1.1), walked by the one worker that claims it. LOS objects
+  // are off-heap (never in the nursery, never moved) and carry no log bit, so the write barrier's heap-range
+  // guard skips stores into them and the remembered set never captures a mature LOS→young pointer (e.g. a large
+  // Array<class> that gains a young element). Treat every live LOS object as an old root: scan its managed
+  // slots for young referents each minor. Immortal buffers (String bytes) hold no managed pointers, so they
+  // are not on this list. A dead-but-unswept LOS object keeps its young referents alive until the next major
+  // sweeps it — conservative, not incorrect.
+  if coord {
+    rtGcPhaseClose(5, tp)
+    tp = rtGcPhaseOpen(6)
+  }
+  let losTaken: Int = job.atomicExchange(1, atByteOffset: 144)
+  if losTaken == 0 {
+    var los: RawPtr = space.load(fromByteOffset: 64)
+    while !los.isNull {
+      let losObj = los.advanced(by: 8)               // object starts after the link word (rtLosAlloc)
+      count = rtMinorScanObj(space, w, losObj, count)
+      los = los.load(fromByteOffset: 0)              // next LOS node
+    }
+  }
+  // The trace: pop each promoted object and scan it for further nursery referents (its young children promote
+  // too). An object popped here may have been copied by another worker and shared through the pool, so the
+  // copy's lines and log bit were set by its copier (rtMinorClaim). Every 32 objects the worker looks for idle
+  // workers and an empty pool, and gives them the bottom of its stack, the work nearest the roots. The
+  // coordinator recruits once its scanned objects reach what the roots left of rtGcParallelMin, with work to
+  // spare.
+  if coord {
+    rtGcPhaseClose(6, tp)
+    tp = rtGcPhaseOpen(7)
+  }
+  var scanned = 0
+  var scannedBytes = 0
+  var tracing = true
+  while tracing {
+    if count > 0 {
+      count = count - 1
+      let qbase: RawPtr = w.load(fromByteOffset: 32)
+      let obj: RawPtr = qbase.load(fromByteOffset: count * 8)
+      scanned = scanned + 1
+      if Runtime.gcRecordLevel() > 0 {           // the report's bytes; folds away unless recording
+        scannedBytes = scannedBytes + rtObjSize(obj)
+      }
+      count = rtMinorScanObj(space, w, obj, count)
+      if (scanned & 31) == 0 && count >= 2 {    // every 32 objects, with work to spare: share, or recruit
+        let idle: Int = job.atomicLoad(fromByteOffset: 384)
+        if idle > 0 {
+          let pooled: Int = job.atomicLoad(fromByteOffset: 640)
+          if pooled == 0 {
+            count = rtMinorShare(job, w, count)
+          }
+        } else if recruit >= 0 && scanned >= recruit {
+          rtMinorRecruit(job)
+          recruit = -1
+        }
+      }
+    } else {
+      count = rtMinorAwait(job, w)
+      tracing = count > 0
+    }
+  }
+  if coord {
+    rtGcPhaseClose(7, tp)
+  }
+  w.store(scanned, toByteOffset: 48)
+  w.store(scannedBytes, toByteOffset: 56)
+}
+
+// Move the bottom of worker `w`'s stack (`count` entries, at least 2) into a chunk on the pool: half, at most a
+// chunk. The bottom holds the objects nearest the roots, the most work. Returns the entries left.
+fun rtMinorShare(job: RawPtr, w: RawPtr, count: Int) -> Int {
+  var n = count / 2
+  if n > rtMinorChunk {
+    n = rtMinorChunk
+  }
+  let base: RawPtr = w.load(fromByteOffset: 32)
+  let chunk = RawPtr.alloc(bytes: 16 + rtMinorChunk * 8, align: 8)
+  chunk.store(n, toByteOffset: 8)
+  chunk.advanced(by: 16).copyBytes(from: base, byteCount: n * 8)
+  var i = n
+  while i < count {
+    let e: RawPtr = base.load(fromByteOffset: i * 8)
+    base.store(e, toByteOffset: (i - n) * 8)
+    i = i + 1
+  }
+  rtSchedMutexLockAt(job.advanced(by: 256))
+  let head: RawPtr = job.load(fromByteOffset: 264)
+  chunk.store(head, toByteOffset: 0)
+  job.store(chunk, toByteOffset: 264)
+  job.atomicFetchAdd(1, atByteOffset: 640)
+  rtSchedMutexUnlockAt(job.advanced(by: 256))
+  // Wake one sleeper for the chunk; idle workers still spinning see it unwoken. No wake is lost: the count went
+  // up before the sleepers are read, and a sleeper counts itself before its wait, which rechecks the count.
+  let sleepers: Int = job.atomicLoad(fromByteOffset: 392)
+  if sleepers > 0 {
+    Runtime.futexWake(at: job.advanced(by: 640), all: false)
+  }
+  if Runtime.gcRecordLevel() > 0 {
+    job.atomicFetchAdd(1, atByteOffset: 576)
+  }
+  return count - n
+}
+
+// Wait, idle, for work or the trace's end, worker `w`'s stack empty. Returns the entries of a chunk taken off
+// the pool onto the stack, or 0 when the trace is done. The trace is done once every joined worker is idle with
+// the pool empty. A worker leaves idle only by taking a chunk, under the pool's lock, and only a working worker
+// adds one; so that state, seen under the lock, holds from then on. The worker that sees it marks the job done
+// (rtMinorDone, which also closes it to joins: the CAS fails if a helper joined meanwhile) and wakes the rest.
+fun rtMinorAwait(job: RawPtr, w: RawPtr) -> Int {
+  let lock = job.advanced(by: 256)
+  job.atomicFetchAdd(1, atByteOffset: 384)
+  var spins = 0
+  while true {
+    let pooled: Int = job.atomicLoad(fromByteOffset: 640)
+    if pooled > 0 {
+      rtSchedMutexLockAt(lock)
+      let chunk: RawPtr = job.load(fromByteOffset: 264)
+      if !chunk.isNull {
+        let next: RawPtr = chunk.load(fromByteOffset: 0)
+        job.store(next, toByteOffset: 264)
+        job.atomicFetchAdd(-1, atByteOffset: 640)
+        job.atomicFetchAdd(-1, atByteOffset: 384)     // no longer idle, under the lock
+        rtSchedMutexUnlockAt(lock)
+        let n: Int = chunk.load(fromByteOffset: 8)
+        let base: RawPtr = w.load(fromByteOffset: 32)   // a stack holds at least a chunk (rtCopyStackTake)
+        base.copyBytes(from: chunk.advanced(by: 16), byteCount: n * 8)
+        chunk.free()
+        return n
+      }
+      rtSchedMutexUnlockAt(lock)
+    }
+    let jw: Int = job.atomicLoad(fromByteOffset: 512)
+    if jw >= rtMinorDone {
+      return 0
+    }
+    var done = false
+    let seen: Int = job.atomicLoad(fromByteOffset: 384)
+    if seen == jw {                                     // looks done: confirm under the lock
+      rtSchedMutexLockAt(lock)
+      let head: RawPtr = job.load(fromByteOffset: 264)
+      let idle: Int = job.atomicLoad(fromByteOffset: 384)
+      if head.isNull && idle == jw {
+        let got: Int = job.atomicCas(jw, jw + rtMinorDone, atByteOffset: 512)
+        done = got == jw
+      }
+      rtSchedMutexUnlockAt(lock)
+    }
+    if done {
+      Runtime.futexWake(at: job.advanced(by: 640), all: true)
+      return 0
+    }
+    spins = spins + 1
+    if spins > rtMinorSpins {
+      if Runtime.gcRecordLevel() > 0 {
+        job.atomicFetchAdd(1, atByteOffset: 584)
+      }
+      job.atomicFetchAdd(1, atByteOffset: 392)
+      Runtime.futexWait(at: job.advanced(by: 640), expected: 0, timeoutMicros: 1000)
+      job.atomicFetchAdd(-1, atByteOffset: 392)
+    }
+  }
+  return 0
 }
 
 // Drive a major (defrag) collection at an STW: walk every stopped mutator's root SLOTS and run the defrag
@@ -764,7 +1157,7 @@ fun nomuSchedStwCollectMinor(sched: RawPtr) -> Int {
   if rtGcVerify {
     rtVerifyHeap(space, slots, ns, rem, nrem, 0)
   }
-  let n = rtImmixCollectMinor(space, slots, ns, rem, nrem)
+  let n = rtImmixCollectMinor(sched, space, slots, ns, rem, nrem)
   if rtGcVerify {
     rtVerifyHeap(space, slots, ns, RawPtr.null, 0, 1)   // before the run queues' entries are tagged again
   }

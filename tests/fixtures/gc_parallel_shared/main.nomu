@@ -1,0 +1,82 @@
+// Workers meeting at the same young objects in a parallel minor collection (selfhosted-gc.md §11.7). 4096
+// Holders are built and promoted. Each round makes 8 young Boxes, held by a young array on the stack, and
+// points every Holder's `a` and `b` at them: thousands of remembered objects, and the array, reach each Box, so
+// several workers claim the same Box at once. After the minor collections a churn forces, a write through one
+// Holder must show through every other path to that Box: a Box copied twice would split into two. The
+// Holders' array is a large object, so its scan is a root source too. Prints `bad 0`.
+class Box {
+  var v: Int
+}
+
+class Holder {
+  var a: Box
+  var b: Box
+}
+
+fun churn(n: Int) -> Int {
+  var g = 0
+  var j = 0
+  while j < n {
+    let t = Box(v: j)
+    g = g + t.v % 3
+    j = j + 1
+  }
+  return g
+}
+
+fun main() {
+  let n = 4096
+  var hs: Array<Holder> = []
+  var i = 0
+  while i < n {
+    hs.append(Holder(a: Box(v: 0), b: Box(v: 0)))
+    i = i + 1
+  }
+  var g = churn(200000)                  // promotes the Holders
+  var bad = 0
+  var round = 0
+  while round < 40 {
+    var boxes: Array<Box> = []
+    var k = 0
+    while k < 8 {
+      boxes.append(Box(v: round * 100 + k))
+      k = k + 1
+    }
+    i = 0
+    while i < n {
+      hs[i].a = boxes[i % 8]               // young Boxes into mature Holders: remembered
+      hs[i].b = boxes[i * 3 % 8]
+      i = i + 1
+    }
+    g = g + churn(20000)                 // minor collections move the Boxes
+    k = 0
+    while k < 8 {
+      hs[k].a.v = hs[k].a.v + 1000       // Holder k's `a` is Box k
+      k = k + 1
+    }
+    i = 0
+    while i < n {
+      if hs[i].a.v != round * 100 + i % 8 + 1000 {
+        bad = bad + 1
+      }
+      if hs[i].b.v != round * 100 + i * 3 % 8 + 1000 {
+        bad = bad + 1
+      }
+      i = i + 1
+    }
+    k = 0
+    while k < 8 {
+      if boxes[k].v != round * 100 + k + 1000 {
+        bad = bad + 1
+      }
+      k = k + 1
+    }
+    round = round + 1
+  }
+  print("bad ")
+  print(bad)
+  print("\n")
+  if g < 0 {
+    print("unreachable\n")
+  }
+}
